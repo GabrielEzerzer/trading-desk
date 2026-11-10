@@ -898,6 +898,67 @@ async fn candle_subscribers_share_one_upstream_connection_that_closes_when_they_
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_session_made_by_another_engine_lists_with_a_warning_and_its_resume_is_refused() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    // Two stopped sessions: one made now, one saved before the engine revision was recorded,
+    // which reads as revision 1.
+    for id in ["current", "old"] {
+        let mut paper = PaperSession::create(dir.path(), id, config()).expect("creates");
+        for bar in minutes(-60..0) {
+            paper.feed(bar, Vec::new(), true).expect("warm-up bar");
+        }
+        paper.feed(minute(0), Vec::new(), false).expect("live bar");
+    }
+    let path = td_server::paper_dir(dir.path(), "old").join("config.json");
+    let mut saved: Value =
+        serde_json::from_slice(&std::fs::read(&path).expect("reads")).expect("parses");
+    assert_eq!(saved["engine_revision"], td_engine::ENGINE_REVISION);
+    saved
+        .as_object_mut()
+        .expect("an object")
+        .remove("engine_revision");
+    std::fs::write(&path, saved.to_string()).expect("writes");
+
+    let venue = Exchange::start().await;
+    let api = Api::start(&dir, &venue).await;
+    let (_, list) = api.get("/sessions").await;
+    assert_eq!(list.as_array().map(Vec::len), Some(2), "{list}");
+
+    // The old session shows, replayed, with a warning, and cannot go on.
+    let (status, old) = api.get("/sessions/old").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(old["last_bar"]["open_time"], T0);
+    let warnings = old["warnings"].as_array().expect("warnings");
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    let expected = format!(
+        "created with engine revision 1 and its numbers are replayed with engine revision {}",
+        td_engine::ENGINE_REVISION
+    );
+    assert!(
+        warnings[0].as_str().is_some_and(|w| w.contains(&expected)),
+        "{warnings:?}"
+    );
+    let (status, body) = api.post("/sessions/old/resume", "").await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], "engine_changed");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("start a new session")),
+        "{body}"
+    );
+    let (_, old) = api.get("/sessions/old").await;
+    assert_eq!(old["status"]["status"], "stopped");
+
+    // The current one has no warning and resumes as before.
+    let (_, current) = api.get("/sessions/current").await;
+    assert_eq!(current["warnings"], json!([]));
+    let (status, resumed) = api.post("/sessions/current/resume", "").await;
+    assert_eq!(status, StatusCode::OK, "{resumed}");
+    api.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn unknown_sessions_are_404_and_bad_starts_are_400() {
     let dir = tempfile::tempdir().expect("temp dir");
     let venue = Exchange::start().await;

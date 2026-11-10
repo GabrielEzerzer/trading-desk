@@ -4,7 +4,8 @@
 //! Every session in the data directory is loaded when the server starts, by replaying its log, and
 //! listed as stopped: one that was running when the server last stopped resumes with
 //! `POST /sessions/{id}/resume`, which replays the log again and backfills the bars it missed (see
-//! [`crate::start`]). The server stops every running session when it shuts down.
+//! [`crate::start`]). A session made by another engine revision is listed with a warning and its
+//! resume is refused. The server stops every running session when it shuts down.
 //!
 //! Sessions run on the server's shared live streams ([`super::live`]), so a session and the
 //! `candles:` topics of its instrument use one upstream connection.
@@ -342,7 +343,8 @@ impl Sessions {
     }
 
     /// Replays a stopped session's log and starts it again; it backfills the bars it missed. A
-    /// session that ended on its own counts as stopped, even before its supervisor has noticed.
+    /// session that ended on its own counts as stopped, even before its supervisor has noticed. A
+    /// session made by another engine revision is refused.
     pub(crate) async fn resume(self: &Arc<Self>, id: &str) -> Result<SessionSummary, ApiError> {
         let ops = self.ops.lock().await;
         refuse_if_closed(&ops)?;
@@ -355,7 +357,7 @@ impl Sessions {
                     format!("paper session {id:?} is already running"),
                 ));
             }
-            Some(_) => {}
+            Some(entry) => lock(&entry.session).check_resumable()?,
         }
         let (dir, name) = (self.data_dir.clone(), id.to_string());
         let paper = tokio::task::spawn_blocking(move || PaperSession::open(&dir, &name))
@@ -469,6 +471,9 @@ impl From<PaperError> for ApiError {
             PaperError::Engine(_) | PaperError::InvalidId(_) => ApiError::bad_request(message),
             PaperError::Data(e) => e.into(),
             PaperError::Exists(_) => ApiError::new(StatusCode::CONFLICT, "conflict", message),
+            PaperError::EngineChanged { .. } => {
+                ApiError::new(StatusCode::CONFLICT, "engine_changed", message)
+            }
             PaperError::Io { .. }
             | PaperError::BadFile { .. }
             | PaperError::FeedEnded
@@ -533,7 +538,8 @@ pub(super) async fn stop(
     Ok(Json(state.sessions.stop(&id).await?))
 }
 
-/// `POST /sessions/{id}/resume`: 200 once it is running again, 409 if it already was.
+/// `POST /sessions/{id}/resume`: 200 once it is running again, 409 if it already was or if it was
+/// made by another engine revision.
 pub(super) async fn resume(
     State(state): State<Arc<AppState>>,
     UrlPath(id): UrlPath<String>,

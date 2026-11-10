@@ -12,8 +12,8 @@ use td_core::{
 use td_data::live::Rest;
 use td_data::{DataError, resample};
 use td_engine::{
-    LIQUIDATION_TAG, Order, OrderStatus, ParamValue, Params, Session, SessionConfig,
-    build_strategy, run_backtest,
+    ENGINE_REVISION, LIQUIDATION_TAG, Order, OrderStatus, ParamValue, Params, Session,
+    SessionConfig, build_strategy, run_backtest,
 };
 use td_server::{Funding, PaperConfig, PaperError, PaperHandle, PaperSession, Status, paper_dir};
 use tokio::net::TcpListener;
@@ -329,6 +329,83 @@ fn ids_are_checked_and_a_session_is_never_overwritten() {
     };
     assert!(PaperSession::create(dir.path(), "other", unknown).is_err());
     assert!(!paper_dir(dir.path(), "other").exists());
+}
+
+/// Rewrites a saved session's config as an older engine would have saved it: with `revision`
+/// recorded, or with none, as before the revision was recorded.
+fn save_as_engine(dir: &std::path::Path, id: &str, revision: Option<u32>) {
+    let path = paper_dir(dir, id).join("config.json");
+    let mut json: serde_json::Value =
+        serde_json::from_slice(&fs::read(&path).expect("reads")).expect("parses");
+    let object = json.as_object_mut().expect("an object");
+    match revision {
+        Some(r) => object.insert("engine_revision".into(), r.into()),
+        None => object.remove("engine_revision"),
+    };
+    fs::write(&path, serde_json::to_vec(&json).expect("serializes")).expect("writes");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_made_by_another_engine_opens_with_a_warning_and_will_not_run() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let cfg = config(InstrumentKind::Spot, Timeframe::M1);
+
+    // A session made now records this engine's revision and reopens without a warning.
+    let mut paper = PaperSession::create(dir.path(), "now", cfg.clone()).expect("creates");
+    feed_all(&mut paper, &minutes(0..3), &[]);
+    drop(paper);
+    let path = paper_dir(dir.path(), "now").join("config.json");
+    let saved: serde_json::Value =
+        serde_json::from_slice(&fs::read(&path).expect("reads")).expect("parses");
+    assert_eq!(saved["engine_revision"], ENGINE_REVISION);
+    let now = PaperSession::open(dir.path(), "now").expect("opens");
+    assert_eq!(now.engine_revision(), ENGINE_REVISION);
+    assert!(now.warnings().is_empty(), "{:?}", now.warnings());
+    now.check_resumable().expect("resumable");
+
+    let older = ENGINE_REVISION - 1;
+    for (id, recorded, read_as) in [("unrecorded", None, 1), ("older", Some(older), older)] {
+        let mut paper = PaperSession::create(dir.path(), id, cfg.clone()).expect("creates");
+        feed_all(&mut paper, &minutes(0..3), &[]);
+        drop(paper);
+        save_as_engine(dir.path(), id, recorded);
+
+        // It still opens, replayed by this engine, with a warning saying so.
+        let old = PaperSession::open(dir.path(), id).expect("still opens");
+        assert_eq!(old.session().bars(), minutes(0..3));
+        assert_eq!(old.engine_revision(), read_as);
+        let expected = format!(
+            "created with engine revision {read_as} and its numbers are replayed with engine \
+             revision {ENGINE_REVISION}"
+        );
+        assert_eq!(old.warnings().len(), 1, "{:?}", old.warnings());
+        assert!(
+            old.warnings()[0].contains(&expected),
+            "{:?}",
+            old.warnings()
+        );
+        assert!(matches!(
+            old.check_resumable(),
+            Err(PaperError::EngineChanged { created, current })
+                if created == read_as && current == ENGINE_REVISION
+        ));
+
+        // Started anyway, it ends at once with that error, before it asks the venue for anything:
+        // this source's clock panics if it is asked.
+        let handle =
+            td_server::start_with_stream(old, Arc::new(PanickingRest), serve(Vec::new()).await);
+        tokio::time::timeout(Duration::from_secs(10), handle.finished())
+            .await
+            .expect("ends at once");
+        let status = handle.session().lock().expect("lock").status().clone();
+        match status {
+            Status::Error(message) => {
+                assert!(message.contains("start a new session"), "{message}");
+            }
+            other => panic!("expected the start refused, got {other:?}"),
+        }
+        handle.stop().await;
+    }
 }
 
 /// Serves REST data from lists, as of `now`.
