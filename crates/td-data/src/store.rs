@@ -764,22 +764,25 @@ const LOCK_TRIES: u32 = 20;
 /// open and be waiting for its lock; if that writer went on, it would hold a lock on a file no
 /// longer at the path while a newcomer locked a fresh sidecar there, and both would write. So the
 /// delete first retires the sidecar by writing a byte into it ([`retire_lock`]), and a writer that
-/// gets the lock on a sidecar that is not empty lets it go and opens the path again. The open is
-/// also retried when a delete has just removed the folder (not found) and, on Windows, while a
-/// removed sidecar's name lingers until every handle on it is closed (access denied).
+/// gets the lock on a sidecar that is not empty lets it go and opens the path again. Making the
+/// folder and opening the sidecar are also retried when a delete has just removed the folder (not
+/// found) and, on Windows, while a removed folder's or sidecar's name lingers until every handle
+/// on it is closed (access denied, or already exists from `create_dir_all`, which cannot tell
+/// that such a folder is there).
 fn lock_across_processes(path: &Path) -> Result<File, DataError> {
     let dir = path.parent().unwrap_or(Path::new("."));
     let lock_path = lock_path_of(path);
     let mut wait = Duration::from_millis(1);
     let mut last_error = None;
     for _ in 0..LOCK_TRIES {
-        fs::create_dir_all(dir).map_err(DataError::io(dir))?;
-        let opened = File::options()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&lock_path);
+        let opened = fs::create_dir_all(dir).and_then(|()| {
+            File::options()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&lock_path)
+        });
         match opened {
             Ok(file) => {
                 file.lock().map_err(DataError::io(&lock_path))?;
@@ -792,7 +795,9 @@ fn lock_across_processes(path: &Path) -> Result<File, DataError> {
             Err(e)
                 if matches!(
                     e.kind(),
-                    io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied
+                    io::ErrorKind::NotFound
+                        | io::ErrorKind::PermissionDenied
+                        | io::ErrorKind::AlreadyExists
                 ) =>
             {
                 last_error = Some(e);
@@ -1411,47 +1416,47 @@ mod tests {
         let store = Store::new(dir.path());
         let id = spot_id();
         let jan = Month::containing(1_704_067_200_000); // 2024-01-01
-        let done = std::sync::atomic::AtomicBool::new(false);
         let start = std::sync::Barrier::new(2);
         let deletes = std::thread::scope(|scope| {
-            scope.spawn(|| {
+            let writer = scope.spawn(|| {
                 start.wait();
                 for i in 0..WRITES {
                     store
                         .write_candles(&id, &[flat_candle(jan.start() + i * MINUTE)])
                         .expect("every write succeeds");
                 }
-                done.store(true, Ordering::SeqCst);
             });
-            let deleter = scope.spawn(|| {
-                start.wait();
-                let mut deletes = 0;
-                while !done.load(Ordering::SeqCst) {
-                    let report = store.delete_months(&id, jan, jan).expect("deletes");
-                    deletes += report.files;
-                    // Between deletes, the file always reads whole.
-                    let stored = store.read_month(&id, jan).expect("stays readable");
-                    assert!(stored.windows(2).all(|w| w[0].open_time < w[1].open_time));
-                }
-                deletes
-            });
-            deleter.join().expect("no panic")
+            start.wait();
+            let mut deletes = 0;
+            // Until the writer is done or has failed: a failed write must end the test, not leave
+            // this loop running.
+            while !writer.is_finished() {
+                let report = store.delete_months(&id, jan, jan).expect("deletes");
+                deletes += report.files;
+                // Between deletes, the file always reads whole.
+                let stored = store.read_month(&id, jan).expect("stays readable");
+                assert!(stored.windows(2).all(|w| w[0].open_time < w[1].open_time));
+            }
+            writer.join().expect("every write succeeds");
+            deletes
         });
         assert!(deletes > 0, "the delete ran while the writer did");
         // Every write merged into what was there, so what is left is the minutes written since the
-        // last delete: an unbroken run ending at the last minute written.
+        // last delete: an unbroken run ending at the last minute written, or nothing when the last
+        // delete came after the last write.
         let stored: Vec<Millis> = store
             .read_month(&id, jan)
             .expect("the file stays readable")
             .iter()
             .map(|c| c.open_time)
             .collect();
-        let last = jan.start() + (WRITES - 1) * MINUTE;
-        assert_eq!(stored.last(), Some(&last));
-        let first = stored[0];
-        let expected: Vec<Millis> = (first..=last).step_by(MINUTE as usize).collect();
-        assert_eq!(stored, expected);
-        let leftovers: Vec<_> = fs::read_dir(store.candle_path(&id, jan).unwrap().parent().unwrap())
+        if let Some(&first) = stored.first() {
+            let last = jan.start() + (WRITES - 1) * MINUTE;
+            let expected: Vec<Millis> = (first..=last).step_by(MINUTE as usize).collect();
+            assert_eq!(stored, expected);
+        }
+        let folder = store.candle_path(&id, jan).unwrap().parent().unwrap().to_path_buf();
+        let leftovers: Vec<_> = read_dir_or_empty(&folder)
             .unwrap()
             .map(|e| e.unwrap().file_name())
             .filter(|name| name.to_string_lossy().ends_with(".tmp"))
