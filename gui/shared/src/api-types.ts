@@ -903,7 +903,8 @@ export type ToleratedBucket = { open_time: number, missing_minutes: number, };
  */
 export type PaperConfig = { 
 /**
- * A registered strategy, or [`MANUAL_STRATEGY`] (`none`) for a manual session.
+ * A registered strategy, or `none` ([`MANUAL_STRATEGY`]) for a manual session, which takes no
+ * parameters.
  */
 strategy: string, params: Params, 
 /**

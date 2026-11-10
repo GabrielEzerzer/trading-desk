@@ -7,15 +7,19 @@ use std::time::Duration;
 
 use futures_util::SinkExt;
 use td_core::{
-    Candle, FeeSchedule, Instrument, InstrumentId, InstrumentKind, Millis, Timeframe, Venue,
+    Candle, FeeSchedule, Instrument, InstrumentId, InstrumentKind, Millis, OrderId, OrderRequest,
+    OrderType, Side, TimeInForce, Timeframe, Venue,
 };
 use td_data::live::Rest;
 use td_data::{DataError, resample};
 use td_engine::{
-    ENGINE_REVISION, LIQUIDATION_TAG, Order, OrderStatus, ParamValue, Params, Session,
-    SessionConfig, build_strategy, run_backtest,
+    Context, ENGINE_REVISION, LIQUIDATION_TAG, Order, OrderStatus, ParamValue, Params, Session,
+    SessionConfig, Strategy, build_strategy, run_backtest,
 };
-use td_server::{Funding, PaperConfig, PaperError, PaperHandle, PaperSession, Status, paper_dir};
+use td_server::{
+    Funding, MANUAL_STRATEGY, ManualError, ManualOrder, ManualOrderType, OrderSource, PaperConfig,
+    PaperError, PaperHandle, PaperSession, SessionEvent, Status, TradeSource, paper_dir,
+};
 use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::Message;
 
@@ -869,4 +873,451 @@ async fn a_panic_that_races_a_stop_still_shows_as_an_error() {
         Status::Error(message) => assert!(message.contains("the clock broke late"), "{message}"),
         other => panic!("a panic during the stop shows as {other:?}"),
     }
+}
+
+fn manual_config(kind: InstrumentKind) -> PaperConfig {
+    PaperConfig {
+        strategy: MANUAL_STRATEGY.into(),
+        params: Params::new(),
+        ..config(kind, Timeframe::M1)
+    }
+}
+
+fn market(side: Side, qty: f64) -> ManualOrder {
+    ManualOrder {
+        side,
+        qty,
+        order_type: ManualOrderType::Market,
+        limit_price: None,
+        reduce_only: None,
+    }
+}
+
+fn limit(side: Side, qty: f64, price: f64) -> ManualOrder {
+    ManualOrder {
+        order_type: ManualOrderType::Limit,
+        limit_price: Some(price),
+        ..market(side, qty)
+    }
+}
+
+/// Something done by hand between bars.
+#[derive(Clone)]
+enum Hand {
+    Place(ManualOrder),
+    Cancel(u64),
+}
+
+/// What the manual tests do by hand, after the minute each is paired with closes: a market buy
+/// with its quantity off the lot; a limit sell, off the tick, above every high until the next
+/// peak; a limit buy that is never reached, then its cancel.
+fn script() -> Vec<(i64, Hand)> {
+    vec![
+        (4, Hand::Place(market(Side::Buy, 10.0004))),
+        (9, Hand::Place(limit(Side::Sell, 10.0, 105.299))),
+        (20, Hand::Place(limit(Side::Buy, 10.0, 90.0))),
+        (25, Hand::Cancel(3)),
+    ]
+}
+
+fn by_hand(paper: &mut PaperSession, hand: &Hand) -> Result<td_server::PaperOrder, ManualError> {
+    match hand {
+        Hand::Place(order) => paper.place(order),
+        Hand::Cancel(id) => paper.cancel(OrderId(*id)),
+    }
+}
+
+/// Feeds the minutes in `live` as live bars, doing what `script` says after each.
+fn feed_by_hand(paper: &mut PaperSession, live: std::ops::Range<i64>, script: &[(i64, Hand)]) {
+    for i in live {
+        paper.feed(minute(i), Vec::new(), false).expect("feeds");
+        for (_, hand) in script.iter().filter(|(m, _)| *m == i) {
+            by_hand(paper, hand).expect("accepted");
+        }
+    }
+}
+
+/// A session warmed up on the 20 minutes before `T0`.
+fn warmed_up(dir: &std::path::Path, id: &str, cfg: PaperConfig) -> PaperSession {
+    let mut paper = PaperSession::create(dir, id, cfg).expect("creates");
+    for bar in minutes(-20..0) {
+        paper.feed(bar, Vec::new(), true).expect("warm-up bar");
+    }
+    paper
+}
+
+/// Submits and cancels from its bar callbacks what a script does by hand after those bars: the
+/// reference for manual orders.
+struct Scripted {
+    instrument: InstrumentId,
+    script: Vec<(i64, Hand)>,
+}
+
+impl Strategy for Scripted {
+    fn on_bar(&mut self, ctx: &mut Context, bar: &Candle) {
+        for (minute, hand) in &self.script {
+            if T0 + minute * MIN != bar.open_time {
+                continue;
+            }
+            match hand {
+                Hand::Place(order) => {
+                    let _ = ctx.submit(OrderRequest {
+                        instrument: self.instrument.clone(),
+                        side: order.side,
+                        qty: order.qty,
+                        order_type: match order.limit_price {
+                            Some(price) => OrderType::Limit { price },
+                            None => OrderType::Market,
+                        },
+                        tif: TimeInForce::Gtc,
+                        reduce_only: order.reduce_only.unwrap_or(false),
+                        client_tag: None,
+                    });
+                }
+                Hand::Cancel(id) => {
+                    ctx.cancel(OrderId(*id));
+                }
+            }
+        }
+    }
+}
+
+/// Asserts two sessions hold the same trading state, with the same sources.
+fn assert_same_marked_state(a: &PaperSession, b: &PaperSession) {
+    assert_same_state(a, b);
+    assert_eq!(a.fills_with_source(), b.fills_with_source());
+    assert_eq!(a.open_orders_with_source(), b.open_orders_with_source());
+    assert_eq!(a.trades(), b.trades());
+}
+
+#[test]
+fn manual_orders_take_the_strategy_orders_path_and_fill_by_the_engines_rules() {
+    for kind in [InstrumentKind::Spot, InstrumentKind::Perpetual] {
+        let cfg = manual_config(kind);
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut paper = PaperSession::create(dir.path(), "hand", cfg.clone()).expect("creates");
+        // Refused until the first live bar, warm-up bars included.
+        let early = paper.place(&market(Side::Buy, 1.0));
+        assert!(matches!(early, Err(ManualError::NotLive)), "{early:?}");
+        for bar in minutes(-20..0) {
+            paper.feed(bar, Vec::new(), true).expect("warm-up bar");
+        }
+        let early = paper.place(&market(Side::Buy, 1.0));
+        assert!(matches!(early, Err(ManualError::NotLive)), "{early:?}");
+        feed_by_hand(&mut paper, 0..60, &script());
+
+        // A strategy submitting the same orders from the same bars' callbacks trades the same.
+        let scripted = Scripted {
+            instrument: cfg.instrument.id.clone(),
+            script: script(),
+        };
+        let money = SessionConfig {
+            starting_cash: cfg.starting_cash,
+            slippage_bps: cfg.slippage_bps,
+            fees: cfg.fees,
+            max_leverage: cfg.max_leverage,
+        };
+        let mut reference = Session::new(
+            Box::new(scripted),
+            cfg.instrument.clone(),
+            cfg.timeframe,
+            money,
+        )
+        .expect("session");
+        for bar in minutes(-20..0) {
+            reference.warm_up(bar, &[]).expect("warm-up bar");
+        }
+        for bar in minutes(0..60) {
+            reference.on_bar(bar, &[]).expect("live bar");
+        }
+        assert_eq!(paper.fills(), reference.fills(), "{kind}");
+        assert_eq!(paper.equity(), reference.equity(), "{kind}");
+        assert_eq!(paper.portfolio(), reference.portfolio(), "{kind}");
+        // The same orders, apart from who cancelled the limit buy.
+        let mut expected = reference.orders().to_vec();
+        assert_eq!(
+            expected[2].status,
+            OrderStatus::Cancelled("cancelled by the strategy".into())
+        );
+        expected[2].status = OrderStatus::Cancelled("cancelled manually".into());
+        assert_eq!(paper.orders(), expected, "{kind}");
+
+        // The market buy, rounded down to the lot, filled at the open of the next bar.
+        let (orders, fills) = (paper.orders(), paper.fills());
+        assert_eq!(fills.len(), 2, "{kind}: {fills:?}");
+        assert_eq!(orders[0].request.qty, 10.0);
+        assert_eq!(
+            (fills[0].order_id, fills[0].time),
+            (OrderId(1), T0 + 5 * MIN)
+        );
+        assert_eq!(fills[0].liquidity, td_core::Liquidity::Taker);
+        // The limit sell, rounded up to the tick, rested until the bar at minute 37 reached it
+        // and filled at its price.
+        let OrderType::Limit { price } = orders[1].request.order_type else {
+            panic!("a limit order");
+        };
+        assert!((price - 105.3).abs() < 1e-9, "{price}");
+        assert_eq!(
+            (fills[1].order_id, fills[1].time, fills[1].price),
+            (OrderId(2), T0 + 37 * MIN, price)
+        );
+        assert_eq!(fills[1].liquidity, td_core::Liquidity::Maker);
+        assert!(paper.open_orders().is_empty());
+        assert_eq!(paper.portfolio().position(), 0.0);
+
+        // Every order, fill and trade is marked manual.
+        assert!(
+            paper
+                .fills_with_source()
+                .iter()
+                .all(|f| f.source == OrderSource::Manual)
+        );
+        let trades = paper.trades();
+        assert_eq!(trades.len(), 1, "{kind}: {trades:?}");
+        assert_eq!(trades[0].source, TradeSource::Manual);
+        assert!(!trades[0].trade.open);
+    }
+}
+
+#[test]
+fn a_refused_manual_order_records_nothing_and_says_why() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let mut paper = PaperSession::create(
+        dir.path(),
+        "refused",
+        manual_config(InstrumentKind::Perpetual),
+    )
+    .expect("creates");
+    paper.feed(minute(0), Vec::new(), false).expect("live bar");
+    let log = paper_dir(dir.path(), "refused").join("events.jsonl");
+    let lines = || fs::read_to_string(&log).expect("reads").lines().count();
+    let refused = |paper: &mut PaperSession, order: ManualOrder| match paper.place(&order) {
+        Err(ManualError::Rejected(reason)) => reason,
+        other => panic!("expected a rejection, got {other:?}"),
+    };
+
+    // Rounded down to the lot it is zero.
+    let reason = refused(&mut paper, market(Side::Buy, 0.0004));
+    assert!(reason.contains("qty"), "{reason}");
+    // At 1x and a close of 100, 101 TEST is worth more than the equity.
+    let reason = refused(&mut paper, market(Side::Buy, 101.0));
+    assert!(reason.contains("leverage cap"), "{reason}");
+    let priced_market = ManualOrder {
+        limit_price: Some(100.0),
+        ..market(Side::Buy, 1.0)
+    };
+    assert!(refused(&mut paper, priced_market).contains("limit_price"));
+    let unpriced_limit = ManualOrder {
+        limit_price: None,
+        ..limit(Side::Buy, 1.0, 1.0)
+    };
+    assert!(refused(&mut paper, unpriced_limit).contains("limit_price"));
+    assert!(paper.orders().is_empty());
+    assert_eq!(lines(), 1, "only the bar is in the log");
+
+    // The next order accepted takes the first id.
+    let placed = paper.place(&market(Side::Buy, 1.0)).expect("accepted");
+    assert_eq!(
+        (placed.order.id, placed.source),
+        (OrderId(1), OrderSource::Manual)
+    );
+    assert_eq!(placed.order.status, OrderStatus::Open);
+    assert_eq!(lines(), 2);
+
+    // A manual session takes no parameters.
+    let with_params = PaperConfig {
+        params: Params::new().with("fast", ParamValue::Int(2)),
+        ..manual_config(InstrumentKind::Perpetual)
+    };
+    assert!(PaperSession::create(dir.path(), "params", with_params).is_err());
+}
+
+#[test]
+fn manual_orders_on_a_strategy_session_are_marked_manual_and_only_they_can_be_cancelled() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let cfg = config(InstrumentKind::Perpetual, Timeframe::M1);
+    let mut paper = PaperSession::create(dir.path(), "mixed", cfg).expect("creates");
+    let (events, mut rx) = tokio::sync::broadcast::channel(4096);
+    paper.set_events(events);
+    feed_all(&mut paper, &minutes(0..40), &[]);
+    while rx.try_recv().is_ok() {}
+    let position = paper.portfolio().position();
+    assert!(position != 0.0, "the strategy holds a position");
+    let (side, far) = if position > 0.0 {
+        (Side::Sell, limit(Side::Sell, 0.1, 200.0))
+    } else {
+        (Side::Buy, limit(Side::Buy, 0.1, 50.0))
+    };
+
+    // The strategy's position closed by hand, reported once its line is in the log.
+    let close = ManualOrder {
+        reduce_only: Some(true),
+        ..market(side, position.abs())
+    };
+    let close = paper.place(&close).expect("accepted");
+    assert_eq!(close.source, OrderSource::Manual);
+    assert_eq!(
+        rx.try_recv(),
+        Ok(SessionEvent::Order {
+            order: close.clone()
+        })
+    );
+    let log =
+        fs::read_to_string(paper_dir(dir.path(), "mixed").join("events.jsonl")).expect("reads");
+    let last = log.lines().last().expect("lines");
+    assert!(last.starts_with(r#"{"manual_order":{"id":"#), "{last}");
+
+    // A resting limit far from the price, cancelled by hand.
+    let resting = paper.place(&far).expect("accepted");
+    assert!(rx.try_recv().is_ok(), "the order is reported");
+    let cancelled = paper.cancel(resting.order.id).expect("cancels");
+    assert_eq!(
+        cancelled.order.status,
+        OrderStatus::Cancelled("cancelled manually".into())
+    );
+    assert_eq!(
+        rx.try_recv(),
+        Ok(SessionEvent::Order {
+            order: cancelled.clone()
+        })
+    );
+    let again = paper.cancel(resting.order.id);
+    assert!(
+        matches!(
+            again,
+            Err(ManualError::Done {
+                state: "cancelled",
+                ..
+            })
+        ),
+        "{again:?}"
+    );
+    let strategys = paper.cancel(OrderId(1));
+    assert!(
+        matches!(strategys, Err(ManualError::NotManual(1))),
+        "{strategys:?}"
+    );
+    for unknown in [0, 999] {
+        let none = paper.cancel(OrderId(unknown));
+        assert!(matches!(none, Err(ManualError::NoSuchOrder(_))), "{none:?}");
+    }
+
+    // The close fills at the next open and closes the strategy's trade.
+    feed_all(&mut paper, &minutes(40..41), &[]);
+    let filled = paper.cancel(close.order.id);
+    assert!(
+        matches!(
+            filled,
+            Err(ManualError::Done {
+                state: "filled",
+                ..
+            })
+        ),
+        "{filled:?}"
+    );
+    feed_all(&mut paper, &minutes(41..80), &[]);
+    for fill in paper.fills_with_source() {
+        let expected = if fill.fill.order_id == close.order.id {
+            OrderSource::Manual
+        } else {
+            OrderSource::Strategy
+        };
+        assert_eq!(fill.source, expected, "{fill:?}");
+    }
+    let sources: Vec<TradeSource> = paper.trades().iter().map(|t| t.source).collect();
+    assert_eq!(
+        sources.iter().filter(|&&s| s == TradeSource::Mixed).count(),
+        1,
+        "{sources:?}"
+    );
+    assert!(
+        sources
+            .iter()
+            .filter(|&&s| s == TradeSource::Strategy)
+            .count()
+            > 1,
+        "{sources:?}"
+    );
+    assert!(!sources.contains(&TradeSource::Manual), "{sources:?}");
+
+    // The log replays to the same state, sources included.
+    let reopened = PaperSession::open(dir.path(), "mixed").expect("opens");
+    assert_same_marked_state(&paper, &reopened);
+    assert!(reopened.warnings().is_empty(), "{:?}", reopened.warnings());
+}
+
+#[test]
+fn reopening_replays_manual_orders_and_cancels_to_the_uninterrupted_state() {
+    for kind in [InstrumentKind::Spot, InstrumentKind::Perpetual] {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut whole = warmed_up(dir.path(), "whole", manual_config(kind));
+        feed_by_hand(&mut whole, 0..60, &script());
+
+        // Stopped at minute 30, after the cancel and before the limit sell fills.
+        let mut first = warmed_up(dir.path(), "split", manual_config(kind));
+        feed_by_hand(&mut first, 0..30, &script());
+        let mut reopened = PaperSession::open(dir.path(), "split").expect("opens");
+        assert_same_marked_state(&first, &reopened);
+        assert_eq!(reopened.orders().len(), 3, "{kind}");
+        assert_eq!(reopened.open_orders().len(), 1, "{kind}");
+        drop(first);
+        feed_by_hand(&mut reopened, 30..60, &script());
+        assert_same_marked_state(&whole, &reopened);
+        drop(reopened);
+
+        let again = PaperSession::open(dir.path(), "split").expect("opens");
+        assert_same_marked_state(&whole, &again);
+        assert!(
+            again.warnings().is_empty(),
+            "{kind}: {:?}",
+            again.warnings()
+        );
+        assert_eq!(again.fills().len(), 2, "{kind}");
+    }
+}
+
+#[test]
+fn a_log_written_before_manual_orders_existed_still_opens() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let cfg = config(InstrumentKind::Perpetual, Timeframe::M1);
+    let mut current = PaperSession::create(dir.path(), "current", cfg.clone()).expect("creates");
+    PaperSession::create(dir.path(), "old", cfg).expect("creates");
+    // The lines as sessions wrote them before: a bar, the funding fed with it if any, and
+    // whether it was a warm-up bar if it was.
+    let mut log = String::new();
+    for i in -20..60 {
+        let c = minute(i);
+        log.push_str(&format!(
+            r#"{{"bar":{{"open_time":{},"open":{:?},"high":{:?},"low":{:?},"close":{:?},"volume":{:?},"quote_volume":{:?}}}"#,
+            c.open_time, c.open, c.high, c.low, c.close, c.volume, c.quote_volume
+        ));
+        let mut funding = Vec::new();
+        if i == 0 {
+            log.push_str(&format!(
+                r#","funding":[{{"time":{T0},"rate":0.0001,"due":{T0}}}]"#
+            ));
+            funding.push(Funding {
+                time: T0,
+                rate: 0.0001,
+                due: T0,
+            });
+        }
+        if i < 0 {
+            log.push_str(r#","warm_up":true"#);
+        }
+        log.push_str("}\n");
+        current.feed(c, funding, i < 0).expect("feeds");
+    }
+    let path = paper_dir(dir.path(), "old").join("events.jsonl");
+    fs::write(&path, log).expect("writes");
+
+    let old = PaperSession::open(dir.path(), "old").expect("opens");
+    assert_same_marked_state(&current, &old);
+    assert!(old.warnings().is_empty(), "{:?}", old.warnings());
+    assert!(!old.fills().is_empty());
+    assert!(
+        old.fills_with_source()
+            .iter()
+            .all(|f| f.source == OrderSource::Strategy)
+    );
 }

@@ -122,8 +122,13 @@ pub struct FedBar {
 #[serde(rename_all = "snake_case")]
 enum ManualLine {
     /// The request as the API built it, before rounding, and the id it was given.
-    ManualOrder { id: OrderId, request: OrderRequest },
-    ManualCancel { id: OrderId },
+    ManualOrder {
+        id: OrderId,
+        request: OrderRequest,
+    },
+    ManualCancel {
+        id: OrderId,
+    },
 }
 
 /// One line of `events.jsonl`.
@@ -185,7 +190,9 @@ impl ManualOrder {
             (ManualOrderType::Market, Some(_)) => {
                 return Err("a market order takes no limit_price".into());
             }
-            (ManualOrderType::Limit, None) => return Err("a limit order needs a limit_price".into()),
+            (ManualOrderType::Limit, None) => {
+                return Err("a limit order needs a limit_price".into());
+            }
         };
         Ok(OrderRequest {
             instrument: instrument.clone(),
@@ -1084,6 +1091,54 @@ mod tests {
             Err(broadcast::error::TryRecvError::Empty),
             "a bar that is not in the log was reported"
         );
+    }
+
+    #[test]
+    fn a_manual_order_whose_line_cannot_be_written_is_not_reported_and_stops_the_session() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let config = PaperConfig {
+            strategy: MANUAL_STRATEGY.into(),
+            ..config()
+        };
+        let mut paper = PaperSession::create(dir.path(), "unsaved", config).expect("creates");
+        let (events, mut rx) = broadcast::channel(16);
+        paper.set_events(events);
+        paper.feed(bar(0), Vec::new(), false).expect("live bar");
+        while rx.try_recv().is_ok() {}
+        let order = ManualOrder {
+            side: Side::Buy,
+            qty: 1.0,
+            order_type: ManualOrderType::Market,
+            limit_price: None,
+            reduce_only: None,
+        };
+
+        // A handle that cannot write: the order's line fails.
+        paper.log = File::open(&paper.log_path).expect("opens read-only");
+        assert!(matches!(
+            paper.place(&order),
+            Err(ManualError::Paper(PaperError::Io { .. }))
+        ));
+        assert_eq!(
+            rx.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty),
+            "an order that is not in the log was reported"
+        );
+        // The log no longer matches the session, which takes nothing more, even once it could
+        // write again.
+        paper.log = OpenOptions::new()
+            .append(true)
+            .open(&paper.log_path)
+            .expect("opens");
+        assert!(matches!(
+            paper.place(&order),
+            Err(ManualError::Paper(PaperError::LogFailed(_)))
+        ));
+        assert!(matches!(
+            paper.feed(bar(1), Vec::new(), false),
+            Err(PaperError::LogFailed(_))
+        ));
+        assert_eq!(rx.try_recv(), Err(broadcast::error::TryRecvError::Empty));
     }
 
     #[test]

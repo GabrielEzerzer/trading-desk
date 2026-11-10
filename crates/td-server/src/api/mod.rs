@@ -51,7 +51,7 @@
 //!     through the same rounding, checks (lot, tick and minimums, the spot cash and holding, the
 //!     leverage cap) and broker as a strategy's order, as if submitted at the close of the last
 //!     bar: a market order fills at the next bar's open. 201 with the order (a `PaperOrder`,
-//!     `source: "manual"`). 400 `invalid_order` with the engine's reason when it is refused, 400
+//!     `source: "manual"`). 400 `invalid_order` with the engine's reason when it is refused, 4xx
 //!     `bad_request` for a body that does not read, 409 `not_running` on a session that is not
 //!     running, 409 `not_live` before its first live bar. Its fills and trades are marked manual
 //!     too, and the order is in the session's log, so a resume replays it.

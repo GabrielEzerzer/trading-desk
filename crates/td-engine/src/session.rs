@@ -716,11 +716,12 @@ mod tests {
         assert!(s.orders().is_empty());
 
         // Rounded as a strategy's order is: the quantity down, a buy limit down.
-        let market = s
-            .submit(req(Side::Buy, 1.0004, OrderType::Market))
-            .unwrap();
+        let market = s.submit(req(Side::Buy, 1.0004, OrderType::Market)).unwrap();
         assert_eq!((market.id, market.request.qty), (OrderId(1), 1.0));
-        assert_eq!((market.submitted_at, market.decision_close), (60_000, 100.0));
+        assert_eq!(
+            (market.submitted_at, market.decision_close),
+            (60_000, 100.0)
+        );
         let limit = s
             .submit(req(Side::Buy, 1.0, OrderType::Limit { price: 90.009 }))
             .unwrap();
@@ -730,7 +731,10 @@ mod tests {
         // The market order fills at the next bar's open; the limit rests.
         s.on_bar(bar(2, 105.0), &[]).unwrap();
         assert_eq!(s.fills().len(), 1);
-        assert_eq!((s.fills()[0].order_id, s.fills()[0].price), (OrderId(1), 105.0));
+        assert_eq!(
+            (s.fills()[0].order_id, s.fills()[0].price),
+            (OrderId(1), 105.0)
+        );
         assert!(s.cancel(OrderId(2), "cancelled by hand"));
         assert_eq!(
             s.orders()[1].status,

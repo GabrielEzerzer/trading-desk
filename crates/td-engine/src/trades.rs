@@ -89,14 +89,7 @@ struct Building {
 }
 
 impl Building {
-    fn new(
-        side: TradeSide,
-        fill: &Fill,
-        index: usize,
-        bar: usize,
-        qty: f64,
-        fee: f64,
-    ) -> Building {
+    fn new(side: TradeSide, fill: &Fill, index: usize, bar: usize, qty: f64, fee: f64) -> Building {
         Building {
             side,
             entry_fill: index,
