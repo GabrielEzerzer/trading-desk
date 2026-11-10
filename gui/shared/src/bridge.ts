@@ -40,6 +40,13 @@ export interface TdBridge {
   onMessage(listener: (message: ServerMessage) => void): () => void
   status(): Promise<EngineStatus>
   onStatus(listener: (status: EngineStatus) => void): () => void
+  /** Starts the engine again after it failed. Does nothing while it is starting or running. */
+  restartEngine(): Promise<void>
+  /**
+   * True when the app was started with `TD_MOCK=1`: the renderer then reads its Lab data from the
+   * fixtures in `app/mock/` instead of the engine. Not a secret.
+   */
+  readonly mock: boolean
 }
 
 /** IPC channel names. */
@@ -50,4 +57,8 @@ export const IPC = {
   message: 'td:message',
   status: 'td:status',
   statusChanged: 'td:status-changed',
+  restartEngine: 'td:restart-engine',
 } as const
+
+/** The renderer argument main adds when the app runs on mock data (`TD_MOCK=1`). */
+export const MOCK_ARG = '--td-mock'

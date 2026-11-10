@@ -113,8 +113,11 @@ function isErrorBody(value: unknown): value is { error: ErrorBody } {
   return typeof value.error.code === 'string' && typeof value.error.message === 'string'
 }
 
-/** Sends a checked request to the engine with the token. Never throws. */
-export async function sendRequest(connection: Connection, request: ApiRequest): Promise<ApiResult> {
+/**
+ * Sends a checked request to the engine with the token. Never throws. `signal` aborts it early,
+ * as the app does with every open request when it quits.
+ */
+export async function sendRequest(connection: Connection, request: ApiRequest, signal?: AbortSignal): Promise<ApiResult> {
   const url = new URL(request.path, `http://127.0.0.1:${connection.port}`)
   for (const [key, value] of Object.entries(request.query ?? {})) url.searchParams.set(key, value)
   const headers: Record<string, string> = { authorization: `Bearer ${connection.token}` }
@@ -127,7 +130,9 @@ export async function sendRequest(connection: Connection, request: ApiRequest): 
       headers,
       body: request.body === undefined ? undefined : JSON.stringify(request.body),
       redirect: 'error',
-      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      signal: signal
+        ? AbortSignal.any([signal, AbortSignal.timeout(REQUEST_TIMEOUT_MS)])
+        : AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     })
     status = response.status
     text = await response.text()
