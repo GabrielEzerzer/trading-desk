@@ -34,7 +34,8 @@
 //! - Paper sessions (see [`sessions`]):
 //!   - `POST /sessions` `{strategy, params, instrument, timeframe, starting_cash, slippage_bps,
 //!     fees?}`: creates a session and starts it, 201 with its summary. `instrument` is an
-//!     instrument id; its trading rules come from `GET /instruments`.
+//!     instrument id; its trading rules come from `GET /instruments`. Strategy `none`, with no
+//!     parameters, makes a manual session: no strategy runs and only manual orders trade.
 //!   - `GET /sessions`: every session, oldest first, with its status and equity.
 //!   - `GET /sessions/{id}`: a session's full state: status, position, cash, equity curve, open
 //!     orders, fills and trades so far.
@@ -45,6 +46,18 @@
 //!     `engine_changed` if the session was created by another engine revision: it still lists
 //!     and shows, replayed by this engine with a warning saying so, but cannot go on; start a new
 //!     session instead.
+//!   - `POST /sessions/{id}/orders` `{side, qty, type: "market"|"limit", limit_price?,
+//!     reduce_only?}`: places a manual order (a `ManualOrder`), on a strategy session too. It goes
+//!     through the same rounding, checks (lot, tick and minimums, the spot cash and holding, the
+//!     leverage cap) and broker as a strategy's order, as if submitted at the close of the last
+//!     bar: a market order fills at the next bar's open. 201 with the order (a `PaperOrder`,
+//!     `source: "manual"`). 400 `invalid_order` with the engine's reason when it is refused, 400
+//!     `bad_request` for a body that does not read, 409 `not_running` on a session that is not
+//!     running, 409 `not_live` before its first live bar. Its fills and trades are marked manual
+//!     too, and the order is in the session's log, so a resume replays it.
+//!   - `POST /sessions/{id}/orders/{order_id}/cancel`: cancels an open manual order, 200 with the
+//!     order. 404 for an unknown order, 409 `not_manual` for one the strategy placed, 409
+//!     `order_done` for one already filled or cancelled, 409 `not_running` as above.
 //!
 //!   An unknown session id is a 404.
 //! - `GET /ws`: topic subscriptions: `jobs`, `candles:...` and `session:<id>` (see [`ws`]).
@@ -254,6 +267,11 @@ pub(crate) fn router(state: Arc<AppState>) -> Router {
         .route("/sessions/{id}", get(sessions::get))
         .route("/sessions/{id}/stop", post(sessions::stop))
         .route("/sessions/{id}/resume", post(sessions::resume))
+        .route("/sessions/{id}/orders", post(sessions::place_order))
+        .route(
+            "/sessions/{id}/orders/{order_id}/cancel",
+            post(sessions::cancel_order),
+        )
         .route("/ws", get(ws::upgrade))
         .fallback(not_found)
         .method_not_allowed_fallback(method_not_allowed)

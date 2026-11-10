@@ -612,7 +612,7 @@ async fn a_session_streams_its_events_matches_the_library_and_stops() {
             _ => None,
         })
         .collect();
-    assert_eq!(fills, reference.fills(), "each fill once");
+    assert_eq!(fills, reference.fills_with_source(), "each fill once");
     assert!(
         events
             .iter()

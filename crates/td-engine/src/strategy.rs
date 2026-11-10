@@ -212,12 +212,17 @@ impl Context<'_> {
     /// Cancels an open order. Returns false if it is not open. Cancelling an entry that has not
     /// filled also cancels its attached stop.
     pub fn cancel(&mut self, id: OrderId) -> bool {
+        self.cancel_with(id, "cancelled by the strategy")
+    }
+
+    /// [`Context::cancel`] with the reason the order records.
+    pub(crate) fn cancel_with(&mut self, id: OrderId, reason: &str) -> bool {
         if !self.broker.cancel(id) {
             return false;
         }
         let mut attached = None;
         if let Some(order) = self.orders.iter_mut().find(|o| o.id == id) {
-            order.status = OrderStatus::Cancelled("cancelled by the strategy".into());
+            order.status = OrderStatus::Cancelled(reason.into());
             attached = order.attached_stop;
         }
         if let Some(stop) = attached

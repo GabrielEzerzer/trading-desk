@@ -1,5 +1,7 @@
 //! Round-trip trades built from fills.
 
+use std::ops::Range;
+
 use serde::{Deserialize, Serialize};
 use td_core::{Candle, Fill, Millis};
 
@@ -73,6 +75,8 @@ pub struct BarFunding {
 
 struct Building {
     side: TradeSide,
+    /// Index of the trade's first fill.
+    entry_fill: usize,
     entry_time: Millis,
     entry_bar: usize,
     max_abs: f64,
@@ -85,9 +89,17 @@ struct Building {
 }
 
 impl Building {
-    fn new(side: TradeSide, fill: &Fill, bar: usize, qty: f64, fee: f64) -> Building {
+    fn new(
+        side: TradeSide,
+        fill: &Fill,
+        index: usize,
+        bar: usize,
+        qty: f64,
+        fee: f64,
+    ) -> Building {
         Building {
             side,
+            entry_fill: index,
             entry_time: fill.time,
             entry_bar: bar,
             max_abs: qty,
@@ -140,6 +152,19 @@ impl Building {
 /// Positions follow the portfolio's rule for float residue: a position within `1e-9` of the
 /// traded size of zero is flat.
 pub fn build_trades(fills: &[Fill], bars: &[Candle], bar_funding: &[BarFunding]) -> Vec<Trade> {
+    build_trades_with_fills(fills, bars, bar_funding)
+        .into_iter()
+        .map(|(trade, _)| trade)
+        .collect()
+}
+
+/// [`build_trades`], with the range of `fills` each trade is made of. The ranges follow one
+/// another; a fill that takes the position through zero ends one range and starts the next.
+pub fn build_trades_with_fills(
+    fills: &[Fill],
+    bars: &[Candle],
+    bar_funding: &[BarFunding],
+) -> Vec<(Trade, Range<usize>)> {
     let mut trades = Vec::new();
     let mut current: Option<Building> = None;
     let mut pos = 0.0;
@@ -175,7 +200,8 @@ pub fn build_trades(fills: &[Fill], bars: &[Candle], bar_funding: &[BarFunding])
                 if new == 0.0 || flipped {
                     let done = current.take().expect("checked above");
                     let held = k - done.entry_bar;
-                    trades.push(done.finish(fill.time, held, false));
+                    let range = done.entry_fill..next;
+                    trades.push((done.finish(fill.time, held, false), range));
                 }
                 if flipped {
                     let side = if new > 0.0 {
@@ -184,7 +210,14 @@ pub fn build_trades(fills: &[Fill], bars: &[Candle], bar_funding: &[BarFunding])
                         TradeSide::Short
                     };
                     let rest = qty - closed;
-                    current = Some(Building::new(side, fill, k, rest, fill.fee - closing_fee));
+                    current = Some(Building::new(
+                        side,
+                        fill,
+                        next - 1,
+                        k,
+                        rest,
+                        fill.fee - closing_fee,
+                    ));
                 }
             } else if let Some(t) = current.as_mut() {
                 t.entry_qty += qty;
@@ -197,7 +230,7 @@ pub fn build_trades(fills: &[Fill], bars: &[Candle], bar_funding: &[BarFunding])
                 } else {
                     TradeSide::Short
                 };
-                current = Some(Building::new(side, fill, k, qty, fill.fee));
+                current = Some(Building::new(side, fill, next - 1, k, qty, fill.fee));
             }
             pos = new;
         }
@@ -210,7 +243,8 @@ pub fn build_trades(fills: &[Fill], bars: &[Candle], bar_funding: &[BarFunding])
         t.exit_qty += remaining;
         t.exit_notional += remaining * last.close;
         let held = bars.len() - t.entry_bar;
-        trades.push(t.finish(last.open_time, held, true));
+        let range = t.entry_fill..next;
+        trades.push((t.finish(last.open_time, held, true), range));
     }
     trades
 }
@@ -340,6 +374,13 @@ mod tests {
         approx(t[2].gross_pnl, 4.0);
         approx(t[2].net_pnl, 4.0 - 0.236 - 0.05);
         assert_eq!(t[2].bars_held, 3);
+
+        // The flip at bar 4 ends the long's fills and starts the short's.
+        let ranges: Vec<Range<usize>> = build_trades_with_fills(&fills, &b, &funding)
+            .into_iter()
+            .map(|(_, range)| range)
+            .collect();
+        assert_eq!(ranges, [0..3, 2..4, 4..5]);
     }
 
     #[test]

@@ -272,7 +272,45 @@ impl Session {
             reduce_only: true,
             client_tag: Some("close-out".into()),
         };
-        let mut ctx = Context {
+        // A rejected close-out is recorded with its reason, and the position stays open.
+        let _ = self.context().submit(request);
+    }
+
+    /// Submits an order from outside the strategy, such as a person's manual order, between bars.
+    /// It is taken as decided at the close of the last bar fed, exactly like an order the strategy
+    /// submits from that bar's callbacks: rounded, validated and checked against the spot cash and
+    /// holding and the leverage cap as [`Context::submit`] describes, and first able to fill on
+    /// the next bar, a market order at its open.
+    ///
+    /// Unlike a strategy's, a rejected order is not recorded: the reason is returned and nothing
+    /// changes, so the next order takes the id this one would have had. It is refused before the
+    /// first live bar, while trading is disabled or no bar has been fed. Returns the order as
+    /// recorded.
+    pub fn submit(&mut self, request: OrderRequest) -> Result<Order, String> {
+        if self.equity.is_empty() {
+            return Err("orders can be placed once the session has fed its first live bar".into());
+        }
+        let mut ctx = self.context();
+        match ctx.submit(request) {
+            Ok(id) => Ok(self.order_mut(id).clone()),
+            Err(rejected) => {
+                // Context records the rejected order last; it is taken back out.
+                let taken = self.orders.pop();
+                debug_assert_eq!(taken.map(|o| o.id), Some(rejected.id));
+                Err(rejected.reason)
+            }
+        }
+    }
+
+    /// Cancels an open order from outside the strategy, between bars, recording `reason`, as
+    /// [`Context::cancel`] does. Returns false if it is not open.
+    pub fn cancel(&mut self, id: OrderId, reason: &str) -> bool {
+        self.context().cancel_with(id, reason)
+    }
+
+    /// A strategy context on the last bar fed, with trading enabled. There must be a bar.
+    fn context(&mut self) -> Context<'_> {
+        Context {
             bars: &self.bars,
             instrument: &self.instrument,
             timeframe: self.timeframe,
@@ -283,9 +321,7 @@ impl Session {
             broker: &mut *self.broker,
             orders: &mut self.orders,
             warming_up: false,
-        };
-        // A rejected close-out is recorded with its reason, and the position stays open.
-        let _ = ctx.submit(request);
+        }
     }
 
     /// Cancels every open order, and the attached stops of entries that have not filled, with
@@ -429,7 +465,7 @@ impl Session {
         self.strategy.on_bar(&mut ctx, bar);
     }
 
-    fn order_mut(&mut self, id: td_core::OrderId) -> &mut Order {
+    fn order_mut(&mut self, id: OrderId) -> &mut Order {
         // Ids are assigned in submission order starting at 1.
         &mut self.orders[id.0 as usize - 1]
     }
@@ -615,6 +651,94 @@ mod tests {
             volume: 1.0,
             quote_volume: open,
         }
+    }
+
+    fn perp() -> Instrument {
+        Instrument {
+            id: InstrumentId {
+                venue: Venue::Binance,
+                symbol: "TESTUSDT".into(),
+                kind: InstrumentKind::Perpetual,
+            },
+            base: "TEST".into(),
+            quote: "USDT".into(),
+            tick_size: 0.01,
+            lot_size: 0.001,
+            min_qty: 0.001,
+            min_notional: 1.0,
+            fees: FeeSchedule {
+                maker: 0.001,
+                taker: 0.002,
+            },
+        }
+    }
+
+    /// Never trades.
+    struct Idle;
+
+    impl Strategy for Idle {
+        fn on_bar(&mut self, _ctx: &mut Context, _bar: &Candle) {}
+    }
+
+    #[test]
+    fn orders_from_outside_the_strategy_are_checked_like_its_own_and_fill_on_the_next_bar() {
+        let config = SessionConfig {
+            starting_cash: 10_000.0,
+            slippage_bps: 0.0,
+            fees: None,
+            max_leverage: 1.0,
+        };
+        let mut s = Session::new(Box::new(Idle), perp(), Timeframe::M1, config).unwrap();
+        let req = |side, qty, order_type| OrderRequest {
+            instrument: perp().id,
+            side,
+            qty,
+            order_type,
+            tif: TimeInForce::Gtc,
+            reduce_only: false,
+            client_tag: None,
+        };
+        // Refused until the first live bar, warm-up bars included.
+        assert!(s.submit(req(Side::Buy, 1.0, OrderType::Market)).is_err());
+        s.warm_up(bar(0, 100.0), &[]).unwrap();
+        assert!(s.submit(req(Side::Buy, 1.0, OrderType::Market)).is_err());
+        s.on_bar(bar(1, 100.0), &[]).unwrap();
+
+        // Rejections give the engine's reason and record nothing.
+        let reason = s
+            .submit(req(Side::Buy, 0.0004, OrderType::Market))
+            .unwrap_err();
+        assert!(reason.contains("qty"), "{reason}");
+        let reason = s
+            .submit(req(Side::Buy, 101.0, OrderType::Market))
+            .unwrap_err();
+        assert!(reason.contains("leverage cap"), "{reason}");
+        assert!(s.orders().is_empty());
+
+        // Rounded as a strategy's order is: the quantity down, a buy limit down.
+        let market = s
+            .submit(req(Side::Buy, 1.0004, OrderType::Market))
+            .unwrap();
+        assert_eq!((market.id, market.request.qty), (OrderId(1), 1.0));
+        assert_eq!((market.submitted_at, market.decision_close), (60_000, 100.0));
+        let limit = s
+            .submit(req(Side::Buy, 1.0, OrderType::Limit { price: 90.009 }))
+            .unwrap();
+        assert_eq!(limit.request.order_type, OrderType::Limit { price: 90.0 });
+        assert_eq!(s.open_orders().len(), 2);
+
+        // The market order fills at the next bar's open; the limit rests.
+        s.on_bar(bar(2, 105.0), &[]).unwrap();
+        assert_eq!(s.fills().len(), 1);
+        assert_eq!((s.fills()[0].order_id, s.fills()[0].price), (OrderId(1), 105.0));
+        assert!(s.cancel(OrderId(2), "cancelled by hand"));
+        assert_eq!(
+            s.orders()[1].status,
+            OrderStatus::Cancelled("cancelled by hand".into())
+        );
+        assert!(!s.cancel(OrderId(2), "again"), "already cancelled");
+        assert!(!s.cancel(OrderId(1), "filled"), "already filled");
+        assert!(s.open_orders().is_empty());
     }
 
     #[test]

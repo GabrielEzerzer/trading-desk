@@ -23,7 +23,9 @@
 //! - `session:<id>`: one paper session. Right after `subscribed` comes its full state, as
 //!   `{"type":"session_state","session":<SessionState>}`, then each change as
 //!   `{"type":"session","id":...,"event":<SessionEvent>}`: funding charged, fills and order changes,
-//!   then the bar that caused them, status changes, buckets the feed dropped and warnings. Every
+//!   then the bar that caused them, status changes, buckets the feed dropped and warnings. A manual
+//!   order placed or cancelled between bars comes as an order change of its own, once it is in the
+//!   session's log. Orders and fills carry a `source` (`strategy`, `manual` or `liquidation`). Every
 //!   change after the state arrives exactly once. The full state comes again when the subscriber
 //!   fell so far behind that events were dropped, and when the session is resumed, since a resume
 //!   replays it from its log; each change after the latest state arrives exactly once. An unknown

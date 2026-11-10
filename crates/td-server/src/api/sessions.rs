@@ -1,5 +1,5 @@
-//! Paper sessions over the API: start, list, inspect, stop and resume, with each session's events
-//! on the `session:<id>` WebSocket topic.
+//! Paper sessions over the API: start, list, inspect, stop and resume, place and cancel manual
+//! orders, with each session's events on the `session:<id>` WebSocket topic.
 //!
 //! Every session in the data directory is loaded when the server starts, by replaying its log, and
 //! listed as stopped: one that was running when the server last stopped resumes with
@@ -20,13 +20,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use axum::Json;
-use axum::extract::rejection::JsonRejection;
+use axum::extract::rejection::{JsonRejection, PathRejection};
 use axum::extract::{Path as UrlPath, State};
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
-use td_core::{Candle, FeeSchedule, Fill, InstrumentId, Millis, Timeframe};
+use td_core::{Candle, FeeSchedule, InstrumentId, Millis, OrderId, Timeframe};
 use td_data::time::now_ms;
-use td_engine::{EquityPoint, Order, Params, Trade, build_trades};
+use td_engine::{EquityPoint, Params};
 use tokio::sync::{broadcast, oneshot, watch};
 use tokio::task::JoinHandle;
 use ts_rs::TS;
@@ -35,7 +35,10 @@ use super::AppState;
 use super::data;
 use super::error::ApiError;
 use super::live::Streams;
-use crate::{Funding, PaperConfig, PaperError, PaperSession, SessionEvent, Status};
+use crate::{
+    Funding, ManualError, ManualOrder, PaperConfig, PaperError, PaperFill, PaperOrder,
+    PaperSession, PaperTrade, SessionEvent, Status,
+};
 
 /// Events buffered per `session:` subscriber before it is sent the full state again.
 pub(super) const EVENT_BUFFER: usize = 1024;
@@ -44,7 +47,8 @@ pub(super) const EVENT_BUFFER: usize = 1024;
 /// instrument list.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 pub struct StartSessionRequest {
-    /// A registered strategy, as `GET /strategies` lists it.
+    /// A registered strategy, as `GET /strategies` lists it, or `none` for a manual session, where
+    /// only manual orders trade; it takes no parameters.
     pub strategy: String,
     pub params: Params,
     pub instrument: InstrumentId,
@@ -96,10 +100,10 @@ pub struct SessionState {
     pub position: PositionInfo,
     /// Equity at each live bar's close.
     pub equity_curve: Vec<EquityPoint>,
-    pub open_orders: Vec<Order>,
-    pub fills: Vec<Fill>,
+    pub open_orders: Vec<PaperOrder>,
+    pub fills: Vec<PaperFill>,
     /// Round trips so far; one still open is marked at the last close.
-    pub trades: Vec<Trade>,
+    pub trades: Vec<PaperTrade>,
     /// Funding rates charged.
     pub funding: Vec<Funding>,
     /// Open time of the first live bar, after warm-up.
@@ -115,10 +119,6 @@ impl SessionState {
     /// The state of a paper session, as the API shows it.
     pub fn of(paper: &PaperSession) -> SessionState {
         let portfolio = paper.portfolio();
-        let session = paper.session();
-        // Trades are built over the live bars, one per bar funding entry, after the warm-up bars.
-        let bars = session.bars();
-        let live = &bars[bars.len().saturating_sub(session.bar_funding().len())..];
         SessionState {
             id: paper.id().to_string(),
             config: paper.config().clone(),
@@ -135,9 +135,9 @@ impl SessionState {
                 funding_paid: portfolio.funding_paid(),
             },
             equity_curve: paper.equity().to_vec(),
-            open_orders: paper.open_orders().to_vec(),
-            fills: paper.fills().to_vec(),
-            trades: build_trades(paper.fills(), live, session.bar_funding()),
+            open_orders: paper.open_orders_with_source(),
+            fills: paper.fills_with_source(),
+            trades: paper.trades(),
             funding: paper.funding().to_vec(),
             live_from: paper.live_from(),
             last_bar: paper.last_bar().copied(),
@@ -208,6 +208,14 @@ struct Ops {
 
 fn session_not_found(id: &str) -> ApiError {
     ApiError::not_found(format!("no paper session {id:?}"))
+}
+
+fn not_running(id: &str) -> ApiError {
+    ApiError::new(
+        StatusCode::CONFLICT,
+        "not_running",
+        format!("paper session {id:?} is not running"),
+    )
 }
 
 impl Sessions {
@@ -329,13 +337,7 @@ impl Sessions {
         let run = {
             let mut entries = self.entries();
             let entry = entries.get_mut(id).ok_or_else(|| session_not_found(id))?;
-            entry.run.take().ok_or_else(|| {
-                ApiError::new(
-                    StatusCode::CONFLICT,
-                    "not_running",
-                    format!("paper session {id:?} is not running"),
-                )
-            })?
+            entry.run.take().ok_or_else(|| not_running(id))?
         };
         let _ = run.stop.send(());
         let _ = run.supervisor.await;
@@ -377,6 +379,42 @@ impl Sessions {
         }
         drop(ops);
         self.summary_of(id)
+    }
+
+    /// Places a manual order on a running session, or cancels one, with `act`. The session's log
+    /// is written under the lock of the list, so a resume cannot reopen the session between the
+    /// check that it runs and the write. When the log cannot be written, the session is stopped.
+    fn manual(
+        &self,
+        id: &str,
+        act: impl FnOnce(&mut PaperSession) -> Result<PaperOrder, ManualError>,
+    ) -> Result<PaperOrder, ApiError> {
+        let mut entries = self.entries();
+        let entry = entries.get_mut(id).ok_or_else(|| session_not_found(id))?;
+        if !entry.run.as_ref().is_some_and(|run| !run.is_over()) {
+            return Err(not_running(id));
+        }
+        let done = act(&mut lock(&entry.session));
+        if let Err(ManualError::Paper(e)) = &done {
+            let mut paper = lock(&entry.session);
+            paper.warn(format!("stopped: {e}"));
+            drop(paper);
+            // Its supervisor stops it and lets the run go; it is not waited for here.
+            if let Some(run) = entry.run.take() {
+                let _ = run.stop.send(());
+            }
+        }
+        done.map_err(ApiError::from)
+    }
+
+    /// Places a manual order on a running session.
+    pub(crate) fn place(&self, id: &str, order: &ManualOrder) -> Result<PaperOrder, ApiError> {
+        self.manual(id, |paper| paper.place(order))
+    }
+
+    /// Cancels a manual order on a running session.
+    pub(crate) fn cancel(&self, id: &str, order: OrderId) -> Result<PaperOrder, ApiError> {
+        self.manual(id, |paper| paper.cancel(order))
     }
 
     /// Stops every running session, for shutdown; none starts after this.
@@ -477,7 +515,25 @@ impl From<PaperError> for ApiError {
             PaperError::Io { .. }
             | PaperError::BadFile { .. }
             | PaperError::FeedEnded
-            | PaperError::Task(_) => ApiError::internal(message),
+            | PaperError::Task(_)
+            | PaperError::LogFailed(_) => ApiError::internal(message),
+        }
+    }
+}
+
+impl From<ManualError> for ApiError {
+    fn from(e: ManualError) -> Self {
+        let message = e.to_string();
+        match e {
+            ManualError::NotLive => ApiError::new(StatusCode::CONFLICT, "not_live", message),
+            ManualError::Rejected(_) => {
+                ApiError::new(StatusCode::BAD_REQUEST, "invalid_order", message)
+            }
+            ManualError::NoSuchOrder(_) => ApiError::not_found(message),
+            ManualError::NotManual(_) => ApiError::new(StatusCode::CONFLICT, "not_manual", message),
+            ManualError::Done { .. } => ApiError::new(StatusCode::CONFLICT, "order_done", message),
+            // Only a log that could not be written.
+            ManualError::Paper(e) => ApiError::internal(e.to_string()),
         }
     }
 }
@@ -545,6 +601,27 @@ pub(super) async fn resume(
     UrlPath(id): UrlPath<String>,
 ) -> Result<Json<SessionSummary>, ApiError> {
     Ok(Json(state.sessions.resume(&id).await?))
+}
+
+/// `POST /sessions/{id}/orders`: 201 with the order, open and marked manual.
+pub(super) async fn place_order(
+    State(state): State<Arc<AppState>>,
+    UrlPath(id): UrlPath<String>,
+    body: Result<Json<ManualOrder>, JsonRejection>,
+) -> Result<(StatusCode, Json<PaperOrder>), ApiError> {
+    let Json(order) = body?;
+    let placed = state.sessions.place(&id, &order)?;
+    Ok((StatusCode::CREATED, Json(placed)))
+}
+
+/// `POST /sessions/{id}/orders/{order_id}/cancel`: 200 with the cancelled order.
+pub(super) async fn cancel_order(
+    State(state): State<Arc<AppState>>,
+    path: Result<UrlPath<(String, u64)>, PathRejection>,
+) -> Result<Json<PaperOrder>, ApiError> {
+    let UrlPath((id, order)) =
+        path.map_err(|_| ApiError::not_found("order ids are whole numbers"))?;
+    Ok(Json(state.sessions.cancel(&id, OrderId(order))?))
 }
 
 #[cfg(test)]
