@@ -33,6 +33,8 @@ pub struct Session {
     strategy: Box<dyn Strategy>,
     instrument: Instrument,
     timeframe: Timeframe,
+    fees: FeeSchedule,
+    slippage_bps: f64,
     broker: Box<dyn Broker>,
     portfolio: Portfolio,
     bars: Vec<Candle>,
@@ -72,6 +74,8 @@ impl Session {
             portfolio: Portfolio::new(instrument.id.kind, config.starting_cash),
             instrument,
             timeframe,
+            fees,
+            slippage_bps: config.slippage_bps,
             broker: Box::new(broker),
             bars: Vec::new(),
             orders: Vec::new(),
@@ -83,12 +87,83 @@ impl Session {
     /// Feeds the next closed bar, with the funding events (`(time, rate)`) that fall inside it.
     ///
     /// The bar must be valid, on a timeframe boundary and later than the previous bar; gaps are
-    /// allowed. On an error nothing changes. Then, in order: open orders are checked against this
-    /// bar, funding is charged, equity is marked at the close, and the strategy is called.
+    /// allowed. On an error nothing changes. Then, in order: funding due at the bar's open is
+    /// charged on the position held going into the bar, at the open price; open orders are checked
+    /// against this bar; funding due later in the bar is charged on the position after this bar's
+    /// fills, at the close; equity is marked at the close; and the strategy is called.
     ///
-    /// Funding is charged on the position after this bar's fills, at this bar's close price:
-    /// the candle data has no price at the funding moment itself.
+    /// Venues usually charge funding at 00:00, 08:00 and 16:00 UTC, which are bar open times on
+    /// every timeframe shorter than a day.
     pub fn on_bar(&mut self, bar: Candle, funding: &[(Millis, f64)]) -> Result<(), EngineError> {
+        self.check_bar(&bar, funding)?;
+
+        // Funding due at the open is owed by the position held going into the bar, before this
+        // bar's fills.
+        for &(time, rate) in funding {
+            if time == bar.open_time {
+                self.portfolio.charge_funding(rate, bar.open);
+            }
+        }
+        let first_new_fill = self.fills.len();
+        for event in self.broker.on_bar(&bar, self.portfolio.position()) {
+            match event {
+                BrokerEvent::Filled(fill) => {
+                    self.order_mut(fill.order_id).status = OrderStatus::Filled;
+                    self.portfolio
+                        .apply_fill(fill.side, fill.qty, fill.price, fill.fee);
+                    self.fills.push(fill);
+                }
+                BrokerEvent::Cancelled { id, reason } => {
+                    self.order_mut(id).status = OrderStatus::Cancelled(reason);
+                }
+                BrokerEvent::Placed(order) => {
+                    let id = order.id;
+                    *self.order_mut(id) = order;
+                }
+            }
+        }
+        // shortcut: funding due later in the bar is charged on the position after all of this
+        // bar's fills, at the close, since the candle model does not know when a fill happened
+        // inside the bar or what the price was at the funding time. Upgrade with a trade-level
+        // fill model that times each fill.
+        for &(time, rate) in funding {
+            if time > bar.open_time {
+                self.portfolio.charge_funding(rate, bar.close);
+            }
+        }
+        self.portfolio.mark(bar.close);
+        self.equity.push(EquityPoint {
+            time: bar.open_time,
+            equity: self.portfolio.equity(),
+        });
+        self.bars.push(bar);
+        self.call_strategy(&bar, first_new_fill, false);
+        Ok(())
+    }
+
+    /// Feeds a closed bar that only adds to the strategy's history, before the first live bar.
+    /// Walk-forward tests and paper trading use it to give a strategy the history its indicators
+    /// need before it trades.
+    ///
+    /// The bar and its funding events are checked as in [`Session::on_bar`], the bar joins the
+    /// history, and the strategy is called on it the same way, with `on_start` on the first bar fed
+    /// whether that is a warm-up bar or a live one. But trading is disabled: every order the
+    /// strategy submits is rejected (see [`Context::is_warming_up`]), nothing fills, no funding is
+    /// charged, no equity point is recorded and the portfolio does not change. It is an error once
+    /// a bar has been fed with `on_bar`.
+    pub fn warm_up(&mut self, bar: Candle, funding: &[(Millis, f64)]) -> Result<(), EngineError> {
+        // Every live bar records an equity point.
+        if !self.equity.is_empty() {
+            return Err(EngineError::WarmUpAfterLive);
+        }
+        self.check_bar(&bar, funding)?;
+        self.bars.push(bar);
+        self.call_strategy(&bar, self.fills.len(), true);
+        Ok(())
+    }
+
+    /// Checks that `bar` can be fed next, with `funding` inside it.
+    fn check_bar(&self, bar: &Candle, funding: &[(Millis, f64)]) -> Result<(), EngineError> {
         bar.validate()?;
         if self.timeframe.floor(bar.open_time) != bar.open_time {
             return Err(EngineError::MisalignedBar {
@@ -124,38 +199,22 @@ impl Session {
                 return Err(EngineError::InvalidFundingRate { time, rate });
             }
         }
+        Ok(())
+    }
 
-        let first_new_fill = self.fills.len();
-        for event in self.broker.on_bar(&bar, self.portfolio.position()) {
-            match event {
-                BrokerEvent::Filled(fill) => {
-                    self.order_mut(fill.order_id).status = OrderStatus::Filled;
-                    self.portfolio
-                        .apply_fill(fill.side, fill.qty, fill.price, fill.fee);
-                    self.fills.push(fill);
-                }
-                BrokerEvent::Cancelled { id, reason } => {
-                    self.order_mut(id).status = OrderStatus::Cancelled(reason);
-                }
-            }
-        }
-        for &(_, rate) in funding {
-            self.portfolio.charge_funding(rate, bar.close);
-        }
-        self.portfolio.mark(bar.close);
-        self.equity.push(EquityPoint {
-            time: bar.open_time,
-            equity: self.portfolio.equity(),
-        });
-        self.bars.push(bar);
-
+    /// Calls the strategy on `bar`, which has just been pushed: `on_start` on the first bar fed,
+    /// `on_fill` for each fill from `first_new_fill` on, then `on_bar`.
+    fn call_strategy(&mut self, bar: &Candle, first_new_fill: usize, warming_up: bool) {
         let mut ctx = Context {
             bars: &self.bars,
             instrument: &self.instrument,
             timeframe: self.timeframe,
+            fees: self.fees,
+            slippage_bps: self.slippage_bps,
             portfolio: &self.portfolio,
             broker: &mut *self.broker,
             orders: &mut self.orders,
+            warming_up,
         };
         if ctx.bars.len() == 1 {
             self.strategy.on_start(&mut ctx);
@@ -163,8 +222,7 @@ impl Session {
         for fill in &self.fills[first_new_fill..] {
             self.strategy.on_fill(&mut ctx, fill);
         }
-        self.strategy.on_bar(&mut ctx, &bar);
-        Ok(())
+        self.strategy.on_bar(&mut ctx, bar);
     }
 
     fn order_mut(&mut self, id: td_core::OrderId) -> &mut Order {
@@ -184,7 +242,8 @@ impl Session {
         &self.bars
     }
 
-    /// Equity at each bar's close, one point per bar fed.
+    /// Equity at each live bar's close, one point per bar fed with [`Session::on_bar`]. Warm-up
+    /// bars record none, so the series starts at the first live bar.
     pub fn equity(&self) -> &[EquityPoint] {
         &self.equity
     }

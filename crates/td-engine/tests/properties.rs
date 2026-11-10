@@ -1,16 +1,19 @@
 //! Property tests over random bars, random orders and random funding.
 //!
 //! - Equity recorded at each close equals cash plus the position marked at that close, where cash
-//!   and position are rebuilt independently from the fills and funding.
+//!   and position are rebuilt independently from the fills and funding. Funding due at a bar's
+//!   open is owed by the position before that bar's fills, at the open; funding due later in the
+//!   bar by the position after them, at the close.
 //! - No order fills on the bar it was submitted on, and every fill lands on a bar's open time.
 //! - Spot positions never go below zero.
+//! - An attached stop waits exactly while its entry is open, and fills only once its entry has.
 
 mod common;
 
 use common::*;
 use proptest::prelude::*;
 use td_core::{Candle, InstrumentKind, OrderType, Side, Timeframe};
-use td_engine::{Context, Session, Strategy as EngineStrategy};
+use td_engine::{Context, OrderStatus, Session, Strategy as EngineStrategy};
 
 #[derive(Debug, Clone)]
 struct Action {
@@ -21,6 +24,8 @@ struct Action {
     limit_offset: f64,
     ioc: bool,
     reduce_only: bool,
+    /// Distance of an attached stop from the entry's price, if the entry has one.
+    stop: Option<f64>,
 }
 
 struct Random {
@@ -48,7 +53,18 @@ impl EngineStrategy for Random {
                 r = ioc(r);
             }
             // Rejections are part of the test: they must leave the books consistent.
-            let _ = ctx.submit(r);
+            let _ = match a.stop {
+                Some(distance) => {
+                    let entry = match order_type {
+                        OrderType::Market => bar.close,
+                        OrderType::Limit { price } | OrderType::StopLimit { price, .. } => price,
+                        OrderType::Stop { trigger } => trigger,
+                    };
+                    let stop = entry - side.sign() * distance;
+                    ctx.submit_with_stop(r, stop).map(|(entry, _)| entry)
+                }
+                None => ctx.submit(r),
+            };
         }
         // Now and then cancel the oldest open order.
         if index % 7 == 3
@@ -68,9 +84,10 @@ fn action() -> impl Strategy<Value = Action> {
         -1.0..1.0f64,
         prop::bool::weighted(0.2),
         prop::bool::weighted(0.2),
+        prop::option::weighted(0.3, 0.0..3.0f64),
     )
         .prop_map(
-            |(buy, milli, kind, offset, limit_offset, ioc, reduce_only)| Action {
+            |(buy, milli, kind, offset, limit_offset, ioc, reduce_only, stop)| Action {
                 buy,
                 qty: milli as f64 / 1000.0,
                 kind,
@@ -78,20 +95,23 @@ fn action() -> impl Strategy<Value = Action> {
                 limit_offset,
                 ioc,
                 reduce_only,
+                stop,
             },
         )
 }
 
-/// Per bar: gap, body and wicks in percent, a funding rate, and up to two orders.
-type BarSpec = (f64, f64, f64, f64, Option<f64>, Vec<Action>);
+/// Per bar: gap, body and wicks in percent, funding rates due at the open and later in the bar,
+/// and up to two orders.
+type BarSpec = (f64, f64, f64, f64, (Option<f64>, Option<f64>), Vec<Action>);
 
 fn bar_spec() -> impl Strategy<Value = BarSpec> {
+    let rate = || prop::option::of(-0.001..0.001f64);
     (
         -1.0..1.0f64,
         -3.0..3.0f64,
         0.0..2.0f64,
         0.0..2.0f64,
-        prop::option::of(-0.001..0.001f64),
+        (rate(), rate()),
         prop::collection::vec(action(), 0..3),
     )
 }
@@ -129,9 +149,12 @@ fn check(kind: InstrumentKind, slippage: f64, specs: Vec<BarSpec>) -> Result<(),
     .unwrap();
     let mut funding = Vec::new();
     for (b, spec) in bars.iter().zip(&specs) {
-        let events: Vec<(i64, f64)> = match (kind, spec.4) {
-            (InstrumentKind::Perpetual, Some(rate)) => vec![(b.open_time + 30_000, rate)],
-            _ => vec![],
+        let (at_open, later) = spec.4;
+        let events: Vec<(i64, f64)> = match kind {
+            InstrumentKind::Perpetual => (at_open.map(|rate| (b.open_time, rate)).into_iter())
+                .chain(later.map(|rate| (b.open_time + 30_000, rate)))
+                .collect(),
+            InstrumentKind::Spot => vec![],
         };
         session.on_bar(*b, &events).unwrap();
         funding.push(events);
@@ -142,13 +165,20 @@ fn check(kind: InstrumentKind, slippage: f64, specs: Vec<BarSpec>) -> Result<(),
     let mut position = 0.0;
     let fills = session.fills();
     for (t, b) in bars.iter().enumerate() {
+        for &(time, rate) in &funding[t] {
+            if time == b.open_time {
+                cash -= position * b.open * rate;
+            }
+        }
         for f in fills.iter().filter(|f| f.time == b.open_time) {
             let dq = f.side.sign() * f.qty;
             cash -= dq * f.price + f.fee;
             position += dq;
         }
-        for &(_, rate) in &funding[t] {
-            cash -= position * b.close * rate;
+        for &(time, rate) in &funding[t] {
+            if time > b.open_time {
+                cash -= position * b.close * rate;
+            }
         }
         let expected = cash + position * b.close;
         let recorded = session.equity()[t].equity;
@@ -172,6 +202,32 @@ fn check(kind: InstrumentKind, slippage: f64, specs: Vec<BarSpec>) -> Result<(),
             f.time
         );
         prop_assert!(bars.iter().any(|b| b.open_time == f.time));
+    }
+
+    let orders = session.orders();
+    for entry in orders {
+        let Some(stop) = entry.attached_stop else {
+            continue;
+        };
+        let child = &orders[stop.id.0 as usize - 1];
+        prop_assert_eq!(
+            entry.status == OrderStatus::Open,
+            child.status == OrderStatus::Attached,
+            "entry {} is {:?} and its stop {:?}",
+            entry.id.0,
+            &entry.status,
+            &child.status
+        );
+        prop_assert!(child.request.reduce_only && child.request.side != entry.request.side);
+        let entry_fill = fills.iter().find(|f| f.order_id == entry.id);
+        for f in fills.iter().filter(|f| f.order_id == stop.id) {
+            prop_assert!(
+                entry_fill.is_some_and(|e| e.time <= f.time),
+                "stop {} filled at {} before its entry",
+                stop.id.0,
+                f.time
+            );
+        }
     }
     Ok(())
 }

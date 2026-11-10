@@ -12,8 +12,10 @@ use td_core::{InstrumentKind, Side};
 /// shortcut: perpetual positions are only marked to market and charged funding; there is no
 /// margin, leverage limit or liquidation. Upgrade when strategies trade with real leverage.
 ///
-/// shortcut: there is no buying-power check, so spot cash can go negative if a strategy buys more
-/// than it can pay for. Upgrade by rejecting such fills in the broker once a strategy needs it.
+/// shortcut: spot buys are checked against the cash when they are submitted, a market buy at the
+/// decision bar's close and a stop at its trigger, so a fill above that price (a gap up at the
+/// next open, or slippage) can still overdraw the cash slightly. Upgrade by checking again in the
+/// broker at fill time if a strategy depends on never overdrawing.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Portfolio {
     kind: InstrumentKind,
@@ -73,7 +75,8 @@ impl Portfolio {
         self.funding_paid
     }
 
-    /// The price the position was last marked at: the close of the latest bar.
+    /// The price the position was last marked at: the close of the latest live bar. Warm-up bars
+    /// do not mark it.
     pub fn mark_price(&self) -> f64 {
         self.mark_price
     }

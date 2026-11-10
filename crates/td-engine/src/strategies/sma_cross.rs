@@ -1,12 +1,15 @@
 use td_core::{Candle, InstrumentKind, OrderType, Side};
 
-use super::{direction, order};
+use super::{affordable_qty, direction, order};
 use crate::{
     Context, EngineError, ParamKind, ParamSpec, ParamValue, Params, Strategy, StrategyEntry,
 };
 
 /// Long while the fast simple moving average of closes is above the slow one, flat otherwise.
 /// With `allow_short` on a perpetual, short while the fast average is below the slow one.
+///
+/// The position is `equity_fraction` of equity, capped so that its value plus the taker fee,
+/// slippage and a small margin fits in the equity, so a spot buy passes the cash check.
 #[derive(Debug, Clone)]
 pub struct SmaCross {
     pub fast: usize,
@@ -52,8 +55,8 @@ pub(crate) fn entry() -> StrategyEntry {
                 default: ParamValue::Float(0.95),
                 min: Some(0.0),
                 max: Some(1.0),
-                description: "Position size as a fraction of equity. Below 1 leaves room for \
-                              fees and slippage.",
+                description: "Position size as a fraction of equity. Sizes near 1 are capped so \
+                              that fees, slippage and a small margin still fit in the equity.",
             },
         ],
         build,
@@ -83,8 +86,9 @@ fn sma(bars: &[Candle], n: usize) -> f64 {
 impl Strategy for SmaCross {
     fn on_bar(&mut self, ctx: &mut Context, bar: &Candle) {
         let bars = ctx.bars();
-        // Wait for the previous order to fill before deciding again.
-        if bars.len() < self.slow || !ctx.open_orders().is_empty() {
+        // Wait for the previous order to fill before deciding again, and send nothing while
+        // warming up: it would only be rejected.
+        if ctx.is_warming_up() || bars.len() < self.slow || !ctx.open_orders().is_empty() {
             return;
         }
         let (fast, slow) = (sma(bars, self.fast), sma(bars, self.slow));
@@ -100,7 +104,11 @@ impl Strategy for SmaCross {
         if direction(position) == want {
             return;
         }
-        let target = want * ctx.equity() * self.equity_fraction / bar.close;
+        // On spot a buy only happens from flat, where the equity is all cash.
+        let equity = ctx.equity();
+        let size =
+            (equity * self.equity_fraction / bar.close).min(affordable_qty(ctx, equity, bar.close));
+        let target = want * size;
         let delta = target - position;
         let side = if delta > 0.0 { Side::Buy } else { Side::Sell };
         let req = order(ctx, side, delta.abs(), OrderType::Market, false);
