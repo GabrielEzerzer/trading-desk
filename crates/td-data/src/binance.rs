@@ -2,8 +2,8 @@
 // published .CHECKSUM, and reading an archive's one member) and engine/src/venue/binance/archive.rs
 // at 7dc6d12 (archive URLs and CSV rows).
 
-//! Binance history: 1-minute klines from the public archive at data.binance.vision, and funding
-//! rates from the USD-M REST API.
+//! Binance history: 1-minute klines from the public archive at data.binance.vision, recent klines
+//! from the spot and USD-M REST APIs, and funding rates from the USD-M REST API.
 //!
 //! Archive files are `<SYMBOL>-1m-<YYYY-MM>.zip` (monthly) and `<SYMBOL>-1m-<YYYY-MM-DD>.zip`
 //! (daily), each holding one CSV of the same name and published with a `.CHECKSUM` beside it
@@ -18,13 +18,19 @@ use std::time::Duration;
 
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use td_core::{Candle, InstrumentId, InstrumentKind, Millis};
+use td_core::{Candle, InstrumentId, InstrumentKind, Millis, Timeframe};
 
 use crate::DataError;
 use crate::http::Http;
-use crate::time::{MINUTE, Month, format_date};
+use crate::time::{MINUTE, Month, format_date, now_ms};
 
 const ARCHIVE: &str = "https://data.binance.vision/data";
+const SPOT_KLINES_URL: &str = "https://api.binance.com/api/v3/klines";
+const USDM_KLINES_URL: &str = "https://fapi.binance.com/fapi/v1/klines";
+/// The most rows a kline request returns on spot (USD-M allows 1500; one limit keeps it simple).
+const KLINE_LIMIT: usize = 1000;
+/// A pause between kline pages, well inside both APIs' request-weight limits.
+const KLINE_DELAY: Duration = Duration::from_millis(200);
 const FUNDING_URL: &str = "https://fapi.binance.com/fapi/v1/fundingRate";
 /// The most rows `/fapi/v1/fundingRate` returns at once.
 const FUNDING_LIMIT: usize = 1000;
@@ -201,6 +207,76 @@ pub fn normalise_time(t: i64) -> Millis {
     if t >= MICROS_FROM { t / 1000 } else { t }
 }
 
+/// Parses a `/api/v3/klines` or `/fapi/v1/klines` response into candles, oldest first. A row is
+/// `[openTime, open, high, low, close, volume, closeTime, quoteVolume, ...]` with the prices and
+/// volumes as strings.
+pub fn parse_klines(body: &str) -> Result<Vec<Candle>, DataError> {
+    let what = "Binance klines";
+    let rows: Vec<Vec<serde_json::Value>> =
+        serde_json::from_str(body).map_err(|e| DataError::parse(what, e))?;
+    rows.iter()
+        .map(|row| {
+            let field = |i: usize| {
+                row.get(i).ok_or_else(|| {
+                    DataError::parse(what, format!("a row has {} fields, not 12", row.len()))
+                })
+            };
+            let float = |i: usize| -> Result<f64, DataError> {
+                let value = field(i)?;
+                value
+                    .as_str()
+                    .and_then(|text| text.parse().ok())
+                    .ok_or_else(|| DataError::parse(what, format!("{value} is not a number")))
+            };
+            let time = field(0)?;
+            let open_time = time
+                .as_i64()
+                .ok_or_else(|| DataError::parse(what, format!("{time} is not a time")))?;
+            Ok(Candle {
+                open_time,
+                open: float(1)?,
+                high: float(2)?,
+                low: float(3)?,
+                close: float(4)?,
+                volume: float(5)?,
+                quote_volume: float(7)?,
+            })
+        })
+        .collect()
+}
+
+/// Downloads the klines of `timeframe` for a spot or USD-M instrument with open times in
+/// `[from, to)` from the REST API, oldest first. A bar still in progress is left out.
+pub fn fetch_klines(
+    http: &Http,
+    id: &InstrumentId,
+    timeframe: Timeframe,
+    from: Millis,
+    to: Millis,
+) -> Result<Vec<Candle>, DataError> {
+    let url = match id.kind {
+        InstrumentKind::Spot => SPOT_KLINES_URL,
+        InstrumentKind::Perpetual => USDM_KLINES_URL,
+    };
+    let to = to.min(timeframe.floor(now_ms()));
+    let open_time = |c: &Candle| c.open_time;
+    let mut candles = page_forwards(from, to, KLINE_LIMIT, open_time, |start| {
+        if start > from {
+            std::thread::sleep(KLINE_DELAY);
+        }
+        let query = [
+            ("symbol", id.symbol.clone()),
+            ("interval", timeframe.as_str().to_string()),
+            ("startTime", start.to_string()),
+            ("endTime", (to - 1).to_string()),
+            ("limit", KLINE_LIMIT.to_string()),
+        ];
+        parse_klines(&http.get_text(url, &query)?)
+    })?;
+    candles.retain(|c| (from..to).contains(&c.open_time));
+    Ok(candles)
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct FundingRow {
@@ -232,50 +308,59 @@ pub fn fetch_funding(
     from: Millis,
     to: Millis,
 ) -> Result<Vec<(Millis, f64)>, DataError> {
-    page_forwards(from, to, FUNDING_LIMIT, |start| {
-        // A pause between pages, not before the first.
-        if start > from {
-            std::thread::sleep(FUNDING_DELAY);
-        }
-        let query = [
-            ("symbol", symbol.to_string()),
-            ("startTime", start.to_string()),
-            ("endTime", (to - 1).to_string()),
-            ("limit", FUNDING_LIMIT.to_string()),
-        ];
-        parse_funding(&http.get_text(FUNDING_URL, &query)?)
-    })
+    page_forwards(
+        from,
+        to,
+        FUNDING_LIMIT,
+        |&(t, _)| t,
+        |start| {
+            // A pause between pages, not before the first.
+            if start > from {
+                std::thread::sleep(FUNDING_DELAY);
+            }
+            let query = [
+                ("symbol", symbol.to_string()),
+                ("startTime", start.to_string()),
+                ("endTime", (to - 1).to_string()),
+                ("limit", FUNDING_LIMIT.to_string()),
+            ];
+            parse_funding(&http.get_text(FUNDING_URL, &query)?)
+        },
+    )
 }
 
 /// Reads an oldest-first endpoint forwards over `[from, to)`. `fetch(start)` returns a page of up
-/// to `limit` rates, the oldest at or after `start`; after a full page the next one starts just
-/// after its last rate, and a short page is the last.
-fn page_forwards(
+/// to `limit` rows, the oldest at or after `start`; after a full page the next one starts just
+/// after its last row, and a short page is the last.
+fn page_forwards<T>(
     from: Millis,
     to: Millis,
     limit: usize,
-    mut fetch: impl FnMut(Millis) -> Result<Vec<(Millis, f64)>, DataError>,
-) -> Result<Vec<(Millis, f64)>, DataError> {
-    let mut rates = Vec::new();
+    time: impl Fn(&T) -> Millis,
+    mut fetch: impl FnMut(Millis) -> Result<Vec<T>, DataError>,
+) -> Result<Vec<T>, DataError> {
+    let mut rows = Vec::new();
     let mut start = from;
     while start < to {
         let page = fetch(start)?;
         let full = page.len() == limit;
-        let Some(&(last, _)) = page.last() else { break };
-        rates.extend(page);
+        let Some(last) = page.last().map(&time) else {
+            break;
+        };
+        rows.extend(page);
         if !full {
             break;
         }
         // A full page whose last row is before the start asked for would page forever.
         if last < start {
             return Err(DataError::Parse {
-                what: "a page of funding rates".into(),
+                what: "a page of rows".into(),
                 reason: format!("a full page starting at {start} ended at {last}"),
             });
         }
         start = last + 1;
     }
-    Ok(rates)
+    Ok(rows)
 }
 
 #[cfg(test)]
@@ -284,7 +369,8 @@ mod tests {
 
     #[test]
     fn a_full_page_that_does_not_move_forward_is_an_error() {
-        let result = page_forwards(100, 200, 2, |_| Ok(vec![(10, 0.0), (20, 0.0)]));
+        let time = |&(t, _): &(Millis, f64)| t;
+        let result = page_forwards(100, 200, 2, time, |_| Ok(vec![(10, 0.0), (20, 0.0)]));
         assert!(matches!(result, Err(DataError::Parse { .. })));
     }
 
@@ -298,14 +384,20 @@ mod tests {
         limit: usize,
     ) -> (Vec<Millis>, Vec<Millis>) {
         let mut starts = Vec::new();
-        let rates = page_forwards(from, to, limit, |start| {
-            starts.push(start);
-            let page = times.iter().map(|&t| (t, 0.0001));
-            Ok(page
-                .filter(|(t, _)| (start..to).contains(t))
-                .take(limit)
-                .collect())
-        })
+        let rates = page_forwards(
+            from,
+            to,
+            limit,
+            |&(t, _)| t,
+            |start| {
+                starts.push(start);
+                let page = times.iter().map(|&t| (t, 0.0001));
+                Ok(page
+                    .filter(|(t, _)| (start..to).contains(t))
+                    .take(limit)
+                    .collect())
+            },
+        )
         .expect("pages");
         (rates.into_iter().map(|(t, _)| t).collect(), starts)
     }
