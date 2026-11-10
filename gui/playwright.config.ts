@@ -12,8 +12,8 @@ export default defineConfig({
   timeout: 30_000,
   reporter: process.env.CI ? [['list'], ['github']] : 'list',
   outputDir: 'e2e/.results',
-  // Baselines are made on CI's Linux runner (README, "UI gates"). A missing one is written and the
-  // test fails, so CI's first run on a new state produces the file to commit.
+  // Baselines are made on CI's Linux runner (README, "UI gates"). A missing one is written (and the
+  // test passes), so the gui workflow fails any run that leaves an uncommitted baseline behind.
   updateSnapshots: 'missing',
   snapshotPathTemplate: '{testDir}/__screenshots__/{arg}{ext}',
   expect: {

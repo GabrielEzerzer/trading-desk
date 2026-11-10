@@ -4,8 +4,9 @@
 # It runs the TypeScript suite: typecheck, the vitest tests and the electron-vite build, then the
 # Playwright UI gates against the built renderer in headless Chromium (never Electron). The test that
 # starts the real td-server binary skips itself here, since this workflow builds no Rust; ci.yml covers Rust.
-# The screenshot baselines in gui/e2e/__screenshots__ are made here, on Linux: a missing one is written
-# and fails the run, and the failure artifact carries it to commit (gui/README.md, "UI gates").
+# The screenshot baselines in gui/e2e/__screenshots__ are made here, on Linux: a missing one is written,
+# the check after the gates fails the run, and the failure artifact carries it to commit
+# (gui/README.md, "UI gates").
 # Never give this workflow production URLs, real secrets, .env.local or a service_role key.
 name: gui
 
@@ -55,6 +56,15 @@ jobs:
         run: pnpm exec playwright install --with-deps --only-shell chromium
       - name: UI gates
         run: pnpm gates
+      # Playwright writes a missing baseline and passes, so a run that wrote one compared nothing.
+      - name: Check every screenshot baseline is committed
+        run: |
+          written=$(git status --porcelain -- e2e/__screenshots__)
+          if [ -n "$written" ]; then
+            echo "::error::Screenshot baselines are missing from the commit. The ui-gates artifact holds them; look at them and commit them."
+            echo "$written"
+            exit 1
+          fi
       - name: Upload UI gate results
         if: failure()
         uses: actions/upload-artifact@v4
