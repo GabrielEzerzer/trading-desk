@@ -11,6 +11,17 @@
 //!   server on the same data folder is safe, since the store locks across processes, just
 //!   redundant).
 //! - `GET /data/coverage?instrument=venue:symbol:kind`: which months and minutes the store holds.
+//! - `GET /candles?instrument=venue:symbol:kind&timeframe=&from=&to=&limit=`: closed bars of the
+//!   timeframe with open times in `[from, to)`, oldest first, for a chart (see [`candles`]). Bars
+//!   come from the store, resampled from its minutes; the slots it does not cover are fetched from
+//!   the venue's REST API, as a paper session's warm-up does, and are not stored, so an instrument
+//!   with no stored data works too. A bar still open is never returned. `to` defaults to now and
+//!   `from` to 2017-01-01. `limit` defaults to and is capped at [`candles::MAX_CANDLES`]; a range
+//!   holding more bar slots than `limit` is cut to the latest `limit` slots ending at `to`, so the
+//!   chart gets the latest history (`truncated` says so when `from` was given). The response
+//!   names the spans served by the venue (`from_venue`) and the slots neither had (`missing`). A
+//!   malformed instrument, an unknown venue, kind or timeframe, a `limit` of 0 or `from >= to` is
+//!   a 400 `bad_request`; the venue failing while filling in is a 502 `venue` with its message.
 //! - `GET /strategies`: the registered strategies and their parameter specs.
 //! - `GET /jobs`, `GET /jobs/{id}`, `POST /jobs/{id}/cancel`: background jobs (see [`jobs`]).
 //! - `POST /runs/backtest` (a `BacktestConfig`), `POST /runs/sweep` (a `SweepSpec`),
@@ -53,6 +64,7 @@
 //! ([`Handshake`]), and logs only to stderr.
 
 pub mod auth;
+pub mod candles;
 pub mod data;
 pub mod error;
 pub mod jobs;
@@ -239,6 +251,7 @@ pub(crate) fn router(state: Arc<AppState>) -> Router {
         .route("/instruments", get(data::instruments))
         .route("/data/download", post(data::download))
         .route("/data/coverage", get(data::coverage))
+        .route("/candles", get(candles::candles))
         .route("/strategies", get(strategies))
         .route("/jobs", get(list_jobs))
         .route("/jobs/{id}", get(get_job))
