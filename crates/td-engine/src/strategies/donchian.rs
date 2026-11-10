@@ -144,9 +144,8 @@ impl Strategy for DonchianBreakout {
             let affordable = affordable_qty(ctx, ctx.cash(), bar.close);
             let qty = (self.risk * ctx.equity() / distance).min(affordable);
             let entry = order(ctx, side, qty, OrderType::Market, false);
-            if let Ok(id) = ctx.submit_with_stop(entry, trigger) {
-                // The attached stop is recorded under the entry's id plus one.
-                self.stop = Some(OrderId(id.0 + 1));
+            if let Ok((_, stop)) = ctx.submit_with_stop(entry, trigger) {
+                self.stop = Some(stop);
             }
         } else {
             let channel = &previous[previous.len() - self.exit..];

@@ -786,7 +786,11 @@ fn an_attached_stop_covers_the_bar_its_entry_fills_on() {
     let entry = req(&i, Side::Buy, 1.0, OrderType::Market);
     let strategy = steps(move |ctx, n| {
         if n == 0 {
-            assert_eq!(ctx.submit_with_stop(entry.clone(), 106.0), Ok(OrderId(1)));
+            // The entry's id and its stop's.
+            assert_eq!(
+                ctx.submit_with_stop(entry.clone(), 106.0),
+                Ok((OrderId(1), OrderId(2)))
+            );
         }
     });
     let s = run(i, 0.0, &bars, strategy);

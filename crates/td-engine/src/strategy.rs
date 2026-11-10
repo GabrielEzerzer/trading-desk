@@ -88,7 +88,7 @@ impl Context<'_> {
     /// trigger, or this bar's close for a market order, plus the taker fee. A rejected order is
     /// recorded with its reason and returned as an error.
     pub fn submit(&mut self, request: OrderRequest) -> Result<OrderId, OrderRejected> {
-        self.send(request, None)
+        self.send(request, None).map(|(id, _)| id)
     }
 
     /// Submits an entry with a protective stop attached. When the entry fills, a reduce-only stop
@@ -103,23 +103,26 @@ impl Context<'_> {
     /// valued at its limit price, its trigger, or this bar's close for a market order. A
     /// reduce-only entry or a spot sell cannot have a stop attached.
     ///
-    /// The stop is recorded under the entry's id plus one, as [`OrderStatus::Attached`] until the
-    /// entry fills; from then on it is an ordinary open order. Until then it cannot be cancelled
-    /// on its own, and cancelling the entry cancels it too.
+    /// Returns the entry's id and the stop's. The stop is recorded as [`OrderStatus::Attached`]
+    /// until the entry fills; from then on it is an ordinary open order. Until then it cannot be
+    /// cancelled on its own, and cancelling the entry cancels it too.
     pub fn submit_with_stop(
         &mut self,
         request: OrderRequest,
         stop_trigger: f64,
-    ) -> Result<OrderId, OrderRejected> {
+    ) -> Result<(OrderId, OrderId), OrderRejected> {
         let trigger = self.instrument.round_price(stop_trigger, Rounding::Nearest);
-        self.send(request, Some(trigger))
+        let (id, stop) = self.send(request, Some(trigger))?;
+        Ok((id, stop.expect("an accepted entry has its stop attached")))
     }
 
+    /// Records the order and sends it to the broker if it passes the checks, with a protective
+    /// stop attached when `stop_trigger` is set. Returns the order's id and its stop's.
     fn send(
         &mut self,
         request: OrderRequest,
         stop_trigger: Option<f64>,
-    ) -> Result<OrderId, OrderRejected> {
+    ) -> Result<(OrderId, Option<OrderId>), OrderRejected> {
         let id = OrderId(self.orders.len() as u64 + 1);
         let (submitted_at, decision_close) = (self.bar().open_time, self.bar().close);
         let (request, mut check) = self.prepare(request);
@@ -156,8 +159,9 @@ impl Context<'_> {
                         status: OrderStatus::Attached,
                     });
                 }
+                let stop = order.attached_stop.map(|stop| stop.id);
                 self.broker.submit(order);
-                Ok(id)
+                Ok((id, stop))
             }
             Err(reason) => Err(OrderRejected { id, reason }),
         }

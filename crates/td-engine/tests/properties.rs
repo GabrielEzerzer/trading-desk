@@ -61,7 +61,7 @@ impl EngineStrategy for Random {
                         OrderType::Stop { trigger } => trigger,
                     };
                     let stop = entry - side.sign() * distance;
-                    ctx.submit_with_stop(r, stop)
+                    ctx.submit_with_stop(r, stop).map(|(entry, _)| entry)
                 }
                 None => ctx.submit(r),
             };
