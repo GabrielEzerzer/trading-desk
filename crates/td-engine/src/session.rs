@@ -26,6 +26,7 @@ pub struct SessionConfig {
 }
 
 /// Equity at the close of the bar that opened at `time`.
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct EquityPoint {
     pub time: Millis,

@@ -52,6 +52,55 @@ min_qty: number,
  */
 min_notional: number, fees: FeeSchedule, };
 
+/**
+ * A candle interval. Serialized and displayed as `1m`, `5m`, `15m`, `30m`, `1h`, `4h`, `1d`, `1w`.
+ */
+export type Timeframe = "1m" | "5m" | "15m" | "30m" | "1h" | "4h" | "1d" | "1w";
+
+export type Side = "buy" | "sell";
+
+/**
+ * How an order is priced.
+ *
+ * A buy stop triggers when a bar's high reaches `trigger` or above; a sell stop triggers when a
+ * bar's low reaches `trigger` or below. Once triggered, `Stop` fills as a market order and
+ * `StopLimit` rests as a limit order at `price`. A take-profit is expressed as a `Limit` order;
+ * there is no separate type for it.
+ */
+export type OrderType = { "type": "market" } | { "type": "limit", price: number, } | { "type": "stop", trigger: number, } | { "type": "stop_limit", trigger: number, price: number, };
+
+export type TimeInForce = "gtc" | "ioc";
+
+export type OrderId = number;
+
+/**
+ * An order as a strategy or the user submits it. Quantity is in the base asset and always
+ * positive; `side` carries the direction.
+ */
+export type OrderRequest = { instrument: InstrumentId, side: Side, qty: number, order_type: OrderType, tif: TimeInForce, 
+/**
+ * Only reduce an open position, never open or grow one.
+ */
+reduce_only: boolean, 
+/**
+ * A free label from the submitter, carried through to reports.
+ */
+client_tag: string | null, };
+
+/**
+ * Whether a fill added liquidity to the book (maker) or took it (taker).
+ */
+export type Liquidity = "maker" | "taker";
+
+/**
+ * A full or partial execution of an order.
+ */
+export type Fill = { order_id: OrderId, instrument: InstrumentId, side: Side, time: number, price: number, qty: number, 
+/**
+ * The fee paid, in the quote asset. Negative for a rebate.
+ */
+fee: number, liquidity: Liquidity, };
+
 export type ParamKind = "int" | "float" | "bool";
 
 export type ParamValue = boolean | number | number;
@@ -64,6 +113,536 @@ export type ParamSpec = { name: string, kind: ParamKind, default: ParamValue,
  * Inclusive bounds for `Int` and `Float` parameters; `None` for `Bool` or no bound.
  */
 min: number | null, max: number | null, description: string, };
+
+/**
+ * Parameter values by name.
+ */
+export type Params = { [key in string]: ParamValue };
+
+/**
+ * Everything that defines a backtest apart from the data itself.
+ */
+export type BacktestConfig = { 
+/**
+ * A name from the strategy registry.
+ */
+strategy: string, 
+/**
+ * Parameter values; missing ones take the strategy's defaults.
+ */
+params: Params, instrument: Instrument, timeframe: Timeframe, 
+/**
+ * Bars that open at or after `from` and before `to` are used.
+ */
+from: number, to: number, 
+/**
+ * Starting balance in the quote asset.
+ */
+starting_cash: number, 
+/**
+ * Slippage on market and stop fills, in basis points of price.
+ */
+slippage_bps: number, 
+/**
+ * Replaces the instrument's fee schedule when set.
+ */
+fee_override: FeeSchedule | null, 
+/**
+ * When set, bars that open at or after `warmup_from` and before `from` are fed to the
+ * strategy first with trading disabled (see [`Session::warm_up`]), so its indicators are
+ * ready at the first traded bar. They add no equity points and are not in the metrics;
+ * orders the strategy submits on them are rejected and recorded in the result's `orders`.
+ */
+warmup_from?: number | null, 
+/**
+ * When set, a position still open at the end is closed with a real fill: at the close of
+ * the second-to-last traded bar every open order is cancelled and a reduce-only market order
+ * for the whole position is submitted, so it fills at the last bar's open with slippage and
+ * the taker fee, like any market order. Orders the strategy submits from then on never fill.
+ * The trade list then ends with a closed trade instead of an open one marked at the last
+ * close. The strategy tester sets it on out-of-sample runs.
+ */
+close_at_end?: boolean, };
+
+export type BacktestResult = { config: BacktestConfig, 
+/**
+ * The td-engine crate version that produced the result.
+ */
+engine_version: string, 
+/**
+ * The [`ENGINE_REVISION`] that produced the result.
+ */
+engine_revision: number, 
+/**
+ * SHA-256 of the bars (warm-up bars first) and funding the run used; see
+ * [`data_fingerprint`].
+ */
+data_fingerprint: string, 
+/**
+ * Equity at each bar's close.
+ */
+equity: Array<EquityPoint>, 
+/**
+ * Every order submitted, rejected ones included (warm-up bars' too), in submission order.
+ */
+orders: Array<Order>, fills: Array<Fill>, trades: Array<Trade>, metrics: MetricsReport, benchmark: Benchmark, };
+
+/**
+ * Buy and hold of the same instrument over the same bars.
+ */
+export type Benchmark = { 
+/**
+ * Quantity bought at the first bar's open: all starting cash, after the taker fee, rounded
+ * down to the lot size.
+ */
+qty: number, 
+/**
+ * The first bar's open with slippage, rounded up to the tick.
+ */
+entry_price: number, equity: Array<EquityPoint>, metrics: MetricsReport, 
+/**
+ * Strategy total return minus benchmark total return.
+ */
+excess_return: number | null, 
+/**
+ * Pearson correlation of the strategy's per-bar returns with the benchmark's.
+ */
+correlation: number | null, };
+
+/**
+ * Equity at the close of the bar that opened at `time`.
+ */
+export type EquityPoint = { time: number, equity: number, };
+
+/**
+ * An order the session accepted or rejected, with its request as rounded at submission.
+ */
+export type Order = { id: OrderId, request: OrderRequest, 
+/**
+ * Open time of the bar the order was decided on. It can first fill on a later bar.
+ */
+submitted_at: number, 
+/**
+ * Close of the bar the order was decided on: the last price before it was sent.
+ */
+decision_close: number, 
+/**
+ * The protective stop to place when this order fills, if one was attached.
+ */
+attached_stop: AttachedStop | null, status: OrderStatus, };
+
+/**
+ * A protective stop attached to an entry with [`crate::Context::submit_with_stop`]. When the
+ * entry fills, the broker places a reduce-only stop on the other side, for the filled quantity,
+ * under `id`.
+ */
+export type AttachedStop = { id: OrderId, trigger: number, };
+
+export type OrderStatus = { "status": "attached" } | { "status": "open" } | { "status": "filled" } | { "status": "cancelled", "reason": string } | { "status": "rejected", "reason": string };
+
+/**
+ * One round trip: the position leaves zero, then returns to it.
+ */
+export type Trade = { side: TradeSide, 
+/**
+ * Open time of the bar of the first fill.
+ */
+entry_time: number, 
+/**
+ * Open time of the bar of the fill that closed the trade, or of the last bar for an open
+ * trade.
+ */
+exit_time: number, 
+/**
+ * Still open at the end of the run; its exit is the remaining position marked at the last
+ * close, with no exit fee.
+ */
+open: boolean, 
+/**
+ * The largest absolute position during the trade.
+ */
+qty: number, 
+/**
+ * Volume-weighted price of the fills that opened or added to the position.
+ */
+entry_price: number, 
+/**
+ * Volume-weighted price of the fills that reduced or closed it (and the mark, if open).
+ */
+exit_price: number, 
+/**
+ * `sign * exit_qty * (exit_price - entry_price)`, before fees and funding. Over a closed
+ * round trip this is the exit notional minus the entry notional (reversed for a short),
+ * which is what the portfolio's average-cost realised P&L adds up to.
+ */
+gross_pnl: number, 
+/**
+ * Fees of the trade's fills. A fill that flips the position splits its fee between the two
+ * trades in proportion to the quantity that closed and that opened.
+ */
+fees: number, 
+/**
+ * Funding charged on the trade's position: at a bar's open (including funding due in a gap
+ * before the bar) while it was held going into the bar, and later in a bar while it was held
+ * after the bar's fills.
+ */
+funding: number, 
+/**
+ * `gross_pnl - fees - funding`.
+ */
+net_pnl: number, 
+/**
+ * `net_pnl / (entry_price * qty)`: net P&L over the largest entry notional.
+ */
+return_on_notional: number, 
+/**
+ * Bars from the entry fill's bar to the exit fill's bar; for an open trade, to the end of the
+ * last bar. It counts bars fed, not time: missing bars in a gap are not counted, so across a
+ * gap it understates how long the position was held. For a closed trade, the time between
+ * the entry and exit fills' bars is `exit_time - entry_time`.
+ */
+bars_held: number, };
+
+export type TradeSide = "long" | "short";
+
+/**
+ * The metrics report for one equity series and its trades.
+ */
+export type MetricsReport = { start_equity: number, end_equity: number, 
+/**
+ * See [`total_return`].
+ */
+total_return: number | null, 
+/**
+ * See [`cagr`].
+ */
+cagr: number | null, 
+/**
+ * Annualised volatility of daily returns; see [`volatility`] and [`daily_equity`].
+ */
+volatility: number | null, 
+/**
+ * Annualised Sharpe ratio of daily returns; see [`sharpe`].
+ */
+sharpe: number | null, 
+/**
+ * Annualised Sortino ratio of daily returns; see [`sortino`].
+ */
+sortino: number | null, 
+/**
+ * Depth of the largest drawdown as a fraction of its peak; see [`max_drawdown`].
+ */
+max_drawdown: number | null, 
+/**
+ * From the largest drawdown's peak to its recovery, or to the end if it never recovered.
+ */
+max_drawdown_duration_ms: number | null, max_drawdown_duration_bars: number | null, 
+/**
+ * See [`calmar`].
+ */
+calmar: number | null, 
+/**
+ * Closed trades. The trade statistics below count closed trades only; an open trade at the
+ * end is in the trade list but not in these numbers.
+ */
+trades: number, 
+/**
+ * See [`win_rate`].
+ */
+win_rate: number | null, 
+/**
+ * See [`profit_factor`].
+ */
+profit_factor: number | null, 
+/**
+ * Mean net P&L per closed trade.
+ */
+avg_trade_pnl: number | null, 
+/**
+ * Median net P&L per closed trade.
+ */
+median_trade_pnl: number | null, 
+/**
+ * Mean bars held per closed trade: bars, not time (see [`Trade::bars_held`]).
+ */
+avg_bars_held: number | null, 
+/**
+ * See [`exposure`].
+ */
+exposure: number | null, 
+/**
+ * See [`turnover`].
+ */
+turnover: number | null, 
+/**
+ * Sum of fill fees; negative if rebates outweighed fees.
+ */
+fees_paid: number, 
+/**
+ * Net funding paid; negative when the position received funding.
+ */
+funding_paid: number, };
+
+/**
+ * The values one parameter takes in a sweep.
+ */
+export type ParamSpace = { "kind": "values", values: Array<ParamValue>, } | { "kind": "range", from: number, to: number, step: number, } | { "kind": "bool" };
+
+/**
+ * One swept parameter.
+ */
+export type ParamAxis = { name: string, space: ParamSpace, };
+
+export type SweepMode = "grid" | { "random": { samples: number, seed: number, } };
+
+/**
+ * A metrics report field a sweep can rank by.
+ */
+export type Metric = "total_return" | "cagr" | "sharpe" | "sortino" | "calmar" | "profit_factor" | "win_rate" | "max_drawdown";
+
+export type Direction = "maximize" | "minimize";
+
+export type Objective = { metric: Metric, direction: Direction, };
+
+/**
+ * A parameter sweep.
+ */
+export type SweepSpec = { 
+/**
+ * The backtest every parameter set shares. Its `params` fix parameters that are not swept;
+ * parameters in neither take the strategy's defaults. A parameter may not be both fixed and
+ * swept.
+ */
+base: BacktestConfig, 
+/**
+ * The swept parameters. The grid order has the first axis changing slowest.
+ */
+axes: Array<ParamAxis>, mode: SweepMode, objective: Objective, 
+/**
+ * Runs with fewer closed trades than this rank after every run that has enough.
+ */
+min_trades: number, };
+
+/**
+ * The metrics a sweep keeps per run.
+ */
+export type Headline = { total_return: number | null, cagr: number | null, sharpe: number | null, sortino: number | null, calmar: number | null, profit_factor: number | null, win_rate: number | null, max_drawdown: number | null, 
+/**
+ * Closed trades.
+ */
+trades: number, };
+
+/**
+ * One parameter set of a sweep and how it did.
+ */
+export type SweepRow = { 
+/**
+ * Position in the grid order. Runs that rank equal are ordered by it.
+ */
+index: number, 
+/**
+ * The full parameter set the run used, defaults included.
+ */
+params: Params, 
+/**
+ * Whether the run ranks by its objective: it ran, made at least `min_trades` closed trades
+ * and its objective is defined. Other runs rank after all qualified ones: first those that
+ * ran, then those the strategy refused, each in grid order.
+ */
+qualified: boolean, 
+/**
+ * `None` when the strategy refused the parameter set.
+ */
+metrics: Headline | null, 
+/**
+ * Why the strategy refused the parameter set (a rule across parameters, such as an SMA
+ * cross needing fast below slow).
+ */
+error: string | null, };
+
+/**
+ * The result of a sweep.
+ *
+ * shortcut: rows keep headline metrics only, not equity curves or trades, so memory stays
+ * bounded with many runs; the best run is run again to get its full result.
+ */
+export type SweepResult = { spec: SweepSpec, engine_version: string, 
+/**
+ * The fingerprint of the data in the base range; see [`crate::data_fingerprint`].
+ */
+data_fingerprint: string, 
+/**
+ * Every parameter set, best first.
+ */
+rows: Array<SweepRow>, 
+/**
+ * The best row's full backtest. `None` when no row qualified.
+ */
+best: BacktestResult | null, };
+
+/**
+ * Where the base range splits into in-sample and out-of-sample.
+ */
+export type Split = { "fraction": number } | { "at": number };
+
+export type OosSpec = { 
+/**
+ * The sweep over the whole range; `base.from..base.to` is split in two.
+ */
+sweep: SweepSpec, split: Split, };
+
+export type OosResult = { spec: OosSpec, engine_version: string, 
+/**
+ * The fingerprint of the data in the whole range.
+ */
+data_fingerprint: string, 
+/**
+ * Open time of the first out-of-sample bar; the in-sample segment ends before it.
+ */
+split_at: number, 
+/**
+ * The sweep over the in-sample segment. Its best run supplies the parameters.
+ */
+in_sample: SweepResult, 
+/**
+ * The chosen parameters on the out-of-sample segment, warmed up with the in-sample bars.
+ * It runs with `close_at_end`: a position still open is closed by a market order decided at
+ * the close of the second-to-last bar and filled at the last bar's open, with slippage and
+ * the taker fee, so its trades are all closed and their costs real. The in-sample sweep's
+ * runs close out the same way, so `degradation` and `min_trades` compare like with like.
+ */
+out_of_sample: BacktestResult, 
+/**
+ * Out-of-sample objective over in-sample objective. With `TotalReturn` as the objective it
+ * is the ratio of CAGRs instead, because the two segments usually differ in length and a
+ * cumulative return grows with it. `None` if either value is undefined or the in-sample
+ * value is zero. For a maximised metric below 1 is worse out of sample; for a minimised one
+ * above 1 is worse. Not meaningful when the in-sample value is negative.
+ */
+degradation: number | null, };
+
+export type WindowMode = "rolling" | "anchored";
+
+/**
+ * Walk-forward windows, in bars of the base range.
+ *
+ * Window k tests bars `train + k * step .. train + k * step + test`. Its train window is the
+ * `train` bars before that (rolling) or every bar before it (anchored), so a test segment never
+ * overlaps its own train window. `step` must be at least `test`, so test segments never overlap
+ * each other; with `step == test` they are contiguous. Trailing bars that do not fill a whole
+ * test segment are not tested.
+ */
+export type WindowSpec = { train_bars: number, test_bars: number, step_bars: number, mode: WindowMode, };
+
+export type WalkForwardSpec = { 
+/**
+ * The sweep run on every train window; `base.from..base.to` is the whole range.
+ */
+sweep: SweepSpec, windows: WindowSpec, };
+
+/**
+ * One walk-forward window and its out-of-sample run.
+ *
+ * shortcut: keeps the chosen parameters and their in-sample headline metrics, not the train
+ * sweep's rows, so a long walk-forward stays small.
+ */
+export type WindowResult = { 
+/**
+ * The train segment: bars that open in `train_from..train_to`.
+ */
+train_from: number, train_to: number, 
+/**
+ * The test segment: bars that open in `test_from..test_to`; `test_from == train_to`.
+ */
+test_from: number, test_to: number, 
+/**
+ * The best parameters on the train segment.
+ */
+params: Params, in_sample: Headline, 
+/**
+ * The chosen parameters on the test segment, warmed up with the train bars and closed out
+ * at its end; see [`WalkForwardResult`].
+ */
+out_of_sample: BacktestResult, };
+
+/**
+ * The result of a walk-forward run.
+ *
+ * At a test window's end the position is closed for real: each test run has `close_at_end`
+ * set, so at the close of the window's second-to-last bar its open orders are cancelled and a
+ * reduce-only market order for the whole position is submitted, which fills at the last bar's
+ * open with slippage and the taker fee. Every window therefore ends flat unless the close-out
+ * is rejected (see `Session::close_out`); its trades are then all closed and counted in the
+ * trade statistics, and the exit costs are in the stitched equity. The next window starts flat
+ * from where the stitched equity ended.
+ *
+ * Train sweeps close out the same way, so a window's in-sample and out-of-sample trade counts
+ * (and `min_trades`) count a position held at the end alike. A rolling window's train sweep is
+ * warmed up on the bars just before it, as many as the window's train length (fewer near the
+ * start of the range), the same warm-up its test run gets; the first window's, and every
+ * anchored window's, starts cold because no bars come before it.
+ *
+ * The stitched metrics are computed like a single backtest's (see [`MetricsReport`]): the
+ * stitched Sharpe, Sortino and volatility come from the stitched curve's daily UTC returns, not
+ * from its per-bar returns, so they are comparable with a backtest's on any timeframe.
+ */
+export type WalkForwardResult = { spec: WalkForwardSpec, engine_version: string, 
+/**
+ * The fingerprint of the data in the whole range.
+ */
+data_fingerprint: string, windows: Array<WindowResult>, 
+/**
+ * The test segments stitched into one curve; see [`stitch`].
+ */
+equity: Array<EquityPoint>, 
+/**
+ * Metrics of the stitched curve, its trades and its fills.
+ */
+metrics: MetricsReport, 
+/**
+ * Every test segment's trades in time order, with quantities, P&L, fees and funding scaled
+ * by the same factor as the segment's equity, so they add up to the stitched equity's
+ * changes. Segments after the stitched equity reached zero (factor 0, see [`stitch`]) traded
+ * nothing in the stitched account and add no trades.
+ */
+trades: Array<Trade>, 
+/**
+ * Every test segment's fills in time order, with quantities and fees scaled the same way and
+ * the same segments left out.
+ */
+fills: Array<Fill>, 
+/**
+ * How many windows chose different parameters from the window before.
+ */
+param_changes: number, 
+/**
+ * `param_changes / (windows - 1)`: 0 when every window chose the same parameters, 1 when
+ * every window changed them. `None` with one window.
+ */
+param_change_rate: number | null, };
+
+/**
+ * A run's id: the save time in milliseconds since the epoch, zero-padded to 13 digits so ids
+ * sort by time, then `-` and the first 8 hex digits of the SHA-256 of `result.json`.
+ */
+export type RunId = string;
+
+/**
+ * What a saved run is.
+ */
+export type RunKind = "backtest" | "sweep" | "oos" | "walk_forward";
+
+/**
+ * A result as saved, tagged with its kind: `{"kind": "...", "result": {...}}`.
+ */
+export type SavedRun = { "kind": "backtest", "result": BacktestResult } | { "kind": "sweep", "result": SweepResult } | { "kind": "oos", "result": OosResult } | { "kind": "walk_forward", "result": WalkForwardResult };
+
+/**
+ * One row of the run list. The strategy and range are the base configuration's. The metrics
+ * are the backtest's, the sweep's best run's (none if no run qualified), the out-of-sample
+ * segment's, or the stitched walk-forward curve's.
+ */
+export type RunSummary = { id: RunId, created_at: number, kind: RunKind, strategy: string, instrument: InstrumentId, timeframe: Timeframe, from: number, to: number, total_return: number | null, cagr: number | null, sharpe: number | null, max_drawdown: number | null, trades: number, };
 
 /**
  * The line the binary prints to stdout once it listens, for the app that started it.
@@ -199,19 +778,90 @@ error: ErrorBody | null,
  */
 cancel_requested: boolean, created_at: number, started_at: number | null, finished_at: number | null, };
 
-export type JobKind = "download";
+export type JobKind = "download" | "backtest" | "sweep" | "out_of_sample" | "walk_forward";
 
 export type JobStatus = "queued" | "running" | "done" | "failed" | "cancelled";
 
 /**
  * What a job was asked to do, tagged by `kind`.
  */
-export type JobRequest = { "kind": "download" } & DownloadRequest;
+export type JobRequest = { "kind": "download" } & DownloadRequest | { "kind": "backtest" } & BacktestConfig | { "kind": "sweep" } & SweepSpec | { "kind": "out_of_sample" } & OosSpec | { "kind": "walk_forward" } & WalkForwardSpec;
 
 /**
  * What a finished job produced, tagged by `kind`.
  */
-export type JobResult = { "kind": "download" } & DownloadResult;
+export type JobResult = { "kind": "download" } & DownloadResult | { "kind": "backtest" } & RunDone | { "kind": "sweep" } & RunDone | { "kind": "out_of_sample" } & RunDone | { "kind": "walk_forward" } & RunDone;
+
+/**
+ * What a finished run job produced: the saved run's id and its row in the run list. The whole
+ * result is at `GET /jobs/{id}/result` and `GET /runs/{run_id}`.
+ */
+export type RunDone = { run_id: RunId, summary: RunSummary, 
+/**
+ * How many buckets were left out as incomplete; the list is the result's `data.dropped`.
+ */
+dropped_buckets: number, };
+
+/**
+ * A saved run in full.
+ */
+export type RunDetail = { id: RunId, run: SavedRun, 
+/**
+ * The data the run was given; `null` for a run saved by another tool, without one.
+ */
+data: DataReport | null, 
+/**
+ * Whether the run would come out the same today; set by `GET /runs/{id}`, `null` from
+ * `GET /jobs/{id}/result`.
+ */
+check: RunCheck | null, };
+
+/**
+ * A saved run checked against the store and the engine as they are now, as
+ * [`td_engine::Rerun`] reports for a rerun, without running it again.
+ */
+export type RunCheck = { 
+/**
+ * Whether the store's data for the run's range hashes the same as the data the run used.
+ * False also when the store no longer has data there.
+ */
+data_matches: boolean, 
+/**
+ * Whether this engine has the revision that produced the run. When false, the same data
+ * may now give a different result because the engine changed. `null` for a sweep in which
+ * no run qualified: it holds no backtest to read the revision from.
+ */
+engine_matches: boolean | null, };
+
+/**
+ * The data a run was given: its bars at the run's timeframe, and the buckets td-data left out or
+ * built with minutes missing. The engine does not record these; the API does, so the apps can
+ * show them.
+ */
+export type DataReport = { 
+/**
+ * Bars from the start of the range (warm-up included) to its end.
+ */
+bars: number, 
+/**
+ * Open times of the buckets left out because too many of their minutes are missing from the
+ * store (td-data's rule: a bucket needs its first and last minute and at most 1% missing).
+ * The run has no bar there.
+ */
+dropped: Array<number>, 
+/**
+ * Buckets built with a tolerated number of minutes missing.
+ */
+tolerated: Array<ToleratedBucket>, 
+/**
+ * Funding rates given to the run; 0 for spot.
+ */
+funding_rates: number, };
+
+/**
+ * A bucket built although a few of its minutes are missing, within td-data's tolerance.
+ */
+export type ToleratedBucket = { open_time: number, missing_minutes: number, };
 
 /**
  * A message from the client.

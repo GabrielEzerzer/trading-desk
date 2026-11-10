@@ -2,9 +2,9 @@
 //! thread once a slot is free, reports progress, and ends done (with a result), failed (with an
 //! error) or cancelled. Every change is published to the `jobs` WebSocket topic.
 //!
-//! Downloads are the only kind so far. A backtest, sweep or walk-forward run plugs in by adding a
-//! variant to [`JobKind`], [`JobRequest`] and [`JobResult`] and a route that calls [`Jobs::submit`]
-//! with its work.
+//! Kinds: downloads ([`super::data`]) and runs: backtests, sweeps, out-of-sample splits and
+//! walk-forwards ([`super::runs`]). A new kind plugs in by adding a variant to [`JobKind`],
+//! [`JobRequest`] and [`JobResult`] and a route that calls [`Jobs::submit`] with its work.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,13 +17,19 @@ use td_data::time::now_ms;
 use tokio::sync::{Semaphore, broadcast};
 use ts_rs::TS;
 
+use td_engine::{BacktestConfig, OosSpec, SweepSpec, WalkForwardSpec};
+
 use super::data::{DownloadRequest, DownloadResult};
 use super::error::{ApiError, ErrorBody};
+use super::runs::RunDone;
 
-/// How many jobs run at once; the rest wait as `queued`.
-// shortcut: one shared limit for every kind, sized for downloads (venue rate limits); when
-// backtests and sweeps land (#13, #14), give CPU-bound kinds their own pool sized to the cores.
-const MAX_RUNNING: usize = 2;
+/// How many downloads run at once, for the venues' rate limits; the rest wait as `queued`.
+const MAX_DOWNLOADS: usize = 2;
+
+/// How many runs (backtests and tester runs) go at once, apart from downloads, so a long sweep
+/// never holds up a download. A sweep already spreads over every core through rayon; two at once
+/// share them.
+const MAX_RUNS: usize = 2;
 
 /// Events buffered per WebSocket subscriber before it is told to resync.
 const EVENT_BUFFER: usize = 1024;
@@ -32,6 +38,10 @@ const EVENT_BUFFER: usize = 1024;
 #[serde(rename_all = "snake_case")]
 pub enum JobKind {
     Download,
+    Backtest,
+    Sweep,
+    OutOfSample,
+    WalkForward,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -58,12 +68,20 @@ impl JobStatus {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum JobRequest {
     Download(DownloadRequest),
+    Backtest(BacktestConfig),
+    Sweep(SweepSpec),
+    OutOfSample(OosSpec),
+    WalkForward(WalkForwardSpec),
 }
 
 impl JobRequest {
     pub fn kind(&self) -> JobKind {
         match self {
             JobRequest::Download(_) => JobKind::Download,
+            JobRequest::Backtest(_) => JobKind::Backtest,
+            JobRequest::Sweep(_) => JobKind::Sweep,
+            JobRequest::OutOfSample(_) => JobKind::OutOfSample,
+            JobRequest::WalkForward(_) => JobKind::WalkForward,
         }
     }
 
@@ -71,6 +89,7 @@ impl JobRequest {
     pub fn downloads(&self) -> Option<&InstrumentId> {
         match self {
             JobRequest::Download(d) => Some(&d.instrument),
+            _ => None,
         }
     }
 }
@@ -80,6 +99,23 @@ impl JobRequest {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum JobResult {
     Download(DownloadResult),
+    Backtest(RunDone),
+    Sweep(RunDone),
+    OutOfSample(RunDone),
+    WalkForward(RunDone),
+}
+
+impl JobResult {
+    /// The saved run, for a run job.
+    pub fn run(&self) -> Option<&RunDone> {
+        match self {
+            JobResult::Download(_) => None,
+            JobResult::Backtest(r)
+            | JobResult::Sweep(r)
+            | JobResult::OutOfSample(r)
+            | JobResult::WalkForward(r) => Some(r),
+        }
+    }
 }
 
 /// A job as the API shows it.
@@ -183,7 +219,8 @@ struct Inner {
 pub struct Jobs {
     inner: Mutex<Inner>,
     events: broadcast::Sender<JobInfo>,
-    slots: Arc<Semaphore>,
+    download_slots: Arc<Semaphore>,
+    run_slots: Arc<Semaphore>,
 }
 
 impl Default for Jobs {
@@ -191,7 +228,8 @@ impl Default for Jobs {
         Jobs {
             inner: Mutex::new(Inner::default()),
             events: broadcast::channel(EVENT_BUFFER).0,
-            slots: Arc::new(Semaphore::new(MAX_RUNNING)),
+            download_slots: Arc::new(Semaphore::new(MAX_DOWNLOADS)),
+            run_slots: Arc::new(Semaphore::new(MAX_RUNS)),
         }
     }
 }
@@ -256,11 +294,15 @@ impl Jobs {
             info
         };
 
+        let slots = match info.kind {
+            JobKind::Download => self.download_slots.clone(),
+            _ => self.run_slots.clone(),
+        };
         let jobs = self.clone();
         let id = info.id;
         tokio::spawn(async move {
             // The semaphore is never closed, so acquiring only waits.
-            let Ok(_permit) = jobs.slots.clone().acquire_owned().await else {
+            let Ok(_permit) = slots.acquire_owned().await else {
                 return;
             };
             if !jobs.start(id) {
@@ -423,7 +465,7 @@ mod tests {
         let jobs = Arc::new(Jobs::default());
         let ran = Arc::new(AtomicUsize::new(0));
         // Fill every slot with a job that runs until cancelled.
-        let busy: Vec<u64> = (0..MAX_RUNNING)
+        let busy: Vec<u64> = (0..MAX_DOWNLOADS)
             .map(|i| {
                 let ran = ran.clone();
                 jobs.submit(request(&format!("BUSY{i}")), move |ctx| {
@@ -459,7 +501,7 @@ mod tests {
             wait_for(&jobs, id, JobStatus::Cancelled).await;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
-        assert_eq!(ran.load(Ordering::SeqCst), MAX_RUNNING);
+        assert_eq!(ran.load(Ordering::SeqCst), MAX_DOWNLOADS);
         assert_eq!(
             ran_queued.load(Ordering::SeqCst),
             0,

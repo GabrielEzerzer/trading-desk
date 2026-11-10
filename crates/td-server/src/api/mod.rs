@@ -11,6 +11,15 @@
 //! - `GET /data/coverage?instrument=venue:symbol:kind`: which months and minutes the store holds.
 //! - `GET /strategies`: the registered strategies and their parameter specs.
 //! - `GET /jobs`, `GET /jobs/{id}`, `POST /jobs/{id}/cancel`: background jobs (see [`jobs`]).
+//! - `POST /runs/backtest` (a `BacktestConfig`), `POST /runs/sweep` (a `SweepSpec`),
+//!   `POST /runs/out-of-sample` (an `OosSpec`), `POST /runs/walk-forward` (a `WalkForwardSpec`):
+//!   start a run job, answer `{job_id}`. The data is loaded from the store first: a range it does
+//!   not cover is a 422 `data_missing` naming the missing spans; a bad spec is a 400
+//!   (`invalid_config`, `invalid_spec`). Each finished run is saved (see [`runs`]).
+//! - `GET /jobs/{id}/result`: the saved run of a finished run job (`RunDetail`); 409
+//!   `job_not_done` before it is done.
+//! - `GET /runs`: the saved runs, newest first, one summary row each. `GET /runs/{id}`: one saved
+//!   run with its data report and a check of whether its data and engine still match.
 //! - `GET /ws`: topic subscriptions, `jobs` for now (see [`ws`]).
 //!
 //! On start the binary prints one line to stdout, `{"port":<n>,"token":"<hex>"}`
@@ -20,6 +29,7 @@ pub mod auth;
 pub mod data;
 pub mod error;
 pub mod jobs;
+pub mod runs;
 pub mod source;
 pub mod ts;
 pub mod ws;
@@ -179,6 +189,13 @@ pub(crate) fn router(state: Arc<AppState>) -> Router {
         .route("/jobs", get(list_jobs))
         .route("/jobs/{id}", get(get_job))
         .route("/jobs/{id}/cancel", post(cancel_job))
+        .route("/jobs/{id}/result", get(runs::job_result))
+        .route("/runs", get(runs::list))
+        .route("/runs/backtest", post(runs::backtest))
+        .route("/runs/sweep", post(runs::sweep))
+        .route("/runs/out-of-sample", post(runs::out_of_sample))
+        .route("/runs/walk-forward", post(runs::walk_forward))
+        .route("/runs/{id}", get(runs::get))
         .route("/ws", get(ws::upgrade))
         .fallback(not_found)
         .method_not_allowed_fallback(method_not_allowed)

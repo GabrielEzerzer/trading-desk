@@ -40,7 +40,8 @@ pub use portfolio::Portfolio;
 pub use registry::{StrategyEntry, build_strategy, find_strategy, strategies};
 pub use results::{RunId, RunKind, RunSummary, SavedRun, StoreError, list, load, save};
 pub use runner::{
-    BacktestConfig, BacktestResult, Benchmark, ENGINE_REVISION, Rerun, data_fingerprint, rerun, run,
+    BacktestConfig, BacktestResult, Benchmark, ENGINE_REVISION, Rerun, config_fingerprint,
+    data_fingerprint, rerun, run,
 };
 pub use session::{EquityPoint, Session, SessionConfig, run_backtest};
 pub use strategy::{Context, Strategy};

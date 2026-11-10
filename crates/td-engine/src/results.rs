@@ -46,6 +46,7 @@ pub enum StoreError {
 
 /// A run's id: the save time in milliseconds since the epoch, zero-padded to 13 digits so ids
 /// sort by time, then `-` and the first 8 hex digits of the SHA-256 of `result.json`.
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct RunId(String);
@@ -84,6 +85,7 @@ impl fmt::Display for RunId {
 }
 
 /// What a saved run is.
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunKind {
@@ -94,6 +96,7 @@ pub enum RunKind {
 }
 
 /// A result as saved, tagged with its kind: `{"kind": "...", "result": {...}}`.
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "result", rename_all = "snake_case")]
 pub enum SavedRun {
@@ -112,11 +115,56 @@ impl SavedRun {
             SavedRun::WalkForward(_) => RunKind::WalkForward,
         }
     }
+
+    /// The backtest configuration the run is built on: the backtest's own, or the tester spec's
+    /// base. Its range is the whole range the run used.
+    pub fn base_config(&self) -> &BacktestConfig {
+        match self {
+            SavedRun::Backtest(r) => &r.config,
+            SavedRun::Sweep(r) => &r.spec.base,
+            SavedRun::Oos(r) => &r.spec.sweep.base,
+            SavedRun::WalkForward(r) => &r.spec.sweep.base,
+        }
+    }
+
+    /// The fingerprint of the data the run used: [`crate::config_fingerprint`] over
+    /// [`SavedRun::base_config`] gives the same on the same data.
+    pub fn data_fingerprint(&self) -> &str {
+        match self {
+            SavedRun::Backtest(r) => &r.data_fingerprint,
+            SavedRun::Sweep(r) => &r.data_fingerprint,
+            SavedRun::Oos(r) => &r.data_fingerprint,
+            SavedRun::WalkForward(r) => &r.data_fingerprint,
+        }
+    }
+
+    /// The [`crate::ENGINE_REVISION`] that produced the run, read from a backtest it holds; `None`
+    /// for a sweep in which no run qualified, which holds none.
+    pub fn engine_revision(&self) -> Option<u32> {
+        match self {
+            SavedRun::Backtest(r) => Some(r.engine_revision),
+            SavedRun::Sweep(r) => r.best.as_ref().map(|b| b.engine_revision),
+            SavedRun::Oos(r) => Some(r.out_of_sample.engine_revision),
+            SavedRun::WalkForward(r) => r.windows.first().map(|w| w.out_of_sample.engine_revision),
+        }
+    }
+
+    /// The run's row in the run list, as [`list`] would give it under `id`.
+    pub fn summary(&self, id: RunId) -> RunSummary {
+        let metrics = match self {
+            SavedRun::Backtest(r) => Some(&r.metrics),
+            SavedRun::Sweep(r) => r.best.as_ref().map(|b| &b.metrics),
+            SavedRun::Oos(r) => Some(&r.out_of_sample.metrics),
+            SavedRun::WalkForward(r) => Some(&r.metrics),
+        };
+        summary_row(id, self.kind(), self.base_config(), metrics)
+    }
 }
 
 /// One row of the run list. The strategy and range are the base configuration's. The metrics
 /// are the backtest's, the sweep's best run's (none if no run qualified), the out-of-sample
 /// segment's, or the stitched walk-forward curve's.
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunSummary {
     pub id: RunId,
@@ -214,25 +262,33 @@ pub fn list(runs_dir: &Path) -> Result<Vec<RunSummary>, StoreError> {
                 (RunKind::WalkForward, spec.sweep.base, Some(metrics))
             }
         };
-        let m = metrics.as_ref();
-        runs.push(RunSummary {
-            created_at: id.created_at(),
-            id,
-            kind,
-            strategy: config.strategy,
-            instrument: config.instrument.id,
-            timeframe: config.timeframe,
-            from: config.from,
-            to: config.to,
-            total_return: m.and_then(|m| m.total_return),
-            cagr: m.and_then(|m| m.cagr),
-            sharpe: m.and_then(|m| m.sharpe),
-            max_drawdown: m.and_then(|m| m.max_drawdown),
-            trades: m.map_or(0, |m| m.trades),
-        });
+        runs.push(summary_row(id, kind, &config, metrics.as_ref()));
     }
     runs.sort_by(|a, b| b.id.cmp(&a.id));
     Ok(runs)
+}
+
+fn summary_row(
+    id: RunId,
+    kind: RunKind,
+    config: &BacktestConfig,
+    m: Option<&MetricsReport>,
+) -> RunSummary {
+    RunSummary {
+        created_at: id.created_at(),
+        id,
+        kind,
+        strategy: config.strategy.clone(),
+        instrument: config.instrument.id.clone(),
+        timeframe: config.timeframe,
+        from: config.from,
+        to: config.to,
+        total_return: m.and_then(|m| m.total_return),
+        cagr: m.and_then(|m| m.cagr),
+        sharpe: m.and_then(|m| m.sharpe),
+        max_drawdown: m.and_then(|m| m.max_drawdown),
+        trades: m.map_or(0, |m| m.trades),
+    }
 }
 
 // Only the fields the run list needs; serde skips the rest of the file.

@@ -9,7 +9,7 @@ use serde_json::Value;
 use td_core::{Candle, Millis, Timeframe};
 use td_engine::{
     BacktestConfig, BacktestResult, ENGINE_REVISION, EngineError, ParamValue, Params, RunKind,
-    SavedRun, data_fingerprint, list, load, rerun, run, save,
+    SavedRun, config_fingerprint, data_fingerprint, list, load, rerun, run, save,
 };
 
 const HOUR: Millis = 3_600_000;
@@ -255,6 +255,11 @@ fn save_load_and_rerun_reproduce_the_result_exactly() {
     assert_eq!(s.total_return, result.metrics.total_return);
     assert_eq!(s.trades, result.metrics.trades);
     assert!(s.created_at > T0);
+    assert_eq!(&saved.summary(id.clone()), s);
+    assert_eq!(
+        config_fingerprint(&config(), &synthetic_bars(), &synthetic_funding()).unwrap(),
+        result.data_fingerprint
+    );
     // No temporary directory is left behind.
     assert_eq!(std::fs::read_dir(&runs).unwrap().count(), 1);
 }
