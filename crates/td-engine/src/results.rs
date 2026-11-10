@@ -8,6 +8,7 @@ use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -20,6 +21,9 @@ use crate::{BacktestConfig, BacktestResult, OosResult, SweepResult, WalkForwardR
 
 const CONFIG_FILE: &str = "config.json";
 const RESULT_FILE: &str = "result.json";
+
+/// Numbers each save's temporary directory within this process.
+static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -42,10 +46,16 @@ pub enum StoreError {
 
     #[error("a run with id {0} already exists")]
     RunExists(RunId),
+
+    #[error(
+        "{0:?} cannot be saved beside a run: it must be a plain file name other than {CONFIG_FILE} and {RESULT_FILE}"
+    )]
+    InvalidFileName(String),
 }
 
 /// A run's id: the save time in milliseconds since the epoch, zero-padded to 13 digits so ids
 /// sort by time, then `-` and the first 8 hex digits of the SHA-256 of `result.json`.
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct RunId(String);
@@ -84,6 +94,7 @@ impl fmt::Display for RunId {
 }
 
 /// What a saved run is.
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunKind {
@@ -94,6 +105,7 @@ pub enum RunKind {
 }
 
 /// A result as saved, tagged with its kind: `{"kind": "...", "result": {...}}`.
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "result", rename_all = "snake_case")]
 pub enum SavedRun {
@@ -112,11 +124,56 @@ impl SavedRun {
             SavedRun::WalkForward(_) => RunKind::WalkForward,
         }
     }
+
+    /// The backtest configuration the run is built on: the backtest's own, or the tester spec's
+    /// base. Its range is the whole range the run used.
+    pub fn base_config(&self) -> &BacktestConfig {
+        match self {
+            SavedRun::Backtest(r) => &r.config,
+            SavedRun::Sweep(r) => &r.spec.base,
+            SavedRun::Oos(r) => &r.spec.sweep.base,
+            SavedRun::WalkForward(r) => &r.spec.sweep.base,
+        }
+    }
+
+    /// The fingerprint of the data the run used: [`crate::config_fingerprint`] over
+    /// [`SavedRun::base_config`] gives the same on the same data.
+    pub fn data_fingerprint(&self) -> &str {
+        match self {
+            SavedRun::Backtest(r) => &r.data_fingerprint,
+            SavedRun::Sweep(r) => &r.data_fingerprint,
+            SavedRun::Oos(r) => &r.data_fingerprint,
+            SavedRun::WalkForward(r) => &r.data_fingerprint,
+        }
+    }
+
+    /// The [`crate::ENGINE_REVISION`] that produced the run, read from a backtest it holds; `None`
+    /// for a sweep in which no run qualified, which holds none.
+    pub fn engine_revision(&self) -> Option<u32> {
+        match self {
+            SavedRun::Backtest(r) => Some(r.engine_revision),
+            SavedRun::Sweep(r) => r.best.as_ref().map(|b| b.engine_revision),
+            SavedRun::Oos(r) => Some(r.out_of_sample.engine_revision),
+            SavedRun::WalkForward(r) => r.windows.first().map(|w| w.out_of_sample.engine_revision),
+        }
+    }
+
+    /// The run's row in the run list, as [`list`] would give it under `id`.
+    pub fn summary(&self, id: RunId) -> RunSummary {
+        let metrics = match self {
+            SavedRun::Backtest(r) => Some(&r.metrics),
+            SavedRun::Sweep(r) => r.best.as_ref().map(|b| &b.metrics),
+            SavedRun::Oos(r) => Some(&r.out_of_sample.metrics),
+            SavedRun::WalkForward(r) => Some(&r.metrics),
+        };
+        summary_row(id, self.kind(), self.base_config(), metrics)
+    }
 }
 
 /// One row of the run list. The strategy and range are the base configuration's. The metrics
 /// are the backtest's, the sweep's best run's (none if no run qualified), the out-of-sample
 /// segment's, or the stitched walk-forward curve's.
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunSummary {
     pub id: RunId,
@@ -137,8 +194,32 @@ pub struct RunSummary {
 /// Saves a result and returns its new id.
 ///
 /// Both files are written into a temporary directory inside `runs_dir`, which is then renamed to
-/// the run's id, so a run appears whole or not at all. `runs_dir` is created if needed.
+/// the run's id, so a run appears whole or not at all. `runs_dir` is created if needed. A run with
+/// the same id already saved, by this call's time or by another save racing it, is
+/// [`StoreError::RunExists`]; saving again in a later millisecond gives a new id.
 pub fn save(run: &SavedRun, runs_dir: &Path) -> Result<RunId, StoreError> {
+    save_with_files(run, runs_dir, &[])
+}
+
+/// [`save`], with `files` (name and contents) written into the run's directory in the same atomic
+/// save, for what a caller keeps beside a run. Each name must be a plain file name other than the
+/// run's own files.
+pub fn save_with_files(
+    run: &SavedRun,
+    runs_dir: &Path,
+    files: &[(&str, &[u8])],
+) -> Result<RunId, StoreError> {
+    for &(name, _) in files {
+        let plain = Path::new(name).file_name().is_some_and(|n| n == name);
+        // Case-insensitive, as Windows and macOS file systems are: `Result.json` would replace
+        // the run's own `result.json`.
+        let own = [CONFIG_FILE, RESULT_FILE]
+            .iter()
+            .any(|f| f.eq_ignore_ascii_case(name));
+        if !plain || own {
+            return Err(StoreError::InvalidFileName(name.to_string()));
+        }
+    }
     let config_json = match run {
         SavedRun::Backtest(r) => to_json(&r.config, runs_dir)?,
         SavedRun::Sweep(r) => to_json(&r.spec, runs_dir)?,
@@ -157,14 +238,36 @@ pub fn save(run: &SavedRun, runs_dir: &Path) -> Result<RunId, StoreError> {
     if dest.exists() {
         return Err(StoreError::RunExists(id));
     }
-    let tmp = runs_dir.join(format!(".tmp-{id}"));
-    let write = || -> Result<(), StoreError> {
-        fs::create_dir(&tmp).map_err(io_err(&tmp))?;
-        for (name, json) in [(CONFIG_FILE, &config_json), (RESULT_FILE, &result_json)] {
-            let path = tmp.join(name);
-            fs::write(&path, json).map_err(io_err(&path))?;
+    // Unique to this call, so two saves of the same run in the same millisecond (one id) never
+    // share a temporary directory, and each removes only its own.
+    let n = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp = runs_dir.join(format!(".tmp-{id}-{}-{n}", std::process::id()));
+    match fs::create_dir(&tmp) {
+        Ok(()) => {}
+        // A directory left by a process that had this pid; a later save gets a new name.
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            return Err(StoreError::RunExists(id));
         }
-        fs::rename(&tmp, &dest).map_err(io_err(&dest))
+        Err(e) => return Err(io_err(&tmp)(e)),
+    }
+    let write = || -> Result<(), StoreError> {
+        let own = [
+            (CONFIG_FILE, config_json.as_bytes()),
+            (RESULT_FILE, result_json.as_bytes()),
+        ];
+        for &(name, contents) in own.iter().chain(files) {
+            let path = tmp.join(name);
+            fs::write(&path, contents).map_err(io_err(&path))?;
+        }
+        // Another save of the same run can land between the check above and here; the rename
+        // then fails, as no file system renames a directory over a non-empty one.
+        fs::rename(&tmp, &dest).map_err(|e| {
+            if dest.exists() {
+                StoreError::RunExists(id.clone())
+            } else {
+                io_err(&dest)(e)
+            }
+        })
     };
     write().inspect_err(|_| {
         let _ = fs::remove_dir_all(&tmp);
@@ -214,25 +317,33 @@ pub fn list(runs_dir: &Path) -> Result<Vec<RunSummary>, StoreError> {
                 (RunKind::WalkForward, spec.sweep.base, Some(metrics))
             }
         };
-        let m = metrics.as_ref();
-        runs.push(RunSummary {
-            created_at: id.created_at(),
-            id,
-            kind,
-            strategy: config.strategy,
-            instrument: config.instrument.id,
-            timeframe: config.timeframe,
-            from: config.from,
-            to: config.to,
-            total_return: m.and_then(|m| m.total_return),
-            cagr: m.and_then(|m| m.cagr),
-            sharpe: m.and_then(|m| m.sharpe),
-            max_drawdown: m.and_then(|m| m.max_drawdown),
-            trades: m.map_or(0, |m| m.trades),
-        });
+        runs.push(summary_row(id, kind, &config, metrics.as_ref()));
     }
     runs.sort_by(|a, b| b.id.cmp(&a.id));
     Ok(runs)
+}
+
+fn summary_row(
+    id: RunId,
+    kind: RunKind,
+    config: &BacktestConfig,
+    m: Option<&MetricsReport>,
+) -> RunSummary {
+    RunSummary {
+        created_at: id.created_at(),
+        id,
+        kind,
+        strategy: config.strategy.clone(),
+        instrument: config.instrument.id.clone(),
+        timeframe: config.timeframe,
+        from: config.from,
+        to: config.to,
+        total_return: m.and_then(|m| m.total_return),
+        cagr: m.and_then(|m| m.cagr),
+        sharpe: m.and_then(|m| m.sharpe),
+        max_drawdown: m.and_then(|m| m.max_drawdown),
+        trades: m.map_or(0, |m| m.trades),
+    }
 }
 
 // Only the fields the run list needs; serde skips the rest of the file.

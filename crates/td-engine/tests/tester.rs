@@ -4,14 +4,15 @@
 
 mod common;
 
+use std::ops::ControlFlow;
 use std::sync::Mutex;
 
 use td_core::{Candle, Millis, Timeframe};
 use td_engine::{
     BacktestConfig, Direction, EngineError, MAX_RUNS, Metric, Objective, OosSpec, ParamAxis,
     ParamSpace, ParamValue, Params, RunKind, SavedRun, Split, SweepMode, SweepSpec, TesterError,
-    WalkForwardSpec, WindowMode, WindowSpec, list, load, out_of_sample, run, save, sweep,
-    walk_forward,
+    WalkForwardSpec, WindowMode, WindowSpec, config_fingerprint, list, load, out_of_sample, run,
+    save, sweep, walk_forward,
 };
 
 const HOUR: Millis = 3_600_000;
@@ -370,7 +371,10 @@ fn parallel_and_serial_sweeps_give_identical_results() {
     let bars = wavy_bars(500);
     let s = wavy_spec();
     let calls = Mutex::new(Vec::new());
-    let progress = |done: usize, total: usize| calls.lock().unwrap().push((done, total));
+    let progress = |done: usize, total: usize| {
+        calls.lock().unwrap().push((done, total));
+        ControlFlow::Continue(())
+    };
     let serial = pool(1).install(|| sweep(&s, &bars, &[], Some(&progress)).unwrap());
     let parallel = pool(4).install(|| sweep(&s, &bars, &[], None).unwrap());
     assert_eq!(serial.rows.len(), 48);
@@ -549,6 +553,7 @@ fn walk_forward_tests_each_window_after_its_train_and_stitches_the_tests() {
     let progress = |done: usize, total: usize| {
         assert!(done <= total && total == 6 * 6);
         *calls.lock().unwrap() += 1;
+        ControlFlow::Continue(())
     };
     let r = walk_forward(&wf_spec(WindowMode::Rolling), &bars, &[], Some(&progress)).unwrap();
     assert_eq!(calls.into_inner().unwrap(), 36);
@@ -688,6 +693,20 @@ fn sweeps_and_walk_forwards_save_and_load_with_their_kind() {
     let o = kind_of(&ids[2]);
     assert_eq!(o.kind, RunKind::Oos);
     assert_eq!(o.total_return, oos.out_of_sample.metrics.total_return);
+    // A loaded run gives the same row as the list, and its fingerprint is the base config's.
+    for (s, id) in saved.iter().zip(&ids) {
+        assert_eq!(&s.summary(id.clone()), kind_of(id));
+        assert_eq!(s.engine_revision(), Some(td_engine::ENGINE_REVISION));
+    }
+    assert_eq!(saved[0].data_fingerprint(), swept.data_fingerprint);
+    assert_eq!(
+        config_fingerprint(&swept.spec.base, &bars, &[]).unwrap(),
+        swept.data_fingerprint
+    );
+    assert_eq!(
+        config_fingerprint(&wf.spec.sweep.base, &bars, &[]).unwrap(),
+        wf.data_fingerprint
+    );
 }
 
 /// Long-only SMA cross with fast 1 on a perpetual over the rising line, in rolling windows of 50
@@ -901,4 +920,89 @@ fn the_walk_forward_result_lists_the_stitched_trades_and_fills() {
     let scale = first.equity.last().unwrap().equity / 10_000.0;
     let own = &r.windows[1].out_of_sample.trades[0];
     assert!((r.trades[1].net_pnl - own.net_pnl * scale).abs() < 1e-9);
+}
+
+#[test]
+fn a_progress_callback_that_breaks_stops_the_sweep_before_its_remaining_runs() {
+    let bars = wavy_bars(500);
+    let count = Mutex::new(0usize);
+    let calls = &count;
+    let stop_after = |n: usize| {
+        move |_: usize, _: usize| {
+            let mut c = calls.lock().unwrap();
+            *c += 1;
+            if *c >= n {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        }
+    };
+    // One thread, so the runs go one at a time and none starts after the stop.
+    let progress = stop_after(3);
+    let r = pool(1).install(|| sweep(&wavy_spec(), &bars, &[], Some(&progress)));
+    assert_eq!(r, Err(TesterError::Cancelled));
+    assert_eq!(*calls.lock().unwrap(), 3, "48 runs, stopped after 3");
+
+    *calls.lock().unwrap() = 0;
+    let progress = stop_after(8);
+    let r = pool(1)
+        .install(|| walk_forward(&wf_spec(WindowMode::Rolling), &bars, &[], Some(&progress)));
+    assert_eq!(r, Err(TesterError::Cancelled));
+    assert_eq!(
+        *calls.lock().unwrap(),
+        8,
+        "36 runs over 6 windows, stopped in the second"
+    );
+
+    *calls.lock().unwrap() = 0;
+    let oos = OosSpec {
+        sweep: wavy_spec(),
+        split: Split::Fraction(0.5),
+    };
+    let progress = stop_after(1);
+    let r = pool(1).install(|| out_of_sample(&oos, &bars, &[], Some(&progress)));
+    assert_eq!(r, Err(TesterError::Cancelled));
+    assert_eq!(*calls.lock().unwrap(), 1);
+}
+
+#[test]
+fn a_progress_callback_that_continues_leaves_the_result_unchanged() {
+    let bars = wavy_bars(500);
+    let progress = |_: usize, _: usize| ControlFlow::Continue(());
+    let with = sweep(&wavy_spec(), &bars, &[], Some(&progress)).unwrap();
+    let without = sweep(&wavy_spec(), &bars, &[], None).unwrap();
+    assert_eq!(with, without);
+}
+
+#[test]
+fn checking_a_spec_without_data_finds_what_the_run_would_refuse_first() {
+    let bars = wavy_bars(500);
+    assert_eq!(wavy_spec().check(), Ok(()));
+    let mut bad = wavy_spec();
+    bad.axes.push(values("fast", &ints(&[2])));
+    assert!(matches!(bad.check(), Err(TesterError::InvalidSpace { .. })));
+    assert_eq!(bad.check(), sweep(&bad, &bars, &[], None).map(|_| ()));
+    let mut unknown = wavy_spec();
+    unknown.base.strategy = "nope".into();
+    assert_eq!(
+        unknown.check(),
+        sweep(&unknown, &bars, &[], None).map(|_| ())
+    );
+
+    let mut warm = wavy_spec();
+    warm.base.warmup_from = Some(T0);
+    let oos = OosSpec {
+        sweep: warm.clone(),
+        split: Split::Fraction(0.5),
+    };
+    assert!(matches!(oos.check(), Err(TesterError::InvalidSpec(_))));
+    assert_eq!(
+        oos.check(),
+        out_of_sample(&oos, &bars, &[], None).map(|_| ())
+    );
+    let mut wf = wf_spec(WindowMode::Rolling);
+    assert_eq!(wf.check(), Ok(()));
+    wf.sweep = warm;
+    assert_eq!(wf.check(), walk_forward(&wf, &bars, &[], None).map(|_| ()));
 }
