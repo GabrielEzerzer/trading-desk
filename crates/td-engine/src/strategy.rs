@@ -10,7 +10,9 @@ use crate::{AttachedStop, Broker, Order, OrderRejected, OrderStatus, Portfolio};
 ///
 /// All callbacks run at a bar's close, after that bar's fills, funding and equity mark. On each
 /// bar the session calls `on_start` (first bar only), then `on_fill` once per fill on this bar,
-/// then `on_bar`. Orders submitted from any of them can first fill on the next bar.
+/// then `on_bar`. Orders submitted from any of them can first fill on the next bar. Warm-up bars
+/// ([`crate::Session::warm_up`]) get the same calls, but nothing fills on them and every order
+/// submitted is rejected.
 pub trait Strategy: Send {
     fn on_start(&mut self, _ctx: &mut Context) {}
     fn on_bar(&mut self, ctx: &mut Context, bar: &Candle);
@@ -27,7 +29,11 @@ pub struct Context<'a> {
     pub(crate) portfolio: &'a Portfolio,
     pub(crate) broker: &'a mut dyn Broker,
     pub(crate) orders: &'a mut Vec<Order>,
+    pub(crate) warming_up: bool,
 }
+
+/// The reason orders submitted on a warm-up bar are rejected with.
+const WARM_UP: &str = "warm-up: trading is disabled";
 
 impl Context<'_> {
     /// The bars seen so far, oldest first, ending at the current bar.
@@ -80,13 +86,20 @@ impl Context<'_> {
         self.broker.open_orders()
     }
 
+    /// True on a warm-up bar ([`crate::Session::warm_up`]), where every order submitted is
+    /// rejected, so a strategy can skip submitting.
+    pub fn is_warming_up(&self) -> bool {
+        self.warming_up
+    }
+
     /// Rounds the order to the instrument's lot and tick, validates it and sends it to the
     /// broker. Quantities round down; limit prices round in the order's favour-safe direction
     /// (buys down, sells up) so an order never trades worse than asked; triggers round to the
     /// nearest tick. On spot, a sell must fit in the holding less the open sells, and a buy must
     /// fit in the cash together with the open buys: each buy is valued at its limit price, its
-    /// trigger, or this bar's close for a market order, plus the taker fee. A rejected order is
-    /// recorded with its reason and returned as an error.
+    /// trigger, or this bar's close for a market order, plus the taker fee. Every order is
+    /// rejected on a warm-up bar. A rejected order is recorded with its reason and returned as an
+    /// error.
     pub fn submit(&mut self, request: OrderRequest) -> Result<OrderId, OrderRejected> {
         self.send(request, None).map(|(id, _)| id)
     }
@@ -126,6 +139,9 @@ impl Context<'_> {
         let id = OrderId(self.orders.len() as u64 + 1);
         let (submitted_at, decision_close) = (self.bar().open_time, self.bar().close);
         let (request, mut check) = self.prepare(request);
+        if self.warming_up {
+            check = Err(WARM_UP.into());
+        }
         let attached_stop = stop_trigger.map(|trigger| AttachedStop {
             id: OrderId(id.0 + 1),
             trigger,

@@ -11,6 +11,9 @@
 //! charged, equity is marked at the close, then the strategy sees the bar. An order the strategy
 //! submits while handling bar t can first fill on bar t+1, and the strategy only ever sees bars up
 //! to the current one, because the session does not have later bars.
+//!
+//! Before the first live bar, [`Session::warm_up`] can feed bars that only give the strategy the
+//! history its indicators need: the strategy sees them as usual, but cannot trade on them.
 
 mod broker;
 mod error;

@@ -117,7 +117,8 @@ impl Strategy for DonchianBreakout {
     fn on_bar(&mut self, ctx: &mut Context, bar: &Candle) {
         let bars = ctx.bars();
         let n = bars.len();
-        if n < self.entry.max(self.exit).max(self.atr_period) + 1 {
+        // Send nothing while warming up: it would only be rejected.
+        if ctx.is_warming_up() || n < self.entry.max(self.exit).max(self.atr_period) + 1 {
             return;
         }
         // Wait while an entry or exit order is in flight.

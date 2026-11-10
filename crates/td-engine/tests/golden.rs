@@ -6,10 +6,10 @@ mod common;
 use std::sync::{Arc, Mutex};
 
 use common::*;
-use td_core::{Candle, Liquidity, OrderId, OrderType, Side, Timeframe};
+use td_core::{Candle, InstrumentKind, Liquidity, OrderId, OrderType, Side, Timeframe};
 use td_engine::{
-    AttachedStop, Context, EngineError, OrderStatus, Params, Session, Strategy, build_strategy,
-    run_backtest,
+    AttachedStop, Context, EngineError, OrderStatus, Params, Portfolio, Session, Strategy,
+    build_strategy, run_backtest,
 };
 
 fn run(
@@ -1276,4 +1276,163 @@ fn reference_strategies_size_full_spot_entries_to_pass_the_cash_check() {
         assert_eq!(entry.side, Side::Buy, "{name}");
         approx(entry.qty, qty);
     }
+}
+
+#[test]
+fn warm_up_bars_count_as_history_and_the_strategy_trades_on_the_first_live_bar() {
+    let p = Params::new()
+        .with("fast", td_engine::ParamValue::Int(3))
+        .with("slow", td_engine::ParamValue::Int(8));
+    let strategy = build_strategy("sma_cross", &p).unwrap();
+    let mut s = Session::new(strategy, spot(), Timeframe::M1, config(0.0)).unwrap();
+    let bars = up_then_down();
+    // The slow average needs 8 bars: warm up on bars 0 to 7. Bar 7 has them, but the strategy
+    // does not trade while warming up. Warm-up records no equity and leaves the portfolio as it
+    // started.
+    for b in &bars[..8] {
+        s.warm_up(*b, &[]).unwrap();
+    }
+    assert_eq!(s.bars().len(), 8);
+    assert!(s.orders().is_empty(), "{:?}", s.orders());
+    assert!(s.equity().is_empty());
+    assert_eq!(
+        s.portfolio(),
+        &Portfolio::new(InstrumentKind::Spot, 10_000.0)
+    );
+    // Bar 8 is the first live bar. The fast average of the closes 112, 114 and 116 is 114, above
+    // the slow average of the closes 102 to 116, 109, so the strategy buys 95% of the 10000
+    // equity at the close of 116: 9500 / 116 = 81.896 after rounding down to the lot (the cash
+    // cap, 9950 / (116 * 1.002) = 85.604, does not bind). The buy fills at bar 9's open of 118
+    // with the 0.2% taker fee: 81.896 * 118 = 9663.728, fee 19.327456. Cash is then
+    // 10000 - 9663.728 - 19.327456 = 316.944544, and equity at bar 9's close of 118 is
+    // 316.944544 + 9663.728 = 9980.672544.
+    s.on_bar(bars[8], &[]).unwrap();
+    s.on_bar(bars[9], &[]).unwrap();
+    assert_eq!(s.orders()[0].submitted_at, 8 * MIN);
+    let f = s.fills();
+    assert_eq!(f.len(), 1);
+    assert_eq!((f[0].time, f[0].side), (9 * MIN, Side::Buy));
+    approx(f[0].price, 118.0);
+    approx(f[0].qty, 81.896);
+    approx(f[0].fee, 19.327456);
+    approx(s.portfolio().cash(), 316.944544);
+    // The equity series starts at the first live bar.
+    let times: Vec<i64> = s.equity().iter().map(|p| p.time).collect();
+    assert_eq!(times, vec![8 * MIN, 9 * MIN]);
+    let e = equity(&s);
+    approx(e[0], 10_000.0);
+    approx(e[1], 9980.672544);
+}
+
+#[test]
+fn orders_submitted_while_warming_up_are_rejected_and_nothing_is_charged() {
+    const WARM_UP: &str = "warm-up: trading is disabled";
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let seen = log.clone();
+    let strategy = steps(move |ctx, n| {
+        let entry = req(ctx.instrument(), Side::Buy, 1.0, OrderType::Market);
+        let plain = ctx.submit(entry.clone()).map_err(|e| e.reason);
+        let stop = ctx.bar().close - 5.0;
+        let with_stop = ctx.submit_with_stop(entry, stop).map_err(|e| e.reason);
+        seen.lock()
+            .unwrap()
+            .push((n, ctx.is_warming_up(), plain, with_stop));
+    });
+    let mut s = Session::new(strategy, perp(), Timeframe::M1, config(0.0)).unwrap();
+    // The funding passed with a warm-up bar is checked but not charged, and the portfolio is not
+    // even marked: it is exactly as it started.
+    s.warm_up(bar(0, 100.0, 101.0, 99.0, 100.0), &[(0, 0.01)])
+        .unwrap();
+    s.warm_up(bar(1, 100.0, 101.0, 99.0, 100.0), &[]).unwrap();
+    assert_eq!(
+        s.portfolio(),
+        &Portfolio::new(InstrumentKind::Perpetual, 10_000.0)
+    );
+    assert!(s.fills().is_empty() && s.open_orders().is_empty() && s.equity().is_empty());
+    // Each rejected order is recorded with its reason, and an entry's stop is not.
+    let o = s.orders();
+    assert_eq!(o.len(), 4);
+    for (order, at) in o.iter().zip([0, 0, MIN, MIN]) {
+        assert_eq!(order.status, OrderStatus::Rejected(WARM_UP.into()));
+        assert_eq!((order.submitted_at, order.attached_stop), (at, None));
+    }
+    // Live, both go through: order 5, then order 6 with its stop as order 7.
+    s.on_bar(bar(2, 100.0, 101.0, 99.0, 100.0), &[]).unwrap();
+    let log = log.lock().unwrap();
+    let reason = || WARM_UP.to_string();
+    assert_eq!(log[0], (0, true, Err(reason()), Err(reason())));
+    assert_eq!(log[1], (1, true, Err(reason()), Err(reason())));
+    assert_eq!(
+        log[2],
+        (2, false, Ok(OrderId(5)), Ok((OrderId(6), OrderId(7))))
+    );
+}
+
+#[test]
+fn warm_up_bars_join_the_history_and_must_all_come_before_the_first_live_bar() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let strategy = Box::new(Recorder(seen.clone()));
+    let mut s = Session::new(strategy, spot(), Timeframe::M1, config(0.0)).unwrap();
+    let flat = |n| bar(n, 100.0, 101.0, 99.0, 100.0);
+    // Warm-up bars are checked like live ones, and later bars are checked against them.
+    s.warm_up(flat(0), &[]).unwrap();
+    assert_eq!(
+        s.warm_up(flat(0), &[]),
+        Err(EngineError::DuplicateBar { time: 0 })
+    );
+    assert_eq!(
+        s.warm_up(flat(1), &[(MIN, 0.01)]),
+        Err(EngineError::FundingOnSpot)
+    );
+    s.warm_up(flat(1), &[]).unwrap();
+    assert_eq!(
+        s.on_bar(flat(1), &[]),
+        Err(EngineError::DuplicateBar { time: MIN })
+    );
+    s.on_bar(flat(2), &[]).unwrap();
+    s.on_bar(flat(3), &[]).unwrap();
+    // Once a bar has been fed live, warming up is an error and changes nothing.
+    assert_eq!(s.warm_up(flat(4), &[]), Err(EngineError::WarmUpAfterLive));
+    assert_eq!(s.bars().len(), 4);
+    // on_start runs once, on the first warm-up bar, and on_bar on every bar, warm-up or live,
+    // with the history ending at that bar.
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![
+            (1, 0, -1),
+            (1, 0, 0),
+            (2, MIN, MIN),
+            (3, 2 * MIN, 2 * MIN),
+            (4, 3 * MIN, 3 * MIN)
+        ]
+    );
+}
+
+#[test]
+fn donchian_sends_nothing_while_warming_up_and_enters_on_the_first_live_bar() {
+    let p = Params::new()
+        .with("entry", td_engine::ParamValue::Int(5))
+        .with("exit", td_engine::ParamValue::Int(3))
+        .with("atr_period", td_engine::ParamValue::Int(3));
+    let strategy = build_strategy("donchian_breakout", &p).unwrap();
+    let mut s = Session::new(strategy, perp(), Timeframe::M1, config(0.0)).unwrap();
+    let bars = up_then_down();
+    // Bar 5's close of 110 breaks the 5-bar high of 109, but bar 5 is a warm-up bar, so the
+    // strategy sends nothing, not even an order to be rejected.
+    for b in &bars[..6] {
+        s.warm_up(*b, &[]).unwrap();
+    }
+    assert!(s.orders().is_empty(), "{:?}", s.orders());
+    // Live bar 6's close of 112 breaks the 5-bar high of 111, from bars 1 to 5. ATR is 3, so the
+    // entry goes out on bar 6 with its stop 2 * 3 = 6 under the close, at 106.
+    s.on_bar(bars[6], &[]).unwrap();
+    let entry = &s.orders()[0];
+    assert_eq!(entry.submitted_at, 6 * MIN);
+    assert_eq!(
+        entry.attached_stop,
+        Some(AttachedStop {
+            id: OrderId(2),
+            trigger: 106.0
+        })
+    );
 }
