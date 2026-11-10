@@ -1,5 +1,6 @@
 //! The trading engine: the `Strategy` trait, the event-driven simulation on candles, the fill
-//! model, the broker and the portfolio.
+//! model, the broker and the portfolio, and the backtest runner with its metrics and saved
+//! results.
 //!
 //! The engine is push-driven. A [`Session`] is fed one closed bar at a time with
 //! [`Session::on_bar`]; a backtest ([`run_backtest`]) is a loop that feeds stored bars, and paper
@@ -14,18 +15,26 @@
 mod broker;
 mod error;
 mod fill;
+pub mod metrics;
 mod params;
 mod portfolio;
 mod registry;
+mod results;
+mod runner;
 mod session;
 mod strategies;
 mod strategy;
+mod trades;
 
 pub use broker::{Broker, BrokerEvent, Order, OrderStatus, SimBroker};
 pub use error::{EngineError, OrderRejected};
 pub use fill::{CandleFillModel, FillCheck, FillModel};
+pub use metrics::MetricsReport;
 pub use params::{ParamKind, ParamSpec, ParamValue, Params};
 pub use portfolio::Portfolio;
 pub use registry::{StrategyEntry, build_strategy, find_strategy, strategies};
+pub use results::{RunId, RunSummary, StoreError, list, load, save};
+pub use runner::{BacktestConfig, BacktestResult, Benchmark, Rerun, data_fingerprint, rerun, run};
 pub use session::{EquityPoint, Session, SessionConfig, run_backtest};
 pub use strategy::{Context, Strategy};
+pub use trades::{Trade, TradeSide, build_trades};

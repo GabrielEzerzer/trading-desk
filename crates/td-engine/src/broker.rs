@@ -1,4 +1,4 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use td_core::{
     Candle, FeeSchedule, Fill, Instrument, Liquidity, Millis, OrderId, OrderRequest, OrderType,
     Side, TimeInForce,
@@ -7,7 +7,7 @@ use td_core::{
 use crate::{FillCheck, FillModel};
 
 /// An order the session accepted or rejected, with its request as rounded at submission.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Order {
     pub id: OrderId,
     pub request: OrderRequest,
@@ -16,7 +16,7 @@ pub struct Order {
     pub status: OrderStatus,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "status", content = "reason", rename_all = "snake_case")]
 pub enum OrderStatus {
     Open,

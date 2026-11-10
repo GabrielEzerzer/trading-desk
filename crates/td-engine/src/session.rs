@@ -1,4 +1,6 @@
-use serde::Serialize;
+use std::ops::Range;
+
+use serde::{Deserialize, Serialize};
 use td_core::{Candle, FeeSchedule, Fill, Instrument, InstrumentKind, Millis, Timeframe};
 
 use crate::{
@@ -17,7 +19,7 @@ pub struct SessionConfig {
 }
 
 /// Equity at the close of the bar that opened at `time`.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct EquityPoint {
     pub time: Millis,
     pub equity: f64,
@@ -218,20 +220,40 @@ pub fn run_backtest(
     funding: &[(Millis, f64)],
     config: SessionConfig,
 ) -> Result<Session, EngineError> {
-    let mut funding = funding.to_vec();
-    funding.sort_by_key(|&(time, _)| time);
+    let funding = sorted_funding(funding);
+    let ranges = funding_ranges(timeframe, bars, &funding);
     let mut session = Session::new(strategy, instrument, timeframe, config)?;
-    let mut next = 0;
-    for bar in bars {
-        let end = bar.open_time + timeframe.duration_ms();
-        while next < funding.len() && funding[next].0 < bar.open_time {
-            next += 1;
-        }
-        let start = next;
-        while next < funding.len() && funding[next].0 < end {
-            next += 1;
-        }
-        session.on_bar(*bar, &funding[start..next])?;
+    for (bar, range) in bars.iter().zip(ranges) {
+        session.on_bar(*bar, &funding[range])?;
     }
     Ok(session)
+}
+
+pub(crate) fn sorted_funding(funding: &[(Millis, f64)]) -> Vec<(Millis, f64)> {
+    let mut funding = funding.to_vec();
+    funding.sort_by_key(|&(time, _)| time);
+    funding
+}
+
+/// For each bar, the range of `funding` (sorted by time) that falls inside the bar's time window.
+/// Events before the first bar or in a gap between bars belong to no range.
+pub(crate) fn funding_ranges(
+    timeframe: Timeframe,
+    bars: &[Candle],
+    funding: &[(Millis, f64)],
+) -> Vec<Range<usize>> {
+    let mut next = 0;
+    bars.iter()
+        .map(|bar| {
+            let end = bar.open_time + timeframe.duration_ms();
+            while next < funding.len() && funding[next].0 < bar.open_time {
+                next += 1;
+            }
+            let start = next;
+            while next < funding.len() && funding[next].0 < end {
+                next += 1;
+            }
+            start..next
+        })
+        .collect()
 }

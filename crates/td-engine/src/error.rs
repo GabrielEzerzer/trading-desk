@@ -24,6 +24,9 @@ pub enum EngineError {
     #[error("funding was given for a spot instrument")]
     FundingOnSpot,
 
+    #[error("no bars open between {from} and {to}")]
+    NoBarsInRange { from: Millis, to: Millis },
+
     #[error("invalid session config: {0}")]
     InvalidConfig(&'static str),
 
