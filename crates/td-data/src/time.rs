@@ -78,6 +78,34 @@ pub fn round_to_minute(t: Millis) -> Millis {
     (t + MINUTE / 2).div_euclid(MINUTE) * MINUTE
 }
 
+/// How far a stamp can be from the minute it rounds to (see [`round_to_minute`]). A venue is asked
+/// for funding stamped this far either side of a range, so a rate stamped just before the range
+/// starts, which rounds into it, is not lost between two adjacent fetches.
+pub(crate) const ROUNDING_PAD: Millis = MINUTE / 2;
+
+/// Funding rates fetched as the venue stamps them, in any order, as `(funding time, rate)` on the
+/// minute in `[from, to)`, oldest first. Two stamps on one minute keep the later, as
+/// [`crate::Store`] does when it reads a file.
+pub(crate) fn funding_on_the_minute(
+    mut stamped: Vec<(Millis, f64)>,
+    from: Millis,
+    to: Millis,
+) -> Vec<(Millis, f64)> {
+    stamped.sort_by_key(|&(t, _)| t);
+    let mut rates: Vec<(Millis, f64)> = Vec::with_capacity(stamped.len());
+    for (t, rate) in stamped {
+        let t = round_to_minute(t);
+        if !(from..to).contains(&t) {
+            continue;
+        }
+        match rates.last_mut() {
+            Some(last) if last.0 == t => *last = (t, rate),
+            _ => rates.push((t, rate)),
+        }
+    }
+    rates
+}
+
 /// Formats as `YYYY-MM-DD HH:MM` UTC.
 pub fn format_minute(t: Millis) -> String {
     let (year, month, day) = civil_from_days(t.div_euclid(DAY));
