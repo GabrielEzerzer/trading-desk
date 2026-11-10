@@ -222,12 +222,14 @@ impl SharedStream {
         let connected = Arc::new(AtomicBool::new(false));
         let (reader_tx, mut reader_rx) = mpsc::channel(FRAME_BUFFER);
         let (out, flag) = (frames.clone(), connected.clone());
-        let socket = match source.live() {
+        // Wrapped here, not inside the task below: a stream dropped before that task first runs
+        // must still abort the socket task, or it would connect once with nobody listening.
+        let socket = AbortOnDrop(match source.live() {
             Ok(live) => tokio::spawn(ws::run_reader(url, live.greeting(&id), reader_tx)),
             Err(e) => tokio::spawn(refuse(e.to_string(), reader_tx)),
-        };
+        });
         let reader = tokio::spawn(async move {
-            let _socket = AbortOnDrop(socket);
+            let _socket = socket;
             while let Some(inbound) = reader_rx.recv().await {
                 match inbound {
                     Inbound::Connected => flag.store(true, Ordering::SeqCst),
