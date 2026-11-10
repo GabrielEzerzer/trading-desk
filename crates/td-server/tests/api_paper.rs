@@ -2,6 +2,7 @@
 //! in-process on 127.0.0.1:0, a temporary data directory, a scripted venue stream on 127.0.0.1 and
 //! a fake REST source. No network.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -18,7 +19,7 @@ use td_engine::{ParamValue, Params};
 use td_server::api::auth::Token;
 use td_server::api::sessions::SessionState;
 use td_server::api::source::{LiveSource, MarketSource};
-use td_server::api::ws::ServerMessage;
+use td_server::api::ws::{MAX_CANDLE_TOPICS, ServerMessage};
 use td_server::api::{ApiConfig, JOB_GRACE, Server};
 use td_server::{Funding, PaperConfig, PaperSession, SessionEvent};
 use tempfile::TempDir;
@@ -261,8 +262,9 @@ impl LiveSource for Live {
         self.rest.clone()
     }
 
-    fn stream_url(&self, id: &InstrumentId) -> String {
-        assert_eq!(*id, instrument_id(), "only the test instrument streams");
+    /// Every instrument streams from the one scripted venue; only the test instrument's frames are
+    /// ever sent.
+    fn stream_url(&self, _: &InstrumentId) -> String {
         self.venue.url.clone()
     }
 }
@@ -426,6 +428,53 @@ impl Ws {
                 }
                 Some(Ok(Message::Close(_)) | Err(_)) | None => panic!("the socket closed"),
                 Some(Ok(_)) => {}
+            }
+        }
+    }
+
+    /// Reads a `session:` subscription, whose last bar so far is `last`, until it has sent the live
+    /// bar at `open_time`. Returns how many full states came, the minute of the latest one's last
+    /// bar (0 for none) and the live bars sent after it. Fails on a bar that is not the minute
+    /// after the one before it, counting the state's last bar.
+    async fn session_until(
+        &mut self,
+        mut last: Option<Millis>,
+        open_time: Millis,
+    ) -> (usize, i64, Vec<Candle>) {
+        let (mut states, mut from, mut bars) = (0, 0, Vec::new());
+        loop {
+            match self.next().await {
+                ServerMessage::SessionState { session } => {
+                    states += 1;
+                    bars.clear();
+                    last = session.last_bar.map(|b| b.open_time);
+                    from = last.map_or(0, |t| (t - T0) / MIN);
+                    if last >= Some(open_time) {
+                        return (states, from, bars);
+                    }
+                }
+                ServerMessage::Session {
+                    event:
+                        SessionEvent::Bar {
+                            bar,
+                            warm_up: false,
+                            ..
+                        },
+                    ..
+                } => {
+                    assert_eq!(
+                        Some(bar.open_time - MIN),
+                        last,
+                        "a bar out of turn: {bar:?} after {last:?}"
+                    );
+                    last = Some(bar.open_time);
+                    bars.push(bar);
+                    if bar.open_time >= open_time {
+                        return (states, from, bars);
+                    }
+                }
+                ServerMessage::Session { .. } => {}
+                other => panic!("expected a session message, got {other:?}"),
             }
         }
     }
@@ -633,17 +682,185 @@ async fn a_session_running_when_the_server_stopped_resumes_after_a_restart() {
     let (_, replayed) = api.get(&format!("/sessions/{id}")).await;
     assert_same_state(&replayed, &reference(&minutes(0..20)).1);
 
+    // A subscriber that stays connected through the resume, a stop and another resume.
+    let topic = format!("session:{id}");
+    let mut ws = api.websocket().await;
+    ws.subscribe(&topic).await;
+    let ServerMessage::SessionState { session: replayed } = ws.next().await else {
+        panic!("the state comes right after subscribed");
+    };
+    assert_eq!(replayed.last_bar, Some(minute(19)));
+
     let (status, resumed) = api.post(&format!("/sessions/{id}/resume"), "").await;
     assert_eq!(status, StatusCode::OK, "{resumed}");
     let (status, body) = api.post(&format!("/sessions/{id}/resume"), "").await;
     assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(body["error"]["code"], "already_running");
+    // The resumed session was replayed from its log: the subscriber gets its state first.
+    match ws.next().await {
+        ServerMessage::SessionState { session } => {
+            assert_eq!(session.last_bar, Some(minute(19)));
+        }
+        other => panic!("expected the resumed session's state, got {other:?}"),
+    }
     api.until_live(&id).await;
     venue.until_open(1).await;
     // Minutes 20 to 24 went by while it was stopped: the feed backfills them.
     venue.send(&minutes(25..40));
+    let (states, _, bars) = ws.session_until(Some(T0 + 19 * MIN), T0 + 39 * MIN).await;
+    assert_eq!((states, bars), (0, minutes(20..40)), "each live bar once");
     let state = api.until_bar(&id, T0 + 39 * MIN).await;
     assert_same_state(&state, &reference(&minutes(0..40)).1);
+
+    let (status, stopped) = api.post(&format!("/sessions/{id}/stop"), "").await;
+    assert_eq!(status, StatusCode::OK, "{stopped}");
+    venue.until_open(0).await;
+    let (status, resumed) = api.post(&format!("/sessions/{id}/resume"), "").await;
+    assert_eq!(status, StatusCode::OK, "{resumed}");
+    api.until_live(&id).await;
+    venue.until_open(1).await;
+    venue.send(&minutes(45..50));
+    // The stop shows, then the state of the session resumed again, then minutes 40 to 49 once.
+    let (states, from, bars) = ws.session_until(Some(T0 + 39 * MIN), T0 + 49 * MIN).await;
+    assert_eq!(states, 1);
+    assert!(
+        from >= 39,
+        "the state is the resumed session's, at minute {from}"
+    );
+    assert_eq!(
+        bars,
+        minutes(from + 1..50),
+        "each live bar after the state once"
+    );
+    let state = api.until_bar(&id, T0 + 49 * MIN).await;
+    assert_same_state(&state, &reference(&minutes(0..50)).1);
+    api.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn nothing_an_old_subscription_queued_arrives_after_a_resubscribe_or_an_unsubscribe() {
+    const CYCLES: usize = 100;
+    let dir = tempfile::tempdir().expect("temp dir");
+    let venue = Exchange::start().await;
+    let api = Api::start(&dir, &venue).await;
+    let id = api.start_session().await;
+    api.until_live(&id).await;
+    venue.until_open(1).await;
+    let session = format!("session:{id}");
+    let candles = format!("candles:{INSTRUMENT}:1m");
+    let mut ws = api.websocket().await;
+    // Bars keep coming while the client leaves and rejoins both topics over and over without
+    // reading, as a React app in StrictMode does on mount: a bar every other round.
+    for round in 0..CYCLES {
+        if round % 2 == 0 {
+            venue.send(&[minute(round as i64 / 2)]);
+        }
+        // Each round leaves and rejoins both, and subscribes to each again on top.
+        for topic in [&session, &candles] {
+            for kind in ["unsubscribe", "subscribe", "subscribe"] {
+                ws.send(json!({ "type": kind, "topic": topic })).await;
+            }
+        }
+    }
+
+    // Every message, checked: nothing of a topic between its unsubscribed and its next
+    // subscribed, and after each session state, each later bar once and in turn.
+    let mut subscribed: HashMap<String, usize> = HashMap::new();
+    let mut open: HashMap<String, bool> = HashMap::new();
+    let mut last_bar: Option<Millis> = None;
+    let mut last_candle: Option<Millis> = None;
+    loop {
+        let message = ws.next().await;
+        match &message {
+            ServerMessage::Subscribed { topic } => {
+                *subscribed.entry(topic.clone()).or_default() += 1;
+                open.insert(topic.clone(), true);
+                if *topic == candles {
+                    last_candle = None;
+                }
+            }
+            ServerMessage::Unsubscribed { topic } => {
+                open.insert(topic.clone(), false);
+            }
+            ServerMessage::SessionState { session: state } => {
+                assert_eq!(
+                    open.get(&session),
+                    Some(&true),
+                    "a state after unsubscribed"
+                );
+                last_bar = state.last_bar.map(|b| b.open_time);
+            }
+            ServerMessage::Session { event, .. } => {
+                assert_eq!(
+                    open.get(&session),
+                    Some(&true),
+                    "{event:?} after unsubscribed"
+                );
+                if let SessionEvent::Bar {
+                    bar,
+                    warm_up: false,
+                    ..
+                } = event
+                {
+                    assert_eq!(
+                        Some(bar.open_time - MIN),
+                        last_bar,
+                        "a bar out of turn: {bar:?}"
+                    );
+                    last_bar = Some(bar.open_time);
+                }
+            }
+            ServerMessage::Candle { topic, candle } => {
+                assert_eq!(*topic, candles);
+                assert_eq!(
+                    open.get(&candles),
+                    Some(&true),
+                    "{candle:?} after unsubscribed"
+                );
+                assert!(
+                    last_candle < Some(candle.open_time),
+                    "{candle:?} again or out of order after {last_candle:?}"
+                );
+                last_candle = Some(candle.open_time);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        let rejoined = |topic: &str| subscribed.get(topic) == Some(&(2 * CYCLES));
+        if rejoined(&session) && rejoined(&candles) && last_bar >= Some(T0 + 49 * MIN) {
+            break;
+        }
+    }
+    api.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_connection_holds_a_limited_number_of_candle_topics() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let venue = Exchange::start().await;
+    let api = Api::start(&dir, &venue).await;
+    let topic = |i: usize| format!("candles:binance:T{i}USDT:spot:1m");
+    let mut ws = api.websocket().await;
+    for i in 0..MAX_CANDLE_TOPICS {
+        ws.subscribe(&topic(i)).await;
+    }
+    ws.send(json!({ "type": "subscribe", "topic": topic(MAX_CANDLE_TOPICS) }))
+        .await;
+    match ws.next().await {
+        ServerMessage::Error { error } => {
+            assert_eq!(error.code, "too_many_topics");
+            assert!(error.message.contains("unsubscribe"), "{}", error.message);
+        }
+        other => panic!("expected too_many_topics, got {other:?}"),
+    }
+    // Subscribing again to one it holds replaces it; leaving one makes room for another.
+    ws.subscribe(&topic(0)).await;
+    ws.unsubscribe(&topic(0)).await;
+    ws.subscribe(&topic(MAX_CANDLE_TOPICS)).await;
+    // Other topics do not count.
+    ws.subscribe("jobs").await;
+    venue.until_open(MAX_CANDLE_TOPICS).await;
+    drop(ws);
+    venue.until_open(0).await;
     api.shutdown().await;
 }
 

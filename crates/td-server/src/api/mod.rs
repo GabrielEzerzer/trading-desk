@@ -22,7 +22,8 @@
 //!     orders, fills and trades so far.
 //!   - `POST /sessions/{id}/stop`: 200 once stopped, 409 `not_running` if it was not running.
 //!   - `POST /sessions/{id}/resume`: replays a stopped session and starts it again, backfilling
-//!     what it missed; 409 `already_running` if it is running.
+//!     what it missed; 409 `already_running` if it is running. A session that ended on its own
+//!     with an error counts as stopped. Its `session:` subscribers get the resumed state.
 //!
 //!   An unknown session id is a 404.
 //! - `GET /ws`: topic subscriptions: `jobs`, `candles:...` and `session:<id>` (see [`ws`]).

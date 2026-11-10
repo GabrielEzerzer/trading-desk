@@ -81,7 +81,9 @@ pub enum Status {
 
 /// What a session reports as it runs, once [`PaperSession::set_events`] gives it a channel. Sent
 /// while the session is locked, so a reader that subscribes and takes the state under the same lock
-/// sees each change exactly once. Replaying the log reports nothing.
+/// sees each change exactly once. A bar's events are sent once its line is in the log, so a
+/// subscriber never sees a bar that a resume would fetch and report again. Replaying the log
+/// reports nothing.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum SessionEvent {
@@ -106,6 +108,15 @@ pub enum SessionEvent {
     },
     Status {
         status: Status,
+    },
+    /// The live feed left out the bucket opening at this time: too many of its minutes were
+    /// missing.
+    Dropped {
+        open_time: Millis,
+    },
+    /// A problem that did not stop the session, as [`PaperSession::warnings`] keeps it.
+    Warning {
+        message: String,
     },
 }
 
@@ -238,11 +249,11 @@ impl PaperSession {
         Ok(paper)
     }
 
-    /// Feeds one bar with its funding to the engine session, then appends it to the log. A
-    /// warm-up bar goes through [`Session::warm_up`], with trading disabled. A live bar's line is
-    /// synced to disk before this returns; warm-up lines are synced with the first live one. On
-    /// an engine error nothing changes; on a log error the bar has been applied but may not be
-    /// saved, so stop the session.
+    /// Feeds one bar with its funding to the engine session, then appends it to the log and
+    /// reports its events. A warm-up bar goes through [`Session::warm_up`], with trading disabled.
+    /// A live bar's line is synced to disk before this returns; warm-up lines are synced with the
+    /// first live one. On an engine error nothing changes; on a log error the bar has been applied
+    /// but may not be saved and is not reported, so stop the session.
     pub fn feed(
         &mut self,
         bar: Candle,
@@ -256,9 +267,7 @@ impl PaperSession {
         };
         let before = self.events.as_ref().map(|_| self.mark());
         self.apply(&fed)?;
-        if let Some(before) = before {
-            self.report(&fed, before);
-        }
+        let events = before.map(|before| self.report(&fed, before));
         let mut line = serde_json::to_string(&fed).map_err(|e| PaperError::BadFile {
             path: self.log_path.clone(),
             reason: e.to_string(),
@@ -274,7 +283,11 @@ impl PaperSession {
                     self.log.sync_data()
                 }
             })
-            .map_err(PaperError::io(&self.log_path))
+            .map_err(PaperError::io(&self.log_path))?;
+        for event in events.into_iter().flatten() {
+            self.emit(event);
+        }
+        Ok(())
     }
 
     /// Where the orders and fills stand, to report what a bar changes.
@@ -292,8 +305,8 @@ impl PaperSession {
         }
     }
 
-    /// Sends the events of the bar just applied.
-    fn report(&self, fed: &FedBar, before: Mark) {
+    /// The events of the bar just applied.
+    fn report(&self, fed: &FedBar, before: Mark) -> Vec<SessionEvent> {
         let orders = self.session.orders();
         let changed = before
             .pending
@@ -322,9 +335,7 @@ impl PaperSession {
             warm_up: fed.warm_up,
             equity: (!fed.warm_up).then(|| self.session.portfolio().equity()),
         });
-        for event in events {
-            self.emit(event);
-        }
+        events
     }
 
     /// Sends an event to the channel, if there is one. No one listening is fine.
@@ -430,6 +441,7 @@ impl PaperSession {
 
     pub(crate) fn push_dropped(&mut self, open_time: Millis) {
         self.dropped.push(open_time);
+        self.emit(SessionEvent::Dropped { open_time });
     }
 
     /// Things that went wrong without stopping the session: a torn log line, a frame that did not
@@ -445,7 +457,8 @@ impl PaperSession {
         if self.warnings.len() == KEEP {
             self.warnings.remove(0);
         }
-        self.warnings.push(warning);
+        self.warnings.push(warning.clone());
+        self.emit(SessionEvent::Warning { message: warning });
     }
 }
 
@@ -524,9 +537,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_strategy_cannot_trade_on_warm_up_bars() {
-        let config = PaperConfig {
+    fn config() -> PaperConfig {
+        PaperConfig {
             strategy: "sma_cross".into(),
             params: Params::new(),
             instrument: Instrument {
@@ -550,7 +562,12 @@ mod tests {
             starting_cash: 10_000.0,
             slippage_bps: 0.0,
             fees: None,
-        };
+        }
+    }
+
+    #[test]
+    fn a_strategy_cannot_trade_on_warm_up_bars() {
+        let config = config();
         let dir = tempfile::tempdir().expect("temp dir");
         let mut paper = PaperSession::create(dir.path(), "warm", config.clone()).expect("creates");
         // The registry has no strategy that trades while warming up, so swap one in.
@@ -607,5 +624,49 @@ mod tests {
                 .count(),
             5
         );
+    }
+
+    #[test]
+    fn a_bar_whose_line_cannot_be_written_is_not_reported() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut paper = PaperSession::create(dir.path(), "torn", config()).expect("creates");
+        let (events, mut rx) = broadcast::channel(16);
+        paper.set_events(events);
+        paper.feed(bar(0), Vec::new(), false).expect("live bar");
+        assert!(matches!(rx.try_recv(), Ok(SessionEvent::Bar { .. })));
+
+        // A handle that cannot write: the next line fails.
+        paper.log = File::open(&paper.log_path).expect("opens read-only");
+        assert!(matches!(
+            paper.feed(bar(1), Vec::new(), false),
+            Err(PaperError::Io { .. })
+        ));
+        assert_eq!(
+            rx.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty),
+            "a bar that is not in the log was reported"
+        );
+    }
+
+    #[test]
+    fn dropped_buckets_and_warnings_are_reported() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut paper = PaperSession::create(dir.path(), "notes", config()).expect("creates");
+        let (events, mut rx) = broadcast::channel(16);
+        paper.set_events(events);
+        paper.push_dropped(5 * MIN);
+        paper.warn("a frame did not read".into());
+        assert_eq!(
+            rx.try_recv(),
+            Ok(SessionEvent::Dropped { open_time: 5 * MIN })
+        );
+        assert_eq!(
+            rx.try_recv(),
+            Ok(SessionEvent::Warning {
+                message: "a frame did not read".into()
+            })
+        );
+        assert_eq!(paper.dropped(), [5 * MIN]);
+        assert_eq!(paper.warnings(), ["a frame did not read"]);
     }
 }

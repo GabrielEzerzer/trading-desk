@@ -8,6 +8,10 @@
 //!
 //! Sessions run on the server's shared live streams ([`super::live`]), so a session and the
 //! `candles:` topics of its instrument use one upstream connection.
+//!
+//! Each run of a session reports its events on a channel of its own. A resume opens a new one and
+//! drops the old, so a `session:` subscriber that stays through a stop and resume sees its channel
+//! close, takes the resumed session's full state and follows the new channel from there.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -22,7 +26,7 @@ use serde::{Deserialize, Serialize};
 use td_core::{Candle, FeeSchedule, Fill, InstrumentId, Millis, Timeframe};
 use td_data::time::now_ms;
 use td_engine::{EquityPoint, Order, Params, Trade, build_trades};
-use tokio::sync::{broadcast, oneshot};
+use tokio::sync::{broadcast, oneshot, watch};
 use tokio::task::JoinHandle;
 use ts_rs::TS;
 
@@ -33,7 +37,7 @@ use super::live::Streams;
 use crate::{Funding, PaperConfig, PaperError, PaperSession, SessionEvent, Status};
 
 /// Events buffered per `session:` subscriber before it is sent the full state again.
-const EVENT_BUFFER: usize = 1024;
+pub(super) const EVENT_BUFFER: usize = 1024;
 
 /// `POST /sessions`: what to paper trade. The instrument's trading rules come from the venue's
 /// instrument list.
@@ -167,11 +171,20 @@ struct Run {
     generation: u64,
     stop: oneshot::Sender<()>,
     supervisor: JoinHandle<()>,
+    /// Turns true once the session has ended, before the supervisor clears the run.
+    ended: watch::Receiver<bool>,
+}
+
+impl Run {
+    /// The session has ended, on its own or by a stop; the supervisor may not have noticed yet.
+    fn is_over(&self) -> bool {
+        *self.ended.borrow()
+    }
 }
 
 struct Entry {
     session: Arc<Mutex<PaperSession>>,
-    /// Kept across stops and resumes, so a subscriber keeps getting the session's events.
+    /// The channel of the session's current run, or of its last one. A resume replaces it.
     events: broadcast::Sender<SessionEvent>,
     run: Option<Run>,
 }
@@ -273,6 +286,12 @@ impl Sessions {
         Some((entry.events.subscribe(), SessionState::of(&paper)))
     }
 
+    /// The sender of a session's current channel, to put events on it in tests.
+    #[cfg(test)]
+    pub(crate) fn events(&self, id: &str) -> Option<broadcast::Sender<SessionEvent>> {
+        self.entries().get(id).map(|e| e.events.clone())
+    }
+
     /// Creates a session with a new id and starts it.
     pub(crate) async fn start(
         self: &Arc<Self>,
@@ -322,13 +341,14 @@ impl Sessions {
         self.summary_of(id)
     }
 
-    /// Replays a stopped session's log and starts it again; it backfills the bars it missed.
+    /// Replays a stopped session's log and starts it again; it backfills the bars it missed. A
+    /// session that ended on its own counts as stopped, even before its supervisor has noticed.
     pub(crate) async fn resume(self: &Arc<Self>, id: &str) -> Result<SessionSummary, ApiError> {
         let ops = self.ops.lock().await;
         refuse_if_closed(&ops)?;
         match self.entries().get(id) {
             None => return Err(session_not_found(id)),
-            Some(entry) if entry.run.is_some() => {
+            Some(entry) if entry.run.as_ref().is_some_and(|run| !run.is_over()) => {
                 return Err(ApiError::new(
                     StatusCode::CONFLICT,
                     "already_running",
@@ -344,7 +364,12 @@ impl Sessions {
         {
             let mut entries = self.entries();
             let entry = entries.get_mut(id).ok_or_else(|| session_not_found(id))?;
+            // A new channel: once the old run's session is gone too, the old channel closes and its
+            // subscribers take the resumed session's state (see `ws::forward_session`).
+            entry.events = broadcast::channel(EVENT_BUFFER).0;
             let (session, run) = self.launch(id, paper, entry.events.clone());
+            // The finished run's supervisor, if it is still winding down, no longer matches this
+            // generation and leaves the new run alone.
             entry.session = session;
             entry.run = Some(run);
         }
@@ -385,6 +410,7 @@ impl Sessions {
         let rest = streams.live().rest();
         let handle = crate::start_on(paper, rest, move || streams.stream(&instrument));
         let session = handle.session().clone();
+        let ended = handle.ended();
         let generation = self.generations.fetch_add(1, Ordering::SeqCst);
         let (stop, stopped) = oneshot::channel::<()>();
         let (sessions, id) = (Arc::clone(self), id.to_string());
@@ -408,6 +434,7 @@ impl Sessions {
             generation,
             stop,
             supervisor,
+            ended,
         };
         (session, run)
     }
@@ -512,8 +539,118 @@ pub(super) async fn resume(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
+    use td_core::{Instrument, InstrumentKind, Venue};
+    use td_data::DataError;
+    use td_data::live::Rest;
+    use td_engine::ParamValue;
+
     use super::*;
+    use crate::api::source::LiveSource;
+
+    /// No venue: REST has nothing and the stream URL refuses connections, so a session started on
+    /// it warms up on nothing and keeps reconnecting.
+    struct Nowhere;
+
+    impl Rest for Nowhere {
+        fn klines(
+            &self,
+            _: &InstrumentId,
+            _: Timeframe,
+            _: Millis,
+            _: Millis,
+        ) -> Result<Vec<Candle>, DataError> {
+            Ok(Vec::new())
+        }
+
+        fn funding(
+            &self,
+            _: &InstrumentId,
+            _: Millis,
+            _: Millis,
+        ) -> Result<Vec<(Millis, f64)>, DataError> {
+            Ok(Vec::new())
+        }
+
+        fn now(&self) -> Millis {
+            1_704_067_200_000
+        }
+    }
+
+    impl LiveSource for Nowhere {
+        fn rest(&self) -> Arc<dyn Rest> {
+            Arc::new(Nowhere)
+        }
+
+        fn stream_url(&self, _: &InstrumentId) -> String {
+            // Port 9 on loopback: nothing listens there, so the connection is refused at once.
+            "ws://127.0.0.1:9/".into()
+        }
+    }
+
+    /// The sessions of a temporary data directory holding one stopped session, `s`, on no venue.
+    pub(crate) fn one_session() -> (tempfile::TempDir, Arc<Sessions>) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let config = PaperConfig {
+            strategy: "sma_cross".into(),
+            params: Params::new()
+                .with("fast", ParamValue::Int(2))
+                .with("slow", ParamValue::Int(5)),
+            instrument: Instrument {
+                id: InstrumentId {
+                    venue: Venue::Binance,
+                    symbol: "TESTUSDT".into(),
+                    kind: InstrumentKind::Spot,
+                },
+                base: "TEST".into(),
+                quote: "USDT".into(),
+                tick_size: 0.01,
+                lot_size: 0.001,
+                min_qty: 0.001,
+                min_notional: 1.0,
+                fees: FeeSchedule {
+                    maker: 0.001,
+                    taker: 0.002,
+                },
+            },
+            timeframe: Timeframe::M1,
+            starting_cash: 10_000.0,
+            slippage_bps: 0.0,
+            fees: None,
+        };
+        PaperSession::create(dir.path(), "s", config).expect("creates");
+        let streams = Arc::new(Streams::new(Arc::new(Nowhere)));
+        let sessions = Arc::new(Sessions::load(dir.path(), streams));
+        (dir, sessions)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_session_that_ended_resumes_before_its_supervisor_has_noticed() {
+        let (_dir, sessions) = one_session();
+        // A run that has ended, with a supervisor that has not got round to clearing it.
+        let (stop, stopped) = oneshot::channel();
+        let stuck = tokio::spawn(async move {
+            let _ = stopped.await;
+        });
+        let (_ended_tx, ended) = watch::channel(true);
+        sessions.entries().get_mut("s").expect("loaded").run = Some(Run {
+            generation: u64::MAX,
+            stop,
+            supervisor: stuck,
+            ended,
+        });
+
+        let resumed = sessions.resume("s").await.expect("resumes");
+        assert_eq!(resumed.id, "s");
+        // A run that has not ended still refuses a resume.
+        let (_running_tx, running) = watch::channel(false);
+        if let Some(run) = sessions.entries().get_mut("s").and_then(|e| e.run.as_mut()) {
+            run.ended = running;
+        }
+        let refused = sessions.resume("s").await.expect_err("already running");
+        assert_eq!(refused.body.code, "already_running");
+        sessions.stop_all().await;
+    }
 
     #[test]
     fn new_ids_are_valid_session_ids_that_sort_by_time() {

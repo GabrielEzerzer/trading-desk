@@ -8,7 +8,8 @@
 //!
 //! One connection can serve many feeds: a [`SharedStream`] reads an instrument's stream once and
 //! every feed run on it with [`run_feed_on`] builds its own bars, from its own start, out of the
-//! same frames.
+//! same frames. The first feed run on a stream gets every frame since the stream opened, however
+//! late it starts; a later one gets the frames from the moment [`run_feed_on`] is called.
 //!
 //! The feed never asks the clock: a gap is noticed when the next closed minute arrives, so after a
 //! reconnect the missing minutes are backfilled when the first closed minute comes in, at most a
@@ -18,8 +19,9 @@ mod bars;
 mod parse;
 mod ws;
 
-use std::sync::Arc;
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use td_core::{Candle, InstrumentId, InstrumentKind, Millis, Timeframe, Venue};
@@ -204,6 +206,9 @@ pub async fn run_feed(spec: FeedSpec, rest: Arc<dyn Rest>, tx: mpsc::Sender<Feed
 pub struct SharedStream {
     id: InstrumentId,
     frames: broadcast::Sender<Inbound>,
+    /// Subscribed before the reader starts and taken by the first feed, so no frame is lost
+    /// between opening the stream and running a feed on it.
+    first: Mutex<Option<broadcast::Receiver<Inbound>>>,
     /// Whether the connection is up, so a feed that joins later still learns it is connected.
     connected: Arc<AtomicBool>,
     _reader: AbortOnDrop,
@@ -213,7 +218,7 @@ impl SharedStream {
     /// Connects to `url`, which serves `id`'s venue's message format.
     pub fn open(id: InstrumentId, url: String) -> SharedStream {
         install_crypto_provider();
-        let (frames, _) = broadcast::channel(FRAME_BUFFER);
+        let (frames, first) = broadcast::channel(FRAME_BUFFER);
         let connected = Arc::new(AtomicBool::new(false));
         let (reader_tx, mut reader_rx) = mpsc::channel(FRAME_BUFFER);
         let (out, flag, greeting) = (frames.clone(), connected.clone(), greeting(&id));
@@ -234,6 +239,7 @@ impl SharedStream {
         SharedStream {
             id,
             frames,
+            first: Mutex::new(Some(first)),
             connected,
             _reader: AbortOnDrop(reader),
         }
@@ -244,35 +250,53 @@ impl SharedStream {
     }
 }
 
-/// Runs a feed of `timeframe` bars from `start` (see [`FeedSpec::start`]) on a shared stream,
-/// until `tx`'s receiver is dropped. The feed keeps the stream open while it runs.
-pub async fn run_feed_on(
+/// A feed of `timeframe` bars from `start` (see [`FeedSpec::start`]) on a shared stream, which
+/// runs until `tx`'s receiver is dropped. The feed keeps the stream open while it runs.
+///
+/// It takes its frames when called, not when first polled, so a feed spawned later misses nothing
+/// that arrives in between.
+pub fn run_feed_on(
     stream: Arc<SharedStream>,
     timeframe: Timeframe,
     start: Option<Millis>,
     rest: Arc<dyn Rest>,
     tx: mpsc::Sender<FeedEvent>,
-) {
-    let mut frames = stream.frames.subscribe();
+) -> impl Future<Output = ()> + Send + 'static {
+    let first = stream
+        .first
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .take();
+    // The first feed's receiver holds every frame since the stream opened, the connect included.
+    let (mut frames, from_open) = match first {
+        Some(frames) => (frames, true),
+        None => (stream.frames.subscribe(), false),
+    };
+    let connected = !from_open && stream.connected.load(Ordering::SeqCst);
     let mut feed = Feed {
         builder: BarBuilder::new(timeframe, start),
         id: stream.id.clone(),
         rest,
         tx,
     };
-    // Subscribed first, so a connect that happens now is seen at worst twice, never missed.
-    if stream.connected.load(Ordering::SeqCst) && feed.send(FeedEvent::Connected).await.is_err() {
-        return;
-    }
-    loop {
-        let inbound = match frames.recv().await {
-            Ok(inbound) => inbound,
-            // The frames it missed show up as a gap at the next closed minute, which is backfilled.
-            Err(RecvError::Lagged(_)) => continue,
-            Err(RecvError::Closed) => break,
-        };
-        if feed.handle(inbound).await.is_err() {
-            break;
+    async move {
+        // Keeps the connection open while the feed runs.
+        let _stream = stream;
+        // Subscribed first, so a connect that happens now is seen at worst twice, never missed.
+        if connected && feed.send(FeedEvent::Connected).await.is_err() {
+            return;
+        }
+        loop {
+            let inbound = match frames.recv().await {
+                Ok(inbound) => inbound,
+                // The frames it missed show up as a gap at the next closed minute, which is
+                // backfilled.
+                Err(RecvError::Lagged(_)) => continue,
+                Err(RecvError::Closed) => break,
+            };
+            if feed.handle(inbound).await.is_err() {
+                break;
+            }
         }
     }
 }

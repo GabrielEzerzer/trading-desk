@@ -17,15 +17,20 @@
 //!   backfilled; the first bar of a timeframe above a minute comes once a whole bucket has been
 //!   seen. Every subscriber of an instrument, and every paper session on it, shares one upstream
 //!   connection, which closes when the last of them is gone. A subscriber that falls far behind
-//!   skips bars.
+//!   skips bars. One connection may hold at most [`MAX_CANDLE_TOPICS`] `candles:` topics at once,
+//!   since each instrument's first opens a venue connection and venues limit connections per IP;
+//!   one more answers `too_many_topics`.
 //! - `session:<id>`: one paper session. Right after `subscribed` comes its full state, as
 //!   `{"type":"session_state","session":<SessionState>}`, then each change as
 //!   `{"type":"session","id":...,"event":<SessionEvent>}`: funding charged, fills and order changes,
-//!   then the bar that caused them, and status changes. Every change after the state arrives
-//!   exactly once; a subscriber that falls so far behind that events were dropped gets the full
-//!   state again. An unknown id answers `not_found`.
+//!   then the bar that caused them, status changes, buckets the feed dropped and warnings. Every
+//!   change after the state arrives exactly once. The full state comes again when the subscriber
+//!   fell so far behind that events were dropped, and when the session is resumed, since a resume
+//!   replays it from its log; each change after the latest state arrives exactly once. An unknown
+//!   id answers `not_found`.
 //!
-//! Subscribing again to a topic already subscribed replaces the subscription.
+//! Subscribing again to a topic already subscribed replaces the subscription: nothing of the old
+//! one arrives after the new `subscribed`. Nothing of a topic arrives after its `unsubscribed`.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -54,6 +59,10 @@ pub const JOBS_TOPIC: &str = "jobs";
 
 /// Messages from `candles:` and `session:` subscriptions waiting to be sent on one connection.
 const OUTGOING_BUFFER: usize = 1024;
+
+/// The most `candles:` topics one connection may subscribe to at once. A desk shows a handful of
+/// charts; the cap keeps a client from opening a venue connection per topic without limit.
+pub const MAX_CANDLE_TOPICS: usize = 16;
 
 /// A message from the client.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
@@ -113,8 +122,36 @@ pub(super) async fn upgrade(
 /// A `candles:` or `session:` subscription: a task forwarding its messages to the connection, and
 /// the feed it keeps open. Dropping it ends both.
 struct Subscription {
+    /// Tells this subscription apart from an earlier one to the same topic.
+    serial: u64,
     _forward: AbortOnDrop,
     _feed: Option<Arc<CandleFeed>>,
+}
+
+/// A message a forwarding task queued, with the subscription it came from.
+struct Outgoing {
+    topic: String,
+    serial: u64,
+    message: ServerMessage,
+}
+
+/// Where one subscription's forwarding task queues its messages.
+struct Sink {
+    topic: String,
+    serial: u64,
+    out: mpsc::Sender<Outgoing>,
+}
+
+impl Sink {
+    /// Queues a message; false once the connection is gone.
+    async fn send(&self, message: ServerMessage) -> bool {
+        let outgoing = Outgoing {
+            topic: self.topic.clone(),
+            serial: self.serial,
+            message,
+        };
+        self.out.send(outgoing).await.is_ok()
+    }
 }
 
 /// What one connection is subscribed to.
@@ -122,7 +159,30 @@ struct Subscriptions {
     jobs: Option<broadcast::Receiver<JobInfo>>,
     topics: HashMap<String, Subscription>,
     /// Where the forwarding tasks send their messages.
-    out: mpsc::Sender<ServerMessage>,
+    out: mpsc::Sender<Outgoing>,
+    /// The serial of the latest subscription.
+    serial: u64,
+}
+
+impl Subscriptions {
+    /// A sink for a new subscription to `topic`.
+    fn sink(&mut self, topic: &str) -> Sink {
+        self.serial += 1;
+        Sink {
+            topic: topic.to_string(),
+            serial: self.serial,
+            out: self.out.clone(),
+        }
+    }
+
+    /// Whether a queued message still belongs to a current subscription. One from a subscription
+    /// replaced or ended since is dropped: the client has been sent the new state, or
+    /// `unsubscribed`, after it was queued.
+    fn is_current(&self, outgoing: &Outgoing) -> bool {
+        self.topics
+            .get(&outgoing.topic)
+            .is_some_and(|sub| sub.serial == outgoing.serial)
+    }
 }
 
 async fn connection(mut socket: WebSocket, state: Arc<AppState>) {
@@ -131,6 +191,7 @@ async fn connection(mut socket: WebSocket, state: Arc<AppState>) {
         jobs: None,
         topics: HashMap::new(),
         out,
+        serial: 0,
     };
     let mut shutdown = state.shutdown.clone();
     loop {
@@ -150,7 +211,12 @@ async fn connection(mut socket: WebSocket, state: Arc<AppState>) {
                 }
             },
             // The connection holds a sender, so this never ends while the loop runs.
-            Some(message) = outgoing_rx.recv() => vec![message],
+            Some(outgoing) = outgoing_rx.recv() => {
+                if !subs.is_current(&outgoing) {
+                    continue;
+                }
+                vec![outgoing.message]
+            }
             () = stopping(&mut shutdown) => {
                 let close = CloseFrame {
                     code: close_code::AWAY,
@@ -208,11 +274,28 @@ fn handle(text: &str, state: &AppState, subs: &mut Subscriptions) -> Vec<ServerM
         }
         ClientMessage::Subscribe { topic } => match parse_topic(&topic, state) {
             Ok(Topic::Candles(id, timeframe)) => {
+                let candle_topics = subs
+                    .topics
+                    .keys()
+                    .filter(|t| t.starts_with("candles:"))
+                    .count();
+                if !subs.topics.contains_key(&topic) && candle_topics >= MAX_CANDLE_TOPICS {
+                    return vec![error(
+                        "too_many_topics",
+                        format!(
+                            "a connection may subscribe to at most {MAX_CANDLE_TOPICS} candles \
+                             topics at once; unsubscribe from one first"
+                        ),
+                    )];
+                }
                 let (feed, bars) = state.streams.candles(&id, timeframe);
-                let forward = forward_candles(topic.clone(), bars, subs.out.clone());
+                let sink = subs.sink(&topic);
+                let serial = sink.serial;
+                let forward = forward_candles(topic.clone(), bars, sink);
                 subs.topics.insert(
                     topic.clone(),
                     Subscription {
+                        serial,
                         _forward: AbortOnDrop(tokio::spawn(forward)),
                         _feed: Some(feed),
                     },
@@ -223,10 +306,13 @@ fn handle(text: &str, state: &AppState, subs: &mut Subscriptions) -> Vec<ServerM
                 let Some((events, session)) = state.sessions.subscribe(&id) else {
                     return vec![error("not_found", format!("no paper session {id:?}"))];
                 };
-                let forward = forward_session(id, events, state.sessions.clone(), subs.out.clone());
+                let sink = subs.sink(&topic);
+                let serial = sink.serial;
+                let forward = forward_session(id, events, state.sessions.clone(), sink);
                 subs.topics.insert(
                     topic.clone(),
                     Subscription {
+                        serial,
                         _forward: AbortOnDrop(tokio::spawn(forward)),
                         _feed: None,
                     },
@@ -284,11 +370,7 @@ fn parse_topic(topic: &str, state: &AppState) -> Result<Topic, (&'static str, St
 }
 
 /// Sends a `candles:` topic's bars to the connection. A subscriber that fell behind skips bars.
-async fn forward_candles(
-    topic: String,
-    mut bars: broadcast::Receiver<Candle>,
-    out: mpsc::Sender<ServerMessage>,
-) {
+async fn forward_candles(topic: String, mut bars: broadcast::Receiver<Candle>, sink: Sink) {
     loop {
         let candle = match bars.recv().await {
             Ok(candle) => candle,
@@ -296,23 +378,20 @@ async fn forward_candles(
             Err(RecvError::Closed) => return,
         };
         let topic = topic.clone();
-        if out
-            .send(ServerMessage::Candle { topic, candle })
-            .await
-            .is_err()
-        {
+        if !sink.send(ServerMessage::Candle { topic, candle }).await {
             return;
         }
     }
 }
 
-/// Sends a session's events to the connection. One that fell behind subscribes again and gets the
-/// full state, so it still sees every change exactly once.
+/// Sends a session's events to the connection. When it fell behind and events were dropped, or the
+/// session was resumed and its old channel closed, it subscribes again and sends the full state, so
+/// every change after the latest state still arrives exactly once.
 async fn forward_session(
     id: String,
     mut events: broadcast::Receiver<SessionEvent>,
     sessions: Arc<Sessions>,
-    out: mpsc::Sender<ServerMessage>,
+    sink: Sink,
 ) {
     loop {
         let message = match events.recv().await {
@@ -320,7 +399,7 @@ async fn forward_session(
                 id: id.clone(),
                 event,
             },
-            Err(RecvError::Lagged(_)) => {
+            Err(RecvError::Lagged(_) | RecvError::Closed) => {
                 let Some((again, session)) = sessions.subscribe(&id) else {
                     return;
                 };
@@ -329,9 +408,8 @@ async fn forward_session(
                     session: Box::new(session),
                 }
             }
-            Err(RecvError::Closed) => return,
         };
-        if out.send(message).await.is_err() {
+        if !sink.send(message).await {
             return;
         }
     }
@@ -352,5 +430,63 @@ fn error(code: &str, message: impl Into<String>) -> ServerMessage {
             code: code.to_string(),
             message: message.into(),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::sessions::EVENT_BUFFER;
+    use crate::api::sessions::tests::one_session;
+
+    /// The next message a forwarding task queued, or fails after 5 s.
+    async fn next(rx: &mut mpsc::Receiver<Outgoing>) -> ServerMessage {
+        let outgoing = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("a message in time")
+            .expect("the task is running");
+        outgoing.message
+    }
+
+    fn warning(message: &str) -> SessionEvent {
+        SessionEvent::Warning {
+            message: message.into(),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_session_subscriber_that_fell_behind_gets_the_full_state_then_the_changes_after_it() {
+        let (_dir, sessions) = one_session();
+        let (events, state) = sessions.subscribe("s").expect("a session");
+        let tx = sessions.events("s").expect("a session");
+        // More events than the channel holds, before the subscriber reads any.
+        for i in 0..EVENT_BUFFER + 10 {
+            tx.send(warning(&format!("burst {i}"))).expect("subscribed");
+        }
+        let (out, mut rx) = mpsc::channel(16);
+        let sink = Sink {
+            topic: "session:s".into(),
+            serial: 1,
+            out,
+        };
+        let forward = AbortOnDrop(tokio::spawn(forward_session(
+            "s".into(),
+            events,
+            sessions.clone(),
+            sink,
+        )));
+        match next(&mut rx).await {
+            ServerMessage::SessionState { session } => assert_eq!(*session, state),
+            other => panic!("expected the full state, got {other:?}"),
+        }
+        tx.send(warning("after")).expect("subscribed again");
+        assert_eq!(
+            next(&mut rx).await,
+            ServerMessage::Session {
+                id: "s".into(),
+                event: warning("after"),
+            }
+        );
+        drop(forward);
     }
 }

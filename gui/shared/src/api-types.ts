@@ -483,9 +483,11 @@ warnings: Array<string>, };
 /**
  * What a session reports as it runs, once [`PaperSession::set_events`] gives it a channel. Sent
  * while the session is locked, so a reader that subscribes and takes the state under the same lock
- * sees each change exactly once. Replaying the log reports nothing.
+ * sees each change exactly once. A bar's events are sent once its line is in the log, so a
+ * subscriber never sees a bar that a resume would fetch and report again. Replaying the log
+ * reports nothing.
  */
-export type SessionEvent = { "event": "funding", funding: Funding, } | { "event": "fill", fill: Fill, } | { "event": "order", order: Order, } | { "event": "bar", bar: Candle, warm_up: boolean, equity: number | null, } | { "event": "status", status: Status, };
+export type SessionEvent = { "event": "funding", funding: Funding, } | { "event": "fill", fill: Fill, } | { "event": "order", order: Order, } | { "event": "bar", bar: Candle, warm_up: boolean, equity: number | null, } | { "event": "status", status: Status, } | { "event": "dropped", open_time: number, } | { "event": "warning", message: string, };
 
 /**
  * A message from the client.

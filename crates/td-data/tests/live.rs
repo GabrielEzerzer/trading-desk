@@ -380,3 +380,54 @@ async fn feeds_of_two_timeframes_share_one_connection_which_closes_when_both_are
         "{ended:?}"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn frames_that_arrive_before_the_first_feed_runs_are_not_lost() {
+    let all = minutes();
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let url = format!("ws://{}/", listener.local_addr().expect("address"));
+    let stream = Arc::new(SharedStream::open(btc(Venue::Binance), url));
+    let (tcp, _) = listener.accept().await.expect("accept");
+    let mut socket = tokio_tungstenite::accept_async(tcp).await.expect("upgrade");
+    let frame = |c: &Candle| {
+        format!(
+            r#"{{"e":"kline","E":1,"s":"BTCUSDT","k":{{"t":{},"i":"1m","o":"{}","h":"{}","l":"{}","c":"{}","v":"{}","q":"{}","x":true}}}}"#,
+            c.open_time, c.open, c.high, c.low, c.close, c.volume, c.quote_volume
+        )
+    };
+    // The venue sends four minutes before any feed runs on the stream, as it can between opening
+    // a stream and spawning the feed on it...
+    for minute in &all[..4] {
+        socket
+            .send(Message::text(frame(minute)))
+            .await
+            .expect("sends");
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let rest = FakeRest::new(all.clone(), 0);
+    let (tx, mut rx) = mpsc::channel(64);
+    let feed = tokio::spawn(run_feed_on(
+        stream,
+        Timeframe::M1,
+        Some(T0),
+        rest.clone(),
+        tx,
+    ));
+    // ...and the fifth after.
+    socket
+        .send(Message::text(frame(&all[4])))
+        .await
+        .expect("sends");
+
+    let mut got = Vec::new();
+    for _ in 0..all.len() {
+        got.push(next_bar(&mut rx).await);
+    }
+    assert_eq!(got, all);
+    assert!(
+        rest.calls().is_empty(),
+        "frames were lost: {:?}",
+        rest.calls()
+    );
+    feed.abort();
+}

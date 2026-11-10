@@ -65,6 +65,11 @@ impl PaperHandle {
         let _ = ended.wait_for(|ended| *ended).await;
     }
 
+    /// Turns true once the session has ended, as [`PaperHandle::finished`] waits for.
+    pub(crate) fn ended(&self) -> watch::Receiver<bool> {
+        self.ended.clone()
+    }
+
     /// Stops the session and waits for its loop to end. Its status is then `Stopped`, or `Error`
     /// if it had already failed.
     pub async fn stop(self) -> Arc<Mutex<PaperSession>> {
