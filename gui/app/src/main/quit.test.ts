@@ -11,7 +11,7 @@ function setup(stopEngine: () => Promise<string>, overrides: Partial<QuitDeps> =
     killEngine: () => calls.push('killEngine'),
     closeConnections: () => calls.push('closeConnections'),
     exit: (code) => calls.push(`exit ${code}`),
-    terminate: () => calls.push('terminate'),
+    armWatchdog: (afterMs) => calls.push(`armWatchdog ${afterMs}`),
     log: (line) => calls.push(`log ${line}`),
     ...overrides,
   }
@@ -41,7 +41,7 @@ describe('createQuit', () => {
     expect(second.prevented).toBe(true)
 
     await vi.advanceTimersByTimeAsync(0)
-    expect(calls).toEqual(['closeConnections', 'stopEngine', 'log stopped (clean)', 'exit 0'])
+    expect(calls).toEqual(['closeConnections', 'stopEngine', 'log stopped (clean)', 'armWatchdog 500', 'exit 0'])
 
     // A quit after exit was asked for changes nothing, and the stop timeout never fires.
     quit.onBeforeQuit(event())
@@ -75,13 +75,26 @@ describe('createQuit', () => {
     }
   })
 
-  it('terminates the process if it is still alive after exit', async () => {
-    const { quit, calls } = setup(() => Promise.resolve('exited'))
+  it('arms the watchdog exactly once, just before exit, even when the stop timeout also fires', async () => {
+    const { quit, calls } = setup(() => new Promise(() => {}))
+    quit.onBeforeQuit({ preventDefault() {} })
+    expect(calls).not.toContain('armWatchdog 500')
+    await vi.advanceTimersByTimeAsync(1_000)
+    quit.onBeforeQuit({ preventDefault() {} })
+    await vi.advanceTimersByTimeAsync(5_000)
+    expect(calls.filter((c) => c.startsWith('armWatchdog'))).toEqual(['armWatchdog 500'])
+    expect(calls.slice(-2)).toEqual(['armWatchdog 500', 'exit 0'])
+  })
+
+  it('still exits when arming the watchdog throws', async () => {
+    const { quit, calls } = setup(() => Promise.resolve('clean'), {
+      armWatchdog: () => {
+        throw new Error('spawn failed')
+      },
+    })
     quit.onBeforeQuit({ preventDefault() {} })
     await vi.advanceTimersByTimeAsync(0)
-    expect(calls).not.toContain('terminate')
-    await vi.advanceTimersByTimeAsync(500)
-    expect(calls.at(-1)).toBe('terminate')
+    expect(calls.slice(-2)).toEqual(['log arming the quit watchdog failed: spawn failed', 'exit 0'])
   })
 
   it('still stops the engine when closing connections throws', async () => {
@@ -92,6 +105,12 @@ describe('createQuit', () => {
     })
     quit.onBeforeQuit({ preventDefault() {} })
     await vi.advanceTimersByTimeAsync(0)
-    expect(calls).toEqual(['log closing connections failed: socket gone', 'stopEngine', 'log stopped (clean)', 'exit 0'])
+    expect(calls).toEqual([
+      'log closing connections failed: socket gone',
+      'stopEngine',
+      'log stopped (clean)',
+      'armWatchdog 500',
+      'exit 0',
+    ])
   })
 })
