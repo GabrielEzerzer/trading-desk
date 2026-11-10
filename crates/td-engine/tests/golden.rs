@@ -468,6 +468,66 @@ fn a_daily_bar_charges_funding_at_its_open_and_inside_it_on_different_positions(
     // Cash 10000 - 0.2 - 0.098 - 0.132 = 9999.57, plus 2 * (102 - 99).
     approx(p.cash(), 9999.57);
     approx(e[2], 10_005.57);
+    // The session records that split per bar, for the trade list.
+    let split: Vec<(f64, f64)> = s
+        .bar_funding()
+        .iter()
+        .map(|f| (f.at_open, f.in_bar))
+        .collect();
+    assert_eq!(split.len(), 3);
+    assert_eq!(split[0], (0.0, 0.0));
+    assert_eq!(split[1].0, 0.0);
+    approx(split[1].1, 0.02);
+    approx(split[2].0, 0.01);
+    approx(split[2].1, 0.0408 + 0.0612);
+}
+
+#[test]
+fn funding_due_in_a_gap_is_charged_at_the_next_bar_open() {
+    let i = perp();
+    const H: i64 = 3_600_000;
+    let hour = |n: i64, o, h, l, c| Candle {
+        open_time: n * H,
+        ..bar(0, o, h, l, c)
+    };
+    // The 08:00 bar is missing.
+    let bars = [
+        hour(6, 100.0, 100.0, 100.0, 100.0),
+        hour(7, 100.0, 101.0, 99.0, 100.0),
+        hour(9, 104.0, 105.0, 103.0, 104.0),
+        hour(10, 104.0, 104.0, 104.0, 104.0),
+    ];
+    let (script, _) = Script::new(vec![(0, req(&i, Side::Buy, 2.0, OrderType::Market))]);
+    // 08:00 falls in the gap; 05:00 is before the first bar and is not charged.
+    let funding = [(8 * H, 0.0001), (5 * H, 0.01)];
+    let s = run_backtest(script, i, Timeframe::H1, &bars, &funding, config(0.0)).unwrap();
+    // The long of 2 bought at 07:00's open at 100 (fee 0.4) is held across the gap. The 08:00
+    // funding is charged at the 09:00 bar's open on that long, at the open price: 2 * 104 * 0.0001
+    // = 0.0208.
+    let p = s.portfolio();
+    approx(p.funding_paid(), 0.0208);
+    approx(p.cash(), 10_000.0 - 0.4 - 0.0208);
+    // Equity at 09:00: cash 9999.5792 plus 2 * (104 - 100).
+    approx(equity(&s)[2], 10_007.579_2);
+    let f = s.bar_funding()[2];
+    approx(f.at_open, 0.0208);
+    assert_eq!(f.in_bar, 0.0);
+
+    // A session fed directly takes the gap's funding with the next bar, but not funding before the
+    // first bar or in the bar before the gap.
+    let (script, _) = Script::new(vec![]);
+    let mut s = Session::new(script, perp(), Timeframe::H1, config(0.0)).unwrap();
+    assert!(matches!(
+        s.on_bar(bars[0], &[(5 * H, 0.0001)]),
+        Err(EngineError::FundingOutsideBar { .. })
+    ));
+    s.on_bar(bars[0], &[]).unwrap();
+    s.on_bar(bars[1], &[]).unwrap();
+    assert!(matches!(
+        s.on_bar(bars[2], &[(7 * H, 0.0001)]),
+        Err(EngineError::FundingOutsideBar { .. })
+    ));
+    s.on_bar(bars[2], &[(8 * H, 0.0001)]).unwrap();
 }
 
 #[test]

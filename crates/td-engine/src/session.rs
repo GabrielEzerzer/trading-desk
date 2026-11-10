@@ -4,8 +4,8 @@ use serde::{Deserialize, Serialize};
 use td_core::{Candle, FeeSchedule, Fill, Instrument, InstrumentKind, Millis, Timeframe};
 
 use crate::{
-    Broker, BrokerEvent, CandleFillModel, Context, EngineError, Order, OrderStatus, Portfolio,
-    SimBroker, Strategy,
+    BarFunding, Broker, BrokerEvent, CandleFillModel, Context, EngineError, Order, OrderStatus,
+    Portfolio, SimBroker, Strategy,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
@@ -41,6 +41,7 @@ pub struct Session {
     orders: Vec<Order>,
     fills: Vec<Fill>,
     equity: Vec<EquityPoint>,
+    bar_funding: Vec<BarFunding>,
 }
 
 impl Session {
@@ -81,27 +82,32 @@ impl Session {
             orders: Vec::new(),
             fills: Vec::new(),
             equity: Vec::new(),
+            bar_funding: Vec::new(),
         })
     }
 
-    /// Feeds the next closed bar, with the funding events (`(time, rate)`) that fall inside it.
+    /// Feeds the next closed bar, with the funding events (`(time, rate)`) that fall inside it or
+    /// in the gap since the previous bar.
     ///
     /// The bar must be valid, on a timeframe boundary and later than the previous bar; gaps are
-    /// allowed. On an error nothing changes. Then, in order: funding due at the bar's open is
-    /// charged on the position held going into the bar, at the open price; open orders are checked
-    /// against this bar; funding due later in the bar is charged on the position after this bar's
-    /// fills, at the close; equity is marked at the close; and the strategy is called.
+    /// allowed. On an error nothing changes. Then, in order: funding due at the bar's open, or in
+    /// the gap between the previous bar's end and this bar's open, is charged on the position held
+    /// going into the bar, at the open price; open orders are checked against this bar; funding due
+    /// later in the bar is charged on the position after this bar's fills, at the close; equity is
+    /// marked at the close; and the strategy is called. The first bar fed takes no funding from
+    /// before its open.
     ///
     /// Venues usually charge funding at 00:00, 08:00 and 16:00 UTC, which are bar open times on
     /// every timeframe shorter than a day.
     pub fn on_bar(&mut self, bar: Candle, funding: &[(Millis, f64)]) -> Result<(), EngineError> {
         self.check_bar(&bar, funding)?;
 
-        // Funding due at the open is owed by the position held going into the bar, before this
-        // bar's fills.
+        // Funding due at the open, or in the gap before it, is owed by the position held going
+        // into the bar, before this bar's fills.
+        let mut charged = BarFunding::default();
         for &(time, rate) in funding {
-            if time == bar.open_time {
-                self.portfolio.charge_funding(rate, bar.open);
+            if time <= bar.open_time {
+                charged.at_open += self.portfolio.charge_funding(rate, bar.open);
             }
         }
         let first_new_fill = self.fills.len();
@@ -128,9 +134,10 @@ impl Session {
         // fill model that times each fill.
         for &(time, rate) in funding {
             if time > bar.open_time {
-                self.portfolio.charge_funding(rate, bar.close);
+                charged.in_bar += self.portfolio.charge_funding(rate, bar.close);
             }
         }
+        self.bar_funding.push(charged);
         self.portfolio.mark(bar.close);
         self.equity.push(EquityPoint {
             time: bar.open_time,
@@ -149,7 +156,7 @@ impl Session {
     /// history, and the strategy is called on it the same way, with `on_start` on the first bar fed
     /// whether that is a warm-up bar or a live one. But trading is disabled: every order the
     /// strategy submits is rejected (see [`Context::is_warming_up`]), nothing fills, no funding is
-    /// charged, no equity point is recorded and the portfolio does not change. It is an error once
+    /// charged, no equity point or bar funding is recorded and the portfolio does not change. It is an error once
     /// a bar has been fed with `on_bar`.
     pub fn warm_up(&mut self, bar: Candle, funding: &[(Millis, f64)]) -> Result<(), EngineError> {
         // Every live bar records an equity point.
@@ -162,7 +169,7 @@ impl Session {
         Ok(())
     }
 
-    /// Checks that `bar` can be fed next, with `funding` inside it.
+    /// Checks that `bar` can be fed next, with `funding` inside it or in the gap before it.
     fn check_bar(&self, bar: &Candle, funding: &[(Millis, f64)]) -> Result<(), EngineError> {
         bar.validate()?;
         if self.timeframe.floor(bar.open_time) != bar.open_time {
@@ -184,12 +191,18 @@ impl Session {
                 });
             }
         }
-        let end = bar.open_time + self.timeframe.duration_ms();
+        let step = self.timeframe.duration_ms();
+        let end = bar.open_time + step;
+        // From the previous bar's end, so funding due in a gap is charged at this bar's open.
+        let start = self
+            .bars
+            .last()
+            .map_or(bar.open_time, |prev| prev.open_time + step);
         for &(time, rate) in funding {
             if self.instrument.id.kind == InstrumentKind::Spot {
                 return Err(EngineError::FundingOnSpot);
             }
-            if !(bar.open_time..end).contains(&time) {
+            if !(start..end).contains(&time) {
                 return Err(EngineError::FundingOutsideBar {
                     time,
                     bar_open: bar.open_time,
@@ -248,6 +261,13 @@ impl Session {
         &self.equity
     }
 
+    /// The funding charged on each live bar, split into the part charged at the open and the
+    /// part charged after the bar's fills; one entry per bar fed with [`Session::on_bar`], like
+    /// [`Session::equity`].
+    pub fn bar_funding(&self) -> &[BarFunding] {
+        &self.bar_funding
+    }
+
     pub fn fills(&self) -> &[Fill] {
         &self.fills
     }
@@ -269,8 +289,8 @@ impl Session {
 /// Runs a strategy over stored bars by feeding them to a new [`Session`] one at a time.
 ///
 /// `funding` is a series of `(time, rate)`, in any order; each event is charged on the bar whose
-/// time window contains it, and events that fall in no bar's window (before the first bar or in
-/// a gap) are not charged.
+/// time window contains it, an event in a gap between bars at the next bar's open, and events
+/// before the first bar or from the last bar's end on are not charged.
 pub fn run_backtest(
     strategy: Box<dyn Strategy>,
     instrument: Instrument,
@@ -294,20 +314,24 @@ pub(crate) fn sorted_funding(funding: &[(Millis, f64)]) -> Vec<(Millis, f64)> {
     funding
 }
 
-/// For each bar, the range of `funding` (sorted by time) that falls inside the bar's time window.
-/// Events before the first bar or in a gap between bars belong to no range.
+/// For each bar, the range of `funding` (sorted by time) that [`Session::on_bar`] takes with it:
+/// the events inside the bar's time window and, from the second bar on, those in the gap since the
+/// previous bar's end. Events before the first bar or from the last bar's end on belong to no
+/// range.
 pub(crate) fn funding_ranges(
     timeframe: Timeframe,
     bars: &[Candle],
     funding: &[(Millis, f64)],
 ) -> Vec<Range<usize>> {
     let mut next = 0;
+    if let Some(first) = bars.first() {
+        while next < funding.len() && funding[next].0 < first.open_time {
+            next += 1;
+        }
+    }
     bars.iter()
         .map(|bar| {
             let end = bar.open_time + timeframe.duration_ms();
-            while next < funding.len() && funding[next].0 < bar.open_time {
-                next += 1;
-            }
             let start = next;
             while next < funding.len() && funding[next].0 < end {
                 next += 1;

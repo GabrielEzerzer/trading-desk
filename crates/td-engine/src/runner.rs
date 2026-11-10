@@ -11,6 +11,14 @@ use crate::{
     SessionConfig, Trade, build_strategy, build_trades,
 };
 
+/// The revision of the engine's behaviour, stored in every result so a rerun can tell an engine
+/// change from a data change.
+///
+/// Bump it whenever the engine's behaviour changes: fills, fees, funding, the trade list, metrics
+/// or the benchmark. In practice that is whenever `tests/fixtures/backtest_expected.json` has to
+/// be regenerated; bump it in the same change.
+pub const ENGINE_REVISION: u32 = 1;
+
 /// Everything that defines a backtest apart from the data itself.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BacktestConfig {
@@ -60,6 +68,8 @@ pub struct BacktestResult {
     pub config: BacktestConfig,
     /// The td-engine crate version that produced the result.
     pub engine_version: String,
+    /// The [`ENGINE_REVISION`] that produced the result.
+    pub engine_revision: u32,
     /// SHA-256 of the bars (warm-up bars first) and funding the run used; see
     /// [`data_fingerprint`].
     pub data_fingerprint: String,
@@ -79,15 +89,23 @@ pub struct Rerun {
     pub result: BacktestResult,
     /// Whether the data used this time hashes the same as the data of the saved run.
     pub fingerprint_matches: bool,
+    /// Whether this engine has the saved run's [`ENGINE_REVISION`]. When it does not, a different
+    /// result on the same data may come from the engine rather than the data.
+    pub engine_matches: bool,
 }
 
 /// Runs a backtest.
 ///
 /// `bars` may cover more than the configured range; only bars inside `from..to` are traded, and
 /// bars inside `warmup_from..from` warm the strategy up first. `funding` is `(time, rate)` in any
-/// order; events outside the traded bars' windows are ignored.
+/// order. An event in a gap between traded bars is charged at the next bar's open, like one due at
+/// that open; events before the first traded bar or from the last traded bar's end on are ignored.
+///
 /// The strategy is built through the registry and run on a [`Session`], then the trade list,
 /// metrics and buy-and-hold benchmark are derived from the session's record.
+///
+/// The caller loads the candles and funding, and is responsible for reporting any buckets the
+/// data layer dropped as invalid; the result does not record them.
 pub fn run(
     config: &BacktestConfig,
     bars: &[Candle],
@@ -109,31 +127,16 @@ pub fn run(
         session.warm_up(*bar, &[])?;
     }
     let mut positions = Vec::with_capacity(bars.len());
-    let mut bar_funding = Vec::with_capacity(bars.len());
     let mut used_funding = Vec::new();
     for (bar, range) in bars.iter().zip(&ranges) {
         let events = &funding[range.clone()];
-        let held = session.portfolio().position();
-        let before = session.portfolio().funding_paid();
         session.on_bar(*bar, events)?;
-        let total = session.portfolio().funding_paid() - before;
-        // The session charges funding due at the open on the position held going into the bar,
-        // at the open price, the same way Portfolio::charge_funding does.
-        let at_open: f64 = events
-            .iter()
-            .filter(|&&(time, _)| time == bar.open_time)
-            .map(|&(_, rate)| held * bar.open * rate)
-            .sum();
-        bar_funding.push(BarFunding {
-            at_open,
-            in_bar: total - at_open,
-        });
         positions.push(session.portfolio().position());
         used_funding.extend_from_slice(events);
     }
 
     let fills = session.fills().to_vec();
-    let trades = build_trades(&fills, &bars, &bar_funding);
+    let trades = build_trades(&fills, &bars, session.bar_funding());
     let series = EquitySeries::new(config.starting_cash, session.equity(), tf);
     let report = metrics::report(
         &series,
@@ -150,6 +153,7 @@ pub fn run(
     Ok(BacktestResult {
         config: config.clone(),
         engine_version: env!("CARGO_PKG_VERSION").to_string(),
+        engine_revision: ENGINE_REVISION,
         data_fingerprint: data_fingerprint(&used_bars, &used_funding),
         equity: session.equity().to_vec(),
         orders: session.orders().to_vec(),
@@ -215,16 +219,18 @@ pub fn rerun(
 ) -> Result<Rerun, EngineError> {
     let result = run(&saved.config, bars, funding)?;
     let fingerprint_matches = result.data_fingerprint == saved.data_fingerprint;
+    let engine_matches = result.engine_revision == saved.engine_revision;
     Ok(Rerun {
         result,
         fingerprint_matches,
+        engine_matches,
     })
 }
 
 /// Buys at the first bar's open with all starting cash (taker fee, the run's slippage) and holds
 /// to the last close, paying funding on a perpetual like the session does: funding due at a bar's
-/// open on the position held going into the bar, at the open price, so none at the first open,
-/// and funding due later in the bar at the close.
+/// open or in the gap before it on the position held going into the bar, at the open price, so
+/// none at the first open, and funding due later in the bar at the close.
 fn benchmark(
     config: &BacktestConfig,
     bars: &[Candle],
@@ -249,7 +255,7 @@ fn benchmark(
     for (k, (bar, range)) in bars.iter().zip(ranges).enumerate() {
         let events = &funding[range.clone()];
         let mut charged = BarFunding::default();
-        for &(_, rate) in events.iter().filter(|&&(time, _)| time == bar.open_time) {
+        for &(_, rate) in events.iter().filter(|&&(time, _)| time <= bar.open_time) {
             charged.at_open += portfolio.charge_funding(rate, bar.open);
         }
         if k == 0 && qty.is_finite() && qty > 0.0 {

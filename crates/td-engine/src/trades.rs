@@ -44,22 +44,26 @@ pub struct Trade {
     /// Fees of the trade's fills. A fill that flips the position splits its fee between the two
     /// trades in proportion to the quantity that closed and that opened.
     pub fees: f64,
-    /// Funding charged on the trade's position: at a bar's open while it was held going into the
-    /// bar, and later in a bar while it was held after the bar's fills.
+    /// Funding charged on the trade's position: at a bar's open (including funding due in a gap
+    /// before the bar) while it was held going into the bar, and later in a bar while it was held
+    /// after the bar's fills.
     pub funding: f64,
     /// `gross_pnl - fees - funding`.
     pub net_pnl: f64,
     /// `net_pnl / (entry_price * qty)`: net P&L over the largest entry notional.
     pub return_on_notional: f64,
     /// Bars from the entry fill's bar to the exit fill's bar; for an open trade, to the end of the
-    /// last bar.
+    /// last bar. It counts bars fed, not time: missing bars in a gap are not counted, so across a
+    /// gap it understates how long the position was held. For a closed trade, the time between
+    /// the entry and exit fills' bars is `exit_time - entry_time`.
     pub bars_held: usize,
 }
 
 /// The funding a session charged on one bar, split by the position it was charged on.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct BarFunding {
-    /// Due at the bar's open, charged on the position held going into the bar.
+    /// Due at the bar's open or in the gap before it, charged on the position held going into the
+    /// bar.
     pub at_open: f64,
     /// Due later in the bar, charged on the position after the bar's fills.
     pub in_bar: f64,

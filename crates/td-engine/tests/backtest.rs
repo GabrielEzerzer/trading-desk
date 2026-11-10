@@ -8,7 +8,8 @@ use std::path::PathBuf;
 use serde_json::Value;
 use td_core::{Candle, Millis, Timeframe};
 use td_engine::{
-    BacktestConfig, BacktestResult, EngineError, ParamValue, Params, RunKind, SavedRun,
+    BacktestConfig, BacktestResult, ENGINE_REVISION, EngineError, ParamValue, Params, RunKind,
+    SavedRun,
     data_fingerprint, list, load, rerun, run, save,
 };
 
@@ -120,6 +121,10 @@ fn assert_json_eq(actual: &Value, expected: &Value, path: &str) {
 /// Rewrites the expected result file. Run it on purpose after a deliberate change to fills,
 /// trades or metrics, then review the diff of the file before committing it:
 /// `cargo test -p td-engine --test backtest -- --ignored regenerate_expected_result`
+///
+/// A change that needs this is an engine behaviour change: bump `ENGINE_REVISION` in
+/// `src/runner.rs` in the same change, before regenerating, so saved results from the old engine
+/// show `engine_matches: false` on a rerun.
 #[test]
 #[ignore = "regenerates tests/fixtures/backtest_expected.json"]
 fn regenerate_expected_result() {
@@ -234,6 +239,7 @@ fn save_load_and_rerun_reproduce_the_result_exactly() {
 
     let again = rerun(&loaded, &synthetic_bars(), &synthetic_funding()).unwrap();
     assert!(again.fingerprint_matches);
+    assert!(again.engine_matches);
     assert_eq!(serde_json::to_string(&again.result).unwrap(), original);
 
     let listed = list(&runs).unwrap();
@@ -258,12 +264,18 @@ fn list_is_newest_first_and_skips_other_entries() {
     let runs = dir.path();
     let result = SavedRun::Backtest(Box::new(run_synthetic()));
     let first = save(&result, runs).unwrap();
-    let mut second = save(&result, runs);
-    // Two saves of the same result in the same millisecond get the same id; wait and retry.
-    while second.is_err() {
-        second = save(&result, runs);
-    }
-    let second = second.unwrap();
+    // Two saves of the same result in the same millisecond get the same id; wait and retry, a
+    // bounded number of times. Any other error fails at once.
+    let second = (0..100)
+        .find_map(|_| match save(&result, runs) {
+            Ok(id) => Some(id),
+            Err(td_engine::StoreError::RunExists(_)) => {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+                None
+            }
+            Err(e) => panic!("saving the second run failed: {e}"),
+        })
+        .expect("the second save still had the first run's id after 100 tries");
     std::fs::create_dir(runs.join(".tmp-1762790000123-0a1b2c3d")).unwrap();
     std::fs::create_dir(runs.join("not-a-run")).unwrap();
     std::fs::create_dir(runs.join("1762790000123-0a1b2c3d")).unwrap();
@@ -273,6 +285,60 @@ fn list_is_newest_first_and_skips_other_entries() {
         load(runs, "../outside"),
         Err(td_engine::StoreError::InvalidRunId(_))
     ));
+}
+
+#[test]
+fn funding_in_gaps_is_charged_at_the_next_open_and_attributed_to_the_trade_held() {
+    // Every bar that opens on a funding time (each 8 hours) is missing, so every funding event in
+    // range falls in a gap and is due at the next bar's open.
+    let bars: Vec<Candle> = synthetic_bars()
+        .into_iter()
+        .filter(|b| (b.open_time - T0) % (8 * HOUR) != 0)
+        .collect();
+    let funding = synthetic_funding();
+    let mut c = config();
+    c.params = c.params.with("allow_short", ParamValue::Bool(false));
+    let r = run(&c, &bars, &funding).unwrap();
+    assert!(r.metrics.funding_paid != 0.0);
+    // Long-only, so some exits leave the position flat on a bar right after a gap: the funding due
+    // at that open belongs to the trade that was closed, not to nothing.
+    assert_trades_add_up(&r);
+
+    // The benchmark holds the same quantity throughout and pays each event at the next open. The
+    // first used bar is at 10:00; events from 16:00 to bar 488 are in range, each charged at bar
+    // 8k + 1, which opens at price(8k).
+    let expected: f64 = funding
+        .iter()
+        .filter(|&&(t, _)| t > c.from && t < c.to)
+        .map(|&(t, rate)| r.benchmark.qty * price((t - T0) / HOUR) * rate)
+        .sum();
+    assert!(expected != 0.0);
+    let paid = r.benchmark.metrics.funding_paid;
+    assert!(
+        (paid - expected).abs() < 1e-9,
+        "benchmark paid {paid}, expected {expected}"
+    );
+
+    // Gap funding is part of the data the run used.
+    let mut rates = funding.clone();
+    let k = rates
+        .iter()
+        .position(|&(t, _)| t == T0 + 16 * HOUR)
+        .unwrap();
+    rates[k].1 += 1e-6;
+    assert!(!rerun(&r, &bars, &rates).unwrap().fingerprint_matches);
+}
+
+#[test]
+fn a_result_from_another_engine_revision_does_not_match() {
+    let mut saved = run_synthetic();
+    assert_eq!(saved.engine_revision, ENGINE_REVISION);
+    // A saved run from an engine that behaved differently, on the same data.
+    saved.engine_revision = ENGINE_REVISION + 1;
+    let again = rerun(&saved, &synthetic_bars(), &synthetic_funding()).unwrap();
+    assert!(again.fingerprint_matches);
+    assert!(!again.engine_matches);
+    assert_eq!(again.result.engine_revision, ENGINE_REVISION);
 }
 
 #[test]
@@ -352,4 +418,29 @@ fn spot_benchmark_buys_with_all_cash_at_the_first_open() {
     assert!((end - (cash + qty * last)).abs() < 1e-6);
     let expected_excess = r.metrics.total_return.unwrap() - b.metrics.total_return.unwrap();
     assert_eq!(b.excess_return, Some(expected_excess));
+}
+
+#[test]
+fn a_two_bar_one_minute_run_has_no_infinite_metric_and_round_trips() {
+    // The benchmark gains about 0.8% in two minutes, which compounds past f64::MAX a year.
+    let bars = [
+        common::bar(0, 100.0, 100.6, 99.9, 100.5),
+        common::bar(1, 100.5, 101.0, 100.4, 101.0),
+    ];
+    let mut c = config();
+    c.instrument = common::spot();
+    c.params = Params::new();
+    c.timeframe = Timeframe::M1;
+    c.from = 0;
+    c.to = 2 * common::MIN;
+    c.slippage_bps = 0.0;
+    let r = run(&c, &bars, &[]).unwrap();
+    assert!(r.benchmark.metrics.total_return.unwrap() > 0.007);
+    assert_eq!(r.benchmark.metrics.cagr, None);
+    assert_eq!(r.benchmark.metrics.calmar, None);
+
+    let dir = tempfile::tempdir().unwrap();
+    let saved = SavedRun::Backtest(Box::new(r));
+    let id = save(&saved, dir.path()).unwrap();
+    assert_eq!(load(dir.path(), id.as_str()).unwrap(), saved);
 }
