@@ -826,6 +826,40 @@ to?: string, };
 export type DeleteResult = { files: number, bytes: number, };
 
 /**
+ * `GET /candles`: closed bars, oldest first.
+ */
+export type CandlesResponse = { instrument: InstrumentId, timeframe: Timeframe, 
+/**
+ * The bar slots the response covers: open times in `[from, to)`, each on a bar boundary. `to`
+ * is the asked `to` rounded up to a boundary, but no later than the open time of the bar
+ * still forming; `from` is later than asked when the limit cut the range, and never before
+ * 2017-01-01.
+ */
+from: number, to: number, 
+/**
+ * `from` was given and the range held more than `limit` bar slots, so the oldest were left
+ * out.
+ */
+truncated: boolean, 
+/**
+ * Closed bars, oldest first.
+ */
+candles: Array<Candle>, 
+/**
+ * The bars fetched from the venue rather than read from the store.
+ */
+from_venue: Array<BarSpan>, 
+/**
+ * Slots in `[from, to)` with no bar in the store or at the venue.
+ */
+missing: Array<BarSpan>, };
+
+/**
+ * A run of bar slots: open times from `from` up to but not including `to`, `bars` of them.
+ */
+export type BarSpan = { from: number, to: number, bars: number, };
+
+/**
  * A strategy the apps can run, with the parameters it takes.
  */
 export type StrategyInfo = { name: string, description: string, params: Array<ParamSpec>, };

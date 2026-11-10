@@ -1,7 +1,8 @@
-//! Live candle feeds from Binance's and Bybit's public WebSocket streams.
+//! Live candle feeds from a source's WebSocket stream ([`LiveStream`]).
 //!
-//! A feed reads a venue's 1-minute kline stream, keeps only closed bars (Binance `k.x`, Bybit
-//! `confirm`), checks each with [`Candle::validate`], skips duplicates, and backfills over REST any
+//! A feed reads a source's 1-minute kline stream, keeps only closed bars (as the source's
+//! [`LiveStream::parse`] marks them), checks each with [`Candle::validate`], skips duplicates, and
+//! backfills over REST any
 //! minutes the stream skipped, after a reconnect or a dropped frame, before it takes a newer one.
 //! It turns the minutes into bars of the session's timeframe and emits a bar once its bucket is
 //! settled, by the same resampling rule as the store ([`crate::resample`]).
@@ -16,30 +17,48 @@
 //! minute later. By then REST has published every minute before it.
 
 mod bars;
-mod parse;
 mod ws;
 
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::Duration;
 
 use td_core::{Candle, InstrumentId, InstrumentKind, Millis, Timeframe, Venue};
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::{broadcast, mpsc};
 
 pub use bars::{BarBuilder, Placement};
-pub use parse::{KlineUpdate, parse_binance, parse_bybit, parse_message};
+pub use ws::Greeting;
 
+pub use crate::source::LiveStream;
+use crate::source::{DataSource, source};
 use crate::time::{MINUTE, now_ms};
-use crate::{DataError, Http, LoadedCandles, binance, bybit};
-use ws::{Greeting, INITIAL_BACKOFF, Inbound, MAX_BACKOFF};
+use crate::{DataError, Http, LoadedCandles};
+use ws::{INITIAL_BACKOFF, Inbound, MAX_BACKOFF};
 
 /// How many frames may wait for the feed while it backfills; more are dropped and recovered as a
 /// gap.
 const FRAME_BUFFER: usize = 1024;
-/// Bybit closes a public connection that sends nothing for a while; it asks for a ping every 20 s.
-const BYBIT_PING_EVERY: Duration = Duration::from_secs(20);
+
+/// One kline update from a stream: the bar as it stands, and whether it has closed. A source sends
+/// many updates for the bar in progress and one with `closed` set when its minute ends.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct KlineUpdate {
+    pub candle: Candle,
+    pub closed: bool,
+}
+
+/// Reads one text frame from `venue`'s kline stream (see [`LiveStream::parse`]). A venue whose
+/// source has no live stream is an error.
+pub fn parse_message(venue: Venue, text: &str) -> Result<Vec<KlineUpdate>, DataError> {
+    source(venue).live()?.parse(text)
+}
+
+/// Reads a number a stream frame gives as text.
+pub(crate) fn frame_number(what: &str, text: &str) -> Result<f64, DataError> {
+    text.parse()
+        .map_err(|_| DataError::parse(what, format!("{text:?} is not a number")))
+}
 
 /// The venue's REST data a live feed and a paper session need. [`VenueRest`] is the real one; tests
 /// use a fake.
@@ -69,7 +88,7 @@ pub trait Rest: Send + Sync {
     }
 }
 
-/// Binance's and Bybit's public REST APIs.
+/// Each venue's public REST API, through its source ([`crate::source`]).
 ///
 /// shortcut: a new HTTP client per call, so the blocking client is always made and dropped on a
 /// blocking thread, never inside the async runtime (where reqwest's blocking client panics on drop).
@@ -85,11 +104,8 @@ impl Rest for VenueRest {
         from: Millis,
         to: Millis,
     ) -> Result<Vec<Candle>, DataError> {
-        let http = Http::new()?;
-        match id.venue {
-            Venue::Binance => binance::fetch_klines(&http, id, timeframe, from, to),
-            Venue::Bybit => bybit::fetch_klines(&http, id, timeframe, from, to),
-        }
+        let live = source(id.venue).live()?;
+        live.klines(&Http::new()?, id, timeframe, from, to)
     }
 
     fn funding(
@@ -101,46 +117,21 @@ impl Rest for VenueRest {
         if id.kind != InstrumentKind::Perpetual {
             return Err(DataError::NotPerpetual(id.to_string()));
         }
-        let http = Http::new()?;
-        match id.venue {
-            Venue::Binance => binance::fetch_funding(&http, &id.symbol, from, to),
-            Venue::Bybit => bybit::fetch_funding(&http, &id.symbol, from, to),
-        }
+        source(id.venue).funding(&Http::new()?, id, from, to)
     }
 }
 
-/// The public kline stream for an instrument's 1-minute bars.
+/// The public kline stream for an instrument's 1-minute bars, from its source.
+///
+/// shortcut: a source with no live stream gives an empty URL, because callers (td-server's
+/// `run::start`) take a `String`; a [`SharedStream`] opened on it reports the source's
+/// [`DataError::NoLiveStream`] instead of connecting. Return a `Result` once those callers can
+/// take one.
 pub fn stream_url(id: &InstrumentId) -> String {
-    let lower = id.symbol.to_lowercase();
-    match (id.venue, id.kind) {
-        (Venue::Binance, InstrumentKind::Spot) => {
-            format!("wss://stream.binance.com:9443/ws/{lower}@kline_1m")
-        }
-        // USD-M serves market streams under `/market`; the old `/ws/<stream>` path still accepts
-        // the connection but sent no frames when checked on 2026-11-10.
-        (Venue::Binance, InstrumentKind::Perpetual) => {
-            format!("wss://fstream.binance.com/market/ws/{lower}@kline_1m")
-        }
-        (Venue::Bybit, InstrumentKind::Spot) => "wss://stream.bybit.com/v5/public/spot".into(),
-        (Venue::Bybit, InstrumentKind::Perpetual) => {
-            "wss://stream.bybit.com/v5/public/linear".into()
-        }
-    }
-}
-
-/// What a connection sends once it opens: Bybit needs a subscription and a ping every 20 s;
-/// Binance's stream is named in the URL and the server does the pinging.
-fn greeting(id: &InstrumentId) -> Greeting {
-    match id.venue {
-        Venue::Binance => Greeting::default(),
-        Venue::Bybit => Greeting {
-            subscribe: Some(format!(
-                r#"{{"op":"subscribe","args":["kline.1.{}"]}}"#,
-                id.symbol
-            )),
-            heartbeat: Some((BYBIT_PING_EVERY, r#"{"op":"ping"}"#.into())),
-        },
-    }
+    source(id.venue)
+        .live()
+        .map(|live| live.url(id))
+        .unwrap_or_default()
 }
 
 /// Picks the process-wide TLS crypto provider once, so that a second provider compiled in by
@@ -205,6 +196,7 @@ pub async fn run_feed(spec: FeedSpec, rest: Arc<dyn Rest>, tx: mpsc::Sender<Feed
 /// from inside a tokio runtime.
 pub struct SharedStream {
     id: InstrumentId,
+    source: &'static dyn DataSource,
     frames: broadcast::Sender<Inbound>,
     /// Subscribed before the reader starts and taken by the first feed, so no frame is lost
     /// between opening the stream and running a feed on it.
@@ -217,13 +209,27 @@ pub struct SharedStream {
 impl SharedStream {
     /// Connects to `url`, which serves `id`'s venue's message format.
     pub fn open(id: InstrumentId, url: String) -> SharedStream {
+        SharedStream::open_on(source(id.venue), id, url)
+    }
+
+    /// Connects to `url`, which serves `source`'s message format: [`SharedStream::open`] on a
+    /// source other than the venue's own, such as a fake. A source with no live stream does not
+    /// connect; the stream reports its [`DataError::NoLiveStream`] as a failed connection, again
+    /// after each backoff.
+    pub fn open_on(source: &'static dyn DataSource, id: InstrumentId, url: String) -> SharedStream {
         install_crypto_provider();
         let (frames, first) = broadcast::channel(FRAME_BUFFER);
         let connected = Arc::new(AtomicBool::new(false));
         let (reader_tx, mut reader_rx) = mpsc::channel(FRAME_BUFFER);
-        let (out, flag, greeting) = (frames.clone(), connected.clone(), greeting(&id));
+        let (out, flag) = (frames.clone(), connected.clone());
+        // Wrapped here, not inside the task below: a stream dropped before that task first runs
+        // must still abort the socket task, or it would connect once with nobody listening.
+        let socket = AbortOnDrop(match source.live() {
+            Ok(live) => tokio::spawn(ws::run_reader(url, live.greeting(&id), reader_tx)),
+            Err(e) => tokio::spawn(refuse(e.to_string(), reader_tx)),
+        });
         let reader = tokio::spawn(async move {
-            let _reader = AbortOnDrop(tokio::spawn(ws::run_reader(url, greeting, reader_tx)));
+            let _socket = socket;
             while let Some(inbound) = reader_rx.recv().await {
                 match inbound {
                     Inbound::Connected => flag.store(true, Ordering::SeqCst),
@@ -238,6 +244,7 @@ impl SharedStream {
         });
         SharedStream {
             id,
+            source,
             frames,
             first: Mutex::new(Some(first)),
             connected,
@@ -247,6 +254,19 @@ impl SharedStream {
 
     pub fn id(&self) -> &InstrumentId {
         &self.id
+    }
+}
+
+/// Stands in for the reader of a source with no live stream: reports `error` as a failed
+/// connection, again after each backoff, until the receiver is dropped.
+async fn refuse(error: String, tx: mpsc::Sender<Inbound>) {
+    let mut backoff = INITIAL_BACKOFF;
+    let failed = || Inbound::ConnectFailed {
+        error: error.clone(),
+    };
+    while tx.send(failed()).await.is_ok() {
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(MAX_BACKOFF);
     }
 }
 
@@ -276,6 +296,7 @@ pub fn run_feed_on(
     let mut feed = Feed {
         builder: BarBuilder::new(timeframe, start),
         id: stream.id.clone(),
+        source: stream.source,
         rest,
         tx,
     };
@@ -315,6 +336,7 @@ struct Gone;
 
 struct Feed {
     id: InstrumentId,
+    source: &'static dyn DataSource,
     builder: BarBuilder,
     rest: Arc<dyn Rest>,
     tx: mpsc::Sender<FeedEvent>,
@@ -326,7 +348,7 @@ impl Feed {
             Inbound::Connected => self.send(FeedEvent::Connected).await,
             Inbound::ConnectFailed { error } => self.send(FeedEvent::ConnectFailed { error }).await,
             Inbound::Disconnected { reason } => self.send(FeedEvent::Disconnected { reason }).await,
-            Inbound::Text(text) => match parse_message(self.id.venue, &text) {
+            Inbound::Text(text) => match self.source.live().and_then(|live| live.parse(&text)) {
                 Err(e) => {
                     let error = e.to_string();
                     self.send(FeedEvent::BadMessage { error }).await

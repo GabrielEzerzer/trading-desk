@@ -9,6 +9,7 @@ use ts_rs::{Config, TS};
 use super::Handshake;
 use super::HealthResponse;
 use super::StrategyInfo;
+use super::candles::{BarSpan, CandlesResponse};
 use super::data::{
     CoverageResponse, DeleteRequest, DeleteResult, DownloadRequest, DownloadResult,
     FundingCoverage, GapInfo, InstrumentsResponse, MonthCount, MonthCoverageInfo,
@@ -121,6 +122,8 @@ pub fn render() -> String {
         StoredMonthInfo,
         DeleteRequest,
         DeleteResult,
+        CandlesResponse,
+        BarSpan,
         StrategyInfo,
         JobCreated,
         JobInfo,
