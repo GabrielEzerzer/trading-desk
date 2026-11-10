@@ -1,0 +1,2 @@
+# This repo's secrets live in the hush vault under this project name, not in the repo.
+project = "trading-desk"

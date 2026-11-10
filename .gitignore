@@ -1,0 +1,4 @@
+# hush: secrets live in the hush vault, never in files in the repo
+.env
+.env.*
+!.env.example
