@@ -835,11 +835,20 @@ button {
   inset: 0;
 }
 
-/* The link the chart library's licence asks for, quiet, left of the price scale. */
+/* The library raises its own canvases with z-index; keeping them in the canvas's own stacking
+   context lets the attribution and the empty-chart notes above it take clicks. */
+.chart-canvas {
+  z-index: 0;
+}
+
+/* The link the chart library's licence asks for, quiet, left of the price scale. The padding
+   makes its hit area 24 px tall; the top is pulled up by the same amount to keep the text where
+   it was. */
 .chart-attribution {
   position: absolute;
-  top: var(--space-4);
+  top: calc(var(--space-4) - var(--space-1));
   z-index: 1;
+  padding-block: var(--space-1);
   color: var(--grey-2);
   font-size: var(--text-label);
   line-height: var(--text-label-line);
@@ -998,6 +1007,7 @@ button {
 }
 
 .menu-search {
+  flex: none;
   height: 40px;
   padding: 0 var(--space-3);
   border: 0;
@@ -1019,9 +1029,11 @@ button {
   box-shadow: none;
 }
 
-/* A small choice of a few options: the same neutral thumb as the section toggle. */
+/* A small choice of a few options: the same neutral thumb as the section toggle. It keeps its
+   height in a column that runs short, such as the ticker menu, where the list is what scrolls. */
 .segmented {
   display: inline-flex;
+  flex: none;
   align-self: flex-start;
   gap: 2px;
   padding: 3px;
