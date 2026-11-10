@@ -579,7 +579,10 @@ fn the_listing_shows_each_instrument_with_its_months_and_bytes_and_reports_stray
     );
     for m in &perp_listed.months {
         assert!(m.bytes > 0);
-        assert_eq!(m.bytes, file_size(store.candle_path(&perp, m.month).unwrap()));
+        assert_eq!(
+            m.bytes,
+            file_size(store.candle_path(&perp, m.month).unwrap())
+        );
     }
     let funding_bytes = file_size(store.funding_path(&perp).unwrap());
     assert_eq!(perp_listed.funding_bytes, Some(funding_bytes));
@@ -685,7 +688,10 @@ fn deleting_a_month_range_leaves_the_other_months_readable() {
         .write_candles(&id, &flat_minutes(month("2024-02").start(), 0..5))
         .expect("writes");
     assert_eq!(
-        store.read_month(&id, month("2024-02")).expect("reads").len(),
+        store
+            .read_month(&id, month("2024-02"))
+            .expect("reads")
+            .len(),
         5
     );
 }

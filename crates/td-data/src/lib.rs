@@ -21,6 +21,6 @@ pub use http::Http;
 pub use instruments::{InstrumentList, default_fees, fetch_instruments, validate_instrument};
 pub use resample::{LoadedCandles, resample};
 pub use store::{
-    DeleteReport, Gap, MonthCoverage, Store, StoredData, StoredInstrument, StoredMonth, WriteReport,
-    data_dir, missing_minutes,
+    DeleteReport, Gap, MonthCoverage, Store, StoredData, StoredInstrument, StoredMonth,
+    WriteReport, data_dir, missing_minutes,
 };

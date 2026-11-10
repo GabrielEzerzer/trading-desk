@@ -1,10 +1,11 @@
-//! `td-data`: list instruments, download history into the store, and show what the store holds.
+//! `td-data`: list instruments, download history into the store, show what the store holds and
+//! how big it is, and delete it.
 
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use td_core::{InstrumentId, InstrumentKind, Venue};
-use td_data::time::{format_minute, parse_date};
+use td_data::time::{Month, format_minute, parse_date};
 use td_data::{DataError, Gap, Http, Store, download_candles, download_funding, fetch_instruments};
 
 #[derive(Debug, Parser)]
@@ -42,6 +43,24 @@ enum Command {
         #[command(flatten)]
         instrument: InstrumentArgs,
     },
+    /// List every instrument the store holds, with the size of each month file and funding file.
+    Stored,
+    /// Delete an instrument's candles for a range of months, or with no range the whole
+    /// instrument, including a perpetual's funding file.
+    Delete {
+        #[command(flatten)]
+        instrument: InstrumentArgs,
+        /// First month to delete, YYYY-MM.
+        #[arg(long, requires = "to", value_parser = parse_month)]
+        from: Option<Month>,
+        /// Last month to delete, YYYY-MM, included.
+        #[arg(long, requires = "from", value_parser = parse_month)]
+        to: Option<Month>,
+    },
+}
+
+fn parse_month(text: &str) -> Result<Month, String> {
+    Month::parse(text).ok_or_else(|| format!("{text:?} is not a month in the form YYYY-MM"))
 }
 
 #[derive(Debug, clap::Args)]
@@ -193,8 +212,69 @@ fn run(cli: Cli) -> Result<(), DataError> {
                 }
             }
         }
+        Command::Stored => {
+            let store = Store::open_default()?;
+            let stored = store.stored()?;
+            println!("store: {}", store.root().display());
+            for instrument in &stored.instruments {
+                println!("{}: {}", instrument.id, size(instrument.bytes()));
+                for month in &instrument.months {
+                    println!("  {}: {}", month.month, size(month.bytes));
+                }
+                if let Some(bytes) = instrument.funding_bytes {
+                    println!("  funding: {}", size(bytes));
+                }
+            }
+            for path in &stored.unrecognised {
+                println!("not written by the store, left alone: {}", path.display());
+            }
+            let total: u64 = stored.instruments.iter().map(|i| i.bytes()).sum();
+            println!(
+                "instruments: {}, total: {}",
+                stored.instruments.len(),
+                size(total)
+            );
+        }
+        Command::Delete {
+            instrument,
+            from,
+            to,
+        } => {
+            if let (Some(from), Some(to)) = (from, to)
+                && from > to
+            {
+                Cli::command()
+                    .error(
+                        clap::error::ErrorKind::ValueValidation,
+                        format!("--to {to} is before --from {from}"),
+                    )
+                    .exit();
+            }
+            let id = instrument.id();
+            let store = Store::open_default()?;
+            eprintln!("store: {}", store.root().display());
+            let report = match (from, to) {
+                (Some(from), Some(to)) => store.delete_months(&id, from, to)?,
+                _ => store.delete_instrument(&id)?,
+            };
+            println!(
+                "{id}: removed {} files, {}",
+                report.files,
+                size(report.bytes)
+            );
+        }
     }
     Ok(())
+}
+
+/// A size in bytes for people: kB, MB or GB, powers of 1000.
+fn size(bytes: u64) -> String {
+    let b = bytes as f64;
+    match bytes {
+        0..1_000_000 => format!("{:.1} kB", b / 1e3),
+        1_000_000..1_000_000_000 => format!("{:.1} MB", b / 1e6),
+        _ => format!("{:.2} GB", b / 1e9),
+    }
 }
 
 /// Prints missing-minute runs, at most 20 of them.
@@ -214,5 +294,38 @@ fn print_gaps(gaps: &[Gap]) {
     }
     if gaps.len() > 20 {
         println!("  ... and {} more", gaps.len() - 20);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sizes_read_in_kb_mb_or_gb() {
+        assert_eq!(size(0), "0.0 kB");
+        assert_eq!(size(1_500), "1.5 kB");
+        assert_eq!(size(999_999), "1000.0 kB");
+        assert_eq!(size(1_000_000), "1.0 MB");
+        assert_eq!(size(12_345_678), "12.3 MB");
+        assert_eq!(size(2_500_000_000), "2.50 GB");
+    }
+
+    #[test]
+    fn a_delete_takes_both_ends_of_a_month_range_or_neither() {
+        let parse = |args: &[&str]| {
+            let base = ["td-data", "delete", "--venue", "binance", "--kind", "spot"];
+            Cli::try_parse_from(
+                base.iter()
+                    .chain(["--symbol", "BTCUSDT"].iter())
+                    .chain(args),
+            )
+        };
+        assert!(parse(&[]).is_ok());
+        assert!(parse(&["--from", "2024-01", "--to", "2024-03"]).is_ok());
+        assert!(parse(&["--from", "2024-01"]).is_err());
+        assert!(parse(&["--to", "2024-01"]).is_err());
+        assert!(parse(&["--from", "2024-1", "--to", "2024-03"]).is_err());
+        assert!(parse(&["--from", "2024-01-01", "--to", "2024-03"]).is_err());
     }
 }

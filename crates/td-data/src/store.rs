@@ -555,9 +555,9 @@ impl Store {
                 continue;
             };
             for name in dir_names(&venue_dir, &mut unrecognised, &self.root)? {
-                let parsed = name.split_once(".parquet").filter(|(symbol, rest)| {
-                    check_symbol(symbol).is_ok() && is_store_suffix(rest)
-                });
+                let parsed = name
+                    .split_once(".parquet")
+                    .filter(|(symbol, rest)| check_symbol(symbol).is_ok() && is_store_suffix(rest));
                 let Some((symbol, rest)) = parsed else {
                     unrecognised.push(self.relative(&venue_dir.join(&name)));
                     continue;
@@ -1396,7 +1396,9 @@ mod tests {
             .open(lock_path_of(&path))
             .expect("opens");
         store.delete_months(&id, jan, jan).expect("deletes");
-        waiting.lock().expect("gets the lock once the delete lets go");
+        waiting
+            .lock()
+            .expect("gets the lock once the delete lets go");
         assert_eq!(
             waiting.metadata().expect("metadata").len(),
             1,
@@ -1407,6 +1409,27 @@ mod tests {
         let fresh = lock_across_processes(&path).expect("locks");
         assert_eq!(fresh.metadata().expect("metadata").len(), 0);
         assert!(lock_path_of(&path).exists());
+    }
+
+    #[test]
+    fn a_writer_never_writes_under_a_retired_sidecar() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let store = Store::new(dir.path());
+        let id = spot_id();
+        let jan = Month::containing(1_704_067_200_000); // 2024-01-01
+        store
+            .write_candles(&id, &[flat_candle(jan.start())])
+            .expect("writes");
+        let path = store.candle_path(&id, jan).expect("a path");
+        // A delete that stopped after retiring the sidecar and before removing it.
+        fs::write(lock_path_of(&path), b"x").expect("writes");
+        assert!(lock_across_processes(&path).is_err());
+        assert!(
+            store
+                .write_candles(&id, &[flat_candle(jan.start() + MINUTE)])
+                .is_err()
+        );
+        assert_eq!(store.read_month(&id, jan).expect("reads").len(), 1);
     }
 
     #[test]
@@ -1455,7 +1478,12 @@ mod tests {
             let expected: Vec<Millis> = (first..=last).step_by(MINUTE as usize).collect();
             assert_eq!(stored, expected);
         }
-        let folder = store.candle_path(&id, jan).unwrap().parent().unwrap().to_path_buf();
+        let folder = store
+            .candle_path(&id, jan)
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
         let leftovers: Vec<_> = read_dir_or_empty(&folder)
             .unwrap()
             .map(|e| e.unwrap().file_name())
