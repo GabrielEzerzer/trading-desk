@@ -1,7 +1,7 @@
 # CI for this repo, copied in by D:/code/setup/new-project.py. Rules: D:/code/CLAUDE.md, "Test suites".
 # It runs on pushes to branches other than the default and on manual dispatch, so each push starts one run
 # and a branch has results before its PR exists.
-# The Suite step fails until the first code PR replaces it with the project's own commands.
+# It runs the Rust suite: rustfmt, clippy with warnings denied, and the workspace tests.
 # Never give this workflow production URLs, real secrets, .env.local or a service_role key.
 name: ci
 
@@ -23,7 +23,13 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
-      - name: Suite
-        run: |
-          echo "::error::No test suite is wired into CI yet. Replace this step with the project's commands."
-          exit 1
+      # With no arguments, rustup installs the toolchain and components named in rust-toolchain.toml.
+      - name: Install toolchain
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --workspace
