@@ -401,7 +401,8 @@ impl Store {
     ///
     /// Times are rounded to the nearest minute as they are read, so a file written before the
     /// venue parsers rounded them reads the same as one written after; the next write of the file
-    /// stores them rounded.
+    /// stores them rounded. Two stamps that round to the same minute keep the later rate, with a
+    /// warning.
     fn read_funding(&self, id: &InstrumentId) -> Result<Vec<(Millis, f64)>, DataError> {
         let path = self.funding_path(id)?;
         let Some(columns) = read_columns(&path, &FUNDING_COLUMNS)? else {
@@ -423,11 +424,16 @@ impl Store {
             }
             previous = t;
             let t = round_to_minute(t);
-            if rates.last().is_some_and(|&(last, _)| last == t) {
-                return Err(bad_file(
-                    &path,
-                    format!("row {row} is on the same minute as the row before"),
-                ));
+            // Two stamps in one minute, from a file written before times were rounded: keep the
+            // later, so the next write repairs the file instead of failing on it.
+            if let Some(last) = rates.last_mut().filter(|(last, _)| *last == t) {
+                eprintln!(
+                    "warning: {}: row {row} is on the same minute as the row before; keeping \
+                     the later rate",
+                    path.display()
+                );
+                *last = (t, rate);
+                continue;
             }
             rates.push((t, rate));
         }
@@ -982,5 +988,67 @@ mod tests {
             store.load_funding(&id, t, t + 3 * h8).expect("loads"),
             [(t, 0.0001), (t + h8, 0.0003), (t + 2 * h8, 0.0004)]
         );
+        // The file itself now holds the times on the minute.
+        assert_eq!(raw_funding_times(&store, &id), [t, t + h8, t + 2 * h8]);
+    }
+
+    fn funding_id() -> InstrumentId {
+        InstrumentId {
+            venue: td_core::Venue::Binance,
+            symbol: "BTCUSDT".into(),
+            kind: InstrumentKind::Perpetual,
+        }
+    }
+
+    /// The funding times as stored in the file, without the rounding applied on reading.
+    fn raw_funding_times(store: &Store, id: &InstrumentId) -> Vec<Millis> {
+        let path = store.funding_path(id).expect("a path");
+        let columns = read_columns(&path, &FUNDING_COLUMNS)
+            .expect("reads")
+            .expect("a file");
+        int_column(&path, &columns[0]).expect("times").to_vec()
+    }
+
+    #[test]
+    fn funding_is_written_with_its_times_rounded_to_the_minute() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let store = Store::new(dir.path());
+        let id = funding_id();
+        let t = 1_704_096_000_000;
+        store
+            .write_funding(&id, &[(t + 8, 0.0001), (t + 8 * 3_600_000 - 5, 0.0002)])
+            .expect("writes");
+        assert_eq!(raw_funding_times(&store, &id), [t, t + 8 * 3_600_000]);
+    }
+
+    #[test]
+    fn a_funding_file_with_two_stamps_in_one_minute_keeps_the_later_and_is_repaired_on_write() {
+        // Written before times were rounded: 00:00 stamped 5 ms early, then again 8 ms late.
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let store = Store::new(dir.path());
+        let id = funding_id();
+        let path = store.funding_path(&id).expect("a path");
+        let t = 1_704_096_000_000;
+        let h8 = 8 * 3_600_000;
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(Int64Array::from(vec![t - 5, t + 8])),
+            Arc::new(Float64Array::from(vec![0.0001, 0.0002])),
+        ];
+        write_atomic(
+            &path,
+            &record_batch(&FUNDING_COLUMNS, columns).expect("a batch"),
+        )
+        .expect("writes");
+        assert_eq!(
+            store.load_funding(&id, t - h8, t + h8).expect("loads"),
+            [(t, 0.0002)]
+        );
+        assert_eq!(
+            store
+                .write_funding(&id, &[(t + h8, 0.0003)])
+                .expect("writes"),
+            2
+        );
+        assert_eq!(raw_funding_times(&store, &id), [t, t + h8]);
     }
 }

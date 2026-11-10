@@ -11,11 +11,13 @@ pub enum FillCheck {
     Fill {
         price: f64,
         liquidity: Liquidity,
-        /// The market price the order met, before slippage and before capping at a limit. For a
-        /// resting limit the bar opens through, it is the open while `price` is the limit. When it
+        /// The market price the order met, before slippage and before capping at a limit. When it
         /// is the bar's open, the broker takes the fill as happening at the open, before any fill
-        /// inside the bar's range. An attached stop is checked against the rest of the bar from
-        /// this price.
+        /// inside the bar's range, and an attached stop is checked against the rest of the bar
+        /// from this price. A resting limit the bar opens through has the open here and its limit
+        /// in `price`, and fills as a maker: the broker takes it as filled between the bars, before
+        /// the fills at the open, and checks its attached stop from the limit, with the market
+        /// trading on from there to the open.
         market: f64,
     },
 }
@@ -23,7 +25,8 @@ pub enum FillCheck {
 /// Decides whether and at what price an order fills on a bar. The broker calls it only for bars
 /// after the one the order was decided on, and handles fees, ordering and order state. For an
 /// attached stop it also calls it on its entry's fill bar, with the bar's open replaced by the
-/// entry's market price.
+/// price the entry met the market at: its market price, or its limit when it filled between the
+/// bars, with the range stretched to include that limit.
 pub trait FillModel: Send {
     /// `first` says whether this is the first bar the order can fill on. `triggered` says whether
     /// a stop-limit was triggered on an earlier bar.
@@ -62,9 +65,12 @@ pub trait FillModel: Send {
 ///
 /// shortcut: a resting limit a bar opens through fills at its own price, which assumes the market
 /// traded through it between the bars, as on a venue that trades around the clock with no gap.
-/// After a real jump (a halt or an outage that reopens past the limit) a venue would fill it at the
-/// reopening price, which is better, so this errs against the strategy. Upgrade with a trade-level
-/// fill model.
+/// The broker keeps to that assumption for what follows from the fill: it comes before the fills
+/// at the open, and an attached stop between the limit and the open fills at its trigger on the
+/// way. After a real jump (a halt or an outage that reopens past the limit) a venue would fill the
+/// limit at the reopening price, which is better, so this errs against the strategy. Stops the bar
+/// opens through still fill at the open, which errs against the strategy the other way. Upgrade
+/// with a trade-level fill model.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CandleFillModel {
     pub slippage_bps: f64,
