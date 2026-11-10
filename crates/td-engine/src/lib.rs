@@ -41,4 +41,4 @@ pub use results::{RunId, RunSummary, StoreError, list, load, save};
 pub use runner::{BacktestConfig, BacktestResult, Benchmark, Rerun, data_fingerprint, rerun, run};
 pub use session::{EquityPoint, Session, SessionConfig, run_backtest};
 pub use strategy::{Context, Strategy};
-pub use trades::{Trade, TradeSide, build_trades};
+pub use trades::{BarFunding, Trade, TradeSide, build_trades};
