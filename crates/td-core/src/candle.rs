@@ -18,7 +18,7 @@ pub struct Candle {
 
 impl Candle {
     /// Rejects bars that cannot be real: non-finite values, a high below the open or close, a low
-    /// above them, or negative volume.
+    /// above them, a low at or below zero, or negative volume.
     pub fn validate(&self) -> Result<(), CoreError> {
         let fail = |reason| {
             Err(CoreError::InvalidCandle {
@@ -42,6 +42,10 @@ impl Candle {
         }
         if self.low > self.open.min(self.close) {
             return fail("low is above open or close");
+        }
+        // The low is the smallest of the four prices once the checks above pass.
+        if self.low <= 0.0 {
+            return fail("non-positive price");
         }
         if self.volume < 0.0 || self.quote_volume < 0.0 {
             return fail("negative volume");
@@ -108,6 +112,24 @@ mod tests {
                 ..candle()
             }),
             "low is above open or close"
+        );
+    }
+
+    #[test]
+    fn non_positive_prices_are_rejected() {
+        assert_eq!(
+            reason(Candle {
+                low: 0.0,
+                ..candle()
+            }),
+            "non-positive price"
+        );
+        assert_eq!(
+            reason(Candle {
+                low: -1.0,
+                ..candle()
+            }),
+            "non-positive price"
         );
     }
 
