@@ -829,13 +829,15 @@ fn spot_buys_must_fit_in_the_cash_with_the_taker_fee_and_open_buys() {
     approx(s.portfolio().cash(), 4_939.9);
     assert_eq!(s.open_orders().len(), 1);
 
-    // Perpetuals have no margin model, so the same oversized buy is accepted there.
+    // A perpetual has no cash check, but the same oversized buy is 10x, over the default 1x
+    // leverage cap.
     let (script, log) = Script::new(vec![(
         0,
         req(&perp(), Side::Buy, 1000.0, OrderType::Market),
     )]);
     run(perp(), 0.0, &bars, script);
-    assert!(log.lock().unwrap()[0].is_ok());
+    let log = log.lock().unwrap();
+    assert!(log[0].as_ref().unwrap_err().reason.contains("leverage cap"));
 }
 
 #[test]
@@ -1495,12 +1497,22 @@ fn bad_bars_are_rejected_and_change_nothing() {
 
 #[test]
 fn bad_configs_are_rejected() {
-    for (cash, slip) in [(-1.0, 0.0), (f64::NAN, 0.0), (1.0, -1.0), (1.0, 10_000.0)] {
+    let cases = [
+        (-1.0, 0.0, 1.0),
+        (f64::NAN, 0.0, 1.0),
+        (1.0, -1.0, 1.0),
+        (1.0, 10_000.0, 1.0),
+        (1.0, 0.0, 0.0),
+        (1.0, 0.0, -2.0),
+        (1.0, 0.0, f64::INFINITY),
+    ];
+    for (cash, slip, max_leverage) in cases {
         let (script, _) = Script::new(vec![]);
         let cfg = td_engine::SessionConfig {
             starting_cash: cash,
             slippage_bps: slip,
             fees: None,
+            max_leverage,
         };
         assert!(matches!(
             Session::new(script, spot(), Timeframe::M1, cfg),
@@ -1661,10 +1673,14 @@ fn reference_strategies_size_full_spot_entries_to_pass_the_cash_check() {
         .with("risk", td_engine::ParamValue::Float(1.0));
     // Uncapped, both would buy 10000 / close, which costs 10020 with the taker fee. Capped at
     // 10000 * 0.995 / (close * (1 + 0.002 + 0.0005)) with 5 bps of slippage: SMA decides on bar
-    // 7's close of 114 and buys 87.063; Donchian decides on bar 5's close of 110 and buys 90.228.
+    // 7's close of 114 and orders 87.063; Donchian decides on bar 5's close of 110 and orders
+    // 90.228. Both pass the cash check. The next bar opens 2 higher, a gap bigger than the
+    // headroom, so each buy is cut at fill time to the cash: SMA fills at 116 plus slippage,
+    // 116.06, and 10000 / (116.06 * 1.002) = 85.990; Donchian at 112.06, and
+    // 10000 / (112.06 * 1.002) = 89.059.
     let cases = [
-        ("sma_cross", sma, 87.063),
-        ("donchian_breakout", donchian, 90.228),
+        ("sma_cross", sma, 85.99),
+        ("donchian_breakout", donchian, 89.059),
     ];
     for (name, params, qty) in cases {
         let strategy = build_strategy(name, &params).unwrap();
@@ -1680,6 +1696,7 @@ fn reference_strategies_size_full_spot_entries_to_pass_the_cash_check() {
         let entry = &s.fills()[0];
         assert_eq!(entry.side, Side::Buy, "{name}");
         approx(entry.qty, qty);
+        assert!(s.portfolio().cash() >= 0.0, "{name}");
     }
 }
 

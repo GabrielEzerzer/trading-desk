@@ -337,6 +337,7 @@ fn config(kind: InstrumentKind, days: i64) -> BacktestConfig {
         fee_override: None,
         warmup_from: None,
         close_at_end: false,
+        max_leverage: 1.0,
     }
 }
 
