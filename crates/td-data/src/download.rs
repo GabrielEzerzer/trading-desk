@@ -35,23 +35,19 @@ pub fn download_candles(
     progress: &mut dyn FnMut(String),
 ) -> Result<DownloadReport, DataError> {
     let now = now_ms();
-    let this_month = Month::containing(now);
     let mut report = DownloadReport::default();
     for month in Month::range(from, to.min(now)) {
         let lo = from.max(month.start());
         let hi = to.min(month.end()).min(now);
         let mut candles = match id.venue {
-            Venue::Binance => {
-                let monthly = if month < this_month {
-                    binance::fetch_archive(http, id, ArchivePeriod::Month(month))?
-                } else {
-                    None
-                };
-                match monthly {
-                    Some(candles) => candles,
-                    None => binance_days(http, id, lo, hi, &mut report.missing_files)?,
-                }
-            }
+            Venue::Binance => binance_month(
+                &id.symbol,
+                month,
+                (lo, hi),
+                now,
+                &mut report.missing_files,
+                |period| binance::fetch_archive(http, id, period),
+            )?,
             Venue::Bybit => bybit::fetch_klines(http, id, lo, hi)?,
         };
         candles.retain(|c| (lo..hi).contains(&c.open_time));
@@ -67,22 +63,32 @@ pub fn download_candles(
     Ok(report)
 }
 
-/// The daily archive files for the days that overlap `[lo, hi)`, up to yesterday.
-fn binance_days(
-    http: &Http,
-    id: &InstrumentId,
-    lo: Millis,
-    hi: Millis,
+/// One month of Binance klines from the archive, where `fetch` downloads one archive file (`None`
+/// when the archive has no such file). A month before the current one comes from its monthly
+/// file; when that is not published, and for the current month, the daily files for the days that
+/// overlap `[lo, hi)` up to yesterday are used instead, and the names of those the archive lacks
+/// are added to `missing`.
+fn binance_month(
+    symbol: &str,
+    month: Month,
+    (lo, hi): (Millis, Millis),
+    now: Millis,
     missing: &mut Vec<String>,
+    mut fetch: impl FnMut(ArchivePeriod) -> Result<Option<Vec<Candle>>, DataError>,
 ) -> Result<Vec<Candle>, DataError> {
-    let today = now_ms().div_euclid(DAY) * DAY;
+    if month < Month::containing(now)
+        && let Some(candles) = fetch(ArchivePeriod::Month(month))?
+    {
+        return Ok(candles);
+    }
+    let today = now.div_euclid(DAY) * DAY;
     let mut candles = Vec::new();
     let mut day = lo.div_euclid(DAY) * DAY;
     while day < hi && day < today {
         let period = ArchivePeriod::Day(day);
-        match binance::fetch_archive(http, id, period)? {
+        match fetch(period)? {
             Some(rows) => candles.extend(rows),
-            None => missing.push(binance::archive_file_name(&id.symbol, period)),
+            None => missing.push(binance::archive_file_name(symbol, period)),
         }
         day += DAY;
     }
@@ -107,4 +113,78 @@ pub fn download_funding(
     };
     store.write_funding(id, &rates)?;
     Ok(rates.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Reads `month` through [`binance_month`] from an archive that holds the files `has` says it
+    /// holds, each with one candle at the start of its period. Returns the open times read, the
+    /// files asked for and the names reported missing.
+    fn month_from_archive(
+        month: Month,
+        range: (Millis, Millis),
+        now: Millis,
+        has: impl Fn(ArchivePeriod) -> bool,
+    ) -> (Vec<Millis>, Vec<ArchivePeriod>, Vec<String>) {
+        let (mut asked, mut missing) = (Vec::new(), Vec::new());
+        let candles = binance_month("BTCUSDT", month, range, now, &mut missing, |period| {
+            asked.push(period);
+            let open_time = match period {
+                ArchivePeriod::Month(m) => m.start(),
+                ArchivePeriod::Day(day) => day,
+            };
+            let candle = Candle {
+                open_time,
+                open: 1.0,
+                high: 1.0,
+                low: 1.0,
+                close: 1.0,
+                volume: 0.0,
+                quote_volume: 0.0,
+            };
+            Ok(has(period).then(|| vec![candle]))
+        })
+        .expect("reads");
+        let times = candles.iter().map(|c| c.open_time).collect();
+        (times, asked, missing)
+    }
+
+    #[test]
+    fn a_missing_monthly_file_falls_back_to_the_daily_files() {
+        let jan = Month::parse("2024-01").expect("a month");
+        let now = jan.end() + 40 * DAY;
+        // 2024-01-10 up to 2024-01-13, from an archive with no monthly file and no file for the 11th.
+        let [d10, d11, d12] = [9, 10, 11].map(|n| jan.start() + n * DAY);
+        let has = |p| !matches!(p, ArchivePeriod::Month(_)) && p != ArchivePeriod::Day(d11);
+        let (read, asked, missing) = month_from_archive(jan, (d10, d12 + DAY), now, has);
+        assert_eq!(
+            asked,
+            [
+                ArchivePeriod::Month(jan),
+                ArchivePeriod::Day(d10),
+                ArchivePeriod::Day(d11),
+                ArchivePeriod::Day(d12)
+            ]
+        );
+        assert_eq!(read, [d10, d12]);
+        assert_eq!(missing, ["BTCUSDT-1m-2024-01-11.zip"]);
+    }
+
+    #[test]
+    fn a_published_monthly_file_is_used_alone_and_the_current_month_reads_up_to_yesterday() {
+        let jan = Month::parse("2024-01").expect("a month");
+        let (read, asked, missing) =
+            month_from_archive(jan, (jan.start(), jan.end()), jan.end() + DAY, |_| true);
+        assert_eq!(asked, [ArchivePeriod::Month(jan)]);
+        assert_eq!(read, [jan.start()]);
+        assert!(missing.is_empty());
+        // At noon on 2024-01-03 the month has no monthly file yet, and today has no daily file.
+        let now = jan.start() + 2 * DAY + DAY / 2;
+        let (read, asked, _) = month_from_archive(jan, (jan.start(), now), now, |_| true);
+        let days = [jan.start(), jan.start() + DAY];
+        assert_eq!(asked, days.map(ArchivePeriod::Day));
+        assert_eq!(read, days);
+    }
 }

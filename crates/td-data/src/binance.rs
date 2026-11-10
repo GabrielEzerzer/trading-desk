@@ -232,24 +232,83 @@ pub fn fetch_funding(
     from: Millis,
     to: Millis,
 ) -> Result<Vec<(Millis, f64)>, DataError> {
-    let mut rates = Vec::new();
-    let mut start = from;
-    while start < to {
+    page_forwards(from, to, FUNDING_LIMIT, |start| {
+        // A pause between pages, not before the first.
+        if start > from {
+            std::thread::sleep(FUNDING_DELAY);
+        }
         let query = [
             ("symbol", symbol.to_string()),
             ("startTime", start.to_string()),
             ("endTime", (to - 1).to_string()),
             ("limit", FUNDING_LIMIT.to_string()),
         ];
-        let page = parse_funding(&http.get_text(FUNDING_URL, &query)?)?;
-        let full = page.len() == FUNDING_LIMIT;
+        parse_funding(&http.get_text(FUNDING_URL, &query)?)
+    })
+}
+
+/// Reads an oldest-first endpoint forwards over `[from, to)`. `fetch(start)` returns a page of up
+/// to `limit` rates, the oldest at or after `start`; after a full page the next one starts just
+/// after its last rate, and a short page is the last.
+fn page_forwards(
+    from: Millis,
+    to: Millis,
+    limit: usize,
+    mut fetch: impl FnMut(Millis) -> Result<Vec<(Millis, f64)>, DataError>,
+) -> Result<Vec<(Millis, f64)>, DataError> {
+    let mut rates = Vec::new();
+    let mut start = from;
+    while start < to {
+        let page = fetch(start)?;
+        let full = page.len() == limit;
         let Some(&(last, _)) = page.last() else { break };
         rates.extend(page);
         if !full {
             break;
         }
         start = last + 1;
-        std::thread::sleep(FUNDING_DELAY);
     }
     Ok(rates)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pages forwards over `[from, to)` through an oldest-first endpoint holding a rate at each of
+    /// `times`, which answers with the oldest `limit` of them in the range asked for. Returns the
+    /// times read and the start of each page asked for.
+    fn read_forward(
+        times: &[Millis],
+        from: Millis,
+        to: Millis,
+        limit: usize,
+    ) -> (Vec<Millis>, Vec<Millis>) {
+        let mut starts = Vec::new();
+        let rates = page_forwards(from, to, limit, |start| {
+            starts.push(start);
+            let page = times.iter().map(|&t| (t, 0.0001));
+            Ok(page
+                .filter(|(t, _)| (start..to).contains(t))
+                .take(limit)
+                .collect())
+        })
+        .expect("pages");
+        (rates.into_iter().map(|(t, _)| t).collect(), starts)
+    }
+
+    #[test]
+    fn forward_paging_neither_drops_nor_repeats_a_rate_at_a_page_boundary() {
+        // Rates one millisecond apart, so the start of the second page, one after the last rate of
+        // the full first page, lands exactly on a rate. The second page is short.
+        let limit = FUNDING_LIMIT as Millis;
+        let times: Vec<Millis> = (0..limit + 3).collect();
+        let (read, starts) = read_forward(&times, 0, limit + 3, FUNDING_LIMIT);
+        assert_eq!(read, times);
+        assert_eq!(starts, [0, limit]);
+        // A full page that reaches the end of the range is the last one asked for.
+        let (read, starts) = read_forward(&times, 3, limit + 3, FUNDING_LIMIT);
+        assert_eq!(read, times[3..]);
+        assert_eq!(starts, [3]);
+    }
 }

@@ -70,32 +70,50 @@ pub fn fetch_klines(
     to: Millis,
 ) -> Result<Vec<Candle>, DataError> {
     let closed_before = now_ms() - MINUTE;
-    let mut candles = Vec::new();
-    let mut end = to.min(closed_before + 1) - 1;
-    while end >= from {
+    let end = to.min(closed_before + 1) - 1;
+    let open_time = |c: &Candle| c.open_time;
+    page_backwards(from, end, KLINE_LIMIT, open_time, |page_end| {
         let query = [
             ("category", bybit_category(id.kind).to_string()),
             ("symbol", id.symbol.clone()),
             ("interval", "1".to_string()),
             ("start", from.to_string()),
-            ("end", end.to_string()),
+            ("end", page_end.to_string()),
             ("limit", KLINE_LIMIT.to_string()),
         ];
         let page = parse_kline_page(&http.get_text(KLINE_URL, &query)?)?;
         std::thread::sleep(DELAY);
-        let full = page.len() == KLINE_LIMIT;
-        let Some(oldest) = page.iter().map(|c| c.open_time).min() else {
+        Ok(page)
+    })
+}
+
+/// Reads a newest-first endpoint backwards over `[from, end]`. `fetch(end)` returns a page of up
+/// to `limit` rows, the newest at or before `end`; after a full page the next one ends just before
+/// its oldest row, and a short page is the last. Returns the rows in `[from, end]`, oldest first.
+fn page_backwards<T>(
+    from: Millis,
+    end: Millis,
+    limit: usize,
+    time: impl Fn(&T) -> Millis,
+    mut fetch: impl FnMut(Millis) -> Result<Vec<T>, DataError>,
+) -> Result<Vec<T>, DataError> {
+    let mut rows = Vec::new();
+    let mut page_end = end;
+    while page_end >= from {
+        let page = fetch(page_end)?;
+        let full = page.len() == limit;
+        let Some(oldest) = page.iter().map(&time).min() else {
             break;
         };
-        candles.extend(page);
+        rows.extend(page);
         if !full {
             break;
         }
-        end = oldest - 1;
+        page_end = oldest - 1;
     }
-    candles.retain(|c| (from..to).contains(&c.open_time) && c.open_time <= closed_before);
-    candles.sort_by_key(|c| c.open_time);
-    Ok(candles)
+    rows.retain(|row| (from..=end).contains(&time(row)));
+    rows.sort_by_key(&time);
+    Ok(rows)
 }
 
 #[derive(Debug, Deserialize)]
@@ -141,30 +159,83 @@ pub fn fetch_funding(
     from: Millis,
     to: Millis,
 ) -> Result<Vec<(Millis, f64)>, DataError> {
-    let mut rates = Vec::new();
-    let mut end = to - 1;
-    while end >= from {
+    let funding_time = |&(t, _): &(Millis, f64)| t;
+    let mut rates = page_backwards(from, to - 1, FUNDING_LIMIT, funding_time, |page_end| {
         let query = [
             ("category", "linear".to_string()),
             ("symbol", symbol.to_string()),
             ("startTime", from.to_string()),
-            ("endTime", end.to_string()),
+            ("endTime", page_end.to_string()),
             ("limit", FUNDING_LIMIT.to_string()),
         ];
         let page = parse_funding_page(&http.get_text(FUNDING_URL, &query)?)?;
         std::thread::sleep(DELAY);
-        let full = page.len() == FUNDING_LIMIT;
-        let Some(oldest) = page.iter().map(|&(t, _)| t).min() else {
-            break;
-        };
-        rates.extend(page);
-        if !full {
-            break;
-        }
-        end = oldest - 1;
-    }
-    rates.retain(|&(t, _)| (from..to).contains(&t));
-    rates.sort_by_key(|&(t, _)| t);
+        Ok(page)
+    })?;
     rates.dedup_by_key(|&mut (t, _)| t);
     Ok(rates)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pages backwards over `[from, end]` through a newest-first endpoint holding `times`, which
+    /// answers with the newest `limit` of them in the range asked for. Returns the rows read and
+    /// the end of each page asked for.
+    fn read_back(
+        times: &[Millis],
+        from: Millis,
+        end: Millis,
+        limit: usize,
+    ) -> (Vec<Millis>, Vec<Millis>) {
+        let mut ends = Vec::new();
+        let rows = page_backwards(
+            from,
+            end,
+            limit,
+            |&t: &Millis| t,
+            |page_end| {
+                ends.push(page_end);
+                let page = times.iter().rev().copied();
+                Ok(page
+                    .filter(|t| (from..=page_end).contains(t))
+                    .take(limit)
+                    .collect())
+            },
+        )
+        .expect("pages");
+        (rows, ends)
+    }
+
+    #[test]
+    fn backward_paging_neither_drops_nor_repeats_a_row_at_a_page_boundary() {
+        for limit in [KLINE_LIMIT, FUNDING_LIMIT] {
+            // Rows one millisecond apart, so the end of the second page, one before the oldest row
+            // of the full first page, lands exactly on a row. The second page is short.
+            let n = limit as Millis + 7;
+            let times: Vec<Millis> = (0..n).collect();
+            let (rows, ends) = read_back(&times, 0, n - 1, limit);
+            assert_eq!(rows, times, "page size {limit}");
+            assert_eq!(ends, [n - 1, 6], "page size {limit}");
+            // A full page that reaches back to `from` is the last one asked for.
+            let (rows, ends) = read_back(&times[7..], 7, n - 1, limit);
+            assert_eq!(rows, times[7..], "page size {limit}");
+            assert_eq!(ends, [n - 1], "page size {limit}");
+        }
+    }
+
+    #[test]
+    fn backward_paging_keeps_only_rows_in_the_range() {
+        // An endpoint that also returns a row after `end` and one before `from`.
+        let rows = page_backwards(
+            10,
+            20,
+            1000,
+            |&t: &Millis| t,
+            |_| Ok(vec![25, 20, 15, 10, 5]),
+        )
+        .expect("pages");
+        assert_eq!(rows, [10, 15, 20]);
+    }
 }
