@@ -10,11 +10,13 @@ import {
   MOCK_ARG,
   TITLE_BAR_HEIGHT,
 } from '@td/shared'
-import { type Connection, RefusedRequest, sendRequest, validateRequest, validateTopic } from './bridge'
+import { RefusedRequest, sendRequest, validateRequest, validateTopic } from './bridge'
+import { createEngine } from './engine'
 import { isExternalLink } from './links'
 import { createQuit } from './quit'
 import { Sidecar, sidecarBin } from './sidecar'
 import { EngineSocket } from './socket'
+import { spawnWatchdog } from './watchdog'
 
 // Sized so the Lab's 680 px reading column, its margins and the 12 px ground strip fit at the
 // minimum, and the verdict and composer both stay in view on a 768 px tall laptop screen.
@@ -24,9 +26,6 @@ const MIN_HEIGHT = 600
 const log = (line: string) => console.log(`[td-server] ${line}`)
 
 let window: BrowserWindow | null = null
-let sidecar: Sidecar | null = null
-let connection: Connection | null = null
-let status: EngineStatus = { state: 'connecting' }
 // Aborted when the app quits, so no request to the engine is left open.
 const requests = new AbortController()
 
@@ -35,62 +34,27 @@ const socket = new EngineSocket((message: ServerMessage) => {
 }, log)
 
 const quit = createQuit({
-  stopEngine: () => (sidecar ? sidecar.stop() : Promise.resolve('exited')),
-  killEngine: () => sidecar?.kill(),
+  stopEngine: () => engine.stop(),
+  killEngine: () => engine.kill(),
   closeConnections: () => {
-    socket.close()
+    engine.disconnect()
     requests.abort()
-    connection = null
   },
   exit: (code) => app.exit(code),
-  // shortcut: terminates only the main process; Chromium's helpers exit when it goes. Revisit if a
-  // real launch ever shows helpers outliving it.
-  terminate: () => process.kill(process.pid, 'SIGKILL'),
+  // shortcut: the watchdog kills only the main process; Chromium's helpers exit when it goes.
+  // Revisit if a real launch ever shows helpers outliving it.
+  armWatchdog: (afterMs) => spawnWatchdog(process.pid, afterMs),
   log,
 })
 
-function setStatus(next: EngineStatus): void {
-  status = next
-  window?.webContents.send(IPC.statusChanged, next)
-}
-
-async function startEngine(): Promise<void> {
-  if (quit.quitting) return
-  setStatus({ state: 'connecting' })
-  const bin = sidecarBin(process.env, app.getAppPath(), app.isPackaged)
-  const engine = new Sidecar({ bin, env: process.env, log })
-  sidecar = engine
-  void engine.exited.then(({ code, signal }) => {
-    if (sidecar !== engine) return
-    connection = null
-    socket.close()
-    if (!quit.quitting && status.state === 'running') {
-      setStatus({ state: 'failed', message: `the engine stopped (${signal ? `signal ${signal}` : `exit code ${code}`})` })
-    }
-  })
-  try {
-    const handshake = await engine.ready
-    // The handshake can arrive after a quit began; never open a socket to an engine being stopped.
-    if (quit.quitting || sidecar !== engine) return
-    connection = handshake
-    socket.open(handshake)
-    setStatus({ state: 'running' })
-  } catch (e) {
-    if (quit.quitting || sidecar !== engine) return
-    const message = e instanceof Error ? e.message : String(e)
-    log(message)
-    setStatus({ state: 'failed', message })
-  }
-}
-
-/** Starts a new engine after the last one failed. Anything else is left alone. */
-async function restartEngine(): Promise<void> {
-  if (quit.quitting || status.state !== 'failed') return
-  setStatus({ state: 'connecting' })
-  const old = sidecar
-  if (old) log(`stopped before restart (${await old.stop()})`)
-  await startEngine()
-}
+const engine = createEngine({
+  spawn: () => new Sidecar({ bin: sidecarBin(process.env, app.getAppPath(), app.isPackaged), env: process.env, log }),
+  openSocket: (connection) => socket.open(connection),
+  closeSocket: () => socket.close(),
+  onStatus: (status: EngineStatus) => window?.webContents.send(IPC.statusChanged, status),
+  quit,
+  log,
+})
 
 /** Only the app's own window, from its top frame, may use the bridge. */
 function checkSender(event: IpcMainInvokeEvent): void {
@@ -110,7 +74,9 @@ function registerIpc(): void {
       log(`refused a renderer request: ${e.message}`)
       return { ok: false, status: 0, error: { code: 'refused', message: e.message } }
     }
+    const connection = engine.connection
     if (!connection || quit.quitting) {
+      const status = engine.status
       const why = status.state === 'failed' ? status.message : 'the engine is still starting'
       return { ok: false, status: 0, error: { code: 'engine_unavailable', message: why } }
     }
@@ -126,12 +92,12 @@ function registerIpc(): void {
   })
   ipcMain.handle(IPC.status, (event) => {
     checkSender(event)
-    return status
+    return engine.status
   })
   ipcMain.handle(IPC.restartEngine, async (event, ...args: unknown[]) => {
     checkSender(event)
     if (args.length > 0) throw new Error('restartEngine takes no arguments')
-    await restartEngine()
+    await engine.restart()
   })
 }
 
@@ -180,6 +146,12 @@ if (!app.requestSingleInstanceLock()) {
   app.exit(0)
 } else {
   app.on('second-instance', () => {
+    // shortcut: a relaunch is dropped while the engine stops, for up to 13 s (QUIT_TIMINGS); the
+    // user has to launch again after. Upgrade to relaunching once this process exits if it bites.
+    if (quit.quitting) {
+      log('a second launch arrived while the app was stopping; ignored')
+      return
+    }
     if (!window) return
     if (window.isMinimized()) window.restore()
     window.focus()
@@ -190,7 +162,7 @@ if (!app.requestSingleInstanceLock()) {
     session.defaultSession.setPermissionRequestHandler((_contents, _permission, callback) => callback(false))
     registerIpc()
     createWindow()
-    void startEngine()
+    void engine.start()
   })
 
   // One window: closing it quits the app, and quitting stops the engine first (quit.ts).
@@ -198,5 +170,5 @@ if (!app.requestSingleInstanceLock()) {
   app.on('before-quit', (event) => quit.onBeforeQuit(event))
 
   // Last resort if the process exits without going through before-quit.
-  process.on('exit', () => sidecar?.kill())
+  process.on('exit', () => engine.kill())
 }

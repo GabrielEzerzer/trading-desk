@@ -36,7 +36,7 @@ Fonts render differently on each operating system, so the screenshot baselines a
 
 ## Design
 
-The look follows the project's design direction (`docs/design/direction.md`, outside git). Every colour, size and duration is a token in `shared/src/theme.css`; components never name a raw value. The Lab reads its data through the `LabSource` seam in `app/src/renderer/src/lab/source.ts`, so mock data never enters the components.
+The look follows the project's design direction (`docs/design/direction.md`, outside git). Every colour and motion duration is a token in `shared/src/theme.css`, and components never name a raw one; the one exception is the reduced-motion override in `styles.css`, which cuts every duration to 0.01 ms. Sizes and spacing are still written as raw pixel values in `styles.css`. The Lab reads its data through the `LabSource` seam in `app/src/renderer/src/lab/source.ts`, so mock data never enters the components.
 
 Trading reads its data through the `TradingSource` seam in `app/src/renderer/src/trading/source.ts`, chosen the same way. The engine has no candle history and no manual order endpoint yet (#36), so with the real engine the chart starts empty and fills from the live candle stream, and the order composer says orders arrive with #36.
 

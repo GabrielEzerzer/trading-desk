@@ -4,9 +4,11 @@
 // sequence: stop anything that could reconnect or start new work, ask the engine to stop, and
 // then end the process with `app.exit(0)`. Every `before-quit` is prevented, so the process only
 // ends through that exit: Electron's own quit never continues past a half-finished stop, and the
-// sequence never relies on a second `app.quit()` being honoured. Two timers make it bounded:
-// the engine gets `stopTimeoutMs` before it is killed and the app exits anyway, and if the
-// process is still alive `terminateAfterMs` after `exit` it terminates itself.
+// sequence never relies on a second `app.quit()` being honoured. Two backstops make it bounded:
+// the engine gets `stopTimeoutMs` before it is killed and the app exits anyway, and just before
+// `exit` a watchdog process is armed that kills the app if it is still alive `terminateAfterMs`
+// later (watchdog.ts). The watchdog lives outside the app because `exit` tears down Node before
+// Chromium's shutdown, where a hang would happen, so no timer in this process could fire then.
 
 export interface QuitDeps {
   /** Asks the engine to stop; resolves with how it went, for the log. */
@@ -17,8 +19,8 @@ export interface QuitDeps {
   closeConnections(): void
   /** Ends the process without another `before-quit` (Electron's `app.exit`). */
   exit(code: number): void
-  /** Ends the process outright, for when `exit` did not. */
-  terminate(): void
+  /** Arms a watchdog outside the process that kills it `afterMs` from now, for when `exit` hangs. */
+  armWatchdog(afterMs: number): void
   log(line: string): void
 }
 
@@ -46,11 +48,11 @@ export function createQuit(deps: QuitDeps, timings: QuitTimings = QUIT_TIMINGS):
     if (state === 'exiting') return
     state = 'exiting'
     clearTimeout(stopTimer)
-    const terminateTimer = setTimeout(() => {
-      deps.log(`the app was still running ${timings.terminateAfterMs} ms after exit; terminating it`)
-      deps.terminate()
-    }, timings.terminateAfterMs)
-    terminateTimer.unref?.()
+    try {
+      deps.armWatchdog(timings.terminateAfterMs)
+    } catch (e) {
+      deps.log(`arming the quit watchdog failed: ${e instanceof Error ? e.message : String(e)}`)
+    }
     deps.exit(0)
   }
 

@@ -13,6 +13,19 @@ describe('format', () => {
     expect(formatNumber(0, 'percent', { sign: true })).toBe('0.0%')
   })
 
+  it('writes a figure that rounds to zero with no sign', () => {
+    expect(formatNumber(-0.00004, 'percent')).toBe('0.0%')
+    expect(formatNumber(0.00004, 'percent', { sign: true })).toBe('0.0%')
+    expect(formatNumber(-0.004, 'ratio')).toBe('0.00')
+    expect(formatNumber(-0.4, 'count')).toBe('0')
+    expect(formatNumber(-0, 'percent', { sign: true })).toBe('0.0%')
+    expect(formatReturnPct(-0.004)).toBe('0.00%')
+    expect(formatReturnPct(0.004)).toBe('0.00%')
+    // Just past the rounding edge the sign comes back.
+    expect(formatNumber(-0.0005, 'percent')).toBe('−0.1%')
+    expect(formatReturnPct(-0.005)).toBe('−0.01%')
+  })
+
   it('writes trade returns, prices, days, instruments and limits', () => {
     expect(formatReturnPct(3.2)).toBe('+3.20%')
     expect(formatReturnPct(-1.5)).toBe('−1.50%')
@@ -24,10 +37,14 @@ describe('format', () => {
     expect(formatLimit({ label: 'x', value: 0.2, limit: 0.25, rule: 'at_most', format: 'percent', pass: true })).toBe('at most 25.0%')
   })
 
-  it('tones P&L by sign only', () => {
-    expect(pnlTone(0.1)).toBe('gain')
-    expect(pnlTone(-0.1)).toBe('loss')
-    expect(pnlTone(0)).toBeUndefined()
+  it('tones P&L by the sign of the figure as shown', () => {
+    expect(pnlTone(0.1, 'percent')).toBe('gain')
+    expect(pnlTone(-0.1, 'percent')).toBe('loss')
+    expect(pnlTone(0, 'percent')).toBeUndefined()
+    expect(pnlTone(-0.00004, 'percent')).toBeUndefined()
+    expect(pnlTone(0.00004, 'percent')).toBeUndefined()
+    expect(pnlTone(-0.004, 'return_pct')).toBeUndefined()
+    expect(pnlTone(-0.02, 'return_pct')).toBe('loss')
   })
 
   it('turns engine messages into sentences without capitalising program names', () => {

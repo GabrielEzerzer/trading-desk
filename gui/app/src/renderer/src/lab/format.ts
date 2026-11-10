@@ -6,9 +6,14 @@ import type { Criterion, NumberFormat } from './source'
 
 const MINUS = '−'
 
+// The sign comes from the figure as shown: a value that rounds to zero is written "0.0%", never
+// "−0.0%" or "+0.0%".
+const roundsToZero = (text: string) => !/[1-9]/.test(text)
+
 function signed(text: string, value: number, sign: boolean): string {
+  if (roundsToZero(text)) return text
   if (value < 0) return MINUS + text
-  return sign && value > 0 ? `+${text}` : text
+  return sign ? `+${text}` : text
 }
 
 /** `0.2466` as percent is "24.7%"; ratios get two decimals; counts are whole numbers. */
@@ -64,9 +69,12 @@ export function formatLimit(criterion: Criterion): string {
   return `${word} ${formatNumber(criterion.limit, criterion.format)}`
 }
 
-/** The colour role of a P&L number: gain above zero, loss below, ink at zero. */
-export function pnlTone(value: number): 'gain' | 'loss' | undefined {
-  if (value > 0) return 'gain'
-  if (value < 0) return 'loss'
-  return undefined
+/**
+ * The colour role of a P&L number as it is shown in `format` (`return_pct` for `formatReturnPct`):
+ * gain above zero, loss below, ink when it rounds to zero.
+ */
+export function pnlTone(value: number, format: NumberFormat | 'return_pct'): 'gain' | 'loss' | undefined {
+  const text = format === 'return_pct' ? formatReturnPct(value) : formatNumber(value, format)
+  if (roundsToZero(text)) return undefined
+  return value > 0 ? 'gain' : 'loss'
 }
