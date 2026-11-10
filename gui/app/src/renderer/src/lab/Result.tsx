@@ -62,7 +62,7 @@ export function Result({ strategy, verdict, fresh, onCounted }: Props) {
         {verdict.keyNumbers.map((k) => (
           <div key={k.label} className="key-number">
             <dt>{k.label}</dt>
-            <dd data-tone={k.tone === 'pnl' ? pnlTone(k.value) : undefined}>
+            <dd data-tone={k.tone === 'pnl' ? pnlTone(k.value, k.format) : undefined}>
               {formatNumber(count(k.value), k.format, { sign: k.tone === 'pnl' })}
             </dd>
           </div>
@@ -137,7 +137,7 @@ export function Result({ strategy, verdict, fresh, onCounted }: Props) {
                 <td>{formatDay(t.exitTime)}</td>
                 <td className="num">{formatPrice(t.entryPrice)}</td>
                 <td className="num">{formatPrice(t.exitPrice)}</td>
-                <td className="num" data-tone={pnlTone(t.returnPct)}>
+                <td className="num" data-tone={pnlTone(t.returnPct, 'return_pct')}>
                   {formatReturnPct(t.returnPct)}
                 </td>
               </tr>
