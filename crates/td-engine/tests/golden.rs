@@ -83,7 +83,7 @@ fn market_orders_fill_at_the_next_open_with_slippage_and_taker_fee() {
 }
 
 #[test]
-fn limit_buys_fill_at_the_open_on_a_gap_and_at_the_limit_on_a_touch() {
+fn limit_buys_fill_at_their_limit_on_a_gap_and_on_a_touch() {
     let i = spot();
     let bars = [
         bar(0, 100.0, 101.0, 99.0, 100.0),
@@ -99,21 +99,22 @@ fn limit_buys_fill_at_the_open_on_a_gap_and_at_the_limit_on_a_touch() {
 
     let f = s.fills();
     assert_eq!(f.len(), 2);
-    // Bar 1 opens at 97, already below the 98 limit: fills at 97, maker 0.1% of 485.
+    // Bar 1 opens at 97, already below the 98 limit, which rested from the close of 100: the
+    // market passed 98 between the bars, so it fills at 98, maker 0.1% of 490.
     assert_eq!((f[0].order_id.0, f[0].time), (1, MIN));
-    approx(f[0].price, 97.0);
-    approx(f[0].fee, 0.485);
+    approx(f[0].price, 98.0);
+    approx(f[0].fee, 0.49);
     assert_eq!(f[0].liquidity, Liquidity::Maker);
     // Bar 1's low 96 never reaches 95. Bar 2's low 94.5 does, after opening at 96: fills at 95.
     assert_eq!((f[1].order_id.0, f[1].time), (2, 2 * MIN));
     approx(f[1].price, 95.0);
     approx(f[1].fee, 0.095);
 
-    // Bar 1: 10000 - 485.485 + 5 * 98. Bar 2: cash 10000 - 485.485 - 95.095 = 9419.42, plus 6 * 95.
+    // Bar 1: 10000 - 490.49 + 5 * 98. Bar 2: cash 10000 - 490.49 - 95.095 = 9414.415, plus 6 * 95.
     let e = equity(&s);
-    approx(e[1], 10_004.515);
-    approx(e[2], 9_989.42);
-    approx(s.portfolio().cash(), 9_419.42);
+    approx(e[1], 9_999.51);
+    approx(e[2], 9_984.415);
+    approx(s.portfolio().cash(), 9_414.415);
     approx(s.portfolio().position(), 6.0);
     // The 90 limit was never reached and is still resting.
     assert_eq!(s.orders()[2].status, OrderStatus::Open);
@@ -121,7 +122,7 @@ fn limit_buys_fill_at_the_open_on_a_gap_and_at_the_limit_on_a_touch() {
 }
 
 #[test]
-fn limit_sell_fills_at_the_open_on_a_gap_up() {
+fn a_limit_sell_fills_at_its_limit_on_a_gap_up() {
     let i = perp();
     let bars = [
         bar(0, 100.0, 101.0, 99.0, 100.0),
@@ -132,13 +133,15 @@ fn limit_sell_fills_at_the_open_on_a_gap_up() {
         req(&i, Side::Sell, 1.0, OrderType::Limit { price: 102.0 }),
     )]);
     let s = run(i, 0.0, &bars, script);
-    // Opens at 103, above the 102 limit: a short of 1 at 103, maker fee 0.103.
-    approx(s.fills()[0].price, 103.0);
-    approx(s.fills()[0].fee, 0.103);
-    // Perpetual: cash 10000 - 0.103; unrealised -1 * (103.5 - 103) = -0.5.
-    approx(s.portfolio().cash(), 9_999.897);
+    // Opens at 103, above the 102 limit resting from the close of 100: a short of 1 at 102, maker
+    // fee 0.102.
+    approx(s.fills()[0].price, 102.0);
+    approx(s.fills()[0].fee, 0.102);
+    assert_eq!(s.fills()[0].liquidity, Liquidity::Maker);
+    // Perpetual: cash 10000 - 0.102; unrealised -1 * (103.5 - 102) = -1.5.
+    approx(s.portfolio().cash(), 9_999.898);
     approx(s.portfolio().position(), -1.0);
-    approx(equity(&s)[1], 9_999.397);
+    approx(equity(&s)[1], 9_998.398);
 }
 
 #[test]
@@ -182,12 +185,12 @@ fn a_limit_priced_through_the_market_fills_as_a_taker_with_slippage() {
     approx(f[3].price, 100.05);
     approx(f[3].fee, 0.2001);
     // Order 5 buys at 100.5 after a close of 100, but bar 2 opens at 101, past the limit, and its
-    // low of 100.8 stays above it: it rests as a plain limit. Bar 3 opens inside the limit at
-    // 100.3, but that is no longer the order's first bar, so it fills as a resting limit: at the
-    // open, as a maker, fee 0.1003.
+    // low of 100.8 stays above it: it rests as a plain limit. Bar 3 opens through the limit at
+    // 100.3, but that is no longer the order's first bar, so it fills as a resting limit: at its
+    // limit of 100.5, as a maker, fee 0.1005.
     assert_eq!(fill(4), (5, 3 * MIN, Liquidity::Maker));
-    approx(f[4].price, 100.3);
-    approx(f[4].fee, 0.1003);
+    approx(f[4].price, 100.5);
+    approx(f[4].fee, 0.1005);
 
     // Perpetual, bar 1: the fees 0.2002 + 0.2002 + 0.1998 + 0.2001 = 0.8003, and order 3 closes 1
     // of the 2 bought at 100.10 for 99.90, realising -0.20: cash 9998.9997. Long 2 at an average
@@ -196,13 +199,13 @@ fn a_limit_priced_through_the_market_fills_as_a_taker_with_slippage() {
     approx(e[1], 9998.8497);
     // Bar 2: marked at 101.5, unrealised 2 * 1.425 = 2.85.
     approx(e[2], 10001.8497);
-    // Bar 3: cash less 0.1003 = 9998.8994. Long 3 at an average of (200.15 + 100.3) / 3, marked at
-    // 100.2: unrealised 300.6 - 300.45 = 0.15.
+    // Bar 3: cash less 0.1005 = 9998.8992. Long 3 at an average of (200.15 + 100.5) / 3, marked at
+    // 100.2: unrealised 300.6 - 300.65 = -0.05.
     let p = s.portfolio();
-    approx(p.cash(), 9998.8994);
+    approx(p.cash(), 9998.8992);
     approx(p.position(), 3.0);
     approx(p.realised_pnl(), -0.20);
-    approx(e[3], 9999.0494);
+    approx(e[3], 9998.8492);
 }
 
 #[test]
@@ -325,6 +328,136 @@ fn ioc_orders_only_see_the_open_and_cancel_if_unfilled() {
     assert_eq!(f.liquidity, Liquidity::Taker);
     approx(s.portfolio().cash(), 9_899.8);
     assert!(s.open_orders().is_empty());
+}
+
+#[test]
+fn resting_limits_a_bar_opens_through_fill_at_their_own_price_as_makers() {
+    let i = perp();
+    let bars = [
+        bar(0, 105.0, 106.0, 104.0, 105.0),
+        bar(1, 105.0, 106.0, 104.0, 105.0),
+        bar(2, 90.0, 92.0, 89.0, 91.0),
+        bar(3, 115.0, 116.0, 114.0, 115.0),
+    ];
+    let limit = |price| OrderType::Limit { price };
+    let (script, _) = Script::new(vec![
+        (0, req(&i, Side::Buy, 1.0, limit(100.0))),
+        (0, req(&i, Side::Sell, 1.0, limit(110.0))),
+    ]);
+    let s = run(i, 10.0, &bars, script);
+    // Both rest from the close of 105, the buy below it and the sell above it, and bar 1 reaches
+    // neither. Bar 2 opens at 90, through the buy: the market passed 100 on the way down, where the
+    // resting order filled, so it buys at 100, not 90, as a maker with no slippage: fee 0.1.
+    let f = s.fills();
+    assert_eq!(f.len(), 2);
+    assert_eq!((f[0].order_id.0, f[0].time), (1, 2 * MIN));
+    assert_eq!(f[0].liquidity, Liquidity::Maker);
+    approx(f[0].price, 100.0);
+    approx(f[0].fee, 0.1);
+    // Bar 3 opens at 115, through the sell: it sells at 110, not 115, fee 0.11.
+    assert_eq!((f[1].order_id.0, f[1].time), (2, 3 * MIN));
+    assert_eq!(f[1].liquidity, Liquidity::Maker);
+    approx(f[1].price, 110.0);
+    approx(f[1].fee, 0.11);
+    // Bar 2: cash 10000 - 0.1, long 1 from 100 marked at 91. Bar 3: realised 10, flat.
+    let e = equity(&s);
+    approx(e[2], 9990.9);
+    let p = s.portfolio();
+    assert_eq!(p.position(), 0.0);
+    approx(p.realised_pnl(), 10.0);
+    approx(p.cash(), 10009.79);
+    approx(e[3], 10009.79);
+}
+
+#[test]
+fn an_ioc_limit_marketable_at_the_open_takes_with_slippage_up_to_its_limit() {
+    let i = spot();
+    let bars = [
+        bar(0, 100.0, 101.0, 99.0, 100.0),
+        bar(1, 99.0, 100.0, 98.0, 99.5),
+    ];
+    let limit = |price| ioc(req(&i, Side::Buy, 1.0, OrderType::Limit { price }));
+    let (script, _) = Script::new(vec![(0, limit(99.5)), (0, limit(99.05))]);
+    let s = run(i, 10.0, &bars, script);
+    // Neither was marketable at the close of 100, but an IOC order trades on arrival, at bar 1's
+    // open of 99, where both are marketable: they take liquidity like a market order. 99 * 1.001
+    // = 99.099, rounded up to 99.10, inside the 99.5 limit: taker fee 0.1982. The second is capped
+    // at its 99.05 limit: fee 0.1981.
+    let f = s.fills();
+    assert_eq!(f.len(), 2);
+    assert!(f.iter().all(|f| f.liquidity == Liquidity::Taker));
+    approx(f[0].price, 99.10);
+    approx(f[0].fee, 0.1982);
+    approx(f[1].price, 99.05);
+    approx(f[1].fee, 0.1981);
+    approx(s.portfolio().cash(), 10_000.0 - 99.2982 - 99.2481);
+}
+
+#[test]
+fn a_triggered_stop_limit_the_next_bar_opens_through_fills_at_its_limit() {
+    let i = spot();
+    let bars = [
+        bar(0, 100.0, 101.0, 99.0, 100.0),
+        bar(1, 104.0, 105.0, 103.8, 104.5),
+        bar(2, 102.0, 103.0, 101.5, 102.5),
+    ];
+    let (script, _) = Script::new(vec![(
+        0,
+        req(
+            &i,
+            Side::Buy,
+            1.0,
+            OrderType::StopLimit {
+                trigger: 103.0,
+                price: 103.5,
+            },
+        ),
+    )]);
+    let s = run(i, 10.0, &bars, script);
+    // Bar 1 opens at 104, past the 103 trigger and above the 103.5 limit: triggered, and the
+    // limit rests. Bar 2 opens at 102, through the resting limit, so it buys at 103.5, not 102,
+    // as a maker: fee 0.1035.
+    let f = s.fills();
+    assert_eq!(f.len(), 1);
+    assert_eq!((f[0].order_id.0, f[0].time), (1, 2 * MIN));
+    assert_eq!(f[0].liquidity, Liquidity::Maker);
+    approx(f[0].price, 103.5);
+    approx(f[0].fee, 0.1035);
+    // Cash 10000 - 103.6035, plus 1 marked at 102.5.
+    approx(s.portfolio().cash(), 9896.3965);
+    approx(equity(&s)[2], 9998.8965);
+}
+
+#[test]
+fn an_attached_stop_on_a_resting_entry_a_bar_opens_through_both_fills_at_the_open() {
+    let i = perp();
+    let bars = [
+        bar(0, 105.0, 106.0, 104.0, 105.0),
+        bar(1, 90.0, 92.0, 89.0, 91.0),
+    ];
+    let entry = req(&i, Side::Buy, 1.0, OrderType::Limit { price: 100.0 });
+    let strategy = steps(move |ctx, n| {
+        if n == 0 {
+            ctx.submit_with_stop(entry.clone(), 95.0).unwrap();
+        }
+    });
+    let s = run(i, 0.0, &bars, strategy);
+    // Bar 1 opens at 90, through the resting entry at 100 and its stop at 95. The entry buys at
+    // its limit of 100 as a maker, fee 0.1. The market it met is the open of 90, already through
+    // the stop, so the stop sells there at once as a taker: fee 0.18. Realised -10.
+    let f = s.fills();
+    assert_eq!(f.len(), 2);
+    assert_eq!((f[0].order_id.0, f[0].liquidity), (1, Liquidity::Maker));
+    approx(f[0].price, 100.0);
+    approx(f[0].fee, 0.1);
+    assert_eq!((f[1].order_id.0, f[1].time), (2, MIN));
+    assert_eq!(f[1].liquidity, Liquidity::Taker);
+    approx(f[1].price, 90.0);
+    approx(f[1].fee, 0.18);
+    let p = s.portfolio();
+    assert_eq!(p.position(), 0.0);
+    approx(p.realised_pnl(), -10.0);
+    approx(p.cash(), 9989.72);
 }
 
 fn funding_session(side: Side) -> Session {
@@ -734,24 +867,24 @@ fn a_take_profit_the_bar_opens_through_fills_before_a_stop_inside_the_range() {
     ]);
     let s = run(i, 0.0, &bars, script);
     // Bar 2 opens at 112, already through the 110 take-profit, so the take-profit fills at the
-    // open, before anything inside the range: at 112 as a maker (the gap rule), fee 0.112. The
-    // fall to 94 that reaches the stop comes after it, when the position is already closed.
+    // open, before anything inside the range: at its limit of 110 as a maker, fee 0.11. The fall
+    // to 94 that reaches the stop comes after it, when the position is already closed.
     let f = s.fills();
     assert_eq!(f.len(), 2);
     assert_eq!((f[1].order_id.0, f[1].time), (2, 2 * MIN));
-    approx(f[1].price, 112.0);
-    approx(f[1].fee, 0.112);
+    approx(f[1].price, 110.0);
+    approx(f[1].fee, 0.11);
     assert_eq!(f[1].liquidity, Liquidity::Maker);
     assert_eq!(
         s.orders()[2].status,
         OrderStatus::Cancelled("reduce-only order would not reduce the position".into())
     );
-    // Entry at 100, fee 0.2. Realised 112 - 100 = 12: cash 10000 - 0.2 + 12 - 0.112 = 10011.688.
+    // Entry at 100, fee 0.2. Realised 110 - 100 = 10: cash 10000 - 0.2 + 10 - 0.11 = 10009.69.
     let p = s.portfolio();
     assert_eq!(p.position(), 0.0);
-    approx(p.realised_pnl(), 12.0);
-    approx(p.cash(), 10011.688);
-    approx(equity(&s)[2], 10011.688);
+    approx(p.realised_pnl(), 10.0);
+    approx(p.cash(), 10009.69);
+    approx(equity(&s)[2], 10009.69);
 }
 
 #[test]
@@ -779,9 +912,9 @@ fn an_attached_stop_inside_the_range_waits_for_the_fills_at_the_open() {
     let s = run(i, 0.0, &bars, strategy);
     // Bar 1: order 1 buys 1 at 100, fee 0.2. Bar 2 opens at 112: order 2 buys 1 there, fee 0.224,
     // for a long of 2 at an average of 106, and the take-profit, which the bar opens through,
-    // sells both at 112 as a maker, fee 0.224. The stop at 95 is placed with order 2's fill, but
-    // the bar only reaches it inside the range, after the fills at the open, and by then there is
-    // nothing left to close.
+    // sells both at its limit of 110 as a maker, fee 0.22. The stop at 95 is placed with order 2's
+    // fill, but the bar only reaches it inside the range, after the fills at the open, and by then
+    // there is nothing left to close.
     let f = s.fills();
     assert_eq!(f.len(), 3);
     let fill = |n: usize| (f[n].order_id.0, f[n].time, f[n].side);
@@ -789,19 +922,19 @@ fn an_attached_stop_inside_the_range_waits_for_the_fills_at_the_open() {
     approx(f[1].price, 112.0);
     approx(f[1].fee, 0.224);
     assert_eq!(fill(2), (4, 2 * MIN, Side::Sell));
-    approx(f[2].price, 112.0);
+    approx(f[2].price, 110.0);
     approx(f[2].qty, 2.0);
-    approx(f[2].fee, 0.224);
+    approx(f[2].fee, 0.22);
     assert_eq!(
         s.orders()[2].status,
         OrderStatus::Cancelled("reduce-only order would not reduce the position".into())
     );
-    // Realised 2 * (112 - 106) = 12: cash 10000 - 0.2 - 0.224 - 0.224 + 12 = 10011.352, flat.
+    // Realised 2 * (110 - 106) = 8: cash 10000 - 0.2 - 0.224 - 0.22 + 8 = 10007.356, flat.
     let p = s.portfolio();
     assert_eq!(p.position(), 0.0);
-    approx(p.realised_pnl(), 12.0);
-    approx(p.cash(), 10011.352);
-    approx(equity(&s)[2], 10011.352);
+    approx(p.realised_pnl(), 8.0);
+    approx(p.cash(), 10007.356);
+    approx(equity(&s)[2], 10007.356);
 }
 
 #[test]

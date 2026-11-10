@@ -325,3 +325,45 @@ fn funding_history_from_both_venues() {
     assert_eq!(bybit[0], (1_704_182_400_000, 0.00049958));
     assert_eq!(bybit[4], (1_704_067_200_000, 0.00043294));
 }
+
+#[test]
+fn funding_times_are_rounded_to_the_nearest_minute_on_both_venues() {
+    // 2024-01-01 08:00 UTC, stamped 8 ms late, 5 ms early and on time.
+    let t = 1_704_096_000_000;
+    let binance = binance::parse_funding(&format!(
+        r#"[{{"symbol":"BTCUSDT","fundingTime":{},"fundingRate":"0.0001"}},
+            {{"symbol":"BTCUSDT","fundingTime":{},"fundingRate":"0.0002"}},
+            {{"symbol":"BTCUSDT","fundingTime":{},"fundingRate":"0.0003"}}]"#,
+        t + 8,
+        t + 8 * 3_600_000 - 5,
+        t + 16 * 3_600_000,
+    ))
+    .expect("parses");
+    assert_eq!(
+        binance,
+        [
+            (t, 0.0001),
+            (t + 8 * 3_600_000, 0.0002),
+            (t + 16 * 3_600_000, 0.0003)
+        ]
+    );
+
+    let bybit = bybit::parse_funding_page(&format!(
+        r#"{{"retCode":0,"retMsg":"OK","result":{{"category":"linear","list":[
+            {{"symbol":"BTCUSDT","fundingRate":"0.0003","fundingRateTimestamp":"{}"}},
+            {{"symbol":"BTCUSDT","fundingRate":"0.0002","fundingRateTimestamp":"{}"}},
+            {{"symbol":"BTCUSDT","fundingRate":"0.0001","fundingRateTimestamp":"{}"}}]}}}}"#,
+        t + 16 * 3_600_000,
+        t + 8 * 3_600_000 - 5,
+        t + 7,
+    ))
+    .expect("parses");
+    assert_eq!(
+        bybit,
+        [
+            (t + 16 * 3_600_000, 0.0003),
+            (t + 8 * 3_600_000, 0.0002),
+            (t, 0.0001)
+        ]
+    );
+}

@@ -67,6 +67,17 @@ pub fn parse_date(text: &str) -> Result<Millis, DataError> {
     Ok(days * DAY)
 }
 
+/// The whole minute nearest `t`; half a minute rounds up.
+///
+/// Funding times are read through this, at parsing and when stored files are read, because a
+/// venue can stamp a rate a few milliseconds after the hour it belongs to. The engine charges
+/// funding at a bar's open only when the time is at or before the open, so a stamp a few
+/// milliseconds late would be charged on the position after that bar's fills instead of the one
+/// held into it.
+pub fn round_to_minute(t: Millis) -> Millis {
+    (t + MINUTE / 2).div_euclid(MINUTE) * MINUTE
+}
+
 /// Formats as `YYYY-MM-DD HH:MM` UTC.
 pub fn format_minute(t: Millis) -> String {
     let (year, month, day) = civil_from_days(t.div_euclid(DAY));

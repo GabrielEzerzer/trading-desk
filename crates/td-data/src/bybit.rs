@@ -10,7 +10,7 @@ use td_core::{Candle, InstrumentId, Millis, Timeframe};
 use crate::DataError;
 use crate::http::Http;
 use crate::instruments::{bybit_category, bybit_result};
-use crate::time::now_ms;
+use crate::time::{now_ms, round_to_minute};
 
 const KLINE_URL: &str = "https://api.bybit.com/v5/market/kline";
 const FUNDING_URL: &str = "https://api.bybit.com/v5/market/funding/history";
@@ -150,7 +150,8 @@ struct FundingRow {
 }
 
 /// Parses one `/v5/market/funding/history` response into `(funding time, rate)`, in the order
-/// given (newest first).
+/// given (newest first). Funding times are rounded to the nearest minute (see
+/// [`round_to_minute`]), the same rule as for Binance.
 pub fn parse_funding_page(body: &str) -> Result<Vec<(Millis, f64)>, DataError> {
     let page: FundingPage = bybit_result(FUNDING_URL, body)?;
     page.list
@@ -168,7 +169,7 @@ pub fn parse_funding_page(body: &str) -> Result<Vec<(Millis, f64)>, DataError> {
                     format!("{:?} is not a number", row.funding_rate),
                 )
             })?;
-            Ok((time, rate))
+            Ok((round_to_minute(time), rate))
         })
         .collect()
 }

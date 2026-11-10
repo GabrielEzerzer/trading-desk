@@ -97,7 +97,7 @@ pub trait Broker: Send {
 /// The path inside the bar is unknown, so the fills inside its range follow in the order that is
 /// worse for the strategy: stops and stop-limits triggered on this bar, then limit orders, then by
 /// order id. A protective stop therefore beats a take-profit limit when the bar reaches both inside
-/// its range, but a take-profit the bar opens through fills first, at the open.
+/// its range, but a take-profit the bar opens through fills first, as of the open, at its limit.
 ///
 /// When an entry with an attached stop fills, the stop is placed at once and checked against the
 /// same bar. The path after the fill is unknown, so the whole bar range counts as coming after it:

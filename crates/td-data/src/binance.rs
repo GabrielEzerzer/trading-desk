@@ -22,7 +22,7 @@ use td_core::{Candle, InstrumentId, InstrumentKind, Millis, Timeframe};
 
 use crate::DataError;
 use crate::http::Http;
-use crate::time::{MINUTE, Month, format_date, now_ms};
+use crate::time::{MINUTE, Month, format_date, now_ms, round_to_minute};
 
 const ARCHIVE: &str = "https://data.binance.vision/data";
 const SPOT_KLINES_URL: &str = "https://api.binance.com/api/v3/klines";
@@ -284,7 +284,9 @@ struct FundingRow {
     funding_rate: String,
 }
 
-/// Parses a `/fapi/v1/fundingRate` response into `(funding time, rate)`, oldest first.
+/// Parses a `/fapi/v1/fundingRate` response into `(funding time, rate)`, oldest first. Funding
+/// times are rounded to the nearest minute (see [`round_to_minute`]): Binance can stamp a rate a
+/// few milliseconds after the hour it belongs to.
 pub fn parse_funding(body: &str) -> Result<Vec<(Millis, f64)>, DataError> {
     let rows: Vec<FundingRow> =
         serde_json::from_str(body).map_err(|e| DataError::parse(FUNDING_URL, e))?;
@@ -296,7 +298,7 @@ pub fn parse_funding(body: &str) -> Result<Vec<(Millis, f64)>, DataError> {
                     format!("rate {:?} is not a number", row.funding_rate),
                 )
             })?;
-            Ok((row.funding_time, rate))
+            Ok((round_to_minute(row.funding_time), rate))
         })
         .collect()
 }
@@ -308,7 +310,7 @@ pub fn fetch_funding(
     from: Millis,
     to: Millis,
 ) -> Result<Vec<(Millis, f64)>, DataError> {
-    page_forwards(
+    let mut rates = page_forwards(
         from,
         to,
         FUNDING_LIMIT,
@@ -326,7 +328,11 @@ pub fn fetch_funding(
             ];
             parse_funding(&http.get_text(FUNDING_URL, &query)?)
         },
-    )
+    )?;
+    // A page starts one millisecond after the previous page's last time, which rounding may have
+    // moved back from the venue's stamp, so that rate can come again at the top of the next page.
+    rates.dedup_by_key(|&mut (t, _)| t);
+    Ok(rates)
 }
 
 /// Reads an oldest-first endpoint forwards over `[from, to)`. `fetch(start)` returns a page of up
