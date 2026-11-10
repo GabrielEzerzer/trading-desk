@@ -38,7 +38,7 @@ pub enum EngineError {
 }
 
 /// An order the engine refused at submission. The order is still recorded, with status
-/// `Rejected`, under `id`.
+/// `Rejected`, under `id`, except during warm-up, when nothing is recorded and `id` is 0.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 #[error("order {} rejected: {reason}", id.0)]
 pub struct OrderRejected {

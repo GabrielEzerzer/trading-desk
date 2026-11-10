@@ -24,6 +24,7 @@ pub struct Context<'a> {
     pub(crate) portfolio: &'a Portfolio,
     pub(crate) broker: &'a mut dyn Broker,
     pub(crate) orders: &'a mut Vec<Order>,
+    pub(crate) warming_up: bool,
 }
 
 impl Context<'_> {
@@ -67,11 +68,26 @@ impl Context<'_> {
         self.broker.open_orders()
     }
 
+    /// True while the session feeds warm-up bars (see [`crate::Session::warm_up`]): the strategy
+    /// sees the bars but cannot trade.
+    pub fn is_warming_up(&self) -> bool {
+        self.warming_up
+    }
+
     /// Rounds the order to the instrument's lot and tick, validates it and sends it to the
     /// broker. Quantities round down; limit prices round in the order's favour-safe direction
     /// (buys down, sells up) so an order never trades worse than asked; triggers round to the
     /// nearest tick. A rejected order is recorded with its reason and returned as an error.
+    ///
+    /// While warming up every order is refused with id 0 and nothing is recorded, so warm-up
+    /// leaves no trace in the run's order list.
     pub fn submit(&mut self, request: OrderRequest) -> Result<OrderId, OrderRejected> {
+        if self.warming_up {
+            return Err(OrderRejected {
+                id: OrderId(0),
+                reason: "trading is disabled while warming up".into(),
+            });
+        }
         let id = OrderId(self.orders.len() as u64 + 1);
         let submitted_at = self.bar().open_time;
         let (request, check) = self.prepare(request);

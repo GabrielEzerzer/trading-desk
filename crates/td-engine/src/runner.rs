@@ -31,6 +31,11 @@ pub struct BacktestConfig {
     /// Replaces the instrument's fee schedule when set.
     #[serde(default)]
     pub fee_override: Option<FeeSchedule>,
+    /// When set, bars that open at or after `warmup_from` and before `from` are fed to the
+    /// strategy first with trading disabled (see [`Session::warm_up`]), so its indicators are
+    /// ready at the first traded bar. They add no equity points and are not in the metrics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warmup_from: Option<Millis>,
 }
 
 /// Buy and hold of the same instrument over the same bars.
@@ -54,7 +59,8 @@ pub struct BacktestResult {
     pub config: BacktestConfig,
     /// The td-engine crate version that produced the result.
     pub engine_version: String,
-    /// SHA-256 of the bars and funding the run used; see [`data_fingerprint`].
+    /// SHA-256 of the bars (warm-up bars first) and funding the run used; see
+    /// [`data_fingerprint`].
     pub data_fingerprint: String,
     /// Equity at each bar's close.
     pub equity: Vec<EquityPoint>,
@@ -76,8 +82,9 @@ pub struct Rerun {
 
 /// Runs a backtest.
 ///
-/// `bars` may cover more than the configured range; only bars inside `from..to` are used.
-/// `funding` is `(time, rate)` in any order; events outside the used bars' windows are ignored.
+/// `bars` may cover more than the configured range; only bars inside `from..to` are traded, and
+/// bars inside `warmup_from..from` warm the strategy up first. `funding` is `(time, rate)` in any
+/// order; events outside the traded bars' windows are ignored.
 /// The strategy is built through the registry and run on a [`Session`], then the trade list,
 /// metrics and buy-and-hold benchmark are derived from the session's record.
 pub fn run(
@@ -85,20 +92,7 @@ pub fn run(
     bars: &[Candle],
     funding: &[(Millis, f64)],
 ) -> Result<BacktestResult, EngineError> {
-    if config.from >= config.to {
-        return Err(EngineError::InvalidConfig("from must be before to"));
-    }
-    let bars: Vec<Candle> = bars
-        .iter()
-        .filter(|b| (config.from..config.to).contains(&b.open_time))
-        .copied()
-        .collect();
-    if bars.is_empty() {
-        return Err(EngineError::NoBarsInRange {
-            from: config.from,
-            to: config.to,
-        });
-    }
+    let (warmup, bars) = select_bars(config, bars)?;
     let tf = config.timeframe;
     let funding = sorted_funding(funding);
     let ranges = funding_ranges(tf, &bars, &funding);
@@ -110,6 +104,9 @@ pub fn run(
         fees: config.fee_override,
     };
     let mut session = Session::new(strategy, config.instrument.clone(), tf, session_config)?;
+    for bar in &warmup {
+        session.warm_up(*bar, &[])?;
+    }
     let mut positions = Vec::with_capacity(bars.len());
     let mut bar_funding = Vec::with_capacity(bars.len());
     let mut used_funding = Vec::new();
@@ -134,11 +131,13 @@ pub fn run(
         session.portfolio().funding_paid(),
     );
     let benchmark = benchmark(config, &bars, &funding, &ranges, &series, &report);
+    let mut used_bars = warmup;
+    used_bars.extend_from_slice(&bars);
 
     Ok(BacktestResult {
         config: config.clone(),
         engine_version: env!("CARGO_PKG_VERSION").to_string(),
-        data_fingerprint: data_fingerprint(&bars, &used_funding),
+        data_fingerprint: data_fingerprint(&used_bars, &used_funding),
         equity: session.equity().to_vec(),
         orders: session.orders().to_vec(),
         fills,
@@ -146,6 +145,53 @@ pub fn run(
         metrics: report,
         benchmark,
     })
+}
+
+/// The warm-up bars (`warmup_from..from`) and the traded bars (`from..to`) of `bars`, after
+/// checking the range.
+pub(crate) fn select_bars(
+    config: &BacktestConfig,
+    bars: &[Candle],
+) -> Result<(Vec<Candle>, Vec<Candle>), EngineError> {
+    if config.from >= config.to {
+        return Err(EngineError::InvalidConfig("from must be before to"));
+    }
+    let warmup_from = config.warmup_from.unwrap_or(config.from);
+    if warmup_from > config.from {
+        return Err(EngineError::InvalidConfig(
+            "warmup_from must not be after from",
+        ));
+    }
+    let within = |from: Millis, to: Millis| -> Vec<Candle> {
+        bars.iter()
+            .filter(|b| (from..to).contains(&b.open_time))
+            .copied()
+            .collect()
+    };
+    let traded = within(config.from, config.to);
+    if traded.is_empty() {
+        return Err(EngineError::NoBarsInRange {
+            from: config.from,
+            to: config.to,
+        });
+    }
+    Ok((within(warmup_from, config.from), traded))
+}
+
+/// The fingerprint [`run`] would record for `config` on this data, without running it.
+pub(crate) fn config_fingerprint(
+    config: &BacktestConfig,
+    bars: &[Candle],
+    funding: &[(Millis, f64)],
+) -> Result<String, EngineError> {
+    let (mut used, traded) = select_bars(config, bars)?;
+    let funding = sorted_funding(funding);
+    let used_funding: Vec<(Millis, f64)> = funding_ranges(config.timeframe, &traded, &funding)
+        .into_iter()
+        .flat_map(|r| funding[r].iter().copied())
+        .collect();
+    used.extend_from_slice(&traded);
+    Ok(data_fingerprint(&used, &used_funding))
 }
 
 /// Runs a saved result's configuration again on `bars` and `funding`.

@@ -89,6 +89,84 @@ impl Session {
     /// Funding is charged on the position after this bar's fills, at this bar's close price:
     /// the candle data has no price at the funding moment itself.
     pub fn on_bar(&mut self, bar: Candle, funding: &[(Millis, f64)]) -> Result<(), EngineError> {
+        self.check_bar(&bar, funding)?;
+        let first_new_fill = self.fills.len();
+        for event in self.broker.on_bar(&bar, self.portfolio.position()) {
+            match event {
+                BrokerEvent::Filled(fill) => {
+                    self.order_mut(fill.order_id).status = OrderStatus::Filled;
+                    self.portfolio
+                        .apply_fill(fill.side, fill.qty, fill.price, fill.fee);
+                    self.fills.push(fill);
+                }
+                BrokerEvent::Cancelled { id, reason } => {
+                    self.order_mut(id).status = OrderStatus::Cancelled(reason);
+                }
+            }
+        }
+        for &(_, rate) in funding {
+            self.portfolio.charge_funding(rate, bar.close);
+        }
+        self.portfolio.mark(bar.close);
+        self.equity.push(EquityPoint {
+            time: bar.open_time,
+            equity: self.portfolio.equity(),
+        });
+        self.bars.push(bar);
+
+        let mut ctx = Context {
+            bars: &self.bars,
+            instrument: &self.instrument,
+            timeframe: self.timeframe,
+            portfolio: &self.portfolio,
+            broker: &mut *self.broker,
+            orders: &mut self.orders,
+            warming_up: false,
+        };
+        if ctx.bars.len() == 1 {
+            self.strategy.on_start(&mut ctx);
+        }
+        for fill in &self.fills[first_new_fill..] {
+            self.strategy.on_fill(&mut ctx, fill);
+        }
+        self.strategy.on_bar(&mut ctx, &bar);
+        Ok(())
+    }
+
+    /// Feeds a bar the strategy sees while trading is disabled, so its indicators are ready when
+    /// trading starts. Warm-up bars come before the first bar fed with [`Session::on_bar`].
+    ///
+    /// The bar is checked like in `on_bar` and added to the bars the strategy sees, and the
+    /// strategy is called (`on_start` on the very first bar, then `on_bar`), with
+    /// [`Context::is_warming_up`] true. Orders it submits are refused and not recorded. No equity
+    /// point is added and no funding is charged: the position is always zero while warming up, so
+    /// the funding events are only checked.
+    pub fn warm_up(&mut self, bar: Candle, funding: &[(Millis, f64)]) -> Result<(), EngineError> {
+        if !self.equity.is_empty() {
+            return Err(EngineError::InvalidConfig(
+                "warm-up bars must come before the first traded bar",
+            ));
+        }
+        self.check_bar(&bar, funding)?;
+        self.bars.push(bar);
+        let mut ctx = Context {
+            bars: &self.bars,
+            instrument: &self.instrument,
+            timeframe: self.timeframe,
+            portfolio: &self.portfolio,
+            broker: &mut *self.broker,
+            orders: &mut self.orders,
+            warming_up: true,
+        };
+        if ctx.bars.len() == 1 {
+            self.strategy.on_start(&mut ctx);
+        }
+        self.strategy.on_bar(&mut ctx, &bar);
+        Ok(())
+    }
+
+    /// The checks `on_bar` and `warm_up` make before changing anything.
+    fn check_bar(&self, bar: &Candle, funding: &[(Millis, f64)]) -> Result<(), EngineError> {
         bar.validate()?;
         if self.timeframe.floor(bar.open_time) != bar.open_time {
             return Err(EngineError::MisalignedBar {
@@ -124,46 +202,6 @@ impl Session {
                 return Err(EngineError::InvalidFundingRate { time, rate });
             }
         }
-
-        let first_new_fill = self.fills.len();
-        for event in self.broker.on_bar(&bar, self.portfolio.position()) {
-            match event {
-                BrokerEvent::Filled(fill) => {
-                    self.order_mut(fill.order_id).status = OrderStatus::Filled;
-                    self.portfolio
-                        .apply_fill(fill.side, fill.qty, fill.price, fill.fee);
-                    self.fills.push(fill);
-                }
-                BrokerEvent::Cancelled { id, reason } => {
-                    self.order_mut(id).status = OrderStatus::Cancelled(reason);
-                }
-            }
-        }
-        for &(_, rate) in funding {
-            self.portfolio.charge_funding(rate, bar.close);
-        }
-        self.portfolio.mark(bar.close);
-        self.equity.push(EquityPoint {
-            time: bar.open_time,
-            equity: self.portfolio.equity(),
-        });
-        self.bars.push(bar);
-
-        let mut ctx = Context {
-            bars: &self.bars,
-            instrument: &self.instrument,
-            timeframe: self.timeframe,
-            portfolio: &self.portfolio,
-            broker: &mut *self.broker,
-            orders: &mut self.orders,
-        };
-        if ctx.bars.len() == 1 {
-            self.strategy.on_start(&mut ctx);
-        }
-        for fill in &self.fills[first_new_fill..] {
-            self.strategy.on_fill(&mut ctx, fill);
-        }
-        self.strategy.on_bar(&mut ctx, &bar);
         Ok(())
     }
 

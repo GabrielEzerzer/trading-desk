@@ -8,8 +8,8 @@ use std::path::PathBuf;
 use serde_json::Value;
 use td_core::{Candle, Millis, Timeframe};
 use td_engine::{
-    BacktestConfig, BacktestResult, EngineError, ParamValue, Params, data_fingerprint, list, load,
-    rerun, run, save,
+    BacktestConfig, BacktestResult, EngineError, ParamValue, Params, RunKind, SavedRun,
+    data_fingerprint, list, load, rerun, run, save,
 };
 
 const HOUR: Millis = 3_600_000;
@@ -76,6 +76,7 @@ fn config() -> BacktestConfig {
         starting_cash: 10_000.0,
         slippage_bps: 5.0,
         fee_override: None,
+        warmup_from: None,
     }
 }
 
@@ -177,17 +178,20 @@ fn save_load_and_rerun_reproduce_the_result_exactly() {
     let dir = tempfile::tempdir().unwrap();
     let runs = dir.path().join("runs");
     let result = run_synthetic();
+    let saved = SavedRun::Backtest(Box::new(result.clone()));
     let original = serde_json::to_string(&result).unwrap();
 
-    let id = save(&result, &runs).unwrap();
+    let id = save(&saved, &runs).unwrap();
     let config_json = std::fs::read_to_string(runs.join(id.as_str()).join("config.json")).unwrap();
     assert_eq!(
         serde_json::from_str::<BacktestConfig>(&config_json).unwrap(),
         config()
     );
-    let loaded = load(&runs, id.as_str()).unwrap();
+    let SavedRun::Backtest(loaded) = load(&runs, id.as_str()).unwrap() else {
+        panic!("saved as a backtest");
+    };
     assert_eq!(serde_json::to_string(&loaded).unwrap(), original);
-    assert_eq!(loaded, result);
+    assert_eq!(*loaded, result);
 
     let again = rerun(&loaded, &synthetic_bars(), &synthetic_funding()).unwrap();
     assert!(again.fingerprint_matches);
@@ -197,6 +201,7 @@ fn save_load_and_rerun_reproduce_the_result_exactly() {
     assert_eq!(listed.len(), 1);
     let s = &listed[0];
     assert_eq!(s.id, id);
+    assert_eq!(s.kind, RunKind::Backtest);
     assert_eq!(s.strategy, "sma_cross");
     assert_eq!(s.instrument, config().instrument.id);
     assert_eq!(s.timeframe, Timeframe::H1);
@@ -212,7 +217,7 @@ fn save_load_and_rerun_reproduce_the_result_exactly() {
 fn list_is_newest_first_and_skips_other_entries() {
     let dir = tempfile::tempdir().unwrap();
     let runs = dir.path();
-    let result = run_synthetic();
+    let result = SavedRun::Backtest(Box::new(run_synthetic()));
     let first = save(&result, runs).unwrap();
     let mut second = save(&result, runs);
     // Two saves of the same result in the same millisecond get the same id; wait and retry.
