@@ -379,14 +379,30 @@ impl Store {
         Ok(rates)
     }
 
+    /// A perpetual's funding file, sorted; empty when none is stored.
     fn read_funding(&self, id: &InstrumentId) -> Result<Vec<(Millis, f64)>, DataError> {
         let path = self.funding_path(id)?;
         let Some(columns) = read_columns(&path, &FUNDING_COLUMNS)? else {
             return Ok(Vec::new());
         };
         let times = int_column(&path, &columns[0])?;
-        let rates = float_column(&path, &columns[1])?;
-        Ok(times.iter().copied().zip(rates.iter().copied()).collect())
+        let values = float_column(&path, &columns[1])?;
+        let mut rates = Vec::with_capacity(times.len());
+        let mut previous = Millis::MIN;
+        for (row, (&t, &rate)) in times.iter().zip(values).enumerate() {
+            if !rate.is_finite() {
+                return Err(bad_file(
+                    &path,
+                    format!("row {row} has a rate that is not finite: {rate}"),
+                ));
+            }
+            if t <= previous {
+                return Err(bad_file(&path, format!("row {row} is out of order")));
+            }
+            previous = t;
+            rates.push((t, rate));
+        }
+        Ok(rates)
     }
 }
 
@@ -608,6 +624,39 @@ mod tests {
         }
         for bad in ["", "..", "BTC/USDT", "..\\x", "a b", "C:"] {
             assert!(check_symbol(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn funding_files_out_of_order_or_not_finite_are_refused() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let store = Store::new(dir.path());
+        let id = InstrumentId {
+            venue: td_core::Venue::Bybit,
+            symbol: "BTCUSDT".into(),
+            kind: InstrumentKind::Perpetual,
+        };
+        let path = store.funding_path(&id).expect("a path");
+        for (times, rates) in [
+            (vec![2, 1], vec![0.0001, 0.0002]),
+            (vec![1, 1], vec![0.0001, 0.0002]),
+            (vec![1, 2], vec![0.0001, f64::NAN]),
+            (vec![1, 2], vec![f64::INFINITY, 0.0002]),
+        ] {
+            let columns: Vec<ArrayRef> = vec![
+                Arc::new(Int64Array::from(times.clone())),
+                Arc::new(Float64Array::from(rates.clone())),
+            ];
+            write_atomic(
+                &path,
+                &record_batch(&FUNDING_COLUMNS, columns).expect("a batch"),
+            )
+            .expect("writes");
+            let read = store.load_funding(&id, Millis::MIN, Millis::MAX);
+            assert!(
+                matches!(read, Err(DataError::BadFile { .. })),
+                "{times:?} {rates:?}: {read:?}"
+            );
         }
     }
 }
