@@ -348,3 +348,27 @@ fn spot_benchmark_buys_with_all_cash_at_the_first_open() {
     let expected_excess = r.metrics.total_return.unwrap() - b.metrics.total_return.unwrap();
     assert_eq!(b.excess_return, Some(expected_excess));
 }
+
+#[test]
+fn a_two_bar_one_minute_run_has_no_infinite_metric_and_round_trips() {
+    // The benchmark gains about 0.8% in two minutes, which compounds past f64::MAX a year.
+    let bars = [
+        common::bar(0, 100.0, 100.6, 99.9, 100.5),
+        common::bar(1, 100.5, 101.0, 100.4, 101.0),
+    ];
+    let mut c = config();
+    c.instrument = common::spot();
+    c.params = Params::new();
+    c.timeframe = Timeframe::M1;
+    c.from = 0;
+    c.to = 2 * common::MIN;
+    c.slippage_bps = 0.0;
+    let r = run(&c, &bars, &[]).unwrap();
+    assert!(r.benchmark.metrics.total_return.unwrap() > 0.007);
+    assert_eq!(r.benchmark.metrics.cagr, None);
+    assert_eq!(r.benchmark.metrics.calmar, None);
+
+    let dir = tempfile::tempdir().unwrap();
+    let id = save(&r, dir.path()).unwrap();
+    assert_eq!(load(dir.path(), id.as_str()).unwrap(), r);
+}

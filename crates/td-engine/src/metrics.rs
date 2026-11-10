@@ -4,9 +4,11 @@
 //! bar's close, so a run of n bars gives n + 1 values and n per-bar returns. Its times are the
 //! first bar's open time, then each bar's close time (open time plus the timeframe).
 //!
-//! Every value that can be undefined is an `Option`: `None` means there is not enough data or the
-//! formula would divide by zero. The report never holds NaN or an infinity, so it serialises to
-//! JSON cleanly.
+//! Every value that can be undefined is an `Option`: `None` means there is not enough data, the
+//! formula would divide by zero, or the result is not a finite number (CAGR over a few minutes
+//! can compound past `f64::MAX`). Every public function here returns `None` rather than NaN or an
+//! infinity, so the report serialises to JSON and loads back equal. The plain `f64` fields are the
+//! first and last equity and sums of fill fees and funding, finite for finite inputs.
 
 use serde::{Deserialize, Serialize};
 use td_core::{Fill, Millis, Timeframe};
@@ -141,73 +143,95 @@ pub fn bars_per_year(timeframe: Timeframe) -> f64 {
     MS_PER_YEAR / timeframe.duration_ms() as f64
 }
 
-/// `last / first - 1`. `None` with fewer than two values or a first value at or below zero.
+/// `Some(x)` if `x` is finite; NaN and the infinities are `None`.
+fn finite(x: f64) -> Option<f64> {
+    x.is_finite().then_some(x)
+}
+
+/// `last / first - 1`. `None` with fewer than two values, a first value at or below zero, or a
+/// result that is not finite.
 pub fn total_return(values: &[f64]) -> Option<f64> {
     match (values.first(), values.last()) {
-        (Some(&a), Some(&b)) if values.len() >= 2 && a > 0.0 => Some(b / a - 1.0),
+        (Some(&a), Some(&b)) if values.len() >= 2 && a > 0.0 => finite(b / a - 1.0),
         _ => None,
     }
 }
 
-/// `r_i = v_i / v_{i-1} - 1` for each consecutive pair. `None` with fewer than two values, or if
-/// any value a return is measured from is at or below zero (the return is then meaningless).
+/// `r_i = v_i / v_{i-1} - 1` for each consecutive pair. `None` with fewer than two values, if
+/// any value a return is measured from is at or below zero (the return is then meaningless), or if
+/// a return is not finite.
 pub fn per_bar_returns(values: &[f64]) -> Option<Vec<f64>> {
     if values.len() < 2 || values[..values.len() - 1].iter().any(|&v| v <= 0.0) {
         return None;
     }
-    Some(values.windows(2).map(|w| w[1] / w[0] - 1.0).collect())
+    values
+        .windows(2)
+        .map(|w| finite(w[1] / w[0] - 1.0))
+        .collect()
 }
 
 /// Compound annual growth rate over the actual elapsed time, with a 365-day year:
 /// `(last / first) ^ (365 days / elapsed) - 1`. `None` if the elapsed time is not positive, the
-/// first value is at or below zero, or the last value is below zero.
+/// first value is at or below zero, the last value is below zero, or the result is not finite: a
+/// gain over a short run (0.8% in two minutes) compounds past `f64::MAX`.
 pub fn cagr(values: &[f64], elapsed_ms: Millis) -> Option<f64> {
     let (&a, &b) = (values.first()?, values.last()?);
     if elapsed_ms <= 0 || a <= 0.0 || b < 0.0 {
         return None;
     }
-    Some((b / a).powf(MS_PER_YEAR / elapsed_ms as f64) - 1.0)
+    finite((b / a).powf(MS_PER_YEAR / elapsed_ms as f64) - 1.0)
 }
 
 fn mean_f(xs: &[f64]) -> f64 {
     xs.iter().sum::<f64>() / xs.len() as f64
 }
 
-/// Sample standard deviation (n - 1 in the denominator). Needs at least two values.
+/// Sample standard deviation (n - 1 in the denominator). Needs at least two values; `None` if the
+/// squares overflow, so a ratio over it is never a misleading 0.
 fn sample_std(xs: &[f64]) -> Option<f64> {
     if xs.len() < 2 {
         return None;
     }
     let m = mean_f(xs);
     let ss: f64 = xs.iter().map(|x| (x - m) * (x - m)).sum();
-    Some((ss / (xs.len() - 1) as f64).sqrt())
+    finite((ss / (xs.len() - 1) as f64).sqrt())
 }
 
 /// Annualised volatility: the sample standard deviation of per-bar returns times
-/// `sqrt(bars_per_year)`. `None` with fewer than two returns.
+/// `sqrt(bars_per_year)`. `None` with fewer than two returns or a result that is not finite.
 pub fn volatility(returns: &[f64], bars_per_year: f64) -> Option<f64> {
-    Some(sample_std(returns)? * bars_per_year.sqrt())
+    finite(sample_std(returns)? * bars_per_year.sqrt())
 }
 
 /// Annualised Sharpe ratio with a risk-free rate of zero:
-/// `mean(r) / sample_std(r) * sqrt(bars_per_year)`. `None` with fewer than two returns or zero
-/// volatility.
+/// `mean(r) / sample_std(r) * sqrt(bars_per_year)`. `None` with fewer than two returns, zero
+/// volatility or a result that is not finite.
 pub fn sharpe(returns: &[f64], bars_per_year: f64) -> Option<f64> {
     let sd = sample_std(returns)?;
-    (sd > 0.0).then(|| mean_f(returns) / sd * bars_per_year.sqrt())
+    if sd > 0.0 {
+        finite(mean_f(returns) / sd * bars_per_year.sqrt())
+    } else {
+        None
+    }
 }
 
 /// Annualised Sortino ratio with a target return of zero:
 /// `mean(r) / dd * sqrt(bars_per_year)`, where the downside deviation
 /// `dd = sqrt(sum(min(r_i, 0)^2) / n)` is taken over all n bars, not only the losing ones.
-/// `None` with no returns or no losing bar.
+/// `None` with fewer than two returns (as for Sharpe), no losing bar or a result that is not
+/// finite.
 pub fn sortino(returns: &[f64], bars_per_year: f64) -> Option<f64> {
-    if returns.is_empty() {
+    if returns.len() < 2 {
         return None;
     }
     let down: f64 = returns.iter().map(|r| r.min(0.0).powi(2)).sum();
     let dd = (down / returns.len() as f64).sqrt();
-    (dd > 0.0).then(|| mean_f(returns) / dd * bars_per_year.sqrt())
+    // An infinite downside deviation would give a misleading 0.
+    if dd > 0.0 && dd.is_finite() {
+        finite(mean_f(returns) / dd * bars_per_year.sqrt())
+    } else {
+        None
+    }
 }
 
 /// The largest peak-to-trough fall of an equity series.
@@ -227,7 +251,7 @@ pub struct Drawdown {
 }
 
 /// The maximum drawdown and its duration. The first of equally deep drawdowns wins. `None` for an
-/// empty series or one whose running peak is at or below zero.
+/// empty series, one whose running peak is at or below zero, or a depth that is not finite.
 pub fn max_drawdown(times: &[Millis], values: &[f64]) -> Option<Drawdown> {
     if values.is_empty() || times.len() != values.len() {
         return None;
@@ -241,6 +265,9 @@ pub fn max_drawdown(times: &[Millis], values: &[f64]) -> Option<Drawdown> {
             peak = i;
         } else {
             let d = 1.0 - v / values[peak];
+            if !d.is_finite() {
+                return None;
+            }
             if d > depth {
                 (best_peak, trough, depth) = (peak, i, d);
             }
@@ -268,10 +295,11 @@ pub fn max_drawdown(times: &[Millis], values: &[f64]) -> Option<Drawdown> {
     })
 }
 
-/// `cagr / max_drawdown`. `None` if either is missing or the drawdown is zero.
+/// `cagr / max_drawdown`. `None` if either is missing, the drawdown is zero or the result is not
+/// finite.
 pub fn calmar(cagr: Option<f64>, max_drawdown: Option<f64>) -> Option<f64> {
     let dd = max_drawdown?;
-    (dd > 0.0).then_some(cagr? / dd)
+    if dd > 0.0 { finite(cagr? / dd) } else { None }
 }
 
 /// Fraction of trades with net P&L above zero. `None` with no trades.
@@ -280,20 +308,29 @@ pub fn win_rate(pnls: &[f64]) -> Option<f64> {
 }
 
 /// Gross profit over gross loss: `sum(p > 0) / |sum(p < 0)|` on net trade P&L. 0 when every
-/// trade lost; `None` with no losing trade (including no trades), rather than infinity.
+/// trade lost; `None` with no losing trade (including no trades), rather than infinity, or a
+/// result that is not finite.
 pub fn profit_factor(pnls: &[f64]) -> Option<f64> {
     let profit: f64 = pnls.iter().filter(|&&p| p > 0.0).sum();
     let loss: f64 = pnls.iter().filter(|&&p| p < 0.0).sum();
-    (loss < 0.0).then(|| profit / -loss)
+    if loss < 0.0 {
+        finite(profit / -loss)
+    } else {
+        None
+    }
 }
 
-/// Arithmetic mean. `None` when empty.
+/// Arithmetic mean. `None` when empty or when the result is not finite.
 pub fn mean(xs: &[f64]) -> Option<f64> {
-    (!xs.is_empty()).then(|| mean_f(xs))
+    if xs.is_empty() {
+        None
+    } else {
+        finite(mean_f(xs))
+    }
 }
 
 /// Median: the middle value, or the mean of the two middle values for an even count. `None` when
-/// empty.
+/// empty or not finite.
 pub fn median(xs: &[f64]) -> Option<f64> {
     if xs.is_empty() {
         return None;
@@ -301,7 +338,7 @@ pub fn median(xs: &[f64]) -> Option<f64> {
     let mut s = xs.to_vec();
     s.sort_by(f64::total_cmp);
     let n = s.len();
-    Some(if n % 2 == 1 {
+    finite(if n % 2 == 1 {
         s[n / 2]
     } else {
         (s[n / 2 - 1] + s[n / 2]) / 2.0
@@ -315,15 +352,20 @@ pub fn exposure(positions: &[f64]) -> Option<f64> {
 }
 
 /// Traded notional over average equity: `sum(qty * price) / mean(equity)`, with the equity at
-/// each bar's close. `None` with no bars or an average equity at or below zero.
+/// each bar's close. `None` with no bars, an average equity at or below zero or a result that is
+/// not finite.
 pub fn turnover(fills: &[Fill], equity: &[f64]) -> Option<f64> {
     let avg = mean(equity)?;
     let traded: f64 = fills.iter().map(|f| f.qty * f.price).sum();
-    (avg > 0.0).then_some(traded / avg)
+    if avg > 0.0 {
+        finite(traded / avg)
+    } else {
+        None
+    }
 }
 
 /// Pearson correlation of two equally long series. `None` if the lengths differ, there are fewer
-/// than two values, or either series is constant.
+/// than two values, either series is constant, or the result is not finite.
 pub fn correlation(a: &[f64], b: &[f64]) -> Option<f64> {
     if a.len() != b.len() || a.len() < 2 {
         return None;
@@ -335,7 +377,13 @@ pub fn correlation(a: &[f64], b: &[f64]) -> Option<f64> {
         va += (x - ma) * (x - ma);
         vb += (y - mb) * (y - mb);
     }
-    (va > 0.0 && vb > 0.0).then(|| cov / (va * vb).sqrt())
+    // An infinite denominator would give a misleading 0.
+    let denom = (va * vb).sqrt();
+    if va > 0.0 && vb > 0.0 && denom.is_finite() {
+        finite(cov / denom)
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -427,6 +475,8 @@ mod tests {
         // No losing bar: no downside deviation, so no ratio.
         assert_eq!(sortino(&[0.01, 0.02], 365.0), None);
         assert_eq!(sortino(&[], 365.0), None);
+        // One return is not enough, as for Sharpe.
+        assert_eq!(sortino(&[-0.01], 365.0), None);
     }
 
     #[test]
@@ -521,6 +571,38 @@ mod tests {
         some(correlation(&[1.0, 2.0, 3.0], &[1.0, 3.0, 2.0]), 0.5);
         assert_eq!(correlation(&[1.0, 1.0], &[1.0, 2.0]), None);
         assert_eq!(correlation(&[1.0], &[1.0]), None);
+    }
+
+    #[test]
+    fn ratios_that_overflow_are_none_not_infinite() {
+        // +0.8% over two one-minute bars compounds to more than f64::MAX a year.
+        assert_eq!(cagr(&[100.0, 100.4, 100.8], 2 * 60_000), None);
+        assert_eq!(calmar(Some(1e300), Some(1e-300)), None);
+        assert_eq!(total_return(&[1e-300, 1e300]), None);
+        assert_eq!(per_bar_returns(&[1e-300, 1e300]), None);
+        assert_eq!(profit_factor(&[1e300, -1e-300]), None);
+        assert_eq!(mean(&[1e308, 1e308]), None);
+        assert_eq!(median(&[1e308, 1e308]), None);
+        assert_eq!(volatility(&[1e300, -1e300], 365.0), None);
+        assert_eq!(sharpe(&[1e300, -1e300, 1e300], 365.0), None);
+        assert_eq!(sortino(&[1e300, -1e300], 365.0), None);
+        assert_eq!(correlation(&[1e200, -1e200], &[1e200, -1e200]), None);
+        assert_eq!(max_drawdown(&[0, 1], &[1e-300, -1e300]), None);
+        let fill = Fill {
+            order_id: td_core::OrderId(1),
+            instrument: td_core::InstrumentId {
+                venue: td_core::Venue::Binance,
+                symbol: "X".into(),
+                kind: td_core::InstrumentKind::Spot,
+            },
+            side: td_core::Side::Buy,
+            time: 0,
+            price: 1e300,
+            qty: 1e300,
+            fee: 0.0,
+            liquidity: td_core::Liquidity::Taker,
+        };
+        assert_eq!(turnover(&[fill], &[1.0]), None);
     }
 
     #[test]
