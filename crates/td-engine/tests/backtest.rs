@@ -306,6 +306,8 @@ fn extra_files_are_saved_with_the_run_and_only_under_plain_new_names() {
     for name in [
         "result.json",
         "config.json",
+        "Result.JSON",
+        "CONFIG.json",
         "../escape.json",
         "a/b.json",
         "..",

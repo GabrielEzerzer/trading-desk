@@ -205,7 +205,12 @@ pub fn save_with_files(
 ) -> Result<RunId, StoreError> {
     for &(name, _) in files {
         let plain = Path::new(name).file_name().is_some_and(|n| n == name);
-        if !plain || name == CONFIG_FILE || name == RESULT_FILE {
+        // Case-insensitive, as Windows and macOS file systems are: `Result.json` would replace
+        // the run's own `result.json`.
+        let own = [CONFIG_FILE, RESULT_FILE]
+            .iter()
+            .any(|f| f.eq_ignore_ascii_case(name));
+        if !plain || own {
             return Err(StoreError::InvalidFileName(name.to_string()));
         }
     }
