@@ -24,6 +24,7 @@ zip = { version = "9.0.5", default-features = false, features = ["deflate-flate2
 
 # td-engine
 proptest = "1"
+rayon = "1"
 
 # Live feeds and paper sessions (#15). The same versions and features as Tipping Point.
 futures-util = { version = "0.3.34", default-features = false, features = ["sink"] }
