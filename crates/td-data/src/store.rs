@@ -26,7 +26,7 @@ use parquet::file::properties::WriterProperties;
 use td_core::{Candle, InstrumentId, InstrumentKind, Millis, Timeframe};
 
 use crate::DataError;
-use crate::resample::resample;
+use crate::resample::{LoadedCandles, resample};
 use crate::time::{MINUTE, Month};
 
 const CANDLE_COLUMNS: [&str; 7] = [
@@ -313,13 +313,12 @@ impl Store {
         Ok(coverage)
     }
 
-    /// Bars of `timeframe` that open in `[from, to)`, built from the stored 1-minute candles.
+    /// Bars of `timeframe` resampled from the stored 1-minute candles with open times in
+    /// `[from, to)`, by the rules of [`resample`].
     ///
-    /// A bar opens on a [`Timeframe::floor`] boundary at or after `from`, so a bucket that started
-    /// before `from` is left out rather than built from part of its minutes. The last bar is
-    /// incomplete when its final minute is not stored or falls at or after `to`; it is left out
-    /// unless `include_incomplete` is set. Gaps inside a bar are not filled: the bar is built from
-    /// the minutes that are there.
+    /// Minutes outside the range are not read, so a bucket that `from` or `to` falls inside is
+    /// missing minutes, and it is dropped or kept by the same rule as a bucket with minutes missing
+    /// from the store.
     pub fn load_candles(
         &self,
         id: &InstrumentId,
@@ -327,19 +326,13 @@ impl Store {
         from: Millis,
         to: Millis,
         include_incomplete: bool,
-    ) -> Result<Vec<Candle>, DataError> {
-        let floor = timeframe.floor(from);
-        let start = if floor == from {
-            from
-        } else {
-            floor + timeframe.duration_ms()
-        };
+    ) -> Result<LoadedCandles, DataError> {
         let mut minutes = Vec::new();
-        for month in Month::range(start, to) {
+        for month in Month::range(from, to) {
             minutes.extend(
                 self.read_month(id, month)?
                     .into_iter()
-                    .filter(|c| (start..to).contains(&c.open_time)),
+                    .filter(|c| (from..to).contains(&c.open_time)),
             );
         }
         Ok(resample(&minutes, timeframe, include_incomplete))

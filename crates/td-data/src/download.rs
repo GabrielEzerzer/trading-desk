@@ -62,7 +62,7 @@ pub fn download_candles(
     let end = to.min(now - now.rem_euclid(MINUTE));
     if from < end {
         let stored = store.load_candles(id, Timeframe::M1, from, end, true)?;
-        report.gaps = missing_minutes(&stored, from, end);
+        report.gaps = missing_minutes(&stored.candles, from, end);
     }
     Ok(report)
 }

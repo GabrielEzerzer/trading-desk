@@ -26,11 +26,15 @@ fn one_day_of_btcusdt_from_each_source() {
             let candles = store
                 .load_candles(&id, Timeframe::M1, from, to, false)
                 .expect("loads");
-            assert_eq!(candles.len(), 1440, "{id}");
+            assert_eq!(candles.candles.len(), 1440, "{id}");
             let hours = store
                 .load_candles(&id, Timeframe::H1, from, to, false)
                 .expect("loads");
-            assert_eq!(hours.len(), 24, "{id}");
+            assert_eq!(hours.candles.len(), 24, "{id}");
+            assert!(
+                hours.dropped.is_empty() && hours.tolerated.is_empty(),
+                "{id}"
+            );
             if kind == InstrumentKind::Perpetual {
                 let rates = download_funding(&http, &store, &id, from, to)
                     .unwrap_or_else(|e| panic!("{id}: {e}"));
