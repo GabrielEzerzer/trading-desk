@@ -85,11 +85,13 @@ impl Session {
     /// Feeds the next closed bar, with the funding events (`(time, rate)`) that fall inside it.
     ///
     /// The bar must be valid, on a timeframe boundary and later than the previous bar; gaps are
-    /// allowed. On an error nothing changes. Then, in order: open orders are checked against this
-    /// bar, funding is charged, equity is marked at the close, and the strategy is called.
+    /// allowed. On an error nothing changes. Then, in order: funding due at the bar's open is
+    /// charged on the position held going into the bar, at the open price; open orders are checked
+    /// against this bar; funding due later in the bar is charged on the position after this bar's
+    /// fills, at the close; equity is marked at the close; and the strategy is called.
     ///
-    /// Funding is charged on the position after this bar's fills, at this bar's close price:
-    /// the candle data has no price at the funding moment itself.
+    /// Venues usually charge funding at 00:00, 08:00 and 16:00 UTC, which are bar open times on
+    /// every timeframe shorter than a day.
     pub fn on_bar(&mut self, bar: Candle, funding: &[(Millis, f64)]) -> Result<(), EngineError> {
         bar.validate()?;
         if self.timeframe.floor(bar.open_time) != bar.open_time {
@@ -127,6 +129,13 @@ impl Session {
             }
         }
 
+        // Funding due at the open is owed by the position held going into the bar, before this
+        // bar's fills.
+        for &(time, rate) in funding {
+            if time == bar.open_time {
+                self.portfolio.charge_funding(rate, bar.open);
+            }
+        }
         let first_new_fill = self.fills.len();
         for event in self.broker.on_bar(&bar, self.portfolio.position()) {
             match event {
@@ -145,8 +154,14 @@ impl Session {
                 }
             }
         }
-        for &(_, rate) in funding {
-            self.portfolio.charge_funding(rate, bar.close);
+        // shortcut: funding due later in the bar is charged on the position after all of this
+        // bar's fills, at the close, since the candle model does not know when a fill happened
+        // inside the bar or what the price was at the funding time. Upgrade with a trade-level
+        // fill model that times each fill.
+        for &(time, rate) in funding {
+            if time > bar.open_time {
+                self.portfolio.charge_funding(rate, bar.close);
+            }
         }
         self.portfolio.mark(bar.close);
         self.equity.push(EquityPoint {

@@ -339,7 +339,8 @@ fn funding_session(side: Side) -> Session {
         hour(1, 100.0, 106.0, 99.0, 105.0),
         hour(2, 105.0, 111.0, 104.0, 110.0),
     ];
-    // Unsorted on purpose; the event before the first bar falls in no bar and is not charged.
+    // Unsorted on purpose; the event before the first bar falls in no bar and is not charged, and
+    // the one at 2 * H is due at bar 2's open.
     let funding = [
         (2 * H, 0.0001),
         (H + 5_000, 0.0002),
@@ -353,24 +354,120 @@ fn funding_session(side: Side) -> Session {
 #[test]
 fn funding_is_charged_to_longs_on_a_positive_rate() {
     let s = funding_session(Side::Buy);
-    // Fill on bar 1 at 100, fee 0.4. The funding in bar 0 meets a flat position. Bar 1 charges
-    // 2 * 105 * 0.0002 = 0.042, bar 2 charges 2 * 110 * 0.0001 = 0.022.
+    // Fill on bar 1 at 100, fee 0.4. The funding in bar 0 meets a flat position. Bar 1's event is
+    // inside the bar: 2 * 105 (the close) * 0.0002 = 0.042. Bar 2's is due at its open, on the
+    // long held going into it: 2 * 105 (the open) * 0.0001 = 0.021.
     let p = s.portfolio();
-    approx(p.funding_paid(), 0.064);
-    approx(p.cash(), 10_000.0 - 0.4 - 0.064);
-    // Equity on bar 2: cash 9999.536 plus 2 * (110 - 100).
+    approx(p.funding_paid(), 0.063);
+    approx(p.cash(), 10_000.0 - 0.4 - 0.063);
+    // Equity on bar 2: cash 9999.537 plus 2 * (110 - 100).
     approx(equity(&s)[1], 10_000.0 - 0.4 - 0.042 + 10.0);
-    approx(equity(&s)[2], 10_019.536);
+    approx(equity(&s)[2], 10_019.537);
 }
 
 #[test]
 fn funding_is_paid_to_shorts_on_a_positive_rate() {
     let s = funding_session(Side::Sell);
     let p = s.portfolio();
-    approx(p.funding_paid(), -0.064);
-    approx(p.cash(), 10_000.0 - 0.4 + 0.064);
-    // Equity on bar 2: cash 9999.664 plus -2 * (110 - 100).
-    approx(equity(&s)[2], 9_979.664);
+    approx(p.funding_paid(), -0.063);
+    approx(p.cash(), 10_000.0 - 0.4 + 0.063);
+    // Equity on bar 2: cash 9999.663 plus -2 * (110 - 100).
+    approx(equity(&s)[2], 9_979.663);
+}
+
+#[test]
+fn funding_due_at_the_open_is_charged_on_a_long_stopped_out_inside_the_bar() {
+    let i = perp();
+    let bars = [
+        bar(0, 100.0, 101.0, 99.0, 100.0),
+        bar(1, 100.0, 101.0, 99.0, 100.0),
+        bar(2, 100.0, 101.0, 94.0, 96.0),
+    ];
+    let (script, _) = Script::new(vec![
+        (0, req(&i, Side::Buy, 2.0, OrderType::Market)),
+        (
+            1,
+            reduce_only(req(&i, Side::Sell, 2.0, OrderType::Stop { trigger: 95.0 })),
+        ),
+    ]);
+    let funding = [(2 * MIN, 0.001)];
+    let s = run_backtest(script, i, Timeframe::M1, &bars, &funding, config(0.0)).unwrap();
+    // The long of 2 bought at 100 on bar 1 (fee 0.4) is still held at bar 2's open, when the
+    // funding is due: 2 * 100 * 0.001 = 0.2. The stop sells it later in the bar, at 95: fee 0.38,
+    // realised -10.
+    let p = s.portfolio();
+    assert_eq!(p.position(), 0.0);
+    approx(p.funding_paid(), 0.2);
+    // 10000 - 0.4 - 0.2 - 10 - 0.38.
+    approx(p.cash(), 9989.02);
+    approx(equity(&s)[2], 9989.02);
+}
+
+#[test]
+fn an_entry_inside_the_bar_does_not_pay_the_funding_due_at_its_open() {
+    let i = perp();
+    let bars = [
+        bar(0, 100.0, 101.0, 99.0, 100.0),
+        bar(1, 100.0, 101.0, 98.0, 100.0),
+    ];
+    let (script, _) = Script::new(vec![(
+        0,
+        req(&i, Side::Buy, 2.0, OrderType::Limit { price: 99.0 }),
+    )]);
+    let funding = [(MIN, 0.001)];
+    let s = run_backtest(script, i, Timeframe::M1, &bars, &funding, config(0.0)).unwrap();
+    // Flat at bar 1's open, when the funding is due, so nothing is paid. The limit then buys 2 at
+    // 99 inside the bar, as a maker: fee 0.198.
+    let p = s.portfolio();
+    approx(p.position(), 2.0);
+    assert_eq!(p.funding_paid(), 0.0);
+    approx(p.cash(), 9999.802);
+    // Marked at 100: 9999.802 + 2 * (100 - 99).
+    approx(equity(&s)[1], 10_001.802);
+}
+
+#[test]
+fn a_daily_bar_charges_funding_at_its_open_and_inside_it_on_different_positions() {
+    let i = perp();
+    const D: i64 = 86_400_000;
+    const H8: i64 = 8 * 3_600_000;
+    let day = |n: i64, o, h, l, c| Candle {
+        open_time: n * D,
+        ..bar(0, o, h, l, c)
+    };
+    let bars = [
+        day(0, 100.0, 101.0, 99.0, 100.0),
+        day(1, 100.0, 101.0, 99.0, 100.0),
+        day(2, 100.0, 104.0, 97.0, 102.0),
+    ];
+    let (script, _) = Script::new(vec![
+        (0, req(&i, Side::Buy, 1.0, OrderType::Market)),
+        (1, req(&i, Side::Buy, 1.0, OrderType::Limit { price: 98.0 })),
+    ]);
+    // 00:00, 08:00 and 16:00 UTC on days 1 and 2.
+    let funding = [
+        (D, 0.0001),
+        (D + H8, 0.0001),
+        (D + 2 * H8, 0.0001),
+        (2 * D, 0.0001),
+        (2 * D + H8, 0.0002),
+        (2 * D + 2 * H8, 0.0003),
+    ];
+    let s = run_backtest(script, i, Timeframe::D1, &bars, &funding, config(0.0)).unwrap();
+    // Day 1: flat at 00:00, so nothing is due then. The market buy fills at the open at 100, fee
+    // 0.2, and 08:00 and 16:00 are charged on that long of 1 at the close: 1 * 100 * 0.0001 = 0.01
+    // each. Equity: 10000 - 0.2 - 0.02 = 9999.78.
+    let e = equity(&s);
+    approx(e[1], 9999.78);
+    // Day 2: 00:00 is charged on the long of 1 held going into the day, at the open of 100: 0.01.
+    // The limit buys 1 more at 98 inside the bar, maker fee 0.098, for a long of 2 at an average
+    // of 99. 08:00 and 16:00 are charged on that long at the close of 102: 2 * 102 * 0.0002 =
+    // 0.0408 and 2 * 102 * 0.0003 = 0.0612.
+    let p = s.portfolio();
+    approx(p.funding_paid(), 0.02 + 0.01 + 0.0408 + 0.0612);
+    // Cash 10000 - 0.2 - 0.098 - 0.132 = 9999.57, plus 2 * (102 - 99).
+    approx(p.cash(), 9999.57);
+    approx(e[2], 10_005.57);
 }
 
 #[test]
