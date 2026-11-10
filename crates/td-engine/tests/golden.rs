@@ -1201,6 +1201,49 @@ fn donchian_enters_on_a_breakout_places_a_stop_and_exits() {
 }
 
 #[test]
+fn donchian_skips_an_entry_whose_stop_would_be_at_or_below_zero() {
+    let p = Params::new()
+        .with("entry", td_engine::ParamValue::Int(5))
+        .with("exit", td_engine::ParamValue::Int(3))
+        .with("atr_period", td_engine::ParamValue::Int(3))
+        .with("atr_stop", td_engine::ParamValue::Float(40.0));
+    let strategy = build_strategy("donchian_breakout", &p).unwrap();
+    let s = run_backtest(
+        strategy,
+        perp(),
+        Timeframe::M1,
+        &up_then_down(),
+        &[],
+        config(0.0),
+    )
+    .unwrap();
+    // ATR is 3, so the stop sits 40 * 3 = 120 under the close. On the breakouts from bar 5 (close
+    // 110) to bar 10 (close 120) that is at or below zero, and the strategy sends no order. Bar 11
+    // closes at 122, so the stop is at 2: the entry goes out, sized 100 / 120 = 0.833 after
+    // rounding down to the lot, and fills at bar 12's open of 124. Bar 41's exit closes it.
+    let o = s.orders();
+    assert_eq!(o.len(), 3, "entry, its stop and the exit: {o:?}");
+    assert!(
+        o.iter()
+            .all(|o| !matches!(o.status, OrderStatus::Rejected(_)))
+    );
+    assert_eq!(o[0].submitted_at, 11 * MIN);
+    assert_eq!(
+        o[0].attached_stop,
+        Some(AttachedStop {
+            id: OrderId(2),
+            trigger: 2.0
+        })
+    );
+    let entry = &s.fills()[0];
+    assert_eq!(entry.time, 12 * MIN);
+    approx(entry.price, 124.0);
+    approx(entry.qty, 0.833);
+    assert_eq!(s.fills()[1].time, 42 * MIN);
+    assert_eq!(s.portfolio().position(), 0.0);
+}
+
+#[test]
 fn reference_strategies_size_full_spot_entries_to_pass_the_cash_check() {
     let sma = Params::new()
         .with("fast", td_engine::ParamValue::Int(3))
