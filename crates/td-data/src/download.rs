@@ -1,13 +1,13 @@
 //! Downloading a range of history into the store, one month at a time so a long download keeps
 //! what it has fetched if it stops part way.
 
-use td_core::{Candle, InstrumentId, InstrumentKind, Millis, Timeframe, Venue};
+use td_core::{InstrumentId, InstrumentKind, Millis, Timeframe};
 
-use crate::binance::{self, ArchivePeriod};
+use crate::DataError;
 use crate::http::Http;
+use crate::source::{DataSource, MinuteHistory, source};
 use crate::store::{Gap, Store, missing_minutes};
-use crate::time::{DAY, MINUTE, Month, now_ms};
-use crate::{DataError, bybit};
+use crate::time::{MINUTE, Month, now_ms};
 
 /// What a candle download did.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -20,13 +20,23 @@ pub struct DownloadReport {
     pub gaps: Vec<Gap>,
 }
 
-/// Downloads the 1-minute candles of `id` with open times in `[from, to)` and merges them into the
-/// store. `progress` is called with a line of text after each month.
-///
-/// Binance comes from the public archive: a monthly file for each whole past month (falling back
-/// to daily files if the monthly one is not published yet) and daily files for the current month,
-/// which exist up to yesterday. Bybit comes from its REST API.
+/// Downloads the 1-minute candles of `id` with open times in `[from, to)` from its venue's source
+/// ([`DataSource::minute_history`]) and merges them into the store. `progress` is called with a
+/// line of text after each month.
 pub fn download_candles(
+    http: &Http,
+    store: &Store,
+    id: &InstrumentId,
+    from: Millis,
+    to: Millis,
+    progress: &mut dyn FnMut(String),
+) -> Result<DownloadReport, DataError> {
+    download_candles_from(source(id.venue), http, store, id, from, to, progress)
+}
+
+/// [`download_candles`] from a given source.
+fn download_candles_from(
+    source: &dyn DataSource,
     http: &Http,
     store: &Store,
     id: &InstrumentId,
@@ -39,17 +49,11 @@ pub fn download_candles(
     for month in Month::range(from, to.min(now)) {
         let lo = from.max(month.start());
         let hi = to.min(month.end()).min(now);
-        let mut candles = match id.venue {
-            Venue::Binance => binance_month(
-                &id.symbol,
-                month,
-                (lo, hi),
-                now,
-                &mut report.missing_files,
-                |period| binance::fetch_archive(http, id, period),
-            )?,
-            Venue::Bybit => bybit::fetch_klines(http, id, Timeframe::M1, lo, hi)?,
-        };
+        let MinuteHistory {
+            mut candles,
+            missing_files,
+        } = source.minute_history(http, id, lo, hi, now)?;
+        report.missing_files.extend(missing_files);
         candles.retain(|c| (lo..hi).contains(&c.open_time));
         store.write_candles(id, &candles)?;
         progress(format!("{id} {month}: {} candles", candles.len()));
@@ -63,41 +67,21 @@ pub fn download_candles(
     Ok(report)
 }
 
-/// One month of Binance klines from the archive, where `fetch` downloads one archive file (`None`
-/// when the archive has no such file). A month before the current one comes from its monthly
-/// file; when that is not published, and for the current month, the daily files for the days that
-/// overlap `[lo, hi)` up to yesterday are used instead, and the names of those the archive lacks
-/// are added to `missing`.
-fn binance_month(
-    symbol: &str,
-    month: Month,
-    (lo, hi): (Millis, Millis),
-    now: Millis,
-    missing: &mut Vec<String>,
-    mut fetch: impl FnMut(ArchivePeriod) -> Result<Option<Vec<Candle>>, DataError>,
-) -> Result<Vec<Candle>, DataError> {
-    if month < Month::containing(now)
-        && let Some(candles) = fetch(ArchivePeriod::Month(month))?
-    {
-        return Ok(candles);
-    }
-    let today = now.div_euclid(DAY) * DAY;
-    let mut candles = Vec::new();
-    let mut day = lo.div_euclid(DAY) * DAY;
-    while day < hi && day < today {
-        let period = ArchivePeriod::Day(day);
-        match fetch(period)? {
-            Some(rows) => candles.extend(rows),
-            None => missing.push(binance::archive_file_name(symbol, period)),
-        }
-        day += DAY;
-    }
-    Ok(candles)
+/// Downloads the funding rates of a perpetual in `[from, to)` and merges them into the store.
+/// Returns the number of rates fetched. A venue whose source has no funding is an error.
+pub fn download_funding(
+    http: &Http,
+    store: &Store,
+    id: &InstrumentId,
+    from: Millis,
+    to: Millis,
+) -> Result<usize, DataError> {
+    download_funding_from(source(id.venue), http, store, id, from, to)
 }
 
-/// Downloads the funding rates of a perpetual in `[from, to)` and merges them into the store.
-/// Returns the number of rates fetched.
-pub fn download_funding(
+/// [`download_funding`] from a given source.
+fn download_funding_from(
+    source: &dyn DataSource,
     http: &Http,
     store: &Store,
     id: &InstrumentId,
@@ -107,84 +91,92 @@ pub fn download_funding(
     if id.kind != InstrumentKind::Perpetual {
         return Err(DataError::NotPerpetual(id.to_string()));
     }
-    let rates = match id.venue {
-        Venue::Binance => binance::fetch_funding(http, &id.symbol, from, to)?,
-        Venue::Bybit => bybit::fetch_funding(http, &id.symbol, from, to)?,
-    };
+    let rates = source.funding(http, id, from, to)?;
     store.write_funding(id, &rates)?;
     Ok(rates.len())
 }
 
 #[cfg(test)]
 mod tests {
+    use td_core::Venue;
+
     use super::*;
+    use crate::source::fake::DailyFiles;
+    use crate::time::{DAY, parse_date};
 
-    /// Reads `month` through [`binance_month`] from an archive that holds the files `has` says it
-    /// holds, each with one candle at the start of its period. Returns the open times read, the
-    /// files asked for and the names reported missing.
-    fn month_from_archive(
-        month: Month,
-        range: (Millis, Millis),
-        now: Millis,
-        has: impl Fn(ArchivePeriod) -> bool,
-    ) -> (Vec<Millis>, Vec<ArchivePeriod>, Vec<String>) {
-        let (mut asked, mut missing) = (Vec::new(), Vec::new());
-        let candles = binance_month("BTCUSDT", month, range, now, &mut missing, |period| {
-            asked.push(period);
-            let open_time = match period {
-                ArchivePeriod::Month(m) => m.start(),
-                ArchivePeriod::Day(day) => day,
-            };
-            let candle = Candle {
-                open_time,
-                open: 1.0,
-                high: 1.0,
-                low: 1.0,
-                close: 1.0,
-                volume: 0.0,
-                quote_volume: 0.0,
-            };
-            Ok(has(period).then(|| vec![candle]))
+    fn id(kind: InstrumentKind) -> InstrumentId {
+        InstrumentId {
+            venue: Venue::Binance,
+            symbol: "EURUSD".into(),
+            kind,
+        }
+    }
+
+    #[test]
+    fn a_download_runs_month_by_month_through_the_source_into_the_store() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let store = Store::new(dir.path());
+        let id = id(InstrumentKind::Spot);
+        let feb = parse_date("2024-02-01").expect("a date");
+        // Noon on 30 January up to 3 February, from a source that has no file for 1 February.
+        let (from, to) = (feb - 2 * DAY + DAY / 2, feb + 2 * DAY);
+        let source = DailyFiles::new(vec![feb]);
+        let mut lines = Vec::new();
+        let http = Http::new().expect("an HTTP client");
+        let report = download_candles_from(&source, &http, &store, &id, from, to, &mut |line| {
+            lines.push(line)
         })
-        .expect("reads");
-        let times = candles.iter().map(|c| c.open_time).collect();
-        (times, asked, missing)
-    }
+        .expect("downloads");
 
-    #[test]
-    fn a_missing_monthly_file_falls_back_to_the_daily_files() {
-        let jan = Month::parse("2024-01").expect("a month");
-        let now = jan.end() + 40 * DAY;
-        // 2024-01-10 up to 2024-01-13, from an archive with no monthly file and no file for the 11th.
-        let [d10, d11, d12] = [9, 10, 11].map(|n| jan.start() + n * DAY);
-        let has = |p| !matches!(p, ArchivePeriod::Month(_)) && p != ArchivePeriod::Day(d11);
-        let (read, asked, missing) = month_from_archive(jan, (d10, d12 + DAY), now, has);
+        // One call per month, each kept inside its month.
         assert_eq!(
-            asked,
-            [
-                ArchivePeriod::Month(jan),
-                ArchivePeriod::Day(d10),
-                ArchivePeriod::Day(d11),
-                ArchivePeriod::Day(d12)
-            ]
+            *source.asked.lock().expect("lock"),
+            [(from, feb), (feb, to)]
         );
-        assert_eq!(read, [d10, d12]);
-        assert_eq!(missing, ["BTCUSDT-1m-2024-01-11.zip"]);
+        let per_day = DAY / MINUTE;
+        let [jan, february] = [Month::containing(from), Month::containing(feb)];
+        // The morning of 30 January, which the source sent with the rest of its file, is left out.
+        let counts = [
+            (jan, (per_day * 3 / 2) as usize),
+            (february, per_day as usize),
+        ];
+        assert_eq!(report.months, counts);
+        assert_eq!(report.missing_files, ["2024-02-01.csv.gz"]);
+        assert_eq!(
+            report.gaps,
+            [Gap {
+                from: feb,
+                to: feb + DAY
+            }]
+        );
+        assert_eq!(lines.len(), 2);
+
+        let stored = store
+            .load_candles(&id, Timeframe::M1, from - DAY, to + DAY, true)
+            .expect("loads")
+            .candles;
+        assert_eq!(stored.len(), (per_day * 5 / 2) as usize);
+        assert_eq!(stored.first().map(|c| c.open_time), Some(from));
+        assert_eq!(stored.last().map(|c| c.open_time), Some(to - MINUTE));
     }
 
     #[test]
-    fn a_published_monthly_file_is_used_alone_and_the_current_month_reads_up_to_yesterday() {
-        let jan = Month::parse("2024-01").expect("a month");
-        let (read, asked, missing) =
-            month_from_archive(jan, (jan.start(), jan.end()), jan.end() + DAY, |_| true);
-        assert_eq!(asked, [ArchivePeriod::Month(jan)]);
-        assert_eq!(read, [jan.start()]);
-        assert!(missing.is_empty());
-        // At noon on 2024-01-03 the month has no monthly file yet, and today has no daily file.
-        let now = jan.start() + 2 * DAY + DAY / 2;
-        let (read, asked, _) = month_from_archive(jan, (jan.start(), now), now, |_| true);
-        let days = [jan.start(), jan.start() + DAY];
-        assert_eq!(asked, days.map(ArchivePeriod::Day));
-        assert_eq!(read, days);
+    fn funding_from_a_source_without_funding_is_an_error_and_stores_nothing() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let store = Store::new(dir.path());
+        let id = id(InstrumentKind::Perpetual);
+        let http = Http::new().expect("an HTTP client");
+        let source = DailyFiles::new(Vec::new());
+        let result = download_funding_from(&source, &http, &store, &id, 0, DAY);
+        assert!(
+            matches!(result, Err(DataError::NoFunding(Venue::Binance))),
+            "{result:?}"
+        );
+        assert!(
+            store
+                .load_funding(&id, i64::MIN, i64::MAX)
+                .expect("loads")
+                .is_empty()
+        );
     }
 }
