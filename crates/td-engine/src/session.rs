@@ -1,12 +1,19 @@
 use std::ops::Range;
 
 use serde::{Deserialize, Serialize};
-use td_core::{Candle, FeeSchedule, Fill, Instrument, InstrumentKind, Millis, Timeframe};
+use td_core::{
+    Candle, FeeSchedule, Fill, Instrument, InstrumentKind, Millis, OrderRequest, OrderType, Side,
+    TimeInForce, Timeframe,
+};
 
+use crate::broker::ENTRY_CANCELLED;
 use crate::{
     BarFunding, Broker, BrokerEvent, CandleFillModel, Context, EngineError, Order, OrderStatus,
     Portfolio, SimBroker, Strategy,
 };
+
+/// Why [`Session::close_out`] cancels the open orders.
+const CLOSED_OUT: &str = "cancelled to close out the position at the end of the run";
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct SessionConfig {
@@ -167,6 +174,62 @@ impl Session {
         self.bars.push(bar);
         self.call_strategy(&bar, self.fills.len(), true);
         Ok(())
+    }
+
+    /// Closes out at the end of a run, after the second-to-last bar: cancels every open order
+    /// (and the attached stops of entries that have not filled) and, if a position is open,
+    /// submits a reduce-only market order for all of it, tagged `close-out`. The order goes
+    /// through the same checks as a strategy's and fills on the next bar's open like any market
+    /// order, with slippage and the taker fee, so the exit is a real fill decided only from what
+    /// is known at this close. Orders the strategy submits after this are not cancelled. Does
+    /// nothing before the first live bar, when nothing can be open.
+    ///
+    /// shortcut: a position too small for the instrument's minimums (a spot dust holding below
+    /// the minimum notional) has its close-out rejected and stays open; size the close from the
+    /// venue's dust rules if that matters.
+    pub(crate) fn close_out(&mut self) {
+        if self.equity.is_empty() {
+            return;
+        }
+        for order in self.broker.open_orders().to_vec() {
+            self.broker.cancel(order.id);
+            self.order_mut(order.id).status = OrderStatus::Cancelled(CLOSED_OUT.into());
+            if let Some(stop) = order.attached_stop
+                && self.order_mut(stop.id).status == OrderStatus::Attached
+            {
+                self.order_mut(stop.id).status = OrderStatus::Cancelled(ENTRY_CANCELLED.into());
+            }
+        }
+        let position = self.portfolio.position();
+        if position == 0.0 {
+            return;
+        }
+        let request = OrderRequest {
+            instrument: self.instrument.id.clone(),
+            side: if position > 0.0 {
+                Side::Sell
+            } else {
+                Side::Buy
+            },
+            qty: position.abs(),
+            order_type: OrderType::Market,
+            tif: TimeInForce::Gtc,
+            reduce_only: true,
+            client_tag: Some("close-out".into()),
+        };
+        let mut ctx = Context {
+            bars: &self.bars,
+            instrument: &self.instrument,
+            timeframe: self.timeframe,
+            fees: self.fees,
+            slippage_bps: self.slippage_bps,
+            portfolio: &self.portfolio,
+            broker: &mut *self.broker,
+            orders: &mut self.orders,
+            warming_up: false,
+        };
+        // A rejected close-out is recorded with its reason, and the position stays open.
+        let _ = ctx.submit(request);
     }
 
     /// Checks that `bar` can be fed next, with `funding` inside it or in the gap before it.
@@ -339,4 +402,105 @@ pub(crate) fn funding_ranges(
             start..next
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use td_core::{InstrumentId, Venue};
+
+    use super::*;
+
+    /// Shorts 1 at bar 0's close, then at bar 1's close rests a limit buy far below and a limit
+    /// sell far above with a stop attached, neither of which fills.
+    struct ShortThenRest;
+
+    impl Strategy for ShortThenRest {
+        fn on_bar(&mut self, ctx: &mut Context, _bar: &Candle) {
+            let req = |side, qty, order_type| OrderRequest {
+                instrument: ctx.instrument().id.clone(),
+                side,
+                qty,
+                order_type,
+                tif: TimeInForce::Gtc,
+                reduce_only: false,
+                client_tag: None,
+            };
+            match ctx.bars().len() {
+                1 => {
+                    ctx.submit(req(Side::Sell, 1.0, OrderType::Market)).unwrap();
+                }
+                2 => {
+                    let low = req(Side::Buy, 1.0, OrderType::Limit { price: 50.0 });
+                    let high = req(Side::Sell, 1.0, OrderType::Limit { price: 150.0 });
+                    ctx.submit(low).unwrap();
+                    ctx.submit_with_stop(high, 160.0).unwrap();
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn bar(i: i64, open: f64) -> Candle {
+        Candle {
+            open_time: i * 60_000,
+            open,
+            high: open + 1.0,
+            low: open - 1.0,
+            close: open,
+            volume: 1.0,
+            quote_volume: open,
+        }
+    }
+
+    #[test]
+    fn closing_out_cancels_open_orders_and_closes_the_position_at_the_next_open() {
+        let inst = Instrument {
+            id: InstrumentId {
+                venue: Venue::Binance,
+                symbol: "TESTUSDT".into(),
+                kind: InstrumentKind::Perpetual,
+            },
+            base: "TEST".into(),
+            quote: "USDT".into(),
+            tick_size: 0.01,
+            lot_size: 0.001,
+            min_qty: 0.001,
+            min_notional: 1.0,
+            fees: FeeSchedule {
+                maker: 0.001,
+                taker: 0.002,
+            },
+        };
+        let config = SessionConfig {
+            starting_cash: 10_000.0,
+            slippage_bps: 10.0,
+            fees: None,
+        };
+        let mut s = Session::new(Box::new(ShortThenRest), inst, Timeframe::M1, config).unwrap();
+        for i in 0..3 {
+            s.on_bar(bar(i, 100.0 + i as f64), &[]).unwrap();
+        }
+        assert_eq!(s.portfolio().position(), -1.0);
+        s.close_out();
+        assert_eq!(s.open_orders().len(), 1);
+        let status = |id: u64| s.orders()[id as usize - 1].status.clone();
+        // Orders 2 and 3 are the resting limits, 4 the stop attached to 3.
+        assert_eq!(status(2), OrderStatus::Cancelled(CLOSED_OUT.into()));
+        assert_eq!(status(3), OrderStatus::Cancelled(CLOSED_OUT.into()));
+        assert_eq!(status(4), OrderStatus::Cancelled(ENTRY_CANCELLED.into()));
+        let close = s.orders()[4].clone();
+        assert_eq!(close.status, OrderStatus::Open);
+        assert_eq!(close.request.side, Side::Buy);
+        assert_eq!(close.request.qty, 1.0);
+        assert!(close.request.reduce_only);
+
+        s.on_bar(bar(3, 110.0), &[]).unwrap();
+        assert_eq!(s.portfolio().position(), 0.0);
+        let fill = s.fills().last().unwrap();
+        assert_eq!(fill.order_id, close.id);
+        // The open plus 10 bps of slippage against the buy, and the taker fee.
+        assert_eq!(fill.price, 110.11);
+        assert!((fill.fee - 110.11 * 0.002).abs() < 1e-12);
+        assert_eq!(s.orders()[4].status, OrderStatus::Filled);
+    }
 }

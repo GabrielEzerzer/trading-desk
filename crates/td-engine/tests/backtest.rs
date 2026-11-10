@@ -9,8 +9,7 @@ use serde_json::Value;
 use td_core::{Candle, Millis, Timeframe};
 use td_engine::{
     BacktestConfig, BacktestResult, ENGINE_REVISION, EngineError, ParamValue, Params, RunKind,
-    SavedRun,
-    data_fingerprint, list, load, rerun, run, save,
+    SavedRun, data_fingerprint, list, load, rerun, run, save,
 };
 
 const HOUR: Millis = 3_600_000;
@@ -78,6 +77,7 @@ fn config() -> BacktestConfig {
         slippage_bps: 5.0,
         fee_override: None,
         warmup_from: None,
+        close_at_end: false,
     }
 }
 

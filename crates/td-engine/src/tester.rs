@@ -24,7 +24,8 @@ use crate::{
     Params, Trade, find_strategy, run,
 };
 
-/// The most backtests one sweep may run: the grid size, or the sample count in random mode.
+/// The most backtests one sweep may run: the grid size, or the sample count in random mode. A
+/// walk-forward may run at most this many over all its train windows together.
 pub const MAX_RUNS: usize = 100_000;
 
 /// A progress callback: runs done so far, then the total. Called from the worker threads.
@@ -38,7 +39,7 @@ pub enum TesterError {
     #[error("parameter {name:?}: {reason}")]
     InvalidSpace { name: String, reason: String },
 
-    #[error("the sweep would run {runs} backtests, more than the limit of {limit}")]
+    #[error("this would run {runs} backtests, more than the limit of {limit}")]
     TooManyRuns { runs: u128, limit: usize },
 
     #[error("{0}")]
@@ -627,6 +628,10 @@ pub struct OosResult {
     /// The sweep over the in-sample segment. Its best run supplies the parameters.
     pub in_sample: SweepResult,
     /// The chosen parameters on the out-of-sample segment, warmed up with the in-sample bars.
+    /// It runs with `close_at_end`: a position still open is closed by a market order decided at
+    /// the close of the second-to-last bar and filled at the last bar's open, with slippage and
+    /// the taker fee, so its trades are all closed and their costs real. The in-sample sweep's
+    /// runs do not close out; an open trade there is left out of their trade statistics.
     pub out_of_sample: BacktestResult,
     /// Out-of-sample objective over in-sample objective. `None` if either is undefined or the
     /// in-sample value is zero. For a maximised metric below 1 is worse out of sample; for a
@@ -661,6 +666,7 @@ pub fn out_of_sample(
     let oos_config = BacktestConfig {
         from: split_at,
         warmup_from: Some(base.from),
+        close_at_end: true,
         ..with_params(base, &best.config.params)
     };
     let out_of_sample = run(&oos_config, bars, funding)?;
@@ -751,24 +757,32 @@ impl WindowSpec {
         if self.step_bars < self.test_bars {
             return invalid("the step must be at least the test length, or test segments overlap");
         }
-        if self.train_bars + self.test_bars > bars {
+        let overflow = || TesterError::InvalidSpec("the window lengths are too large".into());
+        let needed = self
+            .train_bars
+            .checked_add(self.test_bars)
+            .ok_or_else(overflow)?;
+        if needed > bars {
             return Err(TesterError::InvalidSpec(format!(
-                "one window needs {} bars, the range has {bars}",
-                self.train_bars + self.test_bars
+                "one window needs {needed} bars, the range has {bars}"
             )));
         }
         let mut out = Vec::new();
         let mut start = self.train_bars;
-        while start + self.test_bars <= bars {
+        loop {
+            let end = start.checked_add(self.test_bars).ok_or_else(overflow)?;
+            if end > bars {
+                break;
+            }
             let train_start = match self.mode {
                 WindowMode::Rolling => start - self.train_bars,
                 WindowMode::Anchored => 0,
             };
             out.push(Window {
                 train: train_start..start,
-                test: start..start + self.test_bars,
+                test: start..end,
             });
-            start += self.step_bars;
+            start = start.checked_add(self.step_bars).ok_or_else(overflow)?;
         }
         Ok(out)
     }
@@ -796,10 +810,24 @@ pub struct WindowResult {
     /// The best parameters on the train segment.
     pub params: Params,
     pub in_sample: Headline,
-    /// The chosen parameters on the test segment, warmed up with the train bars.
+    /// The chosen parameters on the test segment, warmed up with the train bars and closed out
+    /// at its end; see [`WalkForwardResult`].
     pub out_of_sample: BacktestResult,
 }
 
+/// The result of a walk-forward run.
+///
+/// At a test window's end the position is closed for real: each test run has `close_at_end`
+/// set, so at the close of the window's second-to-last bar its open orders are cancelled and a
+/// reduce-only market order for the whole position is submitted, which fills at the last bar's
+/// open with slippage and the taker fee. Every window therefore ends flat, its trades are all
+/// closed and counted in the trade statistics, and the exit costs are in the stitched equity.
+/// The next window starts flat from where the stitched equity ended.
+///
+/// Train sweeps do not close out. A rolling window's train sweep is warmed up on the bars just
+/// before it, as many as the window's train length (fewer near the start of the range), the
+/// same warm-up its test run gets; the first window's, and every anchored window's, starts cold
+/// because no bars come before it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WalkForwardResult {
     pub spec: WalkForwardSpec,
@@ -809,9 +837,14 @@ pub struct WalkForwardResult {
     pub windows: Vec<WindowResult>,
     /// The test segments stitched into one curve; see [`stitch`].
     pub equity: Vec<EquityPoint>,
-    /// Metrics of the stitched curve, with the trades and fills of every test segment scaled
-    /// by the same factor as its equity.
+    /// Metrics of the stitched curve, its trades and its fills.
     pub metrics: MetricsReport,
+    /// Every test segment's trades in time order, with quantities, P&L, fees and funding scaled
+    /// by the same factor as the segment's equity, so they add up to the stitched equity's
+    /// changes.
+    pub trades: Vec<Trade>,
+    /// Every test segment's fills in time order, with quantities and fees scaled the same way.
+    pub fills: Vec<Fill>,
     /// How many windows chose different parameters from the window before.
     pub param_changes: usize,
     /// `param_changes / (windows - 1)`: 0 when every window chose the same parameters, 1 when
@@ -835,6 +868,13 @@ pub fn walk_forward(
     let time_at = |i: usize| traded.get(i).map_or(base.to, |b| b.open_time);
 
     let per_window = plan.indices.len();
+    let runs = per_window as u128 * windows.len() as u128;
+    if runs > MAX_RUNS as u128 {
+        return Err(TesterError::TooManyRuns {
+            runs,
+            limit: MAX_RUNS,
+        });
+    }
     let total = per_window * windows.len();
     let mut results = Vec::with_capacity(windows.len());
     for (k, w) in windows.iter().enumerate() {
@@ -843,6 +883,9 @@ pub fn walk_forward(
         let mut train = spec.sweep.clone();
         train.base.from = train_from;
         train.base.to = train_to;
+        // Warm up on the bars just before the train window, as many as the test run gets.
+        let warm_start = w.train.start.saturating_sub(w.train.len());
+        train.base.warmup_from = (warm_start < w.train.start).then(|| time_at(warm_start));
         let offset = k * per_window;
         let window_progress = |done: usize, _: usize| {
             if let Some(report) = progress {
@@ -858,6 +901,7 @@ pub fn walk_forward(
             from: test_from,
             to: test_to,
             warmup_from: Some(train_from),
+            close_at_end: true,
             ..with_params(base, &best.config.params)
         };
         results.push(WindowResult {
@@ -871,7 +915,12 @@ pub fn walk_forward(
         });
     }
 
-    let (equity, metrics) = stitched_report(base, &results);
+    let Stitched {
+        equity,
+        metrics,
+        trades,
+        fills,
+    } = stitched_report(base, &results);
     let param_changes = results
         .windows(2)
         .filter(|w| w[0].params != w[1].params)
@@ -885,19 +934,28 @@ pub fn walk_forward(
         windows: results,
         equity,
         metrics,
+        trades,
+        fills,
         param_changes,
         param_change_rate,
     })
 }
 
 /// The factor each segment's equity is multiplied by in the stitched curve: the stitched equity
-/// at the end of the segments before it, over the starting cash. The first is 1.
+/// at the end of the segments before it, over the starting cash. The first is 1. Once the
+/// stitched equity has reached zero or below, every later factor is 0: the account is gone, and
+/// a negative factor would turn the later segments' gains into losses.
 fn segment_scales(starting_cash: f64, segments: &[&[EquityPoint]]) -> Vec<f64> {
     let mut level = starting_cash;
     segments
         .iter()
-        .map(|seg| {
-            let scale = level / starting_cash;
+        .enumerate()
+        .map(|(i, seg)| {
+            let scale = match i {
+                0 => 1.0,
+                _ if level > 0.0 && starting_cash > 0.0 => level / starting_cash,
+                _ => 0.0,
+            };
             if let Some(last) = seg.last() {
                 level = last.equity * scale;
             }
@@ -924,12 +982,17 @@ pub fn stitch(starting_cash: f64, segments: &[&[EquityPoint]]) -> Vec<EquityPoin
         .collect()
 }
 
+/// The stitched curve with its metrics, trades and fills.
+struct Stitched {
+    equity: Vec<EquityPoint>,
+    metrics: MetricsReport,
+    trades: Vec<Trade>,
+    fills: Vec<Fill>,
+}
+
 /// The stitched curve and its metrics. Trades, fills, positions and funding of each segment are
 /// scaled by the segment's factor, so trade P&L adds up to the stitched equity's changes.
-fn stitched_report(
-    base: &BacktestConfig,
-    windows: &[WindowResult],
-) -> (Vec<EquityPoint>, MetricsReport) {
+fn stitched_report(base: &BacktestConfig, windows: &[WindowResult]) -> Stitched {
     let cash = base.starting_cash;
     let segments: Vec<&[EquityPoint]> = windows
         .iter()
@@ -980,7 +1043,7 @@ fn stitched_report(
         funding += r.metrics.funding_paid * s;
     }
     let series = EquitySeries::new(cash, &equity, base.timeframe);
-    let report = metrics::report(
+    let metrics = metrics::report(
         &series,
         base.timeframe,
         &positions,
@@ -988,7 +1051,12 @@ fn stitched_report(
         &fills,
         funding,
     );
-    (equity, report)
+    Stitched {
+        equity,
+        metrics,
+        trades,
+        fills,
+    }
 }
 
 #[cfg(test)]
@@ -1101,6 +1169,56 @@ mod tests {
         }
         assert!(matches!(ok.windows(14), Err(TesterError::InvalidSpec(_))));
         assert_eq!(ok.windows(15).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_segment_ending_at_or_below_zero_zeroes_every_later_segment() {
+        let a = [point(0, 50.0)];
+        let b = [point(1, -20.0)];
+        let c = [point(2, 150.0)];
+        let d = [point(3, 200.0)];
+        assert_eq!(
+            segment_scales(100.0, &[&a, &b, &c, &d]),
+            [1.0, 0.5, 0.0, 0.0]
+        );
+        let values: Vec<f64> = stitch(100.0, &[&a, &b, &c, &d])
+            .iter()
+            .map(|p| p.equity)
+            .collect();
+        assert_eq!(values, [50.0, -10.0, 0.0, 0.0]);
+        // Exactly zero is ruin too.
+        let z = [point(1, 0.0)];
+        assert_eq!(segment_scales(100.0, &[&a, &z, &c]), [1.0, 0.5, 0.0]);
+    }
+
+    #[test]
+    fn window_lengths_that_overflow_are_errors() {
+        let ok = WindowSpec {
+            train_bars: 10,
+            test_bars: 5,
+            step_bars: 5,
+            mode: WindowMode::Rolling,
+        };
+        for bad in [
+            WindowSpec {
+                train_bars: usize::MAX,
+                ..ok
+            },
+            WindowSpec {
+                test_bars: usize::MAX,
+                step_bars: usize::MAX,
+                ..ok
+            },
+            WindowSpec {
+                step_bars: usize::MAX,
+                ..ok
+            },
+        ] {
+            assert!(
+                matches!(bad.windows(100), Err(TesterError::InvalidSpec(_))),
+                "{bad:?}"
+            );
+        }
     }
 
     #[test]

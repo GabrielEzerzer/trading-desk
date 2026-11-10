@@ -74,6 +74,7 @@ fn base(instrument: td_core::Instrument, bars: i64) -> BacktestConfig {
         slippage_bps: 0.0,
         fee_override: None,
         warmup_from: None,
+        close_at_end: false,
     }
 }
 
@@ -633,4 +634,182 @@ fn sweeps_and_walk_forwards_save_and_load_with_their_kind() {
     let o = kind_of(&ids[2]);
     assert_eq!(o.kind, RunKind::Oos);
     assert_eq!(o.total_return, oos.out_of_sample.metrics.total_return);
+}
+
+/// Long-only SMA cross with fast 1 on a perpetual over the rising line, in rolling windows of 50
+/// bars: every test window enters near its start and is still long at its last bar.
+fn rising_wf_spec() -> WalkForwardSpec {
+    let mut b = base(common::perp(), 300);
+    b.slippage_bps = 5.0;
+    b.params = Params::new().with("fast", ParamValue::Int(1));
+    WalkForwardSpec {
+        sweep: spec(b, vec![values("slow", &ints(&[5, 10]))]),
+        windows: WindowSpec {
+            train_bars: 50,
+            test_bars: 50,
+            step_bars: 50,
+            mode: WindowMode::Rolling,
+        },
+    }
+}
+
+/// Checks that `o` ends flat: its position is closed by a reduce-only market sell decided at the
+/// close of the second-to-last bar before `to` and filled at the last bar's open, with slippage
+/// and the taker fee, and every trade is closed.
+fn assert_closed_out(o: &td_engine::BacktestResult, bars: &[Candle], to: Millis) {
+    let last = bars.iter().rfind(|b| b.open_time < to).unwrap();
+    assert!(!o.trades.is_empty());
+    assert!(o.trades.iter().all(|t| !t.open), "{:?}", o.trades);
+    let exit = o.fills.last().unwrap();
+    assert_eq!(exit.side, td_core::Side::Sell);
+    assert_eq!(exit.time, last.open_time);
+    assert!(exit.price < last.open && exit.price >= last.open * (1.0 - 5e-4) - 0.01);
+    assert!((exit.fee - exit.price * exit.qty * 0.002).abs() < 1e-9);
+    let order = o.orders.iter().find(|x| x.id == exit.order_id).unwrap();
+    assert_eq!(order.submitted_at, last.open_time - HOUR);
+    assert!(order.request.reduce_only);
+    assert_eq!(order.request.order_type, td_core::OrderType::Market);
+    let position: f64 = o.fills.iter().map(|f| f.side.sign() * f.qty).sum();
+    assert!(position.abs() < 1e-9, "{position}");
+    // The trade's exit fee is in its P&L.
+    let t = o.trades.last().unwrap();
+    assert_eq!(t.exit_time, last.open_time);
+    assert!(t.fees > exit.fee - 1e-9);
+}
+
+#[test]
+fn walk_forward_closes_every_test_window_with_a_real_exit_fill() {
+    let bars = rising_bars(300);
+    let r = walk_forward(&rising_wf_spec(), &bars, &[], None).unwrap();
+    assert_eq!(r.windows.len(), 5);
+    let mut exit_fees = 0.0;
+    for w in &r.windows {
+        let o = &w.out_of_sample;
+        assert!(o.config.close_at_end);
+        assert_closed_out(o, &bars, w.test_to);
+        assert_eq!(o.metrics.trades, o.trades.len());
+        exit_fees += o.fills.last().unwrap().fee;
+    }
+    // Each window's one trade is closed and counted; on a rising line every one wins.
+    assert_eq!(r.metrics.trades, 5);
+    assert_eq!(r.metrics.win_rate, Some(1.0));
+    assert!(r.metrics.avg_trade_pnl.unwrap() > 0.0);
+    // The stitched fees include the exit fees (scaled up, since equity grew).
+    assert!(r.metrics.fees_paid > exit_fees);
+}
+
+#[test]
+fn the_out_of_sample_run_is_closed_out_at_its_end() {
+    let mut s = rising_spec();
+    s.base.instrument = common::perp();
+    s.base.slippage_bps = 5.0;
+    let bars = rising_bars(300);
+    let r = out_of_sample(
+        &OosSpec {
+            sweep: s,
+            split: Split::Fraction(0.5),
+        },
+        &bars,
+        &[],
+        None,
+    )
+    .unwrap();
+    let o = &r.out_of_sample;
+    assert!(o.config.close_at_end);
+    assert_closed_out(o, &bars, T0 + 300 * HOUR);
+    assert_eq!(o.metrics.trades, 1);
+}
+
+#[test]
+fn rolling_train_sweeps_after_the_first_warm_up_on_the_bars_before_them() {
+    let bars = rising_bars(300);
+    let r = walk_forward(&rising_wf_spec(), &bars, &[], None).unwrap();
+    for (k, w) in r.windows.iter().enumerate() {
+        let warm = (k > 0).then(|| w.train_from - 50 * HOUR);
+        let expected = run(
+            &BacktestConfig {
+                from: w.train_from,
+                to: w.train_to,
+                warmup_from: warm,
+                ..with(&rising_wf_spec().sweep.base, &w.params)
+            },
+            &bars,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            w.in_sample.total_return, expected.metrics.total_return,
+            "window {k}"
+        );
+    }
+    // Warmed, a train run enters on its first bar; cold, it would wait for `slow` bars.
+    let w = &r.windows[1];
+    let cold = run(
+        &BacktestConfig {
+            from: w.train_from,
+            to: w.train_to,
+            ..with(&rising_wf_spec().sweep.base, &w.params)
+        },
+        &bars,
+        &[],
+    )
+    .unwrap();
+    assert_ne!(w.in_sample.total_return, cold.metrics.total_return);
+}
+
+fn with(base: &BacktestConfig, params: &Params) -> BacktestConfig {
+    BacktestConfig {
+        params: params.clone(),
+        ..base.clone()
+    }
+}
+
+#[test]
+fn walk_forwards_over_the_run_limit_are_refused_before_running() {
+    // 1000 parameter sets in each of 299 one-bar windows.
+    let mut s = rising_wf_spec();
+    s.sweep.base.params = Params::new().with("slow", ParamValue::Int(2000));
+    s.sweep.axes = vec![range("fast", 1.0, 1000.0, 1.0)];
+    s.windows = WindowSpec {
+        train_bars: 1,
+        test_bars: 1,
+        step_bars: 1,
+        mode: WindowMode::Rolling,
+    };
+    let started = |_: usize, _: usize| panic!("the walk-forward started running");
+    let err = walk_forward(&s, &rising_bars(300), &[], Some(&started)).unwrap_err();
+    assert!(
+        matches!(err, TesterError::TooManyRuns { runs: 299_000, limit } if limit == MAX_RUNS),
+        "{err}"
+    );
+}
+
+#[test]
+fn the_walk_forward_result_lists_the_stitched_trades_and_fills() {
+    let bars = rising_bars(300);
+    let r = walk_forward(&rising_wf_spec(), &bars, &[], None).unwrap();
+    let fills: usize = r.windows.iter().map(|w| w.out_of_sample.fills.len()).sum();
+    assert_eq!(r.fills.len(), fills);
+    assert_eq!(r.trades.len(), 5);
+    assert!(r.trades.iter().all(|t| !t.open));
+    assert!(
+        r.trades
+            .windows(2)
+            .all(|p| p[0].exit_time <= p[1].entry_time)
+    );
+    assert!(r.fills.windows(2).all(|p| p[0].time <= p[1].time));
+    // Scaled, the trades' net P&L adds up to the stitched equity's change, and the fills' fees
+    // to the stitched fees.
+    let pnl: f64 = r.trades.iter().map(|t| t.net_pnl).sum();
+    assert!(
+        (pnl - (r.metrics.end_equity - 10_000.0)).abs() < 1e-6,
+        "{pnl}"
+    );
+    let fees: f64 = r.fills.iter().map(|f| f.fee).sum();
+    assert_eq!(fees, r.metrics.fees_paid);
+    // The second window's trade is scaled by the first window's growth.
+    let first = &r.windows[0].out_of_sample;
+    let scale = first.equity.last().unwrap().equity / 10_000.0;
+    let own = &r.windows[1].out_of_sample.trades[0];
+    assert!((r.trades[1].net_pnl - own.net_pnl * scale).abs() < 1e-9);
 }

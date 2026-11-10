@@ -45,6 +45,14 @@ pub struct BacktestConfig {
     /// orders the strategy submits on them are rejected and recorded in the result's `orders`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub warmup_from: Option<Millis>,
+    /// When set, a position still open at the end is closed with a real fill: at the close of
+    /// the second-to-last traded bar every open order is cancelled and a reduce-only market order
+    /// for the whole position is submitted, so it fills at the last bar's open with slippage and
+    /// the taker fee, like any market order. Orders the strategy submits from then on never fill.
+    /// The trade list then ends with a closed trade instead of an open one marked at the last
+    /// close. The strategy tester sets it on out-of-sample runs.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub close_at_end: bool,
 }
 
 /// Buy and hold of the same instrument over the same bars.
@@ -128,11 +136,16 @@ pub fn run(
     }
     let mut positions = Vec::with_capacity(bars.len());
     let mut used_funding = Vec::new();
-    for (bar, range) in bars.iter().zip(&ranges) {
+    // The bar whose close decides the close-out, so it fills at the last bar's open.
+    let close_out_at = bars.len().checked_sub(2).filter(|_| config.close_at_end);
+    for (i, (bar, range)) in bars.iter().zip(&ranges).enumerate() {
         let events = &funding[range.clone()];
         session.on_bar(*bar, events)?;
         positions.push(session.portfolio().position());
         used_funding.extend_from_slice(events);
+        if close_out_at == Some(i) {
+            session.close_out();
+        }
     }
 
     let fills = session.fills().to_vec();
