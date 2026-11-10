@@ -204,12 +204,19 @@ fn data_range(config: &BacktestConfig) -> Result<(Millis, Millis), ApiError> {
     }
 }
 
+/// What the store holds for a configuration's range, before judging what is missing.
+struct StoreData {
+    /// The bars at the configuration's timeframe, with the buckets left out.
+    loaded: LoadedCandles,
+    /// The missing minutes.
+    gaps: Vec<Gap>,
+    /// A perpetual's funding rates; empty for spot.
+    funding: Vec<(Millis, f64)>,
+}
+
 /// Reads the 1-minute candles of the configuration's range, resamples them to its timeframe, and
-/// reads a perpetual's funding, without judging what is missing. Also returns the missing minutes.
-fn read_data(
-    store: &Store,
-    config: &BacktestConfig,
-) -> Result<(LoadedCandles, Vec<Gap>, Vec<(Millis, f64)>), ApiError> {
+/// reads a perpetual's funding.
+fn read_data(store: &Store, config: &BacktestConfig) -> Result<StoreData, ApiError> {
     let id = &config.instrument.id;
     let (from, to) = data_range(config)?;
     let mut minutes = Vec::new();
@@ -227,7 +234,11 @@ fn read_data(
         InstrumentKind::Perpetual => store.load_funding(id, from, to)?,
         InstrumentKind::Spot => Vec::new(),
     };
-    Ok((loaded, gaps, funding))
+    Ok(StoreData {
+        loaded,
+        gaps,
+        funding,
+    })
 }
 
 /// Loads a run's data, refusing with 422 `data_missing` when the store lacks part of the range:
@@ -236,7 +247,11 @@ fn read_data(
 pub fn load_run_data(store: &Store, config: &BacktestConfig) -> Result<RunData, ApiError> {
     let id = &config.instrument.id;
     let (from, to) = data_range(config)?;
-    let (loaded, gaps, funding) = read_data(store, config)?;
+    let StoreData {
+        loaded,
+        gaps,
+        funding,
+    } = read_data(store, config)?;
     let long: Vec<&Gap> = gaps.iter().filter(|g| g.to - g.from >= MAX_GAP).collect();
     if !long.is_empty() || loaded.candles.is_empty() {
         let spans = if long.is_empty() {
@@ -372,7 +387,7 @@ fn report_progress(ctx: &JobCtx, done: usize, total: usize) -> ControlFlow<()> {
         return ControlFlow::Break(());
     }
     let step = (total / 200).max(1);
-    if done % step == 0 || done == total {
+    if done.is_multiple_of(step) || done == total {
         ctx.progress(
             done as f64 / total.max(1) as f64,
             format!("{done} of {total} backtests"),
@@ -430,7 +445,7 @@ fn check_run(store: &Store, run: &SavedRun) -> RunCheck {
     let base = run.base_config();
     let data_matches = read_data(store, base)
         .ok()
-        .and_then(|(loaded, _, funding)| config_fingerprint(base, &loaded.candles, &funding).ok())
+        .and_then(|d| config_fingerprint(base, &d.loaded.candles, &d.funding).ok())
         .is_some_and(|fingerprint| fingerprint == run.data_fingerprint());
     RunCheck {
         data_matches,
