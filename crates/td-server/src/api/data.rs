@@ -384,7 +384,9 @@ pub(super) async fn delete(
     let id = request.instrument;
     let month = |text: &str| {
         Month::parse(text).ok_or_else(|| {
-            ApiError::bad_request(format!("{text:?} is not a month: use YYYY-MM, like 2024-01"))
+            ApiError::bad_request(format!(
+                "{text:?} is not a month: use YYYY-MM, like 2024-01"
+            ))
         })
     };
     let range = match (request.from.as_deref(), request.to.as_deref()) {
