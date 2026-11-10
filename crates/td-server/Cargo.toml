@@ -6,17 +6,23 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
+axum.workspace = true
+clap.workspace = true
+getrandom.workspace = true
 serde.workspace = true
 # Exact float parsing: a replayed log must give back the very bars and rates that were fed.
 serde_json = { workspace = true, features = ["float_roundtrip"] }
-td-core.workspace = true
-td-data = { path = "../td-data" }
-td-engine = { path = "../td-engine" }
+subtle.workspace = true
+td-core = { workspace = true, features = ["ts"] }
+td-data.workspace = true
+td-engine = { workspace = true, features = ["ts"] }
 thiserror.workspace = true
 tokio.workspace = true
+ts-rs.workspace = true
 
 [dev-dependencies]
 futures-util.workspace = true
+reqwest.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 tokio-tungstenite.workspace = true

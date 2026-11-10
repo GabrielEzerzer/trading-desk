@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::EngineError;
 
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ParamKind {
@@ -12,6 +13,7 @@ pub enum ParamKind {
     Bool,
 }
 
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ParamValue {
@@ -21,6 +23,7 @@ pub enum ParamValue {
 }
 
 /// One tunable parameter of a strategy, as the tester and the API list it.
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ParamSpec {
     pub name: &'static str,

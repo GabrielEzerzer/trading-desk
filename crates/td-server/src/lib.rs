@@ -1,10 +1,11 @@
-//! The local API server that the two desktop apps talk to over localhost. For now it holds paper
-//! sessions; the API that drives them comes with #16.
+//! The engine sidecar the two desktop apps start: a localhost API over the engine, the data store
+//! and paper sessions. The API lives in [`api`].
 //!
 //! A paper session runs a strategy through the same engine [`td_engine::Session`], fill model and
 //! simulated broker as a backtest; only the bar source differs: live bars from
 //! [`td_data::live`] instead of stored ones.
 
+pub mod api;
 mod error;
 mod paper;
 mod run;

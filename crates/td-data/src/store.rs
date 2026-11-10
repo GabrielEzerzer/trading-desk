@@ -6,14 +6,20 @@
 //!
 //! Every file holds rows sorted by time with no duplicates, and every candle passed
 //! [`Candle::validate`] on its way in. Files are replaced atomically: written to a temp file in the
-//! same folder, then renamed over the old one. Missing minutes are reported, never filled.
+//! same folder, then renamed over the old one. Each read-merge-write of a file holds a lock for
+//! that path, in this process and across processes, so two writers (two download jobs, or the two
+//! apps' servers sharing one data folder) never lose each other's rows. The cross-process lock is
+//! an OS lock on a sidecar file beside the data file, `<name>.parquet.lock`, which stays on disk.
+//! Readers take no lock: the rename means they see the old file or the new one, never half of one.
+//! Missing minutes are reported, never filled.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread::sleep;
 use std::time::Duration;
 
@@ -126,11 +132,14 @@ fn data_dir_from(
 }
 
 /// Checks that a symbol is safe as a folder or file name: letters (any script), digits, `-`, `_`.
+/// Lowercase letters are refused: venues list symbols in uppercase, and on a case-insensitive
+/// file system `btcusdt` would share `BTCUSDT`'s folder while bypassing the per-file write locks
+/// and the API's one-download-per-instrument check, which compare exact strings.
 pub(crate) fn check_symbol(symbol: &str) -> Result<(), DataError> {
     let ok = !symbol.is_empty()
         && symbol
             .chars()
-            .all(|c| c.is_alphanumeric() || c == '-' || c == '_');
+            .all(|c| (c.is_alphanumeric() && !c.is_lowercase()) || c == '-' || c == '_');
     if ok {
         Ok(())
     } else {
@@ -211,6 +220,10 @@ impl Store {
         };
         let mut merged_span = Vec::new();
         for (month, new) in by_month {
+            let path = self.candle_path(id, month)?;
+            let lock = file_lock(&path);
+            let _held = hold(&lock);
+            let _locked = lock_across_processes(&path)?;
             let mut merged: BTreeMap<Millis, Candle> = self
                 .read_month(id, month)?
                 .into_iter()
@@ -222,7 +235,7 @@ impl Store {
                 }
             }
             let merged: Vec<Candle> = merged.into_values().collect();
-            write_atomic(&self.candle_path(id, month)?, &candle_batch(&merged)?)?;
+            write_atomic(&path, &candle_batch(&merged)?)?;
             report.months.push(month);
             merged_span.extend(
                 merged
@@ -352,6 +365,9 @@ impl Store {
                 format!("rate {rate} is not finite"),
             ));
         }
+        let lock = file_lock(&path);
+        let _held = hold(&lock);
+        let _locked = lock_across_processes(&path)?;
         let mut merged: BTreeMap<Millis, f64> = self.read_funding(id)?.into_iter().collect();
         merged.extend(rates.iter().copied());
         let (times, values): (Vec<Millis>, Vec<f64>) = merged.into_iter().unzip();
@@ -458,12 +474,61 @@ fn candle_batch(candles: &[Candle]) -> Result<RecordBatch, DataError> {
     )
 }
 
-/// Writes `batch` to a temp file beside `path`, then renames it over `path`.
+/// The lock that serialises read-merge-write of one store file among this process's threads.
+/// Callers take it, then [`lock_across_processes`], and hold both from the read through the
+/// rename. The OS lock alone would be enough, but this keeps waiting threads on a cheap mutex
+/// instead of each holding an open lock file in the OS lock queue.
+// shortcut: keyed by the path as built from the store root, so two `Store`s that spell one folder
+// differently (relative and absolute) do not share this mutex, and entries are never removed (one
+// per file written, a few hundred bytes each); canonicalise and evict if either ever matters. The
+// OS lock taken next still serialises such writers, since it is keyed by the file itself.
+fn file_lock(path: &Path) -> Arc<Mutex<()>> {
+    static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
+    let mut locks = hold(LOCKS.get_or_init(Mutex::default));
+    locks.entry(path.to_path_buf()).or_default().clone()
+}
+
+/// Takes the exclusive OS lock that serialises read-merge-write of the store file at `path` across
+/// processes, waiting for any other holder, and returns the open lock file; the lock lasts until it
+/// is dropped. Callers take it after [`file_lock`] and hold it from the read through the rename.
+///
+/// The lock is on a sidecar file, `<file name>.lock` beside `path`, not on the data file: on Windows
+/// a lock or open handle on the data file would make the rename over it fail. The sidecar is never
+/// deleted, since a writer could otherwise lock a file another writer is about to remove and both
+/// would proceed. It is an OS lock (`flock` on Unix, `LockFileEx` on Windows) bound to the open
+/// handle, so the OS releases it when the holder exits or is killed: a crash cannot leave a file
+/// locked, as a create-exclusive marker file would.
+fn lock_across_processes(path: &Path) -> Result<File, DataError> {
+    let dir = path.parent().unwrap_or(Path::new("."));
+    fs::create_dir_all(dir).map_err(DataError::io(dir))?;
+    let mut name = path.file_name().unwrap_or_default().to_owned();
+    name.push(".lock");
+    let lock_path = dir.join(name);
+    let file = File::options()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(DataError::io(&lock_path))?;
+    file.lock().map_err(DataError::io(&lock_path))?;
+    Ok(file)
+}
+
+/// Locks `mutex`, carrying on past a panic in another holder: the data behind these locks is a
+/// map of locks or nothing at all, so it cannot be left half-changed.
+fn hold<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Writes `batch` to a temp file beside `path`, then renames it over `path`. The temp name holds
+/// the process id and a per-process counter, so no two writes share one.
 fn write_atomic(path: &Path, batch: &RecordBatch) -> Result<(), DataError> {
+    static WRITES: AtomicU64 = AtomicU64::new(0);
     let dir = path.parent().unwrap_or(Path::new("."));
     fs::create_dir_all(dir).map_err(DataError::io(dir))?;
     let mut temp_name = path.file_name().unwrap_or_default().to_owned();
-    temp_name.push(format!(".{}.tmp", std::process::id()));
+    let write = WRITES.fetch_add(1, Ordering::Relaxed);
+    temp_name.push(format!(".{}.{write}.tmp", std::process::id()));
     let temp = dir.join(temp_name);
     let parquet_error = |source| DataError::Parquet {
         path: temp.clone(),
@@ -622,8 +687,209 @@ mod tests {
         ] {
             assert!(check_symbol(ok).is_ok(), "{ok}");
         }
-        for bad in ["", "..", "BTC/USDT", "..\\x", "a b", "C:"] {
+        for bad in [
+            "", "..", "BTC/USDT", "..\\x", "a b", "C:", "btcusdt", "BTCusdt",
+        ] {
             assert!(check_symbol(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn two_threads_writing_one_month_keep_every_minute_both_wrote() {
+        const WRITES: i64 = 40;
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let store = Store::new(dir.path());
+        let id = InstrumentId {
+            venue: td_core::Venue::Binance,
+            symbol: "BTCUSDT".into(),
+            kind: InstrumentKind::Spot,
+        };
+        let jan = Month::containing(1_704_067_200_000); // 2024-01-01
+        let candle = |open_time| Candle {
+            open_time,
+            open: 100.0,
+            high: 101.0,
+            low: 99.0,
+            close: 100.5,
+            volume: 1.0,
+            quote_volume: 100.0,
+        };
+        // One thread writes the even minutes and the other the odd ones, one write per minute, so
+        // each write reads, merges and rewrites the same month file the other is rewriting.
+        let start = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            for parity in 0..2 {
+                let (store, id, start) = (&store, &id, &start);
+                scope.spawn(move || {
+                    start.wait();
+                    for i in 0..WRITES {
+                        let t = jan.start() + (2 * i + parity) * MINUTE;
+                        store.write_candles(id, &[candle(t)]).expect("writes");
+                    }
+                });
+            }
+        });
+        let stored: Vec<Millis> = store
+            .read_month(&id, jan)
+            .expect("the file stays readable")
+            .iter()
+            .map(|c| c.open_time)
+            .collect();
+        let expected: Vec<Millis> = (0..2 * WRITES).map(|i| jan.start() + i * MINUTE).collect();
+        assert_eq!(stored, expected);
+        let leftovers: Vec<_> =
+            fs::read_dir(store.candle_path(&id, jan).unwrap().parent().unwrap())
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .filter(|name| name.to_string_lossy().ends_with(".tmp"))
+                .collect();
+        assert_eq!(
+            leftovers,
+            Vec::<OsString>::new(),
+            "no temp files left behind"
+        );
+    }
+
+    /// Set in a child process started by [`spawn_child`] to the role it plays in its test.
+    const CHILD_ROLE: &str = "TD_STORE_TEST_CHILD_ROLE";
+    /// Set in a child process to the folder it shares with its parent test.
+    const CHILD_DIR: &str = "TD_STORE_TEST_CHILD_DIR";
+
+    /// The folder shared with the parent, when this process is a child playing `role`.
+    fn child_dir(role: &str) -> Option<PathBuf> {
+        if std::env::var(CHILD_ROLE).ok()? != role {
+            return None;
+        }
+        std::env::var_os(CHILD_DIR).map(PathBuf::from)
+    }
+
+    /// Starts this test binary again as a second OS process that runs only the test `name`, as a
+    /// child playing `role` with the folder `dir`.
+    fn spawn_child(name: &str, role: &str, dir: &Path) -> std::process::Child {
+        std::process::Command::new(std::env::current_exe().expect("the test binary"))
+            .args(["--exact", name, "--nocapture", "--test-threads=1"])
+            .env(CHILD_ROLE, role)
+            .env(CHILD_DIR, dir)
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("the child process starts")
+    }
+
+    /// Waits up to 60 s for `path` to exist.
+    fn wait_for(path: &Path) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while !path.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {}",
+                path.display()
+            );
+            sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn two_processes_writing_one_month_keep_every_minute_both_wrote() {
+        const NAME: &str =
+            "store::tests::two_processes_writing_one_month_keep_every_minute_both_wrote";
+        const ROLE: &str = "odd minutes";
+        const WRITES: i64 = 60;
+        let id = InstrumentId {
+            venue: td_core::Venue::Binance,
+            symbol: "BTCUSDT".into(),
+            kind: InstrumentKind::Spot,
+        };
+        let jan = Month::containing(1_704_067_200_000); // 2024-01-01
+        // One process writes the even minutes and the other the odd ones, one write per minute, so
+        // each write reads, merges and rewrites the same month file the other is rewriting.
+        let write_minutes = |root: &Path, parity: i64| {
+            let store = Store::new(root);
+            for i in 0..WRITES {
+                let candle = Candle {
+                    open_time: jan.start() + (2 * i + parity) * MINUTE,
+                    open: 100.0,
+                    high: 101.0,
+                    low: 99.0,
+                    close: 100.5,
+                    volume: 1.0,
+                    quote_volume: 100.0,
+                };
+                store.write_candles(&id, &[candle]).expect("writes");
+            }
+        };
+        if let Some(dir) = child_dir(ROLE) {
+            fs::write(dir.join("ready"), b"").expect("signals ready");
+            wait_for(&dir.join("go"));
+            write_minutes(&dir.join("store"), 1);
+            return;
+        }
+
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let root = dir.path().join("store");
+        let mut child = spawn_child(NAME, ROLE, dir.path());
+        wait_for(&dir.path().join("ready"));
+        fs::write(dir.path().join("go"), b"").expect("starts the child");
+        write_minutes(&root, 0);
+        let status = child.wait().expect("the child finishes");
+        assert!(status.success(), "the child process failed: {status}");
+
+        let store = Store::new(&root);
+        let stored: Vec<Millis> = store
+            .read_month(&id, jan)
+            .expect("the file stays readable")
+            .iter()
+            .map(|c| c.open_time)
+            .collect();
+        let expected: Vec<Millis> = (0..2 * WRITES).map(|i| jan.start() + i * MINUTE).collect();
+        assert_eq!(stored, expected);
+        let path = store.candle_path(&id, jan).expect("a path");
+        assert!(
+            path.with_extension("parquet.lock").exists(),
+            "the lock file stays"
+        );
+        assert_eq!(
+            store.months(&id).expect("lists"),
+            [jan],
+            "lock files are not months"
+        );
+        assert_eq!(store.coverage(&id).expect("covers").len(), 1);
+    }
+
+    #[test]
+    fn a_killed_writer_leaves_no_file_locked() {
+        const NAME: &str = "store::tests::a_killed_writer_leaves_no_file_locked";
+        const ROLE: &str = "lock holder";
+        if let Some(dir) = child_dir(ROLE) {
+            let _locked = lock_across_processes(&dir.join("2024-01.parquet")).expect("locks");
+            fs::write(dir.join("ready"), b"").expect("signals ready");
+            sleep(Duration::from_secs(60)); // killed long before this ends
+            return;
+        }
+
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let mut child = spawn_child(NAME, ROLE, dir.path());
+        wait_for(&dir.path().join("ready"));
+        let lock_file = File::options()
+            .write(true)
+            .open(dir.path().join("2024-01.parquet.lock"))
+            .expect("the child made the lock file");
+        let held = lock_file.try_lock();
+        let _ = child.kill();
+        child.wait().expect("the child is gone");
+        assert!(
+            matches!(held, Err(fs::TryLockError::WouldBlock)),
+            "the lock is held while its holder lives: {held:?}"
+        );
+        // Windows releases a dead process's locks soon after it exits, not always at once.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            match lock_file.try_lock() {
+                Ok(()) => break,
+                Err(fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                    sleep(Duration::from_millis(10));
+                }
+                Err(e) => panic!("the killed holder's lock was not released: {e}"),
+            }
         }
     }
 
