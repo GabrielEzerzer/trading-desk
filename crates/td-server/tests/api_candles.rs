@@ -87,7 +87,8 @@ impl MarketSource for NoSource {
 struct FakeRest {
     minutes: Vec<Candle>,
     now: Millis,
-    fail: Option<String>,
+    /// Every call fails with this error instead.
+    fail: Option<fn() -> DataError>,
     calls: Mutex<Vec<(Timeframe, Millis, Millis)>>,
 }
 
@@ -115,12 +116,8 @@ impl Rest for FakeRest {
         to: Millis,
     ) -> Result<Vec<Candle>, DataError> {
         self.calls.lock().unwrap().push((timeframe, from, to));
-        if let Some(body) = &self.fail {
-            return Err(DataError::Status {
-                url: "https://venue.test/klines".into(),
-                status: 503,
-                body: body.clone(),
-            });
+        if let Some(fail) = self.fail {
+            return Err(fail());
         }
         let bars = if timeframe == Timeframe::M1 {
             self.minutes.clone()
@@ -311,6 +308,38 @@ async fn daily_and_weekly_bars_over_months_match_the_store() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn from_and_to_between_bar_boundaries_round_up_to_the_next() {
+    const DAY: Millis = 24 * HOUR;
+    let minutes = stored(0..21 * DAY / MIN);
+    let api = Api::start(&minutes, FakeRest::new(Vec::new(), T0 + 30 * DAY)).await;
+    // 00:10 to 03:05: the hours opening at 01:00, 02:00 and 03:00.
+    let got = api
+        .candles(&format!(
+            "&timeframe=1h&from={}&to={}",
+            T0 + 10 * MIN,
+            T0 + 3 * HOUR + 5 * MIN
+        ))
+        .await;
+    let hours = resample(&minutes, Timeframe::H1, false).candles;
+    assert_eq!(got.candles, hours[1..4]);
+    assert_eq!((got.from, got.to), (T0 + HOUR, T0 + 4 * HOUR));
+    // From Wednesday 3 January: the weeks opening on Monday 8 and Monday 15 January.
+    let got = api
+        .candles(&format!(
+            "&timeframe=1w&from={}&to={}",
+            T0 + 2 * DAY,
+            T0 + 21 * DAY
+        ))
+        .await;
+    let weeks = resample(&minutes, Timeframe::W1, false).candles;
+    assert_eq!(got.candles, weeks[1..3]);
+    assert_eq!((got.from, got.to), (T0 + 7 * DAY, T0 + 21 * DAY));
+    assert!(got.missing.is_empty() && got.from_venue.is_empty());
+    assert!(api.rest.calls().is_empty());
+    api.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_gap_in_the_store_is_filled_from_the_venue_and_not_stored() {
     let store_minutes: Vec<Candle> = stored((0..30).chain(45..120));
     // The venue lacks two of the minutes the store lacks too.
@@ -471,31 +500,76 @@ async fn bad_instruments_timeframes_and_ranges_are_400() {
     api.shutdown().await;
 }
 
+fn venue_status(status: u16, body: &str) -> DataError {
+    DataError::Status {
+        url: "https://venue.test/klines".into(),
+        status,
+        body: body.into(),
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_venue_failure_is_a_502_with_the_venues_message() {
+    let failures: [(fn() -> DataError, &str); 3] = [
+        (
+            || venue_status(503, "the venue is down for maintenance"),
+            "the venue is down for maintenance",
+        ),
+        // The venue's rate limit says nothing about the request.
+        (
+            || venue_status(429, "too many requests"),
+            "too many requests",
+        ),
+        // Bybit answers 200 with a non-zero retCode.
+        (
+            || DataError::Api {
+                url: "https://venue.test/klines".into(),
+                message: "retCode 10016: service error".into(),
+            },
+            "retCode 10016: service error",
+        ),
+    ];
+    for (fail, expected) in failures {
+        let rest = FakeRest {
+            fail: Some(fail),
+            ..FakeRest::new(Vec::new(), T0 + 10 * HOUR)
+        };
+        let api = Api::start(&stored(0..60), rest).await;
+        let (status, body) = api
+            .get(&format!(
+                "/candles?instrument={INSTRUMENT}&timeframe=1m&from={T0}&to={}",
+                T0 + 90 * MIN
+            ))
+            .await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+        assert_eq!(body["error"]["code"], "venue");
+        let message = body["error"]["message"].as_str().expect("a message");
+        assert!(message.contains(expected), "{message}");
+        // A range the store covers never asks the venue, so it still answers.
+        let got = api
+            .candles(&format!("&timeframe=1m&from={T0}&to={}", T0 + 60 * MIN))
+            .await;
+        assert_eq!(got.candles, stored(0..60));
+        assert_eq!(api.rest.calls().len(), 1);
+        api.shutdown().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_symbol_the_venue_does_not_list_is_a_400_with_the_venues_message() {
+    // Binance answers an unknown symbol with a 400.
     let rest = FakeRest {
-        fail: Some("the venue is down for maintenance".into()),
+        fail: Some(|| venue_status(400, r#"{"code":-1121,"msg":"Invalid symbol."}"#)),
         ..FakeRest::new(Vec::new(), T0 + 10 * HOUR)
     };
-    let api = Api::start(&stored(0..60), rest).await;
+    let api = Api::start(&[], rest).await;
     let (status, body) = api
-        .get(&format!(
-            "/candles?instrument={INSTRUMENT}&timeframe=1m&from={T0}&to={}",
-            T0 + 90 * MIN
-        ))
+        .get("/candles?instrument=binance:NOSUCHUSDT:spot&timeframe=1h")
         .await;
-    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
-    assert_eq!(body["error"]["code"], "venue");
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"]["code"], "bad_request");
     let message = body["error"]["message"].as_str().expect("a message");
-    assert!(
-        message.contains("the venue is down for maintenance"),
-        "{message}"
-    );
-    // A range the store covers never asks the venue, so it still answers.
-    let got = api
-        .candles(&format!("&timeframe=1m&from={T0}&to={}", T0 + 60 * MIN))
-        .await;
-    assert_eq!(got.candles, stored(0..60));
+    assert!(message.contains("Invalid symbol."), "{message}");
     assert_eq!(api.rest.calls().len(), 1);
     api.shutdown().await;
 }

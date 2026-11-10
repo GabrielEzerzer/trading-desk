@@ -16,12 +16,14 @@
 //!   come from the store, resampled from its minutes; the slots it does not cover are fetched from
 //!   the venue's REST API, as a paper session's warm-up does, and are not stored, so an instrument
 //!   with no stored data works too. A bar still open is never returned. `to` defaults to now and
-//!   `from` to 2017-01-01. `limit` defaults to and is capped at [`candles::MAX_CANDLES`]; a range
+//!   `from` to 2017-01-01; either one between bar boundaries is rounded up to the next. `limit` defaults to and is capped at [`candles::MAX_CANDLES`]; a range
 //!   holding more bar slots than `limit` is cut to the latest `limit` slots ending at `to`, so the
 //!   chart gets the latest history (`truncated` says so when `from` was given). The response
 //!   names the spans served by the venue (`from_venue`) and the slots neither had (`missing`). A
 //!   malformed instrument, an unknown venue, kind or timeframe, a `limit` of 0 or `from >= to` is
-//!   a 400 `bad_request`; the venue failing while filling in is a 502 `venue` with its message.
+//!   a 400 `bad_request`, and so is the venue refusing the request with a 4xx (other than its
+//!   rate limit), as Binance does for a symbol it does not list, with the venue's message. Any
+//!   other venue failure while filling in is a 502 `venue` with its message.
 //! - `GET /strategies`: the registered strategies and their parameter specs.
 //! - `GET /jobs`, `GET /jobs/{id}`, `POST /jobs/{id}/cancel`: background jobs (see [`jobs`]).
 //! - `POST /runs/backtest` (a `BacktestConfig`), `POST /runs/sweep` (a `SweepSpec`),

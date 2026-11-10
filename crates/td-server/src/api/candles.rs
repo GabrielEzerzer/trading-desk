@@ -14,9 +14,9 @@ use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 use td_core::{Candle, InstrumentId, Millis, Timeframe};
-use td_data::Store;
 use td_data::live::Rest;
 use td_data::time::{DAY, Month};
+use td_data::{DataError, Store};
 use ts_rs::TS;
 
 use super::AppState;
@@ -25,8 +25,8 @@ use super::error::ApiError;
 
 /// The most bars one response holds, and the default `limit`.
 pub const MAX_CANDLES: usize = 5_000;
-/// How much time one read of the store covers at most: about a month's minutes in memory.
-const STORE_READ_MS: Millis = 31 * DAY;
+/// How much time one read of the store covers for weekly bars: four weeks, about a month's minutes.
+const WEEKLY_STORE_READ_MS: Millis = 28 * DAY;
 
 #[derive(Debug, Clone, Deserialize)]
 pub(super) struct CandlesQuery {
@@ -123,12 +123,18 @@ fn read_candles(
         ((from..end).contains(&t) && timeframe.floor(t) == t).then(|| ((t - from) / dur) as usize)
     };
     let mut slots: Vec<Slot> = vec![None; ((end - from) / dur) as usize];
-    // The stored minutes are read about a month of bars at a time, so a daily or weekly chart
-    // over years never holds years of minutes at once. Each piece starts on a bar boundary.
-    let piece = (STORE_READ_MS / dur).max(1) * dur;
+    // The stored minutes are read about a month at a time, so a daily or weekly chart over years
+    // never holds years of minutes at once, and every piece ends on a bar boundary. Up to 1d a
+    // piece ends at the next month start, which is a whole day, so it reads one month file; weeks
+    // do not divide months, so 1w reads four weeks at a time.
     let mut start = from;
     while start < end {
-        let stop = (start + piece).min(end);
+        let stop = if dur <= DAY {
+            Month::containing(start).end()
+        } else {
+            start + WEEKLY_STORE_READ_MS
+        }
+        .min(end);
         for bar in store
             .load_candles(&id, timeframe, start, stop, false)?
             .candles
@@ -147,13 +153,7 @@ fn read_candles(
         let (span_from, span_to) = (from + first as i64 * dur, from + (last as i64 + 1) * dur);
         let fetched = rest
             .klines(&id, timeframe, span_from, span_to)
-            .map_err(|e| {
-                ApiError::new(
-                    StatusCode::BAD_GATEWAY,
-                    "venue",
-                    format!("fetching {id} {timeframe} bars from the venue failed: {e}"),
-                )
-            })?;
+            .map_err(|e| venue_error(&id, timeframe, e))?;
         // A bar that fails validation is skipped, as in a session's warm-up.
         for bar in fetched.into_iter().filter(|b| b.validate().is_ok()) {
             if let Some(i) = slot_of(bar.open_time)
@@ -187,6 +187,22 @@ fn read_candles(
         }
     }
     Ok(response)
+}
+
+/// The venue refusing the request (an HTTP 4xx, such as Binance's answer for a symbol it does not
+/// list) is the client's mistake, a 400 with the venue's message. Any other failure is a 502: a
+/// 5xx, the network, a timeout, a body that does not parse, and the venue's rate limit (429, and
+/// 418 for Binance's ban after ignoring it), which says nothing about the request.
+fn venue_error(id: &InstrumentId, timeframe: Timeframe, e: DataError) -> ApiError {
+    let message = format!("fetching {id} {timeframe} bars from the venue failed: {e}");
+    match e {
+        DataError::Status { status, .. }
+            if (400..500).contains(&status) && !matches!(status, 418 | 429) =>
+        {
+            ApiError::bad_request(message)
+        }
+        _ => ApiError::new(StatusCode::BAD_GATEWAY, "venue", message),
+    }
 }
 
 /// Adds the slot opening at `open_time` to the last span if it follows on, else starts a new one.
