@@ -2035,7 +2035,16 @@ dependencies = [
 name = "td-server"
 version = "0.1.0"
 dependencies = [
+ "futures-util",
+ "serde",
+ "serde_json",
  "td-core",
+ "td-data",
+ "td-engine",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tokio-tungstenite",
 ]
 
 [[package]]

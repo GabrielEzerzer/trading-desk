@@ -1,3 +1,3 @@
-//! The local API server that the two desktop apps talk to over localhost. It does nothing yet.
+//! The local API server binary. It serves nothing yet; the API comes with #16.
 
 fn main() {}
