@@ -421,9 +421,9 @@ fn out_of_sample_warms_up_on_the_in_sample_bars() {
     )
     .unwrap();
     assert_eq!(cold.orders[0].submitted_at, r.split_at + 4 * HOUR);
-    // A total-return objective is compared by CAGR, since the segments may differ in length.
-    let expected = o.metrics.cagr.unwrap() / best.metrics.cagr.unwrap();
-    assert_eq!(r.degradation, Some(expected));
+    // Both segments are too short for a CAGR, so there is no degradation; the CAGR ratio is
+    // checked on long segments in the next test.
+    assert_eq!(r.degradation, None);
 
     // A split at a time gives the same segments.
     let at = OosSpec {
@@ -1005,4 +1005,200 @@ fn checking_a_spec_without_data_finds_what_the_run_would_refuse_first() {
     assert_eq!(wf.check(), Ok(()));
     wf.sweep = warm;
     assert_eq!(wf.check(), walk_forward(&wf, &bars, &[], None).map(|_| ()));
+}
+
+#[test]
+fn a_parameter_set_that_never_trades_ranks_last_when_minimising_drawdown_by_default() {
+    // slow 1000 is longer than the 500 bars, so that set never trades and has no drawdown at
+    // all: ranked by drawdown alone it would come first.
+    let mut b = base(common::perp(), 500);
+    b.params = Params::new().with("fast", ParamValue::Int(6));
+    let mut s = spec(b, vec![values("slow", &ints(&[1000, 24, 12]))]);
+    s.objective = Objective {
+        metric: Metric::MaxDrawdown,
+        direction: Direction::Minimize,
+    };
+    // A spec that leaves min_trades out, as the apps may.
+    let mut json = serde_json::to_value(&s).unwrap();
+    json.as_object_mut().unwrap().remove("min_trades");
+    let s: SweepSpec = serde_json::from_value(json).unwrap();
+    assert_eq!(s.min_trades, 1);
+    let r = sweep(&s, &wavy_bars(500), &[], None).unwrap();
+    let last = r.rows.last().unwrap();
+    assert_eq!(int(&last.params, "slow"), 1000);
+    assert_eq!(last.metrics.unwrap().trades, 0);
+    assert_eq!(last.metrics.unwrap().max_drawdown, Some(0.0));
+    assert!(!last.qualified);
+    assert!(r.rows[..2].iter().all(|row| row.qualified));
+    assert_ne!(int(&r.best.as_ref().unwrap().config.params, "slow"), 1000);
+}
+
+#[test]
+fn an_objective_undefined_on_a_short_range_qualifies_no_run_and_ranks_in_grid_order() {
+    // 500 hourly bars are under 21 days: too few daily returns for a Sharpe ratio.
+    let mut s = wavy_spec();
+    s.objective = Objective {
+        metric: Metric::Sharpe,
+        direction: Direction::Maximize,
+    };
+    let r = sweep(&s, &wavy_bars(500), &[], None).unwrap();
+    assert!(
+        r.rows
+            .iter()
+            .all(|row| !row.qualified && row.metrics.unwrap().sharpe.is_none())
+    );
+    let order: Vec<u64> = r.rows.iter().map(|row| row.index).collect();
+    assert_eq!(order, (0..48).collect::<Vec<_>>());
+    assert!(r.best.is_none());
+}
+
+#[test]
+fn a_sharpe_objective_ranks_a_run_without_a_sharpe_ratio_after_every_run_with_one() {
+    // 60 days of hourly bars, enough daily returns; the set that never trades has a flat
+    // curve, so no Sharpe ratio, and ranks after the sets that do.
+    let n = 60 * 24;
+    let mut b = base(common::perp(), n);
+    b.params = Params::new().with("fast", ParamValue::Int(6));
+    let mut s = spec(b, vec![values("slow", &ints(&[5000, 24, 12]))]);
+    s.objective = Objective {
+        metric: Metric::Sharpe,
+        direction: Direction::Maximize,
+    };
+    s.min_trades = 0;
+    let r = sweep(&s, &wavy_bars(n), &[], None).unwrap();
+    assert!(r.rows[..2].iter().all(|row| row.qualified));
+    let last = r.rows.last().unwrap();
+    assert_eq!(int(&last.params, "slow"), 5000);
+    assert_eq!(last.metrics.unwrap().sharpe, None);
+    assert!(!last.qualified);
+}
+
+#[test]
+fn a_total_return_degradation_is_undefined_when_a_segment_is_too_short_for_a_cagr() {
+    // 300 hourly bars split in half: both segments are under 90 days, so neither has a CAGR.
+    let r = out_of_sample(
+        &OosSpec {
+            sweep: rising_spec(),
+            split: Split::Fraction(0.5),
+        },
+        &rising_bars(300),
+        &[],
+        None,
+    )
+    .unwrap();
+    assert_eq!(r.out_of_sample.metrics.cagr, None);
+    assert!(r.out_of_sample.metrics.total_return.is_some());
+    assert_eq!(r.degradation, None);
+}
+
+/// Funding for the walk-forward benchmark test: one event before the first test bar (ignored),
+/// one at the open of bar 60, one inside bar 100 and one at the end of the range (ignored).
+fn wf_benchmark_funding() -> Vec<(Millis, f64)> {
+    vec![
+        (T0 + 300 * HOUR, 0.0003),
+        (T0 + 60 * HOUR, 0.0001),
+        (T0 + 100 * HOUR + 30 * 60_000, -0.00005),
+        (T0 + 10 * HOUR, 0.0002),
+    ]
+}
+
+#[test]
+fn the_walk_forward_benchmark_buys_at_the_first_test_bar_and_holds_to_the_last() {
+    let bars = rising_bars(300);
+    let funding = wf_benchmark_funding();
+    let r = walk_forward(&rising_wf_spec(), &bars, &funding, None).unwrap();
+    // Tests run from bar 50 to bar 299.
+    assert_eq!(r.windows[0].test_from, T0 + 50 * HOUR);
+    let b = r.benchmark.as_ref().unwrap();
+    // Bar 50 opens at 124.5; with 5 bps of slippage 124.56225, rounded up to the tick.
+    assert_eq!(b.entry_price, 124.57);
+    // 10 000 / (124.57 * 1.002) = 80.1159..., rounded down to the lot.
+    assert!((b.qty - 80.115).abs() < 1e-9, "{}", b.qty);
+    assert_eq!(b.equity.len(), 250);
+    assert_eq!(b.equity[0].time, T0 + 50 * HOUR);
+    assert_eq!(b.equity.last().unwrap().time, T0 + 299 * HOUR);
+    // Held to the close of bar 299 at 249.5, less the entry fee and the two funding payments in
+    // the span: at the open of bar 60 (129.5) and inside bar 100, at its close (150).
+    let fee = 124.57 * 80.115 * 0.002;
+    let paid = 80.115 * 129.5 * 0.0001 + 80.115 * 150.0 * -0.00005;
+    let end = 10_000.0 - fee - paid + 80.115 * (249.5 - 124.57);
+    let got = b.equity.last().unwrap().equity;
+    assert!((got - end).abs() < 1e-9, "{got} vs {end}");
+    assert!((b.metrics.funding_paid - paid).abs() < 1e-12);
+    assert!((b.metrics.total_return.unwrap() - (end / 10_000.0 - 1.0)).abs() < 1e-12);
+    assert_eq!(
+        b.excess_return,
+        Some(r.metrics.total_return.unwrap() - b.metrics.total_return.unwrap())
+    );
+    assert!(b.correlation.is_some());
+}
+
+#[test]
+fn the_walk_forward_benchmark_holds_through_the_gaps_between_test_windows() {
+    let bars = rising_bars(300);
+    let mut s = rising_wf_spec();
+    // Tests of 40 bars every 50: 60..100, 110..150, ..., 260..300.
+    s.windows.test_bars = 40;
+    let r = walk_forward(&s, &bars, &wf_benchmark_funding(), None).unwrap();
+    assert_eq!(r.windows[0].test_from, T0 + 60 * HOUR);
+    assert_eq!(r.equity.len(), 200);
+    let b = r.benchmark.as_ref().unwrap();
+    // Bars 60 to 299, gaps included, held continuously.
+    assert_eq!(b.equity.len(), 240);
+    assert_eq!(b.equity[0].time, T0 + 60 * HOUR);
+    // Bar 60 opens at 129.5: 129.56475, rounded up to the tick.
+    assert_eq!(b.entry_price, 129.57);
+    // 10 000 / (129.57 * 1.002) = 77.0243..., rounded down to the lot.
+    let qty = 77.024;
+    assert!((b.qty - qty).abs() < 1e-9, "{}", b.qty);
+    // Funding at bar 60's open falls before the entry and is not charged; bar 100's is.
+    let fee = 129.57 * qty * 0.002;
+    let end = 10_000.0 - fee - qty * 150.0 * -0.00005 + qty * (249.5 - 129.57);
+    let got = b.equity.last().unwrap().equity;
+    assert!((got - end).abs() < 1e-9, "{got} vs {end}");
+    // The correlation pairs each stitched bar's return with the benchmark's over the same time.
+    assert!(b.correlation.is_some());
+}
+
+#[test]
+fn walk_forward_tests_up_to_the_last_bar_and_warms_the_first_train_sweep_on_the_leftover() {
+    // 310 bars with 50-bar windows: 10 bars are left over at the start, not at the end.
+    let bars = rising_bars(310);
+    let mut s = rising_wf_spec();
+    s.sweep.base.to = T0 + 310 * HOUR;
+    let r = walk_forward(&s, &bars, &[], None).unwrap();
+    assert_eq!(r.windows.len(), 5);
+    assert_eq!(r.windows.last().unwrap().test_to, T0 + 310 * HOUR);
+    assert_eq!(r.equity.last().unwrap().time, T0 + 309 * HOUR);
+    let first = &r.windows[0];
+    assert_eq!(
+        (first.train_from, first.test_from),
+        (T0 + 10 * HOUR, T0 + 60 * HOUR)
+    );
+    // The first train sweep is warmed up on the 10 leftover bars.
+    let warmed = run(
+        &BacktestConfig {
+            from: first.train_from,
+            to: first.train_to,
+            warmup_from: Some(T0),
+            close_at_end: true,
+            ..with(&s.sweep.base, &first.params)
+        },
+        &bars,
+        &[],
+    )
+    .unwrap();
+    assert_eq!(first.in_sample.total_return, warmed.metrics.total_return);
+    let cold = run(
+        &BacktestConfig {
+            from: first.train_from,
+            to: first.train_to,
+            close_at_end: true,
+            ..with(&s.sweep.base, &first.params)
+        },
+        &bars,
+        &[],
+    )
+    .unwrap();
+    assert_ne!(first.in_sample.total_return, cold.metrics.total_return);
 }

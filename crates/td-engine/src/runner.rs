@@ -57,7 +57,8 @@ pub struct BacktestConfig {
     pub close_at_end: bool,
 }
 
-/// Buy and hold of the same instrument over the same bars.
+/// Buy and hold of the same instrument over the same bars: a backtest's traded bars, or a
+/// walk-forward's stitched span (see [`crate::WalkForwardResult`]).
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Benchmark {
@@ -70,7 +71,10 @@ pub struct Benchmark {
     pub metrics: MetricsReport,
     /// Strategy total return minus benchmark total return.
     pub excess_return: Option<f64>,
-    /// Pearson correlation of the strategy's per-bar returns with the benchmark's.
+    /// Pearson correlation of the strategy's per-bar returns with the benchmark's over the same
+    /// intervals: the benchmark's equity is read at each time of the strategy's equity series.
+    /// In a backtest the two have the same bars; in a walk-forward, across a gap between test
+    /// windows, the benchmark's return spans the gap like the stitched curve's does.
     pub correlation: Option<f64>,
 }
 
@@ -245,6 +249,28 @@ pub fn rerun(
     })
 }
 
+/// [`benchmark`] over `bars`, the bars of `config`'s range, with `funding` in any order and the
+/// same rules as [`run`]: an event in a gap between bars is charged at the next bar's open, and
+/// events before the first bar or from the last bar's end on are ignored.
+pub(crate) fn benchmark_over(
+    config: &BacktestConfig,
+    bars: &[Candle],
+    funding: &[(Millis, f64)],
+    strategy_series: &EquitySeries,
+    strategy_report: &MetricsReport,
+) -> Benchmark {
+    let funding = sorted_funding(funding);
+    let ranges = funding_ranges(config.timeframe, bars, &funding);
+    benchmark(
+        config,
+        bars,
+        &funding,
+        &ranges,
+        strategy_series,
+        strategy_report,
+    )
+}
+
 /// Buys at the first bar's open with all starting cash (taker fee, the run's slippage) and holds
 /// to the last close, paying funding on a perpetual like the session does: funding due at a bar's
 /// open or in the gap before it on the position held going into the bar, at the open price, so
@@ -315,13 +341,7 @@ fn benchmark(
         (Some(s), Some(b)) => Some(s - b),
         _ => None,
     };
-    let correlation = match (
-        metrics::per_bar_returns(&strategy_series.values),
-        metrics::per_bar_returns(&series.values),
-    ) {
-        (Some(s), Some(b)) => metrics::correlation(&s, &b),
-        _ => None,
-    };
+    let correlation = aligned_correlation(strategy_series, &series);
     Benchmark {
         qty: fills.first().map_or(0.0, |f| f.qty),
         entry_price: price,
@@ -330,6 +350,27 @@ fn benchmark(
         excess_return,
         correlation,
     }
+}
+
+/// The correlation of the strategy's per-bar returns with the benchmark's, with the benchmark's
+/// equity read at the strategy series' times. Every strategy time must be one of the benchmark's
+/// (both are the first bar's open, then bar closes, and the benchmark holds through every bar);
+/// `None` otherwise. With equal times this is the plain correlation of the two return series.
+fn aligned_correlation(strategy: &EquitySeries, bench: &EquitySeries) -> Option<f64> {
+    let mut sampled = Vec::with_capacity(strategy.times.len());
+    let mut j = 0;
+    for &t in &strategy.times {
+        while j < bench.times.len() && bench.times[j] < t {
+            j += 1;
+        }
+        if bench.times.get(j) != Some(&t) {
+            return None;
+        }
+        sampled.push(bench.values[j]);
+    }
+    let s = metrics::per_bar_returns(&strategy.values)?;
+    let b = metrics::per_bar_returns(&sampled)?;
+    metrics::correlation(&s, &b)
 }
 
 /// SHA-256, as lowercase hex, over the bars and funding in a fixed byte form: the bar count as a

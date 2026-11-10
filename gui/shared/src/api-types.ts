@@ -201,7 +201,8 @@ equity: Array<EquityPoint>,
 orders: Array<Order>, fills: Array<Fill>, trades: Array<Trade>, metrics: MetricsReport, benchmark: Benchmark, };
 
 /**
- * Buy and hold of the same instrument over the same bars.
+ * Buy and hold of the same instrument over the same bars: a backtest's traded bars, or a
+ * walk-forward's stitched span (see [`crate::WalkForwardResult`]).
  */
 export type Benchmark = { 
 /**
@@ -218,7 +219,10 @@ entry_price: number, equity: Array<EquityPoint>, metrics: MetricsReport,
  */
 excess_return: number | null, 
 /**
- * Pearson correlation of the strategy's per-bar returns with the benchmark's.
+ * Pearson correlation of the strategy's per-bar returns with the benchmark's over the same
+ * intervals: the benchmark's equity is read at each time of the strategy's equity series.
+ * In a backtest the two have the same bars; in a walk-forward, across a gap between test
+ * windows, the benchmark's return spans the gap like the stitched curve's does.
  */
 correlation: number | null, };
 
@@ -327,11 +331,12 @@ export type MetricsReport = { start_equity: number, end_equity: number,
  */
 total_return: number | null, 
 /**
- * See [`cagr`].
+ * See [`cagr`]. `None` for a run shorter than [`MIN_CAGR_DAYS`].
  */
 cagr: number | null, 
 /**
- * Annualised volatility of daily returns; see [`volatility`] and [`daily_equity`].
+ * Annualised volatility of daily returns; see [`volatility`] and [`daily_equity`]. `None`
+ * with fewer than [`MIN_DAILY_RETURNS`] daily returns, as are Sharpe and Sortino.
  */
 volatility: number | null, 
 /**
@@ -351,7 +356,7 @@ max_drawdown: number | null,
  */
 max_drawdown_duration_ms: number | null, max_drawdown_duration_bars: number | null, 
 /**
- * See [`calmar`].
+ * See [`calmar`]. `None` whenever CAGR is, so for a run shorter than [`MIN_CAGR_DAYS`].
  */
 calmar: number | null, 
 /**
@@ -410,6 +415,11 @@ export type SweepMode = "grid" | { "random": { samples: number, seed: number, } 
 
 /**
  * A metrics report field a sweep can rank by.
+ *
+ * `Sharpe` and `Sortino` are undefined on a range with fewer than
+ * [`metrics::MIN_DAILY_RETURNS`] daily returns, and `Cagr` and `Calmar` on a range shorter than
+ * [`metrics::MIN_CAGR_DAYS`] days; a run whose objective is undefined does not qualify (see
+ * [`SweepRow::qualified`]). In a walk-forward that applies to each train window's length.
  */
 export type Metric = "total_return" | "cagr" | "sharpe" | "sortino" | "calmar" | "profit_factor" | "win_rate" | "max_drawdown";
 
@@ -432,7 +442,9 @@ base: BacktestConfig,
  */
 axes: Array<ParamAxis>, mode: SweepMode, objective: Objective, 
 /**
- * Runs with fewer closed trades than this rank after every run that has enough.
+ * Runs with fewer closed trades than this rank after every run that has enough. Defaults to
+ * 1 when left out, so a parameter set that never trades (no drawdown, no losses) cannot top
+ * a ranking by drawdown; set 0 to rank such sets too.
  */
 min_trades: number, };
 
@@ -459,8 +471,9 @@ index: number,
 params: Params, 
 /**
  * Whether the run ranks by its objective: it ran, made at least `min_trades` closed trades
- * and its objective is defined. Other runs rank after all qualified ones: first those that
- * ran, then those the strategy refused, each in grid order.
+ * and its objective is defined (see [`Metric`] for when it is not). Other runs rank after
+ * all qualified ones: first those that ran, then those the strategy refused, each in grid
+ * order.
  */
 qualified: boolean, 
 /**
@@ -531,6 +544,12 @@ out_of_sample: BacktestResult,
  * cumulative return grows with it. `None` if either value is undefined or the in-sample
  * value is zero. For a maximised metric below 1 is worse out of sample; for a minimised one
  * above 1 is worse. Not meaningful when the in-sample value is negative.
+ *
+ * With `TotalReturn`, `Cagr` or `Calmar` it is therefore `None` when either segment is
+ * shorter than [`metrics::MIN_CAGR_DAYS`] days, and with `Sharpe` or `Sortino` when either
+ * has fewer than [`metrics::MIN_DAILY_RETURNS`] daily returns. It does not fall back to the
+ * ratio of total returns, which would compare segments of different lengths; compare the
+ * two runs' metrics directly then.
  */
 degradation: number | null, };
 
@@ -539,11 +558,18 @@ export type WindowMode = "rolling" | "anchored";
 /**
  * Walk-forward windows, in bars of the base range.
  *
- * Window k tests bars `train + k * step .. train + k * step + test`. Its train window is the
- * `train` bars before that (rolling) or every bar before it (anchored), so a test segment never
- * overlaps its own train window. `step` must be at least `test`, so test segments never overlap
- * each other; with `step == test` they are contiguous. Trailing bars that do not fill a whole
- * test segment are not tested.
+ * The windows are laid back from the end of the range, so the most recent bars are always
+ * tested: the last test segment ends on the last bar, and each earlier one starts `step` bars
+ * before the next. There are as many windows as fit with a whole train window before the first
+ * test segment. A window's train window is the `train` bars before its test segment (rolling)
+ * or every bar before it (anchored), so a test segment never overlaps its own train window.
+ * `step` must be at least `test`, so test segments never overlap each other; with
+ * `step == test` they are contiguous, and with a longer step the untested bars sit before each
+ * test segment.
+ *
+ * The leftover bars at the start, fewer than `step`, are never tested. In rolling mode the first
+ * train sweep is warmed up on them (as many as the train length); in anchored mode every train
+ * window starts at the first bar, so they are part of each one's training data.
  */
 export type WindowSpec = { train_bars: number, test_bars: number, step_bars: number, mode: WindowMode, };
 
@@ -592,12 +618,15 @@ out_of_sample: BacktestResult, };
  * Train sweeps close out the same way, so a window's in-sample and out-of-sample trade counts
  * (and `min_trades`) count a position held at the end alike. A rolling window's train sweep is
  * warmed up on the bars just before it, as many as the window's train length (fewer near the
- * start of the range), the same warm-up its test run gets; the first window's, and every
- * anchored window's, starts cold because no bars come before it.
+ * start of the range), the same warm-up its test run gets; the first window's uses the leftover
+ * bars before it (see [`WindowSpec`]) and starts cold if there are none. Every anchored window's
+ * starts cold, because its train window begins at the first bar.
  *
  * The stitched metrics are computed like a single backtest's (see [`MetricsReport`]): the
  * stitched Sharpe, Sortino and volatility come from the stitched curve's daily UTC returns, not
- * from its per-bar returns, so they are comparable with a backtest's on any timeframe.
+ * from its per-bar returns, so they are comparable with a backtest's on any timeframe. The floors
+ * on annualised metrics apply to the stitched curve as a whole, so it can have a Sharpe ratio or
+ * a CAGR when no single test window is long enough for one.
  */
 export type WalkForwardResult = { spec: WalkForwardSpec, engine_version: string, 
 /**
@@ -612,6 +641,14 @@ equity: Array<EquityPoint>,
  * Metrics of the stitched curve, its trades and its fills.
  */
 metrics: MetricsReport, 
+/**
+ * Buy and hold over the stitched span: bought at the first test bar's open with the starting
+ * cash and held to the last test bar's close, through any bars between test windows, with
+ * the fill, fee and funding rules of a backtest's benchmark. Its excess return is the
+ * stitched total return minus its own. `None` only in a result saved before walk-forwards
+ * had a benchmark.
+ */
+benchmark: Benchmark | null, 
 /**
  * Every test segment's trades in time order, with quantities, P&L, fees and funding scaled
  * by the same factor as the segment's equity, so they add up to the stitched equity's
