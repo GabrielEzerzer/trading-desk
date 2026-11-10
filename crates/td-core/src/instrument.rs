@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::{CoreError, OrderRequest, OrderType};
 
 /// An exchange the desk reads data from and simulates orders against.
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Venue {
@@ -21,6 +22,7 @@ impl fmt::Display for Venue {
     }
 }
 
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum InstrumentKind {
@@ -40,6 +42,7 @@ impl fmt::Display for InstrumentKind {
 
 /// Identifies an instrument across venues. The same symbol can exist as spot and as a perpetual on
 /// one venue, so the kind is part of the key.
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct InstrumentId {
     pub venue: Venue,
@@ -56,6 +59,7 @@ impl fmt::Display for InstrumentId {
 }
 
 /// Trading fees as fractions of notional: 0.001 means 0.1%.
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct FeeSchedule {
     pub maker: f64,
@@ -72,6 +76,7 @@ pub enum Rounding {
 }
 
 /// A tradable instrument with the venue's trading rules.
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Instrument {
     pub id: InstrumentId,
