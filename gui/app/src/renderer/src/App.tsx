@@ -1,17 +1,15 @@
+import * as Tooltip from '@radix-ui/react-tooltip'
 import { useEffect, useState } from 'react'
-import { EngineStatusIndicator } from './EngineStatus'
-import { StrategyLab } from './sections/StrategyLab'
+import { EngineDot } from './EngineDot'
+import { EngineState } from './EngineState'
+import { useEngineStatus } from './engine'
+import { StrategyLab } from './lab/StrategyLab'
+import { SECTIONS, type Section, SectionToggle } from './SectionToggle'
 import { Trading } from './sections/Trading'
-
-type Section = 'lab' | 'trading'
-
-const SECTIONS: readonly { id: Section; label: string; digit: string }[] = [
-  { id: 'lab', label: 'Strategy Lab', digit: '1' },
-  { id: 'trading', label: 'Trading', digit: '2' },
-]
 
 export function App() {
   const [section, setSection] = useState<Section>('lab')
+  const status = useEngineStatus()
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
@@ -26,26 +24,26 @@ export function App() {
     return () => window.removeEventListener('keydown', onKey)
   }, [])
 
+  const label = SECTIONS.find((s) => s.id === section)?.label
+
   return (
-    <div className="app">
-      <header className="titlebar">
-        <div className="toggle" role="group" aria-label="Section">
-          {SECTIONS.map((s) => (
-            <button
-              key={s.id}
-              type="button"
-              aria-pressed={section === s.id}
-              aria-keyshortcuts={`Control+${s.digit}`}
-              title={`${s.label} (Ctrl+${s.digit})`}
-              onClick={() => setSection(s.id)}
-            >
-              {s.label}
-            </button>
-          ))}
-        </div>
-        <EngineStatusIndicator />
-      </header>
-      <main className="content">{section === 'lab' ? <StrategyLab /> : <Trading />}</main>
-    </div>
+    <Tooltip.Provider delayDuration={300}>
+      <div className="app">
+        <header className="titlebar">
+          <SectionToggle value={section} onChange={setSection} />
+          <EngineDot status={status} />
+        </header>
+        <main className="sheet" aria-label={label}>
+          {/* Both sections stay mounted so a run keeps going while Trading is open. A hidden
+              section's fade restarts when it is shown again: the switch is one 180 ms fade. */}
+          <div className="sheet-content" hidden={section !== 'lab'}>
+            {status.state === 'running' ? <StrategyLab /> : <EngineState status={status} />}
+          </div>
+          <div className="sheet-content" hidden={section !== 'trading'}>
+            <Trading />
+          </div>
+        </main>
+      </div>
+    </Tooltip.Provider>
   )
 }

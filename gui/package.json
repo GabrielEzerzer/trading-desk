@@ -7,10 +7,12 @@
     "dev": "cargo build -p td-server --manifest-path ../Cargo.toml && pnpm --filter @td/app dev",
     "build": "pnpm --filter @td/app build",
     "typecheck": "pnpm -r typecheck",
-    "test": "vitest run"
+    "test": "vitest run",
+    "shots": "pnpm --filter @td/app build && node app/shots/shots.mjs"
   },
   "devDependencies": {
     "@types/node": "24.19.2",
+    "playwright": "1.65.0",
     "typescript": "7.0.2",
     "vitest": "5.0.5"
   }
