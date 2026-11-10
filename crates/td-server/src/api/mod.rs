@@ -7,7 +7,9 @@
 //! - `GET /instruments?venue=&kind=`: the instruments a venue lists, cached per server run.
 //! - `POST /data/download` `{instrument, from, to}`: starts a download job, answers `{job_id}`.
 //!   `from` may not be before 2017-01-01 UTC ([`data::EARLIEST_FROM`]); an instrument that already
-//!   has an unfinished download is a 409 `conflict`.
+//!   has an unfinished download in this server is a 409 `conflict` (a duplicate from another
+//!   server on the same data folder is safe, since the store locks across processes, just
+//!   redundant).
 //! - `GET /data/coverage?instrument=venue:symbol:kind`: which months and minutes the store holds.
 //! - `GET /strategies`: the registered strategies and their parameter specs.
 //! - `GET /jobs`, `GET /jobs/{id}`, `POST /jobs/{id}/cancel`: background jobs (see [`jobs`]).
