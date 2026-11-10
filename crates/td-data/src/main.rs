@@ -139,7 +139,11 @@ fn run(cli: Cli) -> Result<(), DataError> {
             to,
         } => {
             let id = instrument.id();
-            let (from, to) = (parse_date(&from)?, parse_date(&to)?);
+            let (from_ms, to_ms) = (parse_date(&from)?, parse_date(&to)?);
+            if from_ms >= to_ms {
+                return Err(DataError::EmptyRange { from, to });
+            }
+            let (from, to) = (from_ms, to_ms);
             let store = Store::open_default()?;
             let http = Http::new()?;
             eprintln!("store: {}", store.root().display());

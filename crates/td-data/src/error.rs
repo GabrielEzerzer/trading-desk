@@ -72,6 +72,9 @@ pub enum DataError {
     #[error("{0:?} is not a date in the form YYYY-MM-DD")]
     InvalidDate(String),
 
+    #[error("the range {from} to {to} is empty: --to must be after --from")]
+    EmptyRange { from: String, to: String },
+
     #[error("no data directory: set TD_DATA_DIR")]
     NoDataDir,
 }
