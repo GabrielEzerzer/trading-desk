@@ -1,7 +1,7 @@
 use std::io;
 use std::path::PathBuf;
 
-use td_core::CoreError;
+use td_core::{CoreError, InstrumentKind, Venue};
 
 /// Errors from downloading, parsing and storing market data.
 #[derive(Debug, thiserror::Error)]
@@ -68,6 +68,15 @@ pub enum DataError {
 
     #[error("{0} is not a perpetual, so it has no funding")]
     NotPerpetual(String),
+
+    #[error("{venue} does not list {kind} instruments")]
+    KindNotListed { venue: Venue, kind: InstrumentKind },
+
+    #[error("{0} publishes no funding rates")]
+    NoFunding(Venue),
+
+    #[error("{0} has no live stream")]
+    NoLiveStream(Venue),
 
     #[error("{0:?} is not a date in the form YYYY-MM-DD")]
     InvalidDate(String),

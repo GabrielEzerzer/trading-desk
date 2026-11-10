@@ -1,10 +1,10 @@
 //! Parsing the venues' responses and archives, from recorded fixtures.
 
 use td_core::{Candle, FeeSchedule, Instrument, InstrumentId, InstrumentKind, Venue};
-use td_data::instruments::{
-    BINANCE_SPOT_FEES, BINANCE_USDM_FEES, BYBIT_LINEAR_FEES, BYBIT_SPOT_FEES, parse_binance_spot,
-    parse_binance_usdm, parse_bybit_instruments,
+use td_data::binance::{
+    BINANCE_SPOT_FEES, BINANCE_USDM_FEES, parse_binance_spot, parse_binance_usdm,
 };
+use td_data::bybit::{BYBIT_LINEAR_FEES, BYBIT_SPOT_FEES, parse_bybit_instruments};
 use td_data::{DataError, binance, bybit, validate_instrument};
 
 fn fixture(name: &str) -> Vec<u8> {
