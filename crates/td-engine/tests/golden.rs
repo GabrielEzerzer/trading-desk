@@ -468,6 +468,18 @@ fn a_daily_bar_charges_funding_at_its_open_and_inside_it_on_different_positions(
     // Cash 10000 - 0.2 - 0.098 - 0.132 = 9999.57, plus 2 * (102 - 99).
     approx(p.cash(), 9999.57);
     approx(e[2], 10_005.57);
+    // The session records that split per bar, for the trade list.
+    let split: Vec<(f64, f64)> = s
+        .bar_funding()
+        .iter()
+        .map(|f| (f.at_open, f.in_bar))
+        .collect();
+    assert_eq!(split.len(), 3);
+    assert_eq!(split[0], (0.0, 0.0));
+    assert_eq!(split[1].0, 0.0);
+    approx(split[1].1, 0.02);
+    approx(split[2].0, 0.01);
+    approx(split[2].1, 0.0408 + 0.0612);
 }
 
 #[test]

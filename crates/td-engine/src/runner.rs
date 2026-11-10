@@ -124,31 +124,16 @@ pub fn run(
     };
     let mut session = Session::new(strategy, config.instrument.clone(), tf, session_config)?;
     let mut positions = Vec::with_capacity(bars.len());
-    let mut bar_funding = Vec::with_capacity(bars.len());
     let mut used_funding = Vec::new();
     for (bar, range) in bars.iter().zip(&ranges) {
         let events = &funding[range.clone()];
-        let held = session.portfolio().position();
-        let before = session.portfolio().funding_paid();
         session.on_bar(*bar, events)?;
-        let total = session.portfolio().funding_paid() - before;
-        // The session charges funding due at the open on the position held going into the bar,
-        // at the open price, the same way Portfolio::charge_funding does.
-        let at_open: f64 = events
-            .iter()
-            .filter(|&&(time, _)| time == bar.open_time)
-            .map(|&(_, rate)| held * bar.open * rate)
-            .sum();
-        bar_funding.push(BarFunding {
-            at_open,
-            in_bar: total - at_open,
-        });
         positions.push(session.portfolio().position());
         used_funding.extend_from_slice(events);
     }
 
     let fills = session.fills().to_vec();
-    let trades = build_trades(&fills, &bars, &bar_funding);
+    let trades = build_trades(&fills, &bars, session.bar_funding());
     let series = EquitySeries::new(config.starting_cash, session.equity(), tf);
     let report = metrics::report(
         &series,

@@ -4,8 +4,8 @@ use serde::{Deserialize, Serialize};
 use td_core::{Candle, FeeSchedule, Fill, Instrument, InstrumentKind, Millis, Timeframe};
 
 use crate::{
-    Broker, BrokerEvent, CandleFillModel, Context, EngineError, Order, OrderStatus, Portfolio,
-    SimBroker, Strategy,
+    BarFunding, Broker, BrokerEvent, CandleFillModel, Context, EngineError, Order, OrderStatus,
+    Portfolio, SimBroker, Strategy,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
@@ -41,6 +41,7 @@ pub struct Session {
     orders: Vec<Order>,
     fills: Vec<Fill>,
     equity: Vec<EquityPoint>,
+    bar_funding: Vec<BarFunding>,
 }
 
 impl Session {
@@ -81,6 +82,7 @@ impl Session {
             orders: Vec::new(),
             fills: Vec::new(),
             equity: Vec::new(),
+            bar_funding: Vec::new(),
         })
     }
 
@@ -99,9 +101,10 @@ impl Session {
 
         // Funding due at the open is owed by the position held going into the bar, before this
         // bar's fills.
+        let mut charged = BarFunding::default();
         for &(time, rate) in funding {
             if time == bar.open_time {
-                self.portfolio.charge_funding(rate, bar.open);
+                charged.at_open += self.portfolio.charge_funding(rate, bar.open);
             }
         }
         let first_new_fill = self.fills.len();
@@ -128,9 +131,10 @@ impl Session {
         // fill model that times each fill.
         for &(time, rate) in funding {
             if time > bar.open_time {
-                self.portfolio.charge_funding(rate, bar.close);
+                charged.in_bar += self.portfolio.charge_funding(rate, bar.close);
             }
         }
+        self.bar_funding.push(charged);
         self.portfolio.mark(bar.close);
         self.equity.push(EquityPoint {
             time: bar.open_time,
@@ -149,7 +153,7 @@ impl Session {
     /// history, and the strategy is called on it the same way, with `on_start` on the first bar fed
     /// whether that is a warm-up bar or a live one. But trading is disabled: every order the
     /// strategy submits is rejected (see [`Context::is_warming_up`]), nothing fills, no funding is
-    /// charged, no equity point is recorded and the portfolio does not change. It is an error once
+    /// charged, no equity point or bar funding is recorded and the portfolio does not change. It is an error once
     /// a bar has been fed with `on_bar`.
     pub fn warm_up(&mut self, bar: Candle, funding: &[(Millis, f64)]) -> Result<(), EngineError> {
         // Every live bar records an equity point.
@@ -246,6 +250,13 @@ impl Session {
     /// bars record none, so the series starts at the first live bar.
     pub fn equity(&self) -> &[EquityPoint] {
         &self.equity
+    }
+
+    /// The funding charged on each live bar, split into the part charged at the open and the
+    /// part charged after the bar's fills; one entry per bar fed with [`Session::on_bar`], like
+    /// [`Session::equity`].
+    pub fn bar_funding(&self) -> &[BarFunding] {
+        &self.bar_funding
     }
 
     pub fn fills(&self) -> &[Fill] {
