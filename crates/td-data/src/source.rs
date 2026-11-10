@@ -190,3 +190,74 @@ pub(crate) mod fake {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+    use crate::binance::{BINANCE_SPOT_FEES, BINANCE_USDM_FEES};
+    use crate::bybit::{BYBIT_LINEAR_FEES, BYBIT_SPOT_FEES};
+
+    fn btc(venue: Venue, kind: InstrumentKind) -> InstrumentId {
+        InstrumentId {
+            venue,
+            symbol: "BTCUSDT".into(),
+            kind,
+        }
+    }
+
+    /// The streams, greetings and fees each venue had before its code moved behind the trait.
+    #[test]
+    fn each_venue_is_served_by_its_own_source_with_its_streams_and_fees() {
+        use InstrumentKind::{Perpetual, Spot};
+        let cases = [
+            (
+                Venue::Binance,
+                Spot,
+                "wss://stream.binance.com:9443/ws/btcusdt@kline_1m",
+                BINANCE_SPOT_FEES,
+            ),
+            (
+                Venue::Binance,
+                Perpetual,
+                "wss://fstream.binance.com/market/ws/btcusdt@kline_1m",
+                BINANCE_USDM_FEES,
+            ),
+            (
+                Venue::Bybit,
+                Spot,
+                "wss://stream.bybit.com/v5/public/spot",
+                BYBIT_SPOT_FEES,
+            ),
+            (
+                Venue::Bybit,
+                Perpetual,
+                "wss://stream.bybit.com/v5/public/linear",
+                BYBIT_LINEAR_FEES,
+            ),
+        ];
+        for (venue, kind, url, fees) in cases {
+            let source = source(venue);
+            assert_eq!(source.venue(), venue);
+            assert_eq!(source.kinds(), [Spot, Perpetual]);
+            assert_eq!(source.default_fees(kind), fees, "{venue} {kind}");
+            let live = source.live().expect("a live stream");
+            let id = btc(venue, kind);
+            assert_eq!(live.url(&id), url);
+            let greeting = live.greeting(&id);
+            match venue {
+                Venue::Binance => {
+                    assert_eq!(greeting.subscribe, None);
+                    assert_eq!(greeting.heartbeat, None);
+                }
+                Venue::Bybit => {
+                    let subscribe = r#"{"op":"subscribe","args":["kline.1.BTCUSDT"]}"#;
+                    assert_eq!(greeting.subscribe.as_deref(), Some(subscribe));
+                    let ping = (Duration::from_secs(20), r#"{"op":"ping"}"#.to_string());
+                    assert_eq!(greeting.heartbeat, Some(ping));
+                }
+            }
+        }
+    }
+}
