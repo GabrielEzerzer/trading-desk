@@ -24,7 +24,7 @@ import type {
   Trade,
 } from '@td/shared'
 import { TIMEFRAME_MS, addCandle } from '../src/renderer/src/trading/candles'
-import { onLot } from '../src/renderer/src/trading/order'
+import { onLot, onTick } from '../src/renderer/src/trading/order'
 import { sameInstrument } from '../src/renderer/src/trading/session'
 import { MANUAL, type ManualOrder, type SessionFeed, type TradingSource } from '../src/renderer/src/trading/source'
 import labFixtures from './lab.json'
@@ -600,6 +600,10 @@ export function createMockTradingSource({ liveMs = 1500, listMs = 400 }: MockTra
       const session = sessionOf(sessionId)
       const lot = session.instrument.lot_size
       if (!onLot(order.qty, lot)) throw new Error(`the size must be a multiple of ${lot}`)
+      const tick = session.instrument.tick_size
+      if (order.order_type.type === 'limit' && !onTick(order.order_type.price, tick)) {
+        throw new Error(`the limit price must be a multiple of ${tick}`)
+      }
       session.submit(order)
     },
   }
