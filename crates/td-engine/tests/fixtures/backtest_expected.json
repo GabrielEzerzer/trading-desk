@@ -1974,6 +1974,8 @@
         "client_tag": null
       },
       "submitted_at": 1704186000000,
+      "decision_close": 97.86056464811784,
+      "attached_stop": null,
       "status": {
         "status": "filled"
       }
@@ -1996,6 +1998,8 @@
         "client_tag": null
       },
       "submitted_at": 1704261600000,
+      "decision_close": 96.410294599018,
+      "attached_stop": null,
       "status": {
         "status": "filled"
       }
@@ -2018,6 +2022,8 @@
         "client_tag": null
       },
       "submitted_at": 1704279600000,
+      "decision_close": 95.24467812329515,
+      "attached_stop": null,
       "status": {
         "status": "filled"
       }
@@ -2040,6 +2046,8 @@
         "client_tag": null
       },
       "submitted_at": 1704286800000,
+      "decision_close": 98.95466721222041,
+      "attached_stop": null,
       "status": {
         "status": "filled"
       }
@@ -2062,6 +2070,8 @@
         "client_tag": null
       },
       "submitted_at": 1704459600000,
+      "decision_close": 102.58559465357338,
+      "attached_stop": null,
       "status": {
         "status": "filled"
       }
@@ -2084,6 +2094,8 @@
         "client_tag": null
       },
       "submitted_at": 1704625200000,
+      "decision_close": 101.3241543917076,
+      "attached_stop": null,
       "status": {
         "status": "filled"
       }
@@ -2106,6 +2118,8 @@
         "client_tag": null
       },
       "submitted_at": 1704790800000,
+      "decision_close": 103.51928805237314,
+      "attached_stop": null,
       "status": {
         "status": "filled"
       }
@@ -2128,6 +2142,8 @@
         "client_tag": null
       },
       "submitted_at": 1704960000000,
+      "decision_close": 100.60787779596289,
+      "attached_stop": null,
       "status": {
         "status": "filled"
       }
@@ -2150,6 +2166,8 @@
         "client_tag": null
       },
       "submitted_at": 1705125600000,
+      "decision_close": 104.6683960720131,
+      "attached_stop": null,
       "status": {
         "status": "filled"
       }
@@ -2172,6 +2190,8 @@
         "client_tag": null
       },
       "submitted_at": 1705147200000,
+      "decision_close": 107.26759410801962,
+      "attached_stop": null,
       "status": {
         "status": "filled"
       }
@@ -2194,6 +2214,8 @@
         "client_tag": null
       },
       "submitted_at": 1705158000000,
+      "decision_close": 103.39665302782328,
+      "attached_stop": null,
       "status": {
         "status": "filled"
       }
@@ -2216,6 +2238,8 @@
         "client_tag": null
       },
       "submitted_at": 1705298400000,
+      "decision_close": 99.28505728314242,
+      "attached_stop": null,
       "status": {
         "status": "filled"
       }
@@ -2238,6 +2262,8 @@
         "client_tag": null
       },
       "submitted_at": 1705305600000,
+      "decision_close": 98.69521003818879,
+      "attached_stop": null,
       "status": {
         "status": "filled"
       }
@@ -2260,6 +2286,8 @@
         "client_tag": null
       },
       "submitted_at": 1705320000000,
+      "decision_close": 102.12959083469723,
+      "attached_stop": null,
       "status": {
         "status": "filled"
       }
@@ -2282,6 +2310,8 @@
         "client_tag": null
       },
       "submitted_at": 1705492800000,
+      "decision_close": 104.74216039279871,
+      "attached_stop": null,
       "status": {
         "status": "filled"
       }
@@ -2304,6 +2334,8 @@
         "client_tag": null
       },
       "submitted_at": 1705654800000,
+      "decision_close": 103.05259410801962,
+      "attached_stop": null,
       "status": {
         "status": "filled"
       }
@@ -2326,6 +2358,8 @@
         "client_tag": null
       },
       "submitted_at": 1705824000000,
+      "decision_close": 106.90400436442992,
+      "attached_stop": null,
       "status": {
         "status": "filled"
       }

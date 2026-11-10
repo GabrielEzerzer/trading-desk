@@ -11,14 +11,27 @@ pub enum FillCheck {
     Fill {
         price: f64,
         liquidity: Liquidity,
+        /// The market price the order met, before slippage and before capping at a limit. An
+        /// attached stop is checked against the rest of the bar from this price.
+        market: f64,
     },
 }
 
 /// Decides whether and at what price an order fills on a bar. The broker calls it only for bars
-/// after the one the order was decided on, and handles fees, ordering and order state.
+/// after the one the order was decided on, and handles fees, ordering and order state. For an
+/// attached stop it also calls it on its entry's fill bar, with the bar's open replaced by the
+/// entry's market price.
 pub trait FillModel: Send {
-    /// `triggered` says whether a stop-limit was triggered on an earlier bar.
-    fn check(&self, order: &Order, triggered: bool, bar: &Candle, inst: &Instrument) -> FillCheck;
+    /// `first` says whether this is the first bar the order can fill on. `triggered` says whether
+    /// a stop-limit was triggered on an earlier bar.
+    fn check(
+        &self,
+        order: &Order,
+        first: bool,
+        triggered: bool,
+        bar: &Candle,
+        inst: &Instrument,
+    ) -> FillCheck;
 }
 
 /// Fills orders from OHLC bars alone.
@@ -26,6 +39,10 @@ pub trait FillModel: Send {
 /// - Market: the bar's open, moved against the order by `slippage_bps`. Taker.
 /// - Limit buy: fills if the low reaches the limit, at the limit, or at the open when the bar
 ///   opens below it. Sells mirror this. Maker.
+/// - Limit already marketable at the close it was decided on (a buy at or above that close, a
+///   sell at or below it): on its first bar it takes liquidity like a market order, at the open
+///   plus slippage but never past its limit, as a taker. If that bar opens past the limit, it
+///   rests as an ordinary limit instead.
 /// - Stop buy: triggers if the high reaches the trigger and fills at `max(open, trigger)` plus
 ///   slippage. Sells mirror this. Taker.
 /// - Stop-limit: triggers like a stop. If the limit is marketable at the trigger point it fills
@@ -37,8 +54,10 @@ pub trait FillModel: Send {
 ///
 /// Slipped prices are rounded to the tick against the order (buys up, sells down).
 ///
-/// shortcut: a limit order that is already marketable when it arrives is charged the maker fee,
-/// where a venue would charge taker; upgrade with a trade-level fill model.
+/// shortcut: a limit that was not marketable at the decision close but that the next bar opens
+/// through fills at the open with no slippage, and as a maker unless it is IOC. A venue would fill
+/// a resting order at its limit, or charge the taker fee if the order arrived after the gap.
+/// Upgrade with a trade-level fill model.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CandleFillModel {
     pub slippage_bps: f64,
@@ -57,7 +76,14 @@ impl CandleFillModel {
 }
 
 impl FillModel for CandleFillModel {
-    fn check(&self, order: &Order, triggered: bool, bar: &Candle, inst: &Instrument) -> FillCheck {
+    fn check(
+        &self,
+        order: &Order,
+        first: bool,
+        triggered: bool,
+        bar: &Candle,
+        inst: &Instrument,
+    ) -> FillCheck {
         let req = &order.request;
         let buy = req.side == Side::Buy;
         let ioc = req.tif == TimeInForce::Ioc;
@@ -83,9 +109,18 @@ impl FillModel for CandleFillModel {
                 FillCheck::Fill {
                     price: fill,
                     liquidity: resting,
+                    market: fill,
                 }
             } else {
                 FillCheck::NoFill
+            }
+        };
+        // Never trade past a limit: a buy pays at most it, a sell gets at least it.
+        let cap = |price: f64, limit: f64| {
+            if buy {
+                price.min(limit)
+            } else {
+                price.max(limit)
             }
         };
         let reaches = |trigger: f64| if buy { high >= trigger } else { low <= trigger };
@@ -100,11 +135,25 @@ impl FillModel for CandleFillModel {
             OrderType::Market => FillCheck::Fill {
                 price: self.slip(open, req.side, inst),
                 liquidity: Liquidity::Taker,
+                market: open,
             },
-            OrderType::Limit { price } => limit(price),
+            OrderType::Limit { price } => {
+                let marketable_at = |level: f64| if buy { price >= level } else { price <= level };
+                if first && marketable_at(order.decision_close) && marketable_at(open) {
+                    // Sent through the market, so it takes liquidity as soon as it arrives.
+                    FillCheck::Fill {
+                        price: cap(self.slip(open, req.side, inst), price),
+                        liquidity: Liquidity::Taker,
+                        market: open,
+                    }
+                } else {
+                    limit(price)
+                }
+            }
             OrderType::Stop { trigger } if reaches(trigger) => FillCheck::Fill {
                 price: self.slip(trigger_point(trigger), req.side, inst),
                 liquidity: Liquidity::Taker,
+                market: trigger_point(trigger),
             },
             OrderType::Stop { .. } => FillCheck::NoFill,
             OrderType::StopLimit { price, .. } if triggered => limit(price),
@@ -114,14 +163,10 @@ impl FillModel for CandleFillModel {
                 if !marketable {
                     return FillCheck::Triggered;
                 }
-                let slipped = self.slip(point, req.side, inst);
                 FillCheck::Fill {
-                    price: if buy {
-                        slipped.min(price)
-                    } else {
-                        slipped.max(price)
-                    },
+                    price: cap(self.slip(point, req.side, inst), price),
                     liquidity: Liquidity::Taker,
+                    market: point,
                 }
             }
             OrderType::StopLimit { .. } => FillCheck::NoFill,

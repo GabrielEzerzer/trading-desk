@@ -27,7 +27,7 @@ mod strategy;
 mod tester;
 mod trades;
 
-pub use broker::{Broker, BrokerEvent, Order, OrderStatus, SimBroker};
+pub use broker::{AttachedStop, Broker, BrokerEvent, Order, OrderStatus, SimBroker};
 pub use error::{EngineError, OrderRejected};
 pub use fill::{CandleFillModel, FillCheck, FillModel};
 pub use metrics::MetricsReport;

@@ -1,9 +1,10 @@
 use td_core::{
-    Candle, Fill, Instrument, InstrumentKind, OrderId, OrderRequest, OrderType, Rounding, Side,
-    Timeframe,
+    Candle, FeeSchedule, Fill, Instrument, InstrumentKind, OrderId, OrderRequest, OrderType,
+    Rounding, Side, Timeframe,
 };
 
-use crate::{Broker, Order, OrderRejected, OrderStatus, Portfolio};
+use crate::broker::ENTRY_CANCELLED;
+use crate::{AttachedStop, Broker, Order, OrderRejected, OrderStatus, Portfolio};
 
 /// A trading strategy. The same value runs in a backtest and in paper trading.
 ///
@@ -21,6 +22,8 @@ pub struct Context<'a> {
     pub(crate) bars: &'a [Candle],
     pub(crate) instrument: &'a Instrument,
     pub(crate) timeframe: Timeframe,
+    pub(crate) fees: FeeSchedule,
+    pub(crate) slippage_bps: f64,
     pub(crate) portfolio: &'a Portfolio,
     pub(crate) broker: &'a mut dyn Broker,
     pub(crate) orders: &'a mut Vec<Order>,
@@ -46,6 +49,16 @@ impl Context<'_> {
 
     pub fn timeframe(&self) -> Timeframe {
         self.timeframe
+    }
+
+    /// The fees fills are charged: the session's override, or else the instrument's own.
+    pub fn fees(&self) -> FeeSchedule {
+        self.fees
+    }
+
+    /// The slippage the session applies to market and stop fills, in basis points of price.
+    pub fn slippage_bps(&self) -> f64 {
+        self.slippage_bps
     }
 
     pub fn portfolio(&self) -> &Portfolio {
@@ -77,11 +90,46 @@ impl Context<'_> {
     /// Rounds the order to the instrument's lot and tick, validates it and sends it to the
     /// broker. Quantities round down; limit prices round in the order's favour-safe direction
     /// (buys down, sells up) so an order never trades worse than asked; triggers round to the
-    /// nearest tick. A rejected order is recorded with its reason and returned as an error.
+    /// nearest tick. On spot, a sell must fit in the holding less the open sells, and a buy must
+    /// fit in the cash together with the open buys: each buy is valued at its limit price, its
+    /// trigger, or this bar's close for a market order, plus the taker fee. A rejected order is
+    /// recorded with its reason and returned as an error.
     ///
     /// While warming up every order is refused with id 0 and nothing is recorded, so warm-up
     /// leaves no trace in the run's order list.
     pub fn submit(&mut self, request: OrderRequest) -> Result<OrderId, OrderRejected> {
+        self.send(request, None)
+    }
+
+    /// Submits an entry with a protective stop attached. When the entry fills, a reduce-only stop
+    /// on the other side, for the filled quantity, is placed at `stop_trigger` and checked against
+    /// the entry's own bar straight away, with the whole bar range counted as coming after the
+    /// fill. So the stop fills on that bar, at its trigger plus slippage, if the bar reaches it,
+    /// or at the open if the entry filled at an open that was already through it. A stop
+    /// submitted from `on_fill` instead could first fill on the next bar.
+    ///
+    /// The entry is checked as in [`Context::submit`]. The trigger rounds to the nearest tick and
+    /// must be below the entry's price for a buy and above it for a sell, where the entry is
+    /// valued at its limit price, its trigger, or this bar's close for a market order. A
+    /// reduce-only entry or a spot sell cannot have a stop attached.
+    ///
+    /// The stop is recorded under the entry's id plus one, as [`OrderStatus::Attached`] until the
+    /// entry fills; from then on it is an ordinary open order. Until then it cannot be cancelled
+    /// on its own, and cancelling the entry cancels it too.
+    pub fn submit_with_stop(
+        &mut self,
+        request: OrderRequest,
+        stop_trigger: f64,
+    ) -> Result<OrderId, OrderRejected> {
+        let trigger = self.instrument.round_price(stop_trigger, Rounding::Nearest);
+        self.send(request, Some(trigger))
+    }
+
+    fn send(
+        &mut self,
+        request: OrderRequest,
+        stop_trigger: Option<f64>,
+    ) -> Result<OrderId, OrderRejected> {
         if self.warming_up {
             return Err(OrderRejected {
                 id: OrderId(0),
@@ -89,8 +137,15 @@ impl Context<'_> {
             });
         }
         let id = OrderId(self.orders.len() as u64 + 1);
-        let submitted_at = self.bar().open_time;
-        let (request, check) = self.prepare(request);
+        let (submitted_at, decision_close) = (self.bar().open_time, self.bar().close);
+        let (request, mut check) = self.prepare(request);
+        let attached_stop = stop_trigger.map(|trigger| AttachedStop {
+            id: OrderId(id.0 + 1),
+            trigger,
+        });
+        if let (Ok(()), Some(stop)) = (&check, attached_stop) {
+            check = self.check_stop(&request, stop);
+        }
         let status = match &check {
             Ok(()) => OrderStatus::Open,
             Err(reason) => OrderStatus::Rejected(reason.clone()),
@@ -99,11 +154,24 @@ impl Context<'_> {
             id,
             request,
             submitted_at,
+            decision_close,
+            // A rejected entry places no stop, so none is recorded for it.
+            attached_stop: attached_stop.filter(|_| check.is_ok()),
             status,
         };
         self.orders.push(order.clone());
         match check {
             Ok(()) => {
+                if let Some(stop) = order.attached_stop {
+                    self.orders.push(Order {
+                        id: stop.id,
+                        request: stop.request(&order.request, order.request.qty),
+                        submitted_at,
+                        decision_close,
+                        attached_stop: None,
+                        status: OrderStatus::Attached,
+                    });
+                }
                 self.broker.submit(order);
                 Ok(id)
             }
@@ -111,15 +179,49 @@ impl Context<'_> {
         }
     }
 
-    /// Cancels an open order. Returns false if it is not open.
+    /// Cancels an open order. Returns false if it is not open. Cancelling an entry that has not
+    /// filled also cancels its attached stop.
     pub fn cancel(&mut self, id: OrderId) -> bool {
         if !self.broker.cancel(id) {
             return false;
         }
+        let mut attached = None;
         if let Some(order) = self.orders.iter_mut().find(|o| o.id == id) {
             order.status = OrderStatus::Cancelled("cancelled by the strategy".into());
+            attached = order.attached_stop;
+        }
+        if let Some(stop) = attached
+            && let Some(order) = self.orders.iter_mut().find(|o| o.id == stop.id)
+        {
+            order.status = OrderStatus::Cancelled(ENTRY_CANCELLED.into());
         }
         true
+    }
+
+    /// Checks a protective stop for `entry`, which has passed its own checks.
+    fn check_stop(&self, entry: &OrderRequest, stop: AttachedStop) -> Result<(), String> {
+        let inst = self.instrument;
+        if entry.reduce_only {
+            return Err("a reduce-only order cannot have a protective stop attached".into());
+        }
+        if inst.id.kind == InstrumentKind::Spot && entry.side == Side::Sell {
+            return Err("spot cannot attach a protective stop to a sell: it has no short".into());
+        }
+        let close = self.bar().close;
+        inst.validate_order(&stop.request(entry, entry.qty), close)
+            .map_err(|e| format!("protective stop: {e}"))?;
+        let price = reference_price(entry.order_type, close);
+        let (wrong_side, side) = match entry.side {
+            Side::Buy => (stop.trigger >= price, "below"),
+            Side::Sell => (stop.trigger <= price, "above"),
+        };
+        if wrong_side {
+            return Err(format!(
+                "a protective stop must be {side} its entry: stop at {}, entry at {price}",
+                stop.trigger
+            ));
+        }
+        Ok(())
     }
 
     fn prepare(&self, mut req: OrderRequest) -> (OrderRequest, Result<(), String>) {
@@ -162,6 +264,39 @@ impl Context<'_> {
                 return (req, Err(reason));
             }
         }
+        if inst.id.kind == InstrumentKind::Spot && req.side == Side::Buy {
+            // Open buys count against the cash too, so several buys cannot add up to more than it.
+            let close = self.bar().close;
+            let cost = |r: &OrderRequest| {
+                r.qty * reference_price(r.order_type, close) * (1.0 + self.fees.taker)
+            };
+            let pending: f64 = self
+                .open_orders()
+                .iter()
+                .filter(|o| o.request.side == Side::Buy)
+                .map(|o| cost(&o.request))
+                .sum();
+            let needed = cost(&req) + pending;
+            let cash = self.cash();
+            if needed > cash * (1.0 + 1e-9) {
+                let reason = format!(
+                    "spot cannot buy for more than its cash: {needed} needed with the taker fee \
+                     and open buys, {cash} available"
+                );
+                return (req, Err(reason));
+            }
+        }
         (req, Ok(()))
+    }
+}
+
+/// The price an order is valued at before it fills: its limit price, its trigger for a stop, or
+/// `last` for a market order. `Instrument::validate_order` values the minimum notional the same
+/// way.
+fn reference_price(order_type: OrderType, last: f64) -> f64 {
+    match order_type {
+        OrderType::Market => last,
+        OrderType::Limit { price } | OrderType::StopLimit { price, .. } => price,
+        OrderType::Stop { trigger } => trigger,
     }
 }

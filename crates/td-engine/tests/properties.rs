@@ -4,13 +4,14 @@
 //!   and position are rebuilt independently from the fills and funding.
 //! - No order fills on the bar it was submitted on, and every fill lands on a bar's open time.
 //! - Spot positions never go below zero.
+//! - An attached stop waits exactly while its entry is open, and fills only once its entry has.
 
 mod common;
 
 use common::*;
 use proptest::prelude::*;
 use td_core::{Candle, InstrumentKind, OrderType, Side, Timeframe};
-use td_engine::{Context, Session, Strategy as EngineStrategy};
+use td_engine::{Context, OrderStatus, Session, Strategy as EngineStrategy};
 
 #[derive(Debug, Clone)]
 struct Action {
@@ -21,6 +22,8 @@ struct Action {
     limit_offset: f64,
     ioc: bool,
     reduce_only: bool,
+    /// Distance of an attached stop from the entry's price, if the entry has one.
+    stop: Option<f64>,
 }
 
 struct Random {
@@ -48,7 +51,18 @@ impl EngineStrategy for Random {
                 r = ioc(r);
             }
             // Rejections are part of the test: they must leave the books consistent.
-            let _ = ctx.submit(r);
+            let _ = match a.stop {
+                Some(distance) => {
+                    let entry = match order_type {
+                        OrderType::Market => bar.close,
+                        OrderType::Limit { price } | OrderType::StopLimit { price, .. } => price,
+                        OrderType::Stop { trigger } => trigger,
+                    };
+                    let stop = entry - side.sign() * distance;
+                    ctx.submit_with_stop(r, stop)
+                }
+                None => ctx.submit(r),
+            };
         }
         // Now and then cancel the oldest open order.
         if index % 7 == 3
@@ -68,9 +82,10 @@ fn action() -> impl Strategy<Value = Action> {
         -1.0..1.0f64,
         prop::bool::weighted(0.2),
         prop::bool::weighted(0.2),
+        prop::option::weighted(0.3, 0.0..3.0f64),
     )
         .prop_map(
-            |(buy, milli, kind, offset, limit_offset, ioc, reduce_only)| Action {
+            |(buy, milli, kind, offset, limit_offset, ioc, reduce_only, stop)| Action {
                 buy,
                 qty: milli as f64 / 1000.0,
                 kind,
@@ -78,6 +93,7 @@ fn action() -> impl Strategy<Value = Action> {
                 limit_offset,
                 ioc,
                 reduce_only,
+                stop,
             },
         )
 }
@@ -172,6 +188,32 @@ fn check(kind: InstrumentKind, slippage: f64, specs: Vec<BarSpec>) -> Result<(),
             f.time
         );
         prop_assert!(bars.iter().any(|b| b.open_time == f.time));
+    }
+
+    let orders = session.orders();
+    for entry in orders {
+        let Some(stop) = entry.attached_stop else {
+            continue;
+        };
+        let child = &orders[stop.id.0 as usize - 1];
+        prop_assert_eq!(
+            entry.status == OrderStatus::Open,
+            child.status == OrderStatus::Attached,
+            "entry {} is {:?} and its stop {:?}",
+            entry.id.0,
+            &entry.status,
+            &child.status
+        );
+        prop_assert!(child.request.reduce_only && child.request.side != entry.request.side);
+        let entry_fill = fills.iter().find(|f| f.order_id == entry.id);
+        for f in fills.iter().filter(|f| f.order_id == stop.id) {
+            prop_assert!(
+                entry_fill.is_some_and(|e| e.time <= f.time),
+                "stop {} filled at {} before its entry",
+                stop.id.0,
+                f.time
+            );
+        }
     }
     Ok(())
 }

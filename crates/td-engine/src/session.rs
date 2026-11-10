@@ -33,6 +33,8 @@ pub struct Session {
     strategy: Box<dyn Strategy>,
     instrument: Instrument,
     timeframe: Timeframe,
+    fees: FeeSchedule,
+    slippage_bps: f64,
     broker: Box<dyn Broker>,
     portfolio: Portfolio,
     bars: Vec<Candle>,
@@ -72,6 +74,8 @@ impl Session {
             portfolio: Portfolio::new(instrument.id.kind, config.starting_cash),
             instrument,
             timeframe,
+            fees,
+            slippage_bps: config.slippage_bps,
             broker: Box::new(broker),
             bars: Vec::new(),
             orders: Vec::new(),
@@ -102,6 +106,10 @@ impl Session {
                 BrokerEvent::Cancelled { id, reason } => {
                     self.order_mut(id).status = OrderStatus::Cancelled(reason);
                 }
+                BrokerEvent::Placed(order) => {
+                    let id = order.id;
+                    *self.order_mut(id) = order;
+                }
             }
         }
         for &(_, rate) in funding {
@@ -118,6 +126,8 @@ impl Session {
             bars: &self.bars,
             instrument: &self.instrument,
             timeframe: self.timeframe,
+            fees: self.fees,
+            slippage_bps: self.slippage_bps,
             portfolio: &self.portfolio,
             broker: &mut *self.broker,
             orders: &mut self.orders,
@@ -153,6 +163,8 @@ impl Session {
             bars: &self.bars,
             instrument: &self.instrument,
             timeframe: self.timeframe,
+            fees: self.fees,
+            slippage_bps: self.slippage_bps,
             portfolio: &self.portfolio,
             broker: &mut *self.broker,
             orders: &mut self.orders,
