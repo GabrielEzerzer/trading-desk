@@ -165,7 +165,7 @@ pub fn parse_kline_csv(file: &str, text: &str) -> Result<Vec<Candle>, DataError>
         if fields.len() < 8 {
             return Err(DataError::parse(
                 what(),
-                format!("{} fields, not 12", fields.len()),
+                format!("{} fields, expected at least 8", fields.len()),
             ));
         }
         let float = |i: usize| {

@@ -208,6 +208,19 @@ fn archive_csv_rejects_bad_rows() {
     ] {
         assert!(binance::parse_kline_csv("bad", bad).is_err(), "{bad}");
     }
+    // Rows need the first 8 of the 12 fields, up to the quote volume.
+    let short = binance::parse_kline_csv("short", "1704067200000,1,2,0.5,1.5\n");
+    assert!(
+        matches!(&short, Err(DataError::Parse { reason, .. }) if reason == "5 fields, expected at least 8"),
+        "{short:?}"
+    );
+    let eight = "1704067200000,1,2,0.5,1.5,1,1704067259999,1\n";
+    assert_eq!(
+        binance::parse_kline_csv("eight", eight)
+            .map(|c| c.len())
+            .ok(),
+        Some(1)
+    );
 }
 
 #[test]
