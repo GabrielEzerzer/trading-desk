@@ -65,7 +65,12 @@ function usePriceTint(price: number | null): 'gain' | 'loss' | undefined {
   useEffect(() => {
     const before = previous.current
     previous.current = price
-    if (before === null || price === null || before === price) return
+    // A new instrument or timeframe starts with no price: drop the old tint with it.
+    if (before === null || price === null) {
+      setTint(undefined)
+      return
+    }
+    if (before === price) return
     setTint(price > before ? 'gain' : 'loss')
     const timer = setTimeout(() => setTint(undefined), 700)
     return () => clearTimeout(timer)
