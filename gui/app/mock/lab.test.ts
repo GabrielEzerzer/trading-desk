@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { overallProgress } from '../src/renderer/src/lab/progress'
 import { RunCancelled } from '../src/renderer/src/lab/source'
 import { createMockLabSource } from './lab'
 
@@ -18,12 +19,17 @@ describe('mock Lab source', () => {
   it('reports progress in order and finishes with a Trade verdict stamped now', async () => {
     const source = createMockLabSource({ stepMs: 100, now: () => 42 })
     const seen: number[] = []
-    const run = source.run('donchian_breakout', (p) => seen.push(p.progress))
+    const steps: number[] = []
+    const run = source.run('donchian_breakout', (p) => {
+      seen.push(overallProgress(p))
+      steps.push(p.step)
+      expect(p.steps).toBe(4)
+    })
     await vi.advanceTimersByTimeAsync(10_000)
     const verdict = await run.result
     expect(verdict.decision).toBe('trade')
     expect(verdict.finishedAt).toBe(42)
-    expect(seen.at(-1)).toBe(1)
+    expect(steps.at(-1)).toBe(4)
     expect(seen).toEqual([...seen].sort((a, b) => a - b))
   })
 
@@ -38,7 +44,7 @@ describe('mock Lab source', () => {
   it('stops reporting and rejects with RunCancelled when cancelled', async () => {
     const source = createMockLabSource({ stepMs: 100 })
     const seen: number[] = []
-    const run = source.run('donchian_breakout', (p) => seen.push(p.progress))
+    const run = source.run('donchian_breakout', (p) => seen.push(p.step))
     await vi.advanceTimersByTimeAsync(150)
     run.cancel()
     await expect(run.result).rejects.toBeInstanceOf(RunCancelled)

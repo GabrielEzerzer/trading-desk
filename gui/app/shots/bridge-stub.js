@@ -1,4 +1,5 @@
-// Test-only stand-in for the preload's `window.td`, injected by shots.mjs before the page loads.
+// Test-only stand-in for the preload's `window.td`, injected by shots.mjs and the UI gates (gui/e2e)
+// before the page loads.
 // It implements the TdBridge contract (gui/shared/src/bridge.ts) with a scripted engine status and
 // answers requests from the mock fixtures. Never part of the app bundle.
 //
@@ -8,7 +9,8 @@
 //
 // For Trading in engine mode it answers GET /instruments from the fixtures, GET /sessions and
 // GET /sessions/{id} from `config.session`, and on a `candles:` subscription emits a closed bar
-// every `config.candles.everyMs`, walking from `config.candles.start`.
+// every `config.candles.everyMs`, walking from `config.candles.start`; `window.__stubCandles` counts
+// them, so a state can wait for the chart to fill.
 
 function installBridgeStub(config) {
   const listeners = new Set()
@@ -56,6 +58,7 @@ function installBridgeStub(config) {
           quote_volume: (12 + (n % 5)) * close,
         }
         n += 1
+        window.__stubCandles = (window.__stubCandles ?? 0) + 1
         emit({ type: 'candle', topic, candle: bar })
       }, config.candles.everyMs),
     )
@@ -103,10 +106,15 @@ function installBridgeStub(config) {
       listeners.add(listener)
       return () => listeners.delete(listener)
     },
+    // Retry restarts the engine: it reports connecting, then running a moment later.
     async restartEngine() {
       if (status.state !== 'failed') return
-      status = { state: 'connecting' }
-      for (const listener of listeners) listener(status)
+      const set = (next) => {
+        status = next
+        for (const listener of listeners) listener(status)
+      }
+      set({ state: 'connecting' })
+      setTimeout(() => set({ state: 'running' }), 300)
     },
   }
 }

@@ -1,8 +1,12 @@
 # CI for the GUI workspace in gui/. Rules: D:/code/CLAUDE.md, "Test suites".
 # It runs on pushes to branches other than the default and on manual dispatch, so each push starts one run
 # and a branch has results before its PR exists.
-# It runs the TypeScript suite: typecheck, the vitest tests and the electron-vite build. The test that
+# It runs the TypeScript suite: typecheck, the vitest tests and the electron-vite build, then the
+# Playwright UI gates against the built renderer in headless Chromium (never Electron). The test that
 # starts the real td-server binary skips itself here, since this workflow builds no Rust; ci.yml covers Rust.
+# The screenshot baselines in gui/e2e/__screenshots__ are made here, on Linux: a missing one is written,
+# the check after the gates fails the run, and the failure artifact carries it to commit
+# (gui/README.md, "UI gates").
 # Never give this workflow production URLs, real secrets, .env.local or a service_role key.
 name: gui
 
@@ -21,7 +25,7 @@ permissions:
 jobs:
   suite:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: gui
@@ -43,3 +47,30 @@ jobs:
         run: pnpm test
       - name: Build
         run: pnpm build
+      - name: Cache Playwright's Chromium
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('gui/pnpm-lock.yaml') }}
+      - name: Install Chromium
+        run: pnpm exec playwright install --with-deps --only-shell chromium
+      - name: UI gates
+        run: pnpm gates
+      # Playwright writes a missing baseline and passes, so a run that wrote one compared nothing.
+      - name: Check every screenshot baseline is committed
+        run: |
+          written=$(git status --porcelain -- e2e/__screenshots__)
+          if [ -n "$written" ]; then
+            echo "::error::Screenshot baselines are missing from the commit. The ui-gates artifact holds them; look at them and commit them."
+            echo "$written"
+            exit 1
+          fi
+      - name: Upload UI gate results
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ui-gates
+          path: |
+            gui/e2e/.results
+            gui/e2e/__screenshots__
+          retention-days: 7
