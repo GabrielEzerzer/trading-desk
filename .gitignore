@@ -3,3 +3,8 @@
 .env.*
 !.env.example
 target/
+
+# GUI (gui/)
+node_modules/
+out/
+dist/
