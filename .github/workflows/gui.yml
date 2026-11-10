@@ -1,0 +1,45 @@
+# CI for the GUI workspace in gui/. Rules: D:/code/CLAUDE.md, "Test suites".
+# It runs on pushes to branches other than the default and on manual dispatch, so each push starts one run
+# and a branch has results before its PR exists.
+# It runs the TypeScript suite: typecheck, the vitest tests and the electron-vite build. The test that
+# starts the real td-server binary skips itself here, since this workflow builds no Rust; ci.yml covers Rust.
+# Never give this workflow production URLs, real secrets, .env.local or a service_role key.
+name: gui
+
+on:
+  push:
+    branches-ignore: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: gui-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  suite:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: gui
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: gui/package.json
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: gui/pnpm-lock.yaml
+      - name: Install
+        run: pnpm install --frozen-lockfile
+      - name: Typecheck
+        run: pnpm typecheck
+      - name: Test
+        run: pnpm test
+      - name: Build
+        run: pnpm build
