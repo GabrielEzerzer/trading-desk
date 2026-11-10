@@ -41,7 +41,10 @@
 //!   - `POST /sessions/{id}/stop`: 200 once stopped, 409 `not_running` if it was not running.
 //!   - `POST /sessions/{id}/resume`: replays a stopped session and starts it again, backfilling
 //!     what it missed; 409 `already_running` if it is running. A session that ended on its own
-//!     with an error counts as stopped. Its `session:` subscribers get the resumed state.
+//!     with an error counts as stopped. Its `session:` subscribers get the resumed state. 409
+//!     `engine_changed` if the session was created by another engine revision: it still lists
+//!     and shows, replayed by this engine with a warning saying so, but cannot go on; start a new
+//!     session instead.
 //!
 //!   An unknown session id is a 404.
 //! - `GET /ws`: topic subscriptions: `jobs`, `candles:...` and `session:<id>` (see [`ws`]).

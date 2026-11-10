@@ -29,6 +29,12 @@ pub enum PaperError {
     #[error("a paper session already exists in {}", .0.display())]
     Exists(PathBuf),
 
+    #[error(
+        "the session was created with engine revision {created} and this engine is revision \
+         {current}, so it cannot be resumed: start a new session"
+    )]
+    EngineChanged { created: u32, current: u32 },
+
     #[error("the live feed stopped")]
     FeedEnded,
 

@@ -58,6 +58,7 @@ pub fn config(slippage_bps: f64) -> SessionConfig {
         starting_cash: 10_000.0,
         slippage_bps,
         fees: None,
+        max_leverage: 1.0,
     }
 }
 
