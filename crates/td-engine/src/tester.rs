@@ -633,9 +633,11 @@ pub struct OosResult {
     /// the taker fee, so its trades are all closed and their costs real. The in-sample sweep's
     /// runs close out the same way, so `degradation` and `min_trades` compare like with like.
     pub out_of_sample: BacktestResult,
-    /// Out-of-sample objective over in-sample objective. `None` if either is undefined or the
-    /// in-sample value is zero. For a maximised metric below 1 is worse out of sample; for a
-    /// minimised one above 1 is worse. Not meaningful when the in-sample value is negative.
+    /// Out-of-sample objective over in-sample objective. With `TotalReturn` as the objective it
+    /// is the ratio of CAGRs instead, because the two segments usually differ in length and a
+    /// cumulative return grows with it. `None` if either value is undefined or the in-sample
+    /// value is zero. For a maximised metric below 1 is worse out of sample; for a minimised one
+    /// above 1 is worse. Not meaningful when the in-sample value is negative.
     pub degradation: Option<f64>,
 }
 
@@ -673,13 +675,11 @@ pub fn out_of_sample(
     };
     let out_of_sample = run(&oos_config, bars, funding)?;
 
-    let metric = spec.sweep.objective.metric;
-    let is_value = Headline::new(&best.metrics).value(metric);
-    let oos_value = Headline::new(&out_of_sample.metrics).value(metric);
-    let degradation = match (is_value, oos_value) {
-        (Some(i), Some(o)) if i != 0.0 => Some(o / i),
-        _ => None,
-    };
+    let degradation = degradation(
+        spec.sweep.objective.metric,
+        &Headline::new(&best.metrics),
+        &Headline::new(&out_of_sample.metrics),
+    );
     Ok(OosResult {
         spec: spec.clone(),
         engine_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -689,6 +689,26 @@ pub fn out_of_sample(
         out_of_sample,
         degradation,
     })
+}
+
+/// Out-of-sample over in-sample value of the objective, on a scale that does not depend on how
+/// long each segment is. `TotalReturn` is cumulative, so +20% over two years against +10% over
+/// half a year would read as 0.5 although the second grows faster; it is compared by CAGR
+/// instead. The other objectives need no such change: CAGR, Sharpe, Sortino and Calmar are
+/// annualised, profit factor and win rate are per-trade ratios, and the maximum drawdown is a
+/// depth, not a sum over time (a longer segment tends to reach a deeper one, but no exact
+/// rescaling exists for it). Totals that do grow with length, such as trade counts and fee or
+/// funding sums, cannot be objectives. `None` if either value is undefined or the in-sample
+/// value is zero.
+fn degradation(metric: Metric, in_sample: &Headline, out_of_sample: &Headline) -> Option<f64> {
+    let compared = match metric {
+        Metric::TotalReturn => Metric::Cagr,
+        m => m,
+    };
+    match (in_sample.value(compared), out_of_sample.value(compared)) {
+        (Some(i), Some(o)) if i != 0.0 => Some(o / i),
+        _ => None,
+    }
 }
 
 /// The open time of the first out-of-sample bar. Both segments must hold at least one bar.

@@ -417,7 +417,8 @@ fn out_of_sample_warms_up_on_the_in_sample_bars() {
     )
     .unwrap();
     assert_eq!(cold.orders[0].submitted_at, r.split_at + 4 * HOUR);
-    let expected = o.metrics.total_return.unwrap() / best.metrics.total_return.unwrap();
+    // A total-return objective is compared by CAGR, since the segments may differ in length.
+    let expected = o.metrics.cagr.unwrap() / best.metrics.cagr.unwrap();
     assert_eq!(r.degradation, Some(expected));
 
     // A split at a time gives the same segments.
@@ -427,6 +428,58 @@ fn out_of_sample_warms_up_on_the_in_sample_bars() {
     };
     let r2 = out_of_sample(&at, &bars, &[], None).unwrap();
     assert_eq!(r2.out_of_sample, r.out_of_sample);
+}
+
+#[test]
+fn total_return_degradation_compares_annualised_growth_across_unequal_segments() {
+    const DAY: Millis = 24 * HOUR;
+    const IS_DAYS: i64 = 730;
+    const OOS_DAYS: i64 = 182;
+    // Daily bars: +20% over two years in-sample, then +10% over half a year out of sample.
+    let price = |i: i64| {
+        if i <= IS_DAYS {
+            100.0 * 1.2f64.powf(i as f64 / IS_DAYS as f64)
+        } else {
+            120.0 * 1.1f64.powf((i - IS_DAYS) as f64 / OOS_DAYS as f64)
+        }
+    };
+    let bars: Vec<Candle> = (0..IS_DAYS + OOS_DAYS)
+        .map(|i| {
+            let (open, close) = (if i == 0 { 99.9 } else { price(i - 1) }, price(i));
+            Candle {
+                open_time: T0 + i * DAY,
+                high: open.max(close) + 0.05,
+                low: open.min(close) - 0.05,
+                ..candle(i, open, close)
+            }
+        })
+        .collect();
+    let mut b = base(common::spot(), 0);
+    b.timeframe = Timeframe::D1;
+    b.to = T0 + (IS_DAYS + OOS_DAYS) * DAY;
+    b.params = Params::new().with("fast", ParamValue::Int(1));
+    let oos = OosSpec {
+        sweep: spec(
+            b,
+            vec![
+                values("slow", &ints(&[5])),
+                values("equity_fraction", &floats(&[0.9])),
+            ],
+        ),
+        split: Split::At(T0 + IS_DAYS * DAY),
+    };
+    let r = out_of_sample(&oos, &bars, &[], None).unwrap();
+    let is = &r.in_sample.best.as_ref().unwrap().metrics;
+    let o = &r.out_of_sample.metrics;
+    // The cumulative return is smaller out of sample, the annualised one larger.
+    assert!(o.total_return.unwrap() < is.total_return.unwrap());
+    assert!(o.cagr.unwrap() > is.cagr.unwrap());
+    let d = r.degradation.unwrap();
+    assert!(
+        d > 1.0,
+        "degradation {d} should show the better out-of-sample growth"
+    );
+    assert_eq!(d, o.cagr.unwrap() / is.cagr.unwrap());
 }
 
 #[test]
