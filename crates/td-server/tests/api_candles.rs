@@ -81,6 +81,9 @@ impl MarketSource for NoSource {
     }
 }
 
+/// Makes the error a failing venue call returns.
+type Failure = fn() -> DataError;
+
 /// The venue's REST klines: its minutes, or bars resampled from them, from `from` on. It serves
 /// the bar still open at `now`, as a venue serves the forming bar, and ignores `to`, so the server
 /// must keep to its own range. Records every call.
@@ -88,7 +91,7 @@ struct FakeRest {
     minutes: Vec<Candle>,
     now: Millis,
     /// Every call fails with this error instead.
-    fail: Option<fn() -> DataError>,
+    fail: Option<Failure>,
     calls: Mutex<Vec<(Timeframe, Millis, Millis)>>,
 }
 
@@ -510,7 +513,7 @@ fn venue_status(status: u16, body: &str) -> DataError {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_venue_failure_is_a_502_with_the_venues_message() {
-    let failures: [(fn() -> DataError, &str); 3] = [
+    let failures: [(Failure, &str); 3] = [
         (
             || venue_status(503, "the venue is down for maintenance"),
             "the venue is down for maintenance",
