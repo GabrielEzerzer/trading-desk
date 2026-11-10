@@ -149,8 +149,12 @@ impl Instrument {
                 min: self.min_qty,
             });
         }
+        // Venues exempt reduce-only perpetual orders from the minimum notional, so a position that
+        // has shrunk below it in value can still be closed. Whether the order really reduces a
+        // position is the broker's check.
+        let exempt = order.reduce_only && self.id.kind == InstrumentKind::Perpetual;
         let notional = qty * price;
-        if notional < self.min_notional * (1.0 - TOLERANCE) {
+        if !exempt && notional < self.min_notional * (1.0 - TOLERANCE) {
             return Err(CoreError::NotionalBelowMin {
                 notional,
                 min: self.min_notional,
@@ -390,6 +394,26 @@ mod tests {
         let i = btc_perp();
         let limit = OrderType::Limit { price: 4000.0 };
         let err = i.validate_order(&order(0.001, limit), 65000.0);
+        assert!(matches!(err, Err(CoreError::NotionalBelowMin { .. })));
+    }
+
+    #[test]
+    fn reduce_only_perpetual_order_is_exempt_from_min_notional() {
+        let i = btc_perp();
+        let limit = OrderType::Limit { price: 4000.0 };
+        let mut o = order(0.001, limit);
+        o.reduce_only = true;
+        assert!(i.validate_order(&o, 65000.0).is_ok());
+
+        let spot = Instrument {
+            id: InstrumentId {
+                kind: InstrumentKind::Spot,
+                ..i.id.clone()
+            },
+            ..i
+        };
+        o.instrument = spot.id.clone();
+        let err = spot.validate_order(&o, 65000.0);
         assert!(matches!(err, Err(CoreError::NotionalBelowMin { .. })));
     }
 
