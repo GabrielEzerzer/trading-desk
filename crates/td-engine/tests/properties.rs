@@ -5,7 +5,10 @@
 //!   open is owed by the position before that bar's fills, at the open; funding due later in the
 //!   bar by the position after them, at the close.
 //! - No order fills on the bar it was submitted on, and every fill lands on a bar's open time.
-//! - Spot positions never go below zero.
+//! - Spot positions and spot cash never go below zero.
+//! - Equity never goes below zero: perpetuals run with random leverage caps and sizes, so some
+//!   runs are liquidated, and a perpetual account left flat with a negative balance is floored at
+//!   zero.
 //! - An attached stop waits exactly while its entry is open, and fills only once its entry has.
 
 mod common;
@@ -13,7 +16,14 @@ mod common;
 use common::*;
 use proptest::prelude::*;
 use td_core::{Candle, InstrumentKind, OrderType, Side, Timeframe};
-use td_engine::{Context, OrderStatus, Session, Strategy as EngineStrategy};
+use td_engine::{Context, OrderStatus, Session, SessionConfig, Strategy as EngineStrategy};
+
+fn leverage_config(slippage: f64, max_leverage: f64) -> SessionConfig {
+    SessionConfig {
+        max_leverage,
+        ..config(slippage)
+    }
+}
 
 #[derive(Debug, Clone)]
 struct Action {
@@ -30,6 +40,8 @@ struct Action {
 
 struct Random {
     actions: Vec<Vec<Action>>,
+    /// Multiplies every action's quantity, so some runs size far above 1x.
+    size: f64,
 }
 
 impl EngineStrategy for Random {
@@ -47,7 +59,7 @@ impl EngineStrategy for Random {
                 },
             };
             let side = if a.buy { Side::Buy } else { Side::Sell };
-            let mut r = req(ctx.instrument(), side, a.qty, order_type);
+            let mut r = req(ctx.instrument(), side, a.qty * self.size, order_type);
             r.reduce_only = a.reduce_only;
             if a.ioc {
                 r = ioc(r);
@@ -136,15 +148,21 @@ fn build_bars(specs: &[BarSpec]) -> Vec<Candle> {
         .collect()
 }
 
-fn check(kind: InstrumentKind, slippage: f64, specs: Vec<BarSpec>) -> Result<(), TestCaseError> {
+fn check(
+    kind: InstrumentKind,
+    slippage: f64,
+    max_leverage: f64,
+    size: f64,
+    specs: Vec<BarSpec>,
+) -> Result<(), TestCaseError> {
     let bars = build_bars(&specs);
     let actions = specs.iter().map(|s| s.5.clone()).collect();
     let inst = instrument(kind);
     let mut session = Session::new(
-        Box::new(Random { actions }),
+        Box::new(Random { actions, size }),
         inst,
         Timeframe::M1,
-        config(slippage),
+        leverage_config(slippage, max_leverage),
     )
     .unwrap();
     let mut funding = Vec::new();
@@ -175,6 +193,11 @@ fn check(kind: InstrumentKind, slippage: f64, specs: Vec<BarSpec>) -> Result<(),
             cash -= dq * f.price + f.fee;
             position += dq;
         }
+        // A perpetual account left flat with a negative balance after the bar's fills is floored
+        // at zero. Flat, the spot-style cash rebuilt here equals the wallet balance.
+        if kind == InstrumentKind::Perpetual && position.abs() < 1e-9 && cash < 0.0 {
+            cash = 0.0;
+        }
         for &(time, rate) in &funding[t] {
             if time > b.open_time {
                 cash -= position * b.close * rate;
@@ -186,14 +209,20 @@ fn check(kind: InstrumentKind, slippage: f64, specs: Vec<BarSpec>) -> Result<(),
             (recorded - expected).abs() <= 1e-7 * (1.0 + expected.abs()),
             "bar {t}: recorded {recorded}, rebuilt {expected}"
         );
+        prop_assert!(recorded >= 0.0, "bar {t}: equity {recorded}");
         if kind == InstrumentKind::Spot {
             prop_assert!(position >= -1e-9, "bar {t}: spot position {position}");
+            prop_assert!(cash >= 0.0, "bar {t}: spot cash {cash}");
         }
     }
     prop_assert!((session.portfolio().position() - position).abs() < 1e-9);
 
     for f in fills {
         let order = &session.orders()[f.order_id.0 as usize - 1];
+        // A liquidation is decided and filled on the same bar.
+        if order.request.client_tag.as_deref() == Some("liquidation") {
+            continue;
+        }
         prop_assert!(
             f.time > order.submitted_at,
             "order {} submitted on the bar at {} filled at {}",
@@ -236,16 +265,19 @@ proptest! {
     #[test]
     fn spot_books_balance_and_never_fill_early(
         slippage in 0.0..20.0f64,
+        size in 1.0..30.0f64,
         specs in prop::collection::vec(bar_spec(), 1..60),
     ) {
-        check(InstrumentKind::Spot, slippage, specs)?;
+        check(InstrumentKind::Spot, slippage, 1.0, size, specs)?;
     }
 
     #[test]
     fn perpetual_books_balance_and_never_fill_early(
         slippage in 0.0..20.0f64,
+        max_leverage in 0.5..50.0f64,
+        size in 1.0..200.0f64,
         specs in prop::collection::vec(bar_spec(), 1..60),
     ) {
-        check(InstrumentKind::Perpetual, slippage, specs)?;
+        check(InstrumentKind::Perpetual, slippage, max_leverage, size, specs)?;
     }
 }

@@ -161,6 +161,15 @@ slippage_bps: number,
  */
 fee_override: FeeSchedule | null, 
 /**
+ * The largest perpetual position allowed, as its notional over equity: 1.0 means 1x, the
+ * default. At 1x a long is liquidated only near a price of zero and a short only once the
+ * price has about doubled (see [`Session::on_bar`]). Orders that would take the position
+ * over it are rejected when submitted; orders that reduce the position are always allowed
+ * (see [`crate::Context::submit`]). Spot ignores it. Left out of the saved result when it is
+ * the default.
+ */
+max_leverage?: number, 
+/**
  * When set, bars that open at or after `warmup_from` and before `from` are fed to the
  * strategy first with trading disabled (see [`Session::warm_up`]), so its indicators are
  * ready at the first traded bar. They add no equity points and are not in the metrics;
@@ -901,7 +910,12 @@ instrument: Instrument, timeframe: Timeframe, starting_cash: number, slippage_bp
 /**
  * Replaces the instrument's fee schedule when set.
  */
-fees: FeeSchedule | null, };
+fees: FeeSchedule | null, 
+/**
+ * The largest perpetual position allowed, as its notional over equity, as in a backtest:
+ * 1.0 means 1x, the default, which a config saved without it also gets. Spot ignores it.
+ */
+max_leverage: number, };
 
 /**
  * A funding rate fed with a bar.

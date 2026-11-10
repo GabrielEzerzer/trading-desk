@@ -764,6 +764,7 @@ mod tests {
             fee_override: None,
             warmup_from: None,
             close_at_end: false,
+            max_leverage: 1.0,
         }
     }
 
