@@ -1,0 +1,101 @@
+/*
+ * The app's design tokens, light only. The reasons behind each value are in the project's design
+ * direction (docs/design/direction.md, sections Type, Colour, Depth and Motion). Components use
+ * these names and never a raw colour, size or duration.
+ *
+ * theme.ts repeats the two values main needs before any CSS loads (the ground behind the title bar
+ * overlay and the title bar height); theme.test.ts keeps them equal.
+ */
+
+:root {
+  /* Colour. The interface is neutral; colour has two jobs: the accent marks what you can change or
+     what is working, and gain/loss marks money. */
+  --ground: #f7f7f8; /* a step below the sheet, so the sheet reads as a surface without a border */
+  --sheet: #ffffff;
+  --ink: #0d0d0d; /* near-black, softer than black over a long session */
+  --grey-1: #5d5d5d; /* secondary text */
+  --grey-2: #8f8f8f; /* labels */
+  --fill: #f3f3f3; /* inactive pills, tracks */
+  --fill-hover: rgb(0 0 0 / 0.07);
+  --hairline: rgb(0 0 0 / 0.05); /* only where white meets white */
+  --on-ink: #ffffff; /* text and icons on the one dark shape, the Run button */
+
+  /* Controls only: a slider's fill, the selected option, progress, focus. Never text, surfaces or
+     backgrounds. Cool, with no green, red or orange, so it never reads as gain, loss or warning. */
+  --accent: #3563e9;
+  /* The far end of a range (a slider's top stop, a costly setting) blends toward violet. */
+  --accent-extreme: #7354e6;
+  --focus-ring: 0 0 0 2px var(--sheet), 0 0 0 4px var(--accent);
+
+  /* Gain and loss, each at least 4.5:1 on white so they work as text. */
+  --gain: #0b7a3e;
+  --loss: #c2302a;
+
+  /* Type. Inter Variable is bundled by the app. Weights 400 and 500 only. */
+  --font-sans: 'Inter Variable', 'Segoe UI', system-ui, sans-serif;
+  --font-mono: ui-monospace, 'Cascadia Mono', Consolas, monospace;
+  --weight-regular: 400;
+  --weight-medium: 500;
+  --text-label: 12px; /* labels under numbers, table headers */
+  --text-label-line: 16px;
+  --text-body: 14px; /* tables and labels read at desk distance */
+  --text-body-line: 23px;
+  --text-body-tracking: -0.01em;
+  --text-step: 20px; /* list names and key numbers: one step up, so they read before content */
+  --text-step-line: 28px;
+  --text-step-tracking: -0.015em;
+  --text-verdict: 32px; /* the answer, the one large thing in the Lab */
+  --text-verdict-line: 38px;
+  --text-verdict-tracking: -0.02em;
+
+  /* Space, on a 4 px base. */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --space-6: 32px;
+  --space-7: 48px;
+  --space-8: 64px;
+
+  /* Layout. */
+  --titlebar-height: 44px; /* fits the 32 px toggle with room above and below; matches the overlay */
+  --ground-strip: 12px; /* the ground showing around the sheet */
+  --column: 680px; /* the Lab's reading column: verdict line and tables read best at this width */
+  --control: 44px; /* the controls that lead to a decision */
+  --control-small: 32px; /* navigation and quiet controls */
+
+  /* Radius. */
+  --radius-sheet: 20px;
+  --radius-menu: 16px;
+  --radius-row: 12px;
+  --radius-item: 10px;
+  --radius-pill: 999px;
+
+  /* Depth. Controls lift with one wide faint shadow; the sheet with an even fainter one. */
+  --shadow-float: 0 8px 32px rgb(0 0 0 / 0.09);
+  --shadow-sheet: 0 1px 2px rgb(0 0 0 / 0.03), 0 12px 48px rgb(0 0 0 / 0.04);
+  --menu-surface: rgb(255 255 255 / 0.78);
+  --menu-blur: 24px;
+
+  /* Motion. Confirms and orients, never performs. */
+  --ease-standard: cubic-bezier(0.4, 0, 0.2, 1);
+  /* A critically damped spring: settles with no overshoot. */
+  --ease-spring: linear(0, 0.044 5%, 0.143 10%, 0.263 15%, 0.383 20%, 0.592 30%, 0.743 40%, 0.844 50%,
+      0.907 60%, 0.946 70%, 0.969 80%, 0.982 90%, 1);
+  --duration-hover: 150ms;
+  --duration-popover: 150ms;
+  --duration-fade: 180ms;
+  --duration-thumb: 350ms; /* one pill of travel, used many times a day */
+  --duration-count: 700ms; /* the verdict's numbers counting up once after a fresh run */
+  --duration-shimmer: 2s; /* one pass of the running-status shimmer */
+  --duration-progress: 400ms;
+  --scale-popover-from: 0.96;
+  --press-opacity: 0.8;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    /* Dark comes later: redefine the same names here. Light only for now. */
+  }
+}

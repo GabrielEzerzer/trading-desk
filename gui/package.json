@@ -1,0 +1,22 @@
+{
+  "name": "trading-desk-gui",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@10.28.2",
+  "scripts": {
+    "dev": "cargo build -p td-server --manifest-path ../Cargo.toml && pnpm --filter @td/app dev",
+    "build": "pnpm --filter @td/app build",
+    "typecheck": "pnpm -r typecheck && tsc -p tsconfig.e2e.json",
+    "test": "vitest run",
+    "shots": "pnpm --filter @td/app build && node app/shots/shots.mjs",
+    "gates": "playwright test"
+  },
+  "devDependencies": {
+    "@axe-core/playwright": "4.14.0",
+    "@playwright/test": "1.65.0",
+    "@types/node": "24.19.2",
+    "playwright": "1.65.0",
+    "typescript": "7.0.2",
+    "vitest": "5.0.5"
+  }
+}
