@@ -21,6 +21,16 @@ pub enum CoreError {
     #[error("{field} must be a finite number above zero, got {value}")]
     InvalidNumber { field: &'static str, value: f64 },
 
+    #[error("quantity {qty} is not a multiple of the lot size {lot_size}")]
+    QtyOffLot { qty: f64, lot_size: f64 },
+
+    #[error("{field} {price} is not a multiple of the tick size {tick_size}")]
+    PriceOffTick {
+        field: &'static str,
+        price: f64,
+        tick_size: f64,
+    },
+
     #[error("quantity {qty} is below the minimum {min}")]
     QtyBelowMin { qty: f64, min: f64 },
 

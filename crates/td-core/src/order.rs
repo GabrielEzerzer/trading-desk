@@ -19,8 +19,12 @@ impl Side {
     }
 }
 
-/// How an order is priced. A stop becomes a market order, and a stop-limit a limit order, once the
-/// market trades through `trigger`.
+/// How an order is priced.
+///
+/// A buy stop triggers when a bar's high reaches `trigger` or above; a sell stop triggers when a
+/// bar's low reaches `trigger` or below. Once triggered, `Stop` fills as a market order and
+/// `StopLimit` rests as a limit order at `price`. A take-profit is expressed as a `Limit` order;
+/// there is no separate type for it.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum OrderType {
@@ -70,6 +74,8 @@ pub enum Liquidity {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Fill {
     pub order_id: OrderId,
+    pub instrument: InstrumentId,
+    pub side: Side,
     pub time: Millis,
     pub price: f64,
     pub qty: f64,

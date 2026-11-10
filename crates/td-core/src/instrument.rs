@@ -101,7 +101,9 @@ impl Instrument {
         round_to_step(qty, self.lot_size, Rounding::Down)
     }
 
-    /// Checks an order against this instrument's minimums. Call it after rounding.
+    /// Checks an order against this instrument's trading rules. Call it after rounding: the quantity
+    /// must be on the lot grid, limit and trigger prices on the tick grid, and both at or above the
+    /// minimums.
     ///
     /// The notional uses the order's limit price, or its trigger for a stop, or `last_price` for a
     /// market order.
@@ -113,13 +115,30 @@ impl Instrument {
             });
         }
         let qty = positive("qty", order.qty)?;
+        if self.round_qty(qty) != qty {
+            return Err(CoreError::QtyOffLot {
+                qty,
+                lot_size: self.lot_size,
+            });
+        }
+        let on_tick = |field: &'static str, price: f64| {
+            let price = positive(field, price)?;
+            if self.round_price(price, Rounding::Nearest) != price {
+                return Err(CoreError::PriceOffTick {
+                    field,
+                    price,
+                    tick_size: self.tick_size,
+                });
+            }
+            Ok(price)
+        };
         let price = match order.order_type {
             OrderType::Market => positive("last_price", last_price)?,
-            OrderType::Limit { price } => positive("price", price)?,
-            OrderType::Stop { trigger } => positive("trigger", trigger)?,
+            OrderType::Limit { price } => on_tick("price", price)?,
+            OrderType::Stop { trigger } => on_tick("trigger", trigger)?,
             OrderType::StopLimit { trigger, price } => {
-                positive("trigger", trigger)?;
-                positive("price", price)?
+                on_tick("trigger", trigger)?;
+                on_tick("price", price)?
             }
         };
         // A rounded quantity times a price can land a hair below an exact minimum (0.57 * 100 is
@@ -130,8 +149,12 @@ impl Instrument {
                 min: self.min_qty,
             });
         }
+        // Venues exempt reduce-only perpetual orders from the minimum notional, so a position that
+        // has shrunk below it in value can still be closed. Whether the order really reduces a
+        // position is the broker's check.
+        let exempt = order.reduce_only && self.id.kind == InstrumentKind::Perpetual;
         let notional = qty * price;
-        if notional < self.min_notional * (1.0 - TOLERANCE) {
+        if !exempt && notional < self.min_notional * (1.0 - TOLERANCE) {
             return Err(CoreError::NotionalBelowMin {
                 notional,
                 min: self.min_notional,
@@ -156,12 +179,14 @@ fn positive(field: &'static str, value: f64) -> Result<f64, CoreError> {
 /// Steps are decimal (0.01, 0.001, 5), which binary floats cannot hold exactly, so a naive
 /// `value / step` can land just under a whole number (0.3 / 0.1 is 2.9999999999999996). The step
 /// is scaled to an integer number of units first, a small epsilon absorbs the remaining error, and
-/// the result is built from integers so it is the float nearest the decimal value.
+/// the result is built from integers so it is the float nearest the decimal value. The epsilon is
+/// a few units of float error in the step count, so it stays far below one step even for large
+/// counts.
 fn round_to_step(value: f64, step: f64, rounding: Rounding) -> f64 {
     let scale = 10f64.powi(step_decimals(step));
     let step_units = (step * scale).round();
     let steps = value * scale / step_units;
-    let eps = (steps.abs() * 1e-12).max(1e-9);
+    let eps = (steps.abs() * 4.0 * f64::EPSILON).max(1e-9);
     let n = match rounding {
         Rounding::Down => (steps + eps).floor(),
         Rounding::Up => (steps - eps).ceil(),
@@ -268,6 +293,28 @@ mod tests {
     }
 
     #[test]
+    fn large_step_counts_round_in_the_asked_direction() {
+        // About 1e13 steps of 1e-8, and 1e10 steps of 1.
+        let cases = [(99999.999999995, 1e-8), (9999999999.995, 1.0)];
+        for (value, step) in cases {
+            let down = round_to_step(value, step, Rounding::Down);
+            let up = round_to_step(value, step, Rounding::Up);
+            assert!(down <= value, "{down} > {value}");
+            assert!(up >= value, "{up} < {value}");
+        }
+        assert_eq!(
+            round_to_step(99999.999999995, 1e-8, Rounding::Down),
+            99999.99999999
+        );
+        assert_eq!(round_to_step(99999.999999995, 1e-8, Rounding::Up), 100000.0);
+        assert_eq!(
+            round_to_step(9999999999.995, 1.0, Rounding::Down),
+            9999999999.0
+        );
+        assert_eq!(round_to_step(9999999999.995, 1.0, Rounding::Up), 1e10);
+    }
+
+    #[test]
     fn rounded_values_are_the_nearest_float_to_the_decimal() {
         // A naive 3.0 * 0.1 gives 0.30000000000000004.
         assert_eq!(with_steps(0.1, 0.1).round_qty(0.31), 0.3);
@@ -287,9 +334,59 @@ mod tests {
 
     #[test]
     fn qty_below_min_is_rejected() {
-        let i = btc_perp();
+        let i = with_steps(0.1, 0.0001);
         let err = i.validate_order(&order(0.0005, OrderType::Market), 65000.0);
         assert!(matches!(err, Err(CoreError::QtyBelowMin { .. })));
+    }
+
+    #[test]
+    fn qty_off_the_lot_grid_is_rejected() {
+        let i = btc_perp();
+        let err = i.validate_order(&order(0.0015, OrderType::Market), 65000.0);
+        assert!(matches!(err, Err(CoreError::QtyOffLot { .. })));
+        // 3.0 * 0.1 is 0.30000000000000004; it must be rounded first.
+        let i = with_steps(0.1, 0.1);
+        let err = i.validate_order(&order(3.0 * 0.1, OrderType::Market), 65000.0);
+        assert!(matches!(err, Err(CoreError::QtyOffLot { .. })));
+        let rounded = i.round_qty(3.0 * 0.1);
+        assert_eq!(
+            i.validate_order(&order(rounded, OrderType::Market), 65000.0),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn prices_off_the_tick_grid_are_rejected() {
+        let i = btc_perp();
+        let limit = OrderType::Limit { price: 65000.05 };
+        let err = i.validate_order(&order(0.01, limit), 65000.0);
+        assert!(matches!(
+            err,
+            Err(CoreError::PriceOffTick { field: "price", .. })
+        ));
+        let stop = OrderType::Stop { trigger: 65000.05 };
+        let err = i.validate_order(&order(0.01, stop), 65000.0);
+        assert!(matches!(
+            err,
+            Err(CoreError::PriceOffTick {
+                field: "trigger",
+                ..
+            })
+        ));
+        let stop_limit = OrderType::StopLimit {
+            trigger: 65000.1,
+            price: 65000.05,
+        };
+        let err = i.validate_order(&order(0.01, stop_limit), 65000.0);
+        assert!(matches!(
+            err,
+            Err(CoreError::PriceOffTick { field: "price", .. })
+        ));
+        // A last price for a market order is a market observation, not checked against the grid.
+        assert_eq!(
+            i.validate_order(&order(0.01, OrderType::Market), 65000.05),
+            Ok(())
+        );
     }
 
     #[test]
@@ -297,6 +394,26 @@ mod tests {
         let i = btc_perp();
         let limit = OrderType::Limit { price: 4000.0 };
         let err = i.validate_order(&order(0.001, limit), 65000.0);
+        assert!(matches!(err, Err(CoreError::NotionalBelowMin { .. })));
+    }
+
+    #[test]
+    fn reduce_only_perpetual_order_is_exempt_from_min_notional() {
+        let i = btc_perp();
+        let limit = OrderType::Limit { price: 4000.0 };
+        let mut o = order(0.001, limit);
+        o.reduce_only = true;
+        assert!(i.validate_order(&o, 65000.0).is_ok());
+
+        let spot = Instrument {
+            id: InstrumentId {
+                kind: InstrumentKind::Spot,
+                ..i.id.clone()
+            },
+            ..i
+        };
+        o.instrument = spot.id.clone();
+        let err = spot.validate_order(&o, 65000.0);
         assert!(matches!(err, Err(CoreError::NotionalBelowMin { .. })));
     }
 
