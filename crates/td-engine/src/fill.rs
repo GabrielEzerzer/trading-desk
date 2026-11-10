@@ -13,8 +13,11 @@ pub enum FillCheck {
         liquidity: Liquidity,
         /// The market price the order met, before slippage and before capping at a limit. When it
         /// is the bar's open, the broker takes the fill as happening at the open, before any fill
-        /// inside the bar's range. An attached stop is checked against the rest of the bar from
-        /// this price.
+        /// inside the bar's range, and an attached stop is checked against the rest of the bar
+        /// from this price. A resting limit the bar opens through has the open here and its limit
+        /// in `price`, and fills as a maker: the broker takes it as filled between the bars, before
+        /// the fills at the open, and checks its attached stop from the limit, with the market
+        /// trading on from there to the open.
         market: f64,
     },
 }
@@ -22,7 +25,10 @@ pub enum FillCheck {
 /// Decides whether and at what price an order fills on a bar. The broker calls it only for bars
 /// after the one the order was decided on, and handles fees, ordering and order state. For an
 /// attached stop it also calls it on its entry's fill bar, with the bar's open replaced by the
-/// entry's market price.
+/// price the entry met the market at: its market price, or its limit when it filled between the
+/// bars, with the range stretched to include that limit. For a reduce-only limit that waits for
+/// the open, it calls it with the order's time in force set to IOC, to price it as a limit arriving
+/// at the open.
 pub trait FillModel: Send {
     /// `first` says whether this is the first bar the order can fill on. `triggered` says whether
     /// a stop-limit was triggered on an earlier bar.
@@ -39,8 +45,10 @@ pub trait FillModel: Send {
 /// Fills orders from OHLC bars alone.
 ///
 /// - Market: the bar's open, moved against the order by `slippage_bps`. Taker.
-/// - Limit buy: fills if the low reaches the limit, at the limit, or at the open when the bar
-///   opens below it. Sells mirror this. Maker.
+/// - Limit buy: rests from the close it was decided on, and fills at the limit if the low reaches
+///   it. When a bar opens below it, the market passed the limit between the bars, where the
+///   resting order filled: it fills at the limit, not the better open, as of the open. Sells
+///   mirror this. Maker.
 /// - Limit already marketable at the close it was decided on (a buy at or above that close, a
 ///   sell at or below it): on its first bar it takes liquidity like a market order, at the open
 ///   plus slippage but never past its limit, as a taker. If that bar opens past the limit, it
@@ -50,16 +58,22 @@ pub trait FillModel: Send {
 /// - Stop-limit: triggers like a stop. If the limit is marketable at the trigger point it fills
 ///   there with slippage, never past the limit, as a taker. Otherwise it rests as a limit from
 ///   the next bar on: the bar's path after the trigger is unknown, so it is assumed not to come
-///   back to the limit within the same bar.
-/// - IOC: only the bar's open is reachable, since the order never rests; it fills as a taker or
-///   not at all.
+///   back to the limit within the same bar. From then on the limit rests like any other.
+/// - IOC: only the bar's open is reachable, since the order never rests. A limit marketable there
+///   fills like a marketable limit, at the open plus slippage but never past its limit, as a
+///   taker; otherwise it does not fill.
 ///
 /// Slipped prices are rounded to the tick against the order (buys up, sells down).
 ///
-/// shortcut: a limit that was not marketable at the decision close but that the next bar opens
-/// through fills at the open with no slippage, and as a maker unless it is IOC. A venue would fill
-/// a resting order at its limit, or charge the taker fee if the order arrived after the gap.
-/// Upgrade with a trade-level fill model.
+/// shortcut: a resting limit a bar opens through fills at its own price, which assumes the market
+/// traded through it between the bars, as on a venue that trades around the clock with no gap.
+/// The broker keeps to that assumption for what follows from the fill: it comes before the fills
+/// at the open, and an attached stop between the limit and the open fills at its trigger on the
+/// way. A reduce-only limit with nothing to reduce between the bars waits for the open instead
+/// (see [`crate::SimBroker`]). After a real jump (a halt or an outage that reopens past the limit) a venue would fill the
+/// limit at the reopening price, which is better, so this errs against the strategy. Stops the bar
+/// opens through still fill at the open, which errs against the strategy the other way. Upgrade
+/// with a trade-level fill model.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CandleFillModel {
     pub slippage_bps: f64,
@@ -95,23 +109,18 @@ impl FillModel for CandleFillModel {
         } else {
             (bar.high, bar.low)
         };
-        let resting = if ioc {
-            Liquidity::Taker
-        } else {
-            Liquidity::Maker
-        };
+        // A resting limit fills at its own price, as a maker, whether the bar reaches it inside its
+        // range or opens through it. Through the open, it filled between the bars, so as of the
+        // open. An IOC order never rests, so it never fills here: its range is only the open, and
+        // a limit marketable there is taken below as a taker.
         let limit = |price: f64| {
             let reached = if buy { low <= price } else { high >= price };
-            let fill = if buy {
-                open.min(price)
-            } else {
-                open.max(price)
-            };
+            let through = if buy { open <= price } else { open >= price };
             if reached {
                 FillCheck::Fill {
-                    price: fill,
-                    liquidity: resting,
-                    market: fill,
+                    price,
+                    liquidity: Liquidity::Maker,
+                    market: if through { open } else { price },
                 }
             } else {
                 FillCheck::NoFill
@@ -141,7 +150,10 @@ impl FillModel for CandleFillModel {
             },
             OrderType::Limit { price } => {
                 let marketable_at = |level: f64| if buy { price >= level } else { price <= level };
-                if first && marketable_at(order.decision_close) && marketable_at(open) {
+                // An IOC order arrives at the open; any other limit at the decision close, and it
+                // rests from there unless it was marketable then.
+                let arrives_marketable = ioc || (first && marketable_at(order.decision_close));
+                if arrives_marketable && marketable_at(open) {
                     // Sent through the market, so it takes liquidity as soon as it arrives.
                     FillCheck::Fill {
                         price: cap(self.slip(open, req.side, inst), price),

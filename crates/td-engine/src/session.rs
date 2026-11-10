@@ -44,6 +44,7 @@ pub struct SessionConfig {
 }
 
 /// Equity at the close of the bar that opened at `time`.
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct EquityPoint {
     pub time: Millis,
@@ -134,14 +135,21 @@ impl Session {
     ///
     /// Liquidation: a perpetual position is liquidated when its equity at the bar's adverse
     /// extreme (the high for a short, the low for a long), less any funding it owes later in the
-    /// bar, falls below [`MAINTENANCE_MARGIN_RATE`] of its notional at that price. It is checked
-    /// twice: on the position held after the fills at the bar's open, and on the position after
-    /// all of the bar's fills. The path inside the bar is unknown, so the first check comes before
-    /// the fills inside the range, as stops come before limits, except for the stops the price
-    /// must cross on its way from the open to the liquidation price (a sell stop at or above it
-    /// for a long, a buy stop at or below it for a short): those fill first, nearest the open
-    /// first, and the check is made again after each. If it still liquidates, the other fills
-    /// inside the range do not happen and their orders are cancelled with the rest. The
+    /// bar, falls below [`MAINTENANCE_MARGIN_RATE`] of its notional at that price. The market is
+    /// taken to move from the previous bar to the open, trading through the resting limits the
+    /// bar opens through on the way (see [`crate::SimBroker`]), so the position is first checked
+    /// on that way: before each of those fills, and before the fills at the open, it is
+    /// liquidated if its liquidation price lies strictly before that fill's limit, or the open,
+    /// on the market's way there. Only the stops the bar opens through
+    /// whose triggers the market reached before the liquidation price (a sell stop at or above it
+    /// for a long, a buy stop at or below it for a short) fill before it, and the check is made
+    /// again after each. Then it is checked on the position held after the fills at the bar's
+    /// open, and last on the position after all of the bar's fills. The path inside the bar is
+    /// unknown, so the check after the fills at the open comes before the fills inside the range,
+    /// as stops come before limits, except for the stops the price must cross on its way from the
+    /// open to the liquidation price: those fill first, nearest the open first, and the check is
+    /// made again after each. Whenever it liquidates before some of the bar's fills, those fills
+    /// do not happen and their orders are cancelled with the rest. The
     /// liquidation price is where equity and maintenance meet, rounded to the tick on the side
     /// that triggers sooner; if the bar opened beyond it, the open. Every open order is cancelled,
     /// and the whole position is closed at that price with no slippage, recorded as a filled
@@ -170,7 +178,7 @@ impl Session {
         }
         let first_new_fill = self.fills.len();
         let instrument = &self.instrument;
-        let breached = |book: &Portfolio| liquidation_price(instrument, book, &bar, funding);
+        let breached = |book: &Portfolio| liquidation_trigger(instrument, book, &bar, funding);
         for event in self.broker.on_bar(&bar, &self.portfolio, &breached) {
             match event {
                 BrokerEvent::Filled(fill) => {
@@ -297,11 +305,18 @@ impl Session {
     /// Liquidates the perpetual position after `bar`'s fills if the bar's adverse extreme breaches
     /// the maintenance margin, as [`Session::on_bar`] describes. `funding` is the bar's funding.
     fn liquidate(&mut self, bar: &Candle, funding: &[(Millis, f64)]) {
-        let Some(price) = liquidation_price(&self.instrument, &self.portfolio, bar, funding) else {
+        let Some(trigger) = liquidation_trigger(&self.instrument, &self.portfolio, bar, funding)
+        else {
             return;
         };
         let q = self.portfolio.position();
         let long = q > 0.0;
+        // At the trigger, or at the open if the bar opened past it.
+        let price = if long {
+            bar.open.min(trigger)
+        } else {
+            bar.open.max(trigger)
+        };
         self.cancel_open_orders(LIQUIDATED);
         let (side, qty) = (if long { Side::Sell } else { Side::Buy }, q.abs());
         let id = OrderId(self.orders.len() as u64 + 1);
@@ -462,9 +477,10 @@ impl Session {
     }
 }
 
-/// The price at which `book`'s perpetual position is liquidated on `bar`, or `None` if it is not;
-/// see [`Session::on_bar`]. `funding` is the bar's funding.
-fn liquidation_price(
+/// The liquidation price of `book`'s perpetual position, where its equity meets maintenance
+/// rounded to the tick on the side that triggers sooner, if `bar` reaches it, or `None` if it does
+/// not; see [`Session::on_bar`]. The bar may open past it. `funding` is the bar's funding.
+fn liquidation_trigger(
     inst: &Instrument,
     book: &Portfolio,
     bar: &Candle,
@@ -490,11 +506,11 @@ fn liquidation_price(
             return None;
         }
         let trigger = inst.round_price(at, Rounding::Up);
-        (bar.low <= trigger).then(|| bar.open.min(trigger))
+        (bar.low <= trigger).then_some(trigger)
     } else {
         // At or below zero, the short is below maintenance at any price.
         let trigger = inst.round_price(at.max(0.0), Rounding::Down);
-        (bar.high >= trigger).then(|| bar.open.max(trigger))
+        (bar.high >= trigger).then_some(trigger)
     }
 }
 

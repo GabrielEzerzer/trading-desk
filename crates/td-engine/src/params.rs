@@ -36,6 +36,7 @@ pub struct ParamSpec {
 }
 
 /// Parameter values by name.
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Params(BTreeMap<String, ParamValue>);

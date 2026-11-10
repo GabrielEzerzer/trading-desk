@@ -12,7 +12,7 @@ use std::sync::Arc;
 use clap::Parser;
 use td_data::Store;
 use td_server::api::auth::Token;
-use td_server::api::source::VenueSource;
+use td_server::api::source::{VenueLive, VenueSource};
 use td_server::api::{ApiConfig, JOB_GRACE, Server};
 use tokio::sync::oneshot;
 
@@ -63,6 +63,7 @@ async fn run(cli: Cli) -> Result<(), String> {
     let server = Server::start(ApiConfig {
         store,
         source: Arc::new(VenueSource),
+        live: Arc::new(VenueLive),
         token,
         port: cli.port,
     })

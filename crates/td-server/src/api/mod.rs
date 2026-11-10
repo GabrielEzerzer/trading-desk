@@ -13,7 +13,20 @@
 //! - `GET /data/coverage?instrument=venue:symbol:kind`: which months and minutes the store holds.
 //! - `GET /strategies`: the registered strategies and their parameter specs.
 //! - `GET /jobs`, `GET /jobs/{id}`, `POST /jobs/{id}/cancel`: background jobs (see [`jobs`]).
-//! - `GET /ws`: topic subscriptions, `jobs` for now (see [`ws`]).
+//! - Paper sessions (see [`sessions`]):
+//!   - `POST /sessions` `{strategy, params, instrument, timeframe, starting_cash, slippage_bps,
+//!     fees?}`: creates a session and starts it, 201 with its summary. `instrument` is an
+//!     instrument id; its trading rules come from `GET /instruments`.
+//!   - `GET /sessions`: every session, oldest first, with its status and equity.
+//!   - `GET /sessions/{id}`: a session's full state: status, position, cash, equity curve, open
+//!     orders, fills and trades so far.
+//!   - `POST /sessions/{id}/stop`: 200 once stopped, 409 `not_running` if it was not running.
+//!   - `POST /sessions/{id}/resume`: replays a stopped session and starts it again, backfilling
+//!     what it missed; 409 `already_running` if it is running. A session that ended on its own
+//!     with an error counts as stopped. Its `session:` subscribers get the resumed state.
+//!
+//!   An unknown session id is a 404.
+//! - `GET /ws`: topic subscriptions: `jobs`, `candles:...` and `session:<id>` (see [`ws`]).
 //!
 //! On start the binary prints one line to stdout, `{"port":<n>,"token":"<hex>"}`
 //! ([`Handshake`]), and logs only to stderr.
@@ -22,6 +35,8 @@ pub mod auth;
 pub mod data;
 pub mod error;
 pub mod jobs;
+mod live;
+pub mod sessions;
 pub mod source;
 pub mod ts;
 pub mod ws;
@@ -50,10 +65,12 @@ use self::auth::Token;
 use self::data::InstrumentsResponse;
 use self::error::ApiError;
 use self::jobs::{JobInfo, Jobs};
-use self::source::MarketSource;
+use self::live::Streams;
+use self::sessions::Sessions;
+use self::source::{LiveSource, MarketSource};
 
-/// How long the binary waits on shutdown, first for open requests to finish and then for running
-/// jobs to reach a checkpoint, before it exits anyway.
+/// How long the binary waits on shutdown, first for open requests to finish and paper sessions to
+/// stop, and then for running jobs to reach a checkpoint, before it exits anyway.
 pub const JOB_GRACE: Duration = Duration::from_secs(5);
 
 /// What a server needs to start.
@@ -61,6 +78,8 @@ pub struct ApiConfig {
     /// The candle store; the binary uses td-data's data directory, tests a temporary one.
     pub store: Store,
     pub source: Arc<dyn MarketSource>,
+    /// Live candles for paper sessions and the `candles:` topic.
+    pub live: Arc<dyn LiveSource>,
     pub token: Token,
     /// The port on 127.0.0.1; 0 lets the operating system choose.
     pub port: u16,
@@ -75,6 +94,8 @@ pub(crate) struct AppState {
     store: Store,
     source: Arc<dyn MarketSource>,
     jobs: Arc<Jobs>,
+    sessions: Arc<Sessions>,
+    streams: Arc<Streams>,
     instruments: Mutex<InstrumentCache>,
     /// Turns true when the server is stopping; WebSocket connections close on it.
     shutdown: watch::Receiver<bool>,
@@ -98,23 +119,33 @@ pub struct Server {
     addr: SocketAddr,
     token: Token,
     jobs: Arc<Jobs>,
+    sessions: Arc<Sessions>,
     shutdown: watch::Sender<bool>,
     task: JoinHandle<io::Result<()>>,
 }
 
 impl Server {
-    /// Binds 127.0.0.1 on the configured port and starts serving in the background.
+    /// Binds 127.0.0.1 on the configured port, loads the saved paper sessions (stopped), and
+    /// starts serving in the background.
     pub async fn start(config: ApiConfig) -> io::Result<Server> {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, config.port)).await?;
         let addr = listener.local_addr()?;
         let (shutdown, shutdown_rx) = watch::channel(false);
         let jobs = Arc::new(Jobs::default());
+        let streams = Arc::new(Streams::new(config.live));
+        let (data_dir, loading) = (config.store.root().to_path_buf(), streams.clone());
+        let sessions = tokio::task::spawn_blocking(move || Sessions::load(&data_dir, loading))
+            .await
+            .map(Arc::new)
+            .map_err(|e| io::Error::other(format!("loading the paper sessions stopped: {e}")))?;
         let state = Arc::new(AppState {
             token: config.token.clone(),
             port: addr.port(),
             store: config.store,
             source: config.source,
             jobs: jobs.clone(),
+            sessions: sessions.clone(),
+            streams,
             instruments: Mutex::new(HashMap::new()),
             shutdown: shutdown_rx.clone(),
         });
@@ -131,6 +162,7 @@ impl Server {
             addr,
             token: config.token,
             jobs,
+            sessions,
             shutdown,
             task,
         })
@@ -157,12 +189,14 @@ impl Server {
         serde_json::to_string(&handshake).expect("a struct of a number and a string serializes")
     }
 
-    /// Stops accepting connections, closes WebSockets, asks running jobs to stop, and waits for
-    /// open requests to finish. Jobs stop at their next checkpoint on their own threads. The wait
-    /// has no limit of its own; the binary bounds it with [`JOB_GRACE`].
+    /// Stops accepting connections, closes WebSockets, asks running jobs to stop, stops every
+    /// running paper session, and waits for open requests to finish. Jobs stop at their next
+    /// checkpoint on their own threads. The wait has no limit of its own; the binary bounds it
+    /// with [`JOB_GRACE`].
     pub async fn shutdown(self) -> io::Result<()> {
         let _ = self.shutdown.send(true);
         self.jobs.cancel_all();
+        self.sessions.stop_all().await;
         self.task
             .await
             .map_err(|e| io::Error::other(format!("the server task stopped: {e}")))?
@@ -181,6 +215,10 @@ pub(crate) fn router(state: Arc<AppState>) -> Router {
         .route("/jobs", get(list_jobs))
         .route("/jobs/{id}", get(get_job))
         .route("/jobs/{id}/cancel", post(cancel_job))
+        .route("/sessions", get(sessions::list).post(sessions::start))
+        .route("/sessions/{id}", get(sessions::get))
+        .route("/sessions/{id}/stop", post(sessions::stop))
+        .route("/sessions/{id}/resume", post(sessions::resume))
         .route("/ws", get(ws::upgrade))
         .fallback(not_found)
         .method_not_allowed_fallback(method_not_allowed)
@@ -301,12 +339,16 @@ mod tests {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let token = Token::generate().unwrap();
+        let unused = std::env::temp_dir().join("td-server-unused");
+        let streams = Arc::new(Streams::new(Arc::new(source::VenueLive)));
         let state = Arc::new(AppState {
             token: token.clone(),
             port,
-            store: Store::new(std::env::temp_dir().join("td-server-unused")),
+            store: Store::new(&unused),
             source: Arc::new(NoSource),
             jobs: Arc::new(Jobs::default()),
+            sessions: Arc::new(Sessions::load(&unused, streams.clone())),
+            streams,
             instruments: Mutex::new(HashMap::new()),
             shutdown: watch::channel(false).1,
         });
