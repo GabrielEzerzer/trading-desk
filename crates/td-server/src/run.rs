@@ -20,6 +20,7 @@ use std::time::Duration;
 
 use td_core::{Candle, InstrumentId, InstrumentKind, Millis, Timeframe};
 use td_data::live::{FeedEvent, Rest, SharedStream, run_feed_on, stream_url};
+use td_data::time::round_to_minute;
 use td_data::{DataError, Store};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
@@ -339,8 +340,11 @@ impl FundingClock {
         clock
     }
 
-    /// Notes a rate at `time`, charged or seen.
+    /// Notes a rate at `time`, charged or seen. The time is rounded to the minute, as the venue
+    /// parsers round fetched rates, so a rate logged with a raw stamp a few milliseconds early is
+    /// not charged again when the same rate is fetched on the minute after a resume.
     fn seen(&mut self, time: Millis) {
+        let time = round_to_minute(time);
         if time > self.last {
             self.interval = time - self.last;
             self.last = time;
@@ -471,6 +475,15 @@ mod tests {
         );
         assert_eq!(clock.last, T);
         assert!(clock.take(&[(T, 0.2)], T + 6 * MIN, T + 7 * MIN).is_empty());
+    }
+
+    #[test]
+    fn a_rate_logged_a_few_ms_early_is_not_charged_again_when_fetched_on_the_minute() {
+        // A resumed session's log holds the rate due at T with the venue's raw stamp, 5 ms early.
+        let mut clock = FundingClock::new(&[(T - 16 * HOUR, 0.1), (T - 8 * HOUR, 0.1)], T - HOUR);
+        clock.seen(T - 5);
+        assert_eq!((clock.last, clock.interval), (T, 8 * HOUR));
+        assert!(clock.take(&[(T, 0.1)], T + MIN, T + 2 * MIN).is_empty());
     }
 
     /// Funding with one rate due at `T`, published from the `publish_on`th request on.
