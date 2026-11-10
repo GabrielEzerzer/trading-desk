@@ -11,8 +11,10 @@ pub enum FillCheck {
     Fill {
         price: f64,
         liquidity: Liquidity,
-        /// The market price the order met, before slippage and before capping at a limit. An
-        /// attached stop is checked against the rest of the bar from this price.
+        /// The market price the order met, before slippage and before capping at a limit. When it
+        /// is the bar's open, the broker takes the fill as happening at the open, before any fill
+        /// inside the bar's range. An attached stop is checked against the rest of the bar from
+        /// this price.
         market: f64,
     },
 }

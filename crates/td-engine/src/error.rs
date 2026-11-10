@@ -24,6 +24,9 @@ pub enum EngineError {
     #[error("funding was given for a spot instrument")]
     FundingOnSpot,
 
+    #[error("warm-up bars must all come before the first live bar")]
+    WarmUpAfterLive,
+
     #[error("invalid session config: {0}")]
     InvalidConfig(&'static str),
 
