@@ -139,6 +139,10 @@ impl Session {
                 BrokerEvent::Cancelled { id, reason } => {
                     self.order_mut(id).status = OrderStatus::Cancelled(reason);
                 }
+                BrokerEvent::Placed(order) => {
+                    let id = order.id;
+                    *self.order_mut(id) = order;
+                }
             }
         }
         for &(_, rate) in funding {

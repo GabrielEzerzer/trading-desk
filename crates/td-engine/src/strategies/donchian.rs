@@ -1,4 +1,4 @@
-use td_core::{Candle, Fill, InstrumentKind, OrderId, OrderType, Side};
+use td_core::{Candle, InstrumentKind, OrderId, OrderType, Side};
 
 use super::{affordable_qty, order};
 use crate::{
@@ -10,10 +10,11 @@ use crate::{
 /// Enters long when the close breaks above the highest high of the previous `entry` bars (short
 /// below the lowest low, with `allow_short` on a perpetual), and exits when the close breaks the
 /// opposite `exit` channel. The position is sized so that a stop `atr_stop` ATRs from the entry
-/// loses `risk` of equity, and that stop is placed as a reduce-only stop order once the entry
-/// fills. The size is also capped so that the entry's value, plus the taker fee, slippage and a
-/// small margin, fits in the cash: the strategy never uses leverage, and a spot entry passes the
-/// cash check.
+/// loses `risk` of equity. That stop sits `atr_stop` ATRs from the close the entry is decided on
+/// and is attached to the entry, so it is placed as a reduce-only stop order when the entry fills
+/// and already covers the entry's own bar. The size is also capped so that the entry's value,
+/// plus the taker fee, slippage and a small margin, fits in the cash: the strategy never uses
+/// leverage, and a spot entry passes the cash check.
 ///
 /// ATR here is the simple mean of the true range over `atr_period` bars.
 #[derive(Debug, Clone)]
@@ -24,8 +25,7 @@ pub struct DonchianBreakout {
     pub atr_stop: f64,
     pub risk: f64,
     pub allow_short: bool,
-    /// The pending entry order and the ATR it was sized with.
-    pending_entry: Option<(OrderId, f64)>,
+    /// The protective stop attached to the current entry.
     stop: Option<OrderId>,
 }
 
@@ -52,7 +52,7 @@ pub(crate) fn entry() -> StrategyEntry {
                 default: ParamValue::Float(2.0),
                 min: Some(0.1),
                 max: None,
-                description: "Distance from the entry price to the stop, in ATRs.",
+                description: "Distance from the close the entry is decided on to its stop, in ATRs.",
             },
             ParamSpec {
                 name: "risk",
@@ -83,7 +83,6 @@ fn build(p: &Params) -> Result<Box<dyn Strategy>, EngineError> {
         atr_stop: p.float("atr_stop")?,
         risk: p.float("risk")?,
         allow_short: p.bool("allow_short")?,
-        pending_entry: None,
         stop: None,
     }))
 }
@@ -133,18 +132,21 @@ impl Strategy for DonchianBreakout {
             }
             let can_short =
                 self.allow_short && ctx.instrument().id.kind == InstrumentKind::Perpetual;
-            let side = if bar.close > highest(channel) {
-                Side::Buy
+            let distance = self.atr_stop * atr;
+            let (side, trigger) = if bar.close > highest(channel) {
+                (Side::Buy, bar.close - distance)
             } else if can_short && bar.close < lowest(channel) {
-                Side::Sell
+                (Side::Sell, bar.close + distance)
             } else {
                 return;
             };
             // Flat here, so the cash is the whole equity.
             let affordable = affordable_qty(ctx, ctx.cash(), bar.close);
-            let qty = (self.risk * ctx.equity() / (self.atr_stop * atr)).min(affordable);
-            if let Ok(id) = ctx.submit(order(ctx, side, qty, OrderType::Market, false)) {
-                self.pending_entry = Some((id, atr));
+            let qty = (self.risk * ctx.equity() / distance).min(affordable);
+            let entry = order(ctx, side, qty, OrderType::Market, false);
+            if let Ok(id) = ctx.submit_with_stop(entry, trigger) {
+                // The attached stop is recorded under the entry's id plus one.
+                self.stop = Some(OrderId(id.0 + 1));
             }
         } else {
             let channel = &previous[previous.len() - self.exit..];
@@ -164,26 +166,6 @@ impl Strategy for DonchianBreakout {
                 };
                 let _ = ctx.submit(order(ctx, side, position.abs(), OrderType::Market, true));
             }
-        }
-    }
-
-    fn on_fill(&mut self, ctx: &mut Context, fill: &Fill) {
-        match self.pending_entry {
-            Some((id, atr)) if id == fill.order_id => {
-                self.pending_entry = None;
-                let distance = self.atr_stop * atr;
-                let (side, trigger) = match fill.side {
-                    Side::Buy => (Side::Sell, fill.price - distance),
-                    Side::Sell => (Side::Buy, fill.price + distance),
-                };
-                if trigger > 0.0 {
-                    let stop = OrderType::Stop { trigger };
-                    let req = order(ctx, side, ctx.position().abs(), stop, true);
-                    self.stop = ctx.submit(req).ok();
-                }
-            }
-            _ if Some(fill.order_id) == self.stop => self.stop = None,
-            _ => {}
         }
     }
 }

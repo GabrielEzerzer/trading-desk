@@ -11,11 +11,16 @@ pub enum FillCheck {
     Fill {
         price: f64,
         liquidity: Liquidity,
+        /// The market price the order met, before slippage and before capping at a limit. An
+        /// attached stop is checked against the rest of the bar from this price.
+        market: f64,
     },
 }
 
 /// Decides whether and at what price an order fills on a bar. The broker calls it only for bars
-/// after the one the order was decided on, and handles fees, ordering and order state.
+/// after the one the order was decided on, and handles fees, ordering and order state. For an
+/// attached stop it also calls it on its entry's fill bar, with the bar's open replaced by the
+/// entry's market price.
 pub trait FillModel: Send {
     /// `first` says whether this is the first bar the order can fill on. `triggered` says whether
     /// a stop-limit was triggered on an earlier bar.
@@ -102,6 +107,7 @@ impl FillModel for CandleFillModel {
                 FillCheck::Fill {
                     price: fill,
                     liquidity: resting,
+                    market: fill,
                 }
             } else {
                 FillCheck::NoFill
@@ -127,6 +133,7 @@ impl FillModel for CandleFillModel {
             OrderType::Market => FillCheck::Fill {
                 price: self.slip(open, req.side, inst),
                 liquidity: Liquidity::Taker,
+                market: open,
             },
             OrderType::Limit { price } => {
                 let marketable_at = |level: f64| if buy { price >= level } else { price <= level };
@@ -135,6 +142,7 @@ impl FillModel for CandleFillModel {
                     FillCheck::Fill {
                         price: cap(self.slip(open, req.side, inst), price),
                         liquidity: Liquidity::Taker,
+                        market: open,
                     }
                 } else {
                     limit(price)
@@ -143,6 +151,7 @@ impl FillModel for CandleFillModel {
             OrderType::Stop { trigger } if reaches(trigger) => FillCheck::Fill {
                 price: self.slip(trigger_point(trigger), req.side, inst),
                 liquidity: Liquidity::Taker,
+                market: trigger_point(trigger),
             },
             OrderType::Stop { .. } => FillCheck::NoFill,
             OrderType::StopLimit { price, .. } if triggered => limit(price),
@@ -155,6 +164,7 @@ impl FillModel for CandleFillModel {
                 FillCheck::Fill {
                     price: cap(self.slip(point, req.side, inst), price),
                     liquidity: Liquidity::Taker,
+                    market: point,
                 }
             }
             OrderType::StopLimit { .. } => FillCheck::NoFill,

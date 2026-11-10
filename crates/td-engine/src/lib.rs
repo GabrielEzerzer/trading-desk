@@ -21,7 +21,7 @@ mod session;
 mod strategies;
 mod strategy;
 
-pub use broker::{Broker, BrokerEvent, Order, OrderStatus, SimBroker};
+pub use broker::{AttachedStop, Broker, BrokerEvent, Order, OrderStatus, SimBroker};
 pub use error::{EngineError, OrderRejected};
 pub use fill::{CandleFillModel, FillCheck, FillModel};
 pub use params::{ParamKind, ParamSpec, ParamValue, Params};
