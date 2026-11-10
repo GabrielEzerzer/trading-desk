@@ -15,7 +15,9 @@ use super::data::{
 };
 use super::error::{ErrorBody, ErrorResponse};
 use super::jobs::{JobCreated, JobInfo, JobKind, JobRequest, JobResult, JobStatus};
+use super::sessions::{PositionInfo, SessionState, SessionSummary, StartSessionRequest};
 use super::ws::{ClientMessage, ServerMessage};
+use crate::{Funding, PaperConfig, SessionEvent, Status};
 
 /// Where the declarations live, from the repository root.
 pub const OUTPUT: &str = "gui/shared/src/api-types.ts";
@@ -53,9 +55,25 @@ pub fn render() -> String {
         td_core::InstrumentId,
         td_core::FeeSchedule,
         td_core::Instrument,
+        td_core::Timeframe,
+        td_core::Candle,
+        td_core::Side,
+        td_core::OrderType,
+        td_core::TimeInForce,
+        td_core::OrderId,
+        td_core::OrderRequest,
+        td_core::Liquidity,
+        td_core::Fill,
         td_engine::ParamKind,
         td_engine::ParamValue,
         td_engine::ParamSpec,
+        td_engine::Params,
+        td_engine::AttachedStop,
+        td_engine::OrderStatus,
+        td_engine::Order,
+        td_engine::EquityPoint,
+        td_engine::TradeSide,
+        td_engine::Trade,
         // the API
         Handshake,
         ErrorResponse,
@@ -77,6 +95,14 @@ pub fn render() -> String {
         JobStatus,
         JobRequest,
         JobResult,
+        PaperConfig,
+        Funding,
+        Status,
+        StartSessionRequest,
+        SessionSummary,
+        PositionInfo,
+        SessionState,
+        SessionEvent,
         ClientMessage,
         ServerMessage,
     );

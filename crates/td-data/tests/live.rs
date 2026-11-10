@@ -6,7 +6,9 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use td_core::{Candle, InstrumentId, InstrumentKind, Millis, Timeframe, Venue};
-use td_data::live::{FeedEvent, FeedSpec, Rest, parse_message, run_feed};
+use td_data::live::{
+    FeedEvent, FeedSpec, Rest, SharedStream, parse_message, run_feed, run_feed_on,
+};
 use td_data::{DataError, binance, bybit, resample};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
@@ -293,5 +295,88 @@ async fn a_dropped_connection_is_reconnected_and_the_missed_minutes_backfilled()
         events
             .iter()
             .any(|e| matches!(e, FeedEvent::BackfillFailed { .. }))
+    );
+}
+
+/// The next bar a feed sends, or fails after 20 s.
+async fn next_bar(rx: &mut mpsc::Receiver<FeedEvent>) -> Candle {
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(20), rx.recv())
+            .await
+            .expect("a bar in time");
+        match event {
+            Some(FeedEvent::Bar(bar)) => return bar,
+            Some(_) => {}
+            None => panic!("the feed ended"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn feeds_of_two_timeframes_share_one_connection_which_closes_when_both_are_gone() {
+    let all = minutes();
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let url = format!("ws://{}/", listener.local_addr().expect("address"));
+    let stream = Arc::new(SharedStream::open(btc(Venue::Binance), url));
+    let (tcp, _) = listener.accept().await.expect("accept");
+    let mut socket = tokio_tungstenite::accept_async(tcp).await.expect("upgrade");
+
+    // One feed starts before the connection is up, one after; both learn it is connected.
+    let rest = FakeRest::new(all.clone(), 0);
+    let (m1_tx, mut m1) = mpsc::channel(64);
+    let m1_feed = tokio::spawn(run_feed_on(
+        stream.clone(),
+        Timeframe::M1,
+        Some(T0),
+        rest.clone(),
+        m1_tx,
+    ));
+    assert_eq!(m1.recv().await, Some(FeedEvent::Connected));
+    let (m5_tx, mut m5) = mpsc::channel(64);
+    let m5_feed = tokio::spawn(run_feed_on(
+        stream.clone(),
+        Timeframe::M5,
+        Some(T0),
+        rest.clone(),
+        m5_tx,
+    ));
+    assert_eq!(m5.recv().await, Some(FeedEvent::Connected));
+    drop(stream);
+
+    for minute in &all {
+        let frame = format!(
+            r#"{{"e":"kline","E":1,"s":"BTCUSDT","k":{{"t":{},"i":"1m","o":"{}","h":"{}","l":"{}","c":"{}","v":"{}","q":"{}","x":true}}}}"#,
+            minute.open_time,
+            minute.open,
+            minute.high,
+            minute.low,
+            minute.close,
+            minute.volume,
+            minute.quote_volume
+        );
+        socket.send(Message::text(frame)).await.expect("sends");
+    }
+    let mut m1_bars = Vec::new();
+    for _ in 0..all.len() {
+        m1_bars.push(next_bar(&mut m1).await);
+    }
+    assert_eq!(m1_bars, all);
+    assert_eq!(
+        vec![next_bar(&mut m5).await],
+        resample(&all, Timeframe::M5, false).candles
+    );
+    assert!(rest.calls().is_empty(), "nothing was missed");
+
+    // The connection outlives one feed and closes with the last.
+    m1_feed.abort();
+    let held = tokio::time::timeout(Duration::from_millis(300), socket.next()).await;
+    assert!(held.is_err(), "closed while a feed still ran: {held:?}");
+    m5_feed.abort();
+    let ended = tokio::time::timeout(Duration::from_secs(5), socket.next())
+        .await
+        .expect("the connection is still open after both feeds were aborted");
+    assert!(
+        matches!(ended, None | Some(Err(_) | Ok(Message::Close(_)))),
+        "{ended:?}"
     );
 }

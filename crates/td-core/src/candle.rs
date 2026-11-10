@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use crate::{CoreError, Millis};
 
 /// One OHLCV bar. `open_time` is the start of the bar's timeframe bucket.
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Candle {
     pub open_time: Millis,

@@ -14,7 +14,11 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use td_core::{Candle, FeeSchedule, Fill, Instrument, Millis, Timeframe};
-use td_engine::{EquityPoint, Order, Params, Portfolio, Session, SessionConfig, build_strategy};
+use td_engine::{
+    EquityPoint, Order, OrderStatus, Params, Portfolio, Session, SessionConfig, build_strategy,
+};
+use tokio::sync::broadcast;
+use ts_rs::TS;
 
 use crate::PaperError;
 
@@ -23,7 +27,7 @@ const EVENTS_FILE: &str = "events.jsonl";
 
 /// What a paper session runs: a registered strategy with its parameters, on one instrument and
 /// timeframe, with the same money settings as a backtest.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 pub struct PaperConfig {
     pub strategy: String,
     pub params: Params,
@@ -38,7 +42,7 @@ pub struct PaperConfig {
 }
 
 /// A funding rate fed with a bar.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, TS)]
 pub struct Funding {
     /// The time the engine was given, inside the bar's window.
     pub time: Millis,
@@ -60,7 +64,7 @@ pub struct FedBar {
 }
 
 /// Where a paper session is.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(tag = "status", content = "message", rename_all = "snake_case")]
 pub enum Status {
     /// Feeding recent history to the strategy before trading.
@@ -73,6 +77,36 @@ pub enum Status {
     Stopped,
     /// Stopped by an error.
     Error(String),
+}
+
+/// What a session reports as it runs, once [`PaperSession::set_events`] gives it a channel. Sent
+/// while the session is locked, so a reader that subscribes and takes the state under the same lock
+/// sees each change exactly once. Replaying the log reports nothing.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(tag = "event", rename_all = "snake_case")]
+pub enum SessionEvent {
+    /// A funding rate charged with the bar that follows.
+    Funding {
+        funding: Funding,
+    },
+    /// A fill on the bar that follows.
+    Fill {
+        fill: Fill,
+    },
+    /// An order submitted, or one that changed state, on the bar that follows.
+    Order {
+        order: Order,
+    },
+    /// A bar the strategy has processed, after the events it caused. `equity` is the equity at its
+    /// close; warm-up bars have none.
+    Bar {
+        bar: Candle,
+        warm_up: bool,
+        equity: Option<f64>,
+    },
+    Status {
+        status: Status,
+    },
 }
 
 /// One strategy paper trading one instrument, and its files.
@@ -89,6 +123,7 @@ pub struct PaperSession {
     live_from: Option<Millis>,
     dropped: Vec<Millis>,
     warnings: Vec<String>,
+    events: Option<broadcast::Sender<SessionEvent>>,
 }
 
 /// The folder of a paper session.
@@ -137,6 +172,7 @@ impl PaperSession {
             live_from: None,
             dropped: Vec::new(),
             warnings: Vec::new(),
+            events: None,
         })
     }
 
@@ -188,6 +224,7 @@ impl PaperSession {
             live_from: None,
             dropped: Vec::new(),
             warnings,
+            events: None,
         };
         let text = String::from_utf8_lossy(&bytes[..complete]);
         for (index, line) in text.lines().enumerate() {
@@ -217,7 +254,11 @@ impl PaperSession {
             funding,
             warm_up,
         };
+        let before = self.events.as_ref().map(|_| self.mark());
         self.apply(&fed)?;
+        if let Some(before) = before {
+            self.report(&fed, before);
+        }
         let mut line = serde_json::to_string(&fed).map_err(|e| PaperError::BadFile {
             path: self.log_path.clone(),
             reason: e.to_string(),
@@ -234,6 +275,68 @@ impl PaperSession {
                 }
             })
             .map_err(PaperError::io(&self.log_path))
+    }
+
+    /// Where the orders and fills stand, to report what a bar changes.
+    fn mark(&self) -> Mark {
+        let orders = self.session.orders();
+        Mark {
+            orders: orders.len(),
+            fills: self.session.fills().len(),
+            pending: orders
+                .iter()
+                .enumerate()
+                .filter(|(_, o)| matches!(o.status, OrderStatus::Open | OrderStatus::Attached))
+                .map(|(i, o)| (i, o.status.clone()))
+                .collect(),
+        }
+    }
+
+    /// Sends the events of the bar just applied.
+    fn report(&self, fed: &FedBar, before: Mark) {
+        let orders = self.session.orders();
+        let changed = before
+            .pending
+            .iter()
+            .filter(|(i, status)| orders.get(*i).is_some_and(|o| o.status != *status))
+            .map(|(i, _)| *i)
+            .chain(before.orders..orders.len());
+        let mut events: Vec<SessionEvent> = Vec::new();
+        if !fed.warm_up {
+            events.extend(
+                fed.funding
+                    .iter()
+                    .map(|&funding| SessionEvent::Funding { funding }),
+            );
+        }
+        events.extend(
+            self.session.fills()[before.fills..]
+                .iter()
+                .map(|fill| SessionEvent::Fill { fill: fill.clone() }),
+        );
+        events.extend(changed.map(|i| SessionEvent::Order {
+            order: orders[i].clone(),
+        }));
+        events.push(SessionEvent::Bar {
+            bar: fed.bar,
+            warm_up: fed.warm_up,
+            equity: (!fed.warm_up).then(|| self.session.portfolio().equity()),
+        });
+        for event in events {
+            self.emit(event);
+        }
+    }
+
+    /// Sends an event to the channel, if there is one. No one listening is fine.
+    fn emit(&self, event: SessionEvent) {
+        if let Some(events) = &self.events {
+            let _ = events.send(event);
+        }
+    }
+
+    /// Gives the session a channel to report its events on, from now on.
+    pub fn set_events(&mut self, events: broadcast::Sender<SessionEvent>) {
+        self.events = Some(events);
     }
 
     fn apply(&mut self, fed: &FedBar) -> Result<(), PaperError> {
@@ -266,7 +369,10 @@ impl PaperSession {
     }
 
     pub(crate) fn set_status(&mut self, status: Status) {
-        self.status = status;
+        if self.status != status {
+            self.status = status.clone();
+            self.emit(SessionEvent::Status { status });
+        }
     }
 
     /// The engine session, for anything the accessors below do not cover.
@@ -341,6 +447,14 @@ impl PaperSession {
         }
         self.warnings.push(warning);
     }
+}
+
+/// Orders and fills before a bar: how many there were, and the orders that could still change, by
+/// index, with their status.
+struct Mark {
+    orders: usize,
+    fills: usize,
+    pending: Vec<(usize, OrderStatus)>,
 }
 
 fn build_session(config: &PaperConfig) -> Result<Session, PaperError> {

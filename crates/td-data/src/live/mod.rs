@@ -6,6 +6,10 @@
 //! It turns the minutes into bars of the session's timeframe and emits a bar once its bucket is
 //! settled, by the same resampling rule as the store ([`crate::resample`]).
 //!
+//! One connection can serve many feeds: a [`SharedStream`] reads an instrument's stream once and
+//! every feed run on it with [`run_feed_on`] builds its own bars, from its own start, out of the
+//! same frames.
+//!
 //! The feed never asks the clock: a gap is noticed when the next closed minute arrives, so after a
 //! reconnect the missing minutes are backfilled when the first closed minute comes in, at most a
 //! minute later. By then REST has published every minute before it.
@@ -15,10 +19,12 @@ mod parse;
 mod ws;
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use td_core::{Candle, InstrumentId, InstrumentKind, Millis, Timeframe, Venue};
-use tokio::sync::mpsc;
+use tokio::sync::broadcast::error::RecvError;
+use tokio::sync::{broadcast, mpsc};
 
 pub use bars::{BarBuilder, Placement};
 pub use parse::{KlineUpdate, parse_binance, parse_bybit, parse_message};
@@ -186,23 +192,85 @@ pub enum FeedEvent {
     BadMessage { error: String },
 }
 
-/// Runs a feed until `tx`'s receiver is dropped.
+/// Runs a feed on its own connection until `tx`'s receiver is dropped.
 pub async fn run_feed(spec: FeedSpec, rest: Arc<dyn Rest>, tx: mpsc::Sender<FeedEvent>) {
-    install_crypto_provider();
-    let (frames_tx, mut frames) = mpsc::channel(FRAME_BUFFER);
-    // Aborted however the feed ends, also when its own task is aborted or dropped mid-await.
-    let _reader = AbortOnDrop(tokio::spawn(ws::run_reader(
-        spec.url.clone(),
-        greeting(&spec.id),
-        frames_tx,
-    )));
+    let stream = Arc::new(SharedStream::open(spec.id, spec.url));
+    run_feed_on(stream, spec.timeframe, spec.start, rest, tx).await;
+}
+
+/// One connection to an instrument's 1-minute stream, read once and handed to any number of feeds
+/// ([`run_feed_on`]). It reconnects on its own, and closes when the last handle is dropped. Open it
+/// from inside a tokio runtime.
+pub struct SharedStream {
+    id: InstrumentId,
+    frames: broadcast::Sender<Inbound>,
+    /// Whether the connection is up, so a feed that joins later still learns it is connected.
+    connected: Arc<AtomicBool>,
+    _reader: AbortOnDrop,
+}
+
+impl SharedStream {
+    /// Connects to `url`, which serves `id`'s venue's message format.
+    pub fn open(id: InstrumentId, url: String) -> SharedStream {
+        install_crypto_provider();
+        let (frames, _) = broadcast::channel(FRAME_BUFFER);
+        let connected = Arc::new(AtomicBool::new(false));
+        let (reader_tx, mut reader_rx) = mpsc::channel(FRAME_BUFFER);
+        let (out, flag, greeting) = (frames.clone(), connected.clone(), greeting(&id));
+        let reader = tokio::spawn(async move {
+            let _reader = AbortOnDrop(tokio::spawn(ws::run_reader(url, greeting, reader_tx)));
+            while let Some(inbound) = reader_rx.recv().await {
+                match inbound {
+                    Inbound::Connected => flag.store(true, Ordering::SeqCst),
+                    Inbound::Disconnected { .. } | Inbound::ConnectFailed { .. } => {
+                        flag.store(false, Ordering::SeqCst);
+                    }
+                    Inbound::Text(_) => {}
+                }
+                // No feed listening is fine; one that falls behind loses frames, recovered as a gap.
+                let _ = out.send(inbound);
+            }
+        });
+        SharedStream {
+            id,
+            frames,
+            connected,
+            _reader: AbortOnDrop(reader),
+        }
+    }
+
+    pub fn id(&self) -> &InstrumentId {
+        &self.id
+    }
+}
+
+/// Runs a feed of `timeframe` bars from `start` (see [`FeedSpec::start`]) on a shared stream,
+/// until `tx`'s receiver is dropped. The feed keeps the stream open while it runs.
+pub async fn run_feed_on(
+    stream: Arc<SharedStream>,
+    timeframe: Timeframe,
+    start: Option<Millis>,
+    rest: Arc<dyn Rest>,
+    tx: mpsc::Sender<FeedEvent>,
+) {
+    let mut frames = stream.frames.subscribe();
     let mut feed = Feed {
-        builder: BarBuilder::new(spec.timeframe, spec.start),
-        id: spec.id,
+        builder: BarBuilder::new(timeframe, start),
+        id: stream.id.clone(),
         rest,
         tx,
     };
-    while let Some(inbound) = frames.recv().await {
+    // Subscribed first, so a connect that happens now is seen at worst twice, never missed.
+    if stream.connected.load(Ordering::SeqCst) && feed.send(FeedEvent::Connected).await.is_err() {
+        return;
+    }
+    loop {
+        let inbound = match frames.recv().await {
+            Ok(inbound) => inbound,
+            // The frames it missed show up as a gap at the next closed minute, which is backfilled.
+            Err(RecvError::Lagged(_)) => continue,
+            Err(RecvError::Closed) => break,
+        };
         if feed.handle(inbound).await.is_err() {
             break;
         }
