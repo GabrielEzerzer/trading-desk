@@ -283,6 +283,14 @@ fn list_is_newest_first_and_skips_other_entries() {
         })
         .expect("the second save still had the first run's id after 100 tries");
     std::fs::create_dir(runs.join(".tmp-1762790000123-0a1b2c3d")).unwrap();
+    // A save's temporary directory, here holding a whole run, is not listed.
+    let tmp = runs.join(".tmp-1762790000123-0a1b2c3d-4242-7");
+    std::fs::create_dir(&tmp).unwrap();
+    std::fs::copy(
+        runs.join(first.as_str()).join("result.json"),
+        tmp.join("result.json"),
+    )
+    .unwrap();
     std::fs::create_dir(runs.join("not-a-run")).unwrap();
     std::fs::create_dir(runs.join("1762790000123-0a1b2c3d")).unwrap();
     let ids: Vec<_> = list(runs).unwrap().into_iter().map(|s| s.id).collect();
@@ -291,6 +299,53 @@ fn list_is_newest_first_and_skips_other_entries() {
         load(runs, "../outside"),
         Err(td_engine::StoreError::InvalidRunId(_))
     ));
+}
+
+#[test]
+fn concurrent_saves_of_the_same_run_neither_fail_nor_clobber_each_other() {
+    let saved = SavedRun::Backtest(Box::new(run_synthetic()));
+    let mut same_id = 0;
+    for _ in 0..200 {
+        let dir = tempfile::tempdir().unwrap();
+        let runs = dir.path();
+        let barrier = std::sync::Barrier::new(2);
+        let (a, b) = std::thread::scope(|s| {
+            let save_after_barrier = || {
+                barrier.wait();
+                save_with_files(&saved, runs, &[("data.json", "{}".as_bytes())])
+            };
+            let a = s.spawn(save_after_barrier);
+            let b = s.spawn(save_after_barrier);
+            (a.join().unwrap(), b.join().unwrap())
+        });
+        let mut ids = Vec::new();
+        for r in [a, b] {
+            match r {
+                Ok(id) => ids.push(id),
+                Err(td_engine::StoreError::RunExists(_)) => same_id += 1,
+                Err(e) => panic!("a concurrent save failed: {e}"),
+            }
+        }
+        // One save at least succeeds, and two that do have different ids.
+        assert!(!ids.is_empty());
+        ids.sort();
+        ids.dedup();
+        for id in &ids {
+            assert_eq!(load(runs, id.as_str()).unwrap(), saved);
+            let run_dir = runs.join(id.as_str());
+            assert_eq!(std::fs::read(run_dir.join("data.json")).unwrap(), b"{}");
+            assert!(run_dir.join("config.json").is_file());
+        }
+        // Only the saved runs are left: no temporary directory.
+        let mut left: Vec<_> = std::fs::read_dir(runs)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        left.sort();
+        let ids: Vec<_> = ids.iter().map(|id| id.to_string()).collect();
+        assert_eq!(left, ids);
+    }
+    eprintln!("{same_id} of 200 rounds saved both runs in the same millisecond");
 }
 
 #[test]

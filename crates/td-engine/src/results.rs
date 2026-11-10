@@ -8,6 +8,7 @@ use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -20,6 +21,9 @@ use crate::{BacktestConfig, BacktestResult, OosResult, SweepResult, WalkForwardR
 
 const CONFIG_FILE: &str = "config.json";
 const RESULT_FILE: &str = "result.json";
+
+/// Numbers each save's temporary directory within this process.
+static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -190,7 +194,9 @@ pub struct RunSummary {
 /// Saves a result and returns its new id.
 ///
 /// Both files are written into a temporary directory inside `runs_dir`, which is then renamed to
-/// the run's id, so a run appears whole or not at all. `runs_dir` is created if needed.
+/// the run's id, so a run appears whole or not at all. `runs_dir` is created if needed. A run with
+/// the same id already saved, by this call's time or by another save racing it, is
+/// [`StoreError::RunExists`]; saving again in a later millisecond gives a new id.
 pub fn save(run: &SavedRun, runs_dir: &Path) -> Result<RunId, StoreError> {
     save_with_files(run, runs_dir, &[])
 }
@@ -232,9 +238,19 @@ pub fn save_with_files(
     if dest.exists() {
         return Err(StoreError::RunExists(id));
     }
-    let tmp = runs_dir.join(format!(".tmp-{id}"));
+    // Unique to this call, so two saves of the same run in the same millisecond (one id) never
+    // share a temporary directory, and each removes only its own.
+    let n = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp = runs_dir.join(format!(".tmp-{id}-{}-{n}", std::process::id()));
+    match fs::create_dir(&tmp) {
+        Ok(()) => {}
+        // A directory left by a process that had this pid; a later save gets a new name.
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            return Err(StoreError::RunExists(id));
+        }
+        Err(e) => return Err(io_err(&tmp)(e)),
+    }
     let write = || -> Result<(), StoreError> {
-        fs::create_dir(&tmp).map_err(io_err(&tmp))?;
         let own = [
             (CONFIG_FILE, config_json.as_bytes()),
             (RESULT_FILE, result_json.as_bytes()),
@@ -243,7 +259,15 @@ pub fn save_with_files(
             let path = tmp.join(name);
             fs::write(&path, contents).map_err(io_err(&path))?;
         }
-        fs::rename(&tmp, &dest).map_err(io_err(&dest))
+        // Another save of the same run can land between the check above and here; the rename
+        // then fails, as no file system renames a directory over a non-empty one.
+        fs::rename(&tmp, &dest).map_err(|e| {
+            if dest.exists() {
+                StoreError::RunExists(id.clone())
+            } else {
+                io_err(&dest)(e)
+            }
+        })
     };
     write().inspect_err(|_| {
         let _ = fs::remove_dir_all(&tmp);
