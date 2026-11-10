@@ -11,5 +11,5 @@ mod paper;
 mod run;
 
 pub use error::PaperError;
-pub use paper::{FedBar, Funding, PaperConfig, PaperSession, Status, paper_dir};
-pub use run::{PaperHandle, WARM_UP_BARS, start, start_with_stream};
+pub use paper::{FedBar, Funding, PaperConfig, PaperSession, SessionEvent, Status, paper_dir};
+pub use run::{PaperHandle, WARM_UP_BARS, start, start_on, start_with_stream};

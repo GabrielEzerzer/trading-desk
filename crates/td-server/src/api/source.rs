@@ -1,7 +1,10 @@
-//! Where market data comes from. The server reaches the venues only through [`MarketSource`], so
-//! tests can hand it a fake and never touch the network.
+//! Where market data comes from. The server reaches the venues only through [`MarketSource`] and
+//! [`LiveSource`], so tests can hand it fakes and never touch the network.
+
+use std::sync::Arc;
 
 use td_core::{InstrumentId, InstrumentKind, Millis, Venue};
+use td_data::live::{Rest, VenueRest};
 use td_data::{DataError, DownloadReport, Http, InstrumentList, Store};
 
 /// Venue access. Every method blocks, and is called from a blocking thread, never from the async
@@ -61,5 +64,28 @@ impl MarketSource for VenueSource {
         to: Millis,
     ) -> Result<usize, DataError> {
         td_data::download_funding(&Http::new()?, store, id, from, to)
+    }
+}
+
+/// Live market data, for paper sessions and the `candles:` WebSocket topic: the venue's REST calls
+/// a live feed needs, and the WebSocket stream of an instrument's 1-minute bars.
+pub trait LiveSource: Send + Sync + 'static {
+    fn rest(&self) -> Arc<dyn Rest>;
+
+    /// The stream for `id`, serving its venue's message format.
+    fn stream_url(&self, id: &InstrumentId) -> String;
+}
+
+/// The venues' public REST APIs and streams.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct VenueLive;
+
+impl LiveSource for VenueLive {
+    fn rest(&self) -> Arc<dyn Rest> {
+        Arc::new(VenueRest)
+    }
+
+    fn stream_url(&self, id: &InstrumentId) -> String {
+        td_data::live::stream_url(id)
     }
 }
