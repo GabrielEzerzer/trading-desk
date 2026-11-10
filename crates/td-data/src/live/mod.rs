@@ -190,11 +190,12 @@ pub enum FeedEvent {
 pub async fn run_feed(spec: FeedSpec, rest: Arc<dyn Rest>, tx: mpsc::Sender<FeedEvent>) {
     install_crypto_provider();
     let (frames_tx, mut frames) = mpsc::channel(FRAME_BUFFER);
-    let reader = tokio::spawn(ws::run_reader(
+    // Aborted however the feed ends, also when its own task is aborted or dropped mid-await.
+    let _reader = AbortOnDrop(tokio::spawn(ws::run_reader(
         spec.url.clone(),
         greeting(&spec.id),
         frames_tx,
-    ));
+    )));
     let mut feed = Feed {
         builder: BarBuilder::new(spec.timeframe, spec.start),
         id: spec.id,
@@ -206,7 +207,15 @@ pub async fn run_feed(spec: FeedSpec, rest: Arc<dyn Rest>, tx: mpsc::Sender<Feed
             break;
         }
     }
-    reader.abort();
+}
+
+/// Aborts a spawned task when dropped.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 /// The receiver of a feed's events is gone.

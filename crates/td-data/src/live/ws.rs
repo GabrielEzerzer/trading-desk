@@ -24,6 +24,9 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 /// WebSocket upgrade) still unfinished after this long is given up and retried.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// A connection that lasted this long resets the reconnect backoff.
+const STABLE_CONNECTION: Duration = Duration::from_secs(60);
+
 /// What a connection sends after it opens: a subscription, and a heartbeat text to repeat.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Greeting {
@@ -72,17 +75,23 @@ pub(crate) async fn run_reader(url: String, greeting: Greeting, tx: mpsc::Sender
                 continue;
             }
         };
-        backoff = INITIAL_BACKOFF;
         if tx.send(Inbound::Connected).await.is_err() {
             return;
         }
+        let opened = Instant::now();
         let Some(reason) = read_until_closed(socket, &greeting, &tx).await else {
             return;
         };
         if tx.send(Inbound::Disconnected { reason }).await.is_err() {
             return;
         }
+        // A server that accepts and then drops at once keeps backing off; only a connection that
+        // held starts the backoff over.
+        if opened.elapsed() >= STABLE_CONNECTION {
+            backoff = INITIAL_BACKOFF;
+        }
         sleep(backoff).await;
+        backoff = (backoff * 2).min(MAX_BACKOFF);
     }
 }
 
@@ -186,5 +195,33 @@ mod tests {
             .expect("reader task");
         assert_eq!(ended.as_deref(), Some("no frames for 60s"));
         assert_eq!(start.elapsed().as_secs(), 60);
+    }
+
+    #[tokio::test]
+    async fn a_server_that_drops_each_connection_at_once_is_retried_with_growing_waits() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let url = format!("ws://{}/", listener.local_addr().expect("address"));
+        let (tx, _rx) = mpsc::channel(16);
+        let reader = tokio::spawn(run_reader(url, Greeting::default(), tx));
+        let mut accepted = Vec::new();
+        let accept_three = async {
+            while accepted.len() < 3 {
+                let (tcp, _) = listener.accept().await.expect("accept");
+                // The handshake succeeds, then the connection is dropped.
+                let socket = tokio_tungstenite::accept_async(tcp).await.expect("upgrade");
+                accepted.push(Instant::now());
+                drop(socket);
+            }
+        };
+        timeout(Duration::from_secs(20), accept_three)
+            .await
+            .expect("three connections");
+        reader.abort();
+        // Waits of 1 s and then 2 s: a successful handshake alone does not reset the backoff.
+        assert!(accepted[1] - accepted[0] >= Duration::from_secs(1));
+        let second = accepted[2] - accepted[1];
+        assert!(second >= Duration::from_secs(2), "waited {second:?}");
     }
 }

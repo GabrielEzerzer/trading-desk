@@ -4,7 +4,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use futures_util::SinkExt;
+use futures_util::{SinkExt, StreamExt};
 use td_core::{Candle, InstrumentId, InstrumentKind, Millis, Timeframe, Venue};
 use td_data::live::{FeedEvent, FeedSpec, Rest, parse_message, run_feed};
 use td_data::{DataError, binance, bybit, resample};
@@ -228,6 +228,30 @@ async fn recorded_streams_give_closed_bars_once_in_order_with_the_skipped_minute
             "{venue}: {events:?}"
         );
     }
+}
+
+#[tokio::test]
+async fn aborting_a_feed_closes_its_connection() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let url = format!("ws://{}/", listener.local_addr().expect("address"));
+    let (tx, mut rx) = mpsc::channel(64);
+    let spec = FeedSpec {
+        url,
+        ..FeedSpec::new(btc(Venue::Binance), Timeframe::M1, Some(T0))
+    };
+    let feed = tokio::spawn(run_feed(spec, FakeRest::new(Vec::new(), 0), tx));
+    let (tcp, _) = listener.accept().await.expect("accept");
+    let mut socket = tokio_tungstenite::accept_async(tcp).await.expect("upgrade");
+    assert_eq!(rx.recv().await, Some(FeedEvent::Connected));
+    feed.abort();
+    // The reader goes with the feed: the connection closes now, not at the reader's idle timeout.
+    let ended = tokio::time::timeout(Duration::from_secs(5), socket.next())
+        .await
+        .expect("the connection is still open after the feed was aborted");
+    assert!(
+        matches!(ended, None | Some(Err(_) | Ok(Message::Close(_)))),
+        "{ended:?}"
+    );
 }
 
 #[tokio::test]
