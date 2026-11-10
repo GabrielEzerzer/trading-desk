@@ -318,7 +318,7 @@ impl<M: FillModel> Broker for SimBroker<M> {
         }
         inside.sort_by_key(|(priority, fill)| (*priority, fill.order.id));
         for (_, fill) in inside {
-            // An entry's stop sorts straight after it here, so it is applied at once.
+            // An entry filled inside the range has its stop applied straight after it.
             if let Some(stop) = apply(fill) {
                 apply(stop);
             }
