@@ -111,9 +111,10 @@ pub enum SweepMode {
 /// A metrics report field a sweep can rank by.
 ///
 /// `Sharpe` and `Sortino` are undefined on a range with fewer than
-/// [`metrics::MIN_DAILY_RETURNS`] daily returns, and `Cagr` and `Calmar` on a range shorter than
-/// [`metrics::MIN_CAGR_DAYS`] days; a run whose objective is undefined does not qualify (see
-/// [`SweepRow::qualified`]). In a walk-forward that applies to each train window's length.
+/// [`metrics::MIN_DAILY_RETURNS`] daily returns or bars, and `Cagr` and `Calmar` on a range
+/// shorter than [`metrics::MIN_CAGR_DAYS`] days; a run whose objective is undefined does not
+/// qualify (see [`SweepRow::qualified`]). In a walk-forward that applies to each train window's
+/// length, and in an out-of-sample test to the in-sample segment's.
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -714,14 +715,16 @@ pub struct OosResult {
     ///
     /// With `TotalReturn`, `Cagr` or `Calmar` it is therefore `None` when either segment is
     /// shorter than [`metrics::MIN_CAGR_DAYS`] days, and with `Sharpe` or `Sortino` when either
-    /// has fewer than [`metrics::MIN_DAILY_RETURNS`] daily returns. It does not fall back to the
+    /// has fewer than [`metrics::MIN_DAILY_RETURNS`] daily returns or bars (the in-sample segment
+    /// is refused up front then, so this is the out-of-sample one). It does not fall back to the
     /// ratio of total returns, which would compare segments of different lengths; compare the
     /// two runs' metrics directly then.
     pub degradation: Option<f64>,
 }
 
 /// Optimises on the in-sample segment, then runs the best parameters on the out-of-sample
-/// segment with the in-sample bars as warm-up.
+/// segment with the in-sample bars as warm-up. An objective undefined on the in-sample segment
+/// whatever the parameters (see [`Metric`]) is refused before anything runs.
 pub fn out_of_sample(
     spec: &OosSpec,
     bars: &[Candle],
@@ -733,6 +736,13 @@ pub fn out_of_sample(
     let plan = Plan::new(&spec.sweep)?;
     let (_, traded) = select_bars(base, bars)?;
     let split_at = split_time(&traded, spec.split)?;
+    let in_sample_bars = traded.partition_point(|b| b.open_time < split_at);
+    refuse_short_segment(
+        spec.sweep.objective.metric,
+        base.timeframe,
+        &traded[..in_sample_bars],
+        FloorRange::InSample,
+    )?;
 
     let mut is_spec = spec.sweep.clone();
     is_spec.base.to = split_at;
@@ -1102,10 +1112,10 @@ fn floored_metric_name(metric: Metric) -> Option<&'static str> {
 
 /// Refuses, without data, a walk-forward whose objective is undefined on its first train window
 /// whatever the data: a Sharpe or Sortino objective when that window cannot hold
-/// [`metrics::MIN_DAILY_RETURNS`] daily returns, or a CAGR or Calmar objective when it cannot span
-/// [`metrics::MIN_CAGR_DAYS`] days. The first train window is the shortest: `train_bars` long when
-/// rolling, and when anchored up to `step_bars - 1` bars longer, since it starts at the first bar
-/// and so also takes the bars left over before the first test.
+/// [`metrics::MIN_DAILY_RETURNS`] daily returns and as many bars, or a CAGR or Calmar objective
+/// when it cannot span [`metrics::MIN_CAGR_DAYS`] days. The first train window is the shortest:
+/// `train_bars` long when rolling, and when anchored up to `step_bars - 1` bars longer, since it
+/// starts at the first bar and so also takes the bars left over before the first test.
 ///
 /// Bars without gaps span their count times the timeframe, and hold the most daily returns when
 /// they start on the last bar of a UTC day. A data gap would stretch a window over more days, but
@@ -1151,6 +1161,14 @@ fn refuse_short_train_bars(spec: &WalkForwardSpec) -> Result<(), TesterError> {
                     metrics::MIN_DAILY_RETURNS
                 )));
             }
+            // Bars longer than a day reach the daily floor with fewer bars than daily returns.
+            if bars < metrics::MIN_DAILY_RETURNS {
+                return Err(TesterError::InvalidSpec(format!(
+                    "a {name} objective needs at least {min} bars as well as {min} daily returns \
+                     in every train window, and {window} is shorter",
+                    min = metrics::MIN_DAILY_RETURNS
+                )));
+            }
         }
         _ => {
             if span < metrics::MIN_CAGR_DAYS * metrics::DAY_MS {
@@ -1167,53 +1185,95 @@ fn refuse_short_train_bars(spec: &WalkForwardSpec) -> Result<(), TesterError> {
 }
 
 /// Refuses a walk-forward whose objective is undefined on one of its train windows whatever the
-/// parameters: a Sharpe or Sortino objective on a window with fewer than
-/// [`metrics::MIN_DAILY_RETURNS`] daily returns, or a CAGR or Calmar objective on one shorter than
-/// [`metrics::MIN_CAGR_DAYS`] days. Every train sweep there would end without a qualifying run;
-/// this says why before anything runs. Each window's daily returns and length are counted from its
-/// bars as the train run's metrics count them, from the first bar's open to the last bar's close.
+/// parameters; see [`refuse_short_segment`]. Every train sweep there would end without a
+/// qualifying run; this says why before anything runs.
 fn refuse_short_train(
     metric: Metric,
     timeframe: Timeframe,
     traded: &[Candle],
     windows: &[Window],
 ) -> Result<(), TesterError> {
+    for (k, w) in windows.iter().enumerate() {
+        refuse_short_segment(
+            metric,
+            timeframe,
+            &traded[w.train.clone()],
+            FloorRange::Train(k),
+        )?;
+    }
+    Ok(())
+}
+
+/// The run a [`refuse_short_segment`] refusal is about.
+#[derive(Debug, Clone, Copy)]
+enum FloorRange {
+    /// A walk-forward's train window, by index.
+    Train(usize),
+    /// An out-of-sample test's in-sample segment.
+    InSample,
+}
+
+/// Refuses a Sharpe or Sortino objective on a segment with fewer than
+/// [`metrics::MIN_DAILY_RETURNS`] daily returns or bars, or a CAGR or Calmar objective on one
+/// shorter than [`metrics::MIN_CAGR_DAYS`] days: the metric is undefined on it whatever the
+/// parameters. The daily returns and length are counted from the bars as the run's metrics count
+/// them, from the first bar's open to the last bar's close.
+fn refuse_short_segment(
+    metric: Metric,
+    timeframe: Timeframe,
+    segment: &[Candle],
+    which: FloorRange,
+) -> Result<(), TesterError> {
     let Some(name) = floored_metric_name(metric) else {
         return Ok(());
     };
+    // Train windows and in-sample segments are at least one bar long.
+    let Some(first) = segment.first().map(|b| b.open_time) else {
+        return Ok(());
+    };
     let step = timeframe.duration_ms();
-    for (k, w) in windows.iter().enumerate() {
-        let train = &traded[w.train.clone()];
-        // `windows` makes every train window at least one bar long.
-        let first = train[0].open_time;
-        let times: Vec<Millis> = std::iter::once(first)
-            .chain(train.iter().map(|b| b.open_time + step))
-            .collect();
-        let span = times[times.len() - 1] - first;
-        let length = format!("{} bars over {}", train.len(), describe_span(span));
-        match metric {
-            Metric::Sharpe | Metric::Sortino => {
-                let returns = metrics::daily_equity(&times, &vec![1.0; times.len()]).len() - 1;
-                if returns < metrics::MIN_DAILY_RETURNS {
-                    return Err(TesterError::InvalidSpec(format!(
-                        "a {name} objective needs at least {} daily returns in every train \
-                         window, and train window {k} ({length}) has {returns}",
-                        metrics::MIN_DAILY_RETURNS
-                    )));
-                }
-            }
-            _ => {
-                if span < metrics::MIN_CAGR_DAYS * metrics::DAY_MS {
-                    return Err(TesterError::InvalidSpec(format!(
-                        "a {name} objective needs train windows of at least {} days, and train \
-                         window {k} is {length}",
-                        metrics::MIN_CAGR_DAYS
-                    )));
-                }
+    let times: Vec<Millis> = std::iter::once(first)
+        .chain(segment.iter().map(|b| b.open_time + step))
+        .collect();
+    let span = times[times.len() - 1] - first;
+    let length = format!("{} bars over {}", segment.len(), describe_span(span));
+    let (every, spans, this) = match which {
+        FloorRange::Train(k) => (
+            "every train window",
+            "train windows",
+            format!("train window {k}"),
+        ),
+        FloorRange::InSample => (
+            "the in-sample segment",
+            "an in-sample segment",
+            "it".to_string(),
+        ),
+    };
+    let min = metrics::MIN_DAILY_RETURNS;
+    let refusal = match metric {
+        Metric::Sharpe | Metric::Sortino => {
+            let returns = metrics::daily_equity(&times, &vec![1.0; times.len()]).len() - 1;
+            if returns < min {
+                format!(
+                    "a {name} objective needs at least {min} daily returns in {every}, and {this} \
+                     ({length}) has {returns}"
+                )
+            } else if segment.len() < min {
+                format!(
+                    "a {name} objective needs at least {min} bars as well as {min} daily returns \
+                     in {every}, and {this} is {length}"
+                )
+            } else {
+                return Ok(());
             }
         }
-    }
-    Ok(())
+        _ if span < metrics::MIN_CAGR_DAYS * metrics::DAY_MS => format!(
+            "a {name} objective needs {spans} of at least {} days, and {this} is {length}",
+            metrics::MIN_CAGR_DAYS
+        ),
+        _ => return Ok(()),
+    };
+    Err(TesterError::InvalidSpec(refusal))
 }
 
 /// A span of time as whole days and hours, rounded down, such as "8 days 8 hours".

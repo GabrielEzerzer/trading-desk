@@ -1380,6 +1380,128 @@ fn checking_a_walk_forward_refuses_train_windows_that_cannot_be_long_enough_for_
     );
     s.windows.train_bars = 30;
     assert_eq!(s.check(), Ok(()));
+
+    // Five weekly bars span 35 days, but 30 of those daily returns are zeros carried forward: the
+    // ratio would come from five weekly moves, so the window also needs 30 bars.
+    let (mut s, _) = train_floor_spec(Metric::Sharpe, 5);
+    s.sweep.base.timeframe = Timeframe::W1;
+    assert_eq!(
+        s.check(),
+        refusal(
+            "a Sharpe objective needs at least 30 bars as well as 30 daily returns in every train \
+             window, and a train window of 5 1w bars is shorter"
+        )
+    );
+    s.windows.train_bars = 30;
+    assert_eq!(s.check(), Ok(()));
+}
+
+const WEEK: Millis = 7 * 24 * HOUR;
+
+/// [`rising_bars`] one a week from `T0`, a Monday.
+fn weekly_bars(n: i64) -> Vec<Candle> {
+    rising_bars(n)
+        .into_iter()
+        .zip(0..)
+        .map(|(b, i)| Candle {
+            open_time: T0 + i * WEEK,
+            ..b
+        })
+        .collect()
+}
+
+/// [`rising_wf_spec`] on weekly bars with a Sharpe objective, over `n` weekly bars.
+fn weekly_wf_spec(n: i64, windows: WindowSpec) -> (WalkForwardSpec, Vec<Candle>) {
+    let mut s = rising_wf_spec();
+    s.sweep.objective.metric = Metric::Sharpe;
+    s.sweep.base.timeframe = Timeframe::W1;
+    s.sweep.base.to = T0 + n * WEEK;
+    s.windows = windows;
+    (s, weekly_bars(n))
+}
+
+#[test]
+fn a_walk_forward_on_weekly_bars_needs_30_bars_in_every_train_window() {
+    let rolling = |train_bars| WindowSpec {
+        train_bars,
+        test_bars: 5,
+        step_bars: 5,
+        mode: WindowMode::Rolling,
+    };
+    let (s, bars) = weekly_wf_spec(10, rolling(5));
+    assert_eq!(
+        refused_before_running(&s, &bars),
+        "a Sharpe objective needs at least 30 bars as well as 30 daily returns in every train \
+         window, and a train window of 5 1w bars is shorter"
+    );
+    // Anchored, the spec allows a first train window of up to 34 bars; over exactly the bars one
+    // window needs it has 25, which the run refuses before running.
+    let (s, bars) = weekly_wf_spec(
+        35,
+        WindowSpec {
+            train_bars: 25,
+            test_bars: 10,
+            step_bars: 10,
+            mode: WindowMode::Anchored,
+        },
+    );
+    assert_eq!(s.check(), Ok(()));
+    assert_eq!(
+        refused_before_running(&s, &bars),
+        "a Sharpe objective needs at least 30 bars as well as 30 daily returns in every train \
+         window, and train window 0 is 25 bars over 175 days"
+    );
+    // Thirty weekly bars are enough: the train window has a Sharpe ratio.
+    let (s, bars) = weekly_wf_spec(35, rolling(30));
+    let r = walk_forward(&s, &bars, &[], None).unwrap();
+    assert!(r.windows[0].in_sample.sharpe.is_some());
+}
+
+#[test]
+fn an_out_of_sample_test_whose_in_sample_segment_is_too_short_for_its_objective_is_refused_before_running()
+ {
+    let oos = |days: i64, metric| {
+        let n = days * 24;
+        let mut sweep = rising_spec();
+        sweep.base.to = T0 + n * HOUR;
+        sweep.objective.metric = metric;
+        let s = OosSpec {
+            sweep,
+            split: Split::Fraction(0.5),
+        };
+        let calls = Mutex::new(0usize);
+        let progress = |_: usize, _: usize| {
+            *calls.lock().unwrap() += 1;
+            ControlFlow::Continue(())
+        };
+        let r = out_of_sample(&s, &rising_bars(n), &[], Some(&progress));
+        (r, calls.into_inner().unwrap())
+    };
+    // 40 days of hourly bars split in half: the in-sample segment has 20 daily returns.
+    let (r, calls) = oos(40, Metric::Sharpe);
+    assert_eq!(calls, 0, "ran before refusing");
+    assert_eq!(
+        r.unwrap_err(),
+        TesterError::InvalidSpec(
+            "a Sharpe objective needs at least 30 daily returns in the in-sample segment, and it \
+             (480 bars over 20 days) has 20"
+                .into()
+        )
+    );
+    let (r, calls) = oos(120, Metric::Cagr);
+    assert_eq!(calls, 0, "ran before refusing");
+    assert_eq!(
+        r.unwrap_err(),
+        TesterError::InvalidSpec(
+            "a CAGR objective needs an in-sample segment of at least 90 days, and it is 1440 bars \
+             over 60 days"
+                .into()
+        )
+    );
+    // 70 days split in half: 35 daily returns in sample, and the whole test runs.
+    let (r, calls) = oos(70, Metric::Sharpe);
+    assert!(r.unwrap().in_sample.best.unwrap().metrics.sharpe.is_some());
+    assert_eq!(calls, 6);
 }
 
 #[test]
