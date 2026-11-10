@@ -17,7 +17,7 @@ use td_server::api::data::GapInfo;
 use td_server::api::jobs::{JobInfo, JobResult, JobStatus};
 const MAX_RUN_JOBS: usize = 8;
 use td_server::api::runs::RunDetail;
-use td_server::api::source::MarketSource;
+use td_server::api::source::{LiveSource, MarketSource};
 use td_server::api::ws::ServerMessage;
 use td_server::api::{ApiConfig, Server};
 use tempfile::TempDir;
@@ -53,6 +53,42 @@ impl MarketSource for NoSource {
         _: Millis,
     ) -> Result<usize, DataError> {
         Err(DataError::NoDataDir)
+    }
+}
+
+/// Live data that is never there: no run streams. A stream would only try a closed local port.
+struct NoLive;
+
+struct NoRest;
+
+impl td_data::live::Rest for NoRest {
+    fn klines(
+        &self,
+        _: &InstrumentId,
+        _: Timeframe,
+        _: Millis,
+        _: Millis,
+    ) -> Result<Vec<Candle>, DataError> {
+        Err(DataError::NoDataDir)
+    }
+
+    fn funding(
+        &self,
+        _: &InstrumentId,
+        _: Millis,
+        _: Millis,
+    ) -> Result<Vec<(Millis, f64)>, DataError> {
+        Err(DataError::NoDataDir)
+    }
+}
+
+impl LiveSource for NoLive {
+    fn rest(&self) -> std::sync::Arc<dyn td_data::live::Rest> {
+        std::sync::Arc::new(NoRest)
+    }
+
+    fn stream_url(&self, _: &InstrumentId) -> String {
+        "ws://127.0.0.1:9/".into()
     }
 }
 
@@ -144,6 +180,7 @@ impl TestServer {
         let server = Server::start(ApiConfig {
             store: store.clone(),
             source: std::sync::Arc::new(NoSource),
+            live: std::sync::Arc::new(NoLive),
             token: Token::generate().expect("rng"),
             port: 0,
         })

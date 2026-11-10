@@ -16,7 +16,9 @@ use super::data::{
 use super::error::{ErrorBody, ErrorResponse};
 use super::jobs::{JobCreated, JobInfo, JobKind, JobRequest, JobResult, JobStatus};
 use super::runs::{DataReport, RunCheck, RunDetail, RunDone, ToleratedBucket};
+use super::sessions::{PositionInfo, SessionState, SessionSummary, StartSessionRequest};
 use super::ws::{ClientMessage, ServerMessage};
+use crate::{Funding, PaperConfig, SessionEvent, Status};
 
 /// Where the declarations live, from the repository root.
 pub const OUTPUT: &str = "gui/shared/src/api-types.ts";
@@ -55,6 +57,7 @@ pub fn render() -> String {
         td_core::FeeSchedule,
         td_core::Instrument,
         td_core::Timeframe,
+        td_core::Candle,
         td_core::Side,
         td_core::OrderType,
         td_core::TimeInForce,
@@ -124,6 +127,14 @@ pub fn render() -> String {
         RunCheck,
         DataReport,
         ToleratedBucket,
+        PaperConfig,
+        Funding,
+        Status,
+        StartSessionRequest,
+        SessionSummary,
+        PositionInfo,
+        SessionState,
+        SessionEvent,
         ClientMessage,
         ServerMessage,
     );
