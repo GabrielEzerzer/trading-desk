@@ -26,6 +26,7 @@ pub struct Context<'a> {
     pub(crate) timeframe: Timeframe,
     pub(crate) fees: FeeSchedule,
     pub(crate) slippage_bps: f64,
+    pub(crate) max_leverage: f64,
     pub(crate) portfolio: &'a Portfolio,
     pub(crate) broker: &'a mut dyn Broker,
     pub(crate) orders: &'a mut Vec<Order>,
@@ -66,6 +67,12 @@ impl Context<'_> {
         self.slippage_bps
     }
 
+    /// The largest perpetual position the session allows, as its notional over equity; see
+    /// [`Context::submit`]. Spot ignores it.
+    pub fn max_leverage(&self) -> f64 {
+        self.max_leverage
+    }
+
     pub fn portfolio(&self) -> &Portfolio {
         self.portfolio
     }
@@ -97,9 +104,18 @@ impl Context<'_> {
     /// (buys down, sells up) so an order never trades worse than asked; triggers round to the
     /// nearest tick. On spot, a sell must fit in the holding less the open sells, and a buy must
     /// fit in the cash together with the open buys: each buy is valued at its limit price, its
-    /// trigger, or this bar's close for a market order, plus the taker fee. Every order is
-    /// rejected on a warm-up bar. A rejected order is recorded with its reason and returned as an
-    /// error.
+    /// trigger, or this bar's close for a market order, plus the taker fee. A spot buy is checked
+    /// again when it fills and cut to the cash then (see [`crate::SimBroker`]).
+    ///
+    /// On a perpetual, an order that is not reduce-only and would leave the position larger than
+    /// it is now is rejected if the position it would build, counting the open orders on the same
+    /// side that are not reduce-only, is worth more than [`Context::max_leverage`] times the
+    /// equity. The position is valued at this bar's close and each order like a spot buy above.
+    /// An order that keeps the position at or below its current size is always allowed, so a
+    /// strategy can always reduce or close, even when losses have taken it over the cap.
+    ///
+    /// Every order is rejected on a warm-up bar. A rejected order is recorded with its reason and
+    /// returned as an error.
     pub fn submit(&mut self, request: OrderRequest) -> Result<OrderId, OrderRejected> {
         self.send(request, None).map(|(id, _)| id)
     }
@@ -288,6 +304,36 @@ impl Context<'_> {
                      and open buys, {cash} available"
                 );
                 return (req, Err(reason));
+            }
+        }
+        if inst.id.kind == InstrumentKind::Perpetual && !req.reduce_only {
+            let close = self.bar().close;
+            let same_side: Vec<&OrderRequest> = self
+                .open_orders()
+                .iter()
+                .map(|o| &o.request)
+                .filter(|r| r.side == req.side && !r.reduce_only)
+                .chain([&req])
+                .collect();
+            let position = self.position();
+            let after = position + same_side.iter().map(|r| r.side.sign() * r.qty).sum::<f64>();
+            if after.abs() > position.abs() * (1.0 + 1e-9) {
+                let notional = (position * close
+                    + same_side
+                        .iter()
+                        .map(|r| r.side.sign() * r.qty * reference_price(r.order_type, close))
+                        .sum::<f64>())
+                .abs();
+                let equity = self.equity();
+                let allowed = self.max_leverage * equity;
+                if notional > allowed * (1.0 + 1e-9) {
+                    let reason = format!(
+                        "over the leverage cap of {}x: the position would be worth {notional} with \
+                         the open orders on this side, {allowed} allowed on {equity} of equity",
+                        self.max_leverage
+                    );
+                    return (req, Err(reason));
+                }
             }
         }
         (req, Ok(()))

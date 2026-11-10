@@ -73,6 +73,7 @@ fn base(instrument: td_core::Instrument, bars: i64) -> BacktestConfig {
         starting_cash: 10_000.0,
         slippage_bps: 0.0,
         fee_override: None,
+        max_leverage: 1.0,
         warmup_from: None,
         close_at_end: false,
     }

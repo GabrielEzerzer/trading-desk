@@ -11,7 +11,10 @@ use td_core::{
 };
 use td_data::live::Rest;
 use td_data::{DataError, resample};
-use td_engine::{ParamValue, Params, SessionConfig, build_strategy, run_backtest};
+use td_engine::{
+    LIQUIDATION_TAG, Order, OrderStatus, ParamValue, Params, Session, SessionConfig,
+    build_strategy, run_backtest,
+};
 use td_server::{Funding, PaperConfig, PaperError, PaperHandle, PaperSession, Status, paper_dir};
 use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::Message;
@@ -53,6 +56,7 @@ fn config(kind: InstrumentKind, timeframe: Timeframe) -> PaperConfig {
         starting_cash: 10_000.0,
         slippage_bps: 5.0,
         fees: None,
+        max_leverage: 1.0,
     }
 }
 
@@ -122,6 +126,7 @@ fn a_paper_session_fed_the_backtest_bars_matches_the_backtest() {
                 starting_cash: cfg.starting_cash,
                 slippage_bps: cfg.slippage_bps,
                 fees: cfg.fees,
+                max_leverage: cfg.max_leverage,
             },
         )
         .expect("runs");
@@ -159,6 +164,103 @@ fn reopening_replays_the_log_to_the_same_state() {
     assert_eq!(reopened.equity()[0].time, T0);
     assert!(reopened.warnings().is_empty());
     assert!(!reopened.fills().is_empty());
+}
+
+/// Falls half a point a minute, so SMA cross goes short at about 0.95x, then the minute at 20
+/// wicks to 250, more than double the entry: the short is liquidated on it.
+fn falling_with_a_wick() -> Vec<Candle> {
+    let price = |i: i64| 100.0 - 0.5 * i as f64;
+    (0..40)
+        .map(|i| {
+            let (open, close) = (price(i - 1), price(i));
+            Candle {
+                open_time: T0 + i * MIN,
+                open,
+                high: if i == 20 {
+                    250.0
+                } else {
+                    open.max(close) + 0.25
+                },
+                low: open.min(close) - 0.25,
+                close,
+                volume: 2.0,
+                quote_volume: 2.0 * close,
+            }
+        })
+        .collect()
+}
+
+/// Runs `cfg` as a backtest and as a paper session on the same bars and funding, asserts they
+/// match and that reopening the paper session replays to the same state, and returns the
+/// backtest.
+fn paper_matches_backtest(cfg: PaperConfig, bars: &[Candle], funding: &[(Millis, f64)]) -> Session {
+    let backtest = run_backtest(
+        build_strategy(&cfg.strategy, &cfg.params).expect("builds"),
+        cfg.instrument.clone(),
+        cfg.timeframe,
+        bars,
+        funding,
+        SessionConfig {
+            starting_cash: cfg.starting_cash,
+            slippage_bps: cfg.slippage_bps,
+            fees: cfg.fees,
+            max_leverage: cfg.max_leverage,
+        },
+    )
+    .expect("runs");
+    let dir = tempfile::tempdir().expect("temp dir");
+    let mut paper = PaperSession::create(dir.path(), "same", cfg.clone()).expect("creates");
+    feed_all(&mut paper, bars, funding);
+    assert_eq!(paper.fills(), backtest.fills());
+    assert_eq!(paper.equity(), backtest.equity());
+    assert_eq!(paper.orders(), backtest.orders());
+    assert_eq!(paper.portfolio(), backtest.portfolio());
+    let reopened = PaperSession::open(dir.path(), "same").expect("opens");
+    assert_eq!(reopened.config(), &cfg);
+    assert_same_state(&paper, &reopened);
+    backtest
+}
+
+#[test]
+fn a_paper_session_matches_the_backtest_through_a_liquidation() {
+    let bars = falling_with_a_wick();
+    let funding = [(T0 + 10 * MIN, 0.0001), (T0 + 20 * MIN + 30_000, 0.0001)];
+    let cfg = config(InstrumentKind::Perpetual, Timeframe::M1);
+    let backtest = paper_matches_backtest(cfg, &bars, &funding);
+    let liquidations: Vec<&Order> = backtest
+        .orders()
+        .iter()
+        .filter(|o| o.request.client_tag.as_deref() == Some(LIQUIDATION_TAG))
+        .collect();
+    assert_eq!(liquidations.len(), 1, "{:?}", backtest.orders());
+    let fill = backtest
+        .fills()
+        .iter()
+        .find(|f| f.order_id == liquidations[0].id)
+        .expect("the liquidation filled");
+    assert_eq!(fill.time, T0 + 20 * MIN);
+    assert!(fill.price > 150.0 && fill.price < 250.0, "{}", fill.price);
+    assert!(backtest.equity().iter().all(|p| p.equity >= 0.0));
+}
+
+#[test]
+fn a_paper_session_carries_its_leverage_cap() {
+    // At 0.5x the strategy's 0.95x entries are rejected in both, for the same reason.
+    let cfg = PaperConfig {
+        max_leverage: 0.5,
+        ..config(InstrumentKind::Perpetual, Timeframe::M1)
+    };
+    let backtest = paper_matches_backtest(cfg.clone(), &minutes(0..60), &[]);
+    assert!(backtest.orders().iter().any(
+        |o| matches!(&o.status, OrderStatus::Rejected(reason) if reason.contains("leverage cap"))
+    ));
+    // A config saved before the setting existed reads as 1x.
+    let mut json = serde_json::to_value(&cfg).expect("serializes");
+    json.as_object_mut()
+        .expect("an object")
+        .remove("max_leverage");
+    let old: PaperConfig = serde_json::from_value(json).expect("reads");
+    assert_eq!(old.max_leverage, 1.0);
 }
 
 #[test]

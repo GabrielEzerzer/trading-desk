@@ -35,6 +35,14 @@ pub struct PaperConfig {
     pub slippage_bps: f64,
     /// Replaces the instrument's fee schedule when set.
     pub fees: Option<FeeSchedule>,
+    /// The largest perpetual position allowed, as its notional over equity, as in a backtest:
+    /// 1.0 means 1x, the default, which a config saved without it also gets. Spot ignores it.
+    #[serde(default = "default_max_leverage")]
+    pub max_leverage: f64,
+}
+
+fn default_max_leverage() -> f64 {
+    1.0
 }
 
 /// A funding rate fed with a bar.
@@ -349,6 +357,7 @@ fn build_session(config: &PaperConfig) -> Result<Session, PaperError> {
         starting_cash: config.starting_cash,
         slippage_bps: config.slippage_bps,
         fees: config.fees,
+        max_leverage: config.max_leverage,
     };
     Ok(Session::new(
         strategy,
@@ -436,6 +445,7 @@ mod tests {
             starting_cash: 10_000.0,
             slippage_bps: 0.0,
             fees: None,
+            max_leverage: 1.0,
         };
         let dir = tempfile::tempdir().expect("temp dir");
         let mut paper = PaperSession::create(dir.path(), "warm", config.clone()).expect("creates");
@@ -448,6 +458,7 @@ mod tests {
                 starting_cash: config.starting_cash,
                 slippage_bps: config.slippage_bps,
                 fees: config.fees,
+                max_leverage: config.max_leverage,
             },
         )
         .expect("session");

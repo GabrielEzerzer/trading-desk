@@ -1,10 +1,10 @@
 use serde::{Deserialize, Serialize};
 use td_core::{
-    Candle, FeeSchedule, Fill, Instrument, Liquidity, Millis, OrderId, OrderRequest, OrderType,
-    Side, TimeInForce,
+    Candle, FeeSchedule, Fill, Instrument, InstrumentKind, Liquidity, Millis, OrderId,
+    OrderRequest, OrderType, Side, TimeInForce,
 };
 
-use crate::{FillCheck, FillModel};
+use crate::{FillCheck, FillModel, Portfolio};
 
 /// An order the session accepted or rejected, with its request as rounded at submission.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -83,8 +83,8 @@ pub trait Broker: Send {
     /// Cancels an open order. Returns false if no open order has this id.
     fn cancel(&mut self, id: OrderId) -> bool;
     /// Processes a new closed bar and returns the fills, cancellations and placed stops it caused,
-    /// in the order they happened. `position` is the signed position before the bar.
-    fn on_bar(&mut self, bar: &Candle, position: f64) -> Vec<BrokerEvent>;
+    /// in the order they happened. `portfolio` is the account before the bar's fills.
+    fn on_bar(&mut self, bar: &Candle, portfolio: &Portfolio) -> Vec<BrokerEvent>;
     fn open_orders(&self) -> &[Order];
 }
 
@@ -106,6 +106,13 @@ pub trait Broker: Send {
 /// for any stop. The stop's fill is applied right after its entry's, except when the entry filled
 /// at the open and the stop triggers inside the range: then it waits for the bar's other fills at
 /// the open and takes its place among the fills inside the range.
+///
+/// A spot buy is cut at fill time to the largest quantity, on the lot grid, whose value at the
+/// fill price plus its fee fits in the cash left at that point in the bar. The cash check at
+/// submission values a market buy at the decision close, so a gap up at the next open could
+/// otherwise overdraw the cash. The cut order counts as filled, for the smaller quantity, and the
+/// rest is dropped; an attached stop is placed for the quantity that filled. If what the cash
+/// covers is below the instrument's minimums, the order is cancelled instead.
 pub struct SimBroker<M: FillModel> {
     instrument: Instrument,
     fees: FeeSchedule,
@@ -129,35 +136,59 @@ impl<M: FillModel> SimBroker<M> {
         }
     }
 
-    /// Fills `order` at `price` on `bar` and moves `position` by the fill. A reduce-only order is
-    /// cut to the position it can close, and `None` means it had nothing to close.
+    /// Fills `order` at `price` on `bar` and applies the fill to `book`. A reduce-only order is
+    /// cut to the position it can close, and a spot buy to the cash; the error is the reason the
+    /// order is cancelled when nothing is left to fill.
     fn fill(
         &self,
         order: &Order,
         price: f64,
         liquidity: Liquidity,
         bar: &Candle,
-        position: &mut f64,
-    ) -> Option<Fill> {
+        book: &mut Portfolio,
+    ) -> Result<Fill, String> {
         let req = &order.request;
+        let inst = &self.instrument;
         let mut qty = req.qty;
         if req.reduce_only {
             // How much of the position this order's side can close.
             let reducible = match req.side {
-                Side::Buy => -*position,
-                Side::Sell => *position,
+                Side::Buy => -book.position(),
+                Side::Sell => book.position(),
             };
-            qty = self.instrument.round_qty(qty.min(reducible.max(0.0)));
+            qty = inst.round_qty(qty.min(reducible.max(0.0)));
             if qty <= 0.0 {
-                return None;
+                return Err("reduce-only order would not reduce the position".into());
             }
         }
         let rate = match liquidity {
             Liquidity::Maker => self.fees.maker,
             Liquidity::Taker => self.fees.taker,
         };
-        *position += req.side.sign() * qty;
-        Some(Fill {
+        if inst.id.kind == InstrumentKind::Spot && req.side == Side::Buy {
+            let unit_cost = price * (1.0 + rate);
+            let cash = book.cash();
+            if qty * unit_cost > cash {
+                qty = inst.round_qty(cash.max(0.0) / unit_cost);
+                // The lot rounding allows a hair of float error upwards; never overdraw.
+                if qty * unit_cost > cash {
+                    qty = inst.round_qty(qty - inst.lot_size);
+                }
+                let cut = OrderRequest {
+                    qty,
+                    order_type: OrderType::Market,
+                    ..req.clone()
+                };
+                if qty <= 0.0 || inst.validate_order(&cut, price).is_err() {
+                    return Err(format!(
+                        "spot buy cancelled at fill time: {cash} of cash does not cover the \
+                         minimum order at {price} with the fee"
+                    ));
+                }
+            }
+        }
+        book.apply_fill(req.side, qty, price, price * qty * rate);
+        Ok(Fill {
             order_id: order.id,
             instrument: req.instrument.clone(),
             side: req.side,
@@ -206,7 +237,10 @@ impl<M: FillModel> Broker for SimBroker<M> {
         self.open.len() != before
     }
 
-    fn on_bar(&mut self, bar: &Candle, mut position: f64) -> Vec<BrokerEvent> {
+    fn on_bar(&mut self, bar: &Candle, portfolio: &Portfolio) -> Vec<BrokerEvent> {
+        // A scratch copy of the account that each fill moves, so a reduce-only order sees the
+        // position and a spot buy the cash that the earlier fills on this bar left.
+        let mut book = portfolio.clone();
         // This bar's fills: those at the open, and those inside the range with a priority.
         let mut at_open = Vec::new();
         let mut inside = Vec::new();
@@ -254,7 +288,6 @@ impl<M: FillModel> Broker for SimBroker<M> {
             }
         }
 
-        const NOTHING_TO_REDUCE: &str = "reduce-only order would not reduce the position";
         let mut events = Vec::new();
         let mut done = Vec::new();
         let mut placed = Vec::new();
@@ -263,10 +296,12 @@ impl<M: FillModel> Broker for SimBroker<M> {
         let mut apply = |fill: Pending| {
             let order = fill.order;
             done.push(order.id);
-            let Some(applied) = self.fill(&order, fill.price, fill.liquidity, bar, &mut position)
-            else {
-                cancel(&mut events, &order, NOTHING_TO_REDUCE);
-                return None;
+            let applied = match self.fill(&order, fill.price, fill.liquidity, bar, &mut book) {
+                Ok(applied) => applied,
+                Err(reason) => {
+                    cancel(&mut events, &order, &reason);
+                    return None;
+                }
             };
             let qty = applied.qty;
             events.push(BrokerEvent::Filled(applied));
