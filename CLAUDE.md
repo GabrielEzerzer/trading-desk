@@ -8,6 +8,7 @@ A private workspace for my own trading: two Electron desktop apps on one Rust en
 - `crates/td-engine`: the `Strategy` trait, the event-driven simulation on candles, portfolio, metrics and the strategy tester.
 - `crates/td-data`: venue clients, history download, the candle store and live feeds.
 - `crates/td-server`: the localhost API binary the apps start as a sidecar.
+- `gui/shared`: the shared GUI package. For now it holds `src/api-types.ts`, generated from td-server's types with `cargo run -p td-server --bin gen-api-types`; never edit it by hand.
 
 ## Conventions
 
