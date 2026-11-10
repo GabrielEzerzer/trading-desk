@@ -156,7 +156,7 @@ const placeOrder = async (page, side, size) => {
 const holdBtc = async (page) => {
   await startManual(page)
   await placeOrder(page, 'Buy', '0.05')
-  await page.locator('.position-summary').filter({ hasText: '0.05000 BTC at' }).waitFor()
+  await page.locator('.position-summary').filter({ hasText: /0\.05000 BTC/ }).waitFor()
 }
 
 const stubCandles = (page, count) => page.waitForFunction((n) => (window.__stubCandles ?? 0) >= n, count)
@@ -423,6 +423,7 @@ export const STATES = [
       await readyTrading(page)
       await page.keyboard.press('Control+k')
       await page.getByRole('combobox', { name: 'Search instruments' }).fill('eth')
+      await page.getByRole('option', { name: /ETHUSDT.*Binance spot/, selected: true }).waitFor()
       await page.keyboard.press('ArrowDown')
       await page.getByRole('option', { name: /ETHBTC/, selected: true }).waitFor()
     },
@@ -450,7 +451,7 @@ export const STATES = [
     steps: async (page) => {
       await readyTrading(page)
       await page.getByRole('button', { name: 'Start a session' }).click()
-      await page.getByText('Start a paper session').waitFor()
+      await page.locator('.start-panel').getByText('Start a paper session', { exact: true }).waitFor()
     },
   },
   {
@@ -480,7 +481,7 @@ export const STATES = [
     steps: async (page) => {
       await holdBtc(page)
       await placeOrder(page, 'Sell', '0.02')
-      await page.locator('.position-summary').filter({ hasText: '0.03000 BTC at' }).waitFor()
+      await page.locator('.position-summary').filter({ hasText: /0\.03000 BTC/ }).waitFor()
       await page.locator('.position-summary').click()
       await page.getByRole('tab', { name: /Fills/ }).click()
       await page.getByRole('tab', { name: /Fills/, selected: true }).waitFor()
@@ -546,6 +547,7 @@ export const STATES = [
       await page.locator('.position-summary').filter({ hasText: 'Manual · Stopped' }).waitFor()
       await page.mouse.click(300, 200)
       await page.locator('.session-panel').waitFor({ state: 'detached' })
+      await page.mouse.move(0, 0)
     },
   },
 ]

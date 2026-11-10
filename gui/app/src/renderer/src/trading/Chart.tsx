@@ -103,7 +103,12 @@ export function Chart({ candles, seriesKey, revision, timeframe, instrument, fil
     markers.current = createSeriesMarkers(candlesSeries, [])
     // The canvas measured its labels before Inter loaded; measure again once it has.
     void document.fonts.ready.then(() => api.applyOptions({ layout: { fontFamily: token('--font-sans') } }))
+    // The time scale narrows whenever the price scale widens, so its size change is when the
+    // attribution link moves to stay clear of the price labels.
+    const measure = () => setScaleWidth(api.priceScale('right').width())
+    api.timeScale().subscribeSizeChange(measure)
     return () => {
+      api.timeScale().unsubscribeSizeChange(measure)
       api.remove()
       chart.current = null
       series.current = null
@@ -132,7 +137,6 @@ export function Chart({ candles, seriesKey, revision, timeframe, instrument, fil
       if (prev.key !== seriesKey) chart.current?.timeScale().scrollToRealTime()
     }
     drawn.current = { key: seriesKey, revision }
-    setScaleWidth(chart.current?.priceScale('right').width() ?? 0)
   }, [candles, seriesKey, revision])
 
   useEffect(() => {
