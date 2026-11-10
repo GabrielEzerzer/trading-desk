@@ -186,21 +186,20 @@ const fixtures = {
   runs: {
     donchian_breakout: {
       steps: [
-        [0.04, 'Loading candles for SOLUSDT perpetual, Bybit'],
-        [0.12, 'Sweeping parameters, 8 of 48'],
-        [0.3, 'Sweeping parameters, 24 of 48'],
-        [0.46, 'Sweeping parameters, 48 of 48'],
-        [0.6, 'Walk-forward window 2 of 5'],
-        [0.76, 'Walk-forward window 4 of 5'],
-        [0.9, 'Testing out of sample'],
-        [1, 'Writing results'],
+        { step: 1, steps: 4, stage: 'Loading candles for SOLUSDT perpetual, Bybit' },
+        { step: 2, steps: 4, stage: 'Sweeping parameters', done: 8, total: 48 },
+        { step: 2, steps: 4, stage: 'Sweeping parameters', done: 24, total: 48 },
+        { step: 2, steps: 4, stage: 'Sweeping parameters', done: 48, total: 48 },
+        { step: 3, steps: 4, stage: 'Walk-forward windows', done: 2, total: 5 },
+        { step: 3, steps: 4, stage: 'Walk-forward windows', done: 4, total: 5 },
+        { step: 4, steps: 4, stage: 'Testing out of sample' },
       ],
       result: donchian,
     },
     funding_carry: {
       steps: [
-        [0.04, 'Loading candles for ETHUSDT perpetual, Bybit'],
-        [0.09, 'Loading funding rates'],
+        { step: 1, steps: 3, stage: 'Loading candles for ETHUSDT perpetual, Bybit' },
+        { step: 2, steps: 3, stage: 'Loading funding rates' },
       ],
       error: 'No funding rates are stored for ETHUSDT perpetual on Bybit before March 2023. Download them first, then run again.',
     },

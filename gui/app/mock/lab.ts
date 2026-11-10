@@ -5,6 +5,7 @@
 import {
   type LabSource,
   type LabStrategy,
+  type RunProgress,
   type VerdictPreview,
   RunCancelled,
   readableName,
@@ -12,7 +13,7 @@ import {
 import fixtures from './lab.json'
 
 interface RunScript {
-  steps: [number, string][]
+  steps: RunProgress[]
   result?: VerdictPreview
   error?: string
 }
@@ -45,7 +46,14 @@ export function createMockLabSource({ stepMs = 700, listMs = 300, now = Date.now
       const script: RunScript | undefined =
         data.runs[name] ??
         (strategy?.last
-          ? { steps: [[0.2, 'Loading candles'], [0.6, 'Walk-forward window 3 of 5'], [1, 'Writing results']], result: strategy.last }
+          ? {
+              steps: [
+                { step: 1, steps: 3, stage: 'Loading candles' },
+                { step: 2, steps: 3, stage: 'Walk-forward windows', done: 3, total: 5 },
+                { step: 3, steps: 3, stage: 'Writing results' },
+              ],
+              result: strategy.last,
+            }
           : undefined)
       let timer: ReturnType<typeof setTimeout> | undefined
       let reject: (reason: Error) => void = () => {}
@@ -59,7 +67,7 @@ export function createMockLabSource({ stepMs = 700, listMs = 300, now = Date.now
         const next = () => {
           const step = script.steps[i]
           if (step) {
-            onProgress({ progress: step[0], message: step[1] })
+            onProgress(step)
             i += 1
             timer = setTimeout(next, stepMs)
             return

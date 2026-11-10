@@ -277,6 +277,10 @@ button {
 /* The Lab: a centred reading column that scrolls, with the composer floating over its foot. */
 
 .lab {
+  /* From the sheet's foot to the composer's top edge (the composer is the control plus 6px padding
+     on each side), and the fade above it where content dissolves before reaching the composer. */
+  --composer-clear: calc(var(--space-5) + var(--control) + 12px);
+  --composer-fade: var(--space-7);
   position: relative;
   height: 100%;
 }
@@ -285,6 +289,10 @@ button {
   height: 100%;
   overflow-y: auto;
   scrollbar-gutter: stable both-edges;
+}
+
+.lab-scroll:focus-visible {
+  box-shadow: inset 0 0 0 2px var(--accent);
 }
 
 .lab-scroll::-webkit-scrollbar {
@@ -300,8 +308,8 @@ button {
 .column {
   max-width: calc(var(--column) + 2 * var(--space-5));
   margin: 0 auto;
-  /* The foot clears the floating composer and its fade. */
-  padding: var(--space-8) var(--space-5) calc(var(--control) + var(--space-8) + var(--space-7));
+  /* The foot lets the last content scroll fully above the composer and its fade. */
+  padding: var(--space-8) var(--space-5) calc(var(--composer-clear) + var(--composer-fade) + var(--space-5));
 }
 
 .eyebrow {
@@ -458,13 +466,14 @@ button {
   pointer-events: none;
 }
 
-/* Content scrolling under the composer fades into the sheet instead of being cut. */
+/* Content dissolves into the sheet just above the composer instead of running under it: solid
+   sheet up to the composer's top edge, then a fade above it. */
 .composer-dock::before {
   content: '';
   position: absolute;
   inset: auto 0 0 0;
-  height: calc(var(--control) + var(--space-8));
-  background: linear-gradient(to top, var(--sheet) 55%, transparent);
+  height: calc(var(--composer-clear) + var(--composer-fade));
+  background: linear-gradient(to top, var(--sheet) var(--composer-clear), transparent);
 }
 
 .composer {
@@ -568,6 +577,21 @@ button {
 .pill:active,
 .icon-button:active {
   opacity: var(--press-opacity);
+}
+
+/* Round controls answer clicks across their whole square, not only inside the circle. */
+.icon-button,
+.run,
+.engine-dot {
+  position: relative;
+}
+
+.icon-button::before,
+.run::before,
+.engine-dot::before {
+  content: '';
+  position: absolute;
+  inset: 0;
 }
 
 /* Result. */

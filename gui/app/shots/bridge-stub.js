@@ -1,4 +1,5 @@
-// Test-only stand-in for the preload's `window.td`, injected by shots.mjs before the page loads.
+// Test-only stand-in for the preload's `window.td`, injected by shots.mjs and the UI gates (gui/e2e)
+// before the page loads.
 // It implements the TdBridge contract (gui/shared/src/bridge.ts) with a scripted engine status and
 // answers requests from the mock fixtures. Never part of the app bundle.
 //
@@ -38,10 +39,15 @@ function installBridgeStub(config) {
       listeners.add(listener)
       return () => listeners.delete(listener)
     },
+    // Retry restarts the engine: it reports connecting, then running a moment later.
     async restartEngine() {
       if (status.state !== 'failed') return
-      status = { state: 'connecting' }
-      for (const listener of listeners) listener(status)
+      const set = (next) => {
+        status = next
+        for (const listener of listeners) listener(status)
+      }
+      set({ state: 'connecting' })
+      setTimeout(() => set({ state: 'running' }), 300)
     },
   }
 }

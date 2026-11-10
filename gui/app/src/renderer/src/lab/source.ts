@@ -76,10 +76,16 @@ export interface LabStrategy {
   last: VerdictPreview | null
 }
 
+/** Where a run is in its test plan: the step, and how far that step has counted when it counts. */
 export interface RunProgress {
-  /** From 0 to 1. */
-  progress: number
-  message: string
+  /** The current step, from 1 to `steps`. */
+  step: number
+  steps: number
+  /** What the step does, for example "Sweeping parameters". */
+  stage: string
+  /** Items this step has finished, and how many it has, when the step counts items. */
+  done?: number
+  total?: number
 }
 
 export interface LabRun {

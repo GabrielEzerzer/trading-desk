@@ -11,3 +11,7 @@ dist/
 
 # Headless screenshots from pnpm shots
 gui/shots/
+
+# Playwright UI gate output (baselines in gui/e2e/__screenshots__ are committed)
+gui/e2e/.results/
+gui/playwright-report/

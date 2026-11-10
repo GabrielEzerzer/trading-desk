@@ -1,13 +1,14 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { sentence } from '../engine'
 import { Composer, type ComposerHandle } from './Composer'
+import { overallProgress, progressLabel } from './progress'
 import { Result } from './Result'
-import { type LabSource, type LabStrategy, RunCancelled, chooseLabSource } from './source'
+import { type LabSource, type LabStrategy, RunCancelled, type RunProgress, chooseLabSource } from './source'
 
 interface ActiveRun {
   name: string
-  progress: number
-  message: string
+  /** Null until the run reports its first step. */
+  progress: RunProgress | null
   cancel(): void
 }
 
@@ -60,8 +61,8 @@ export function StrategyLab() {
     if (!source || !selected || run) return
     const name = selected.name
     setRunError(null)
-    const handle = source.run(name, (p) => setRun((r) => (r && r.name === name ? { ...r, ...p } : r)))
-    setRun({ name, progress: 0, message: 'Starting the run', cancel: handle.cancel })
+    const handle = source.run(name, (progress) => setRun((r) => (r && r.name === name ? { ...r, progress } : r)))
+    setRun({ name, progress: null, cancel: handle.cancel })
     handle.result.then(
       (verdict) => {
         setStrategies((list) => list?.map((s) => (s.name === name ? { ...s, last: verdict } : s)) ?? list)
@@ -143,7 +144,8 @@ export function StrategyLab() {
 
   return (
     <div className="lab">
-      <div className="lab-scroll" ref={scroller}>
+      {/* Focusable, so the keyboard can scroll a result that has no controls in it. */}
+      <div className="lab-scroll" ref={scroller} tabIndex={0}>
         {/* A new key per view, so each new view fades in once. */}
         <div className="column fade-in" key={viewKey}>
           {body}
@@ -193,12 +195,15 @@ function StrategyList({ strategies, onChoose }: { strategies: LabStrategy[]; onC
 }
 
 function Running({ strategy, run }: { strategy: LabStrategy; run: ActiveRun }) {
-  const percent = Math.round(run.progress * 100)
+  // The bar shows the whole test plan; the label names the step it is on.
+  const value = run.progress ? overallProgress(run.progress) : 0
+  const label = run.progress ? progressLabel(run.progress) : 'Starting the run'
+  const percent = Math.round(value * 100)
   return (
     <div className="state">
       <p className="eyebrow">{strategy.label}</p>
       <p className="run-status shimmer" role="status" aria-live="polite">
-        {run.message}
+        {label}
       </p>
       <div
         className="progress"
@@ -207,8 +212,9 @@ function Running({ strategy, run }: { strategy: LabStrategy; run: ActiveRun }) {
         aria-valuemin={0}
         aria-valuemax={100}
         aria-valuenow={percent}
+        aria-valuetext={`${percent}% of the test plan`}
       >
-        <ProgressFill value={run.progress} />
+        <ProgressFill value={value} />
       </div>
     </div>
   )
