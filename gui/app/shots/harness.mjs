@@ -113,7 +113,7 @@ const engineStart = { open_time: trading.end, open: 64180, high: 64230, low: 641
 /** A running strategy session as the engine reports it, for Trading on the engine. */
 const engineSession = {
   id: '1794311000000-sma',
-  config: { strategy: 'sma_cross', params: {}, instrument: btc, timeframe: '1m', starting_cash: 10000, slippage_bps: 2, fees: null },
+  config: { strategy: 'sma_cross', params: {}, instrument: btc, timeframe: '1m', starting_cash: 10000, slippage_bps: 2, fees: null, max_leverage: 1 },
   status: { status: 'live' },
   cash: 2302.4,
   equity: 10009.6,
