@@ -29,8 +29,8 @@ use super::runs::RunDone;
 const MAX_DOWNLOADS: usize = 2;
 
 /// How many runs (backtests and tester runs) go at once, apart from downloads, so a long sweep
-/// never holds up a download. A sweep already spreads over every core through rayon; two at once
-/// share them.
+/// never holds up a download. A tester run spreads over every core on a rayon pool of its own;
+/// two at once share the cores, and neither waits for the other's backtests.
 const MAX_RUNS: usize = 2;
 
 /// How many run jobs may be queued or running at once; one more is refused with 429

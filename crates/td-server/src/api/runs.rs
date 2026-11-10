@@ -6,8 +6,8 @@
 //! check streams the range a month at a time and keeps nothing: a queued job holds only its
 //! request, and loads its candles and funding once it has a run slot. If the store changed in
 //! between so that the run would now be refused, the job fails with that refusal. The job runs on
-//! a blocking thread (a tester run spreads its backtests over rayon's pool), reports progress per
-//! finished backtest and stops early on a cancel.
+//! a blocking thread (a tester run spreads its backtests over a rayon pool of its own), reports
+//! progress per finished backtest and stops early on a cancel.
 //!
 //! Every finished run is saved with [`td_engine::save_with_files`] under `<data dir>/runs`, with a
 //! `data.json` in the same atomic save holding the [`DataReport`]: the minutes and buckets the
@@ -481,15 +481,17 @@ fn execute(
             SavedRun::Backtest(Box::new(result))
         }
         JobRequest::Sweep(spec) => {
-            let result = td_engine::sweep(spec, &bars, &funding, Some(&progress));
+            let result = own_pool(|| td_engine::sweep(spec, &bars, &funding, Some(&progress)))?;
             SavedRun::Sweep(Box::new(result.map_err(tester_job_error)?))
         }
         JobRequest::Oos(spec) => {
-            let result = td_engine::out_of_sample(spec, &bars, &funding, Some(&progress));
+            let result =
+                own_pool(|| td_engine::out_of_sample(spec, &bars, &funding, Some(&progress)))?;
             SavedRun::Oos(Box::new(result.map_err(tester_job_error)?))
         }
         JobRequest::WalkForward(spec) => {
-            let result = td_engine::walk_forward(spec, &bars, &funding, Some(&progress));
+            let result =
+                own_pool(|| td_engine::walk_forward(spec, &bars, &funding, Some(&progress)))?;
             SavedRun::WalkForward(Box::new(result.map_err(tester_job_error)?))
         }
     };
@@ -508,6 +510,18 @@ fn execute(
         JobRequest::WalkForward(_) => JobResult::WalkForward(done),
         _ => JobResult::Backtest(done),
     })
+}
+
+/// Runs a tester call on a rayon pool of its own, one thread per core, dropped when the call
+/// returns. On the shared global pool, a run's backtests would queue behind every backtest another
+/// run has already split off, so a second run would make no progress, and not see its cancel,
+/// until the first finished. With a pool each, two runs share the cores through the operating
+/// system, and a cancel stops a run after the backtest each of its threads has in hand.
+fn own_pool<T: Send>(work: impl FnOnce() -> T + Send) -> Result<T, JobError> {
+    let pool = rayon::ThreadPoolBuilder::new()
+        .build()
+        .map_err(|e| ApiError::internal(format!("cannot start the run's threads: {e}")))?;
+    Ok(pool.install(work))
 }
 
 /// Progress from the tester's worker threads. Publishes about every half percent, not on every

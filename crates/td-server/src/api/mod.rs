@@ -199,6 +199,12 @@ impl Server {
         &self.token
     }
 
+    /// The job registry the routes queue on, for code that queues jobs of its own beside them
+    /// (the tests hold run slots with jobs whose end they control).
+    pub fn jobs(&self) -> &Arc<Jobs> {
+        &self.jobs
+    }
+
     /// The handshake line, without a newline.
     pub fn handshake_line(&self) -> String {
         let handshake = Handshake {

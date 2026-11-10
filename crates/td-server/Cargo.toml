@@ -9,6 +9,8 @@ publish.workspace = true
 axum.workspace = true
 clap.workspace = true
 getrandom.workspace = true
+# Each run's backtests go on a thread pool of its own, so runs never wait for each other's.
+rayon.workspace = true
 serde.workspace = true
 # Exact float parsing: a replayed log must give back the very bars and rates that were fed.
 serde_json = { workspace = true, features = ["float_roundtrip"] }

@@ -1,6 +1,8 @@
 //! Drives the run routes over real HTTP and WebSocket against a server started in-process on
 //! 127.0.0.1:0, with a temporary data directory seeded with 1-minute candles: no network.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
@@ -14,7 +16,7 @@ use td_data::{DataError, DownloadReport, InstrumentList, Store};
 use td_engine::{BacktestConfig, Params, SavedRun};
 use td_server::api::auth::Token;
 use td_server::api::data::GapInfo;
-use td_server::api::jobs::{JobInfo, JobResult, JobStatus};
+use td_server::api::jobs::{JobInfo, JobRequest, JobResult, JobStatus};
 const MAX_RUN_JOBS: usize = 8;
 use td_server::api::runs::RunDetail;
 use td_server::api::source::{LiveSource, MarketSource};
@@ -26,6 +28,8 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
+/// A guard against hangs only: no test waits on time passing, and a passing test never comes
+/// near it.
 const WAIT: Duration = Duration::from_secs(60);
 const HOUR: Millis = 60 * MINUTE;
 
@@ -581,11 +585,55 @@ async fn a_range_the_store_lacks_is_422_data_missing_and_starts_no_job() {
     assert_eq!(jobs, json!([]), "no job was created");
 }
 
+/// Holds every thread of rayon's global pool until dropped.
+struct BusyGlobalPool(Arc<(Mutex<bool>, Condvar)>);
+
+impl BusyGlobalPool {
+    async fn hold() -> BusyGlobalPool {
+        let threads = rayon::current_num_threads();
+        let started = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        for _ in 0..threads {
+            let (started, release) = (started.clone(), release.clone());
+            rayon::spawn(move || {
+                started.fetch_add(1, Ordering::SeqCst);
+                let (released, wake) = &*release;
+                let mut released = released.lock().unwrap_or_else(|e| e.into_inner());
+                while !*released {
+                    released = wake.wait(released).unwrap_or_else(|e| e.into_inner());
+                }
+            });
+        }
+        let held = BusyGlobalPool(release);
+        let deadline = Instant::now() + WAIT;
+        while started.load(Ordering::SeqCst) < threads {
+            assert!(
+                Instant::now() < deadline,
+                "the global pool never took the holds"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        held
+    }
+}
+
+impl Drop for BusyGlobalPool {
+    fn drop(&mut self) {
+        let (released, wake) = &*self.0;
+        *released.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        wake.notify_all();
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_cancelled_sweep_stops_well_before_its_last_backtest() {
+    // Every thread of rayon's global pool stays busy throughout, standing in for any other work in
+    // the process: another run's backtests, or another test's. A run must neither wait for it to
+    // start its backtests nor be held past a cancel by it.
+    let _busy = BusyGlobalPool::hold().await;
     let t = TestServer::seeded(30).await;
     let mut ws = t.websocket().await;
-    // 100 x 200 = 20 000 backtests of 720 bars: minutes of work, so a stop is visible.
+    // 100 x 200 = 20 000 backtests of 720 bars, far more than run before the cancel lands.
     let job = t
         .start("/runs/sweep", &sweep_spec(30, (1, 100), (101, 300)))
         .await;
@@ -604,15 +652,13 @@ async fn a_cancelled_sweep_stops_well_before_its_last_backtest() {
     assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(body["error"]["code"], "job_not_done");
 
-    let asked = Instant::now();
     let (status, _) = t.post(&format!("/jobs/{job}/cancel"), &json!(null)).await;
     assert_eq!(status, StatusCode::ACCEPTED);
     let last = ws.follow(job).await.pop().unwrap();
-    let took = asked.elapsed();
     assert_eq!(last.status, JobStatus::Cancelled);
     assert!(last.result.is_none());
+    // Counted, not timed: fewer than half its backtests ran.
     assert!(last.progress < 0.5, "stopped at {}", last.progress);
-    assert!(took < Duration::from_secs(10), "took {took:?} to stop");
 
     let (_, runs) = t.get("/runs").await;
     assert_eq!(runs, json!([]), "a cancelled run is not saved");
@@ -682,22 +728,28 @@ async fn the_run_routes_need_the_token_and_unknown_ids_are_404() {
     assert_eq!((status, list), (StatusCode::OK, json!([])));
 }
 
-/// Starts two sweeps of minutes of work and waits until both have loaded their data and are
-/// running, so both run slots stay busy until they are cancelled.
-async fn fill_the_run_slots(t: &TestServer, ws: &mut Ws) -> [u64; 2] {
-    let spec = sweep_spec(30, (1, 100), (101, 300));
-    let busy = [
-        t.start("/runs/sweep", &spec).await,
-        t.start("/runs/sweep", &spec).await,
-    ];
-    let mut working = Vec::new();
-    while working.len() < busy.len() {
+/// Fills both run slots with jobs that hold them, doing no work, until each is cancelled, and
+/// waits until both are running. They are run jobs, so they also take two places in the queue.
+async fn hold_the_run_slots(t: &TestServer, ws: &mut Ws) -> [u64; 2] {
+    let hold = || {
+        let request = JobRequest::Backtest(config(InstrumentKind::Spot, 10));
+        let job = t.server.jobs().submit(request, |ctx| {
+            loop {
+                ctx.checkpoint()?;
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        });
+        job.expect("accepted").id
+    };
+    let busy = [hold(), hold()];
+    let mut running = Vec::new();
+    while running.len() < busy.len() {
         let Some(ServerMessage::Job { job }) = ws.next().await else {
             panic!("the topic closed");
         };
-        if busy.contains(&job.id) && job.progress > 0.0 && !working.contains(&job.id) {
-            assert_eq!(job.status, JobStatus::Running);
-            working.push(job.id);
+        if busy.contains(&job.id) && job.status == JobStatus::Running && !running.contains(&job.id)
+        {
+            running.push(job.id);
         }
     }
     busy
@@ -726,7 +778,7 @@ async fn cancel(t: &TestServer, job: u64) -> Value {
 async fn runs_beyond_the_queue_limit_are_429_and_a_cancelled_queued_run_makes_room() {
     let t = TestServer::seeded(30).await;
     let mut ws = t.websocket().await;
-    let busy = fill_the_run_slots(&t, &mut ws).await;
+    let busy = hold_the_run_slots(&t, &mut ws).await;
     let backtest = serde_json::to_value(config(InstrumentKind::Spot, 10)).unwrap();
     let mut queued = Vec::new();
     for _ in busy.len()..MAX_RUN_JOBS {
@@ -766,7 +818,7 @@ async fn runs_beyond_the_queue_limit_are_429_and_a_cancelled_queued_run_makes_ro
 async fn a_queued_run_loads_its_data_only_when_it_starts() {
     let t = TestServer::seeded(30).await;
     let mut ws = t.websocket().await;
-    let busy = fill_the_run_slots(&t, &mut ws).await;
+    let busy = hold_the_run_slots(&t, &mut ws).await;
     let job = t
         .start(
             "/runs/backtest",
@@ -777,17 +829,19 @@ async fn a_queued_run_loads_its_data_only_when_it_starts() {
     assert_eq!(state["status"], "queued", "{state}");
 
     // The spot candles go while the run waits; a run holding data loaded on request would not
-    // notice. The sweeps are on the perpetual and have loaded theirs.
+    // notice.
     let id = instrument(InstrumentKind::Spot).id;
     let file = t
         .store
         .candle_path(&id, td_data::time::Month::containing(t0()))
         .unwrap();
     std::fs::remove_file(file).unwrap();
-    for job in busy {
-        cancel(&t, job).await;
-    }
+    // One slot frees, and the queued run starts on it while the other is still held.
+    cancel(&t, busy[0]).await;
     let last = ws.follow(job).await.pop().unwrap();
+    let (_, held) = t.get(&format!("/jobs/{}", busy[1])).await;
+    assert_eq!(held["status"], "running", "{held}");
+    cancel(&t, busy[1]).await;
     assert_eq!(last.status, JobStatus::Failed, "{last:?}");
     let error = last.error.expect("an error");
     assert_eq!(error.code, "data_missing");
