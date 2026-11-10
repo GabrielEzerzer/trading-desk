@@ -26,7 +26,9 @@ pub enum FillCheck {
 /// after the one the order was decided on, and handles fees, ordering and order state. For an
 /// attached stop it also calls it on its entry's fill bar, with the bar's open replaced by the
 /// price the entry met the market at: its market price, or its limit when it filled between the
-/// bars, with the range stretched to include that limit.
+/// bars, with the range stretched to include that limit. For a reduce-only limit that waits for
+/// the open, it calls it with the order's time in force set to IOC, to price it as a limit arriving
+/// at the open.
 pub trait FillModel: Send {
     /// `first` says whether this is the first bar the order can fill on. `triggered` says whether
     /// a stop-limit was triggered on an earlier bar.
@@ -67,7 +69,8 @@ pub trait FillModel: Send {
 /// traded through it between the bars, as on a venue that trades around the clock with no gap.
 /// The broker keeps to that assumption for what follows from the fill: it comes before the fills
 /// at the open, and an attached stop between the limit and the open fills at its trigger on the
-/// way. After a real jump (a halt or an outage that reopens past the limit) a venue would fill the
+/// way. A reduce-only limit with nothing to reduce between the bars waits for the open instead
+/// (see [`crate::SimBroker`]). After a real jump (a halt or an outage that reopens past the limit) a venue would fill the
 /// limit at the reopening price, which is better, so this errs against the strategy. Stops the bar
 /// opens through still fill at the open, which errs against the strategy the other way. Upgrade
 /// with a trade-level fill model.

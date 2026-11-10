@@ -978,7 +978,9 @@ fn a_take_profit_the_bar_opens_through_fills_before_a_market_order_at_the_open()
     // take-profit fills first, selling that 1 at its limit of 110 as a maker, fee 0.11, realised
     // +10. Then order 2 buys 1 at the open of 112, fee 0.224. Its stop at 95 is below the open, and
     // the fall to 94 inside the range reaches it: it sells 1 at 95, fee 0.19, realised 95 - 112 =
-    // -17. No unit is sold at 110 in the same instant it was bought at 112.
+    // -17. No unit is sold at 110 in the same instant it was bought at 112. The take-profit was
+    // for 2 but had only 1 to reduce: like any reduce-only order it fills once, cut to the
+    // position it can close then, so its other 1 does not wait for the open.
     let f = s.fills();
     assert_eq!(f.len(), 4);
     let fill = |n: usize| (f[n].order_id.0, f[n].time, f[n].side, f[n].liquidity);
@@ -1029,41 +1031,87 @@ fn an_attached_stop_inside_the_range_waits_for_the_fills_at_the_open() {
     approx(p.cash(), 10011.128);
 }
 
-#[test]
-fn a_take_profit_sent_with_its_entry_is_cancelled_when_the_next_bar_opens_through_it() {
+/// The common bracket: a market buy of 1 (order 1, left out when `entry` is false) and a
+/// reduce-only take-profit selling 1 at `take_profit` (order 2), both sent on the close of 100.
+/// Bar 1 opens at 105, through the take-profit. Slippage 10 bps.
+fn bracket(entry: bool, take_profit: f64) -> Session {
     let i = perp();
     let bars = [
         bar(0, 100.0, 101.0, 99.0, 100.0),
         bar(1, 105.0, 106.0, 104.0, 105.0),
     ];
-    let (script, log) = Script::new(vec![
-        (0, req(&i, Side::Buy, 1.0, OrderType::Market)),
-        (
-            0,
-            reduce_only(req(&i, Side::Sell, 1.0, OrderType::Limit { price: 103.0 })),
-        ),
-    ]);
-    let s = run(i, 0.0, &bars, script);
-    assert!(log.lock().unwrap().iter().all(|r| r.is_ok()));
-    // The common bracket: a market entry and a reduce-only take-profit sent on the same close of
-    // 100. Bar 1 opens at 105, through the take-profit at 103: the market passed 103 between the
-    // bars, before the entry filled at the open, so the take-profit had nothing to close and is
-    // cancelled. The entry then buys 1 at 105, fee 0.21, and the long is left without a
-    // take-profit.
+    let buy = req(&i, Side::Buy, 1.0, OrderType::Market);
+    let sell = reduce_only(req(
+        &i,
+        Side::Sell,
+        1.0,
+        OrderType::Limit { price: take_profit },
+    ));
+    let strategy = steps(move |ctx, n| {
+        if n == 0 {
+            if entry {
+                ctx.submit(buy.clone()).unwrap();
+            }
+            ctx.submit(sell.clone()).unwrap();
+        }
+    });
+    run(i, 10.0, &bars, strategy)
+}
+
+#[test]
+fn a_take_profit_sent_with_its_entry_fills_at_the_open_when_the_next_bar_opens_through_it() {
+    let s = bracket(true, 103.0);
+    // The market passed 103 between the bars, before the entry filled, so the take-profit had
+    // nothing to reduce then. It waits for the open. The entry buys there: 105 * 1.001 = 105.105,
+    // rounded up to 105.11, taker fee 0.2% = 0.21022. Then the take-profit has the long to reduce
+    // and takes liquidity at the open: 105 * 0.999 = 104.895, rounded down to 104.89, above its
+    // limit of 103, taker fee 0.20978. Realised 104.89 - 105.11 = -0.22.
     let f = s.fills();
-    assert_eq!(f.len(), 1);
-    assert_eq!((f[0].order_id.0, f[0].time, f[0].side), (1, MIN, Side::Buy));
-    approx(f[0].price, 105.0);
-    approx(f[0].fee, 0.21);
+    assert_eq!(f.len(), 2);
+    let fill = |n: usize| (f[n].order_id.0, f[n].time, f[n].side, f[n].liquidity);
+    assert_eq!(fill(0), (1, MIN, Side::Buy, Liquidity::Taker));
+    approx(f[0].price, 105.11);
+    approx(f[0].fee, 0.21022);
+    assert_eq!(fill(1), (2, MIN, Side::Sell, Liquidity::Taker));
+    approx(f[1].price, 104.89);
+    approx(f[1].qty, 1.0);
+    approx(f[1].fee, 0.20978);
+    assert!(s.orders().iter().all(|o| o.status == OrderStatus::Filled));
+    let p = s.portfolio();
+    assert_eq!(p.position(), 0.0);
+    approx(p.realised_pnl(), -0.22);
+    // 10000 - 0.21022 - 0.20978 - 0.22.
+    approx(p.cash(), 9999.36);
+    approx(equity(&s)[1], 9999.36);
+}
+
+#[test]
+fn a_take_profit_that_waited_for_the_open_fills_no_worse_than_its_limit() {
+    let s = bracket(true, 104.95);
+    // As above, but the open less slippage, 104.89, is below the limit of 104.95: the take-profit
+    // sells at 104.95, taker fee 0.2099. Realised 104.95 - 105.11 = -0.16: cash 10000 - 0.21022
+    // - 0.2099 - 0.16 = 9999.41988.
+    let f = s.fills();
+    assert_eq!(f.len(), 2);
+    assert_eq!((f[1].order_id.0, f[1].liquidity), (2, Liquidity::Taker));
+    approx(f[1].price, 104.95);
+    approx(f[1].fee, 0.2099);
+    assert_eq!(s.portfolio().position(), 0.0);
+    approx(s.portfolio().realised_pnl(), -0.16);
+    approx(s.portfolio().cash(), 9999.41988);
+}
+
+#[test]
+fn a_take_profit_with_nothing_to_reduce_at_the_open_either_is_cancelled() {
+    let s = bracket(false, 103.0);
+    // No entry: the take-profit has nothing to reduce between the bars or at the open.
+    assert!(s.fills().is_empty());
     assert_eq!(
-        s.orders()[1].status,
+        s.orders()[0].status,
         OrderStatus::Cancelled("reduce-only order would not reduce the position".into())
     );
     assert!(s.open_orders().is_empty());
-    approx(s.portfolio().position(), 1.0);
-    // Cash 10000 - 0.21 (a perpetual's cash moves by fees and realised PnL), plus 1 marked at its
-    // entry of 105.
-    approx(equity(&s)[1], 9999.79);
+    approx(s.portfolio().cash(), 10_000.0);
 }
 
 #[test]

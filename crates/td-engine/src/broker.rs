@@ -103,8 +103,15 @@ pub trait Broker: Send {
 /// stop-limits triggered on this bar, then limit orders, then by order id. A protective stop
 /// therefore beats a take-profit limit when the bar reaches both inside its range, but a
 /// take-profit the bar opens through fills first, at its limit, before even a market order sent
-/// on the same close: a reduce-only take-profit sent with its entry finds nothing to close yet and
-/// is cancelled.
+/// on the same close.
+///
+/// A reduce-only limit the bar opens through that has nothing to reduce between the bars, such as
+/// a take-profit sent on the same close as its market entry, is not cancelled then. It waits for
+/// the open, and after the other fills at the open it takes liquidity there like a limit arriving
+/// at the open: at the open with slippage, never past its limit, as a taker, for at most the
+/// position it can reduce. If there is still nothing to reduce, it is cancelled. One that has part
+/// of its quantity to reduce between the bars fills that part at its limit and is done, as any
+/// reduce-only order fills once.
 ///
 /// When an entry with an attached stop fills, the stop is placed at once and checked against the
 /// same bar. The path after the fill is unknown, so the whole bar range counts as coming after it:
@@ -198,6 +205,16 @@ impl Pending {
     }
 }
 
+/// What follows from applying one fill on the bar being processed.
+enum After {
+    Nothing,
+    /// The order's attached stop also fills on this bar.
+    Stop(Pending),
+    /// The order had nothing to reduce between the bars and waits for the open, where it would
+    /// fill like this.
+    Wait(Pending),
+}
+
 /// Records the cancellation of `order`, and of its attached stop, which was never placed.
 fn cancel(events: &mut Vec<BrokerEvent>, order: &Order, reason: &str) {
     events.push(BrokerEvent::Cancelled {
@@ -277,15 +294,13 @@ impl<M: FillModel> Broker for SimBroker<M> {
         let mut done = Vec::new();
         let mut placed = Vec::new();
         // Applies one fill and places the order's attached stop, if it has one. Returns the stop's
-        // fill when the stop fills on this bar too.
+        // fill when the stop fills on this bar too, or the order's fill at the open when it waits
+        // for the open.
         let mut apply = |fill: Pending| {
+            let between = fill.between_bars(bar);
             // The rest of this bar, from the entry's fill on. An entry that filled between the bars
             // met the market at its limit, and the market went on from there to the open.
-            let from = if fill.between_bars(bar) {
-                fill.price
-            } else {
-                fill.market
-            };
+            let from = if between { fill.price } else { fill.market };
             let rest = Candle {
                 open: from,
                 high: bar.high.max(from),
@@ -296,12 +311,37 @@ impl<M: FillModel> Broker for SimBroker<M> {
             done.push(order.id);
             let Some(applied) = self.fill(&order, fill.price, fill.liquidity, bar, &mut position)
             else {
+                // A reduce-only limit the market passed between the bars while it had nothing to
+                // reduce waits for the open, where the fills at the open can give it a position.
+                // There it takes liquidity like a limit arriving at the open, which the model
+                // prices as an IOC limit: the open with slippage, never past the limit, as a taker.
+                if between && order.request.reduce_only {
+                    let mut arriving = order.clone();
+                    arriving.request.tif = TimeInForce::Ioc;
+                    if let FillCheck::Fill {
+                        price,
+                        liquidity,
+                        market,
+                    } = self
+                        .model
+                        .check(&arriving, false, false, bar, &self.instrument)
+                    {
+                        return After::Wait(Pending {
+                            order,
+                            price,
+                            liquidity,
+                            market,
+                        });
+                    }
+                }
                 cancel(&mut events, &order, NOTHING_TO_REDUCE);
-                return None;
+                return After::Nothing;
             };
             let qty = applied.qty;
             events.push(BrokerEvent::Filled(applied));
-            let attached = order.attached_stop?;
+            let Some(attached) = order.attached_stop else {
+                return After::Nothing;
+            };
             let stop = Order {
                 id: attached.id,
                 request: attached.request(&order.request, qty),
@@ -319,7 +359,7 @@ impl<M: FillModel> Broker for SimBroker<M> {
                     price,
                     liquidity,
                     market,
-                } => Some(Pending {
+                } => After::Stop(Pending {
                     order: stop,
                     price,
                     liquidity,
@@ -327,7 +367,7 @@ impl<M: FillModel> Broker for SimBroker<M> {
                 }),
                 FillCheck::Triggered | FillCheck::NoFill => {
                     placed.push(stop);
-                    None
+                    After::Nothing
                 }
             }
         };
@@ -354,21 +394,34 @@ impl<M: FillModel> Broker for SimBroker<M> {
             Side::Sell => stop.market >= bar.open,
             Side::Buy => stop.market <= bar.open,
         };
+        // Reduce-only limits that waited for the open fill after the other fills at the open, which
+        // can give them a position to reduce; with still nothing to reduce they are cancelled.
+        let mut waiting = Vec::new();
         for fill in at_open {
             match apply(fill) {
                 // The entry met a market already through the stop, or the market crossed the stop
                 // on its way from the entry's limit to the open, so the stop fills now.
-                Some(stop) if by_open(&stop) => {
+                After::Stop(stop) if by_open(&stop) => {
                     apply(stop);
                 }
-                Some(stop) => inside.push((0, stop)),
-                None => {}
+                After::Stop(stop) => inside.push((0, stop)),
+                After::Wait(fill) => waiting.push(fill),
+                After::Nothing => {}
+            }
+        }
+        for fill in waiting {
+            match apply(fill) {
+                After::Stop(stop) if by_open(&stop) => {
+                    apply(stop);
+                }
+                After::Stop(stop) => inside.push((0, stop)),
+                After::Wait(_) | After::Nothing => {}
             }
         }
         inside.sort_by_key(|(priority, fill)| (*priority, fill.order.id));
         for (_, fill) in inside {
             // An entry filled inside the range has its stop applied straight after it.
-            if let Some(stop) = apply(fill) {
+            if let After::Stop(stop) = apply(fill) {
                 apply(stop);
             }
         }
