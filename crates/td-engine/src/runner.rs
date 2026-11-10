@@ -90,9 +90,15 @@ pub struct Rerun {
 /// Runs a backtest.
 ///
 /// `bars` may cover more than the configured range; only bars inside `from..to` are used.
-/// `funding` is `(time, rate)` in any order; events outside the used bars' windows are ignored.
+/// `funding` is `(time, rate)` in any order. An event in a gap between used bars is charged at the
+/// next bar's open, like one due at that open; events before the first used bar or from the last
+/// used bar's end on are ignored.
+///
 /// The strategy is built through the registry and run on a [`Session`], then the trade list,
 /// metrics and buy-and-hold benchmark are derived from the session's record.
+///
+/// The caller loads the candles and funding, and is responsible for reporting any buckets the
+/// data layer dropped as invalid; the result does not record them.
 pub fn run(
     config: &BacktestConfig,
     bars: &[Candle],
@@ -177,8 +183,8 @@ pub fn rerun(
 
 /// Buys at the first bar's open with all starting cash (taker fee, the run's slippage) and holds
 /// to the last close, paying funding on a perpetual like the session does: funding due at a bar's
-/// open on the position held going into the bar, at the open price, so none at the first open,
-/// and funding due later in the bar at the close.
+/// open or in the gap before it on the position held going into the bar, at the open price, so
+/// none at the first open, and funding due later in the bar at the close.
 fn benchmark(
     config: &BacktestConfig,
     bars: &[Candle],
@@ -203,7 +209,7 @@ fn benchmark(
     for (k, (bar, range)) in bars.iter().zip(ranges).enumerate() {
         let events = &funding[range.clone()];
         let mut charged = BarFunding::default();
-        for &(_, rate) in events.iter().filter(|&&(time, _)| time == bar.open_time) {
+        for &(_, rate) in events.iter().filter(|&&(time, _)| time <= bar.open_time) {
             charged.at_open += portfolio.charge_funding(rate, bar.open);
         }
         if k == 0 && qty.is_finite() && qty > 0.0 {

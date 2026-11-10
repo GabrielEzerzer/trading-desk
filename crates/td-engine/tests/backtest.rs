@@ -276,6 +276,48 @@ fn list_is_newest_first_and_skips_other_entries() {
 }
 
 #[test]
+fn funding_in_gaps_is_charged_at_the_next_open_and_attributed_to_the_trade_held() {
+    // Every bar that opens on a funding time (each 8 hours) is missing, so every funding event in
+    // range falls in a gap and is due at the next bar's open.
+    let bars: Vec<Candle> = synthetic_bars()
+        .into_iter()
+        .filter(|b| (b.open_time - T0) % (8 * HOUR) != 0)
+        .collect();
+    let funding = synthetic_funding();
+    let mut c = config();
+    c.params = c.params.with("allow_short", ParamValue::Bool(false));
+    let r = run(&c, &bars, &funding).unwrap();
+    assert!(r.metrics.funding_paid != 0.0);
+    // Long-only, so some exits leave the position flat on a bar right after a gap: the funding due
+    // at that open belongs to the trade that was closed, not to nothing.
+    assert_trades_add_up(&r);
+
+    // The benchmark holds the same quantity throughout and pays each event at the next open. The
+    // first used bar is at 10:00; events from 16:00 to bar 488 are in range, each charged at bar
+    // 8k + 1, which opens at price(8k).
+    let expected: f64 = funding
+        .iter()
+        .filter(|&&(t, _)| t > c.from && t < c.to)
+        .map(|&(t, rate)| r.benchmark.qty * price((t - T0) / HOUR) * rate)
+        .sum();
+    assert!(expected != 0.0);
+    let paid = r.benchmark.metrics.funding_paid;
+    assert!(
+        (paid - expected).abs() < 1e-9,
+        "benchmark paid {paid}, expected {expected}"
+    );
+
+    // Gap funding is part of the data the run used.
+    let mut rates = funding.clone();
+    let k = rates
+        .iter()
+        .position(|&(t, _)| t == T0 + 16 * HOUR)
+        .unwrap();
+    rates[k].1 += 1e-6;
+    assert!(!rerun(&r, &bars, &rates).unwrap().fingerprint_matches);
+}
+
+#[test]
 fn a_result_from_another_engine_revision_does_not_match() {
     let mut saved = run_synthetic();
     assert_eq!(saved.engine_revision, ENGINE_REVISION);

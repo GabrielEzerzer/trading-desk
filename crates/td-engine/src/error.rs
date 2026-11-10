@@ -15,7 +15,7 @@ pub enum EngineError {
     #[error("bar open time {time} is not on a {timeframe} boundary")]
     MisalignedBar { time: Millis, timeframe: Timeframe },
 
-    #[error("funding at {time} is outside the bar that opens at {bar_open}")]
+    #[error("funding at {time} is outside the bar that opens at {bar_open} and the gap before it")]
     FundingOutsideBar { time: Millis, bar_open: Millis },
 
     #[error("funding rate {rate} at {time} is not a finite number")]
