@@ -2027,7 +2027,9 @@ dependencies = [
  "proptest",
  "serde",
  "serde_json",
+ "sha2",
  "td-core",
+ "tempfile",
  "thiserror",
 ]
 

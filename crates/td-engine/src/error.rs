@@ -15,7 +15,7 @@ pub enum EngineError {
     #[error("bar open time {time} is not on a {timeframe} boundary")]
     MisalignedBar { time: Millis, timeframe: Timeframe },
 
-    #[error("funding at {time} is outside the bar that opens at {bar_open}")]
+    #[error("funding at {time} is outside the bar that opens at {bar_open} and the gap before it")]
     FundingOutsideBar { time: Millis, bar_open: Millis },
 
     #[error("funding rate {rate} at {time} is not a finite number")]
@@ -26,6 +26,9 @@ pub enum EngineError {
 
     #[error("warm-up bars must all come before the first live bar")]
     WarmUpAfterLive,
+
+    #[error("no bars open between {from} and {to}")]
+    NoBarsInRange { from: Millis, to: Millis },
 
     #[error("invalid session config: {0}")]
     InvalidConfig(&'static str),
