@@ -11,6 +11,14 @@ use crate::{
     SessionConfig, Trade, build_strategy, build_trades,
 };
 
+/// The revision of the engine's behaviour, stored in every result so a rerun can tell an engine
+/// change from a data change.
+///
+/// Bump it whenever the engine's behaviour changes: fills, fees, funding, the trade list, metrics
+/// or the benchmark. In practice that is whenever `tests/fixtures/backtest_expected.json` has to
+/// be regenerated; bump it in the same change.
+pub const ENGINE_REVISION: u32 = 1;
+
 /// Everything that defines a backtest apart from the data itself.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BacktestConfig {
@@ -54,6 +62,8 @@ pub struct BacktestResult {
     pub config: BacktestConfig,
     /// The td-engine crate version that produced the result.
     pub engine_version: String,
+    /// The [`ENGINE_REVISION`] that produced the result.
+    pub engine_revision: u32,
     /// SHA-256 of the bars and funding the run used; see [`data_fingerprint`].
     pub data_fingerprint: String,
     /// Equity at each bar's close.
@@ -72,6 +82,9 @@ pub struct Rerun {
     pub result: BacktestResult,
     /// Whether the data used this time hashes the same as the data of the saved run.
     pub fingerprint_matches: bool,
+    /// Whether this engine has the saved run's [`ENGINE_REVISION`]. When it does not, a different
+    /// result on the same data may come from the engine rather than the data.
+    pub engine_matches: bool,
 }
 
 /// Runs a backtest.
@@ -150,6 +163,7 @@ pub fn run(
     Ok(BacktestResult {
         config: config.clone(),
         engine_version: env!("CARGO_PKG_VERSION").to_string(),
+        engine_revision: ENGINE_REVISION,
         data_fingerprint: data_fingerprint(&bars, &used_funding),
         equity: session.equity().to_vec(),
         orders: session.orders().to_vec(),
@@ -168,9 +182,11 @@ pub fn rerun(
 ) -> Result<Rerun, EngineError> {
     let result = run(&saved.config, bars, funding)?;
     let fingerprint_matches = result.data_fingerprint == saved.data_fingerprint;
+    let engine_matches = result.engine_revision == saved.engine_revision;
     Ok(Rerun {
         result,
         fingerprint_matches,
+        engine_matches,
     })
 }
 

@@ -8,8 +8,8 @@ use std::path::PathBuf;
 use serde_json::Value;
 use td_core::{Candle, Millis, Timeframe};
 use td_engine::{
-    BacktestConfig, BacktestResult, EngineError, ParamValue, Params, data_fingerprint, list, load,
-    rerun, run, save,
+    BacktestConfig, BacktestResult, ENGINE_REVISION, EngineError, ParamValue, Params,
+    data_fingerprint, list, load, rerun, run, save,
 };
 
 const HOUR: Millis = 3_600_000;
@@ -119,6 +119,10 @@ fn assert_json_eq(actual: &Value, expected: &Value, path: &str) {
 /// Rewrites the expected result file. Run it on purpose after a deliberate change to fills,
 /// trades or metrics, then review the diff of the file before committing it:
 /// `cargo test -p td-engine --test backtest -- --ignored regenerate_expected_result`
+///
+/// A change that needs this is an engine behaviour change: bump `ENGINE_REVISION` in
+/// `src/runner.rs` in the same change, before regenerating, so saved results from the old engine
+/// show `engine_matches: false` on a rerun.
 #[test]
 #[ignore = "regenerates tests/fixtures/backtest_expected.json"]
 fn regenerate_expected_result() {
@@ -230,6 +234,7 @@ fn save_load_and_rerun_reproduce_the_result_exactly() {
 
     let again = rerun(&loaded, &synthetic_bars(), &synthetic_funding()).unwrap();
     assert!(again.fingerprint_matches);
+    assert!(again.engine_matches);
     assert_eq!(serde_json::to_string(&again.result).unwrap(), original);
 
     let listed = list(&runs).unwrap();
@@ -268,6 +273,18 @@ fn list_is_newest_first_and_skips_other_entries() {
         load(runs, "../outside"),
         Err(td_engine::StoreError::InvalidRunId(_))
     ));
+}
+
+#[test]
+fn a_result_from_another_engine_revision_does_not_match() {
+    let mut saved = run_synthetic();
+    assert_eq!(saved.engine_revision, ENGINE_REVISION);
+    // A saved run from an engine that behaved differently, on the same data.
+    saved.engine_revision = ENGINE_REVISION + 1;
+    let again = rerun(&saved, &synthetic_bars(), &synthetic_funding()).unwrap();
+    assert!(again.fingerprint_matches);
+    assert!(!again.engine_matches);
+    assert_eq!(again.result.engine_revision, ENGINE_REVISION);
 }
 
 #[test]

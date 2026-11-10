@@ -38,7 +38,9 @@ pub use params::{ParamKind, ParamSpec, ParamValue, Params};
 pub use portfolio::Portfolio;
 pub use registry::{StrategyEntry, build_strategy, find_strategy, strategies};
 pub use results::{RunId, RunSummary, StoreError, list, load, save};
-pub use runner::{BacktestConfig, BacktestResult, Benchmark, Rerun, data_fingerprint, rerun, run};
+pub use runner::{
+    BacktestConfig, BacktestResult, Benchmark, ENGINE_REVISION, Rerun, data_fingerprint, rerun, run,
+};
 pub use session::{EquityPoint, Session, SessionConfig, run_backtest};
 pub use strategy::{Context, Strategy};
 pub use trades::{BarFunding, Trade, TradeSide, build_trades};
