@@ -1,7 +1,8 @@
 # CI for this repo, copied in by D:/code/setup/new-project.py. Rules: D:/code/CLAUDE.md, "Test suites".
 # It runs on pushes to branches other than the default and on manual dispatch, so each push starts one run
 # and a branch has results before its PR exists.
-# It runs the Rust suite: rustfmt, clippy with warnings denied, and the workspace tests.
+# It runs the Rust suite: rustfmt, clippy with warnings denied, the workspace tests, and a check that
+# the generated TypeScript API types are up to date.
 # Never give this workflow production URLs, real secrets, .env.local or a service_role key.
 name: ci
 
@@ -33,3 +34,9 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Test
         run: cargo test --workspace --locked
+      # The GUI's TypeScript API types are generated from the Rust types; fail if the committed
+      # file differs from a fresh generation.
+      - name: TypeScript API types are up to date
+        run: |
+          cargo run -p td-server --bin gen-api-types --locked
+          git diff --exit-code -- gui/shared/src/api-types.ts
