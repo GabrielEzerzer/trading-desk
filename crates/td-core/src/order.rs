@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{InstrumentId, Millis};
 
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Side {
@@ -25,6 +26,7 @@ impl Side {
 /// bar's low reaches `trigger` or below. Once triggered, `Stop` fills as a market order and
 /// `StopLimit` rests as a limit order at `price`. A take-profit is expressed as a `Limit` order;
 /// there is no separate type for it.
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum OrderType {
@@ -34,6 +36,7 @@ pub enum OrderType {
     StopLimit { trigger: f64, price: f64 },
 }
 
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TimeInForce {
@@ -43,12 +46,14 @@ pub enum TimeInForce {
     Ioc,
 }
 
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct OrderId(pub u64);
 
 /// An order as a strategy or the user submits it. Quantity is in the base asset and always
 /// positive; `side` carries the direction.
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OrderRequest {
     pub instrument: InstrumentId,
@@ -63,6 +68,7 @@ pub struct OrderRequest {
 }
 
 /// Whether a fill added liquidity to the book (maker) or took it (taker).
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Liquidity {
@@ -71,6 +77,7 @@ pub enum Liquidity {
 }
 
 /// A full or partial execution of an order.
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Fill {
     pub order_id: OrderId,

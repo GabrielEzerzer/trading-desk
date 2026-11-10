@@ -19,7 +19,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use td_core::{Candle, InstrumentId, InstrumentKind, Millis, Timeframe};
-use td_data::live::{FeedEvent, FeedSpec, Rest, run_feed, stream_url};
+use td_data::live::{FeedEvent, Rest, SharedStream, run_feed_on, stream_url};
+use td_data::time::round_to_minute;
 use td_data::{DataError, Store};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
@@ -47,6 +48,8 @@ pub struct PaperHandle {
     session: Arc<Mutex<PaperSession>>,
     stop: watch::Sender<bool>,
     task: JoinHandle<()>,
+    /// Turns true once the session has ended and its final status is set.
+    ended: watch::Receiver<bool>,
 }
 
 impl PaperHandle {
@@ -54,6 +57,18 @@ impl PaperHandle {
     /// for every bar.
     pub fn session(&self) -> &Arc<Mutex<PaperSession>> {
         &self.session
+    }
+
+    /// Resolves once the session has ended on its own (an error) or after a stop, with its final
+    /// status set.
+    pub async fn finished(&self) {
+        let mut ended = self.ended.clone();
+        let _ = ended.wait_for(|ended| *ended).await;
+    }
+
+    /// Turns true once the session has ended, as [`PaperHandle::finished`] waits for.
+    pub(crate) fn ended(&self) -> watch::Receiver<bool> {
+        self.ended.clone()
     }
 
     /// Stops the session and waits for its loop to end. Its status is then `Stopped`, or `Error`
@@ -73,13 +88,26 @@ pub fn start(session: PaperSession, rest: Arc<dyn Rest>) -> PaperHandle {
 }
 
 /// [`start`] on another WebSocket URL serving the venue's message format, such as a test server.
+/// The session opens its own connection once it has warmed up.
 pub fn start_with_stream(session: PaperSession, rest: Arc<dyn Rest>, url: String) -> PaperHandle {
+    let id = session.config().instrument.id.clone();
+    start_on(session, rest, move || Arc::new(SharedStream::open(id, url)))
+}
+
+/// [`start`] on a stream other feeds may share. `stream` is called once the session has warmed up
+/// and is ready for live bars, and must give a stream of the session's instrument.
+pub fn start_on(
+    session: PaperSession,
+    rest: Arc<dyn Rest>,
+    stream: impl FnOnce() -> Arc<SharedStream> + Send + 'static,
+) -> PaperHandle {
     let session = Arc::new(Mutex::new(session));
     let (stop, mut stopped) = watch::channel(false);
+    let (ended_tx, ended) = watch::channel(false);
     let shared = Arc::clone(&session);
     let task = tokio::spawn(async move {
         // The loop runs in its own task so that a panic in it is caught here and shows as an error.
-        let mut driver = tokio::spawn(drive(Arc::clone(&shared), rest, url));
+        let mut driver = tokio::spawn(drive(Arc::clone(&shared), rest, Box::new(stream)));
         let status = tokio::select! {
             joined = &mut driver => match joined {
                 Ok(Ok(())) => Status::Stopped,
@@ -99,11 +127,13 @@ pub fn start_with_stream(session: PaperSession, rest: Arc<dyn Rest>, url: String
             }
         };
         lock(&shared).set_status(status);
+        let _ = ended_tx.send(true);
     });
     PaperHandle {
         session,
         stop,
         task,
+        ended,
     }
 }
 
@@ -146,10 +176,13 @@ async fn blocking<T: Send + 'static>(
         .map_err(PaperError::from)
 }
 
+/// Gives the stream to feed from, once the session is ready for live bars.
+type OpenStream = Box<dyn FnOnce() -> Arc<SharedStream> + Send>;
+
 async fn drive(
     shared: Arc<Mutex<PaperSession>>,
     rest: Arc<dyn Rest>,
-    url: String,
+    stream: OpenStream,
 ) -> Result<(), PaperError> {
     let shared = &*shared;
     let (id, timeframe, data_dir, next, live) = {
@@ -193,11 +226,8 @@ async fn drive(
 
     lock(shared).set_status(Status::Reconnecting);
     let (tx, mut rx) = mpsc::channel(256);
-    let spec = FeedSpec {
-        url,
-        ..FeedSpec::new(id.clone(), timeframe, Some(start))
-    };
-    let _feed = AbortOnDrop(tokio::spawn(run_feed(spec, rest.clone(), tx)));
+    let feed = run_feed_on(stream(), timeframe, Some(start), rest.clone(), tx);
+    let _feed = AbortOnDrop(tokio::spawn(feed));
     while let Some(event) = rx.recv().await {
         match event {
             FeedEvent::Connected => lock(shared).set_status(Status::Live),
@@ -310,8 +340,11 @@ impl FundingClock {
         clock
     }
 
-    /// Notes a rate at `time`, charged or seen.
+    /// Notes a rate at `time`, charged or seen. The time is rounded to the minute, as the venue
+    /// parsers round fetched rates, so a rate logged with a raw stamp a few milliseconds early is
+    /// not charged again when the same rate is fetched on the minute after a resume.
     fn seen(&mut self, time: Millis) {
+        let time = round_to_minute(time);
         if time > self.last {
             self.interval = time - self.last;
             self.last = time;
@@ -442,6 +475,15 @@ mod tests {
         );
         assert_eq!(clock.last, T);
         assert!(clock.take(&[(T, 0.2)], T + 6 * MIN, T + 7 * MIN).is_empty());
+    }
+
+    #[test]
+    fn a_rate_logged_a_few_ms_early_is_not_charged_again_when_fetched_on_the_minute() {
+        // A resumed session's log holds the rate due at T with the venue's raw stamp, 5 ms early.
+        let mut clock = FundingClock::new(&[(T - 16 * HOUR, 0.1), (T - 8 * HOUR, 0.1)], T - HOUR);
+        clock.seen(T - 5);
+        assert_eq!((clock.last, clock.interval), (T, 8 * HOUR));
+        assert!(clock.take(&[(T, 0.1)], T + MIN, T + 2 * MIN).is_empty());
     }
 
     /// Funding with one rate due at `T`, published from the `publish_on`th request on.

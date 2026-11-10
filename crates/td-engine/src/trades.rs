@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 use td_core::{Candle, Fill, Millis};
 
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TradeSide {
@@ -20,6 +21,7 @@ impl TradeSide {
 }
 
 /// One round trip: the position leaves zero, then returns to it.
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Trade {
     pub side: TradeSide,

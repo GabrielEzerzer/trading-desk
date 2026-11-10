@@ -10,7 +10,7 @@ use td_core::{Candle, InstrumentId, Millis, Timeframe};
 use crate::DataError;
 use crate::http::Http;
 use crate::instruments::{bybit_category, bybit_result};
-use crate::time::now_ms;
+use crate::time::{ROUNDING_PAD, funding_on_the_minute, now_ms, round_to_minute};
 
 const KLINE_URL: &str = "https://api.bybit.com/v5/market/kline";
 const FUNDING_URL: &str = "https://api.bybit.com/v5/market/funding/history";
@@ -150,8 +150,18 @@ struct FundingRow {
 }
 
 /// Parses one `/v5/market/funding/history` response into `(funding time, rate)`, in the order
-/// given (newest first).
+/// given (newest first). Funding times are rounded to the nearest minute (see
+/// [`round_to_minute`]), the same rule as for Binance.
 pub fn parse_funding_page(body: &str) -> Result<Vec<(Millis, f64)>, DataError> {
+    let rates = parse_funding_stamps(body)?;
+    Ok(rates
+        .into_iter()
+        .map(|(t, rate)| (round_to_minute(t), rate))
+        .collect())
+}
+
+/// [`parse_funding_page`] with the times as Bybit stamps them, for paging.
+fn parse_funding_stamps(body: &str) -> Result<Vec<(Millis, f64)>, DataError> {
     let page: FundingPage = bybit_result(FUNDING_URL, body)?;
     page.list
         .iter()
@@ -180,21 +190,36 @@ pub fn fetch_funding(
     from: Millis,
     to: Millis,
 ) -> Result<Vec<(Millis, f64)>, DataError> {
-    let funding_time = |&(t, _): &(Millis, f64)| t;
-    let mut rates = page_backwards(from, to - 1, FUNDING_LIMIT, funding_time, |page_end| {
+    read_funding(from, to, |start, page_end| {
         let query = [
             ("category", "linear".to_string()),
             ("symbol", symbol.to_string()),
-            ("startTime", from.to_string()),
+            ("startTime", start.to_string()),
             ("endTime", page_end.to_string()),
             ("limit", FUNDING_LIMIT.to_string()),
         ];
-        let page = parse_funding_page(&http.get_text(FUNDING_URL, &query)?)?;
+        let page = parse_funding_stamps(&http.get_text(FUNDING_URL, &query)?)?;
         std::thread::sleep(DELAY);
         Ok(page)
+    })
+}
+
+/// Reads the funding rates in `[from, to)` through `fetch(start, end)`, which returns the newest
+/// [`FUNDING_LIMIT`] rates stamped in `[start, end]`, newest first, with the times as the venue
+/// stamps them.
+fn read_funding(
+    from: Millis,
+    to: Millis,
+    mut fetch: impl FnMut(Millis, Millis) -> Result<Vec<(Millis, f64)>, DataError>,
+) -> Result<Vec<(Millis, f64)>, DataError> {
+    // Paged by the stamps themselves, so each page ends just before the oldest stamp read; only
+    // then are the times put on the minute and kept to the range.
+    let (lo, end) = (from - ROUNDING_PAD, to + ROUNDING_PAD - 1);
+    let funding_time = |&(t, _): &(Millis, f64)| t;
+    let stamped = page_backwards(lo, end, FUNDING_LIMIT, funding_time, |page_end| {
+        fetch(lo, page_end)
     })?;
-    rates.dedup_by_key(|&mut (t, _)| t);
-    Ok(rates)
+    Ok(funding_on_the_minute(stamped, from, to))
 }
 
 #[cfg(test)]
@@ -264,5 +289,53 @@ mod tests {
         )
         .expect("pages");
         assert_eq!(rows, [10, 15, 20]);
+    }
+
+    /// A newest-first funding endpoint holding `stamps`, oldest first: it answers with the newest
+    /// [`FUNDING_LIMIT`] rates stamped in the range asked for, newest first, with the times as
+    /// stamped.
+    fn venue(
+        stamps: &[(Millis, f64)],
+    ) -> impl FnMut(Millis, Millis) -> Result<Vec<(Millis, f64)>, DataError> + '_ {
+        move |start, end| {
+            let page = stamps.iter().rev().copied();
+            Ok(page
+                .filter(|(t, _)| (start..=end).contains(t))
+                .take(FUNDING_LIMIT)
+                .collect())
+        }
+    }
+
+    const H8: Millis = 8 * 3_600_000;
+    /// 2024-02-01 00:00 UTC: a funding time on both venues, and the start of a month.
+    const T: Millis = 1_706_745_600_000;
+
+    #[test]
+    fn a_rate_stamped_just_before_a_window_boundary_is_read_once_in_the_window_it_rounds_into() {
+        // 00:00 on 1 February stamped 5 ms early, between a rate on time and one 8 ms late.
+        let stamps = [(T - H8, 0.0001), (T - 5, 0.0002), (T + H8 + 8, 0.0003)];
+        let before = read_funding(T - H8, T, venue(&stamps)).expect("reads");
+        let after = read_funding(T, T + H8, venue(&stamps)).expect("reads");
+        assert_eq!(before, [(T - H8, 0.0001)]);
+        assert_eq!(after, [(T, 0.0002)]);
+    }
+
+    #[test]
+    fn two_stamps_on_one_minute_keep_the_later() {
+        let stamps = [(T - 5, 0.0001), (T + 8, 0.0002)];
+        let rates = read_funding(T - H8, T + H8, venue(&stamps)).expect("reads");
+        assert_eq!(rates, [(T, 0.0002)]);
+    }
+
+    #[test]
+    fn funding_paged_by_its_stamps_comes_back_once_each_on_the_minute() {
+        // More rates than a page holds, stamped alternately 7 ms late and 5 ms early.
+        let n = FUNDING_LIMIT as Millis + 3;
+        let stamps: Vec<(Millis, f64)> = (0..n)
+            .map(|i| (T + i * H8 + if i % 2 == 0 { 7 } else { -5 }, i as f64))
+            .collect();
+        let rates = read_funding(T, T + n * H8, venue(&stamps)).expect("reads");
+        let expected: Vec<(Millis, f64)> = (0..n).map(|i| (T + i * H8, i as f64)).collect();
+        assert_eq!(rates, expected);
     }
 }
