@@ -1,0 +1,52 @@
+/* Bare layout only; the design pass replaces this. */
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  font-family: system-ui, sans-serif;
+  background: Canvas;
+  color: CanvasText;
+}
+
+.app {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+/* The window has no native title bar; this strip is draggable and leaves room for the window
+   controls that titleBarOverlay draws on the right. */
+.titlebar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  height: 36px;
+  width: env(titlebar-area-width, 100%);
+  padding: 0 8px;
+  box-sizing: border-box;
+  -webkit-app-region: drag;
+}
+
+.toggle {
+  display: flex;
+  -webkit-app-region: no-drag;
+}
+
+.toggle button[aria-pressed='true'] {
+  font-weight: 600;
+}
+
+.engine-status {
+  margin: 0;
+  font-size: 12px;
+}
+
+.content {
+  flex: 1;
+  overflow: auto;
+  padding: 16px;
+}
