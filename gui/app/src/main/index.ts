@@ -1,5 +1,5 @@
 import { join } from 'node:path'
-import { type IpcMainInvokeEvent, BrowserWindow, app, ipcMain, session } from 'electron'
+import { type IpcMainInvokeEvent, BrowserWindow, app, ipcMain, session, shell } from 'electron'
 import {
   type ApiResult,
   type EngineStatus,
@@ -11,6 +11,7 @@ import {
   TITLE_BAR_HEIGHT,
 } from '@td/shared'
 import { type Connection, RefusedRequest, sendRequest, validateRequest, validateTopic } from './bridge'
+import { isExternalLink } from './links'
 import { createQuit } from './quit'
 import { Sidecar, sidecarBin } from './sidecar'
 import { EngineSocket } from './socket'
@@ -160,7 +161,11 @@ function createWindow(): void {
   win.on('closed', () => {
     window = null
   })
-  win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
+  // The page opens no windows of its own; the one exact link on the list goes to the browser.
+  win.webContents.setWindowOpenHandler(({ url }) => {
+    if (isExternalLink(url)) void shell.openExternal(url)
+    return { action: 'deny' }
+  })
   win.webContents.on('will-navigate', (event, url) => {
     if (url !== win.webContents.getURL()) event.preventDefault()
   })

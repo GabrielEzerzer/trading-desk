@@ -15,6 +15,7 @@ const here = dirname(fileURLToPath(import.meta.url))
 const root = resolve(here, '..', 'out', 'renderer')
 const outDir = resolve(here, '..', '..', 'shots')
 const fixtures = JSON.parse(readFileSync(join(here, '..', 'mock', 'lab.json'), 'utf8'))
+const trading = JSON.parse(readFileSync(join(here, '..', 'mock', 'trading.json'), 'utf8'))
 const stubSource = readFileSync(join(here, 'bridge-stub.js'), 'utf8')
 
 const SIZES = [
@@ -29,6 +30,61 @@ const TYPES = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/cs
 const engineStrategies = fixtures.strategies.map((s) => ({ name: s.name, description: s.description, params: [] }))
 
 const wait = (ms) => new Promise((r) => setTimeout(r, ms))
+
+const instruments = trading.instruments.map((i) => i.instrument)
+const btc = instruments.find((i) => i.id.symbol === 'BTCUSDT' && i.id.venue === 'binance' && i.id.kind === 'spot')
+const engineStart = { open_time: trading.end, open: 64180, high: 64230, low: 64150, close: 64210, volume: 14, quote_volume: 14 * 64210 }
+
+/** A running strategy session as the engine reports it, for Trading in engine mode. */
+const engineSession = {
+  id: '1794311000000-sma',
+  config: { strategy: 'sma_cross', params: {}, instrument: btc, timeframe: '1m', starting_cash: 10000, slippage_bps: 2, fees: null },
+  status: { status: 'live' },
+  cash: 2302.4,
+  equity: 10009.6,
+  position: { qty: 0.12, avg_entry: 64142.5, mark_price: 64210, unrealised_pnl: 8.1, realised_pnl: 0, fees_paid: 7.7, funding_paid: 0 },
+  equity_curve: [],
+  open_orders: [],
+  fills: [],
+  trades: [],
+  funding: [],
+  live_from: trading.end - 3_600_000,
+  last_bar: engineStart,
+  dropped: [],
+  warnings: [],
+}
+
+const engineTrading = { engine: 'running', mock: false, instruments, candles: { start: engineStart, everyMs: 250 } }
+
+async function toTrading(page) {
+  await page.keyboard.press('Control+2')
+  await page.locator('.trading, .state').filter({ visible: true }).first().waitFor({ timeout: 5000 })
+  await wait(500)
+}
+
+/** Trading with the mock source, ready: instruments loaded and the sessions list read. */
+async function readyTrading(page) {
+  await toTrading(page)
+  await page.locator('.position-line .line-button').first().waitFor({ timeout: 5000 })
+  await wait(1600)
+}
+
+async function startManual(page) {
+  await page.getByRole('button', { name: 'Start a session' }).click()
+  await wait(300)
+  await page.getByRole('button', { name: 'Start', exact: true }).click()
+  await page.locator('.position-summary').waitFor({ timeout: 5000 })
+}
+
+async function order(page, side, size) {
+  await page.getByPlaceholder('Size').fill(size)
+  await page.getByRole('button', { name: side, exact: true }).click()
+}
+
+async function openPanel(page) {
+  await page.locator('.position-summary').click()
+  await wait(400)
+}
 
 // Each state: the stub's config and the steps that bring the page there.
 const STATES = [
@@ -171,12 +227,197 @@ const STATES = [
       await wait(700)
     },
   },
+  { name: 'trading-engine-starting', config: { engine: 'starting', mock: true }, steps: toTrading },
+  { name: 'trading-engine-failed', config: { engine: 'failed', mock: true }, steps: toTrading },
   {
-    name: 'trading',
+    name: 'trading-instruments-loading',
+    config: { ...engineTrading, hangInstruments: true, candles: null },
+    steps: toTrading,
+  },
+  {
+    name: 'trading-instruments-failed',
+    config: { ...engineTrading, failInstruments: true, candles: null },
+    steps: toTrading,
+  },
+  { name: 'trading-engine-empty', config: { ...engineTrading, candles: null }, steps: toTrading },
+  {
+    name: 'trading-engine-filling',
+    config: engineTrading,
+    steps: async (page) => {
+      await toTrading(page)
+      await wait(9000)
+    },
+  },
+  {
+    name: 'trading-engine-session',
+    config: { ...engineTrading, session: engineSession },
+    steps: async (page) => {
+      await toTrading(page)
+      await wait(6000)
+    },
+  },
+  {
+    name: 'trading-engine-start',
+    config: engineTrading,
+    steps: async (page) => {
+      await toTrading(page)
+      await page.getByRole('button', { name: 'Start a session' }).click()
+      await wait(300)
+      await page.getByRole('button', { name: /^Strategy:/ }).click()
+      await wait(400)
+    },
+  },
+  { name: 'trading-no-session', config: { engine: 'running', mock: true }, steps: readyTrading },
+  {
+    name: 'trading-ticker-menu',
     config: { engine: 'running', mock: true },
     steps: async (page) => {
-      await page.keyboard.press('Control+2')
+      await readyTrading(page)
+      await page.keyboard.press('Control+k')
       await wait(500)
+    },
+  },
+  {
+    name: 'trading-ticker-search',
+    config: { engine: 'running', mock: true },
+    steps: async (page) => {
+      await readyTrading(page)
+      await page.keyboard.press('Control+k')
+      await wait(300)
+      await page.keyboard.type('eth')
+      await page.keyboard.press('ArrowDown')
+      await wait(300)
+    },
+  },
+  {
+    name: 'trading-ticker-perpetual',
+    config: { engine: 'running', mock: true },
+    steps: async (page) => {
+      await readyTrading(page)
+      await page.keyboard.press('Control+k')
+      await wait(300)
+      await page.keyboard.type('ethusdt')
+      await page.getByRole('option', { name: /ETHUSDT.*Bybit perpetual/ }).click()
+      await wait(1600)
+      await page.keyboard.press('Control+k')
+      await wait(300)
+      await page.getByRole('radio', { name: 'Perpetual' }).click()
+      await wait(300)
+    },
+  },
+  {
+    name: 'trading-start-session',
+    config: { engine: 'running', mock: true },
+    steps: async (page) => {
+      await readyTrading(page)
+      await page.getByRole('button', { name: 'Start a session' }).click()
+      await wait(400)
+    },
+  },
+  {
+    name: 'trading-order-invalid',
+    config: { engine: 'running', mock: true },
+    steps: async (page) => {
+      await readyTrading(page)
+      await startManual(page)
+      await page.getByPlaceholder('Size').fill('0.00005')
+      await page.mouse.move(0, 0)
+      await wait(300)
+    },
+  },
+  {
+    name: 'trading-session-running',
+    config: { engine: 'running', mock: true },
+    steps: async (page) => {
+      await readyTrading(page)
+      await startManual(page)
+      await order(page, 'Buy', '0.05')
+      await page.mouse.move(0, 0)
+      await wait(5000)
+    },
+  },
+  {
+    name: 'trading-position-panel',
+    config: { engine: 'running', mock: true },
+    steps: async (page) => {
+      await readyTrading(page)
+      await startManual(page)
+      await order(page, 'Buy', '0.05')
+      await wait(3500)
+      await order(page, 'Sell', '0.02')
+      await wait(3500)
+      await openPanel(page)
+      await page.getByRole('tab', { name: /Fills/ }).click()
+      await wait(300)
+    },
+  },
+  {
+    name: 'trading-limit-order',
+    config: { engine: 'running', mock: true },
+    steps: async (page) => {
+      await readyTrading(page)
+      await startManual(page)
+      await page.getByPlaceholder('Size').fill('0.05')
+      await page.getByRole('button', { name: /^Order type:/ }).click()
+      await wait(300)
+      await page.getByRole('menuitemradio', { name: 'Limit' }).click()
+      await wait(300)
+      await page.getByPlaceholder('Price').fill('63800')
+      await page.getByRole('button', { name: 'Buy', exact: true }).click()
+      await page.mouse.move(0, 0)
+      await wait(3500)
+    },
+  },
+  {
+    name: 'trading-order-rejected',
+    config: { engine: 'running', mock: true },
+    steps: async (page) => {
+      await readyTrading(page)
+      await startManual(page)
+      await order(page, 'Sell', '0.05')
+      await page.mouse.move(0, 0)
+      await wait(3500)
+    },
+  },
+  {
+    name: 'trading-reconnecting',
+    config: { engine: 'running', mock: true },
+    steps: async (page) => {
+      await readyTrading(page)
+      await startManual(page)
+      await order(page, 'Buy', '0.05')
+      await wait(3500)
+      await page.evaluate(() => window.tdMockTrading?.reconnect())
+      await page.mouse.move(0, 0)
+      await wait(900)
+    },
+  },
+  {
+    name: 'trading-dropped',
+    config: { engine: 'running', mock: true },
+    steps: async (page) => {
+      await readyTrading(page)
+      await startManual(page)
+      await wait(3500)
+      await page.evaluate(() => window.tdMockTrading?.dropBucket())
+      await page.mouse.move(0, 0)
+      await wait(2000)
+    },
+  },
+  {
+    name: 'trading-session-stopped',
+    config: { engine: 'running', mock: true },
+    steps: async (page) => {
+      await readyTrading(page)
+      await startManual(page)
+      await order(page, 'Buy', '0.05')
+      await wait(3500)
+      await openPanel(page)
+      await page.getByRole('button', { name: 'Stop', exact: true }).click()
+      await wait(500)
+      await page.mouse.click(300, 200)
+      await page.mouse.move(0, 0)
+      await wait(600)
     },
   },
 ]
