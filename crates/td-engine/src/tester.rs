@@ -631,7 +631,7 @@ pub struct OosResult {
     /// It runs with `close_at_end`: a position still open is closed by a market order decided at
     /// the close of the second-to-last bar and filled at the last bar's open, with slippage and
     /// the taker fee, so its trades are all closed and their costs real. The in-sample sweep's
-    /// runs do not close out; an open trade there is left out of their trade statistics.
+    /// runs close out the same way, so `degradation` and `min_trades` compare like with like.
     pub out_of_sample: BacktestResult,
     /// Out-of-sample objective over in-sample objective. `None` if either is undefined or the
     /// in-sample value is zero. For a maximised metric below 1 is worse out of sample; for a
@@ -655,6 +655,8 @@ pub fn out_of_sample(
 
     let mut is_spec = spec.sweep.clone();
     is_spec.base.to = split_at;
+    // Close out like the out-of-sample run, so both sides count a position held at the end alike.
+    is_spec.base.close_at_end = true;
     let in_sample = sweep_planned(&is_spec, &plan, bars, funding, progress)?;
     let best = in_sample
         .best
@@ -820,14 +822,16 @@ pub struct WindowResult {
 /// At a test window's end the position is closed for real: each test run has `close_at_end`
 /// set, so at the close of the window's second-to-last bar its open orders are cancelled and a
 /// reduce-only market order for the whole position is submitted, which fills at the last bar's
-/// open with slippage and the taker fee. Every window therefore ends flat, its trades are all
-/// closed and counted in the trade statistics, and the exit costs are in the stitched equity.
-/// The next window starts flat from where the stitched equity ended.
+/// open with slippage and the taker fee. Every window therefore ends flat unless the close-out
+/// is rejected (see `Session::close_out`); its trades are then all closed and counted in the
+/// trade statistics, and the exit costs are in the stitched equity. The next window starts flat
+/// from where the stitched equity ended.
 ///
-/// Train sweeps do not close out. A rolling window's train sweep is warmed up on the bars just
-/// before it, as many as the window's train length (fewer near the start of the range), the
-/// same warm-up its test run gets; the first window's, and every anchored window's, starts cold
-/// because no bars come before it.
+/// Train sweeps close out the same way, so a window's in-sample and out-of-sample trade counts
+/// (and `min_trades`) count a position held at the end alike. A rolling window's train sweep is
+/// warmed up on the bars just before it, as many as the window's train length (fewer near the
+/// start of the range), the same warm-up its test run gets; the first window's, and every
+/// anchored window's, starts cold because no bars come before it.
 ///
 /// The stitched metrics are computed like a single backtest's (see [`MetricsReport`]): the
 /// stitched Sharpe, Sortino and volatility come from the stitched curve's daily UTC returns, not
@@ -845,9 +849,11 @@ pub struct WalkForwardResult {
     pub metrics: MetricsReport,
     /// Every test segment's trades in time order, with quantities, P&L, fees and funding scaled
     /// by the same factor as the segment's equity, so they add up to the stitched equity's
-    /// changes.
+    /// changes. Segments after the stitched equity reached zero (factor 0, see [`stitch`]) traded
+    /// nothing in the stitched account and add no trades.
     pub trades: Vec<Trade>,
-    /// Every test segment's fills in time order, with quantities and fees scaled the same way.
+    /// Every test segment's fills in time order, with quantities and fees scaled the same way and
+    /// the same segments left out.
     pub fills: Vec<Fill>,
     /// How many windows chose different parameters from the window before.
     pub param_changes: usize,
@@ -887,6 +893,8 @@ pub fn walk_forward(
         let mut train = spec.sweep.clone();
         train.base.from = train_from;
         train.base.to = train_to;
+        // Close out like the test run, so both sides count a position held at the end alike.
+        train.base.close_at_end = true;
         // Warm up on the bars just before the train window, as many as the test run gets.
         let warm_start = w.train.start.saturating_sub(w.train.len());
         train.base.warmup_from = (warm_start < w.train.start).then(|| time_at(warm_start));
@@ -995,7 +1003,9 @@ struct Stitched {
 }
 
 /// The stitched curve and its metrics. Trades, fills, positions and funding of each segment are
-/// scaled by the segment's factor, so trade P&L adds up to the stitched equity's changes.
+/// scaled by the segment's factor, so trade P&L adds up to the stitched equity's changes. A
+/// segment with factor 0 (after ruin) contributes no trades or fills: zero-sized ones would
+/// count as trades in the statistics without having traded anything.
 fn stitched_report(base: &BacktestConfig, windows: &[WindowResult]) -> Stitched {
     let cash = base.starting_cash;
     let segments: Vec<&[EquityPoint]> = windows
@@ -1030,6 +1040,9 @@ fn stitched_report(base: &BacktestConfig, windows: &[WindowResult]) -> Stitched 
                 position
             };
             positions.push(snapped * s);
+        }
+        if s == 0.0 {
+            continue;
         }
         fills.extend(r.fills.iter().map(|f| Fill {
             qty: f.qty * s,
@@ -1186,6 +1199,87 @@ mod tests {
         // Exactly zero is ruin too.
         let z = [point(1, 0.0)];
         assert_eq!(segment_scales(100.0, &[&a, &z, &c]), [1.0, 0.5, 0.0]);
+    }
+
+    #[test]
+    fn segments_after_ruin_add_no_trades_or_fills_to_the_stitched_lists() {
+        use td_core::{FeeSchedule, Instrument, InstrumentId, InstrumentKind, Timeframe, Venue};
+        const HOUR: Millis = 3_600_000;
+        let instrument = Instrument {
+            id: InstrumentId {
+                venue: Venue::Binance,
+                symbol: "TESTUSDT".into(),
+                kind: InstrumentKind::Perpetual,
+            },
+            base: "TEST".into(),
+            quote: "USDT".into(),
+            tick_size: 0.01,
+            lot_size: 0.001,
+            min_qty: 0.001,
+            min_notional: 1.0,
+            fees: FeeSchedule {
+                maker: 0.001,
+                taker: 0.002,
+            },
+        };
+        let bars: Vec<Candle> = (0..40)
+            .map(|i| {
+                let p = 100.0 + i as f64;
+                Candle {
+                    open_time: i * HOUR,
+                    open: p - 0.5,
+                    high: p + 0.5,
+                    low: p - 1.0,
+                    close: p,
+                    volume: 10.0,
+                    quote_volume: 10.0 * p,
+                }
+            })
+            .collect();
+        let base = BacktestConfig {
+            strategy: "sma_cross".into(),
+            params: Params::new()
+                .with("fast", ParamValue::Int(1))
+                .with("slow", ParamValue::Int(3)),
+            instrument,
+            timeframe: Timeframe::H1,
+            from: 0,
+            to: 40 * HOUR,
+            starting_cash: 10_000.0,
+            slippage_bps: 0.0,
+            fee_override: None,
+            warmup_from: None,
+            close_at_end: true,
+        };
+        let window = |from: i64, to: i64| {
+            let config = BacktestConfig {
+                from: from * HOUR,
+                to: to * HOUR,
+                ..base.clone()
+            };
+            let out_of_sample = run(&config, &bars, &[]).unwrap();
+            assert!(!out_of_sample.trades.is_empty() && !out_of_sample.fills.is_empty());
+            WindowResult {
+                train_from: 0,
+                train_to: config.from,
+                test_from: config.from,
+                test_to: config.to,
+                params: base.params.clone(),
+                in_sample: Headline::new(&out_of_sample.metrics),
+                out_of_sample,
+            }
+        };
+        let mut ruined = window(0, 20);
+        // Make the first segment end the account; the second then has factor 0.
+        ruined.out_of_sample.equity.last_mut().unwrap().equity = 0.0;
+        let windows = [ruined, window(20, 40)];
+        let first = &windows[0].out_of_sample;
+        let st = stitched_report(&base, &windows);
+        assert_eq!(st.trades, first.trades);
+        assert_eq!(st.fills, first.fills);
+        assert_eq!(st.metrics.trades, first.metrics.trades);
+        assert_eq!(st.metrics.fees_paid, first.metrics.fees_paid);
+        assert!(st.equity[20..].iter().all(|p| p.equity == 0.0));
     }
 
     #[test]

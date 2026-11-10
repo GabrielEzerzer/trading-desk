@@ -461,11 +461,12 @@ fn bad_splits_and_preset_warmup_are_errors() {
         Err(TesterError::InvalidSpec(_))
     ));
     s.sweep.base.warmup_from = None;
-    s.sweep.min_trades = 1;
+    // Every in-sample run holds one trade, closed out at the end.
+    s.sweep.min_trades = 2;
     assert!(matches!(
         out_of_sample(&s, &bars, &[], None),
         Err(TesterError::NoQualifyingRun {
-            min_trades: 1,
+            min_trades: 2,
             window: None
         })
     ));
@@ -731,6 +732,7 @@ fn rolling_train_sweeps_after_the_first_warm_up_on_the_bars_before_them() {
                 from: w.train_from,
                 to: w.train_to,
                 warmup_from: warm,
+                close_at_end: true,
                 ..with(&rising_wf_spec().sweep.base, &w.params)
             },
             &bars,
@@ -748,6 +750,7 @@ fn rolling_train_sweeps_after_the_first_warm_up_on_the_bars_before_them() {
         &BacktestConfig {
             from: w.train_from,
             to: w.train_to,
+            close_at_end: true,
             ..with(&rising_wf_spec().sweep.base, &w.params)
         },
         &bars,
@@ -755,6 +758,39 @@ fn rolling_train_sweeps_after_the_first_warm_up_on_the_bars_before_them() {
     )
     .unwrap();
     assert_ne!(w.in_sample.total_return, cold.metrics.total_return);
+}
+
+#[test]
+fn a_position_held_at_the_end_counts_alike_in_and_out_of_sample() {
+    // Long from near the start of each segment to its end: the in-sample runs close out like
+    // the out-of-sample run, so both sides count the one trade.
+    let bars = rising_bars(300);
+    let r = out_of_sample(
+        &OosSpec {
+            sweep: rising_spec(),
+            split: Split::Fraction(0.5),
+        },
+        &bars,
+        &[],
+        None,
+    )
+    .unwrap();
+    assert!(r.in_sample.spec.base.close_at_end);
+    let best = r.in_sample.best.as_ref().unwrap();
+    assert!(best.config.close_at_end);
+    assert!(best.trades.iter().all(|t| !t.open));
+    assert_eq!(best.metrics.trades, 1);
+    assert_eq!(r.out_of_sample.metrics.trades, 1);
+    assert!(r.in_sample.rows.iter().all(|row| {
+        let m = row.metrics.as_ref().unwrap();
+        m.trades == 1
+    }));
+
+    let wf = walk_forward(&rising_wf_spec(), &bars, &[], None).unwrap();
+    for (k, w) in wf.windows.iter().enumerate() {
+        assert_eq!(w.in_sample.trades, 1, "window {k}");
+        assert_eq!(w.out_of_sample.metrics.trades, 1, "window {k}");
+    }
 }
 
 fn with(base: &BacktestConfig, params: &Params) -> BacktestConfig {
