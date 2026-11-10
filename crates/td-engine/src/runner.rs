@@ -144,7 +144,6 @@ pub fn run(
     let series = EquitySeries::new(config.starting_cash, session.equity(), tf);
     let report = metrics::report(
         &series,
-        tf,
         &positions,
         &trades,
         &fills,
@@ -243,7 +242,6 @@ fn benchmark(
     let series = EquitySeries::new(config.starting_cash, &equity, config.timeframe);
     let report = metrics::report(
         &series,
-        config.timeframe,
         &positions,
         &trades,
         &fills,
