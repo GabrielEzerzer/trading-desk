@@ -1,6 +1,6 @@
 use td_core::{
-    Candle, Fill, Instrument, InstrumentKind, OrderId, OrderRequest, OrderType, Rounding, Side,
-    Timeframe,
+    Candle, FeeSchedule, Fill, Instrument, InstrumentKind, OrderId, OrderRequest, OrderType,
+    Rounding, Side, Timeframe,
 };
 
 use crate::{Broker, Order, OrderRejected, OrderStatus, Portfolio};
@@ -21,6 +21,8 @@ pub struct Context<'a> {
     pub(crate) bars: &'a [Candle],
     pub(crate) instrument: &'a Instrument,
     pub(crate) timeframe: Timeframe,
+    pub(crate) fees: FeeSchedule,
+    pub(crate) slippage_bps: f64,
     pub(crate) portfolio: &'a Portfolio,
     pub(crate) broker: &'a mut dyn Broker,
     pub(crate) orders: &'a mut Vec<Order>,
@@ -47,6 +49,16 @@ impl Context<'_> {
         self.timeframe
     }
 
+    /// The fees fills are charged: the session's override, or else the instrument's own.
+    pub fn fees(&self) -> FeeSchedule {
+        self.fees
+    }
+
+    /// The slippage the session applies to market and stop fills, in basis points of price.
+    pub fn slippage_bps(&self) -> f64 {
+        self.slippage_bps
+    }
+
     pub fn portfolio(&self) -> &Portfolio {
         self.portfolio
     }
@@ -70,7 +82,10 @@ impl Context<'_> {
     /// Rounds the order to the instrument's lot and tick, validates it and sends it to the
     /// broker. Quantities round down; limit prices round in the order's favour-safe direction
     /// (buys down, sells up) so an order never trades worse than asked; triggers round to the
-    /// nearest tick. A rejected order is recorded with its reason and returned as an error.
+    /// nearest tick. On spot, a sell must fit in the holding less the open sells, and a buy must
+    /// fit in the cash together with the open buys: each buy is valued at its limit price, its
+    /// trigger, or this bar's close for a market order, plus the taker fee. A rejected order is
+    /// recorded with its reason and returned as an error.
     pub fn submit(&mut self, request: OrderRequest) -> Result<OrderId, OrderRejected> {
         let id = OrderId(self.orders.len() as u64 + 1);
         let submitted_at = self.bar().open_time;
@@ -146,6 +161,39 @@ impl Context<'_> {
                 return (req, Err(reason));
             }
         }
+        if inst.id.kind == InstrumentKind::Spot && req.side == Side::Buy {
+            // Open buys count against the cash too, so several buys cannot add up to more than it.
+            let close = self.bar().close;
+            let cost = |r: &OrderRequest| {
+                r.qty * reference_price(r.order_type, close) * (1.0 + self.fees.taker)
+            };
+            let pending: f64 = self
+                .open_orders()
+                .iter()
+                .filter(|o| o.request.side == Side::Buy)
+                .map(|o| cost(&o.request))
+                .sum();
+            let needed = cost(&req) + pending;
+            let cash = self.cash();
+            if needed > cash * (1.0 + 1e-9) {
+                let reason = format!(
+                    "spot cannot buy for more than its cash: {needed} needed with the taker fee \
+                     and open buys, {cash} available"
+                );
+                return (req, Err(reason));
+            }
+        }
         (req, Ok(()))
+    }
+}
+
+/// The price an order is valued at before it fills: its limit price, its trigger for a stop, or
+/// `last` for a market order. `Instrument::validate_order` values the minimum notional the same
+/// way.
+fn reference_price(order_type: OrderType, last: f64) -> f64 {
+    match order_type {
+        OrderType::Market => last,
+        OrderType::Limit { price } | OrderType::StopLimit { price, .. } => price,
+        OrderType::Stop { trigger } => trigger,
     }
 }

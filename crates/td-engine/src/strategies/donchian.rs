@@ -1,6 +1,6 @@
 use td_core::{Candle, Fill, InstrumentKind, OrderId, OrderType, Side};
 
-use super::order;
+use super::{affordable_qty, order};
 use crate::{
     Context, EngineError, ParamKind, ParamSpec, ParamValue, Params, Strategy, StrategyEntry,
 };
@@ -11,7 +11,9 @@ use crate::{
 /// below the lowest low, with `allow_short` on a perpetual), and exits when the close breaks the
 /// opposite `exit` channel. The position is sized so that a stop `atr_stop` ATRs from the entry
 /// loses `risk` of equity, and that stop is placed as a reduce-only stop order once the entry
-/// fills. The size is capped at equity / close, so the strategy never uses leverage.
+/// fills. The size is also capped so that the entry's value, plus the taker fee, slippage and a
+/// small margin, fits in the cash: the strategy never uses leverage, and a spot entry passes the
+/// cash check.
 ///
 /// ATR here is the simple mean of the true range over `atr_period` bars.
 #[derive(Debug, Clone)]
@@ -138,8 +140,9 @@ impl Strategy for DonchianBreakout {
             } else {
                 return;
             };
-            let qty =
-                (self.risk * ctx.equity() / (self.atr_stop * atr)).min(ctx.equity() / bar.close);
+            // Flat here, so the cash is the whole equity.
+            let affordable = affordable_qty(ctx, ctx.cash(), bar.close);
+            let qty = (self.risk * ctx.equity() / (self.atr_stop * atr)).min(affordable);
             if let Ok(id) = ctx.submit(order(ctx, side, qty, OrderType::Market, false)) {
                 self.pending_entry = Some((id, atr));
             }

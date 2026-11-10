@@ -355,6 +355,58 @@ fn spot_cannot_short_or_sell_more_than_it_holds() {
 }
 
 #[test]
+fn spot_buys_must_fit_in_the_cash_with_the_taker_fee_and_open_buys() {
+    let i = spot();
+    let bars = [
+        bar(0, 100.0, 101.0, 99.0, 100.0),
+        bar(1, 100.0, 101.0, 99.0, 100.0),
+    ];
+    let (script, log) = Script::new(vec![
+        // 1000 * 100 = 100000, plus the 0.2% taker fee 100200, against 10000 of cash.
+        (0, req(&i, Side::Buy, 1000.0, OrderType::Market)),
+        // 49 * 100 * 1.002 = 4909.8.
+        (0, req(&i, Side::Buy, 49.0, OrderType::Market)),
+        // Valued at its limit: 50 * 98 * 1.002 = 4909.8, so 9819.6 with the open buy.
+        (
+            0,
+            req(&i, Side::Buy, 50.0, OrderType::Limit { price: 98.0 }),
+        ),
+        // 2 * 100 * 1.002 = 200.4 would make 10020.
+        (0, req(&i, Side::Buy, 2.0, OrderType::Market)),
+        // 1.5 * 100 * 1.002 = 150.3 makes 9969.9, which fits.
+        (0, req(&i, Side::Buy, 1.5, OrderType::Market)),
+    ]);
+    let s = run(i, 0.0, &bars, script);
+    let log = log.lock().unwrap();
+    assert!(log[1].is_ok() && log[2].is_ok() && log[4].is_ok());
+    for rejected in [&log[0], &log[3]] {
+        let err = rejected.as_ref().unwrap_err();
+        assert!(
+            err.reason
+                .starts_with("spot cannot buy for more than its cash"),
+            "{}",
+            err.reason
+        );
+        assert!(matches!(
+            s.orders()[err.id.0 as usize - 1].status,
+            OrderStatus::Rejected(_)
+        ));
+    }
+    // Bar 1 fills the two market buys at 100: 50.5 * 100 = 5050, fees 10.1. The 98 limit rests.
+    approx(s.portfolio().position(), 50.5);
+    approx(s.portfolio().cash(), 4_939.9);
+    assert_eq!(s.open_orders().len(), 1);
+
+    // Perpetuals have no margin model, so the same oversized buy is accepted there.
+    let (script, log) = Script::new(vec![(
+        0,
+        req(&perp(), Side::Buy, 1000.0, OrderType::Market),
+    )]);
+    run(perp(), 0.0, &bars, script);
+    assert!(log.lock().unwrap()[0].is_ok());
+}
+
+#[test]
 fn orders_are_rounded_and_invalid_ones_rejected_with_a_reason() {
     let i = spot();
     let bars = [bar(0, 100.0, 101.0, 99.0, 100.0)];
@@ -590,4 +642,39 @@ fn donchian_enters_on_a_breakout_places_a_stop_and_exits() {
     approx(exit.qty, 16.666);
     assert_eq!(s.portfolio().position(), 0.0);
     assert!(s.open_orders().is_empty());
+}
+
+#[test]
+fn reference_strategies_size_full_spot_entries_to_pass_the_cash_check() {
+    let sma = Params::new()
+        .with("fast", td_engine::ParamValue::Int(3))
+        .with("slow", td_engine::ParamValue::Int(8))
+        .with("equity_fraction", td_engine::ParamValue::Float(1.0));
+    let donchian = Params::new()
+        .with("entry", td_engine::ParamValue::Int(5))
+        .with("exit", td_engine::ParamValue::Int(3))
+        .with("atr_period", td_engine::ParamValue::Int(3))
+        .with("risk", td_engine::ParamValue::Float(1.0));
+    // Uncapped, both would buy 10000 / close, which costs 10020 with the taker fee. Capped at
+    // 10000 * 0.995 / (close * (1 + 0.002 + 0.0005)) with 5 bps of slippage: SMA decides on bar
+    // 7's close of 114 and buys 87.063; Donchian decides on bar 5's close of 110 and buys 90.228.
+    let cases = [
+        ("sma_cross", sma, 87.063),
+        ("donchian_breakout", donchian, 90.228),
+    ];
+    for (name, params, qty) in cases {
+        let strategy = build_strategy(name, &params).unwrap();
+        let bars = up_then_down();
+        let s = run_backtest(strategy, spot(), Timeframe::M1, &bars, &[], config(5.0)).unwrap();
+        assert!(
+            s.orders()
+                .iter()
+                .all(|o| !matches!(o.status, OrderStatus::Rejected(_))),
+            "{name}: {:?}",
+            s.orders()
+        );
+        let entry = &s.fills()[0];
+        assert_eq!(entry.side, Side::Buy, "{name}");
+        approx(entry.qty, qty);
+    }
 }
