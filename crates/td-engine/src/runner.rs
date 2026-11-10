@@ -21,6 +21,7 @@ use crate::{
 pub const ENGINE_REVISION: u32 = 3;
 
 /// Everything that defines a backtest apart from the data itself.
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BacktestConfig {
     /// A name from the strategy registry.
@@ -76,6 +77,7 @@ fn is_default_max_leverage(max_leverage: &f64) -> bool {
 }
 
 /// Buy and hold of the same instrument over the same bars.
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Benchmark {
     /// Quantity bought at the first bar's open: all starting cash, after the taker fee, rounded
@@ -91,6 +93,7 @@ pub struct Benchmark {
     pub correlation: Option<f64>,
 }
 
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BacktestResult {
     pub config: BacktestConfig,
@@ -228,8 +231,10 @@ pub(crate) fn select_bars(
     Ok((within(warmup_from, config.from), traded))
 }
 
-/// The fingerprint [`run`] would record for `config` on this data, without running it.
-pub(crate) fn config_fingerprint(
+/// The fingerprint [`run`] would record for `config` on this data, without running it. A tester
+/// result's `data_fingerprint` is this over its base configuration, so comparing it with a saved
+/// run's tells whether the data changed since, as [`rerun`] does for a backtest.
+pub fn config_fingerprint(
     config: &BacktestConfig,
     bars: &[Candle],
     funding: &[(Millis, f64)],

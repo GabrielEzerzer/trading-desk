@@ -33,6 +33,7 @@ const DAY_MS: Millis = 86_400_000;
 const MS_PER_YEAR: f64 = DAYS_PER_YEAR * DAY_MS as f64;
 
 /// The metrics report for one equity series and its trades.
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MetricsReport {
     pub start_equity: f64,
