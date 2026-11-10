@@ -83,8 +83,17 @@ pub trait Broker: Send {
     /// Cancels an open order. Returns false if no open order has this id.
     fn cancel(&mut self, id: OrderId) -> bool;
     /// Processes a new closed bar and returns the fills, cancellations and placed stops it caused,
-    /// in the order they happened. `portfolio` is the account before the bar's fills.
-    fn on_bar(&mut self, bar: &Candle, portfolio: &Portfolio) -> Vec<BrokerEvent>;
+    /// in the order they happened. `portfolio` is the account before the bar's fills. `breached`
+    /// says whether an account's position is liquidated on this bar: when it is for the account
+    /// after the fills at the bar's open, the fills inside the range are skipped and their orders
+    /// left open, since the liquidation comes first and cancels them (see
+    /// [`crate::Session::on_bar`]).
+    fn on_bar(
+        &mut self,
+        bar: &Candle,
+        portfolio: &Portfolio,
+        breached: &dyn Fn(&Portfolio) -> bool,
+    ) -> Vec<BrokerEvent>;
     fn open_orders(&self) -> &[Order];
 }
 
@@ -237,7 +246,12 @@ impl<M: FillModel> Broker for SimBroker<M> {
         self.open.len() != before
     }
 
-    fn on_bar(&mut self, bar: &Candle, portfolio: &Portfolio) -> Vec<BrokerEvent> {
+    fn on_bar(
+        &mut self,
+        bar: &Candle,
+        portfolio: &Portfolio,
+        breached: &dyn Fn(&Portfolio) -> bool,
+    ) -> Vec<BrokerEvent> {
         // A scratch copy of the account that each fill moves, so a reduce-only order sees the
         // position and a spot buy the cash that the earlier fills on this bar left.
         let mut book = portfolio.clone();
@@ -293,10 +307,10 @@ impl<M: FillModel> Broker for SimBroker<M> {
         let mut placed = Vec::new();
         // Applies one fill and places the order's attached stop, if it has one. Returns the stop's
         // fill when the stop fills on this bar too.
-        let mut apply = |fill: Pending| {
+        let mut apply = |fill: Pending, book: &mut Portfolio| {
             let order = fill.order;
             done.push(order.id);
-            let applied = match self.fill(&order, fill.price, fill.liquidity, bar, &mut book) {
+            let applied = match self.fill(&order, fill.price, fill.liquidity, bar, book) {
                 Ok(applied) => applied,
                 Err(reason) => {
                     cancel(&mut events, &order, &reason);
@@ -342,25 +356,36 @@ impl<M: FillModel> Broker for SimBroker<M> {
         };
         at_open.sort_by_key(|fill| fill.order.id);
         for fill in at_open {
-            match apply(fill) {
+            match apply(fill, &mut book) {
                 // The entry met a market already through the stop, so the stop fills there too.
                 Some(stop) if stop.market == bar.open => {
-                    apply(stop);
+                    apply(stop, &mut book);
                 }
                 Some(stop) => inside.push((0, stop)),
                 None => {}
             }
         }
-        inside.sort_by_key(|(priority, fill)| (*priority, fill.order.id));
-        for (_, fill) in inside {
-            // An entry filled inside the range has its stop applied straight after it.
-            if let Some(stop) = apply(fill) {
-                apply(stop);
+        let liquidated = breached(&book);
+        if liquidated {
+            // The liquidation comes before any fill inside the range. The orders stay open for it
+            // to cancel, including stops just placed for entries filled at the open.
+            for (_, fill) in inside {
+                if !self.open.iter().any(|o| o.id == fill.order.id) {
+                    placed.push(fill.order);
+                }
+            }
+        } else {
+            inside.sort_by_key(|(priority, fill)| (*priority, fill.order.id));
+            for (_, fill) in inside {
+                // An entry filled inside the range has its stop applied straight after it.
+                if let Some(stop) = apply(fill, &mut book) {
+                    apply(stop, &mut book);
+                }
             }
         }
         for index in ioc {
             let order = &self.open[index];
-            if !done.contains(&order.id) {
+            if !liquidated && !done.contains(&order.id) {
                 done.push(order.id);
                 cancel(
                     &mut events,

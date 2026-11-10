@@ -56,28 +56,30 @@ fn a_10x_short_through_a_30_percent_wick_is_liquidated_at_the_maintenance_price(
     approx(f[1].qty, 1000.0);
     approx(f[1].price, 109.25);
     assert_eq!(f[1].time, MIN);
-    // Taker fee on 109,250 of notional.
-    approx(f[1].fee, 218.5);
+    // Taker fee on 109,250 of notional is 218.5. The equity left after it, 9,800 - 1,000 * 9.25 -
+    // 218.5 = 331.5, goes as the liquidation fee: 550 in all.
+    approx(f[1].fee, 550.0);
     assert_eq!(f[1].liquidity, td_core::Liquidity::Taker);
     let order = &s.orders()[f[1].order_id.0 as usize - 1];
     assert_eq!(order.request.client_tag.as_deref(), Some("liquidation"));
     assert!(order.request.reduce_only);
     assert_eq!(order.status, OrderStatus::Filled);
 
-    // 9,800 - 1,000 * 9.25 - 218.5 = 331.5, flat from here on.
+    // Flat at zero from here on.
     assert_eq!(s.portfolio().position(), 0.0);
     let e = equity(&s);
     approx(e[0], 10_000.0);
-    approx(e[1], 331.5);
-    approx(e[2], 331.5);
+    approx(e[1], 0.0);
+    approx(e[2], 0.0);
+    approx(s.portfolio().shortfall_written_off(), 0.0);
 
-    // The liquidation closes the trade in the trade list: -9,250 gross, 418.5 of fees.
+    // The liquidation closes the trade in the trade list: -9,250 gross, 750 of fees.
     let trades = build_trades(s.fills(), s.bars(), s.bar_funding());
     assert_eq!(trades.len(), 1);
     assert_eq!(trades[0].side, TradeSide::Short);
     assert!(!trades[0].open);
     approx(trades[0].exit_price, 109.25);
-    approx(trades[0].net_pnl, -9_668.5);
+    approx(trades[0].net_pnl, -10_000.0);
 }
 
 #[test]
@@ -99,16 +101,17 @@ fn a_long_gapping_through_its_liquidation_price_is_liquidated_at_the_open() {
     assert_eq!(f[1].side, Side::Sell);
     approx(f[1].price, 90.5);
     assert_eq!(f[1].time, 2 * MIN);
-    // Fee 90,500 * 0.2% = 181. Cash 9,800 - 9,500 - 181 = 119.
-    approx(f[1].fee, 181.0);
+    // Taker fee 90,500 * 0.2% = 181, and the 9,800 - 9,500 - 181 = 119 left is the liquidation
+    // fee.
+    approx(f[1].fee, 300.0);
     assert_eq!(s.portfolio().position(), 0.0);
     let e = equity(&s);
     approx(e[1], 9_800.0);
-    approx(e[2], 119.0);
+    approx(e[2], 0.0);
 }
 
 #[test]
-fn a_stop_beyond_the_liquidation_price_cannot_take_equity_below_zero() {
+fn a_liquidation_inside_the_bar_comes_before_a_stop_beyond_its_price() {
     let i = perp();
     let bars = [
         bar(0, 100.0, 101.0, 99.0, 100.0),
@@ -122,17 +125,44 @@ fn a_stop_beyond_the_liquidation_price_cannot_take_equity_below_zero() {
     });
     let s = run(i, lev(10.0), &bars, Box::new(steps));
 
-    // The stop fills inside the bar at 115: 9,800 - 15,000 - 230 = -5,430. The account is flat,
-    // so the balance is floored at zero and the 5,430 is written off, as a venue's insurance fund
-    // would take it. (A venue would have liquidated at 109.25 first and left 331.5, so this is
-    // the pessimistic side.)
+    // The short enters at bar 1's open and its stop at 115 is placed. The bar's high of 130 passes
+    // both the liquidation price of 109.25 and the stop, and the liquidation is reached first: the
+    // stop is cancelled and nothing is written off.
     let f = s.fills();
     assert_eq!(f.len(), 2);
-    approx(f[1].price, 115.0);
+    approx(f[1].price, 109.25);
+    match &s.orders()[1].status {
+        OrderStatus::Cancelled(reason) => assert!(reason.contains("liquidation"), "{reason}"),
+        other => panic!("expected the stop cancelled, got {other:?}"),
+    }
+    assert_eq!(s.portfolio().position(), 0.0);
+    approx(equity(&s)[1], 0.0);
+    approx(s.portfolio().shortfall_written_off(), 0.0);
+}
+
+#[test]
+fn a_gap_far_past_the_liquidation_price_cannot_take_equity_below_zero() {
+    let i = perp();
+    let bars = [
+        bar(0, 100.0, 101.0, 99.0, 100.0),
+        bar(1, 100.0, 101.0, 99.0, 100.0),
+        bar(2, 120.0, 121.0, 119.0, 120.0),
+    ];
+    let (script, _) = Script::new(vec![(0, req(&i, Side::Sell, 1000.0, OrderType::Market))]);
+    let s = run(i, lev(10.0), &bars, script);
+
+    // Bar 2 opens at 120, past the short's liquidation price of 109.25, so it is liquidated at the
+    // open: 9,800 - 20,000 - 240 of taker fee = -10,440, with nothing left for a liquidation fee.
+    // The account is flat, so the balance is floored at zero and the 10,440 is written off, as a
+    // venue's insurance fund would take it.
+    let f = s.fills();
+    assert_eq!(f.len(), 2);
+    approx(f[1].price, 120.0);
+    approx(f[1].fee, 240.0);
     assert_eq!(s.portfolio().position(), 0.0);
     approx(s.portfolio().cash(), 0.0);
-    approx(equity(&s)[1], 0.0);
-    approx(s.portfolio().shortfall_written_off(), 5_430.0);
+    approx(equity(&s)[2], 0.0);
+    approx(s.portfolio().shortfall_written_off(), 10_440.0);
 }
 
 #[test]
@@ -182,8 +212,8 @@ fn orders_that_reduce_the_position_are_allowed_over_the_cap() {
         (1, reduce_only(req(&i, Side::Buy, 400.0, OrderType::Market))),
         // Growing the short is not.
         (1, req(&i, Side::Sell, 1.0, OrderType::Market)),
-        // Nor is flipping to a long larger than the short: with the open buy of 100 it ends at
-        // +1,100, 115,500 of notional against 48,000 allowed.
+        // Nor is flipping to a long: if the open buys close the short first, 100 + 400 + 2,000
+        // less the 1,000 short opens a long of 1,500, 157,500 of notional against 48,000 allowed.
         (1, req(&i, Side::Buy, 2000.0, OrderType::Market)),
     ]);
     let s = run(i, lev(10.0), &bars, script);
@@ -231,6 +261,194 @@ fn a_spot_buy_after_a_gap_up_is_cut_to_the_cash_at_the_fill_price() {
         OrderStatus::Cancelled(reason) => assert!(reason.contains("cash"), "{reason}"),
         other => panic!("expected the second buy cancelled, got {other:?}"),
     }
+}
+
+#[test]
+fn a_short_breaching_in_a_bar_is_liquidated_before_a_limit_that_would_close_it() {
+    let i = perp();
+    let bars = [
+        bar(0, 100.0, 101.0, 99.0, 100.0),
+        bar(1, 100.0, 101.0, 99.0, 100.0),
+        bar(2, 100.0, 130.0, 94.0, 96.0),
+    ];
+    let (script, log) = Script::new(vec![
+        (0, req(&i, Side::Sell, 1000.0, OrderType::Market)),
+        // A take-profit that bar 2 reaches inside its range, at 95.
+        (
+            1,
+            reduce_only(req(&i, Side::Buy, 1000.0, OrderType::Limit { price: 95.0 })),
+        ),
+    ]);
+    let s = run(i, lev(10.0), &bars, script);
+    assert!(log.lock().unwrap().iter().all(|r| r.is_ok()));
+
+    // The path inside bar 2 is unknown, so the worse order counts: the high of 130 first, which
+    // passes the short's liquidation price of 109.25 (cash 9,800, as in the first test), then the
+    // low of 94. The liquidation comes first and cancels the take-profit, which would otherwise
+    // fill at 95 and leave 9,800 + 5,000 - 95 = 14,705.
+    let f = s.fills();
+    assert_eq!(f.len(), 2, "the entry and the liquidation");
+    approx(f[1].price, 109.25);
+    assert_eq!(f[1].time, 2 * MIN);
+    // Taker fee 218.5, and the 331.5 left goes as the liquidation fee.
+    approx(f[1].fee, 550.0);
+    match &s.orders()[1].status {
+        OrderStatus::Cancelled(reason) => assert!(reason.contains("liquidation"), "{reason}"),
+        other => panic!("expected the take-profit cancelled, got {other:?}"),
+    }
+    assert_eq!(s.portfolio().position(), 0.0);
+    approx(equity(&s)[2], 0.0);
+}
+
+#[test]
+fn a_reduce_only_close_cannot_clear_the_way_for_a_reversal_past_the_cap() {
+    let i = perp();
+    let bars = [
+        bar(0, 100.0, 101.0, 99.0, 100.0),
+        bar(1, 100.0, 101.0, 99.0, 100.0),
+        bar(2, 100.0, 101.0, 99.0, 100.0),
+    ];
+    let (script, log) = Script::new(vec![
+        // Long 99 at 100, fee 19.8: equity 9,980.2 at bar 1's close, and 9,980.2 allowed at 1x.
+        (0, req(&i, Side::Buy, 99.0, OrderType::Market)),
+        (1, reduce_only(req(&i, Side::Sell, 99.0, OrderType::Market))),
+        // The reduce-only sell closes the long first, so this opens a fresh short of 198:
+        // 19,800, over the cap.
+        (1, req(&i, Side::Sell, 198.0, OrderType::Market)),
+        // A fresh short of 99 is 9,900: within.
+        (1, req(&i, Side::Sell, 99.0, OrderType::Market)),
+    ]);
+    let s = run(i, lev(1.0), &bars, script);
+    let log = log.lock().unwrap();
+    assert!(log[0].is_ok() && log[1].is_ok());
+    assert!(log[2].as_ref().unwrap_err().reason.contains("leverage"));
+    assert!(log[3].is_ok());
+    approx(s.portfolio().position(), -99.0);
+}
+
+#[test]
+fn a_flip_is_capped_on_the_fresh_position_it_opens() {
+    let i = perp();
+    let bars = [
+        bar(0, 100.0, 101.0, 99.0, 100.0),
+        bar(1, 100.0, 106.0, 99.0, 105.0),
+        bar(2, 105.0, 106.0, 104.0, 105.0),
+    ];
+    let (script, log) = Script::new(vec![
+        (0, req(&i, Side::Sell, 1000.0, OrderType::Market)),
+        // At bar 1's close the short of 1,000 has 4,800 of equity, 48,000 allowed at 10x. Buying
+        // 2,000 closes it and opens a long of 1,000: 105,000, over.
+        (1, req(&i, Side::Buy, 2000.0, OrderType::Market)),
+        // Buying 1,400 opens a long of 400: 42,000, within.
+        (1, req(&i, Side::Buy, 1400.0, OrderType::Market)),
+    ]);
+    let s = run(i, lev(10.0), &bars, script);
+    let log = log.lock().unwrap();
+    assert!(log[0].is_ok());
+    assert!(log[1].as_ref().unwrap_err().reason.contains("leverage"));
+    assert!(log[2].is_ok());
+    // The buy fills at 105: -5,000 realised on the short and 147,000 * 0.2% = 294 of fee, so cash
+    // is 9,800 - 5,000 - 294 = 4,506, long 400 at 105.
+    approx(s.portfolio().position(), 400.0);
+    approx(s.portfolio().cash(), 4_506.0);
+}
+
+#[test]
+fn funding_owed_later_in_the_bar_brings_the_liquidation_price_closer() {
+    let i = perp();
+    let bars = [
+        bar(0, 100.0, 101.0, 99.0, 100.0),
+        bar(1, 100.0, 101.0, 99.0, 100.0),
+        bar(2, 95.0, 96.0, 90.7, 95.0),
+    ];
+    // 0.1% funding half way through bar 2: the long of 1,000 owes 1,000 * 95 * 0.001 = 95.
+    let funding = [(2 * MIN + 30_000, 0.001)];
+    let (script, _) = Script::new(vec![(0, req(&i, Side::Buy, 1000.0, OrderType::Market))]);
+    let s = run_backtest(script, i, Timeframe::M1, &bars, &funding, lev(10.0)).unwrap();
+
+    // Without the funding the long is liquidated at 90.66 (second test), above bar 2's low of 90.7.
+    // With it, cash 9,800 - 95 = 9,705 meets maintenance at (100,000 - 9,705) / 995 = 90.7487...,
+    // rounded up to 90.75, which the low reaches.
+    let f = s.fills();
+    assert_eq!(f.len(), 2, "the entry and the liquidation");
+    approx(f[1].price, 90.75);
+    // Taker fee 181.5; 9,800 - 9,250 - 181.5 = 368.5 left goes as the liquidation fee. The account
+    // is flat when the funding falls due, so it pays none.
+    approx(f[1].fee, 550.0);
+    approx(s.bar_funding()[2].in_bar, 0.0);
+    approx(equity(&s)[2], 0.0);
+}
+
+#[test]
+fn a_long_is_liquidated_when_the_low_touches_its_trigger_and_not_a_tick_above() {
+    let i = perp();
+    let open_long = || {
+        Script::new(vec![(
+            0,
+            req(&perp(), Side::Buy, 1000.0, OrderType::Market),
+        )])
+    };
+    let first = [
+        bar(0, 100.0, 101.0, 99.0, 100.0),
+        bar(1, 100.0, 101.0, 99.0, 100.0),
+    ];
+
+    // The trigger is 90.66 (second test). A low of 90.67 leaves the long open: 9,800 - 5,000.
+    let (script, _) = open_long();
+    let bars = [first[0], first[1], bar(2, 95.0, 96.0, 90.67, 95.0)];
+    let s = run(i.clone(), lev(10.0), &bars, script);
+    assert_eq!(s.fills().len(), 1);
+    approx(s.portfolio().position(), 1000.0);
+    approx(equity(&s)[2], 4_800.0);
+
+    // A low of exactly 90.66 liquidates there: taker fee 90,660 * 0.2% = 181.32, and the
+    // 9,800 - 9,340 - 181.32 = 278.68 left goes as the liquidation fee.
+    let (script, _) = open_long();
+    let bars = [first[0], first[1], bar(2, 95.0, 96.0, 90.66, 95.0)];
+    let s = run(i, lev(10.0), &bars, script);
+    let f = s.fills();
+    assert_eq!(f.len(), 2);
+    approx(f[1].price, 90.66);
+    approx(f[1].fee, 460.0);
+    approx(equity(&s)[2], 0.0);
+}
+
+#[test]
+fn a_partly_closed_long_is_liquidated_at_the_price_of_what_is_left() {
+    let i = perp();
+    let bars = [
+        bar(0, 100.0, 101.0, 99.0, 100.0),
+        bar(1, 100.0, 101.0, 99.0, 100.0),
+        bar(2, 98.0, 99.0, 97.0, 98.0),
+        bar(3, 90.0, 91.0, 85.0, 86.0),
+    ];
+    let (script, log) = Script::new(vec![
+        (0, req(&i, Side::Buy, 1000.0, OrderType::Market)),
+        (
+            1,
+            reduce_only(req(&i, Side::Sell, 400.0, OrderType::Market)),
+        ),
+    ]);
+    let s = run(i, lev(10.0), &bars, script);
+    assert!(log.lock().unwrap().iter().all(|r| r.is_ok()));
+
+    // Long 1,000 at 100, cash 9,800. Selling 400 at bar 2's open of 98 realises -800 with a fee of
+    // 39,200 * 0.2% = 78.4: cash 8,921.6, long 600 at 100. Equity 8,921.6 + 600 * (p - 100) meets
+    // maintenance 0.005 * 600 * p at p = (60,000 - 8,921.6) / (600 * 0.995) = 85.5584...,
+    // rounded up to 85.56. Bar 2's low of 97 is above it; bar 3 opens at 90 and reaches 85.
+    let f = s.fills();
+    assert_eq!(f.len(), 3);
+    approx(f[1].price, 98.0);
+    assert_eq!(f[2].side, Side::Sell);
+    approx(f[2].qty, 600.0);
+    approx(f[2].price, 85.56);
+    assert_eq!(f[2].time, 3 * MIN);
+    // Equity at 85.56 is 8,921.6 - 8,664 = 257.6: the taker fee of 51,336 * 0.2% = 102.672 and a
+    // liquidation fee of the 154.928 left.
+    approx(f[2].fee, 257.6);
+    approx(s.portfolio().fees_paid(), 200.0 + 78.4 + 257.6);
+    assert_eq!(s.portfolio().position(), 0.0);
+    approx(equity(&s)[3], 0.0);
 }
 
 /// Calls the closure with the context and the bar's index at each bar's close.

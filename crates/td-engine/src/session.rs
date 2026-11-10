@@ -132,26 +132,28 @@ impl Session {
     /// Venues usually charge funding at 00:00, 08:00 and 16:00 UTC, which are bar open times on
     /// every timeframe shorter than a day.
     ///
-    /// Liquidation: the perpetual position held after the bar's fills is liquidated when its
-    /// equity at the bar's adverse extreme (the high for a short, the low for a long), less any
-    /// funding it owes later in the bar, falls below [`MAINTENANCE_MARGIN_RATE`] of its notional
-    /// at that price. The liquidation price is where the two meet, rounded to the tick on the side
-    /// that triggers sooner; if the bar opened beyond it, the open. Every open order is cancelled,
-    /// and the whole position is closed at that price with the taker fee and no slippage, recorded
-    /// as a filled reduce-only order tagged [`LIQUIDATION_TAG`] whose fill closes the trade in the
-    /// trade list. The run then goes on flat with the equity left. A perpetual account left flat
-    /// with a negative balance (a gap far past the liquidation price, or a stop that filled beyond
-    /// it) is floored at zero, so equity never goes below zero; see
-    /// [`Portfolio::shortfall_written_off`].
+    /// Liquidation: a perpetual position is liquidated when its equity at the bar's adverse
+    /// extreme (the high for a short, the low for a long), less any funding it owes later in the
+    /// bar, falls below [`MAINTENANCE_MARGIN_RATE`] of its notional at that price. It is checked
+    /// twice: on the position held after the fills at the bar's open, and on the position after
+    /// all of the bar's fills. The path inside the bar is unknown, so the first check comes before
+    /// any fill inside the range, as stops come before limits: if it liquidates, the fills inside
+    /// the range do not happen and their orders are cancelled with the rest. The liquidation price
+    /// is where equity and maintenance meet, rounded to the tick on the side that triggers sooner;
+    /// if the bar opened beyond it, the open. Every open order is cancelled, and the whole
+    /// position is closed at that price with no slippage, recorded as a filled reduce-only order
+    /// tagged [`LIQUIDATION_TAG`] whose fill closes the trade in the trade list. The fill's fee is
+    /// the taker fee plus a liquidation fee of whatever equity is left after it, since a venue
+    /// keeps the rest of the margin, so the account ends flat at zero and the run goes on with
+    /// nothing to trade. A perpetual account left flat with a negative balance (a gap past the
+    /// liquidation price, or a stop that filled beyond it) is floored at zero, so equity never
+    /// goes below zero; see [`Portfolio::shortfall_written_off`].
     ///
     /// This is a pessimistic simplification of a venue's cross margin with one position: the
-    /// whole bar range counts as coming after the bar's fills, as for attached stops, so a
-    /// position opened inside the bar is checked against the part of the range before it too, and
-    /// a stop that a venue would have beaten with a liquidation fills at its own, worse, price. A
-    /// position closed inside the bar is not checked; a venue might have liquidated it first, but
-    /// the floor keeps its loss to the equity. Venues also keep what is left of the maintenance
-    /// margin as a liquidation fee or for their insurance fund, which this does not charge beyond
-    /// the taker fee.
+    /// whole bar range counts as coming after the fills each check follows, as for attached
+    /// stops. So a position opened inside the bar is checked against the part of the range before
+    /// it too, and when its attached stop fills inside the same bar, beyond the liquidation price,
+    /// it fills at its own, worse, price; the floor keeps that loss to the equity.
     pub fn on_bar(&mut self, bar: Candle, funding: &[(Millis, f64)]) -> Result<(), EngineError> {
         self.check_bar(&bar, funding)?;
 
@@ -164,7 +166,10 @@ impl Session {
             }
         }
         let first_new_fill = self.fills.len();
-        for event in self.broker.on_bar(&bar, &self.portfolio) {
+        let instrument = &self.instrument;
+        let breached =
+            |book: &Portfolio| liquidation_price(instrument, book, &bar, funding).is_some();
+        for event in self.broker.on_bar(&bar, &self.portfolio, &breached) {
             match event {
                 BrokerEvent::Filled(fill) => {
                     self.order_mut(fill.order_id).status = OrderStatus::Filled;
@@ -290,39 +295,11 @@ impl Session {
     /// Liquidates the perpetual position after `bar`'s fills if the bar's adverse extreme breaches
     /// the maintenance margin, as [`Session::on_bar`] describes. `funding` is the bar's funding.
     fn liquidate(&mut self, bar: &Candle, funding: &[(Millis, f64)]) {
-        let q = self.portfolio.position();
-        if self.instrument.id.kind != InstrumentKind::Perpetual || q == 0.0 {
+        let Some(price) = liquidation_price(&self.instrument, &self.portfolio, bar, funding) else {
             return;
-        }
-        // Funding the position will pay later in this bar, at the close.
-        let owed: f64 = funding
-            .iter()
-            .filter(|&&(time, _)| time > bar.open_time)
-            .map(|&(_, rate)| q * bar.close * rate)
-            .sum();
-        let cash = self.portfolio.cash() - owed.max(0.0);
-        // Equity at price p is cash + q * (p - entry); maintenance is m * |q| * p.
-        let m = MAINTENANCE_MARGIN_RATE;
-        let at = (q * self.portfolio.avg_entry() - cash) / (q - m * q.abs());
-        let long = q > 0.0;
-        let price = if long {
-            // At or below zero, no price can liquidate the long.
-            if at <= 0.0 {
-                return;
-            }
-            let trigger = self.instrument.round_price(at, Rounding::Up);
-            if bar.low > trigger {
-                return;
-            }
-            bar.open.min(trigger)
-        } else {
-            // At or below zero, the short is below maintenance at any price.
-            let trigger = self.instrument.round_price(at.max(0.0), Rounding::Down);
-            if bar.high < trigger {
-                return;
-            }
-            bar.open.max(trigger)
         };
+        let q = self.portfolio.position();
+        let long = q > 0.0;
         self.cancel_open_orders(LIQUIDATED);
         let (side, qty) = (if long { Side::Sell } else { Side::Buy }, q.abs());
         let id = OrderId(self.orders.len() as u64 + 1);
@@ -343,7 +320,11 @@ impl Session {
             attached_stop: None,
             status: OrderStatus::Filled,
         });
-        let fee = price * qty * self.fees.taker;
+        // The taker fee, then a liquidation fee of whatever equity is left after it: the venue
+        // keeps the rest of the margin. None is left when the bar gapped through the price.
+        let taker = price * qty * self.fees.taker;
+        let left = self.portfolio.cash() + q * (price - self.portfolio.avg_entry()) - taker;
+        let fee = taker + left.max(0.0);
         self.portfolio.apply_fill(side, qty, price, fee);
         self.fills.push(Fill {
             order_id: id,
@@ -472,6 +453,42 @@ impl Session {
 
     pub fn portfolio(&self) -> &Portfolio {
         &self.portfolio
+    }
+}
+
+/// The price at which `book`'s perpetual position is liquidated on `bar`, or `None` if it is not;
+/// see [`Session::on_bar`]. `funding` is the bar's funding.
+fn liquidation_price(
+    inst: &Instrument,
+    book: &Portfolio,
+    bar: &Candle,
+    funding: &[(Millis, f64)],
+) -> Option<f64> {
+    let q = book.position();
+    if inst.id.kind != InstrumentKind::Perpetual || q == 0.0 {
+        return None;
+    }
+    // Funding the position will pay later in this bar, at the close.
+    let owed: f64 = funding
+        .iter()
+        .filter(|&&(time, _)| time > bar.open_time)
+        .map(|&(_, rate)| q * bar.close * rate)
+        .sum();
+    let cash = book.cash() - owed.max(0.0);
+    // Equity at price p is cash + q * (p - entry); maintenance is m * |q| * p.
+    let m = MAINTENANCE_MARGIN_RATE;
+    let at = (q * book.avg_entry() - cash) / (q - m * q.abs());
+    if q > 0.0 {
+        // At or below zero, no price can liquidate the long.
+        if at <= 0.0 {
+            return None;
+        }
+        let trigger = inst.round_price(at, Rounding::Up);
+        (bar.low <= trigger).then(|| bar.open.min(trigger))
+    } else {
+        // At or below zero, the short is below maintenance at any price.
+        let trigger = inst.round_price(at.max(0.0), Rounding::Down);
+        (bar.high >= trigger).then(|| bar.open.max(trigger))
     }
 }
 

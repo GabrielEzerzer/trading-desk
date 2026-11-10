@@ -107,12 +107,22 @@ impl Context<'_> {
     /// trigger, or this bar's close for a market order, plus the taker fee. A spot buy is checked
     /// again when it fills and cut to the cash then (see [`crate::SimBroker`]).
     ///
-    /// On a perpetual, an order that is not reduce-only and would leave the position larger than
-    /// it is now is rejected if the position it would build, counting the open orders on the same
-    /// side that are not reduce-only, is worth more than [`Context::max_leverage`] times the
-    /// equity. The position is valued at this bar's close and each order like a spot buy above.
-    /// An order that keeps the position at or below its current size is always allowed, so a
-    /// strategy can always reduce or close, even when losses have taken it over the cap.
+    /// On a perpetual, an order that is not reduce-only is rejected if the position it could
+    /// build is worth more than [`Context::max_leverage`] times the equity. With no position, or
+    /// on the side of the position, that is the position plus this order and the open orders on
+    /// its side that are not reduce-only. Against the position, this order and the open orders on
+    /// its side, reduce-only or not, are always allowed when together they are no larger than the
+    /// position, since they can then only shrink it, so a strategy can always reduce or close,
+    /// even when losses have taken it over the cap. When they are larger they could flip it: the
+    /// worst case is that the reduce-only orders close what they can first and the others open a
+    /// fresh position on the other side, and that fresh position is what is capped. The position
+    /// is valued at this bar's close, and each order at its limit price, its trigger, or this
+    /// bar's close for a market order, without the fee.
+    ///
+    /// shortcut: a reduce-only order is never checked, so one submitted after a plain order on
+    /// the same side that it would make room for (a reduce-only market close after a plain limit
+    /// that flips) can still let that order open past the cap. Check at fill time, against the
+    /// equity then, if strategies combine orders that way.
     ///
     /// Every order is rejected on a warm-up bar. A rejected order is recorded with its reason and
     /// returned as an error.
@@ -308,22 +318,30 @@ impl Context<'_> {
         }
         if inst.id.kind == InstrumentKind::Perpetual && !req.reduce_only {
             let close = self.bar().close;
-            let same_side: Vec<&OrderRequest> = self
+            let position = self.position();
+            // This order and the open orders on its side, and those of them that are not
+            // reduce-only, with their value.
+            let side: Vec<&OrderRequest> = self
                 .open_orders()
                 .iter()
                 .map(|o| &o.request)
-                .filter(|r| r.side == req.side && !r.reduce_only)
+                .filter(|r| r.side == req.side)
                 .chain([&req])
                 .collect();
-            let position = self.position();
-            let after = position + same_side.iter().map(|r| r.side.sign() * r.qty).sum::<f64>();
-            if after.abs() > position.abs() * (1.0 + 1e-9) {
-                let notional = (position * close
-                    + same_side
-                        .iter()
-                        .map(|r| r.side.sign() * r.qty * reference_price(r.order_type, close))
-                        .sum::<f64>())
-                .abs();
+            let total: f64 = side.iter().map(|r| r.qty).sum();
+            let plain = side.iter().filter(|r| !r.reduce_only);
+            let plain_qty: f64 = plain.clone().map(|r| r.qty).sum();
+            let plain_value: f64 = plain
+                .map(|r| r.qty * reference_price(r.order_type, close))
+                .sum();
+            let notional = if req.side.sign() * position < 0.0 {
+                // Against the position: the fresh position on the other side if it closes first.
+                let fresh = plain_qty.min(total - position.abs());
+                (total > position.abs() * (1.0 + 1e-9)).then(|| plain_value * fresh / plain_qty)
+            } else {
+                Some((position * close + req.side.sign() * plain_value).abs())
+            };
+            if let Some(notional) = notional {
                 let equity = self.equity();
                 let allowed = self.max_leverage * equity;
                 if notional > allowed * (1.0 + 1e-9) {
