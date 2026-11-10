@@ -88,7 +88,7 @@ impl Context<'_> {
     /// recorded with its reason and returned as an error.
     pub fn submit(&mut self, request: OrderRequest) -> Result<OrderId, OrderRejected> {
         let id = OrderId(self.orders.len() as u64 + 1);
-        let submitted_at = self.bar().open_time;
+        let (submitted_at, decision_close) = (self.bar().open_time, self.bar().close);
         let (request, check) = self.prepare(request);
         let status = match &check {
             Ok(()) => OrderStatus::Open,
@@ -98,6 +98,7 @@ impl Context<'_> {
             id,
             request,
             submitted_at,
+            decision_close,
             status,
         };
         self.orders.push(order.clone());

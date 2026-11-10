@@ -122,6 +122,70 @@ fn limit_sell_fills_at_the_open_on_a_gap_up() {
 }
 
 #[test]
+fn a_limit_priced_through_the_market_fills_as_a_taker_with_slippage() {
+    let i = perp();
+    let bars = [
+        bar(0, 100.0, 101.0, 99.0, 100.0),
+        bar(1, 100.0, 101.0, 99.0, 100.0),
+        bar(2, 101.0, 102.0, 100.8, 101.5),
+        bar(3, 100.3, 100.6, 100.0, 100.2),
+    ];
+    let limit = |price| OrderType::Limit { price };
+    let (script, log) = Script::new(vec![
+        (0, req(&i, Side::Buy, 1.0, OrderType::Market)),
+        (0, req(&i, Side::Buy, 1.0, limit(150.0))),
+        (0, req(&i, Side::Sell, 1.0, limit(50.0))),
+        (0, req(&i, Side::Buy, 1.0, limit(100.05))),
+        (1, req(&i, Side::Buy, 1.0, limit(100.5))),
+    ]);
+    let s = run(i, 10.0, &bars, script);
+    assert!(log.lock().unwrap().iter().all(|r| r.is_ok()));
+
+    let f = s.fills();
+    assert_eq!(f.len(), 5);
+    let fill = |n: usize| (f[n].order_id.0, f[n].time, f[n].liquidity);
+    // Order 1, the market buy: 100 * 1.001 = 100.10, taker fee 0.2% = 0.2002.
+    assert_eq!(fill(0), (1, MIN, Liquidity::Taker));
+    approx(f[0].price, 100.10);
+    approx(f[0].fee, 0.2002);
+    // Order 2 buys at 150 when the close was 100: it is a market buy with a cap, so it pays the
+    // same 100.10 and taker fee as order 1, not the open of 100 and a maker fee.
+    assert_eq!(fill(1), (2, MIN, Liquidity::Taker));
+    approx(f[1].price, 100.10);
+    approx(f[1].fee, 0.2002);
+    // Order 3 sells at 50 when the close was 100: 100 * 0.999 = 99.90, fee 0.1998.
+    assert_eq!(fill(2), (3, MIN, Liquidity::Taker));
+    approx(f[2].price, 99.90);
+    approx(f[2].fee, 0.1998);
+    // Order 4 buys at 100.05: the slipped 100.10 is past its limit, so it pays 100.05, fee 0.2001.
+    assert_eq!(fill(3), (4, MIN, Liquidity::Taker));
+    approx(f[3].price, 100.05);
+    approx(f[3].fee, 0.2001);
+    // Order 5 buys at 100.5 after a close of 100, but bar 2 opens at 101, past the limit, and its
+    // low of 100.8 stays above it: it rests as a plain limit. Bar 3 opens inside the limit at
+    // 100.3, but that is no longer the order's first bar, so it fills as a resting limit: at the
+    // open, as a maker, fee 0.1003.
+    assert_eq!(fill(4), (5, 3 * MIN, Liquidity::Maker));
+    approx(f[4].price, 100.3);
+    approx(f[4].fee, 0.1003);
+
+    // Perpetual, bar 1: the fees 0.2002 + 0.2002 + 0.1998 + 0.2001 = 0.8003, and order 3 closes 1
+    // of the 2 bought at 100.10 for 99.90, realising -0.20: cash 9998.9997. Long 2 at an average
+    // of (100.10 + 100.05) / 2 = 100.075, marked at 100: equity 9998.9997 - 0.15.
+    let e = equity(&s);
+    approx(e[1], 9998.8497);
+    // Bar 2: marked at 101.5, unrealised 2 * 1.425 = 2.85.
+    approx(e[2], 10001.8497);
+    // Bar 3: cash less 0.1003 = 9998.8994. Long 3 at an average of (200.15 + 100.3) / 3, marked at
+    // 100.2: unrealised 300.6 - 300.45 = 0.15.
+    let p = s.portfolio();
+    approx(p.cash(), 9998.8994);
+    approx(p.position(), 3.0);
+    approx(p.realised_pnl(), -0.20);
+    approx(e[3], 9999.0494);
+}
+
+#[test]
 fn stops_trigger_on_the_range_and_fill_at_the_worse_of_open_and_trigger() {
     let i = perp();
     let bars = [

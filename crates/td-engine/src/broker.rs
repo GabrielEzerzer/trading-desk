@@ -13,6 +13,8 @@ pub struct Order {
     pub request: OrderRequest,
     /// Open time of the bar the order was decided on. It can first fill on a later bar.
     pub submitted_at: Millis,
+    /// Close of the bar the order was decided on: the last price before it was sent.
+    pub decision_close: f64,
     pub status: OrderStatus,
 }
 
@@ -59,6 +61,8 @@ pub struct SimBroker<M: FillModel> {
     open: Vec<Order>,
     /// Stop-limit orders whose trigger was reached on an earlier bar.
     triggered: Vec<OrderId>,
+    /// Open time of the previous bar. An order decided on it is seeing its first bar.
+    last_bar: Millis,
 }
 
 impl<M: FillModel> SimBroker<M> {
@@ -69,6 +73,7 @@ impl<M: FillModel> SimBroker<M> {
             model,
             open: Vec::new(),
             triggered: Vec::new(),
+            last_bar: Millis::MIN,
         }
     }
 }
@@ -94,6 +99,7 @@ impl<M: FillModel> Broker for SimBroker<M> {
             if order.submitted_at >= bar.open_time {
                 continue;
             }
+            let first = order.submitted_at >= self.last_bar;
             let was_triggered = self.triggered.contains(&order.id);
             let priority = match order.request.order_type {
                 OrderType::Market => 0,
@@ -103,7 +109,7 @@ impl<M: FillModel> Broker for SimBroker<M> {
             };
             match self
                 .model
-                .check(order, was_triggered, bar, &self.instrument)
+                .check(order, first, was_triggered, bar, &self.instrument)
             {
                 FillCheck::Fill { price, liquidity } => {
                     candidates.push((priority, order.id, index, price, liquidity))
@@ -167,6 +173,7 @@ impl<M: FillModel> Broker for SimBroker<M> {
         self.triggered.extend(newly_triggered);
         self.open.retain(|o| !done.contains(&o.id));
         self.triggered.retain(|t| !done.contains(t));
+        self.last_bar = bar.open_time;
         events
     }
 
