@@ -142,7 +142,13 @@ export function Result({ strategy, verdict, fresh, onCounted }: Props) {
                 <td>{formatDay(t.entryTime)}</td>
                 <td>{t.open ? 'Open' : formatDay(t.exitTime)}</td>
                 <td className="num">{formatPrice(t.entryPrice)}</td>
-                <td className="num">{formatPrice(t.exitPrice)}</td>
+                {t.open ? (
+                  <td className="num muted" title="Marked at the last close">
+                    {formatPrice(t.exitPrice)}
+                  </td>
+                ) : (
+                  <td className="num">{formatPrice(t.exitPrice)}</td>
+                )}
                 <td className="num" data-tone={pnlTone(t.returnPct, 'return_pct')}>
                   {formatReturnPct(t.returnPct)}
                 </td>
