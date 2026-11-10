@@ -541,7 +541,8 @@ fn a_protective_stop_beats_a_take_profit_in_the_same_bar() {
         ),
     ]);
     let s = run(i, 0.0, &bars, script);
-    // Bar 2 reaches both 110 and 95. The path is unknown, so the stop is taken first, at 95.
+    // Bar 2 opens at 100, between the two, and reaches both 110 and 95 inside its range. The path
+    // is unknown, so the stop is taken first, at 95.
     let f = s.fills();
     assert_eq!(f.len(), 2);
     assert_eq!(f[1].order_id.0, 3);
@@ -553,6 +554,97 @@ fn a_protective_stop_beats_a_take_profit_in_the_same_bar() {
     assert_eq!(s.portfolio().position(), 0.0);
     // Fees: 0.2 on the entry at 100, 0.19 on the stop at 95. Realised -5.
     approx(s.portfolio().cash(), 10_000.0 - 0.2 - 0.19 - 5.0);
+}
+
+#[test]
+fn a_take_profit_the_bar_opens_through_fills_before_a_stop_inside_the_range() {
+    let i = perp();
+    let bars = [
+        bar(0, 100.0, 101.0, 99.0, 100.0),
+        bar(1, 100.0, 101.0, 99.0, 100.0),
+        bar(2, 112.0, 113.0, 94.0, 95.0),
+    ];
+    let (script, _) = Script::new(vec![
+        (0, req(&i, Side::Buy, 1.0, OrderType::Market)),
+        (
+            1,
+            reduce_only(req(&i, Side::Sell, 1.0, OrderType::Limit { price: 110.0 })),
+        ),
+        (
+            1,
+            reduce_only(req(&i, Side::Sell, 1.0, OrderType::Stop { trigger: 95.0 })),
+        ),
+    ]);
+    let s = run(i, 0.0, &bars, script);
+    // Bar 2 opens at 112, already through the 110 take-profit, so the take-profit fills at the
+    // open, before anything inside the range: at 112 as a maker (the gap rule), fee 0.112. The
+    // fall to 94 that reaches the stop comes after it, when the position is already closed.
+    let f = s.fills();
+    assert_eq!(f.len(), 2);
+    assert_eq!((f[1].order_id.0, f[1].time), (2, 2 * MIN));
+    approx(f[1].price, 112.0);
+    approx(f[1].fee, 0.112);
+    assert_eq!(f[1].liquidity, Liquidity::Maker);
+    assert_eq!(
+        s.orders()[2].status,
+        OrderStatus::Cancelled("reduce-only order would not reduce the position".into())
+    );
+    // Entry at 100, fee 0.2. Realised 112 - 100 = 12: cash 10000 - 0.2 + 12 - 0.112 = 10011.688.
+    let p = s.portfolio();
+    assert_eq!(p.position(), 0.0);
+    approx(p.realised_pnl(), 12.0);
+    approx(p.cash(), 10011.688);
+    approx(equity(&s)[2], 10011.688);
+}
+
+#[test]
+fn an_attached_stop_inside_the_range_waits_for_the_fills_at_the_open() {
+    let i = perp();
+    let bars = [
+        bar(0, 100.0, 101.0, 99.0, 100.0),
+        bar(1, 100.0, 101.0, 99.0, 100.0),
+        bar(2, 112.0, 113.0, 94.0, 95.0),
+    ];
+    let add = req(&i, Side::Buy, 1.0, OrderType::Market);
+    let take_profit = reduce_only(req(&i, Side::Sell, 2.0, OrderType::Limit { price: 110.0 }));
+    let strategy = steps(move |ctx, n| match n {
+        0 => {
+            ctx.submit(add.clone()).unwrap();
+        }
+        1 => {
+            // Adds 1 to the long with a stop at 95 (orders 2 and 3), and takes profit on the
+            // whole position at 110 (order 4).
+            ctx.submit_with_stop(add.clone(), 95.0).unwrap();
+            ctx.submit(take_profit.clone()).unwrap();
+        }
+        _ => {}
+    });
+    let s = run(i, 0.0, &bars, strategy);
+    // Bar 1: order 1 buys 1 at 100, fee 0.2. Bar 2 opens at 112: order 2 buys 1 there, fee 0.224,
+    // for a long of 2 at an average of 106, and the take-profit, which the bar opens through,
+    // sells both at 112 as a maker, fee 0.224. The stop at 95 is placed with order 2's fill, but
+    // the bar only reaches it inside the range, after the fills at the open, and by then there is
+    // nothing left to close.
+    let f = s.fills();
+    assert_eq!(f.len(), 3);
+    let fill = |n: usize| (f[n].order_id.0, f[n].time, f[n].side);
+    assert_eq!(fill(1), (2, 2 * MIN, Side::Buy));
+    approx(f[1].price, 112.0);
+    approx(f[1].fee, 0.224);
+    assert_eq!(fill(2), (4, 2 * MIN, Side::Sell));
+    approx(f[2].price, 112.0);
+    approx(f[2].qty, 2.0);
+    approx(f[2].fee, 0.224);
+    assert_eq!(
+        s.orders()[2].status,
+        OrderStatus::Cancelled("reduce-only order would not reduce the position".into())
+    );
+    // Realised 2 * (112 - 106) = 12: cash 10000 - 0.2 - 0.224 - 0.224 + 12 = 10011.352, flat.
+    let p = s.portfolio();
+    assert_eq!(p.position(), 0.0);
+    approx(p.realised_pnl(), 12.0);
+    approx(p.cash(), 10011.352);
+    approx(equity(&s)[2], 10011.352);
 }
 
 #[test]
