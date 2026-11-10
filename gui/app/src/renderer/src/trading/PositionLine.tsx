@@ -90,7 +90,17 @@ export function PositionLine({ session, instrumentId, instrument, timeframe, str
   )
 
   if (!session.loaded) {
-    return <div className="position-line" />
+    if (!session.loadError) return <div className="position-line" />
+    return (
+      <div className="position-line">
+        <span className="line-text line-error" role="alert" title={session.loadError}>
+          The paper sessions did not load. {session.loadError}
+        </span>
+        <button type="button" className="line-button" onClick={session.reload}>
+          Retry
+        </button>
+      </div>
+    )
   }
 
   if (!summary) {

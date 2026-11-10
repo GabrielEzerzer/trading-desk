@@ -1153,6 +1153,12 @@ button {
   color: var(--grey-1);
 }
 
+.line-error {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 /* A passing note about the feed, such as a dropped bar, above the line for half a minute. */
 .position-notice {
   max-width: 100%;

@@ -5,12 +5,15 @@
 //
 // `config`: { engine: 'starting' | 'failed' | 'running', mock: boolean, hangStrategies: boolean,
 //             strategies: StrategyInfo[], instruments: Instrument[], hangInstruments: boolean, failInstruments: boolean,
-//             candles: { start: Candle, everyMs: number } | null, session: SessionState | null }
+//             candles: { start: Candle, everyMs: number } | null, session: SessionState | null,
+//             failSessions: number }
 //
 // For Trading in engine mode it answers GET /instruments from the fixtures, GET /sessions and
 // GET /sessions/{id} from `config.session`, and on a `candles:` subscription emits a closed bar
 // every `config.candles.everyMs`, walking from `config.candles.start`; `window.__stubCandles` counts
-// them, so a state can wait for the chart to fill.
+// them, so a state can wait for the chart to fill. GET /sessions fails the first `config.failSessions`
+// times. POST /sessions answers after 300 ms with a new warming-up session, which GET /sessions then
+// lists; `window.__stubStarts` counts the requests.
 
 function installBridgeStub(config) {
   const listeners = new Set()
@@ -81,7 +84,39 @@ function installBridgeStub(config) {
         const instruments = (config.instruments ?? []).filter((i) => i.id.venue === venue && i.id.kind === kind)
         return ok({ instruments, rejected: [] })
       }
-      if (request.method === 'GET' && request.path === '/sessions') return ok(config.session ? [summary(config.session)] : [])
+      if (request.method === 'GET' && request.path === '/sessions') {
+        if (config.failSessions > 0) {
+          config.failSessions -= 1
+          return { ok: false, status: 500, error: { code: 'internal', message: 'the session store did not answer' } }
+        }
+        return ok(config.session ? [summary(config.session)] : [])
+      }
+      if (request.method === 'POST' && request.path === '/sessions') {
+        window.__stubStarts = (window.__stubStarts ?? 0) + 1
+        const body = request.body
+        const instrument = (config.instruments ?? []).find(
+          (i) => i.id.venue === body.instrument.venue && i.id.symbol === body.instrument.symbol && i.id.kind === body.instrument.kind,
+        )
+        await new Promise((resolve) => setTimeout(resolve, 300))
+        config.session = {
+          id: `stub-${window.__stubStarts}`,
+          config: { ...body, instrument, fees: null, max_leverage: 1 },
+          status: { status: 'warming_up' },
+          cash: body.starting_cash,
+          equity: body.starting_cash,
+          position: { qty: 0, avg_entry: 0, mark_price: 0, unrealised_pnl: 0, realised_pnl: 0, fees_paid: 0, funding_paid: 0 },
+          equity_curve: [],
+          open_orders: [],
+          fills: [],
+          trades: [],
+          funding: [],
+          live_from: null,
+          last_bar: null,
+          dropped: [],
+          warnings: [],
+        }
+        return ok(summary(config.session))
+      }
       if (request.method === 'GET' && config.session && request.path === `/sessions/${config.session.id}`) return ok(config.session)
       return { ok: false, status: 404, error: { code: 'not_found', message: `${request.path} is not stubbed` } }
     },

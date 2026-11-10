@@ -1,5 +1,6 @@
 // The key flows, driven with real clicks and keys, each asserting the state the page must reach.
 import type { Page } from '@playwright/test'
+import { engineTrading } from '../app/shots/harness.mjs'
 import { expect, test } from './fixtures'
 
 test.use({ viewport: { width: 1100, height: 720 } })
@@ -311,5 +312,39 @@ test.describe('trading', () => {
     await expect(page.getByRole('heading', { name: 'Strategies' })).toBeHidden()
     // The paper session kept running while the Lab was shown.
     await expect(page.locator('.position-summary')).toContainText(/Manual · (Warming up|Live)/)
+  })
+})
+
+test.describe('trading on the engine', () => {
+  const openTrading = async (page: Page, open: (config: typeof engineTrading) => Promise<void>, config: typeof engineTrading) => {
+    await open(config)
+    await page.getByRole('heading', { name: 'Strategies' }).waitFor()
+    await page.keyboard.press('Control+2')
+    await expect(page.locator('main')).toHaveAttribute('aria-label', 'Trading')
+  }
+
+  test('a double click on Start opens one session', async ({ page, open }) => {
+    await openTrading(page, open, engineTrading)
+    await page.getByRole('button', { name: 'Start a session' }).click()
+    const panel = page.getByRole('dialog')
+    const start = panel.getByRole('button', { name: 'Start', exact: true })
+    await expect(start).toHaveAttribute('aria-disabled', 'false')
+    // The stub answers 300 ms later, so the second click lands while the first start is pending.
+    await start.dblclick()
+    await expect(panel).toBeHidden()
+    await expect(page.locator('.position-summary')).toContainText('Warming up')
+    expect(await page.evaluate(() => (window as { __stubStarts?: number }).__stubStarts)).toBe(1)
+  })
+
+  test('a session list that did not load says so with Retry, and offers no new session', async ({ page, open }) => {
+    await openTrading(page, open, { ...engineTrading, failSessions: 1 })
+    const line = page.locator('.position-line')
+    await expect(line.getByRole('alert')).toHaveText('The paper sessions did not load. The session store did not answer.')
+    await expect(page.getByText(/^No paper session/)).toHaveCount(0)
+    await expect(page.getByRole('button', { name: 'Start a session' })).toHaveCount(0)
+    await expect(page.getByText('Start a paper session to place orders.')).toHaveCount(0)
+    await line.getByRole('button', { name: 'Retry' }).click()
+    await expect(page.getByText('No paper session on BTCUSDT')).toBeVisible()
+    await expect(line.getByRole('alert')).toHaveCount(0)
   })
 })

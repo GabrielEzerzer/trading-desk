@@ -130,7 +130,7 @@ const engineSession = {
 }
 
 /** Trading on the engine: instruments from the fixtures and a closed bar every 250 ms. */
-const engineTrading = { engine: 'running', mock: false, instruments, candles: { start: engineStart, everyMs: 250 } }
+export const engineTrading = { engine: 'running', mock: false, instruments, candles: { start: engineStart, everyMs: 250 } }
 
 /** Milliseconds between the mock's live bars (`liveMs` in app/mock/trading.ts). */
 const LIVE_MS = 1500

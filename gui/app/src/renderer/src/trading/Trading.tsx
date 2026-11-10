@@ -103,6 +103,7 @@ function TradingDesk() {
   else if (instruments.error) blocked = 'The instrument lists did not load, so the order cannot be checked.'
   else if (!instruments.list) blocked = 'Loading the instrument’s trading rules.'
   else if (!instrument) blocked = `${instrumentId.symbol} is not on the venue’s list.`
+  else if (session.loadError) blocked = 'The paper sessions did not load, so no order can be placed.'
   else if (!session.loaded) blocked = 'Loading paper sessions.'
   else if (!session.summary) blocked = 'Start a paper session to place orders.'
   else if (!running) blocked = 'The paper session is stopped. Resume it to place orders.'

@@ -65,8 +65,10 @@ export function useCandles(source: TradingSource | null, id: InstrumentId, timef
 }
 
 export interface PaperSession {
-  /** Null while the session list loads. */
+  /** False while the session list loads, and when it did not load. */
   loaded: boolean
+  /** Why the session list did not load, as a sentence; `reload` tries again. */
+  loadError: string | null
   summary: SessionSummary | null
   state: SessionState | null
   /** The latest rejection, with a counter so the same reason twice still shows. */
@@ -78,6 +80,7 @@ export interface PaperSession {
   start(request: StartSessionRequest): Promise<boolean>
   stop(): void
   resume(): void
+  reload(): void
 }
 
 /** The paper session shown for an instrument, followed live. */
@@ -87,19 +90,24 @@ export function usePaperSession(source: TradingSource | null, id: InstrumentId):
   const [rejected, setRejected] = useState<PaperSession['rejected']>(null)
   const [notice, setNotice] = useState<PaperSession['notice']>(null)
   const [error, setError] = useState<string | null>(null)
+  const [loadError, setLoadError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
   const [revision, setRevision] = useState(0)
   const counter = useRef(0)
+  // A double click runs the second call before React re-renders with `busy`, so `act` checks this.
+  const inFlight = useRef(false)
 
   useEffect(() => {
     if (!source) return
     let live = true
+    setLoadError(null)
     source.sessions().then(
       (list) => live && setSessions(list),
       (e: unknown) => {
         if (!live) return
-        setSessions([])
-        setError(errorText(e))
+        // An empty list would read as "no session" and offer to start one beside a running one.
+        setSessions(null)
+        setLoadError(errorText(e))
       },
     )
     return () => {
@@ -152,6 +160,8 @@ export function usePaperSession(source: TradingSource | null, id: InstrumentId):
 
   const act = useCallback(
     async (run: () => Promise<unknown>): Promise<boolean> => {
+      if (inFlight.current) return false
+      inFlight.current = true
       setBusy(true)
       setError(null)
       try {
@@ -162,6 +172,7 @@ export function usePaperSession(source: TradingSource | null, id: InstrumentId):
         setError(errorText(e))
         return false
       } finally {
+        inFlight.current = false
         setBusy(false)
       }
     },
@@ -170,6 +181,7 @@ export function usePaperSession(source: TradingSource | null, id: InstrumentId):
 
   return {
     loaded: sessions !== null,
+    loadError,
     summary,
     state: state && state.id === sessionId ? state : null,
     rejected,
@@ -183,6 +195,7 @@ export function usePaperSession(source: TradingSource | null, id: InstrumentId):
     resume: () => {
       if (source && sessionId) void act(() => source.resumeSession(sessionId))
     },
+    reload: () => setRevision((n) => n + 1),
   }
 }
 
