@@ -735,7 +735,7 @@ fn deleting_a_whole_perpetual_removes_its_candles_funding_and_emptied_folders() 
         .into_iter()
         .map(|i| i.id)
         .collect();
-    assert_eq!(ids, [spot.clone()]);
+    assert_eq!(ids, std::slice::from_ref(&spot));
     let files = tree(dir.path());
     assert!(
         !files
