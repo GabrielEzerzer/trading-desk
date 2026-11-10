@@ -210,17 +210,19 @@ equity: Array<EquityPoint>,
 orders: Array<Order>, fills: Array<Fill>, trades: Array<Trade>, metrics: MetricsReport, benchmark: Benchmark, };
 
 /**
- * Buy and hold of the same instrument over the same bars: a backtest's traded bars, or a
- * walk-forward's stitched span (see [`crate::WalkForwardResult`]).
+ * Buy and hold of the same instrument over the same bars: a backtest's traded bars, or in a
+ * walk-forward each test window's bars, stitched like the test runs (see
+ * [`crate::WalkForwardResult::benchmark`]).
  */
 export type Benchmark = { 
 /**
  * Quantity bought at the first bar's open: all starting cash, after the taker fee, rounded
- * down to the lot size.
+ * down to the lot size. In a walk-forward, the first test window's purchase.
  */
 qty: number, 
 /**
- * The first bar's open with slippage, rounded up to the tick.
+ * The first bar's open with slippage, rounded up to the tick. In a walk-forward, the first
+ * test window's.
  */
 entry_price: number, equity: Array<EquityPoint>, metrics: MetricsReport, 
 /**
@@ -230,8 +232,8 @@ excess_return: number | null,
 /**
  * Pearson correlation of the strategy's per-bar returns with the benchmark's over the same
  * intervals: the benchmark's equity is read at each time of the strategy's equity series.
- * In a backtest the two have the same bars; in a walk-forward, across a gap between test
- * windows, the benchmark's return spans the gap like the stitched curve's does.
+ * In a backtest the two have the same bars, and in a walk-forward the same test windows, so
+ * the times match one to one.
  */
 correlation: number | null, };
 
@@ -651,11 +653,16 @@ equity: Array<EquityPoint>,
  */
 metrics: MetricsReport, 
 /**
- * Buy and hold over the stitched span: bought at the first test bar's open with the starting
- * cash and held to the last test bar's close, through any bars between test windows, with
- * the fill, fee and funding rules of a backtest's benchmark. Its excess return is the
- * stitched total return minus its own. `None` only in a result saved before walk-forwards
- * had a benchmark.
+ * Buy and hold in each test window, stitched like the test runs: each window buys at its
+ * first test bar's open with the starting cash and holds to its last test bar's close, with
+ * the fill, fee and funding rules of a backtest's benchmark, and the windows are compounded
+ * with [`stitch`] as the test segments are. The two curves are therefore exposed over the
+ * same bars: with a step longer than the test, neither holds through the bars between test
+ * windows. Its excess return is the stitched total return minus its own.
+ *
+ * Unlike a test run it never sells, so it pays one taker fee per window to the test run's
+ * two, and it holds through each window's last bar, on whose open a test run closes out.
+ * `None` only in a result saved before walk-forwards had a benchmark.
  */
 benchmark: Benchmark | null, 
 /**

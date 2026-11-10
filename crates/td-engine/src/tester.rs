@@ -185,12 +185,14 @@ impl OosSpec {
 }
 
 impl WalkForwardSpec {
-    /// [`SweepSpec::check`], plus the walk-forward rules that need no data. Whether the windows
-    /// fit the range, and whether every train window is long enough for the objective, is checked
-    /// by the run before it runs anything.
+    /// [`SweepSpec::check`], plus the walk-forward rules that need no data, among them that the
+    /// first train window can be long enough for a Sharpe, Sortino, CAGR or Calmar objective with
+    /// no gaps in the data. Whether the windows fit the range, and whether each train window in
+    /// the data is long enough, is checked by the run before it runs anything.
     pub fn check(&self) -> Result<(), TesterError> {
         refuse_base_warmup(&self.sweep)?;
-        self.sweep.check()
+        self.sweep.check()?;
+        refuse_short_train_bars(self)
     }
 }
 
@@ -996,6 +998,7 @@ pub fn walk_forward(
     let base = &spec.sweep.base;
     refuse_base_warmup(&spec.sweep)?;
     let plan = Plan::new(&spec.sweep)?;
+    refuse_short_train_bars(spec)?;
     let (_, traded) = select_bars(base, bars)?;
     let windows = spec.windows.windows(traded.len())?;
     refuse_short_train(
@@ -1085,6 +1088,84 @@ pub fn walk_forward(
     })
 }
 
+/// The name of `metric` when it is undefined on a run too short for it (see [`Metric`]), `None`
+/// otherwise.
+fn floored_metric_name(metric: Metric) -> Option<&'static str> {
+    match metric {
+        Metric::Sharpe => Some("Sharpe"),
+        Metric::Sortino => Some("Sortino"),
+        Metric::Cagr => Some("CAGR"),
+        Metric::Calmar => Some("Calmar"),
+        _ => None,
+    }
+}
+
+/// Refuses, without data, a walk-forward whose objective is undefined on its first train window
+/// whatever the data: a Sharpe or Sortino objective when that window cannot hold
+/// [`metrics::MIN_DAILY_RETURNS`] daily returns, or a CAGR or Calmar objective when it cannot span
+/// [`metrics::MIN_CAGR_DAYS`] days. The first train window is the shortest: `train_bars` long when
+/// rolling, and when anchored up to `step_bars - 1` bars longer, since it starts at the first bar
+/// and so also takes the bars left over before the first test.
+///
+/// Bars without gaps span their count times the timeframe, and hold the most daily returns when
+/// they start on the last bar of a UTC day. A data gap would stretch a window over more days, but
+/// a window that reaches the floor only through a gap would have its metric measured partly on
+/// days with no bars, so the rule counts bars. [`refuse_short_train`] then checks each window in
+/// the data.
+fn refuse_short_train_bars(spec: &WalkForwardSpec) -> Result<(), TesterError> {
+    let Some(name) = floored_metric_name(spec.sweep.objective.metric) else {
+        return Ok(());
+    };
+    let w = &spec.windows;
+    // A train length of zero is refused by the run's window rules, with their own message.
+    if w.train_bars == 0 {
+        return Ok(());
+    }
+    let bars = match w.mode {
+        WindowMode::Rolling => w.train_bars,
+        WindowMode::Anchored => w.train_bars.saturating_add(w.step_bars.saturating_sub(1)),
+    };
+    let tf = spec.sweep.base.timeframe;
+    let bar = tf.duration_ms();
+    // A span too long for milliseconds in an i64 is far past every floor.
+    let Some(span) = i64::try_from(bars).ok().and_then(|n| n.checked_mul(bar)) else {
+        return Ok(());
+    };
+    let window = match w.mode {
+        WindowMode::Rolling => format!("a train window of {bars} {tf} bars"),
+        WindowMode::Anchored => format!("the first train window, at most {bars} {tf} bars,"),
+    };
+    match spec.sweep.objective.metric {
+        Metric::Sharpe | Metric::Sortino => {
+            // Bars starting `offset` into a UTC day hold a daily return for each 00:00 UTC after
+            // the first bar's open up to the last bar's close, and one more for the day the close
+            // falls in unless it falls on 00:00 (see [`metrics::daily_equity`]). That is the span
+            // plus the offset, in days, rounded up. Bars shorter than a day divide it, so the last
+            // one of a day starts a bar short of its end; daily and weekly bars start at 00:00.
+            let end = (metrics::DAY_MS - bar).max(0) + span;
+            let most = end / metrics::DAY_MS + i64::from(end % metrics::DAY_MS != 0);
+            if most < metrics::MIN_DAILY_RETURNS as i64 {
+                return Err(TesterError::InvalidSpec(format!(
+                    "a {name} objective needs at least {} daily returns in every train window, \
+                     and {window} has at most {most}",
+                    metrics::MIN_DAILY_RETURNS
+                )));
+            }
+        }
+        _ => {
+            if span < metrics::MIN_CAGR_DAYS * metrics::DAY_MS {
+                return Err(TesterError::InvalidSpec(format!(
+                    "a {name} objective needs train windows of at least {} days, and {window} \
+                     spans {}",
+                    metrics::MIN_CAGR_DAYS,
+                    describe_span(span)
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Refuses a walk-forward whose objective is undefined on one of its train windows whatever the
 /// parameters: a Sharpe or Sortino objective on a window with fewer than
 /// [`metrics::MIN_DAILY_RETURNS`] daily returns, or a CAGR or Calmar objective on one shorter than
@@ -1097,12 +1178,8 @@ fn refuse_short_train(
     traded: &[Candle],
     windows: &[Window],
 ) -> Result<(), TesterError> {
-    let name = match metric {
-        Metric::Sharpe => "Sharpe",
-        Metric::Sortino => "Sortino",
-        Metric::Cagr => "CAGR",
-        Metric::Calmar => "Calmar",
-        _ => return Ok(()),
+    let Some(name) = floored_metric_name(metric) else {
+        return Ok(());
     };
     let step = timeframe.duration_ms();
     for (k, w) in windows.iter().enumerate() {

@@ -46,7 +46,8 @@ const MS_PER_YEAR: f64 = DAYS_PER_YEAR * DAY_MS as f64;
 /// with bars: a day inside a data gap, or between two walk-forward test windows in a stitched
 /// curve, counts as a daily return of zero. Zero returns lower the mean daily return more than
 /// its standard deviation, so they pull Sharpe and Sortino toward zero rather than inflate them
-/// (volatility comes out lower), but a gappy curve reaches the floor with fewer real returns.
+/// (and volatility usually comes out lower), but a gappy curve reaches the floor with fewer real
+/// returns.
 pub const MIN_DAILY_RETURNS: usize = 30;
 
 /// The shortest run, from the first bar's open to the last bar's close, the report computes CAGR
