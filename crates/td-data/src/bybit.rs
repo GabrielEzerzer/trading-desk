@@ -1,16 +1,16 @@
-//! Bybit history from the v5 REST API: 1-minute klines (`/v5/market/kline`) and funding rates
+//! Bybit history from the v5 REST API: klines (`/v5/market/kline`) and funding rates
 //! (`/v5/market/funding/history`). Both return pages newest first, so they are read backwards from
 //! the end of the range.
 
 use std::time::Duration;
 
 use serde::Deserialize;
-use td_core::{Candle, InstrumentId, Millis};
+use td_core::{Candle, InstrumentId, Millis, Timeframe};
 
 use crate::DataError;
 use crate::http::Http;
 use crate::instruments::{bybit_category, bybit_result};
-use crate::time::{MINUTE, now_ms};
+use crate::time::now_ms;
 
 const KLINE_URL: &str = "https://api.bybit.com/v5/market/kline";
 const FUNDING_URL: &str = "https://api.bybit.com/v5/market/funding/history";
@@ -61,22 +61,36 @@ pub fn parse_kline_page(body: &str) -> Result<Vec<Candle>, DataError> {
         .collect()
 }
 
-/// Downloads the 1-minute klines of a spot or linear instrument with open times in `[from, to)`,
-/// oldest first. A bar still in progress is left out.
+/// Bybit's name for a kline interval.
+fn interval(timeframe: Timeframe) -> &'static str {
+    match timeframe {
+        Timeframe::M1 => "1",
+        Timeframe::M5 => "5",
+        Timeframe::M15 => "15",
+        Timeframe::M30 => "30",
+        Timeframe::H1 => "60",
+        Timeframe::H4 => "240",
+        Timeframe::D1 => "D",
+        Timeframe::W1 => "W",
+    }
+}
+
+/// Downloads the klines of `timeframe` for a spot or linear instrument with open times in
+/// `[from, to)`, oldest first. A bar still in progress is left out.
 pub fn fetch_klines(
     http: &Http,
     id: &InstrumentId,
+    timeframe: Timeframe,
     from: Millis,
     to: Millis,
 ) -> Result<Vec<Candle>, DataError> {
-    let closed_before = now_ms() - MINUTE;
-    let end = to.min(closed_before + 1) - 1;
+    let end = to.min(timeframe.floor(now_ms())) - 1;
     let open_time = |c: &Candle| c.open_time;
     page_backwards(from, end, KLINE_LIMIT, open_time, |page_end| {
         let query = [
             ("category", bybit_category(id.kind).to_string()),
             ("symbol", id.symbol.clone()),
-            ("interval", "1".to_string()),
+            ("interval", interval(timeframe).to_string()),
             ("start", from.to_string()),
             ("end", page_end.to_string()),
             ("limit", KLINE_LIMIT.to_string()),
