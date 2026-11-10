@@ -15,6 +15,7 @@ use td_engine::{BacktestConfig, Params, SavedRun};
 use td_server::api::auth::Token;
 use td_server::api::data::GapInfo;
 use td_server::api::jobs::{JobInfo, JobResult, JobStatus};
+const MAX_RUN_JOBS: usize = 8;
 use td_server::api::runs::RunDetail;
 use td_server::api::source::MarketSource;
 use td_server::api::ws::ServerMessage;
@@ -642,4 +643,121 @@ async fn the_run_routes_need_the_token_and_unknown_ids_are_404() {
     }
     let (status, list) = t.get("/runs").await;
     assert_eq!((status, list), (StatusCode::OK, json!([])));
+}
+
+/// Starts two sweeps of minutes of work and waits until both have loaded their data and are
+/// running, so both run slots stay busy until they are cancelled.
+async fn fill_the_run_slots(t: &TestServer, ws: &mut Ws) -> [u64; 2] {
+    let spec = sweep_spec(30, (1, 100), (101, 300));
+    let busy = [
+        t.start("/runs/sweep", &spec).await,
+        t.start("/runs/sweep", &spec).await,
+    ];
+    let mut working = Vec::new();
+    while working.len() < busy.len() {
+        let Some(ServerMessage::Job { job }) = ws.next().await else {
+            panic!("the topic closed");
+        };
+        if busy.contains(&job.id) && job.progress > 0.0 && !working.contains(&job.id) {
+            assert_eq!(job.status, JobStatus::Running);
+            working.push(job.id);
+        }
+    }
+    busy
+}
+
+/// Job `job` once it has finished.
+async fn finished(t: &TestServer, job: u64) -> Value {
+    let deadline = Instant::now() + WAIT;
+    while Instant::now() < deadline {
+        let (_, state) = t.get(&format!("/jobs/{job}")).await;
+        if ["done", "failed", "cancelled"].contains(&state["status"].as_str().unwrap_or_default()) {
+            return state;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("job {job} never finished");
+}
+
+async fn cancel(t: &TestServer, job: u64) -> Value {
+    let (status, body) = t.post(&format!("/jobs/{job}/cancel"), &json!(null)).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    body
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn runs_beyond_the_queue_limit_are_429_and_a_cancelled_queued_run_makes_room() {
+    let t = TestServer::seeded(30).await;
+    let mut ws = t.websocket().await;
+    let busy = fill_the_run_slots(&t, &mut ws).await;
+    let backtest = serde_json::to_value(config(InstrumentKind::Spot, 10)).unwrap();
+    let mut queued = Vec::new();
+    for _ in busy.len()..MAX_RUN_JOBS {
+        queued.push(t.start("/runs/backtest", &backtest).await);
+    }
+    for path in ["/runs/backtest", "/runs/sweep"] {
+        let body = if path == "/runs/sweep" {
+            sweep_spec(3, (3, 4), (10, 11))
+        } else {
+            backtest.clone()
+        };
+        let (status, body) = t.post(path, &body).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{path}: {body}");
+        assert_eq!(body["error"]["code"], "too_many_runs");
+    }
+    let (_, jobs) = t.get("/jobs").await;
+    assert_eq!(jobs.as_array().map(Vec::len), Some(MAX_RUN_JOBS));
+
+    // A queued run is cancelled at once, and its place is free for another.
+    let cancelled = cancel(&t, queued[0]).await;
+    assert_eq!(cancelled["status"], "cancelled");
+    queued[0] = t.start("/runs/backtest", &backtest).await;
+    for &job in &queued {
+        let (_, state) = t.get(&format!("/jobs/{job}")).await;
+        assert_eq!(state["status"], "queued", "{state}");
+    }
+
+    for &job in queued.iter().chain(&busy) {
+        cancel(&t, job).await;
+    }
+    for job in busy {
+        assert_eq!(finished(&t, job).await["status"], "cancelled");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_queued_run_loads_its_data_only_when_it_starts() {
+    let t = TestServer::seeded(30).await;
+    let mut ws = t.websocket().await;
+    let busy = fill_the_run_slots(&t, &mut ws).await;
+    let job = t
+        .start(
+            "/runs/backtest",
+            &serde_json::to_value(config(InstrumentKind::Spot, 10)).unwrap(),
+        )
+        .await;
+    let (_, state) = t.get(&format!("/jobs/{job}")).await;
+    assert_eq!(state["status"], "queued", "{state}");
+
+    // The spot candles go while the run waits; a run holding data loaded on request would not
+    // notice. The sweeps are on the perpetual and have loaded theirs.
+    let id = instrument(InstrumentKind::Spot).id;
+    let file = t
+        .store
+        .candle_path(&id, td_data::time::Month::containing(t0()))
+        .unwrap();
+    std::fs::remove_file(file).unwrap();
+    for job in busy {
+        cancel(&t, job).await;
+    }
+    let last = ws.follow(job).await.pop().unwrap();
+    assert_eq!(last.status, JobStatus::Failed, "{last:?}");
+    let error = last.error.expect("an error");
+    assert_eq!(error.code, "data_missing");
+    assert!(
+        error.message.contains("changed after the run was accepted")
+            && error.message.contains("binance:BTCUSDT:spot"),
+        "{}",
+        error.message
+    );
 }

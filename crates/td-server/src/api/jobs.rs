@@ -1,6 +1,8 @@
 //! Background jobs: anything that takes longer than a request. A job is queued, runs on a blocking
 //! thread once a slot is free, reports progress, and ends done (with a result), failed (with an
-//! error) or cancelled. Every change is published to the `jobs` WebSocket topic.
+//! error) or cancelled. Every change is published to the `jobs` WebSocket topic. A job cancelled
+//! while queued stops waiting for its slot at once and drops its work, with everything the work
+//! holds.
 //!
 //! Kinds: downloads ([`super::data`]) and runs: backtests, sweeps, out-of-sample splits and
 //! walk-forwards ([`super::runs`]). A new kind plugs in by adding a variant to [`JobKind`],
@@ -14,7 +16,7 @@ use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 use td_core::{InstrumentId, Millis};
 use td_data::time::now_ms;
-use tokio::sync::{Semaphore, broadcast};
+use tokio::sync::{Notify, Semaphore, broadcast};
 use ts_rs::TS;
 
 use td_engine::{BacktestConfig, OosSpec, SweepSpec, WalkForwardSpec};
@@ -30,6 +32,12 @@ const MAX_DOWNLOADS: usize = 2;
 /// never holds up a download. A sweep already spreads over every core through rayon; two at once
 /// share them.
 const MAX_RUNS: usize = 2;
+
+/// How many run jobs may be queued or running at once; one more is refused with 429
+/// `too_many_runs`. Each run loads its whole range into memory when it starts (a multi-year
+/// 1-minute run is about 150 MB), so the queue is bounded even though queued runs hold only their
+/// requests.
+pub const MAX_RUN_JOBS: usize = 8;
 
 /// Events buffered per WebSocket subscriber before it is told to resync.
 const EVENT_BUFFER: usize = 1024;
@@ -218,6 +226,8 @@ impl JobCtx {
 struct Entry {
     info: JobInfo,
     cancel: Arc<AtomicBool>,
+    /// Woken when the job is cancelled while queued, so it stops waiting for a slot.
+    dequeue: Arc<Notify>,
 }
 
 #[derive(Default)]
@@ -253,6 +263,31 @@ impl Jobs {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// 429 `too_many_runs` when [`MAX_RUN_JOBS`] run jobs are already queued or running. A route
+    /// asks before it reads anything for a run; [`Jobs::submit`] asks again as it queues one.
+    pub fn admit_run(&self) -> Result<(), ApiError> {
+        Self::run_room(&self.lock())
+    }
+
+    fn run_room(inner: &Inner) -> Result<(), ApiError> {
+        let unfinished = inner
+            .jobs
+            .values()
+            .filter(|e| e.info.kind != JobKind::Download && !e.info.status.is_finished())
+            .count();
+        if unfinished >= MAX_RUN_JOBS {
+            return Err(ApiError::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                "too_many_runs",
+                format!(
+                    "{unfinished} runs are already queued or running, the most this server takes; \
+                     wait for one to finish or cancel one"
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     /// Queues `work` and returns the new job. `work` runs on a blocking thread, so it may block on
     /// I/O or compute for as long as it needs; it should call [`JobCtx::checkpoint`] between steps.
     /// Must be called from inside the Tokio runtime.
@@ -261,14 +296,19 @@ impl Jobs {
     /// 409 `conflict`: two jobs would fetch the same data twice. This is a courtesy within one
     /// server process only; the store's per-file locks hold across processes, so a duplicate
     /// download started by another server on the same data folder (the other app's sidecar) is
-    /// safe, just redundant.
+    /// safe, just redundant. A run beyond [`MAX_RUN_JOBS`] queued or running is refused with 429
+    /// `too_many_runs`.
     pub fn submit<F>(self: &Arc<Self>, request: JobRequest, work: F) -> Result<JobInfo, ApiError>
     where
         F: FnOnce(&JobCtx) -> Result<JobResult, JobError> + Send + 'static,
     {
         let cancel = Arc::new(AtomicBool::new(false));
+        let dequeue = Arc::new(Notify::new());
         let info = {
             let mut inner = self.lock();
+            if request.kind() != JobKind::Download {
+                Self::run_room(&inner)?;
+            }
             if let Some(wanted) = request.downloads()
                 && let Some(running) = inner.jobs.values().find(|e| {
                     !e.info.status.is_finished() && e.info.request.downloads() == Some(wanted)
@@ -304,6 +344,7 @@ impl Jobs {
                 Entry {
                     info: info.clone(),
                     cancel: cancel.clone(),
+                    dequeue: dequeue.clone(),
                 },
             );
             let _ = self.events.send(info.clone());
@@ -317,8 +358,15 @@ impl Jobs {
         let jobs = self.clone();
         let id = info.id;
         tokio::spawn(async move {
-            // The semaphore is never closed, so acquiring only waits.
-            let Ok(_permit) = slots.acquire_owned().await else {
+            // A cancel while queued ends the wait at once; returning drops `work`. The semaphore is
+            // never closed, so acquiring only waits. `notify_one` keeps its wake-up for a cancel
+            // that lands before this task first polls.
+            let permit = tokio::select! {
+                biased;
+                () = dequeue.notified() => None,
+                permit = slots.acquire_owned() => permit.ok(),
+            };
+            let Some(_permit) = permit else {
                 return;
             };
             if !jobs.start(id) {
@@ -371,6 +419,7 @@ impl Jobs {
                 entry.info.status = JobStatus::Cancelled;
                 entry.info.message = "cancelled".into();
                 entry.info.finished_at = Some(now_ms());
+                entry.dequeue.notify_one();
             }
             let _ = self.events.send(entry.info.clone());
             entry.info.clone()
@@ -532,6 +581,59 @@ mod tests {
             0,
             "the queued job never ran"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancelling_a_queued_job_drops_its_work_without_waiting_for_a_slot() {
+        let jobs = Arc::new(Jobs::default());
+        let busy: Vec<u64> = (0..MAX_DOWNLOADS)
+            .map(|i| {
+                jobs.submit(request(&format!("HOLD{i}")), |ctx| {
+                    loop {
+                        ctx.checkpoint()?;
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                })
+                .expect("accepted")
+                .id
+            })
+            .collect();
+        for &id in &busy {
+            wait_for(&jobs, id, JobStatus::Running).await;
+        }
+        // The queued job's work holds `held`, standing in for a run's request and anything else.
+        let held = Arc::new(());
+        let inside = held.clone();
+        let queued = jobs
+            .submit(request("WAITING"), move |_| {
+                drop(inside);
+                Err(JobError::Cancelled)
+            })
+            .expect("accepted")
+            .id;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(Arc::strong_count(&held), 2, "the queued work holds it");
+
+        jobs.cancel(queued).unwrap();
+        let mut released = false;
+        for _ in 0..100 {
+            if Arc::strong_count(&held) == 1 {
+                released = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let slots_busy = busy
+            .iter()
+            .all(|&id| jobs.get(id).unwrap().status == JobStatus::Running);
+        // The busy jobs loop until cancelled; stop them before asserting, so a failure here fails
+        // instead of hanging.
+        for &id in &busy {
+            jobs.cancel(id).unwrap();
+            wait_for(&jobs, id, JobStatus::Cancelled).await;
+        }
+        assert!(slots_busy, "the slots were busy throughout");
+        assert!(released, "the cancelled job still holds its work");
     }
 
     #[tokio::test(flavor = "multi_thread")]
