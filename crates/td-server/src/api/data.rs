@@ -66,11 +66,16 @@ pub(super) async fn instruments(
     Ok(Json(response))
 }
 
+/// The earliest `from` a download accepts: 2017-01-01 00:00 UTC, before the earliest data either
+/// venue has. An earlier `from` would only ask the archive for years of files that do not exist.
+pub const EARLIEST_FROM: Millis = 1_483_228_800_000;
+
 /// What to download: the 1-minute candles of `instrument` with open times in `[from, to)`, and
-/// for a perpetual its funding rates in the same range.
+/// for a perpetual its funding rates in the same range. Anything after now is skipped.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 pub struct DownloadRequest {
     pub instrument: InstrumentId,
+    /// Not before 2017-01-01 00:00 UTC (1483228800000); earlier is a 400.
     pub from: Millis,
     pub to: Millis,
 }
@@ -123,8 +128,11 @@ pub(super) async fn download(
     if request.from >= request.to {
         return Err(ApiError::bad_request("`to` must be after `from`"));
     }
-    if request.from < 0 {
-        return Err(ApiError::bad_request("`from` must not be before 1970"));
+    if request.from < EARLIEST_FROM {
+        return Err(ApiError::bad_request(
+            "`from` must not be before 2017-01-01 00:00 UTC (1483228800000), before either \
+             venue's earliest data",
+        ));
     }
     // Rejects a symbol that cannot name a store folder before any work starts.
     state
@@ -134,12 +142,12 @@ pub(super) async fn download(
     let job_request = JobRequest::Download(request.clone());
     let job = state.jobs.submit(job_request, move |ctx| {
         run_download(source.as_ref(), &store, &request, ctx).map(JobResult::Download)
-    });
+    })?;
     Ok((StatusCode::ACCEPTED, Json(JobCreated { job_id: job.id })))
 }
 
 /// The download job: one calendar month at a time, checking for a cancel between months, then
-/// the funding rates of a perpetual.
+/// the funding rates of a perpetual. The range ends at now at the latest.
 pub fn run_download(
     source: &dyn MarketSource,
     store: &Store,
@@ -147,7 +155,8 @@ pub fn run_download(
     ctx: &JobCtx,
 ) -> Result<DownloadResult, JobError> {
     let id = &request.instrument;
-    let months = Month::range(request.from, request.to.min(now_ms()));
+    let (from, to) = (request.from, request.to.min(now_ms()));
+    let months = Month::range(from, to);
     let perpetual = id.kind == InstrumentKind::Perpetual;
     let steps = (months.len() + usize::from(perpetual)).max(1) as f64;
     let mut result = DownloadResult {
@@ -159,9 +168,7 @@ pub fn run_download(
     };
     for (i, month) in months.iter().enumerate() {
         ctx.checkpoint()?;
-        let from = request.from.max(month.start());
-        let to = request.to.min(month.end());
-        let report = source.candles(store, id, from, to)?;
+        let report = source.candles(store, id, from.max(month.start()), to.min(month.end()))?;
         let count: usize = report.months.iter().map(|(_, n)| n).sum();
         result.candles += count;
         result.months.push(MonthCount {
@@ -177,7 +184,11 @@ pub fn run_download(
     }
     if perpetual {
         ctx.checkpoint()?;
-        let rates = source.funding(store, id, request.from, request.to)?;
+        let rates = if from < to {
+            source.funding(store, id, from, to)?
+        } else {
+            0
+        };
         result.funding_rates = Some(rates);
         ctx.progress(1.0, format!("{id}: {rates} funding rates"));
     }

@@ -2,8 +2,14 @@
 //! port, holding the per-launch token.
 //!
 //! The token travels as `Authorization: Bearer <token>`. Browsers cannot set headers on a
-//! WebSocket, so an upgrade request may carry it as the subprotocol `td-token.<token>` in
-//! `Sec-WebSocket-Protocol` instead; the `/ws` handler echoes that subprotocol back.
+//! WebSocket, so an upgrade request to `/ws`, and only there, may carry it as the subprotocol
+//! `td-token.<token>` in `Sec-WebSocket-Protocol` instead; the `/ws` handler echoes that
+//! subprotocol back.
+//!
+//! The apps send their HTTP calls through Electron's main process, which holds the token; the
+//! renderer gets it only for the read-only WebSocket streams. If the WebSocket ever gains
+//! commands that change state, the main process must hand the renderer a WebSocket-only token or
+//! a single-use ticket instead of the API token.
 //!
 //! The Host check stops DNS rebinding: a web page whose domain was re-pointed at 127.0.0.1 still
 //! sends its own domain in `Host`. No CORS headers are sent, so browsers keep other origins from
@@ -25,6 +31,9 @@ use super::error::ApiError;
 
 /// The prefix of the WebSocket subprotocol that carries the token.
 pub const WS_TOKEN_PROTOCOL_PREFIX: &str = "td-token.";
+
+/// The one path where the subprotocol token counts.
+pub const WS_PATH: &str = "/ws";
 
 /// The secret a client must present. New for every launch unless `TD_TOKEN` fixes it.
 #[derive(Clone, PartialEq, Eq)]
@@ -71,11 +80,13 @@ impl Token {
 /// Decides whether a request may go through. Checked in this order: the peer must be a loopback
 /// address (403 `forbidden_peer`), `Host` must be `127.0.0.1:<port>` or `localhost:<port>` (403
 /// `forbidden_host`), and the token must match (401 `unauthorized`). A request with no known peer
-/// address is refused.
+/// address is refused. `path` is the request's path, which decides whether a subprotocol token
+/// counts.
 pub fn check_request(
     token: &Token,
     port: u16,
     peer: Option<SocketAddr>,
+    path: &str,
     headers: &HeaderMap,
 ) -> Result<(), ApiError> {
     match peer {
@@ -102,7 +113,7 @@ pub fn check_request(
             format!("the Host header must be 127.0.0.1:{port} or localhost:{port}"),
         ));
     }
-    if presented_tokens(headers).any(|t| token.matches(t)) {
+    if presented_tokens(headers, path == WS_PATH).any(|t| token.matches(t)) {
         Ok(())
     } else {
         Err(ApiError::new(
@@ -113,9 +124,9 @@ pub fn check_request(
     }
 }
 
-/// The tokens a request presents: the bearer token, and on a WebSocket upgrade each offered
-/// `td-token.` subprotocol.
-fn presented_tokens(headers: &HeaderMap) -> impl Iterator<Item = &str> {
+/// The tokens a request presents: the bearer token, and on a WebSocket upgrade to `/ws` (`ws`)
+/// each offered `td-token.` subprotocol.
+fn presented_tokens(headers: &HeaderMap, ws: bool) -> impl Iterator<Item = &str> {
     let bearer = headers
         .get(AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -123,10 +134,11 @@ fn presented_tokens(headers: &HeaderMap) -> impl Iterator<Item = &str> {
             let (scheme, rest) = v.split_once(' ')?;
             scheme.eq_ignore_ascii_case("bearer").then(|| rest.trim())
         });
-    let upgrade = headers
-        .get(UPGRADE)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v.eq_ignore_ascii_case("websocket"));
+    let upgrade = ws
+        && headers
+            .get(UPGRADE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.eq_ignore_ascii_case("websocket"));
     let protocols = headers
         .get_all(SEC_WEBSOCKET_PROTOCOL)
         .iter()
@@ -145,7 +157,8 @@ pub(super) async fn guard(
     next: Next,
 ) -> Response {
     let peer = connect.ok().map(|ConnectInfo(addr)| addr);
-    match check_request(&state.token, state.port, peer, request.headers()) {
+    let path = request.uri().path();
+    match check_request(&state.token, state.port, peer, path, request.headers()) {
         Ok(()) => next.run(request).await,
         Err(e) => {
             eprintln!(
@@ -205,19 +218,32 @@ mod tests {
             (HOST, "127.0.0.1:4321"),
             (AUTHORIZATION, &format!("Bearer {}", "a".repeat(64))),
         ]);
-        assert_eq!(check_request(&token(), PORT, loopback(), &h), Ok(()));
+        assert_eq!(
+            check_request(&token(), PORT, loopback(), "/health", &h),
+            Ok(())
+        );
         let h = headers(&[
             (HOST, "LOCALHOST:4321"),
             (AUTHORIZATION, &format!("bearer {}", "a".repeat(64))),
         ]);
-        assert_eq!(check_request(&token(), PORT, loopback(), &h), Ok(()));
+        assert_eq!(
+            check_request(&token(), PORT, loopback(), "/health", &h),
+            Ok(())
+        );
     }
 
     #[test]
     fn missing_or_wrong_tokens_are_401() {
         let no_token = headers(&[(HOST, "127.0.0.1:4321")]);
         assert_eq!(
-            code(check_request(&token(), PORT, loopback(), &no_token)).as_deref(),
+            code(check_request(
+                &token(),
+                PORT,
+                loopback(),
+                "/health",
+                &no_token
+            ))
+            .as_deref(),
             Some("unauthorized")
         );
         let wrong = headers(&[
@@ -225,30 +251,41 @@ mod tests {
             (AUTHORIZATION, &format!("Bearer {}", "b".repeat(64))),
         ]);
         assert_eq!(
-            code(check_request(&token(), PORT, loopback(), &wrong)).as_deref(),
+            code(check_request(&token(), PORT, loopback(), "/health", &wrong)).as_deref(),
             Some("unauthorized")
         );
         let basic = headers(&[
             (HOST, "127.0.0.1:4321"),
             (AUTHORIZATION, &format!("Basic {}", "a".repeat(64))),
         ]);
-        assert!(check_request(&token(), PORT, loopback(), &basic).is_err());
+        assert!(check_request(&token(), PORT, loopback(), "/health", &basic).is_err());
     }
 
     #[test]
-    fn the_subprotocol_token_counts_only_on_a_websocket_upgrade() {
+    fn the_subprotocol_token_counts_only_on_a_websocket_upgrade_to_ws() {
         let protocol = format!("other, td-token.{}", "a".repeat(64));
         let upgrade = headers(&[
             (HOST, "127.0.0.1:4321"),
             (UPGRADE, "websocket"),
             (SEC_WEBSOCKET_PROTOCOL, &protocol),
         ]);
-        assert_eq!(check_request(&token(), PORT, loopback(), &upgrade), Ok(()));
+        assert_eq!(
+            check_request(&token(), PORT, loopback(), "/ws", &upgrade),
+            Ok(())
+        );
         let plain = headers(&[
             (HOST, "127.0.0.1:4321"),
             (SEC_WEBSOCKET_PROTOCOL, &protocol),
         ]);
-        assert!(check_request(&token(), PORT, loopback(), &plain).is_err());
+        assert!(check_request(&token(), PORT, loopback(), "/ws", &plain).is_err());
+        // Anywhere but /ws the subprotocol token does not count, upgrade or not.
+        for path in ["/jobs", "/data/download", "/ws/", "/WS"] {
+            assert_eq!(
+                code(check_request(&token(), PORT, loopback(), path, &upgrade)).as_deref(),
+                Some("unauthorized"),
+                "{path}"
+            );
+        }
     }
 
     #[test]
@@ -257,7 +294,7 @@ mod tests {
         for host in ["evil.example:4321", "127.0.0.1:9999", "127.0.0.1", ""] {
             let h = headers(&[(HOST, host), (AUTHORIZATION, &auth)]);
             assert_eq!(
-                code(check_request(&token(), PORT, loopback(), &h)).as_deref(),
+                code(check_request(&token(), PORT, loopback(), "/health", &h)).as_deref(),
                 Some("forbidden_host"),
                 "{host}"
             );
@@ -269,7 +306,7 @@ mod tests {
             None,
         ] {
             assert_eq!(
-                code(check_request(&token(), PORT, peer, &h)).as_deref(),
+                code(check_request(&token(), PORT, peer, "/health", &h)).as_deref(),
                 Some("forbidden_peer"),
                 "{peer:?}"
             );

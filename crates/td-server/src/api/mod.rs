@@ -6,6 +6,8 @@
 //! - `GET /health`: the server version.
 //! - `GET /instruments?venue=&kind=`: the instruments a venue lists, cached per server run.
 //! - `POST /data/download` `{instrument, from, to}`: starts a download job, answers `{job_id}`.
+//!   `from` may not be before 2017-01-01 UTC ([`data::EARLIEST_FROM`]); an instrument that already
+//!   has an unfinished download is a 409 `conflict`.
 //! - `GET /data/coverage?instrument=venue:symbol:kind`: which months and minutes the store holds.
 //! - `GET /strategies`: the registered strategies and their parameter specs.
 //! - `GET /jobs`, `GET /jobs/{id}`, `POST /jobs/{id}/cancel`: background jobs (see [`jobs`]).
@@ -26,6 +28,7 @@ use std::collections::HashMap;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use axum::extract::rejection::PathRejection;
 use axum::extract::{Path, State};
@@ -46,6 +49,10 @@ use self::data::InstrumentsResponse;
 use self::error::ApiError;
 use self::jobs::{JobInfo, Jobs};
 use self::source::MarketSource;
+
+/// How long the binary waits on shutdown, first for open requests to finish and then for running
+/// jobs to reach a checkpoint, before it exits anyway.
+pub const JOB_GRACE: Duration = Duration::from_secs(5);
 
 /// What a server needs to start.
 pub struct ApiConfig {
@@ -149,7 +156,8 @@ impl Server {
     }
 
     /// Stops accepting connections, closes WebSockets, asks running jobs to stop, and waits for
-    /// open requests to finish. Jobs stop at their next checkpoint on their own threads.
+    /// open requests to finish. Jobs stop at their next checkpoint on their own threads. The wait
+    /// has no limit of its own; the binary bounds it with [`JOB_GRACE`].
     pub async fn shutdown(self) -> io::Result<()> {
         let _ = self.shutdown.send(true);
         self.jobs.cancel_all();

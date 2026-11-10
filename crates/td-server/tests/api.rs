@@ -12,13 +12,14 @@ use futures_util::{SinkExt, StreamExt};
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 use td_core::{Candle, FeeSchedule, Instrument, InstrumentId, InstrumentKind, Millis, Venue};
-use td_data::time::{MINUTE, Month, parse_date};
+use td_data::time::{MINUTE, Month, now_ms, parse_date};
 use td_data::{DataError, DownloadReport, InstrumentList, Store};
 use td_server::api::auth::Token;
+use td_server::api::data::EARLIEST_FROM;
 use td_server::api::jobs::{JobInfo, JobResult, JobStatus};
 use td_server::api::source::MarketSource;
 use td_server::api::ws::ServerMessage;
-use td_server::api::{ApiConfig, Handshake, Server, ts};
+use td_server::api::{ApiConfig, Handshake, JOB_GRACE, Server, ts};
 use tempfile::TempDir;
 use tokio::net::TcpStream as AsyncTcpStream;
 use tokio_tungstenite::tungstenite::Message;
@@ -34,6 +35,8 @@ const FAKE_MINUTES: i64 = 60;
 #[derive(Default)]
 struct FakeSource {
     instrument_calls: AtomicUsize,
+    /// The `to` of the last `funding` call.
+    funding_to: Mutex<Option<Millis>>,
     gated: bool,
     permits: Mutex<u32>,
     released: Condvar,
@@ -122,8 +125,9 @@ impl MarketSource for FakeSource {
         store: &Store,
         id: &InstrumentId,
         from: Millis,
-        _to: Millis,
+        to: Millis,
     ) -> Result<usize, DataError> {
+        *self.funding_to.lock().unwrap() = Some(to);
         let hours = 8 * 60 * MINUTE;
         let rates: Vec<(Millis, f64)> = (0..3).map(|i| (from + i * hours, 0.0001)).collect();
         store.write_funding(id, &rates)?;
@@ -136,6 +140,17 @@ struct TestServer {
     source: Arc<FakeSource>,
     client: reqwest::Client,
     _dir: TempDir,
+    _unblock: Unblock,
+}
+
+/// Frees any gated job still waiting when the test server goes, so a failing test ends instead of
+/// hanging on a blocked job thread when its runtime drops.
+struct Unblock(Arc<FakeSource>);
+
+impl Drop for Unblock {
+    fn drop(&mut self) {
+        self.0.release(1000);
+    }
 }
 
 impl TestServer {
@@ -152,6 +167,7 @@ impl TestServer {
         .expect("starts");
         TestServer {
             server,
+            _unblock: Unblock(source.clone()),
             source,
             client: reqwest::Client::new(),
             _dir: dir,
@@ -194,6 +210,22 @@ impl TestServer {
             .header("content-type", "application/json")
             .body(body.to_string());
         self.send(request).await
+    }
+
+    /// Polls `GET /jobs/{id}` until the job's status is `status`, returning the job.
+    async fn until_status(&self, id: u64, status: &str) -> Value {
+        let deadline = Instant::now() + WAIT;
+        loop {
+            let (_, job) = self.get(&format!("/jobs/{id}")).await;
+            if job["status"] == status {
+                return job;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "job {id} never reached {status}: {job}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 
     /// Opens `/ws` with the token as the `td-token.` subprotocol, as a browser would, and checks
@@ -515,6 +547,11 @@ async fn bad_requests_get_json_errors_with_matching_statuses() {
     let cases = [
         (download("BTCUSDT", jan, jan), StatusCode::BAD_REQUEST),
         (download("BTCUSDT", -5, jan), StatusCode::BAD_REQUEST),
+        (download("BTCUSDT", 0, jan), StatusCode::BAD_REQUEST),
+        (
+            download("BTCUSDT", EARLIEST_FROM - MINUTE, jan),
+            StatusCode::BAD_REQUEST,
+        ),
         (
             download("../escape", jan, jan + MINUTE),
             StatusCode::BAD_REQUEST,
@@ -604,6 +641,159 @@ async fn the_websocket_answers_topics_it_lacks_and_closes_on_shutdown() {
         .expect("shuts down in time")
         .expect("shuts down cleanly");
     assert_eq!(ws.next().await, None, "the server closed the socket");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_second_download_of_an_instrument_with_one_unfinished_is_409() {
+    let t = TestServer::start(FakeSource::gated()).await;
+    let download = |symbol: &str, from: &str, to: &str| {
+        json!({
+            "instrument": { "venue": "binance", "symbol": symbol, "kind": "spot" },
+            "from": day(from),
+            "to": day(to),
+        })
+        .to_string()
+    };
+    let (status, created) = t
+        .post(
+            "/data/download",
+            &download("BTCUSDT", "2024-01-01", "2024-02-01"),
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let first = created["job_id"].as_u64().unwrap();
+    t.until_status(first, "running").await;
+
+    let (status, body) = t
+        .post(
+            "/data/download",
+            &download("BTCUSDT", "2024-01-15", "2024-03-01"),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], "conflict");
+    // Another instrument is not held up.
+    let (status, created) = t
+        .post(
+            "/data/download",
+            &download("ETHUSDT", "2024-01-01", "2024-02-01"),
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let other = created["job_id"].as_u64().unwrap();
+
+    t.source.release(2);
+    t.until_status(first, "done").await;
+    t.until_status(other, "done").await;
+    // Once the first has finished, the instrument can be downloaded again.
+    let (status, created) = t
+        .post(
+            "/data/download",
+            &download("BTCUSDT", "2024-01-15", "2024-03-01"),
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    t.source.release(2);
+    t.until_status(created["job_id"].as_u64().unwrap(), "done")
+        .await;
+    assert_eq!(t.get("/jobs").await.1.as_array().map(Vec::len), Some(3));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_download_reaching_past_now_asks_for_funding_only_up_to_now() {
+    let t = TestServer::start(FakeSource::default()).await;
+    let now = now_ms();
+    let from = (now - 1440 * MINUTE).div_euclid(MINUTE) * MINUTE;
+    let body = json!({
+        "instrument": { "venue": "bybit", "symbol": "BTCUSDT", "kind": "perpetual" },
+        "from": from,
+        "to": now + 30 * 1440 * MINUTE,
+    });
+    let (status, created) = t.post("/data/download", &body.to_string()).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    t.until_status(created["job_id"].as_u64().unwrap(), "done")
+        .await;
+    let funding_to = t
+        .source
+        .funding_to
+        .lock()
+        .unwrap()
+        .expect("funding was fetched");
+    assert!(
+        (now..=now_ms()).contains(&funding_to),
+        "funding asked up to {funding_to}, now is {now}"
+    );
+}
+
+#[test]
+fn the_subprotocol_token_opens_only_the_websocket_route() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let t = runtime.block_on(TestServer::start(FakeSource::default()));
+    let port = t.server.port();
+    let token = t.server.token().as_str().to_string();
+    // A WebSocket upgrade request to /jobs with the token only as the subprotocol, no bearer.
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    write!(
+        stream,
+        "GET /jobs HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: Upgrade\r\n\
+         Upgrade: websocket\r\nSec-WebSocket-Version: 13\r\n\
+         Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+         Sec-WebSocket-Protocol: td-token.{token}\r\n\r\n"
+    )
+    .unwrap();
+    let mut status_line = String::new();
+    BufReader::new(stream).read_line(&mut status_line).unwrap();
+    assert!(status_line.starts_with("HTTP/1.1 401"), "{status_line}");
+    drop(t);
+}
+
+/// A client that sends half a request and stalls must not keep the binary alive once its stdin
+/// closes: it waits [`JOB_GRACE`] for open requests, then exits anyway.
+#[test]
+fn the_binary_exits_after_the_grace_period_when_a_request_never_finishes() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_td-server"))
+        .args(["--port", "0"])
+        .env("TD_DATA_DIR", dir.path())
+        .env_remove("TD_TOKEN")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("starts");
+    let mut line = String::new();
+    BufReader::new(child.stdout.take().unwrap())
+        .read_line(&mut line)
+        .expect("a handshake line");
+    let handshake: Handshake = serde_json::from_str(line.trim_end()).expect("JSON");
+
+    // Headers begun but never ended, and no token.
+    let mut slow = TcpStream::connect(("127.0.0.1", handshake.port)).unwrap();
+    write!(
+        slow,
+        "GET /health HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n",
+        handshake.port
+    )
+    .unwrap();
+    slow.flush().unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+
+    drop(child.stdin.take());
+    let closed = Instant::now();
+    let limit = JOB_GRACE + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if closed.elapsed() > limit {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("still running {limit:?} after stdin closed");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(status.success(), "{status}");
+    drop(slow);
 }
 
 #[test]

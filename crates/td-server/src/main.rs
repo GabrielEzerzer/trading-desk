@@ -8,13 +8,12 @@
 use std::io::{Read, Write};
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::time::Duration;
 
 use clap::Parser;
 use td_data::Store;
 use td_server::api::auth::Token;
 use td_server::api::source::VenueSource;
-use td_server::api::{ApiConfig, Server};
+use td_server::api::{ApiConfig, JOB_GRACE, Server};
 use tokio::sync::oneshot;
 
 #[derive(Debug, Parser)]
@@ -27,9 +26,6 @@ struct Cli {
     #[arg(long, default_value_t = 0)]
     port: u16,
 }
-
-/// How long running jobs get to reach a checkpoint after shutdown starts.
-const JOB_GRACE: Duration = Duration::from_secs(5);
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -92,7 +88,15 @@ async fn run(cli: Cli) -> Result<(), String> {
         },
     };
     eprintln!("td-server: {reason}, shutting down");
-    server.shutdown().await.map_err(|e| e.to_string())?;
+    // Open requests get the grace period to finish; one that never completes (a client that sends
+    // half a request and stalls) must not keep the sidecar alive after its parent has gone.
+    match tokio::time::timeout(JOB_GRACE, server.shutdown()).await {
+        Ok(result) => result.map_err(|e| e.to_string())?,
+        Err(_) => eprintln!(
+            "td-server: open requests did not finish within {}s, exiting anyway",
+            JOB_GRACE.as_secs()
+        ),
+    }
     eprintln!("td-server: stopped");
     Ok(())
 }

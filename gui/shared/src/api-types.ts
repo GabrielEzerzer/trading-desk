@@ -91,9 +91,13 @@ export type RejectedInstrument = { symbol: string, reason: string, };
 
 /**
  * What to download: the 1-minute candles of `instrument` with open times in `[from, to)`, and
- * for a perpetual its funding rates in the same range.
+ * for a perpetual its funding rates in the same range. Anything after now is skipped.
  */
-export type DownloadRequest = { instrument: InstrumentId, from: number, to: number, };
+export type DownloadRequest = { instrument: InstrumentId, 
+/**
+ * Not before 2017-01-01 00:00 UTC (1483228800000); earlier is a 400.
+ */
+from: number, to: number, };
 
 /**
  * What a download did.

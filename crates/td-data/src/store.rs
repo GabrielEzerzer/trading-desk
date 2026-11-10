@@ -6,14 +6,17 @@
 //!
 //! Every file holds rows sorted by time with no duplicates, and every candle passed
 //! [`Candle::validate`] on its way in. Files are replaced atomically: written to a temp file in the
-//! same folder, then renamed over the old one. Missing minutes are reported, never filled.
+//! same folder, then renamed over the old one. Each read-merge-write of a file holds a lock for
+//! that path, so two writers in one process (two download jobs, say) never lose each other's rows.
+//! Missing minutes are reported, never filled.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread::sleep;
 use std::time::Duration;
 
@@ -211,6 +214,9 @@ impl Store {
         };
         let mut merged_span = Vec::new();
         for (month, new) in by_month {
+            let path = self.candle_path(id, month)?;
+            let lock = file_lock(&path);
+            let _held = hold(&lock);
             let mut merged: BTreeMap<Millis, Candle> = self
                 .read_month(id, month)?
                 .into_iter()
@@ -222,7 +228,7 @@ impl Store {
                 }
             }
             let merged: Vec<Candle> = merged.into_values().collect();
-            write_atomic(&self.candle_path(id, month)?, &candle_batch(&merged)?)?;
+            write_atomic(&path, &candle_batch(&merged)?)?;
             report.months.push(month);
             merged_span.extend(
                 merged
@@ -352,6 +358,8 @@ impl Store {
                 format!("rate {rate} is not finite"),
             ));
         }
+        let lock = file_lock(&path);
+        let _held = hold(&lock);
         let mut merged: BTreeMap<Millis, f64> = self.read_funding(id)?.into_iter().collect();
         merged.extend(rates.iter().copied());
         let (times, values): (Vec<Millis>, Vec<f64>) = merged.into_iter().unzip();
@@ -458,12 +466,33 @@ fn candle_batch(candles: &[Candle]) -> Result<RecordBatch, DataError> {
     )
 }
 
-/// Writes `batch` to a temp file beside `path`, then renames it over `path`.
+/// The lock that serialises read-merge-write of one store file within this process. Callers hold
+/// it from the read through the rename.
+// shortcut: keyed by the path as built from the store root, so two `Store`s that spell one folder
+// differently (relative and absolute) do not share locks, and entries are never removed (one per
+// file written, a few hundred bytes each); canonicalise and evict if either ever matters. Other
+// processes writing the same data directory are not covered.
+fn file_lock(path: &Path) -> Arc<Mutex<()>> {
+    static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
+    let mut locks = hold(LOCKS.get_or_init(Mutex::default));
+    locks.entry(path.to_path_buf()).or_default().clone()
+}
+
+/// Locks `mutex`, carrying on past a panic in another holder: the data behind these locks is a
+/// map of locks or nothing at all, so it cannot be left half-changed.
+fn hold<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Writes `batch` to a temp file beside `path`, then renames it over `path`. The temp name holds
+/// the process id and a per-process counter, so no two writes share one.
 fn write_atomic(path: &Path, batch: &RecordBatch) -> Result<(), DataError> {
+    static WRITES: AtomicU64 = AtomicU64::new(0);
     let dir = path.parent().unwrap_or(Path::new("."));
     fs::create_dir_all(dir).map_err(DataError::io(dir))?;
     let mut temp_name = path.file_name().unwrap_or_default().to_owned();
-    temp_name.push(format!(".{}.tmp", std::process::id()));
+    let write = WRITES.fetch_add(1, Ordering::Relaxed);
+    temp_name.push(format!(".{}.{write}.tmp", std::process::id()));
     let temp = dir.join(temp_name);
     let parquet_error = |source| DataError::Parquet {
         path: temp.clone(),
@@ -625,6 +654,62 @@ mod tests {
         for bad in ["", "..", "BTC/USDT", "..\\x", "a b", "C:"] {
             assert!(check_symbol(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn two_threads_writing_one_month_keep_every_minute_both_wrote() {
+        const WRITES: i64 = 40;
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let store = Store::new(dir.path());
+        let id = InstrumentId {
+            venue: td_core::Venue::Binance,
+            symbol: "BTCUSDT".into(),
+            kind: InstrumentKind::Spot,
+        };
+        let jan = Month::containing(1_704_067_200_000); // 2024-01-01
+        let candle = |open_time| Candle {
+            open_time,
+            open: 100.0,
+            high: 101.0,
+            low: 99.0,
+            close: 100.5,
+            volume: 1.0,
+            quote_volume: 100.0,
+        };
+        // One thread writes the even minutes and the other the odd ones, one write per minute, so
+        // each write reads, merges and rewrites the same month file the other is rewriting.
+        let start = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            for parity in 0..2 {
+                let (store, id, start) = (&store, &id, &start);
+                scope.spawn(move || {
+                    start.wait();
+                    for i in 0..WRITES {
+                        let t = jan.start() + (2 * i + parity) * MINUTE;
+                        store.write_candles(id, &[candle(t)]).expect("writes");
+                    }
+                });
+            }
+        });
+        let stored: Vec<Millis> = store
+            .read_month(&id, jan)
+            .expect("the file stays readable")
+            .iter()
+            .map(|c| c.open_time)
+            .collect();
+        let expected: Vec<Millis> = (0..2 * WRITES).map(|i| jan.start() + i * MINUTE).collect();
+        assert_eq!(stored, expected);
+        let leftovers: Vec<_> =
+            fs::read_dir(store.candle_path(&id, jan).unwrap().parent().unwrap())
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .filter(|name| name.to_string_lossy().ends_with(".tmp"))
+                .collect();
+        assert_eq!(
+            leftovers,
+            Vec::<OsString>::new(),
+            "no temp files left behind"
+        );
     }
 
     #[test]

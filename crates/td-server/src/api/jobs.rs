@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
-use td_core::Millis;
+use td_core::{InstrumentId, Millis};
 use td_data::time::now_ms;
 use tokio::sync::{Semaphore, broadcast};
 use ts_rs::TS;
@@ -64,6 +64,13 @@ impl JobRequest {
     pub fn kind(&self) -> JobKind {
         match self {
             JobRequest::Download(_) => JobKind::Download,
+        }
+    }
+
+    /// The instrument whose store files this job writes, if it downloads.
+    pub fn downloads(&self) -> Option<&InstrumentId> {
+        match self {
+            JobRequest::Download(d) => Some(&d.instrument),
         }
     }
 }
@@ -198,13 +205,31 @@ impl Jobs {
     /// Queues `work` and returns the new job. `work` runs on a blocking thread, so it may block on
     /// I/O or compute for as long as it needs; it should call [`JobCtx::checkpoint`] between steps.
     /// Must be called from inside the Tokio runtime.
-    pub fn submit<F>(self: &Arc<Self>, request: JobRequest, work: F) -> JobInfo
+    ///
+    /// A download of an instrument that already has an unfinished download job is refused with
+    /// 409 `conflict`: two jobs would fetch the same data twice and race on the same files.
+    pub fn submit<F>(self: &Arc<Self>, request: JobRequest, work: F) -> Result<JobInfo, ApiError>
     where
         F: FnOnce(&JobCtx) -> Result<JobResult, JobError> + Send + 'static,
     {
         let cancel = Arc::new(AtomicBool::new(false));
         let info = {
             let mut inner = self.lock();
+            if let Some(wanted) = request.downloads()
+                && let Some(running) = inner.jobs.values().find(|e| {
+                    !e.info.status.is_finished() && e.info.request.downloads() == Some(wanted)
+                })
+            {
+                return Err(ApiError::new(
+                    StatusCode::CONFLICT,
+                    "conflict",
+                    format!(
+                        "{wanted} already has a download in progress (job {}); wait for it or \
+                         cancel it",
+                        running.info.id
+                    ),
+                ));
+            }
             inner.next_id += 1;
             let info = JobInfo {
                 id: inner.next_id,
@@ -255,7 +280,7 @@ impl Jobs {
             };
             jobs.finish(id, outcome);
         });
-        info
+        Ok(info)
     }
 
     pub fn list(&self) -> Vec<JobInfo> {
@@ -367,13 +392,15 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
-    use td_core::{InstrumentId, InstrumentKind, Venue};
+    use td_core::{InstrumentKind, Venue};
 
-    fn request() -> JobRequest {
+    /// A download request; each `symbol` is its own instrument, so jobs for different symbols do
+    /// not conflict.
+    fn request(symbol: &str) -> JobRequest {
         JobRequest::Download(DownloadRequest {
             instrument: InstrumentId {
                 venue: Venue::Binance,
-                symbol: "BTCUSDT".into(),
+                symbol: symbol.into(),
                 kind: InstrumentKind::Spot,
             },
             from: 0,
@@ -397,15 +424,16 @@ mod tests {
         let ran = Arc::new(AtomicUsize::new(0));
         // Fill every slot with a job that runs until cancelled.
         let busy: Vec<u64> = (0..MAX_RUNNING)
-            .map(|_| {
+            .map(|i| {
                 let ran = ran.clone();
-                jobs.submit(request(), move |ctx| {
+                jobs.submit(request(&format!("BUSY{i}")), move |ctx| {
                     ran.fetch_add(1, Ordering::SeqCst);
                     loop {
                         ctx.checkpoint()?;
                         std::thread::sleep(Duration::from_millis(5));
                     }
                 })
+                .expect("accepted")
                 .id
             })
             .collect();
@@ -415,10 +443,11 @@ mod tests {
         let ran_queued = Arc::new(AtomicUsize::new(0));
         let flag = ran_queued.clone();
         let queued = jobs
-            .submit(request(), move |_| {
+            .submit(request("QUEUED"), move |_| {
                 flag.fetch_add(1, Ordering::SeqCst);
                 Err(JobError::Cancelled)
             })
+            .expect("accepted")
             .id;
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(jobs.get(queued).unwrap().status, JobStatus::Queued);
@@ -442,11 +471,17 @@ mod tests {
     async fn failures_and_panics_end_as_failed_with_an_error() {
         let jobs = Arc::new(Jobs::default());
         let failed = jobs
-            .submit(request(), |_| Err(ApiError::bad_request("nope").into()))
+            .submit(request("FAILS"), |_| {
+                Err(ApiError::bad_request("nope").into())
+            })
+            .expect("accepted")
             .id;
         let job = wait_for(&jobs, failed, JobStatus::Failed).await;
         assert_eq!(job.error.map(|e| e.message), Some("nope".to_string()));
-        let panicked = jobs.submit(request(), |_| panic!("boom")).id;
+        let panicked = jobs
+            .submit(request("PANICS"), |_| panic!("boom"))
+            .expect("accepted")
+            .id;
         let job = wait_for(&jobs, panicked, JobStatus::Failed).await;
         assert_eq!(job.error.map(|e| e.code), Some("internal".to_string()));
     }
