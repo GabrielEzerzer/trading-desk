@@ -43,8 +43,17 @@ pub(super) async fn instruments(
     query: Result<Query<InstrumentsQuery>, QueryRejection>,
 ) -> Result<Json<InstrumentsResponse>, ApiError> {
     let Query(InstrumentsQuery { venue, kind }) = query?;
+    Ok(Json(instrument_list(&state, venue, kind).await?))
+}
+
+/// A venue's instruments of one kind, from the cache or else from the source.
+pub(super) async fn instrument_list(
+    state: &AppState,
+    venue: Venue,
+    kind: InstrumentKind,
+) -> Result<InstrumentsResponse, ApiError> {
     if let Some(cached) = state.instrument_cache().get(&(venue, kind)) {
-        return Ok(Json(cached.clone()));
+        return Ok(cached.clone());
     }
     // shortcut: two requests that miss the cache at once both fetch; harmless (the second insert
     // replaces the first with the same list), dedupe with a per-key once-cell if it ever matters.
@@ -63,7 +72,7 @@ pub(super) async fn instruments(
     state
         .instrument_cache()
         .insert((venue, kind), response.clone());
-    Ok(Json(response))
+    Ok(response)
 }
 
 /// The earliest `from` a download accepts: 2017-01-01 00:00 UTC, before the earliest data either

@@ -7,6 +7,7 @@ use td_core::{
 use crate::{FillCheck, FillModel};
 
 /// An order the session accepted or rejected, with its request as rounded at submission.
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Order {
     pub id: OrderId,
@@ -23,6 +24,7 @@ pub struct Order {
 /// A protective stop attached to an entry with [`crate::Context::submit_with_stop`]. When the
 /// entry fills, the broker places a reduce-only stop on the other side, for the filled quantity,
 /// under `id`.
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct AttachedStop {
     pub id: OrderId,
@@ -52,6 +54,7 @@ impl AttachedStop {
 /// Why an attached stop is cancelled along with its entry.
 pub(crate) const ENTRY_CANCELLED: &str = "its entry was cancelled before it filled";
 
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "status", content = "reason", rename_all = "snake_case")]
 pub enum OrderStatus {

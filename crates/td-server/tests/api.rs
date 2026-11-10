@@ -17,7 +17,7 @@ use td_data::{DataError, DownloadReport, InstrumentList, Store};
 use td_server::api::auth::Token;
 use td_server::api::data::EARLIEST_FROM;
 use td_server::api::jobs::{JobInfo, JobResult, JobStatus};
-use td_server::api::source::MarketSource;
+use td_server::api::source::{LiveSource, MarketSource};
 use td_server::api::ws::ServerMessage;
 use td_server::api::{ApiConfig, Handshake, JOB_GRACE, Server, ts};
 use tempfile::TempDir;
@@ -135,6 +135,43 @@ impl MarketSource for FakeSource {
     }
 }
 
+/// Live data that is never there: no test in this file streams. A stream would only try a closed
+/// local port.
+struct NoLive;
+
+struct NoRest;
+
+impl td_data::live::Rest for NoRest {
+    fn klines(
+        &self,
+        _: &InstrumentId,
+        _: td_core::Timeframe,
+        _: Millis,
+        _: Millis,
+    ) -> Result<Vec<Candle>, DataError> {
+        Err(DataError::NoDataDir)
+    }
+
+    fn funding(
+        &self,
+        _: &InstrumentId,
+        _: Millis,
+        _: Millis,
+    ) -> Result<Vec<(Millis, f64)>, DataError> {
+        Err(DataError::NoDataDir)
+    }
+}
+
+impl LiveSource for NoLive {
+    fn rest(&self) -> Arc<dyn td_data::live::Rest> {
+        Arc::new(NoRest)
+    }
+
+    fn stream_url(&self, _: &InstrumentId) -> String {
+        "ws://127.0.0.1:9/".into()
+    }
+}
+
 struct TestServer {
     server: Server,
     source: Arc<FakeSource>,
@@ -160,6 +197,7 @@ impl TestServer {
         let server = Server::start(ApiConfig {
             store: Store::new(dir.path()),
             source: source.clone(),
+            live: Arc::new(NoLive),
             token: Token::generate().expect("rng"),
             port: 0,
         })
@@ -592,7 +630,7 @@ async fn bad_requests_get_json_errors_with_matching_statuses() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn the_websocket_answers_topics_it_lacks_and_closes_on_shutdown() {
+async fn the_websocket_refuses_bad_topics_and_closes_on_shutdown() {
     let t = TestServer::start(FakeSource::default()).await;
     // The bearer header works for the upgrade too, without a subprotocol.
     let mut request = format!("ws://127.0.0.1:{}/ws", t.server.port())
@@ -609,12 +647,18 @@ async fn the_websocket_answers_topics_it_lacks_and_closes_on_shutdown() {
         Some(ServerMessage::Error { error }) => error.code,
         other => panic!("expected an error, got {other:?}"),
     };
-    ws.send(json!({ "type": "subscribe", "topic": "candles:binance:BTCUSDT:spot:1m" }))
-        .await;
-    assert_eq!(error_code(ws.next().await), "topic_unavailable");
+    for bad in [
+        "candles:binance:BTCUSDT:spot",
+        "candles:binance:BTCUSDT:spot:2m",
+        "candles:kraken:BTCUSDT:spot:1m",
+        "candles:binance:btcusdt:spot:1m",
+    ] {
+        ws.send(json!({ "type": "subscribe", "topic": bad })).await;
+        assert_eq!(error_code(ws.next().await), "bad_topic", "{bad}");
+    }
     ws.send(json!({ "type": "subscribe", "topic": "session:1" }))
         .await;
-    assert_eq!(error_code(ws.next().await), "topic_unavailable");
+    assert_eq!(error_code(ws.next().await), "not_found");
     ws.send(json!({ "type": "subscribe", "topic": "weather" }))
         .await;
     assert_eq!(error_code(ws.next().await), "unknown_topic");
