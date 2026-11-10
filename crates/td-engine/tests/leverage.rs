@@ -354,6 +354,40 @@ fn a_flip_is_capped_on_the_fresh_position_it_opens() {
 }
 
 #[test]
+fn a_flip_values_its_fresh_position_at_the_dearest_of_the_orders() {
+    let i = perp();
+    let bars = [
+        bar(0, 100.0, 101.0, 99.0, 100.0),
+        bar(1, 100.0, 101.0, 99.0, 100.0),
+    ];
+    let (script, log) = Script::new(vec![
+        // Short 50 at 100, fee 10: equity 9,990 at bar 1's close, and 9,990 allowed at 1x.
+        (0, req(&i, Side::Sell, 50.0, OrderType::Market)),
+        // Only closes the short: no fresh position.
+        (
+            1,
+            req(&i, Side::Buy, 50.0, OrderType::Limit { price: 50.0 }),
+        ),
+        // If the limit closes the short first, this stop opens a long of 50 at 300: 15,000, over.
+        // Valued at the average of the two orders, 175, it would be 8,750 and pass.
+        (
+            1,
+            req(&i, Side::Buy, 50.0, OrderType::Stop { trigger: 300.0 }),
+        ),
+        // A long of 50 at 199 is 9,950: within.
+        (
+            1,
+            req(&i, Side::Buy, 50.0, OrderType::Stop { trigger: 199.0 }),
+        ),
+    ]);
+    run(i, lev(1.0), &bars, script);
+    let log = log.lock().unwrap();
+    assert!(log[0].is_ok() && log[1].is_ok());
+    assert!(log[2].as_ref().unwrap_err().reason.contains("leverage"));
+    assert!(log[3].is_ok());
+}
+
+#[test]
 fn funding_owed_later_in_the_bar_brings_the_liquidation_price_closer() {
     let i = perp();
     let bars = [

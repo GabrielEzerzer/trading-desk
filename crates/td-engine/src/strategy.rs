@@ -329,15 +329,33 @@ impl Context<'_> {
                 .chain([&req])
                 .collect();
             let total: f64 = side.iter().map(|r| r.qty).sum();
-            let plain = side.iter().filter(|r| !r.reduce_only);
-            let plain_qty: f64 = plain.clone().map(|r| r.qty).sum();
-            let plain_value: f64 = plain
-                .map(|r| r.qty * reference_price(r.order_type, close))
-                .sum();
+            // The plain orders as (quantity, price), dearest first.
+            let mut plain: Vec<(f64, f64)> = side
+                .iter()
+                .filter(|r| !r.reduce_only)
+                .map(|r| (r.qty, reference_price(r.order_type, close)))
+                .collect();
+            plain.sort_by(|a, b| b.1.total_cmp(&a.1));
+            let plain_qty: f64 = plain.iter().map(|(q, _)| q).sum();
+            let plain_value: f64 = plain.iter().map(|(q, p)| q * p).sum();
             let notional = if req.side.sign() * position < 0.0 {
                 // Against the position: the fresh position on the other side if it closes first.
+                // Any of the orders may be the ones that close it, so the fresh quantity is valued
+                // at the dearest of them, which is the largest it can be worth.
                 let fresh = plain_qty.min(total - position.abs());
-                (total > position.abs() * (1.0 + 1e-9)).then(|| plain_value * fresh / plain_qty)
+                (total > position.abs() * (1.0 + 1e-9)).then(|| {
+                    let mut left = fresh;
+                    let mut value = 0.0;
+                    for (qty, price) in &plain {
+                        let take = qty.min(left);
+                        value += take * price;
+                        left -= take;
+                        if left <= 0.0 {
+                            break;
+                        }
+                    }
+                    value
+                })
             } else {
                 Some((position * close + req.side.sign() * plain_value).abs())
             };
