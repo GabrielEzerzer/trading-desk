@@ -1,6 +1,3 @@
-// Adapted from tipping-point engine/src/venue/binance/rest.rs at 7dc6d12 (reading the
-// PRICE_FILTER and LOT_SIZE filters from exchangeInfo); that reading now lives in `binance`.
-
 //! Instrument metadata: the instruments a source lists, as [`td_core::Instrument`]s with default
 //! fees, validated on load. Each source reads its own listing ([`crate::DataSource::instruments`]).
 

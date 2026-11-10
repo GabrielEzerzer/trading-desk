@@ -14,7 +14,8 @@ use crate::time::{MINUTE, Month, now_ms};
 pub struct DownloadReport {
     /// Candles fetched per month.
     pub months: Vec<(Month, usize)>,
-    /// Archive files the venue does not have (before the symbol listed, or not yet published).
+    /// History files the source does not have (before the symbol listed, or not yet published),
+    /// as [`MinuteHistory::missing_files`] names them.
     pub missing_files: Vec<String>,
     /// Minutes in the range, up to now, that are still not stored after the download.
     pub gaps: Vec<Gap>,

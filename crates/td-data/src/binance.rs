@@ -1,6 +1,7 @@
 // Adapted from tipping-point engine/src/store/import.rs at 7dc6d12 (SHA-256 of an archive, the
 // published .CHECKSUM, and reading an archive's one member) and engine/src/venue/binance/archive.rs
-// at 7dc6d12 (archive URLs and CSV rows).
+// at 7dc6d12 (archive URLs and CSV rows), and engine/src/venue/binance/rest.rs at 7dc6d12 (reading
+// the PRICE_FILTER and LOT_SIZE filters from exchangeInfo).
 
 //! Binance as a [`DataSource`]: spot and USD-M perpetual instruments from `exchangeInfo`,
 //! 1-minute history from the public archive at data.binance.vision, recent klines from the spot
