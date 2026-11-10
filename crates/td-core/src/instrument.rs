@@ -1,0 +1,360 @@
+use std::fmt;
+
+use serde::{Deserialize, Serialize};
+
+use crate::{CoreError, OrderRequest, OrderType};
+
+/// An exchange the desk reads data from and simulates orders against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Venue {
+    Binance,
+    Bybit,
+}
+
+impl fmt::Display for Venue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Venue::Binance => "binance",
+            Venue::Bybit => "bybit",
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum InstrumentKind {
+    Spot,
+    /// A perpetual futures contract (linear, settled in the quote asset).
+    Perpetual,
+}
+
+impl fmt::Display for InstrumentKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            InstrumentKind::Spot => "spot",
+            InstrumentKind::Perpetual => "perpetual",
+        })
+    }
+}
+
+/// Identifies an instrument across venues. The same symbol can exist as spot and as a perpetual on
+/// one venue, so the kind is part of the key.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct InstrumentId {
+    pub venue: Venue,
+    /// The venue's own symbol, for example `BTCUSDT`.
+    pub symbol: String,
+    pub kind: InstrumentKind,
+}
+
+impl fmt::Display for InstrumentId {
+    /// Formats as `venue:symbol:kind`, for example `binance:BTCUSDT:spot`.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}:{}:{}", self.venue, self.symbol, self.kind)
+    }
+}
+
+/// Trading fees as fractions of notional: 0.001 means 0.1%.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct FeeSchedule {
+    pub maker: f64,
+    pub taker: f64,
+}
+
+/// Which way [`Instrument::round_price`] moves a price that is not on a tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Rounding {
+    Down,
+    Up,
+    Nearest,
+}
+
+/// A tradable instrument with the venue's trading rules.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Instrument {
+    pub id: InstrumentId,
+    /// The asset being bought or sold, for example `BTC`.
+    pub base: String,
+    /// The asset prices, notional and fees are in, for example `USDT`.
+    pub quote: String,
+    /// Smallest price increment.
+    pub tick_size: f64,
+    /// Smallest quantity increment.
+    pub lot_size: f64,
+    /// Smallest order quantity, in the base asset.
+    pub min_qty: f64,
+    /// Smallest order value (quantity times price), in the quote asset.
+    pub min_notional: f64,
+    pub fees: FeeSchedule,
+}
+
+impl Instrument {
+    /// Rounds a price to a multiple of the tick size in the given direction.
+    pub fn round_price(&self, price: f64, rounding: Rounding) -> f64 {
+        round_to_step(price, self.tick_size, rounding)
+    }
+
+    /// Rounds a quantity down to a multiple of the lot size, so an order never exceeds what was asked.
+    pub fn round_qty(&self, qty: f64) -> f64 {
+        round_to_step(qty, self.lot_size, Rounding::Down)
+    }
+
+    /// Checks an order against this instrument's minimums. Call it after rounding.
+    ///
+    /// The notional uses the order's limit price, or its trigger for a stop, or `last_price` for a
+    /// market order.
+    pub fn validate_order(&self, order: &OrderRequest, last_price: f64) -> Result<(), CoreError> {
+        if order.instrument != self.id {
+            return Err(CoreError::InstrumentMismatch {
+                order: order.instrument.clone(),
+                instrument: self.id.clone(),
+            });
+        }
+        let qty = positive("qty", order.qty)?;
+        let price = match order.order_type {
+            OrderType::Market => positive("last_price", last_price)?,
+            OrderType::Limit { price } => positive("price", price)?,
+            OrderType::Stop { trigger } => positive("trigger", trigger)?,
+            OrderType::StopLimit { trigger, price } => {
+                positive("trigger", trigger)?;
+                positive("price", price)?
+            }
+        };
+        // A rounded quantity times a price can land a hair below an exact minimum (0.57 * 100 is
+        // 56.99999999999999), so the comparisons allow a relative tolerance.
+        if qty < self.min_qty * (1.0 - TOLERANCE) {
+            return Err(CoreError::QtyBelowMin {
+                qty,
+                min: self.min_qty,
+            });
+        }
+        let notional = qty * price;
+        if notional < self.min_notional * (1.0 - TOLERANCE) {
+            return Err(CoreError::NotionalBelowMin {
+                notional,
+                min: self.min_notional,
+            });
+        }
+        Ok(())
+    }
+}
+
+const TOLERANCE: f64 = 1e-9;
+
+fn positive(field: &'static str, value: f64) -> Result<f64, CoreError> {
+    if value.is_finite() && value > 0.0 {
+        Ok(value)
+    } else {
+        Err(CoreError::InvalidNumber { field, value })
+    }
+}
+
+/// Rounds `value` to a multiple of `step`.
+///
+/// Steps are decimal (0.01, 0.001, 5), which binary floats cannot hold exactly, so a naive
+/// `value / step` can land just under a whole number (0.3 / 0.1 is 2.9999999999999996). The step
+/// is scaled to an integer number of units first, a small epsilon absorbs the remaining error, and
+/// the result is built from integers so it is the float nearest the decimal value.
+fn round_to_step(value: f64, step: f64, rounding: Rounding) -> f64 {
+    let scale = 10f64.powi(step_decimals(step));
+    let step_units = (step * scale).round();
+    let steps = value * scale / step_units;
+    let eps = (steps.abs() * 1e-12).max(1e-9);
+    let n = match rounding {
+        Rounding::Down => (steps + eps).floor(),
+        Rounding::Up => (steps - eps).ceil(),
+        Rounding::Nearest => steps.round(),
+    };
+    n * step_units / scale
+}
+
+/// The number of decimal places in `step`: 2 for 0.01, 0 for 5. Capped at 15.
+fn step_decimals(step: f64) -> i32 {
+    (0..15)
+        .find(|&d| {
+            let scaled = step * 10f64.powi(d);
+            let whole = scaled.round();
+            whole >= 1.0 && (scaled - whole).abs() <= 1e-9 * whole
+        })
+        .unwrap_or(15)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Side, TimeInForce};
+
+    fn btc_perp() -> Instrument {
+        Instrument {
+            id: InstrumentId {
+                venue: Venue::Binance,
+                symbol: "BTCUSDT".into(),
+                kind: InstrumentKind::Perpetual,
+            },
+            base: "BTC".into(),
+            quote: "USDT".into(),
+            tick_size: 0.1,
+            lot_size: 0.001,
+            min_qty: 0.001,
+            min_notional: 5.0,
+            fees: FeeSchedule {
+                maker: 0.0002,
+                taker: 0.0005,
+            },
+        }
+    }
+
+    fn with_steps(tick_size: f64, lot_size: f64) -> Instrument {
+        Instrument {
+            tick_size,
+            lot_size,
+            ..btc_perp()
+        }
+    }
+
+    fn order(qty: f64, order_type: OrderType) -> OrderRequest {
+        OrderRequest {
+            instrument: btc_perp().id,
+            side: Side::Buy,
+            qty,
+            order_type,
+            tif: TimeInForce::Gtc,
+            reduce_only: false,
+            client_tag: None,
+        }
+    }
+
+    #[test]
+    fn price_rounds_to_tick_in_each_direction() {
+        let i = btc_perp();
+        assert_eq!(i.round_price(65000.17, Rounding::Down), 65000.1);
+        assert_eq!(i.round_price(65000.17, Rounding::Up), 65000.2);
+        assert_eq!(i.round_price(65000.17, Rounding::Nearest), 65000.2);
+        assert_eq!(i.round_price(65000.12, Rounding::Nearest), 65000.1);
+    }
+
+    #[test]
+    fn price_already_on_tick_is_unchanged() {
+        let i = btc_perp();
+        for rounding in [Rounding::Down, Rounding::Up, Rounding::Nearest] {
+            assert_eq!(i.round_price(65000.3, rounding), 65000.3);
+        }
+    }
+
+    #[test]
+    fn whole_number_ticks() {
+        let i = with_steps(5.0, 1.0);
+        assert_eq!(i.round_price(1003.0, Rounding::Down), 1000.0);
+        assert_eq!(i.round_price(1003.0, Rounding::Up), 1005.0);
+        assert_eq!(i.round_qty(7.9), 7.0);
+    }
+
+    #[test]
+    fn qty_rounds_down_to_lot() {
+        let i = btc_perp();
+        assert_eq!(i.round_qty(0.0129), 0.012);
+        assert_eq!(i.round_qty(0.0005), 0.0);
+    }
+
+    #[test]
+    fn float_error_does_not_drop_a_lot() {
+        // 0.3 / 0.1 is 2.9999999999999996 and 1.15 / 0.05 is 22.999999999999996 in f64.
+        assert_eq!(with_steps(0.1, 0.1).round_qty(0.3), 0.3);
+        assert_eq!(with_steps(0.1, 0.05).round_qty(1.15), 1.15);
+        assert_eq!(with_steps(0.1, 0.1).round_price(0.3, Rounding::Down), 0.3);
+        assert_eq!(with_steps(0.1, 0.1).round_price(0.3, Rounding::Up), 0.3);
+    }
+
+    #[test]
+    fn rounded_values_are_the_nearest_float_to_the_decimal() {
+        // A naive 3.0 * 0.1 gives 0.30000000000000004.
+        assert_eq!(with_steps(0.1, 0.1).round_qty(0.31), 0.3);
+        assert_eq!(with_steps(1e-8, 1e-8).round_qty(0.123456789), 0.12345678);
+    }
+
+    #[test]
+    fn valid_orders_pass() {
+        let i = btc_perp();
+        assert_eq!(
+            i.validate_order(&order(0.001, OrderType::Market), 65000.0),
+            Ok(())
+        );
+        let limit = OrderType::Limit { price: 64000.0 };
+        assert_eq!(i.validate_order(&order(0.01, limit), f64::NAN), Ok(()));
+    }
+
+    #[test]
+    fn qty_below_min_is_rejected() {
+        let i = btc_perp();
+        let err = i.validate_order(&order(0.0005, OrderType::Market), 65000.0);
+        assert!(matches!(err, Err(CoreError::QtyBelowMin { .. })));
+    }
+
+    #[test]
+    fn notional_below_min_is_rejected() {
+        let i = btc_perp();
+        let limit = OrderType::Limit { price: 4000.0 };
+        let err = i.validate_order(&order(0.001, limit), 65000.0);
+        assert!(matches!(err, Err(CoreError::NotionalBelowMin { .. })));
+    }
+
+    #[test]
+    fn notional_a_hair_under_the_minimum_from_float_error_passes() {
+        // 0.57 * 100.0 is 56.99999999999999 in f64.
+        let i = Instrument {
+            min_notional: 57.0,
+            min_qty: 0.01,
+            ..with_steps(0.01, 0.01)
+        };
+        let limit = OrderType::Limit { price: 100.0 };
+        assert_eq!(i.validate_order(&order(0.57, limit), 0.0), Ok(()));
+    }
+
+    #[test]
+    fn non_finite_and_non_positive_values_are_rejected() {
+        let i = btc_perp();
+        for qty in [f64::NAN, f64::INFINITY, 0.0, -1.0] {
+            let err = i.validate_order(&order(qty, OrderType::Market), 65000.0);
+            assert!(matches!(
+                err,
+                Err(CoreError::InvalidNumber { field: "qty", .. })
+            ));
+        }
+        let err = i.validate_order(&order(1.0, OrderType::Market), f64::NAN);
+        assert!(matches!(
+            err,
+            Err(CoreError::InvalidNumber {
+                field: "last_price",
+                ..
+            })
+        ));
+        let stop_limit = OrderType::StopLimit {
+            trigger: f64::INFINITY,
+            price: 65000.0,
+        };
+        let err = i.validate_order(&order(1.0, stop_limit), 65000.0);
+        assert!(matches!(
+            err,
+            Err(CoreError::InvalidNumber {
+                field: "trigger",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn order_for_another_instrument_is_rejected() {
+        let i = btc_perp();
+        let mut o = order(1.0, OrderType::Market);
+        o.instrument.kind = InstrumentKind::Spot;
+        let err = i.validate_order(&o, 65000.0);
+        assert!(matches!(err, Err(CoreError::InstrumentMismatch { .. })));
+    }
+
+    #[test]
+    fn instrument_id_displays_as_venue_symbol_kind() {
+        assert_eq!(btc_perp().id.to_string(), "binance:BTCUSDT:perpetual");
+    }
+}

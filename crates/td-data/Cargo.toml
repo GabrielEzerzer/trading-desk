@@ -1,0 +1,9 @@
+[package]
+name = "td-data"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+td-core.workspace = true
