@@ -330,6 +330,36 @@ impl Rest for PanickingRest {
     }
 }
 
+/// A source whose clock blocks for a while and then panics, so that a stop can arrive while the
+/// run loop is about to panic and cannot be aborted.
+struct SlowPanickingRest;
+
+impl Rest for SlowPanickingRest {
+    fn klines(
+        &self,
+        _id: &InstrumentId,
+        _timeframe: Timeframe,
+        _from: Millis,
+        _to: Millis,
+    ) -> Result<Vec<Candle>, DataError> {
+        Ok(Vec::new())
+    }
+
+    fn funding(
+        &self,
+        _id: &InstrumentId,
+        _from: Millis,
+        _to: Millis,
+    ) -> Result<Vec<(Millis, f64)>, DataError> {
+        Ok(Vec::new())
+    }
+
+    fn now(&self) -> Millis {
+        std::thread::sleep(Duration::from_millis(500));
+        panic!("the clock broke late");
+    }
+}
+
 /// A closed Binance kline frame for a minute.
 fn frame(c: &Candle) -> String {
     format!(
@@ -535,6 +565,59 @@ async fn a_session_that_crashed_during_warm_up_finishes_it_and_goes_live_from_th
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_warm_up_restarted_long_after_it_crashed_is_fed_one_warm_up_of_bars_at_most() {
+    let tf = Timeframe::M5;
+    let cfg = config(InstrumentKind::Spot, tf);
+    const DAY: i64 = 1440;
+    let history = resample(&minutes(-60..30 * DAY + 20), tf, false).candles;
+    let dir = tempfile::tempdir().expect("temp dir");
+    // The process died after writing five of the warm-up lines...
+    let mut paper = PaperSession::create(dir.path(), "late", cfg).expect("creates");
+    for bar in &history[..5] {
+        paper.feed(*bar, Vec::new(), true).expect("warm-up bar");
+    }
+    drop(paper);
+
+    // ...and restarts 30 days later, at 00:20:30.
+    let restart = T0 + (30 * DAY + 20) * MIN;
+    let rest = Arc::new(FakeRest::new(
+        minutes(30 * DAY..30 * DAY + 60),
+        history.clone(),
+        restart + 30_000,
+    ));
+    let reopened = PaperSession::open(dir.path(), "late").expect("opens");
+    let stream: Vec<String> = minutes(30 * DAY + 20..30 * DAY + 40)
+        .iter()
+        .map(frame)
+        .collect();
+    let handle = td_server::start_with_stream(reopened, rest.clone(), serve(stream).await);
+    wait_for_bar(&handle, restart + 15 * MIN).await;
+    let resumed = unwrap_session(handle.stop().await);
+
+    // Only the last WARM_UP_BARS bars before the restart were asked for and fed.
+    let earliest = restart - td_server::WARM_UP_BARS * tf.duration_ms();
+    let calls = rest.calls.lock().expect("lock").clone();
+    assert_eq!(calls, [(tf, earliest, restart)]);
+    let log =
+        fs::read_to_string(paper_dir(dir.path(), "late").join("events.jsonl")).expect("reads");
+    let warm_up_lines = log
+        .lines()
+        .filter(|l| l.contains(r#""warm_up":true"#))
+        .count();
+    assert_eq!(warm_up_lines, 5 + td_server::WARM_UP_BARS as usize);
+    // It went live from the restart and traded the bars after it.
+    assert_eq!(resumed.live_from(), Some(restart));
+    assert_eq!(resumed.equity()[0].time, restart);
+    let first_after_gap = resumed
+        .session()
+        .bars()
+        .iter()
+        .find(|b| b.open_time > history[4].open_time)
+        .expect("bars after the crash");
+    assert_eq!(first_after_gap.open_time, earliest);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_session_is_live_again_once_a_failed_backfill_succeeds() {
     let tf = Timeframe::M5;
     let history = resample(&minutes(-60..0), tf, false).candles;
@@ -586,4 +669,25 @@ async fn a_panic_in_the_run_loop_shows_as_an_error() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     handle.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_panic_that_races_a_stop_still_shows_as_an_error() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let paper = PaperSession::create(
+        dir.path(),
+        "race",
+        config(InstrumentKind::Spot, Timeframe::M5),
+    )
+    .expect("creates");
+    let handle =
+        td_server::start_with_stream(paper, Arc::new(SlowPanickingRest), serve(Vec::new()).await);
+    // Stop while the loop is blocked in the clock, before it panics.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let stopped = handle.stop().await;
+    let status = stopped.lock().expect("lock").status().clone();
+    match status {
+        Status::Error(message) => assert!(message.contains("the clock broke late"), "{message}"),
+        other => panic!("a panic during the stop shows as {other:?}"),
+    }
 }

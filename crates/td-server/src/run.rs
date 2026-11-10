@@ -10,9 +10,10 @@
 //!
 //! A session that has not fed a live bar yet (it stopped or crashed during warm-up, or after it
 //! but before its first live bar) warms up again instead: it is fed, as warm-up, the bars from the
-//! end of its log up to the last closed bar, and goes live from the time it restarts. It holds no
-//! position or orders then, so nothing is lost, but one stopped right after warm-up goes live at
-//! the restart rather than backfilling the bars it missed.
+//! end of its log up to the last closed bar, at most [`WARM_UP_BARS`] of them, and goes live from
+//! the time it restarts. One restarted long after its log ends skips the bars in between, which the
+//! engine allows. It holds no position or orders then, so nothing is lost, but one stopped right
+//! after warm-up goes live at the restart rather than backfilling the bars it missed.
 
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
@@ -88,8 +89,13 @@ pub fn start_with_stream(session: PaperSession, rest: Arc<dyn Rest>, url: String
             _ = stopped.changed() => {
                 // Wait for the cancelled loop to let go of the session.
                 driver.abort();
-                let _ = driver.await;
-                Status::Stopped
+                match driver.await {
+                    // It panicked before the abort took effect.
+                    Err(e) if e.is_panic() => {
+                        Status::Error(format!("the session panicked: {}", panic_message(e)))
+                    }
+                    _ => Status::Stopped,
+                }
             }
         };
         lock(&shared).set_status(status);
@@ -163,7 +169,9 @@ async fn drive(
         _ => {
             lock(shared).set_status(Status::WarmingUp);
             let end = timeframe.floor(rest.now());
-            let from = next.unwrap_or(end - WARM_UP_BARS * timeframe.duration_ms());
+            // From the end of the log, but never more than a full warm-up back.
+            let earliest = end - WARM_UP_BARS * timeframe.duration_ms();
+            let from = next.map_or(earliest, |n| n.max(earliest));
             let (store, history_rest, history_id) =
                 (Store::new(data_dir), rest.clone(), id.clone());
             let bars = blocking(move || {
