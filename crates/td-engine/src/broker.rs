@@ -84,15 +84,17 @@ pub trait Broker: Send {
     fn cancel(&mut self, id: OrderId) -> bool;
     /// Processes a new closed bar and returns the fills, cancellations and placed stops it caused,
     /// in the order they happened. `portfolio` is the account before the bar's fills. `breached`
-    /// says whether an account's position is liquidated on this bar: when it is for the account
-    /// after the fills at the bar's open, the fills inside the range are skipped and their orders
-    /// left open, since the liquidation comes first and cancels them (see
+    /// gives the price at which an account's position is liquidated on this bar, if it is. When
+    /// the account after the fills at the bar's open is liquidated, the stops inside the range
+    /// that the price crosses on its way from the open to the liquidation price fill first,
+    /// nearest the open first, each followed by a fresh check; the fills left inside the range are
+    /// skipped and their orders left open, since the liquidation comes first and cancels them (see
     /// [`crate::Session::on_bar`]).
     fn on_bar(
         &mut self,
         bar: &Candle,
         portfolio: &Portfolio,
-        breached: &dyn Fn(&Portfolio) -> bool,
+        breached: &dyn Fn(&Portfolio) -> Option<f64>,
     ) -> Vec<BrokerEvent>;
     fn open_orders(&self) -> &[Order];
 }
@@ -250,7 +252,7 @@ impl<M: FillModel> Broker for SimBroker<M> {
         &mut self,
         bar: &Candle,
         portfolio: &Portfolio,
-        breached: &dyn Fn(&Portfolio) -> bool,
+        breached: &dyn Fn(&Portfolio) -> Option<f64>,
     ) -> Vec<BrokerEvent> {
         // A scratch copy of the account that each fill moves, so a reduce-only order sees the
         // position and a spot buy the cash that the earlier fills on this bar left.
@@ -365,17 +367,52 @@ impl<M: FillModel> Broker for SimBroker<M> {
                 None => {}
             }
         }
-        let liquidated = breached(&book);
+        inside.sort_by_key(|(priority, fill)| (*priority, fill.order.id));
+        let mut liquidated = false;
+        while let Some(at) = breached(&book) {
+            // On its way from the open to the liquidation price the market crosses the stops that
+            // close against it there first: sell stops at or above the price for a long, buy stops
+            // at or below it for a short. Take the one nearest the open, then check again, since
+            // the fill moves the position and so the liquidation price.
+            let long = book.position() > 0.0;
+            let next = inside
+                .iter()
+                .enumerate()
+                .filter(|(_, (priority, fill))| {
+                    *priority == 0
+                        && if long {
+                            fill.order.request.side == Side::Sell && fill.market >= at
+                        } else {
+                            fill.order.request.side == Side::Buy && fill.market <= at
+                        }
+                })
+                .min_by(|(_, (_, a)), (_, (_, b))| {
+                    let (a, b) = if long {
+                        (b.market, a.market)
+                    } else {
+                        (a.market, b.market)
+                    };
+                    a.total_cmp(&b)
+                })
+                .map(|(index, _)| index);
+            let Some(index) = next else {
+                liquidated = true;
+                break;
+            };
+            let (_, fill) = inside.remove(index);
+            if let Some(stop) = apply(fill, &mut book) {
+                apply(stop, &mut book);
+            }
+        }
         if liquidated {
-            // The liquidation comes before any fill inside the range. The orders stay open for it
-            // to cancel, including stops just placed for entries filled at the open.
+            // The liquidation comes before the rest of the fills inside the range. The orders stay
+            // open for it to cancel, including stops just placed for entries filled at the open.
             for (_, fill) in inside {
                 if !self.open.iter().any(|o| o.id == fill.order.id) {
                     placed.push(fill.order);
                 }
             }
         } else {
-            inside.sort_by_key(|(priority, fill)| (*priority, fill.order.id));
             for (_, fill) in inside {
                 // An entry filled inside the range has its stop applied straight after it.
                 if let Some(stop) = apply(fill, &mut book) {

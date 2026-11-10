@@ -139,6 +139,11 @@ impl Portfolio {
         payment
     }
 
+    /// Sets the balance to exactly zero, for a liquidation that keeps the rest of the margin.
+    pub(crate) fn clear_cash(&mut self) {
+        self.cash = 0.0;
+    }
+
     /// Floors a flat perpetual account's negative balance at zero and records the shortfall.
     pub(crate) fn write_off_shortfall(&mut self) {
         if self.kind == InstrumentKind::Perpetual && self.position == 0.0 && self.cash < 0.0 {

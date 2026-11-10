@@ -137,17 +137,20 @@ impl Session {
     /// bar, falls below [`MAINTENANCE_MARGIN_RATE`] of its notional at that price. It is checked
     /// twice: on the position held after the fills at the bar's open, and on the position after
     /// all of the bar's fills. The path inside the bar is unknown, so the first check comes before
-    /// any fill inside the range, as stops come before limits: if it liquidates, the fills inside
-    /// the range do not happen and their orders are cancelled with the rest. The liquidation price
-    /// is where equity and maintenance meet, rounded to the tick on the side that triggers sooner;
-    /// if the bar opened beyond it, the open. Every open order is cancelled, and the whole
-    /// position is closed at that price with no slippage, recorded as a filled reduce-only order
-    /// tagged [`LIQUIDATION_TAG`] whose fill closes the trade in the trade list. The fill's fee is
-    /// the taker fee plus a liquidation fee of whatever equity is left after it, since a venue
-    /// keeps the rest of the margin, so the account ends flat at zero and the run goes on with
-    /// nothing to trade. A perpetual account left flat with a negative balance (a gap past the
-    /// liquidation price, or a stop that filled beyond it) is floored at zero, so equity never
-    /// goes below zero; see [`Portfolio::shortfall_written_off`].
+    /// the fills inside the range, as stops come before limits, except for the stops the price
+    /// must cross on its way from the open to the liquidation price (a sell stop at or above it
+    /// for a long, a buy stop at or below it for a short): those fill first, nearest the open
+    /// first, and the check is made again after each. If it still liquidates, the other fills
+    /// inside the range do not happen and their orders are cancelled with the rest. The
+    /// liquidation price is where equity and maintenance meet, rounded to the tick on the side
+    /// that triggers sooner; if the bar opened beyond it, the open. Every open order is cancelled,
+    /// and the whole position is closed at that price with no slippage, recorded as a filled
+    /// reduce-only order tagged [`LIQUIDATION_TAG`] whose fill closes the trade in the trade list.
+    /// The fill's fee is the taker fee plus a liquidation fee of whatever equity is left after it,
+    /// since a venue keeps the rest of the margin, so the account ends flat at exactly zero and
+    /// the run goes on with nothing to trade. A perpetual account left flat with a negative
+    /// balance (a gap past the liquidation price, or a stop that filled beyond it) is floored at
+    /// zero, so equity never goes below zero; see [`Portfolio::shortfall_written_off`].
     ///
     /// This is a pessimistic simplification of a venue's cross margin with one position: the
     /// whole bar range counts as coming after the fills each check follows, as for attached
@@ -167,8 +170,7 @@ impl Session {
         }
         let first_new_fill = self.fills.len();
         let instrument = &self.instrument;
-        let breached =
-            |book: &Portfolio| liquidation_price(instrument, book, &bar, funding).is_some();
+        let breached = |book: &Portfolio| liquidation_price(instrument, book, &bar, funding);
         for event in self.broker.on_bar(&bar, &self.portfolio, &breached) {
             match event {
                 BrokerEvent::Filled(fill) => {
@@ -326,6 +328,10 @@ impl Session {
         let left = self.portfolio.cash() + q * (price - self.portfolio.avg_entry()) - taker;
         let fee = taker + left.max(0.0);
         self.portfolio.apply_fill(side, qty, price, fee);
+        if left >= 0.0 {
+            // Exactly nothing is left, whatever float residue the fee's arithmetic leaves.
+            self.portfolio.clear_cash();
+        }
         self.fills.push(Fill {
             order_id: id,
             instrument: self.instrument.id.clone(),

@@ -410,7 +410,85 @@ fn a_long_is_liquidated_when_the_low_touches_its_trigger_and_not_a_tick_above() 
     assert_eq!(f.len(), 2);
     approx(f[1].price, 90.66);
     approx(f[1].fee, 460.0);
-    approx(equity(&s)[2], 0.0);
+    // The account ends at exactly zero, with no float residue written off.
+    assert_eq!(s.portfolio().cash(), 0.0);
+    assert_eq!(equity(&s)[2], 0.0);
+    assert_eq!(s.portfolio().shortfall_written_off(), 0.0);
+}
+
+#[test]
+fn a_resting_stop_above_the_liquidation_price_fills_before_the_liquidation() {
+    let i = perp();
+    let bars = [
+        bar(0, 100.0, 101.0, 99.0, 100.0),
+        bar(1, 100.0, 101.0, 99.0, 100.0),
+        bar(2, 100.0, 101.0, 89.0, 90.0),
+        bar(3, 90.0, 91.0, 89.0, 90.0),
+    ];
+    let (script, log) = Script::new(vec![
+        (0, req(&i, Side::Buy, 1000.0, OrderType::Market)),
+        (
+            1,
+            reduce_only(req(
+                &i,
+                Side::Sell,
+                1000.0,
+                OrderType::Stop { trigger: 95.0 },
+            )),
+        ),
+    ]);
+    let s = run(i, lev(10.0), &bars, script);
+    assert!(log.lock().unwrap().iter().all(|r| r.is_ok()));
+
+    // Long 1,000 at 100, cash 9,800, liquidation price 90.66 (second test). Bar 2 falls from 100
+    // to 89: the price passes the stop at 95 before 90.66, so the stop fills there and the long
+    // is closed before it can be liquidated. -5,000 realised and 95,000 * 0.2% = 190 of fee.
+    let f = s.fills();
+    assert_eq!(f.len(), 2, "the entry and the stop, no liquidation");
+    approx(f[1].price, 95.0);
+    approx(f[1].fee, 190.0);
+    assert_eq!(s.orders()[1].status, OrderStatus::Filled);
+    assert!(
+        s.orders()
+            .iter()
+            .all(|o| o.request.client_tag.as_deref() != Some("liquidation"))
+    );
+    assert_eq!(s.portfolio().position(), 0.0);
+    let e = equity(&s);
+    approx(e[2], 4_610.0);
+    approx(e[3], 4_610.0);
+    approx(s.portfolio().shortfall_written_off(), 0.0);
+}
+
+#[test]
+fn an_attached_stop_above_the_liquidation_price_fills_before_the_liquidation() {
+    let i = perp();
+    let bars = [
+        bar(0, 100.0, 101.0, 99.0, 100.0),
+        bar(1, 100.0, 101.0, 89.0, 90.0),
+        bar(2, 90.0, 91.0, 89.0, 90.0),
+    ];
+    let steps = Steps(|ctx: &mut td_engine::Context, index: usize| {
+        if index == 0 {
+            let r = req(ctx.instrument(), Side::Buy, 1000.0, OrderType::Market);
+            ctx.submit_with_stop(r, 95.0).unwrap();
+        }
+    });
+    let s = run(i, lev(10.0), &bars, Box::new(steps));
+
+    // The long enters at bar 1's open of 100 and its stop at 95 is placed. The bar falls to 89,
+    // past the liquidation price of 90.66, but it passes the stop first: the stop fills at 95 and
+    // equity is 9,800 - 5,000 - 190 = 4,610.
+    let f = s.fills();
+    assert_eq!(f.len(), 2, "the entry and the stop, no liquidation");
+    approx(f[1].price, 95.0);
+    approx(f[1].fee, 190.0);
+    assert_eq!(s.orders()[1].status, OrderStatus::Filled);
+    assert_eq!(s.portfolio().position(), 0.0);
+    let e = equity(&s);
+    approx(e[1], 4_610.0);
+    approx(e[2], 4_610.0);
+    approx(s.portfolio().shortfall_written_off(), 0.0);
 }
 
 #[test]
