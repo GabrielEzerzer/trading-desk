@@ -10,7 +10,14 @@
 //!   has an unfinished download in this server is a 409 `conflict` (a duplicate from another
 //!   server on the same data folder is safe, since the store locks across processes, just
 //!   redundant).
-//! - `GET /data/coverage?instrument=venue:symbol:kind`: which months and minutes the store holds.
+//! - `GET /data/coverage?instrument=venue:symbol:kind`: which months and minutes the store holds,
+//!   and each month file's bytes.
+//! - `GET /data/stored`: every instrument the store holds, with each month file's bytes and the
+//!   funding file's, and any paths in the data folder the store did not write.
+//! - `POST /data/delete` `{instrument, from?, to?}`: deletes the candles of the months `from` to
+//!   `to` (`YYYY-MM`, both included), or with neither the whole instrument including a
+//!   perpetual's funding file, and answers `{files, bytes}` removed. An instrument with a queued
+//!   or running download in this server is a 409 `conflict`.
 //! - `GET /strategies`: the registered strategies and their parameter specs.
 //! - `GET /jobs`, `GET /jobs/{id}`, `POST /jobs/{id}/cancel`: background jobs (see [`jobs`]).
 //! - `POST /runs/backtest` (a `BacktestConfig`), `POST /runs/sweep` (a `SweepSpec`),
@@ -239,6 +246,8 @@ pub(crate) fn router(state: Arc<AppState>) -> Router {
         .route("/instruments", get(data::instruments))
         .route("/data/download", post(data::download))
         .route("/data/coverage", get(data::coverage))
+        .route("/data/stored", get(data::stored))
+        .route("/data/delete", post(data::delete))
         .route("/strategies", get(strategies))
         .route("/jobs", get(list_jobs))
         .route("/jobs/{id}", get(get_job))
