@@ -13,6 +13,24 @@
 //! - `GET /data/coverage?instrument=venue:symbol:kind`: which months and minutes the store holds.
 //! - `GET /strategies`: the registered strategies and their parameter specs.
 //! - `GET /jobs`, `GET /jobs/{id}`, `POST /jobs/{id}/cancel`: background jobs (see [`jobs`]).
+//! - `POST /runs/backtest` (a `BacktestConfig`), `POST /runs/sweep` (a `SweepSpec`),
+//!   `POST /runs/out-of-sample` (an `OosSpec`), `POST /runs/walk-forward` (a `WalkForwardSpec`):
+//!   start a run job, answer `{job_id}`. An out-of-sample run's job kind is `oos`, the same as its
+//!   saved run's kind; only the route spells it out. `from`, `to` and `warmup_from` must each be
+//!   where a bar of the timeframe opens. The range is checked against the store first: a gap of a
+//!   day or more is a 422 `data_missing` naming the missing spans; shorter gaps are run and listed
+//!   in the result's data report (`gaps`, `dropped`). A bad spec is a 400 (`invalid_config`, which
+//!   includes an unknown strategy and range edges off a bar boundary, or `invalid_spec`). At most
+//!   [`jobs::MAX_RUN_JOBS`] run jobs are queued or running at once; one more is a 429
+//!   `too_many_runs`. A queued run holds only its request and loads its data when it gets one of
+//!   the run slots; if the store changed meanwhile so that the run would be refused, the job fails
+//!   with that `data_missing` error. Each finished run is saved (see [`runs`]).
+//! - `GET /jobs/{id}/result`: the saved run of a finished run job (`RunDetail`); 409
+//!   `job_not_done` while it is queued or running (ask again later), 409 `no_result` once it has
+//!   finished without a saved run (failed, cancelled, or not a run job).
+//! - `GET /runs`: the saved runs, newest first, one summary row each. `GET /runs/{id}`: one saved
+//!   run with its data report (`data_error` says why when that report is damaged) and a check of
+//!   whether its data and engine still match.
 //! - Paper sessions (see [`sessions`]):
 //!   - `POST /sessions` `{strategy, params, instrument, timeframe, starting_cash, slippage_bps,
 //!     fees?}`: creates a session and starts it, 201 with its summary. `instrument` is an
@@ -23,7 +41,10 @@
 //!   - `POST /sessions/{id}/stop`: 200 once stopped, 409 `not_running` if it was not running.
 //!   - `POST /sessions/{id}/resume`: replays a stopped session and starts it again, backfilling
 //!     what it missed; 409 `already_running` if it is running. A session that ended on its own
-//!     with an error counts as stopped. Its `session:` subscribers get the resumed state.
+//!     with an error counts as stopped. Its `session:` subscribers get the resumed state. 409
+//!     `engine_changed` if the session was created by another engine revision: it still lists
+//!     and shows, replayed by this engine with a warning saying so, but cannot go on; start a new
+//!     session instead.
 //!
 //!   An unknown session id is a 404.
 //! - `GET /ws`: topic subscriptions: `jobs`, `candles:...` and `session:<id>` (see [`ws`]).
@@ -36,6 +57,7 @@ pub mod data;
 pub mod error;
 pub mod jobs;
 mod live;
+pub mod runs;
 pub mod sessions;
 pub mod source;
 pub mod ts;
@@ -180,6 +202,12 @@ impl Server {
         &self.token
     }
 
+    /// The job registry the routes queue on, for code that queues jobs of its own beside them
+    /// (the tests hold run slots with jobs whose end they control).
+    pub fn jobs(&self) -> &Arc<Jobs> {
+        &self.jobs
+    }
+
     /// The handshake line, without a newline.
     pub fn handshake_line(&self) -> String {
         let handshake = Handshake {
@@ -215,6 +243,13 @@ pub(crate) fn router(state: Arc<AppState>) -> Router {
         .route("/jobs", get(list_jobs))
         .route("/jobs/{id}", get(get_job))
         .route("/jobs/{id}/cancel", post(cancel_job))
+        .route("/jobs/{id}/result", get(runs::job_result))
+        .route("/runs", get(runs::list))
+        .route("/runs/backtest", post(runs::backtest))
+        .route("/runs/sweep", post(runs::sweep))
+        .route("/runs/out-of-sample", post(runs::out_of_sample))
+        .route("/runs/walk-forward", post(runs::walk_forward))
+        .route("/runs/{id}", get(runs::get))
         .route("/sessions", get(sessions::list).post(sessions::start))
         .route("/sessions/{id}", get(sessions::get))
         .route("/sessions/{id}/stop", post(sessions::stop))

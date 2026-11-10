@@ -10,8 +10,8 @@
 //! and the ranking breaks ties on the grid order.
 
 use std::collections::BTreeSet;
-use std::ops::Range;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::ops::{ControlFlow, Range};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -28,8 +28,13 @@ use crate::{
 /// walk-forward may run at most this many over all its train windows together.
 pub const MAX_RUNS: usize = 100_000;
 
-/// A progress callback: runs done so far, then the total. Called from the worker threads.
-pub type Progress<'a> = &'a (dyn Fn(usize, usize) + Sync);
+/// A progress callback: runs done so far, then the total. Called from the worker threads after
+/// each run.
+///
+/// Returning `ControlFlow::Break(())` stops the whole call: runs not started yet are skipped,
+/// runs already going finish, and the call returns [`TesterError::Cancelled`]. Returning
+/// `Continue` leaves the result exactly as without a callback.
+pub type Progress<'a> = &'a (dyn Fn(usize, usize) -> ControlFlow<()> + Sync);
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum TesterError {
@@ -54,6 +59,10 @@ pub enum TesterError {
         /// The walk-forward window, counted from 0, for a walk-forward run.
         window: Option<usize>,
     },
+
+    /// The progress callback asked to stop.
+    #[error("the run was cancelled")]
+    Cancelled,
 }
 
 fn in_window(window: &Option<usize>) -> String {
@@ -65,6 +74,7 @@ fn in_window(window: &Option<usize>) -> String {
 // ---------------------------------------------------------------------------------------------
 
 /// The values one parameter takes in a sweep.
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ParamSpace {
@@ -79,12 +89,14 @@ pub enum ParamSpace {
 }
 
 /// One swept parameter.
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ParamAxis {
     pub name: String,
     pub space: ParamSpace,
 }
 
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SweepMode {
@@ -97,6 +109,7 @@ pub enum SweepMode {
 }
 
 /// A metrics report field a sweep can rank by.
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Metric {
@@ -111,6 +124,7 @@ pub enum Metric {
     MaxDrawdown,
 }
 
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Direction {
@@ -118,6 +132,7 @@ pub enum Direction {
     Minimize,
 }
 
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Objective {
     pub metric: Metric,
@@ -125,6 +140,7 @@ pub struct Objective {
 }
 
 /// A parameter sweep.
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SweepSpec {
     /// The backtest every parameter set shares. Its `params` fix parameters that are not swept;
@@ -140,7 +156,34 @@ pub struct SweepSpec {
     pub min_trades: usize,
 }
 
+impl SweepSpec {
+    /// Checks the spec without data: the strategy, every fixed and swept parameter value, and the
+    /// run count, as [`sweep`] does before it runs anything. What depends on the data (the range,
+    /// rules across parameters) is checked by the run.
+    pub fn check(&self) -> Result<(), TesterError> {
+        Plan::new(self).map(|_| ())
+    }
+}
+
+impl OosSpec {
+    /// [`SweepSpec::check`], plus the out-of-sample rules that need no data.
+    pub fn check(&self) -> Result<(), TesterError> {
+        refuse_base_warmup(&self.sweep)?;
+        self.sweep.check()
+    }
+}
+
+impl WalkForwardSpec {
+    /// [`SweepSpec::check`], plus the walk-forward rules that need no data. Whether the windows
+    /// fit the range is checked by the run.
+    pub fn check(&self) -> Result<(), TesterError> {
+        refuse_base_warmup(&self.sweep)?;
+        self.sweep.check()
+    }
+}
+
 /// The metrics a sweep keeps per run.
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Headline {
     pub total_return: Option<f64>,
@@ -185,6 +228,7 @@ impl Headline {
 }
 
 /// One parameter set of a sweep and how it did.
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SweepRow {
     /// Position in the grid order. Runs that rank equal are ordered by it.
@@ -206,6 +250,7 @@ pub struct SweepRow {
 ///
 /// shortcut: rows keep headline metrics only, not equity curves or trades, so memory stays
 /// bounded with many runs; the best run is run again to get its full result.
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SweepResult {
     pub spec: SweepSpec,
@@ -495,19 +540,29 @@ fn sweep_planned(
     let data_fingerprint = config_fingerprint(&spec.base, bars, funding)?;
     let total = plan.indices.len();
     let done = AtomicUsize::new(0);
-    let runs: Vec<Result<SweepRow, EngineError>> = plan
+    let stopped = AtomicBool::new(false);
+    // `None` for a run skipped after a stop.
+    let runs: Vec<Option<Result<SweepRow, EngineError>>> = plan
         .indices
         .par_iter()
         .map(|&index| {
+            if stopped.load(Ordering::Relaxed) {
+                return None;
+            }
             let row = run_row(spec, plan, index, bars, funding);
             let n = done.fetch_add(1, Ordering::Relaxed) + 1;
-            if let Some(report) = progress {
-                report(n, total);
+            if let Some(report) = progress
+                && report(n, total).is_break()
+            {
+                stopped.store(true, Ordering::Relaxed);
             }
-            row
+            Some(row)
         })
         .collect();
-    let mut rows = runs.into_iter().collect::<Result<Vec<_>, _>>()?;
+    if stopped.load(Ordering::Relaxed) {
+        return Err(TesterError::Cancelled);
+    }
+    let mut rows = runs.into_iter().flatten().collect::<Result<Vec<_>, _>>()?;
     let objective = spec.objective;
     rows.sort_by(|a, b| {
         let tier = |r: &SweepRow| match (r.qualified, &r.error) {
@@ -600,6 +655,7 @@ fn refuse_base_warmup(spec: &SweepSpec) -> Result<(), TesterError> {
 // ---------------------------------------------------------------------------------------------
 
 /// Where the base range splits into in-sample and out-of-sample.
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Split {
@@ -610,6 +666,7 @@ pub enum Split {
     At(Millis),
 }
 
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OosSpec {
     /// The sweep over the whole range; `base.from..base.to` is split in two.
@@ -617,6 +674,7 @@ pub struct OosSpec {
     pub split: Split,
 }
 
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OosResult {
     pub spec: OosSpec,
@@ -737,6 +795,7 @@ fn split_time(traded: &[Candle], split: Split) -> Result<Millis, TesterError> {
 // Walk-forward
 // ---------------------------------------------------------------------------------------------
 
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WindowMode {
@@ -753,6 +812,7 @@ pub enum WindowMode {
 /// overlaps its own train window. `step` must be at least `test`, so test segments never overlap
 /// each other; with `step == test` they are contiguous. Trailing bars that do not fill a whole
 /// test segment are not tested.
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WindowSpec {
     pub train_bars: usize,
@@ -810,6 +870,7 @@ impl WindowSpec {
     }
 }
 
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WalkForwardSpec {
     /// The sweep run on every train window; `base.from..base.to` is the whole range.
@@ -821,6 +882,7 @@ pub struct WalkForwardSpec {
 ///
 /// shortcut: keeps the chosen parameters and their in-sample headline metrics, not the train
 /// sweep's rows, so a long walk-forward stays small.
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WindowResult {
     /// The train segment: bars that open in `train_from..train_to`.
@@ -856,6 +918,7 @@ pub struct WindowResult {
 /// The stitched metrics are computed like a single backtest's (see [`MetricsReport`]): the
 /// stitched Sharpe, Sortino and volatility come from the stitched curve's daily UTC returns, not
 /// from its per-bar returns, so they are comparable with a backtest's on any timeframe.
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WalkForwardResult {
     pub spec: WalkForwardSpec,
@@ -919,10 +982,9 @@ pub fn walk_forward(
         let warm_start = w.train.start.saturating_sub(w.train.len());
         train.base.warmup_from = (warm_start < w.train.start).then(|| time_at(warm_start));
         let offset = k * per_window;
-        let window_progress = |done: usize, _: usize| {
-            if let Some(report) = progress {
-                report(offset + done, total);
-            }
+        let window_progress = |done: usize, _: usize| match progress {
+            Some(report) => report(offset + done, total),
+            None => ControlFlow::Continue(()),
         };
         let swept = sweep_planned(&train, &plan, bars, funding, Some(&window_progress))?;
         let best = swept.best.ok_or(TesterError::NoQualifyingRun {
@@ -1268,6 +1330,7 @@ mod tests {
             starting_cash: 10_000.0,
             slippage_bps: 0.0,
             fee_override: None,
+            max_leverage: 1.0,
             warmup_from: None,
             close_at_end: true,
         };

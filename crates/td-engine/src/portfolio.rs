@@ -9,13 +9,11 @@ use td_core::{InstrumentKind, Side};
 /// - Perpetual: the wallet balance. Opening a position costs only the fee; realised P&L, fees and
 ///   funding move the balance. Equity is `cash + position * (mark - avg_entry)`.
 ///
-/// shortcut: perpetual positions are only marked to market and charged funding; there is no
-/// margin, leverage limit or liquidation. Upgrade when strategies trade with real leverage.
-///
-/// shortcut: spot buys are checked against the cash when they are submitted, a market buy at the
-/// decision bar's close and a stop at its trigger, so a fill above that price (a gap up at the
-/// next open, or slippage) can still overdraw the cash slightly. Upgrade by checking again in the
-/// broker at fill time if a strategy depends on never overdrawing.
+/// Neither balance goes below zero. A spot buy is cut at fill time to what the cash covers (see
+/// [`crate::SimBroker`]). A perpetual position is capped by the session's leverage limit when an
+/// order is submitted and liquidated when the maintenance margin is breached (see
+/// [`crate::Session::on_bar`]); a perpetual account left flat with a negative balance is floored
+/// at zero and the shortfall recorded in [`Portfolio::shortfall_written_off`].
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Portfolio {
     kind: InstrumentKind,
@@ -26,6 +24,7 @@ pub struct Portfolio {
     fees_paid: f64,
     funding_paid: f64,
     mark_price: f64,
+    shortfall_written_off: f64,
 }
 
 impl Portfolio {
@@ -39,6 +38,7 @@ impl Portfolio {
             fees_paid: 0.0,
             funding_paid: 0.0,
             mark_price: 0.0,
+            shortfall_written_off: 0.0,
         }
     }
 
@@ -79,6 +79,14 @@ impl Portfolio {
     /// do not mark it.
     pub fn mark_price(&self) -> f64 {
         self.mark_price
+    }
+
+    /// Losses beyond the account's equity that were written off: a perpetual account left flat
+    /// with a negative balance (a liquidation that filled past its price on a gap, or a stop that
+    /// filled beyond the liquidation price) has its balance set to zero, as a venue's insurance
+    /// fund would cover the rest.
+    pub fn shortfall_written_off(&self) -> f64 {
+        self.shortfall_written_off
     }
 
     pub fn equity(&self) -> f64 {
@@ -129,6 +137,19 @@ impl Portfolio {
         self.cash -= payment;
         self.funding_paid += payment;
         payment
+    }
+
+    /// Sets the balance to exactly zero, for a liquidation that keeps the rest of the margin.
+    pub(crate) fn clear_cash(&mut self) {
+        self.cash = 0.0;
+    }
+
+    /// Floors a flat perpetual account's negative balance at zero and records the shortfall.
+    pub(crate) fn write_off_shortfall(&mut self) {
+        if self.kind == InstrumentKind::Perpetual && self.position == 0.0 && self.cash < 0.0 {
+            self.shortfall_written_off -= self.cash;
+            self.cash = 0.0;
+        }
     }
 
     pub(crate) fn mark(&mut self, price: f64) {

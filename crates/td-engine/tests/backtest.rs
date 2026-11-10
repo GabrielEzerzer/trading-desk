@@ -9,7 +9,7 @@ use serde_json::Value;
 use td_core::{Candle, Millis, Timeframe};
 use td_engine::{
     BacktestConfig, BacktestResult, ENGINE_REVISION, EngineError, ParamValue, Params, RunKind,
-    SavedRun, data_fingerprint, list, load, rerun, run, save,
+    SavedRun, config_fingerprint, data_fingerprint, list, load, rerun, run, save, save_with_files,
 };
 
 const HOUR: Millis = 3_600_000;
@@ -76,6 +76,7 @@ fn config() -> BacktestConfig {
         starting_cash: 10_000.0,
         slippage_bps: 5.0,
         fee_override: None,
+        max_leverage: 1.0,
         warmup_from: None,
         close_at_end: false,
     }
@@ -255,6 +256,11 @@ fn save_load_and_rerun_reproduce_the_result_exactly() {
     assert_eq!(s.total_return, result.metrics.total_return);
     assert_eq!(s.trades, result.metrics.trades);
     assert!(s.created_at > T0);
+    assert_eq!(&saved.summary(id.clone()), s);
+    assert_eq!(
+        config_fingerprint(&config(), &synthetic_bars(), &synthetic_funding()).unwrap(),
+        result.data_fingerprint
+    );
     // No temporary directory is left behind.
     assert_eq!(std::fs::read_dir(&runs).unwrap().count(), 1);
 }
@@ -278,6 +284,14 @@ fn list_is_newest_first_and_skips_other_entries() {
         })
         .expect("the second save still had the first run's id after 100 tries");
     std::fs::create_dir(runs.join(".tmp-1762790000123-0a1b2c3d")).unwrap();
+    // A save's temporary directory, here holding a whole run, is not listed.
+    let tmp = runs.join(".tmp-1762790000123-0a1b2c3d-4242-7");
+    std::fs::create_dir(&tmp).unwrap();
+    std::fs::copy(
+        runs.join(first.as_str()).join("result.json"),
+        tmp.join("result.json"),
+    )
+    .unwrap();
     std::fs::create_dir(runs.join("not-a-run")).unwrap();
     std::fs::create_dir(runs.join("1762790000123-0a1b2c3d")).unwrap();
     let ids: Vec<_> = list(runs).unwrap().into_iter().map(|s| s.id).collect();
@@ -286,6 +300,84 @@ fn list_is_newest_first_and_skips_other_entries() {
         load(runs, "../outside"),
         Err(td_engine::StoreError::InvalidRunId(_))
     ));
+}
+
+#[test]
+fn concurrent_saves_of_the_same_run_neither_fail_nor_clobber_each_other() {
+    let saved = SavedRun::Backtest(Box::new(run_synthetic()));
+    let mut same_id = 0;
+    for _ in 0..200 {
+        let dir = tempfile::tempdir().unwrap();
+        let runs = dir.path();
+        let barrier = std::sync::Barrier::new(2);
+        let (a, b) = std::thread::scope(|s| {
+            let save_after_barrier = || {
+                barrier.wait();
+                save_with_files(&saved, runs, &[("data.json", "{}".as_bytes())])
+            };
+            let a = s.spawn(save_after_barrier);
+            let b = s.spawn(save_after_barrier);
+            (a.join().unwrap(), b.join().unwrap())
+        });
+        let mut ids = Vec::new();
+        for r in [a, b] {
+            match r {
+                Ok(id) => ids.push(id),
+                Err(td_engine::StoreError::RunExists(_)) => same_id += 1,
+                Err(e) => panic!("a concurrent save failed: {e}"),
+            }
+        }
+        // One save at least succeeds, and two that do have different ids.
+        assert!(!ids.is_empty());
+        ids.sort();
+        ids.dedup();
+        for id in &ids {
+            assert_eq!(load(runs, id.as_str()).unwrap(), saved);
+            let run_dir = runs.join(id.as_str());
+            assert_eq!(std::fs::read(run_dir.join("data.json")).unwrap(), b"{}");
+            assert!(run_dir.join("config.json").is_file());
+        }
+        // Only the saved runs are left: no temporary directory.
+        let mut left: Vec<_> = std::fs::read_dir(runs)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        left.sort();
+        let ids: Vec<_> = ids.iter().map(|id| id.to_string()).collect();
+        assert_eq!(left, ids);
+    }
+    eprintln!("{same_id} of 200 rounds saved both runs in the same millisecond");
+}
+
+#[test]
+fn extra_files_are_saved_with_the_run_and_only_under_plain_new_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let runs = dir.path();
+    let saved = SavedRun::Backtest(Box::new(run_synthetic()));
+    let id = save_with_files(&saved, runs, &[("data.json", "{}".as_bytes())]).unwrap();
+    let run_dir = runs.join(id.as_str());
+    assert_eq!(std::fs::read(run_dir.join("data.json")).unwrap(), b"{}");
+    assert!(run_dir.join("result.json").is_file());
+
+    for name in [
+        "result.json",
+        "config.json",
+        "Result.JSON",
+        "CONFIG.json",
+        "../escape.json",
+        "a/b.json",
+        "..",
+    ] {
+        assert!(
+            matches!(
+                save_with_files(&saved, runs, &[(name, "{}".as_bytes())]),
+                Err(td_engine::StoreError::InvalidFileName(_))
+            ),
+            "{name}"
+        );
+    }
+    // Nothing but the first run was written.
+    assert_eq!(std::fs::read_dir(runs).unwrap().count(), 1);
 }
 
 #[test]

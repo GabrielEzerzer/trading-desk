@@ -2,7 +2,8 @@
 //! that falls in it, goes to the engine session.
 //!
 //! Resume: [`PaperSession::open`] replays the log, then [`start`] runs the feed from the end of
-//! the last bar fed. The feed backfills every minute missed while the session was stopped over
+//! the last bar fed. A session made by another engine revision ends at once with an error (see
+//! [`PaperSession::check_resumable`]). The feed backfills every minute missed while the session was stopped over
 //! REST and the session processes those bars, funding included, as if it had stayed connected.
 //! Orders that were open when it stopped can fill on those bars. That keeps a resumed session
 //! identical to one that never stopped, at the cost of trades it could not really have made while
@@ -187,6 +188,7 @@ async fn drive(
     let shared = &*shared;
     let (id, timeframe, data_dir, next, live) = {
         let s = lock(shared);
+        s.check_resumable()?;
         let config = s.config();
         (
             config.instrument.id.clone(),
