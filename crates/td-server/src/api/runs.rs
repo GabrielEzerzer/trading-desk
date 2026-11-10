@@ -388,10 +388,11 @@ fn report_progress(ctx: &JobCtx, done: usize, total: usize) -> ControlFlow<()> {
     }
     let step = (total / 200).max(1);
     if done.is_multiple_of(step) || done == total {
-        ctx.progress(
-            done as f64 / total.max(1) as f64,
-            format!("{done} of {total} backtests"),
-        );
+        // Worker threads can report their counts out of order; `advance` keeps the shown
+        // progress from moving backwards.
+        ctx.advance(done as f64 / total.max(1) as f64, || {
+            format!("{done} of {total} backtests")
+        });
     }
     ControlFlow::Continue(())
 }

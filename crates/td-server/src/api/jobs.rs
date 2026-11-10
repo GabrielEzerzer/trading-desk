@@ -188,6 +188,19 @@ impl JobCtx {
         });
     }
 
+    /// Like [`JobCtx::progress`], but ignored when `fraction` is below the progress already shown,
+    /// so reports from several threads that arrive out of order never move it backwards.
+    pub fn advance(&self, fraction: f64, message: impl FnOnce() -> String) {
+        self.jobs.update_if(self.id, |job| {
+            if !(fraction.is_finite() && fraction >= job.progress) {
+                return false;
+            }
+            job.progress = fraction.clamp(0.0, 1.0);
+            job.message = message();
+            true
+        });
+    }
+
     pub fn is_cancelled(&self) -> bool {
         self.cancel.load(Ordering::SeqCst)
     }
@@ -424,9 +437,18 @@ impl Jobs {
     /// Changes a job and publishes its new state. Events are sent under the lock, so subscribers
     /// see a job's states in the order they happened.
     fn update(&self, id: u64, change: impl FnOnce(&mut JobInfo)) {
+        self.update_if(id, |job| {
+            change(job);
+            true
+        });
+    }
+
+    /// [`Jobs::update`], publishing only when `change` returns true.
+    fn update_if(&self, id: u64, change: impl FnOnce(&mut JobInfo) -> bool) {
         let mut inner = self.lock();
-        if let Some(entry) = inner.jobs.get_mut(&id) {
-            change(&mut entry.info);
+        if let Some(entry) = inner.jobs.get_mut(&id)
+            && change(&mut entry.info)
+        {
             let _ = self.events.send(entry.info.clone());
         }
     }
@@ -510,6 +532,29 @@ mod tests {
             0,
             "the queued job never ran"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn progress_reported_out_of_order_never_moves_backwards() {
+        let jobs = Arc::new(Jobs::default());
+        let mut events = jobs.subscribe();
+        let id = jobs
+            .submit(request("ORDER"), |ctx| {
+                ctx.advance(0.5, || "half".into());
+                ctx.advance(0.4, || "late".into());
+                ctx.advance(0.6, || "more".into());
+                Err(JobError::Cancelled)
+            })
+            .expect("accepted")
+            .id;
+        wait_for(&jobs, id, JobStatus::Cancelled).await;
+        let mut shown = Vec::new();
+        while let Ok(job) = events.try_recv() {
+            if job.status == JobStatus::Running && job.progress > 0.0 {
+                shown.push((job.progress, job.message));
+            }
+        }
+        assert_eq!(shown, [(0.5, "half".into()), (0.6, "more".into())]);
     }
 
     #[tokio::test(flavor = "multi_thread")]
