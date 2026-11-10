@@ -29,7 +29,7 @@ describe.skipIf(!present)('the real td-server', () => {
   it('answers /health and /strategies through the main-process client, streams jobs, and stops cleanly', async () => {
     const dataDir = await mkdtemp(join(tmpdir(), 'td-gui-test-'))
     dirs.push(dataDir)
-    const env = { ...process.env, TD_DATA_DIR: dataDir }
+    const env: NodeJS.ProcessEnv = { ...process.env, TD_DATA_DIR: dataDir }
     delete env.TD_TOKEN
     const lines: string[] = []
     const sidecar = new Sidecar({ bin: BIN, env, log: (line) => lines.push(line) })
