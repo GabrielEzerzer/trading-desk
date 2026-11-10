@@ -129,11 +129,14 @@ fn data_dir_from(
 }
 
 /// Checks that a symbol is safe as a folder or file name: letters (any script), digits, `-`, `_`.
+/// Lowercase letters are refused: venues list symbols in uppercase, and on a case-insensitive
+/// file system `btcusdt` would share `BTCUSDT`'s folder while bypassing the per-file write locks
+/// and the API's one-download-per-instrument check, which compare exact strings.
 pub(crate) fn check_symbol(symbol: &str) -> Result<(), DataError> {
     let ok = !symbol.is_empty()
         && symbol
             .chars()
-            .all(|c| c.is_alphanumeric() || c == '-' || c == '_');
+            .all(|c| (c.is_alphanumeric() && !c.is_lowercase()) || c == '-' || c == '_');
     if ok {
         Ok(())
     } else {
@@ -651,7 +654,9 @@ mod tests {
         ] {
             assert!(check_symbol(ok).is_ok(), "{ok}");
         }
-        for bad in ["", "..", "BTC/USDT", "..\\x", "a b", "C:"] {
+        for bad in [
+            "", "..", "BTC/USDT", "..\\x", "a b", "C:", "btcusdt", "BTCusdt",
+        ] {
             assert!(check_symbol(bad).is_err(), "{bad}");
         }
     }
