@@ -13,6 +13,7 @@ const WEEK: Millis = 7 * DAY;
 const FIRST_MONDAY: Millis = 4 * DAY;
 
 /// A candle interval. Serialized and displayed as `1m`, `5m`, `15m`, `30m`, `1h`, `4h`, `1d`, `1w`.
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum Timeframe {
     #[serde(rename = "1m")]
