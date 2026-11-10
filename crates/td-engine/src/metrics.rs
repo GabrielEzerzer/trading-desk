@@ -52,7 +52,7 @@ pub struct MetricsReport {
     pub avg_trade_pnl: Option<f64>,
     /// Median net P&L per closed trade.
     pub median_trade_pnl: Option<f64>,
-    /// Mean bars held per closed trade.
+    /// Mean bars held per closed trade: bars, not time (see [`Trade::bars_held`]).
     pub avg_bars_held: Option<f64>,
     /// See [`exposure`].
     pub exposure: Option<f64>,

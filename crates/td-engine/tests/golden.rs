@@ -508,7 +508,7 @@ fn funding_due_in_a_gap_is_charged_at_the_next_bar_open() {
     approx(p.funding_paid(), 0.0208);
     approx(p.cash(), 10_000.0 - 0.4 - 0.0208);
     // Equity at 09:00: cash 9999.5792 plus 2 * (104 - 100).
-    approx(equity(&s)[2], 10_007.5792);
+    approx(equity(&s)[2], 10_007.579_2);
     let f = s.bar_funding()[2];
     approx(f.at_open, 0.0208);
     assert_eq!(f.in_bar, 0.0);

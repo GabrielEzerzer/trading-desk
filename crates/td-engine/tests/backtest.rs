@@ -258,12 +258,18 @@ fn list_is_newest_first_and_skips_other_entries() {
     let runs = dir.path();
     let result = run_synthetic();
     let first = save(&result, runs).unwrap();
-    let mut second = save(&result, runs);
-    // Two saves of the same result in the same millisecond get the same id; wait and retry.
-    while second.is_err() {
-        second = save(&result, runs);
-    }
-    let second = second.unwrap();
+    // Two saves of the same result in the same millisecond get the same id; wait and retry, a
+    // bounded number of times. Any other error fails at once.
+    let second = (0..100)
+        .find_map(|_| match save(&result, runs) {
+            Ok(id) => Some(id),
+            Err(td_engine::StoreError::RunExists(_)) => {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+                None
+            }
+            Err(e) => panic!("saving the second run failed: {e}"),
+        })
+        .expect("the second save still had the first run's id after 100 tries");
     std::fs::create_dir(runs.join(".tmp-1762790000123-0a1b2c3d")).unwrap();
     std::fs::create_dir(runs.join("not-a-run")).unwrap();
     std::fs::create_dir(runs.join("1762790000123-0a1b2c3d")).unwrap();

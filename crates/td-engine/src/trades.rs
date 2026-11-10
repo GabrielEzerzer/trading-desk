@@ -53,7 +53,9 @@ pub struct Trade {
     /// `net_pnl / (entry_price * qty)`: net P&L over the largest entry notional.
     pub return_on_notional: f64,
     /// Bars from the entry fill's bar to the exit fill's bar; for an open trade, to the end of the
-    /// last bar.
+    /// last bar. It counts bars fed, not time: missing bars in a gap are not counted, so across a
+    /// gap it understates how long the position was held. For a closed trade, the time between
+    /// the entry and exit fills' bars is `exit_time - entry_time`.
     pub bars_held: usize,
 }
 
