@@ -5,7 +5,7 @@ import { Composer, type ComposerHandle } from './Composer'
 import { formatDay, formatInstrument, formatNumber } from './format'
 import { overallProgress, progressLabel } from './progress'
 import { Result } from './Result'
-import { type RunFailure, TIMEFRAMES, instrumentKey, runFailure } from './runs'
+import { type RunFailure, TIMEFRAMES, instrumentKey, laterRun, runFailure } from './runs'
 import {
   type LabSource,
   type LabStrategy,
@@ -27,6 +27,8 @@ interface ActiveRun {
 interface ActiveDownload {
   instrument: InstrumentId
   fraction: number
+  /** Cancel was pressed; the view stays until the engine ends the job. */
+  cancelling: boolean
   cancel(): void
 }
 
@@ -132,7 +134,9 @@ export function StrategyLab() {
     handle.result.then(
       (finished) => {
         setResults((r) => ({ ...r, [finished.last.id]: finished.verdict }))
-        setStrategies((list) => list?.map((s) => (s.name === name ? { ...s, last: finished.last } : s)) ?? list)
+        setStrategies(
+          (list) => list?.map((s) => (s.name === name ? { ...s, last: laterRun(s.last, finished.last) } : s)) ?? list,
+        )
         if (!cancelled) setFresh(name)
         setRun((r) => (r?.cancel === cancel ? null : r))
       },
@@ -150,7 +154,12 @@ export function StrategyLab() {
     const handle = source.download(target, ({ fraction }) =>
       setDownload((d) => (d && d.instrument === target ? { ...d, fraction } : d)),
     )
-    setDownload({ instrument: target, fraction: 0, cancel: handle.cancel })
+    // The view stays until the job ends: the engine refuses a second download while one runs.
+    const cancel = () => {
+      handle.cancel()
+      setDownload((d) => (d && d.instrument === target ? { ...d, cancelling: true } : d))
+    }
+    setDownload({ instrument: target, fraction: 0, cancelling: false, cancel })
     handle.result
       .then(async () => {
         const stored = await source.datasets()
@@ -359,12 +368,21 @@ function NoData({ strategy, instrument, title, reason, download, error, onDownlo
       {download ? (
         <>
           <ProgressBar
-            label={`Downloading the history of ${formatInstrument(download.instrument)}`}
+            label={
+              download.cancelling
+                ? 'Cancelling the download'
+                : `Downloading the history of ${formatInstrument(download.instrument)}`
+            }
             name="Download progress"
             value={download.fraction}
             valueText={(percent) => `${percent}% downloaded`}
           />
-          <button type="button" className="button-float" onClick={download.cancel}>
+          <button
+            type="button"
+            className="button-float"
+            onClick={download.cancelling ? undefined : download.cancel}
+            aria-disabled={download.cancelling}
+          >
             Cancel the download
           </button>
         </>

@@ -2,7 +2,7 @@ import { ApiError } from '@td/shared'
 import type { CoverageResponse, RunDetail, RunSummary } from '@td/shared'
 import { describe, expect, it } from 'vitest'
 import engine from '../../../../mock/engine.json'
-import { datasetRange, latestRuns, runFailure, toFinished, toVerdict } from './runs'
+import { datasetRange, laterRun, latestRuns, runFailure, toFinished, toVerdict } from './runs'
 import { RunCancelled } from './source'
 
 const details = engine.details as unknown as Record<string, RunDetail>
@@ -144,5 +144,18 @@ describe('a failed run as the state to show', () => {
     })
     expect(runFailure(new Error('the job failed: out of memory'))).toEqual({ kind: 'failed', message: 'the job failed: out of memory' })
     expect(runFailure('engine gone')).toEqual({ kind: 'failed', message: 'engine gone' })
+  })
+})
+
+describe("a finished run as the strategy's last run", () => {
+  const run = (finishedAt: number) => ({ id: `${finishedAt}-00000000`, finishedAt, totalReturn: 0.1, decision: null })
+
+  it('replaces an older last run, or none', () => {
+    expect(laterRun(null, run(2))).toEqual(run(2))
+    expect(laterRun(run(1), run(2))).toEqual(run(2))
+  })
+
+  it('keeps a newer last run, when a run cancelled while saving finishes late', () => {
+    expect(laterRun(run(3), run(2))).toEqual(run(3))
   })
 })

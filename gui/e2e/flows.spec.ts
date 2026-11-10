@@ -200,11 +200,16 @@ test.describe('running on the engine', () => {
     await open(engine)
     await page.getByRole('button', { name: /Donchian breakout/ }).click()
     await page.getByRole('button', { name: 'Run', exact: true }).click()
-    await expect(page.getByText(/^Step 1 of 1/)).toBeVisible()
+    // Cancel before "Saving the result": past that, the job saves the run anyway.
+    await expect(page.getByText(/^Step 1 of 1 · (Loading the data|Running the backtest)$/)).toBeVisible()
     await page.getByRole('button', { name: 'Cancel the run' }).click()
     await expect(page.getByText('Not run', { exact: true })).toBeVisible()
     await expect(page.getByRole('alert')).toHaveCount(0)
     await expect.poll(() => cancelSent(page)).toBe(true)
+    // A job that ignored the cancel would show its result within its three 700 ms steps.
+    await page.waitForTimeout(3 * 700 + 300)
+    await expect(page.locator('#verdict')).toHaveCount(0)
+    await expect(page.getByText('Not run', { exact: true })).toBeVisible()
   })
 
   test('a cancel that lands after the last checkpoint still shows the saved result', async ({ page, open }) => {
@@ -272,6 +277,9 @@ test.describe('running on the engine', () => {
     await page.getByRole('button', { name: /Donchian breakout/ }).click()
     await page.getByRole('button', { name: 'Download BTCUSDT history' }).click()
     await page.getByRole('button', { name: 'Cancel the download' }).click()
+    // The engine stops the job at its next step; until then the view says so and Cancel is spent.
+    await expect(page.getByText('Cancelling the download')).toBeVisible()
+    await expect(page.getByRole('button', { name: 'Cancel the download' })).toHaveAttribute('aria-disabled', 'true')
     await expect(page.getByRole('button', { name: 'Download BTCUSDT history' })).toBeVisible()
     await expect(page.getByRole('alert')).toHaveCount(0)
     await expect.poll(() => cancelSent(page)).toBe(true)

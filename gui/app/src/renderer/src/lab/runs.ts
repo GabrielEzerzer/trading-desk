@@ -28,6 +28,14 @@ export function runSavedAt(id: string): Millis {
 }
 
 /**
+ * A strategy's last run once `finished` has finished: `finished`, unless the last run is newer. A
+ * run cancelled while saving still finishes, and can finish after a later run did.
+ */
+export function laterRun(last: LastRun | null, finished: LastRun): LastRun {
+  return last && last.finishedAt > finished.finishedAt ? last : finished
+}
+
+/**
  * Each strategy's latest saved backtest.
  *
  * shortcut: sweeps, out-of-sample and walk-forward runs are left out, because the Lab runs one
