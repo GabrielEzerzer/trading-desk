@@ -157,6 +157,15 @@ struct TestServer {
     _dir: TempDir,
 }
 
+/// Stops every unfinished job when a test ends, including by a failed assertion: dropping the
+/// runtime waits for blocking tasks, so a job that holds a slot until cancelled would otherwise
+/// hang the suite instead of failing the test.
+impl Drop for TestServer {
+    fn drop(&mut self) {
+        self.server.jobs().cancel_all();
+    }
+}
+
 impl TestServer {
     /// A server whose store holds `days` days of minutes for BTCUSDT spot and perpetual, with a
     /// 30-minute outage at 10:00 on the second day and perpetual funding every 8 hours.
