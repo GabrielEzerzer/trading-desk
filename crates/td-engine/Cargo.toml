@@ -8,6 +8,10 @@ publish.workspace = true
 [dependencies]
 td-core.workspace = true
 serde.workspace = true
+# float_roundtrip parses every f64 back to the exact value it was written from, so a saved
+# result loads bit for bit.
+serde_json = { workspace = true, features = ["float_roundtrip"] }
+sha2.workspace = true
 thiserror.workspace = true
 ts-rs = { workspace = true, optional = true }
 
@@ -17,4 +21,4 @@ ts = ["dep:ts-rs", "td-core/ts"]
 
 [dev-dependencies]
 proptest.workspace = true
-serde_json.workspace = true
+tempfile.workspace = true

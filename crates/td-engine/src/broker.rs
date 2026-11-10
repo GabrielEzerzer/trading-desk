@@ -1,4 +1,4 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use td_core::{
     Candle, FeeSchedule, Fill, Instrument, Liquidity, Millis, OrderId, OrderRequest, OrderType,
     Side, TimeInForce,
@@ -7,7 +7,7 @@ use td_core::{
 use crate::{FillCheck, FillModel};
 
 /// An order the session accepted or rejected, with its request as rounded at submission.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Order {
     pub id: OrderId,
     pub request: OrderRequest,
@@ -23,7 +23,7 @@ pub struct Order {
 /// A protective stop attached to an entry with [`crate::Context::submit_with_stop`]. When the
 /// entry fills, the broker places a reduce-only stop on the other side, for the filled quantity,
 /// under `id`.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct AttachedStop {
     pub id: OrderId,
     pub trigger: f64,
@@ -52,7 +52,7 @@ impl AttachedStop {
 /// Why an attached stop is cancelled along with its entry.
 pub(crate) const ENTRY_CANCELLED: &str = "its entry was cancelled before it filled";
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "status", content = "reason", rename_all = "snake_case")]
 pub enum OrderStatus {
     /// A protective stop waiting for its entry to fill.

@@ -66,7 +66,9 @@ pub struct CandleFillModel {
 }
 
 impl CandleFillModel {
-    fn slip(&self, price: f64, side: Side, inst: &Instrument) -> f64 {
+    /// Moves `price` against the order by the slippage and rounds it to the tick against the
+    /// order: buys up, sells down.
+    pub(crate) fn slip(&self, price: f64, side: Side, inst: &Instrument) -> f64 {
         let factor = self.slippage_bps / 10_000.0;
         match side {
             Side::Buy => inst.round_price(price * (1.0 + factor), Rounding::Up),

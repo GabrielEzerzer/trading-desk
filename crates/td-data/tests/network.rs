@@ -67,3 +67,50 @@ fn instruments_from_each_venue() {
         }
     }
 }
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "streams from Binance and Bybit for about two minutes"]
+async fn live_streams_give_closed_minutes() {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use td_data::live::{FeedEvent, FeedSpec, VenueRest, run_feed};
+    use tokio::sync::mpsc;
+
+    let (tx, mut rx) = mpsc::channel(256);
+    let mut feeds = Vec::new();
+    for venue in [Venue::Binance, Venue::Bybit] {
+        for kind in [InstrumentKind::Spot, InstrumentKind::Perpetual] {
+            let id = InstrumentId {
+                venue,
+                symbol: "BTCUSDT".into(),
+                kind,
+            };
+            let (feed_tx, mut feed_rx) = mpsc::channel(64);
+            let spec = FeedSpec::new(id.clone(), Timeframe::M1, None);
+            feeds.push(tokio::spawn(run_feed(spec, Arc::new(VenueRest), feed_tx)));
+            let tx = tx.clone();
+            feeds.push(tokio::spawn(async move {
+                while let Some(event) = feed_rx.recv().await {
+                    if tx.send((id.to_string(), event)).await.is_err() {
+                        return;
+                    }
+                }
+            }));
+        }
+    }
+    drop(tx);
+    let mut bars: std::collections::BTreeMap<String, usize> = Default::default();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(130);
+    while let Ok(Some((id, event))) = tokio::time::timeout_at(deadline, rx.recv()).await {
+        println!("{id}: {event:?}");
+        if let FeedEvent::Bar(_) = event {
+            *bars.entry(id).or_default() += 1;
+        }
+    }
+    for feed in feeds {
+        feed.abort();
+    }
+    println!("closed bars per stream: {bars:?}");
+    assert_eq!(bars.len(), 4, "every stream gave a closed bar");
+}
