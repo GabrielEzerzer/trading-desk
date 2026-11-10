@@ -108,8 +108,10 @@ pub fn stream_url(id: &InstrumentId) -> String {
         (Venue::Binance, InstrumentKind::Spot) => {
             format!("wss://stream.binance.com:9443/ws/{lower}@kline_1m")
         }
+        // USD-M serves market streams under `/market`; the old `/ws/<stream>` path still accepts
+        // the connection but sent no frames when checked on 2026-11-10.
         (Venue::Binance, InstrumentKind::Perpetual) => {
-            format!("wss://fstream.binance.com/ws/{lower}@kline_1m")
+            format!("wss://fstream.binance.com/market/ws/{lower}@kline_1m")
         }
         (Venue::Bybit, InstrumentKind::Spot) => "wss://stream.bybit.com/v5/public/spot".into(),
         (Venue::Bybit, InstrumentKind::Perpetual) => {
