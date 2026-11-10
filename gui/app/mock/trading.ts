@@ -311,6 +311,8 @@ class MockSession {
         starting_cash: this.request.starting_cash,
         slippage_bps: this.request.slippage_bps,
         fees: null,
+        // The request has no leverage, so the engine uses its default of 1x.
+        max_leverage: 1,
       },
       status: this.status,
       cash: this.cash,
