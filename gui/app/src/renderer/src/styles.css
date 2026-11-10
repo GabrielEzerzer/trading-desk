@@ -841,22 +841,29 @@ button {
   z-index: 0;
 }
 
-/* The link the chart library's licence asks for, quiet, left of the price scale. The padding
-   makes its hit area 24 px tall; the top is pulled up by the same amount to keep the text where
-   it was. */
+/* The link and notice the chart library's licence asks for, quiet, left of the price scale. The
+   link's padding makes its hit area 24 px tall; the top is pulled up by the same amount to keep
+   its text where it was. */
 .chart-attribution {
   position: absolute;
   top: calc(var(--space-4) - var(--space-1));
   z-index: 1;
-  padding-block: var(--space-1);
+  display: grid;
+  justify-items: end;
+  margin: 0;
   color: var(--grey-2);
   font-size: var(--text-label);
   line-height: var(--text-label-line);
+}
+
+.chart-attribution a {
+  padding-block: var(--space-1);
+  color: inherit;
   text-decoration: none;
   transition: color var(--duration-hover) var(--ease-standard);
 }
 
-.chart-attribution:hover {
+.chart-attribution a:hover {
   color: var(--ink);
 }
 

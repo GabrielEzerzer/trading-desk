@@ -1,13 +1,10 @@
 // The live chart, drawn with TradingView Lightweight Charts.
 //
-// Attribution notice, from the library's NOTICE file, as its licence (Apache-2.0) asks:
-//   TradingView Lightweight Charts™
-//   Copyright (с) 2025 TradingView, Inc. https://www.tradingview.com/
-//
-// The licence also asks for a link to https://www.tradingview.com/ where users see the chart. The
-// library's own `attributionLogo` injects a <style> element, which the app's content security
-// policy (style-src 'self') blocks, so the logo is turned off and the chart shows a plain
-// "Charting by TradingView" link instead. Main opens exactly that link in the browser (links.ts).
+// The library's licence (Apache-2.0, README "License") asks for the attribution notice from its
+// NOTICE file and a link to https://www.tradingview.com/ on a page users see. The chart shows both
+// in its top right corner. The library's own `attributionLogo` injects a <style> element, which the
+// app's content security policy (style-src 'self') blocks, so the logo is turned off and the link
+// is a plain "Charting by TradingView". Main opens exactly that link in the browser (links.ts).
 
 import type { Candle, Fill, Instrument, Order, Timeframe } from '@td/shared'
 import {
@@ -181,15 +178,12 @@ export function Chart({ candles, seriesKey, revision, timeframe, instrument, fil
   return (
     <div className="chart-host">
       <div className="chart-canvas" ref={host} />
-      <a
-        className="chart-attribution"
-        href={TRADINGVIEW_URL}
-        target="_blank"
-        rel="noreferrer"
-        style={{ right: `calc(${scaleWidth}px + var(--space-3))` }}
-      >
-        Charting by TradingView
-      </a>
+      <p className="chart-attribution" style={{ right: `calc(${scaleWidth}px + var(--space-3))` }}>
+        <a href={TRADINGVIEW_URL} target="_blank" rel="noreferrer">
+          Charting by TradingView
+        </a>
+        <span>TradingView Lightweight Charts™ · Copyright © 2025 TradingView, Inc.</span>
+      </p>
     </div>
   )
 }
