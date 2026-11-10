@@ -86,8 +86,9 @@ fn sma(bars: &[Candle], n: usize) -> f64 {
 impl Strategy for SmaCross {
     fn on_bar(&mut self, ctx: &mut Context, bar: &Candle) {
         let bars = ctx.bars();
-        // Wait for the previous order to fill before deciding again.
-        if bars.len() < self.slow || !ctx.open_orders().is_empty() {
+        // Wait for the previous order to fill before deciding again, and send nothing while
+        // warming up: it would only be rejected.
+        if ctx.is_warming_up() || bars.len() < self.slow || !ctx.open_orders().is_empty() {
             return;
         }
         let (fast, slow) = (sma(bars, self.fast), sma(bars, self.slow));

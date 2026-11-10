@@ -1,4 +1,4 @@
-use td_core::{Candle, InstrumentKind, OrderId, OrderType, Side};
+use td_core::{Candle, InstrumentKind, OrderId, OrderType, Rounding, Side};
 
 use super::{affordable_qty, order};
 use crate::{
@@ -12,7 +12,9 @@ use crate::{
 /// opposite `exit` channel. The position is sized so that a stop `atr_stop` ATRs from the entry
 /// loses `risk` of equity. That stop sits `atr_stop` ATRs from the close the entry is decided on
 /// and is attached to the entry, so it is placed as a reduce-only stop order when the entry fills
-/// and already covers the entry's own bar. The size is also capped so that the entry's value,
+/// and already covers the entry's own bar. The strategy never trades without that stop: when the
+/// distance reaches the close, a long's stop would sit at or below zero, so that entry is skipped
+/// and no order is sent. The size is also capped so that the entry's value,
 /// plus the taker fee, slippage and a small margin, fits in the cash: the strategy never uses
 /// leverage, and a spot entry passes the cash check.
 ///
@@ -52,7 +54,8 @@ pub(crate) fn entry() -> StrategyEntry {
                 default: ParamValue::Float(2.0),
                 min: Some(0.1),
                 max: None,
-                description: "Distance from the close the entry is decided on to its stop, in ATRs.",
+                description: "Distance from the close the entry is decided on to its stop, in ATRs. \
+                              A long entry whose stop this puts at or below zero is skipped.",
             },
             ParamSpec {
                 name: "risk",
@@ -114,7 +117,8 @@ impl Strategy for DonchianBreakout {
     fn on_bar(&mut self, ctx: &mut Context, bar: &Candle) {
         let bars = ctx.bars();
         let n = bars.len();
-        if n < self.entry.max(self.exit).max(self.atr_period) + 1 {
+        // Send nothing while warming up: it would only be rejected.
+        if ctx.is_warming_up() || n < self.entry.max(self.exit).max(self.atr_period) + 1 {
             return;
         }
         // Wait while an entry or exit order is in flight.
@@ -140,13 +144,16 @@ impl Strategy for DonchianBreakout {
             } else {
                 return;
             };
+            // No trade without a stop, and a stop at or below zero cannot be placed.
+            if ctx.instrument().round_price(trigger, Rounding::Nearest) <= 0.0 {
+                return;
+            }
             // Flat here, so the cash is the whole equity.
             let affordable = affordable_qty(ctx, ctx.cash(), bar.close);
             let qty = (self.risk * ctx.equity() / distance).min(affordable);
             let entry = order(ctx, side, qty, OrderType::Market, false);
-            if let Ok(id) = ctx.submit_with_stop(entry, trigger) {
-                // The attached stop is recorded under the entry's id plus one.
-                self.stop = Some(OrderId(id.0 + 1));
+            if let Ok((_, stop)) = ctx.submit_with_stop(entry, trigger) {
+                self.stop = Some(stop);
             }
         } else {
             let channel = &previous[previous.len() - self.exit..];

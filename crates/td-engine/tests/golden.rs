@@ -6,10 +6,10 @@ mod common;
 use std::sync::{Arc, Mutex};
 
 use common::*;
-use td_core::{Candle, Liquidity, OrderId, OrderType, Side, Timeframe};
+use td_core::{Candle, InstrumentKind, Liquidity, OrderId, OrderType, Side, Timeframe};
 use td_engine::{
-    AttachedStop, Context, EngineError, OrderStatus, Params, Session, Strategy, build_strategy,
-    run_backtest,
+    AttachedStop, Context, EngineError, OrderStatus, Params, Portfolio, Session, Strategy,
+    build_strategy, run_backtest,
 };
 
 fn run(
@@ -339,7 +339,8 @@ fn funding_session(side: Side) -> Session {
         hour(1, 100.0, 106.0, 99.0, 105.0),
         hour(2, 105.0, 111.0, 104.0, 110.0),
     ];
-    // Unsorted on purpose; the event before the first bar falls in no bar and is not charged.
+    // Unsorted on purpose; the event before the first bar falls in no bar and is not charged, and
+    // the one at 2 * H is due at bar 2's open.
     let funding = [
         (2 * H, 0.0001),
         (H + 5_000, 0.0002),
@@ -353,24 +354,120 @@ fn funding_session(side: Side) -> Session {
 #[test]
 fn funding_is_charged_to_longs_on_a_positive_rate() {
     let s = funding_session(Side::Buy);
-    // Fill on bar 1 at 100, fee 0.4. The funding in bar 0 meets a flat position. Bar 1 charges
-    // 2 * 105 * 0.0002 = 0.042, bar 2 charges 2 * 110 * 0.0001 = 0.022.
+    // Fill on bar 1 at 100, fee 0.4. The funding in bar 0 meets a flat position. Bar 1's event is
+    // inside the bar: 2 * 105 (the close) * 0.0002 = 0.042. Bar 2's is due at its open, on the
+    // long held going into it: 2 * 105 (the open) * 0.0001 = 0.021.
     let p = s.portfolio();
-    approx(p.funding_paid(), 0.064);
-    approx(p.cash(), 10_000.0 - 0.4 - 0.064);
-    // Equity on bar 2: cash 9999.536 plus 2 * (110 - 100).
+    approx(p.funding_paid(), 0.063);
+    approx(p.cash(), 10_000.0 - 0.4 - 0.063);
+    // Equity on bar 2: cash 9999.537 plus 2 * (110 - 100).
     approx(equity(&s)[1], 10_000.0 - 0.4 - 0.042 + 10.0);
-    approx(equity(&s)[2], 10_019.536);
+    approx(equity(&s)[2], 10_019.537);
 }
 
 #[test]
 fn funding_is_paid_to_shorts_on_a_positive_rate() {
     let s = funding_session(Side::Sell);
     let p = s.portfolio();
-    approx(p.funding_paid(), -0.064);
-    approx(p.cash(), 10_000.0 - 0.4 + 0.064);
-    // Equity on bar 2: cash 9999.664 plus -2 * (110 - 100).
-    approx(equity(&s)[2], 9_979.664);
+    approx(p.funding_paid(), -0.063);
+    approx(p.cash(), 10_000.0 - 0.4 + 0.063);
+    // Equity on bar 2: cash 9999.663 plus -2 * (110 - 100).
+    approx(equity(&s)[2], 9_979.663);
+}
+
+#[test]
+fn funding_due_at_the_open_is_charged_on_a_long_stopped_out_inside_the_bar() {
+    let i = perp();
+    let bars = [
+        bar(0, 100.0, 101.0, 99.0, 100.0),
+        bar(1, 100.0, 101.0, 99.0, 100.0),
+        bar(2, 100.0, 101.0, 94.0, 96.0),
+    ];
+    let (script, _) = Script::new(vec![
+        (0, req(&i, Side::Buy, 2.0, OrderType::Market)),
+        (
+            1,
+            reduce_only(req(&i, Side::Sell, 2.0, OrderType::Stop { trigger: 95.0 })),
+        ),
+    ]);
+    let funding = [(2 * MIN, 0.001)];
+    let s = run_backtest(script, i, Timeframe::M1, &bars, &funding, config(0.0)).unwrap();
+    // The long of 2 bought at 100 on bar 1 (fee 0.4) is still held at bar 2's open, when the
+    // funding is due: 2 * 100 * 0.001 = 0.2. The stop sells it later in the bar, at 95: fee 0.38,
+    // realised -10.
+    let p = s.portfolio();
+    assert_eq!(p.position(), 0.0);
+    approx(p.funding_paid(), 0.2);
+    // 10000 - 0.4 - 0.2 - 10 - 0.38.
+    approx(p.cash(), 9989.02);
+    approx(equity(&s)[2], 9989.02);
+}
+
+#[test]
+fn an_entry_inside_the_bar_does_not_pay_the_funding_due_at_its_open() {
+    let i = perp();
+    let bars = [
+        bar(0, 100.0, 101.0, 99.0, 100.0),
+        bar(1, 100.0, 101.0, 98.0, 100.0),
+    ];
+    let (script, _) = Script::new(vec![(
+        0,
+        req(&i, Side::Buy, 2.0, OrderType::Limit { price: 99.0 }),
+    )]);
+    let funding = [(MIN, 0.001)];
+    let s = run_backtest(script, i, Timeframe::M1, &bars, &funding, config(0.0)).unwrap();
+    // Flat at bar 1's open, when the funding is due, so nothing is paid. The limit then buys 2 at
+    // 99 inside the bar, as a maker: fee 0.198.
+    let p = s.portfolio();
+    approx(p.position(), 2.0);
+    assert_eq!(p.funding_paid(), 0.0);
+    approx(p.cash(), 9999.802);
+    // Marked at 100: 9999.802 + 2 * (100 - 99).
+    approx(equity(&s)[1], 10_001.802);
+}
+
+#[test]
+fn a_daily_bar_charges_funding_at_its_open_and_inside_it_on_different_positions() {
+    let i = perp();
+    const D: i64 = 86_400_000;
+    const H8: i64 = 8 * 3_600_000;
+    let day = |n: i64, o, h, l, c| Candle {
+        open_time: n * D,
+        ..bar(0, o, h, l, c)
+    };
+    let bars = [
+        day(0, 100.0, 101.0, 99.0, 100.0),
+        day(1, 100.0, 101.0, 99.0, 100.0),
+        day(2, 100.0, 104.0, 97.0, 102.0),
+    ];
+    let (script, _) = Script::new(vec![
+        (0, req(&i, Side::Buy, 1.0, OrderType::Market)),
+        (1, req(&i, Side::Buy, 1.0, OrderType::Limit { price: 98.0 })),
+    ]);
+    // 00:00, 08:00 and 16:00 UTC on days 1 and 2.
+    let funding = [
+        (D, 0.0001),
+        (D + H8, 0.0001),
+        (D + 2 * H8, 0.0001),
+        (2 * D, 0.0001),
+        (2 * D + H8, 0.0002),
+        (2 * D + 2 * H8, 0.0003),
+    ];
+    let s = run_backtest(script, i, Timeframe::D1, &bars, &funding, config(0.0)).unwrap();
+    // Day 1: flat at 00:00, so nothing is due then. The market buy fills at the open at 100, fee
+    // 0.2, and 08:00 and 16:00 are charged on that long of 1 at the close: 1 * 100 * 0.0001 = 0.01
+    // each. Equity: 10000 - 0.2 - 0.02 = 9999.78.
+    let e = equity(&s);
+    approx(e[1], 9999.78);
+    // Day 2: 00:00 is charged on the long of 1 held going into the day, at the open of 100: 0.01.
+    // The limit buys 1 more at 98 inside the bar, maker fee 0.098, for a long of 2 at an average
+    // of 99. 08:00 and 16:00 are charged on that long at the close of 102: 2 * 102 * 0.0002 =
+    // 0.0408 and 2 * 102 * 0.0003 = 0.0612.
+    let p = s.portfolio();
+    approx(p.funding_paid(), 0.02 + 0.01 + 0.0408 + 0.0612);
+    // Cash 10000 - 0.2 - 0.098 - 0.132 = 9999.57, plus 2 * (102 - 99).
+    approx(p.cash(), 9999.57);
+    approx(e[2], 10_005.57);
 }
 
 #[test]
@@ -541,7 +638,8 @@ fn a_protective_stop_beats_a_take_profit_in_the_same_bar() {
         ),
     ]);
     let s = run(i, 0.0, &bars, script);
-    // Bar 2 reaches both 110 and 95. The path is unknown, so the stop is taken first, at 95.
+    // Bar 2 opens at 100, between the two, and reaches both 110 and 95 inside its range. The path
+    // is unknown, so the stop is taken first, at 95.
     let f = s.fills();
     assert_eq!(f.len(), 2);
     assert_eq!(f[1].order_id.0, 3);
@@ -553,6 +651,97 @@ fn a_protective_stop_beats_a_take_profit_in_the_same_bar() {
     assert_eq!(s.portfolio().position(), 0.0);
     // Fees: 0.2 on the entry at 100, 0.19 on the stop at 95. Realised -5.
     approx(s.portfolio().cash(), 10_000.0 - 0.2 - 0.19 - 5.0);
+}
+
+#[test]
+fn a_take_profit_the_bar_opens_through_fills_before_a_stop_inside_the_range() {
+    let i = perp();
+    let bars = [
+        bar(0, 100.0, 101.0, 99.0, 100.0),
+        bar(1, 100.0, 101.0, 99.0, 100.0),
+        bar(2, 112.0, 113.0, 94.0, 95.0),
+    ];
+    let (script, _) = Script::new(vec![
+        (0, req(&i, Side::Buy, 1.0, OrderType::Market)),
+        (
+            1,
+            reduce_only(req(&i, Side::Sell, 1.0, OrderType::Limit { price: 110.0 })),
+        ),
+        (
+            1,
+            reduce_only(req(&i, Side::Sell, 1.0, OrderType::Stop { trigger: 95.0 })),
+        ),
+    ]);
+    let s = run(i, 0.0, &bars, script);
+    // Bar 2 opens at 112, already through the 110 take-profit, so the take-profit fills at the
+    // open, before anything inside the range: at 112 as a maker (the gap rule), fee 0.112. The
+    // fall to 94 that reaches the stop comes after it, when the position is already closed.
+    let f = s.fills();
+    assert_eq!(f.len(), 2);
+    assert_eq!((f[1].order_id.0, f[1].time), (2, 2 * MIN));
+    approx(f[1].price, 112.0);
+    approx(f[1].fee, 0.112);
+    assert_eq!(f[1].liquidity, Liquidity::Maker);
+    assert_eq!(
+        s.orders()[2].status,
+        OrderStatus::Cancelled("reduce-only order would not reduce the position".into())
+    );
+    // Entry at 100, fee 0.2. Realised 112 - 100 = 12: cash 10000 - 0.2 + 12 - 0.112 = 10011.688.
+    let p = s.portfolio();
+    assert_eq!(p.position(), 0.0);
+    approx(p.realised_pnl(), 12.0);
+    approx(p.cash(), 10011.688);
+    approx(equity(&s)[2], 10011.688);
+}
+
+#[test]
+fn an_attached_stop_inside_the_range_waits_for_the_fills_at_the_open() {
+    let i = perp();
+    let bars = [
+        bar(0, 100.0, 101.0, 99.0, 100.0),
+        bar(1, 100.0, 101.0, 99.0, 100.0),
+        bar(2, 112.0, 113.0, 94.0, 95.0),
+    ];
+    let add = req(&i, Side::Buy, 1.0, OrderType::Market);
+    let take_profit = reduce_only(req(&i, Side::Sell, 2.0, OrderType::Limit { price: 110.0 }));
+    let strategy = steps(move |ctx, n| match n {
+        0 => {
+            ctx.submit(add.clone()).unwrap();
+        }
+        1 => {
+            // Adds 1 to the long with a stop at 95 (orders 2 and 3), and takes profit on the
+            // whole position at 110 (order 4).
+            ctx.submit_with_stop(add.clone(), 95.0).unwrap();
+            ctx.submit(take_profit.clone()).unwrap();
+        }
+        _ => {}
+    });
+    let s = run(i, 0.0, &bars, strategy);
+    // Bar 1: order 1 buys 1 at 100, fee 0.2. Bar 2 opens at 112: order 2 buys 1 there, fee 0.224,
+    // for a long of 2 at an average of 106, and the take-profit, which the bar opens through,
+    // sells both at 112 as a maker, fee 0.224. The stop at 95 is placed with order 2's fill, but
+    // the bar only reaches it inside the range, after the fills at the open, and by then there is
+    // nothing left to close.
+    let f = s.fills();
+    assert_eq!(f.len(), 3);
+    let fill = |n: usize| (f[n].order_id.0, f[n].time, f[n].side);
+    assert_eq!(fill(1), (2, 2 * MIN, Side::Buy));
+    approx(f[1].price, 112.0);
+    approx(f[1].fee, 0.224);
+    assert_eq!(fill(2), (4, 2 * MIN, Side::Sell));
+    approx(f[2].price, 112.0);
+    approx(f[2].qty, 2.0);
+    approx(f[2].fee, 0.224);
+    assert_eq!(
+        s.orders()[2].status,
+        OrderStatus::Cancelled("reduce-only order would not reduce the position".into())
+    );
+    // Realised 2 * (112 - 106) = 12: cash 10000 - 0.2 - 0.224 - 0.224 + 12 = 10011.352, flat.
+    let p = s.portfolio();
+    assert_eq!(p.position(), 0.0);
+    approx(p.realised_pnl(), 12.0);
+    approx(p.cash(), 10011.352);
+    approx(equity(&s)[2], 10011.352);
 }
 
 #[test]
@@ -597,7 +786,11 @@ fn an_attached_stop_covers_the_bar_its_entry_fills_on() {
     let entry = req(&i, Side::Buy, 1.0, OrderType::Market);
     let strategy = steps(move |ctx, n| {
         if n == 0 {
-            assert_eq!(ctx.submit_with_stop(entry.clone(), 106.0), Ok(OrderId(1)));
+            // The entry's id and its stop's.
+            assert_eq!(
+                ctx.submit_with_stop(entry.clone(), 106.0),
+                Ok((OrderId(1), OrderId(2)))
+            );
         }
     });
     let s = run(i, 0.0, &bars, strategy);
@@ -1008,6 +1201,49 @@ fn donchian_enters_on_a_breakout_places_a_stop_and_exits() {
 }
 
 #[test]
+fn donchian_skips_an_entry_whose_stop_would_be_at_or_below_zero() {
+    let p = Params::new()
+        .with("entry", td_engine::ParamValue::Int(5))
+        .with("exit", td_engine::ParamValue::Int(3))
+        .with("atr_period", td_engine::ParamValue::Int(3))
+        .with("atr_stop", td_engine::ParamValue::Float(40.0));
+    let strategy = build_strategy("donchian_breakout", &p).unwrap();
+    let s = run_backtest(
+        strategy,
+        perp(),
+        Timeframe::M1,
+        &up_then_down(),
+        &[],
+        config(0.0),
+    )
+    .unwrap();
+    // ATR is 3, so the stop sits 40 * 3 = 120 under the close. On the breakouts from bar 5 (close
+    // 110) to bar 10 (close 120) that is at or below zero, and the strategy sends no order. Bar 11
+    // closes at 122, so the stop is at 2: the entry goes out, sized 100 / 120 = 0.833 after
+    // rounding down to the lot, and fills at bar 12's open of 124. Bar 41's exit closes it.
+    let o = s.orders();
+    assert_eq!(o.len(), 3, "entry, its stop and the exit: {o:?}");
+    assert!(
+        o.iter()
+            .all(|o| !matches!(o.status, OrderStatus::Rejected(_)))
+    );
+    assert_eq!(o[0].submitted_at, 11 * MIN);
+    assert_eq!(
+        o[0].attached_stop,
+        Some(AttachedStop {
+            id: OrderId(2),
+            trigger: 2.0
+        })
+    );
+    let entry = &s.fills()[0];
+    assert_eq!(entry.time, 12 * MIN);
+    approx(entry.price, 124.0);
+    approx(entry.qty, 0.833);
+    assert_eq!(s.fills()[1].time, 42 * MIN);
+    assert_eq!(s.portfolio().position(), 0.0);
+}
+
+#[test]
 fn reference_strategies_size_full_spot_entries_to_pass_the_cash_check() {
     let sma = Params::new()
         .with("fast", td_engine::ParamValue::Int(3))
@@ -1040,4 +1276,163 @@ fn reference_strategies_size_full_spot_entries_to_pass_the_cash_check() {
         assert_eq!(entry.side, Side::Buy, "{name}");
         approx(entry.qty, qty);
     }
+}
+
+#[test]
+fn warm_up_bars_count_as_history_and_the_strategy_trades_on_the_first_live_bar() {
+    let p = Params::new()
+        .with("fast", td_engine::ParamValue::Int(3))
+        .with("slow", td_engine::ParamValue::Int(8));
+    let strategy = build_strategy("sma_cross", &p).unwrap();
+    let mut s = Session::new(strategy, spot(), Timeframe::M1, config(0.0)).unwrap();
+    let bars = up_then_down();
+    // The slow average needs 8 bars: warm up on bars 0 to 7. Bar 7 has them, but the strategy
+    // does not trade while warming up. Warm-up records no equity and leaves the portfolio as it
+    // started.
+    for b in &bars[..8] {
+        s.warm_up(*b, &[]).unwrap();
+    }
+    assert_eq!(s.bars().len(), 8);
+    assert!(s.orders().is_empty(), "{:?}", s.orders());
+    assert!(s.equity().is_empty());
+    assert_eq!(
+        s.portfolio(),
+        &Portfolio::new(InstrumentKind::Spot, 10_000.0)
+    );
+    // Bar 8 is the first live bar. The fast average of the closes 112, 114 and 116 is 114, above
+    // the slow average of the closes 102 to 116, 109, so the strategy buys 95% of the 10000
+    // equity at the close of 116: 9500 / 116 = 81.896 after rounding down to the lot (the cash
+    // cap, 9950 / (116 * 1.002) = 85.604, does not bind). The buy fills at bar 9's open of 118
+    // with the 0.2% taker fee: 81.896 * 118 = 9663.728, fee 19.327456. Cash is then
+    // 10000 - 9663.728 - 19.327456 = 316.944544, and equity at bar 9's close of 118 is
+    // 316.944544 + 9663.728 = 9980.672544.
+    s.on_bar(bars[8], &[]).unwrap();
+    s.on_bar(bars[9], &[]).unwrap();
+    assert_eq!(s.orders()[0].submitted_at, 8 * MIN);
+    let f = s.fills();
+    assert_eq!(f.len(), 1);
+    assert_eq!((f[0].time, f[0].side), (9 * MIN, Side::Buy));
+    approx(f[0].price, 118.0);
+    approx(f[0].qty, 81.896);
+    approx(f[0].fee, 19.327456);
+    approx(s.portfolio().cash(), 316.944544);
+    // The equity series starts at the first live bar.
+    let times: Vec<i64> = s.equity().iter().map(|p| p.time).collect();
+    assert_eq!(times, vec![8 * MIN, 9 * MIN]);
+    let e = equity(&s);
+    approx(e[0], 10_000.0);
+    approx(e[1], 9980.672544);
+}
+
+#[test]
+fn orders_submitted_while_warming_up_are_rejected_and_nothing_is_charged() {
+    const WARM_UP: &str = "warm-up: trading is disabled";
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let seen = log.clone();
+    let strategy = steps(move |ctx, n| {
+        let entry = req(ctx.instrument(), Side::Buy, 1.0, OrderType::Market);
+        let plain = ctx.submit(entry.clone()).map_err(|e| e.reason);
+        let stop = ctx.bar().close - 5.0;
+        let with_stop = ctx.submit_with_stop(entry, stop).map_err(|e| e.reason);
+        seen.lock()
+            .unwrap()
+            .push((n, ctx.is_warming_up(), plain, with_stop));
+    });
+    let mut s = Session::new(strategy, perp(), Timeframe::M1, config(0.0)).unwrap();
+    // The funding passed with a warm-up bar is checked but not charged, and the portfolio is not
+    // even marked: it is exactly as it started.
+    s.warm_up(bar(0, 100.0, 101.0, 99.0, 100.0), &[(0, 0.01)])
+        .unwrap();
+    s.warm_up(bar(1, 100.0, 101.0, 99.0, 100.0), &[]).unwrap();
+    assert_eq!(
+        s.portfolio(),
+        &Portfolio::new(InstrumentKind::Perpetual, 10_000.0)
+    );
+    assert!(s.fills().is_empty() && s.open_orders().is_empty() && s.equity().is_empty());
+    // Each rejected order is recorded with its reason, and an entry's stop is not.
+    let o = s.orders();
+    assert_eq!(o.len(), 4);
+    for (order, at) in o.iter().zip([0, 0, MIN, MIN]) {
+        assert_eq!(order.status, OrderStatus::Rejected(WARM_UP.into()));
+        assert_eq!((order.submitted_at, order.attached_stop), (at, None));
+    }
+    // Live, both go through: order 5, then order 6 with its stop as order 7.
+    s.on_bar(bar(2, 100.0, 101.0, 99.0, 100.0), &[]).unwrap();
+    let log = log.lock().unwrap();
+    let reason = || WARM_UP.to_string();
+    assert_eq!(log[0], (0, true, Err(reason()), Err(reason())));
+    assert_eq!(log[1], (1, true, Err(reason()), Err(reason())));
+    assert_eq!(
+        log[2],
+        (2, false, Ok(OrderId(5)), Ok((OrderId(6), OrderId(7))))
+    );
+}
+
+#[test]
+fn warm_up_bars_join_the_history_and_must_all_come_before_the_first_live_bar() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let strategy = Box::new(Recorder(seen.clone()));
+    let mut s = Session::new(strategy, spot(), Timeframe::M1, config(0.0)).unwrap();
+    let flat = |n| bar(n, 100.0, 101.0, 99.0, 100.0);
+    // Warm-up bars are checked like live ones, and later bars are checked against them.
+    s.warm_up(flat(0), &[]).unwrap();
+    assert_eq!(
+        s.warm_up(flat(0), &[]),
+        Err(EngineError::DuplicateBar { time: 0 })
+    );
+    assert_eq!(
+        s.warm_up(flat(1), &[(MIN, 0.01)]),
+        Err(EngineError::FundingOnSpot)
+    );
+    s.warm_up(flat(1), &[]).unwrap();
+    assert_eq!(
+        s.on_bar(flat(1), &[]),
+        Err(EngineError::DuplicateBar { time: MIN })
+    );
+    s.on_bar(flat(2), &[]).unwrap();
+    s.on_bar(flat(3), &[]).unwrap();
+    // Once a bar has been fed live, warming up is an error and changes nothing.
+    assert_eq!(s.warm_up(flat(4), &[]), Err(EngineError::WarmUpAfterLive));
+    assert_eq!(s.bars().len(), 4);
+    // on_start runs once, on the first warm-up bar, and on_bar on every bar, warm-up or live,
+    // with the history ending at that bar.
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![
+            (1, 0, -1),
+            (1, 0, 0),
+            (2, MIN, MIN),
+            (3, 2 * MIN, 2 * MIN),
+            (4, 3 * MIN, 3 * MIN)
+        ]
+    );
+}
+
+#[test]
+fn donchian_sends_nothing_while_warming_up_and_enters_on_the_first_live_bar() {
+    let p = Params::new()
+        .with("entry", td_engine::ParamValue::Int(5))
+        .with("exit", td_engine::ParamValue::Int(3))
+        .with("atr_period", td_engine::ParamValue::Int(3));
+    let strategy = build_strategy("donchian_breakout", &p).unwrap();
+    let mut s = Session::new(strategy, perp(), Timeframe::M1, config(0.0)).unwrap();
+    let bars = up_then_down();
+    // Bar 5's close of 110 breaks the 5-bar high of 109, but bar 5 is a warm-up bar, so the
+    // strategy sends nothing, not even an order to be rejected.
+    for b in &bars[..6] {
+        s.warm_up(*b, &[]).unwrap();
+    }
+    assert!(s.orders().is_empty(), "{:?}", s.orders());
+    // Live bar 6's close of 112 breaks the 5-bar high of 111, from bars 1 to 5. ATR is 3, so the
+    // entry goes out on bar 6 with its stop 2 * 3 = 6 under the close, at 106.
+    s.on_bar(bars[6], &[]).unwrap();
+    let entry = &s.orders()[0];
+    assert_eq!(entry.submitted_at, 6 * MIN);
+    assert_eq!(
+        entry.attached_stop,
+        Some(AttachedStop {
+            id: OrderId(2),
+            trigger: 106.0
+        })
+    );
 }

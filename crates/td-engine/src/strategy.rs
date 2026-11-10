@@ -10,7 +10,9 @@ use crate::{AttachedStop, Broker, Order, OrderRejected, OrderStatus, Portfolio};
 ///
 /// All callbacks run at a bar's close, after that bar's fills, funding and equity mark. On each
 /// bar the session calls `on_start` (first bar only), then `on_fill` once per fill on this bar,
-/// then `on_bar`. Orders submitted from any of them can first fill on the next bar.
+/// then `on_bar`. Orders submitted from any of them can first fill on the next bar. Warm-up bars
+/// ([`crate::Session::warm_up`]) get the same calls, but nothing fills on them and every order
+/// submitted is rejected.
 pub trait Strategy: Send {
     fn on_start(&mut self, _ctx: &mut Context) {}
     fn on_bar(&mut self, ctx: &mut Context, bar: &Candle);
@@ -29,6 +31,9 @@ pub struct Context<'a> {
     pub(crate) orders: &'a mut Vec<Order>,
     pub(crate) warming_up: bool,
 }
+
+/// The reason orders submitted on a warm-up bar are rejected with.
+const WARM_UP: &str = "warm-up: trading is disabled";
 
 impl Context<'_> {
     /// The bars seen so far, oldest first, ending at the current bar.
@@ -81,8 +86,8 @@ impl Context<'_> {
         self.broker.open_orders()
     }
 
-    /// True while the session feeds warm-up bars (see [`crate::Session::warm_up`]): the strategy
-    /// sees the bars but cannot trade.
+    /// True on a warm-up bar ([`crate::Session::warm_up`]), where every order submitted is
+    /// rejected, so a strategy can skip submitting.
     pub fn is_warming_up(&self) -> bool {
         self.warming_up
     }
@@ -92,13 +97,11 @@ impl Context<'_> {
     /// (buys down, sells up) so an order never trades worse than asked; triggers round to the
     /// nearest tick. On spot, a sell must fit in the holding less the open sells, and a buy must
     /// fit in the cash together with the open buys: each buy is valued at its limit price, its
-    /// trigger, or this bar's close for a market order, plus the taker fee. A rejected order is
-    /// recorded with its reason and returned as an error.
-    ///
-    /// While warming up every order is refused with id 0 and nothing is recorded, so warm-up
-    /// leaves no trace in the run's order list.
+    /// trigger, or this bar's close for a market order, plus the taker fee. Every order is
+    /// rejected on a warm-up bar. A rejected order is recorded with its reason and returned as an
+    /// error.
     pub fn submit(&mut self, request: OrderRequest) -> Result<OrderId, OrderRejected> {
-        self.send(request, None)
+        self.send(request, None).map(|(id, _)| id)
     }
 
     /// Submits an entry with a protective stop attached. When the entry fills, a reduce-only stop
@@ -113,32 +116,32 @@ impl Context<'_> {
     /// valued at its limit price, its trigger, or this bar's close for a market order. A
     /// reduce-only entry or a spot sell cannot have a stop attached.
     ///
-    /// The stop is recorded under the entry's id plus one, as [`OrderStatus::Attached`] until the
-    /// entry fills; from then on it is an ordinary open order. Until then it cannot be cancelled
-    /// on its own, and cancelling the entry cancels it too.
+    /// Returns the entry's id and the stop's. The stop is recorded as [`OrderStatus::Attached`]
+    /// until the entry fills; from then on it is an ordinary open order. Until then it cannot be
+    /// cancelled on its own, and cancelling the entry cancels it too.
     pub fn submit_with_stop(
         &mut self,
         request: OrderRequest,
         stop_trigger: f64,
-    ) -> Result<OrderId, OrderRejected> {
+    ) -> Result<(OrderId, OrderId), OrderRejected> {
         let trigger = self.instrument.round_price(stop_trigger, Rounding::Nearest);
-        self.send(request, Some(trigger))
+        let (id, stop) = self.send(request, Some(trigger))?;
+        Ok((id, stop.expect("an accepted entry has its stop attached")))
     }
 
+    /// Records the order and sends it to the broker if it passes the checks, with a protective
+    /// stop attached when `stop_trigger` is set. Returns the order's id and its stop's.
     fn send(
         &mut self,
         request: OrderRequest,
         stop_trigger: Option<f64>,
-    ) -> Result<OrderId, OrderRejected> {
-        if self.warming_up {
-            return Err(OrderRejected {
-                id: OrderId(0),
-                reason: "trading is disabled while warming up".into(),
-            });
-        }
+    ) -> Result<(OrderId, Option<OrderId>), OrderRejected> {
         let id = OrderId(self.orders.len() as u64 + 1);
         let (submitted_at, decision_close) = (self.bar().open_time, self.bar().close);
         let (request, mut check) = self.prepare(request);
+        if self.warming_up {
+            check = Err(WARM_UP.into());
+        }
         let attached_stop = stop_trigger.map(|trigger| AttachedStop {
             id: OrderId(id.0 + 1),
             trigger,
@@ -172,8 +175,9 @@ impl Context<'_> {
                         status: OrderStatus::Attached,
                     });
                 }
+                let stop = order.attached_stop.map(|stop| stop.id);
                 self.broker.submit(order);
-                Ok(id)
+                Ok((id, stop))
             }
             Err(reason) => Err(OrderRejected { id, reason }),
         }

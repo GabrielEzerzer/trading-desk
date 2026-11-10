@@ -7,8 +7,8 @@ use td_core::{Candle, FeeSchedule, Fill, Instrument, Millis, OrderId, Side, Time
 use crate::metrics::{self, EquitySeries, MetricsReport};
 use crate::session::{funding_ranges, sorted_funding};
 use crate::{
-    CandleFillModel, EngineError, EquityPoint, Order, Params, Portfolio, Session, SessionConfig,
-    Trade, build_strategy, build_trades,
+    BarFunding, CandleFillModel, EngineError, EquityPoint, Order, Params, Portfolio, Session,
+    SessionConfig, Trade, build_strategy, build_trades,
 };
 
 /// Everything that defines a backtest apart from the data itself.
@@ -33,7 +33,8 @@ pub struct BacktestConfig {
     pub fee_override: Option<FeeSchedule>,
     /// When set, bars that open at or after `warmup_from` and before `from` are fed to the
     /// strategy first with trading disabled (see [`Session::warm_up`]), so its indicators are
-    /// ready at the first traded bar. They add no equity points and are not in the metrics.
+    /// ready at the first traded bar. They add no equity points and are not in the metrics;
+    /// orders the strategy submits on them are rejected and recorded in the result's `orders`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub warmup_from: Option<Millis>,
 }
@@ -64,7 +65,7 @@ pub struct BacktestResult {
     pub data_fingerprint: String,
     /// Equity at each bar's close.
     pub equity: Vec<EquityPoint>,
-    /// Every order submitted, rejected ones included, in submission order.
+    /// Every order submitted, rejected ones included (warm-up bars' too), in submission order.
     pub orders: Vec<Order>,
     pub fills: Vec<Fill>,
     pub trades: Vec<Trade>,
@@ -112,9 +113,21 @@ pub fn run(
     let mut used_funding = Vec::new();
     for (bar, range) in bars.iter().zip(&ranges) {
         let events = &funding[range.clone()];
+        let held = session.portfolio().position();
         let before = session.portfolio().funding_paid();
         session.on_bar(*bar, events)?;
-        bar_funding.push(session.portfolio().funding_paid() - before);
+        let total = session.portfolio().funding_paid() - before;
+        // The session charges funding due at the open on the position held going into the bar,
+        // at the open price, the same way Portfolio::charge_funding does.
+        let at_open: f64 = events
+            .iter()
+            .filter(|&&(time, _)| time == bar.open_time)
+            .map(|&(_, rate)| held * bar.open * rate)
+            .sum();
+        bar_funding.push(BarFunding {
+            at_open,
+            in_bar: total - at_open,
+        });
         positions.push(session.portfolio().position());
         used_funding.extend_from_slice(events);
     }
@@ -209,7 +222,9 @@ pub fn rerun(
 }
 
 /// Buys at the first bar's open with all starting cash (taker fee, the run's slippage) and holds
-/// to the last close, paying funding on a perpetual like the strategy does.
+/// to the last close, paying funding on a perpetual like the session does: funding due at a bar's
+/// open on the position held going into the bar, at the open price, so none at the first open,
+/// and funding due later in the bar at the close.
 fn benchmark(
     config: &BacktestConfig,
     bars: &[Candle],
@@ -228,30 +243,33 @@ fn benchmark(
     let qty = inst.round_qty(config.starting_cash / (price * (1.0 + fees.taker)));
     let mut portfolio = Portfolio::new(inst.id.kind, config.starting_cash);
     let mut fills = Vec::new();
-    if qty.is_finite() && qty > 0.0 {
-        let fill = Fill {
-            order_id: OrderId(0),
-            instrument: inst.id.clone(),
-            side: Side::Buy,
-            time: first.open_time,
-            price,
-            qty,
-            fee: price * qty * fees.taker,
-            liquidity: td_core::Liquidity::Taker,
-        };
-        portfolio.apply_fill(fill.side, fill.qty, fill.price, fill.fee);
-        fills.push(fill);
-    }
-
     let mut equity = Vec::with_capacity(bars.len());
     let mut positions = Vec::with_capacity(bars.len());
     let mut bar_funding = Vec::with_capacity(bars.len());
-    for (bar, range) in bars.iter().zip(ranges) {
-        let before = portfolio.funding_paid();
-        for &(_, rate) in &funding[range.clone()] {
-            portfolio.charge_funding(rate, bar.close);
+    for (k, (bar, range)) in bars.iter().zip(ranges).enumerate() {
+        let events = &funding[range.clone()];
+        let mut charged = BarFunding::default();
+        for &(_, rate) in events.iter().filter(|&&(time, _)| time == bar.open_time) {
+            charged.at_open += portfolio.charge_funding(rate, bar.open);
         }
-        bar_funding.push(portfolio.funding_paid() - before);
+        if k == 0 && qty.is_finite() && qty > 0.0 {
+            let fill = Fill {
+                order_id: OrderId(0),
+                instrument: inst.id.clone(),
+                side: Side::Buy,
+                time: first.open_time,
+                price,
+                qty,
+                fee: price * qty * fees.taker,
+                liquidity: td_core::Liquidity::Taker,
+            };
+            portfolio.apply_fill(fill.side, fill.qty, fill.price, fill.fee);
+            fills.push(fill);
+        }
+        for &(_, rate) in events.iter().filter(|&&(time, _)| time > bar.open_time) {
+            charged.in_bar += portfolio.charge_funding(rate, bar.close);
+        }
+        bar_funding.push(charged);
         portfolio.mark(bar.close);
         equity.push(EquityPoint {
             time: bar.open_time,

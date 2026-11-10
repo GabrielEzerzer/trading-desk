@@ -75,7 +75,8 @@ impl Portfolio {
         self.funding_paid
     }
 
-    /// The price the position was last marked at: the close of the latest bar.
+    /// The price the position was last marked at: the close of the latest live bar. Warm-up bars
+    /// do not mark it.
     pub fn mark_price(&self) -> f64 {
         self.mark_price
     }

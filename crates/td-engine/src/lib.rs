@@ -7,10 +7,14 @@
 //! trading feeds live bars into the same session type, so the strategy code under test is the code
 //! that later trades.
 //!
-//! Each bar runs in this order: pending orders are checked against the new bar, funding is
+//! Each bar runs in this order: funding due at the bar's open is charged on the position held going
+//! into it, pending orders are checked against the new bar, funding due later in the bar is
 //! charged, equity is marked at the close, then the strategy sees the bar. An order the strategy
 //! submits while handling bar t can first fill on bar t+1, and the strategy only ever sees bars up
 //! to the current one, because the session does not have later bars.
+//!
+//! Before the first live bar, [`Session::warm_up`] can feed bars that only give the strategy the
+//! history its indicators need: the strategy sees them as usual, but cannot trade on them.
 
 mod broker;
 mod error;
@@ -44,4 +48,4 @@ pub use tester::{
     WalkForwardSpec, Window, WindowMode, WindowResult, WindowSpec, out_of_sample, stitch, sweep,
     walk_forward,
 };
-pub use trades::{Trade, TradeSide, build_trades};
+pub use trades::{BarFunding, Trade, TradeSide, build_trades};

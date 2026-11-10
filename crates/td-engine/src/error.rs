@@ -24,6 +24,9 @@ pub enum EngineError {
     #[error("funding was given for a spot instrument")]
     FundingOnSpot,
 
+    #[error("warm-up bars must all come before the first live bar")]
+    WarmUpAfterLive,
+
     #[error("no bars open between {from} and {to}")]
     NoBarsInRange { from: Millis, to: Millis },
 
@@ -38,7 +41,7 @@ pub enum EngineError {
 }
 
 /// An order the engine refused at submission. The order is still recorded, with status
-/// `Rejected`, under `id`, except during warm-up, when nothing is recorded and `id` is 0.
+/// `Rejected`, under `id`.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 #[error("order {} rejected: {reason}", id.0)]
 pub struct OrderRejected {

@@ -155,9 +155,19 @@ fn full_backtest_is_internally_consistent() {
             .any(|w| w[0].exit_time == w[1].entry_time)
     );
     assert!(r.metrics.funding_paid != 0.0);
-    // Trade P&L adds up to the change in equity, with an open trade marked at the last close.
+    assert_trades_add_up(&r);
+    // The benchmark is long from the first bar to the last.
+    assert_eq!(r.benchmark.metrics.exposure, Some(1.0));
+    assert_eq!(r.benchmark.equity.len(), r.equity.len());
+    assert!(r.benchmark.correlation.is_some());
+}
+
+/// Trade P&L adds up to the change in equity, with an open trade marked at the last close, and
+/// the trades' fees and funding add up to the run's.
+#[track_caller]
+fn assert_trades_add_up(r: &BacktestResult) {
     let net: f64 = r.trades.iter().map(|t| t.net_pnl).sum();
-    let change = r.equity.last().unwrap().equity - 10_000.0;
+    let change = r.equity.last().unwrap().equity - r.config.starting_cash;
     assert!((net - change).abs() < 1e-6, "trades {net}, equity {change}");
     let funding: f64 = r.trades.iter().map(|t| t.funding).sum();
     assert!((funding - r.metrics.funding_paid).abs() < 1e-9);
@@ -167,10 +177,39 @@ fn full_backtest_is_internally_consistent() {
         r.metrics.trades,
         r.trades.iter().filter(|t| !t.open).count()
     );
-    // The benchmark is long from the first bar to the last.
-    assert_eq!(r.benchmark.metrics.exposure, Some(1.0));
-    assert_eq!(r.benchmark.equity.len(), r.equity.len());
-    assert!(r.benchmark.correlation.is_some());
+}
+
+#[test]
+fn trades_close_on_attached_stops_and_the_result_round_trips() {
+    // Donchian attaches a protective stop to every entry; a tight stop gets hit on this series.
+    let mut c = config();
+    c.strategy = "donchian_breakout".into();
+    c.params = Params::new()
+        .with("entry", ParamValue::Int(12))
+        .with("exit", ParamValue::Int(6))
+        .with("atr_stop", ParamValue::Float(1.0))
+        .with("allow_short", ParamValue::Bool(true));
+    let r = run(&c, &synthetic_bars(), &synthetic_funding()).unwrap();
+    let stops: Vec<_> = r
+        .orders
+        .iter()
+        .filter_map(|o| o.attached_stop)
+        .map(|s| s.id)
+        .collect();
+    let stop_fills = r
+        .fills
+        .iter()
+        .filter(|f| stops.contains(&f.order_id))
+        .count();
+    assert!(stop_fills > 0, "no attached stop filled");
+    // Every fill of an attached stop closes a trade on its bar.
+    for f in r.fills.iter().filter(|f| stops.contains(&f.order_id)) {
+        assert!(r.trades.iter().any(|t| !t.open && t.exit_time == f.time));
+    }
+    assert_trades_add_up(&r);
+    let json = serde_json::to_string(&r).unwrap();
+    let loaded: BacktestResult = serde_json::from_str(&json).unwrap();
+    assert_eq!(loaded, r);
 }
 
 #[test]

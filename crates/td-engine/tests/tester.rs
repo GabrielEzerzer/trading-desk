@@ -9,9 +9,9 @@ use std::sync::Mutex;
 use td_core::{Candle, Millis, Timeframe};
 use td_engine::{
     BacktestConfig, Direction, EngineError, MAX_RUNS, Metric, Objective, OosSpec, ParamAxis,
-    ParamSpace, ParamValue, Params, RunKind, SavedRun, Session, Split, SweepMode, SweepSpec,
-    TesterError, WalkForwardSpec, WindowMode, WindowSpec, list, load, out_of_sample, run, save,
-    sweep, walk_forward,
+    ParamSpace, ParamValue, Params, RunKind, SavedRun, Split, SweepMode, SweepSpec, TesterError,
+    WalkForwardSpec, WindowMode, WindowSpec, list, load, out_of_sample, run, save, sweep,
+    walk_forward,
 };
 
 const HOUR: Millis = 3_600_000;
@@ -514,6 +514,16 @@ fn walk_forward_tests_each_window_after_its_train_and_stitches_the_tests() {
                 .iter()
                 .all(|p| p.time >= w.test_from && p.time < w.test_to)
         );
+        // No look-ahead: the test run is the same without any bar from its test_to on, and the
+        // warm-up bars add nothing to its equity or trades.
+        let known: Vec<Candle> = bars
+            .iter()
+            .filter(|b| b.open_time < w.test_to)
+            .copied()
+            .collect();
+        assert_eq!(&run(&o.config, &known, &[]).unwrap(), o);
+        assert!(o.fills.iter().all(|f| f.time >= w.test_from));
+        assert!(o.trades.iter().all(|t| t.entry_time >= w.test_from));
     }
     for pair in r.windows.windows(2) {
         assert_eq!(pair[0].test_to, pair[1].test_from);
@@ -623,34 +633,4 @@ fn sweeps_and_walk_forwards_save_and_load_with_their_kind() {
     let o = kind_of(&ids[2]);
     assert_eq!(o.kind, RunKind::Oos);
     assert_eq!(o.total_return, oos.out_of_sample.metrics.total_return);
-}
-
-#[test]
-fn warm_up_shows_bars_without_trading_or_equity() {
-    use td_core::{OrderId, OrderType, Side};
-    let inst = common::spot();
-    let order = common::req(&inst, Side::Buy, 1.0, OrderType::Market);
-    let (script, log) = common::Script::new(vec![(0, order.clone()), (2, order)]);
-    let mut session = Session::new(script, inst, Timeframe::M1, common::config(0.0)).unwrap();
-    session
-        .warm_up(common::bar(0, 100.0, 101.0, 99.0, 100.0), &[])
-        .unwrap();
-    session
-        .warm_up(common::bar(1, 100.0, 101.0, 99.0, 100.0), &[])
-        .unwrap();
-    assert!(session.equity().is_empty());
-    session
-        .on_bar(common::bar(2, 100.0, 101.0, 99.0, 100.0), &[])
-        .unwrap();
-    assert_eq!(session.bars().len(), 3);
-    assert_eq!(session.equity().len(), 1);
-    let log = log.lock().unwrap();
-    assert_eq!(log[0].as_ref().unwrap_err().id, OrderId(0));
-    assert_eq!(log[1], Ok(OrderId(1)));
-    assert_eq!(session.orders().len(), 1);
-    // Warm-up after trading has started is refused.
-    assert!(matches!(
-        session.warm_up(common::bar(3, 100.0, 101.0, 99.0, 100.0), &[]),
-        Err(EngineError::InvalidConfig(_))
-    ));
 }
