@@ -153,6 +153,10 @@ fn reopening_replays_the_log_to_the_same_state() {
     let reopened = PaperSession::open(dir.path(), "replay").expect("opens");
     assert_same_state(&paper, &reopened);
     assert_eq!(reopened.live_from(), Some(T0));
+    // The warm-up bars are replayed as warm-up: history, but no equity points.
+    assert_eq!(reopened.session().bars().len(), 170);
+    assert_eq!(reopened.equity().len(), 150);
+    assert_eq!(reopened.equity()[0].time, T0);
     assert!(reopened.warnings().is_empty());
     assert!(!reopened.fills().is_empty());
 }

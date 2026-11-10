@@ -51,7 +51,7 @@ pub struct FedBar {
     pub bar: Candle,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub funding: Vec<Funding>,
-    /// Fed during warm-up, with trading disabled.
+    /// Fed during warm-up with [`Session::warm_up`]: trading is disabled and no funding is charged.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub warm_up: bool,
 }
@@ -228,8 +228,9 @@ impl PaperSession {
         } else {
             self.session.on_bar(fed.bar, &funding)?;
             self.live_from.get_or_insert(fed.bar.open_time);
+            // The engine charges no funding on a warm-up bar.
+            self.funding.extend(&fed.funding);
         }
-        self.funding.extend(&fed.funding);
         Ok(())
     }
 
@@ -275,7 +276,8 @@ impl PaperSession {
         self.session.fills()
     }
 
-    /// Equity at each bar's close, warm-up bars included.
+    /// Equity at each live bar's close. Warm-up bars record none, so the series starts at
+    /// [`PaperSession::live_from`] and is shorter than the bars by the warm-up bars.
     pub fn equity(&self) -> &[EquityPoint] {
         self.session.equity()
     }
@@ -284,7 +286,7 @@ impl PaperSession {
         self.session.bars().last()
     }
 
-    /// Every funding rate charged, in order.
+    /// Every funding rate charged, in order. Funding fed with a warm-up bar is not charged.
     pub fn funding(&self) -> &[Funding] {
         &self.funding
     }
@@ -326,25 +328,6 @@ impl PaperSession {
     }
 }
 
-// TEMP: stands in for td-engine's `Session::warm_up` until the engine review fix lands.
-trait WarmUp {
-    fn warm_up(
-        &mut self,
-        bar: Candle,
-        funding: &[(Millis, f64)],
-    ) -> Result<(), td_engine::EngineError>;
-}
-
-impl WarmUp for Session {
-    fn warm_up(
-        &mut self,
-        bar: Candle,
-        funding: &[(Millis, f64)],
-    ) -> Result<(), td_engine::EngineError> {
-        self.on_bar(bar, funding)
-    }
-}
-
 fn build_session(config: &PaperConfig) -> Result<Session, PaperError> {
     let strategy = build_strategy(&config.strategy, &config.params)?;
     let money = SessionConfig {
@@ -369,5 +352,131 @@ fn check_id(id: &str) -> Result<(), PaperError> {
         Ok(())
     } else {
         Err(PaperError::InvalidId(id.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use td_core::{
+        InstrumentId, InstrumentKind, OrderRequest, OrderType, Side, TimeInForce, Venue,
+    };
+    use td_engine::{Context, OrderStatus, Strategy};
+
+    use super::*;
+
+    const MIN: Millis = 60_000;
+
+    /// Tries to buy on every bar, warm-up bars included.
+    struct AlwaysBuy;
+
+    impl Strategy for AlwaysBuy {
+        fn on_bar(&mut self, ctx: &mut Context, _bar: &Candle) {
+            let _ = ctx.submit(OrderRequest {
+                instrument: ctx.instrument().id.clone(),
+                side: Side::Buy,
+                qty: 1.0,
+                order_type: OrderType::Market,
+                tif: TimeInForce::Gtc,
+                reduce_only: false,
+                client_tag: None,
+            });
+        }
+    }
+
+    fn bar(i: i64) -> Candle {
+        Candle {
+            open_time: i * MIN,
+            open: 100.0,
+            high: 101.0,
+            low: 99.0,
+            close: 100.0,
+            volume: 1.0,
+            quote_volume: 100.0,
+        }
+    }
+
+    #[test]
+    fn a_strategy_cannot_trade_on_warm_up_bars() {
+        let config = PaperConfig {
+            strategy: "sma_cross".into(),
+            params: Params::new(),
+            instrument: Instrument {
+                id: InstrumentId {
+                    venue: Venue::Binance,
+                    symbol: "TESTUSDT".into(),
+                    kind: InstrumentKind::Perpetual,
+                },
+                base: "TEST".into(),
+                quote: "USDT".into(),
+                tick_size: 0.01,
+                lot_size: 0.001,
+                min_qty: 0.001,
+                min_notional: 1.0,
+                fees: FeeSchedule {
+                    maker: 0.001,
+                    taker: 0.002,
+                },
+            },
+            timeframe: Timeframe::M1,
+            starting_cash: 10_000.0,
+            slippage_bps: 0.0,
+            fees: None,
+        };
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut paper = PaperSession::create(dir.path(), "warm", config.clone()).expect("creates");
+        // The registry has no strategy that trades while warming up, so swap one in.
+        paper.session = Session::new(
+            Box::new(AlwaysBuy),
+            config.instrument.clone(),
+            config.timeframe,
+            SessionConfig {
+                starting_cash: config.starting_cash,
+                slippage_bps: config.slippage_bps,
+                fees: config.fees,
+            },
+        )
+        .expect("session");
+
+        let rate = Funding {
+            time: 0,
+            rate: 0.01,
+            due: 0,
+        };
+        paper.feed(bar(0), vec![rate], true).expect("warm-up bar");
+        for i in 1..5 {
+            paper.feed(bar(i), Vec::new(), true).expect("warm-up bar");
+        }
+        assert_eq!(paper.orders().len(), 5, "the strategy tried on every bar");
+        for order in paper.orders() {
+            assert_eq!(
+                order.status,
+                OrderStatus::Rejected("warm-up: trading is disabled".into())
+            );
+        }
+        assert!(paper.fills().is_empty() && paper.open_orders().is_empty());
+        assert!(paper.equity().is_empty() && paper.funding().is_empty());
+        assert_eq!(
+            paper.portfolio(),
+            &Portfolio::new(InstrumentKind::Perpetual, 10_000.0)
+        );
+        assert_eq!(paper.live_from(), None);
+
+        // Live, its orders go through and fill on the next bar.
+        paper.feed(bar(5), Vec::new(), false).expect("live bar");
+        paper.feed(bar(6), Vec::new(), false).expect("live bar");
+        assert_eq!(paper.fills().len(), 1);
+        assert_eq!(paper.equity().len(), 2);
+        assert_eq!(paper.live_from(), Some(5 * MIN));
+
+        // A warm-up bar after a live one is refused and never reaches the log.
+        assert!(paper.feed(bar(7), Vec::new(), true).is_err());
+        let log = fs::read_to_string(&paper.log_path).expect("reads");
+        assert_eq!(log.lines().count(), 7);
+        assert_eq!(
+            log.lines()
+                .filter(|l| l.contains(r#""warm_up":true"#))
+                .count(),
+            5
+        );
     }
 }
