@@ -471,6 +471,38 @@ fn a_protective_stop_beats_a_take_profit_in_the_same_bar() {
     approx(s.portfolio().cash(), 10_000.0 - 0.2 - 0.19 - 5.0);
 }
 
+#[test]
+fn a_reduce_only_order_closes_at_most_the_position_and_is_cancelled_when_flat() {
+    let i = perp();
+    let bars: Vec<Candle> = (0..4).map(|n| bar(n, 100.0, 101.0, 99.0, 100.0)).collect();
+    let (script, log) = Script::new(vec![
+        (0, req(&i, Side::Buy, 1.0, OrderType::Market)),
+        // Long 1: a reduce-only sell of 2 can close only the 1.
+        (1, reduce_only(req(&i, Side::Sell, 2.0, OrderType::Market))),
+        // Flat after bar 2: nothing is left to reduce.
+        (2, reduce_only(req(&i, Side::Sell, 1.0, OrderType::Market))),
+    ]);
+    let s = run(i, 0.0, &bars, script);
+    assert!(log.lock().unwrap().iter().all(|r| r.is_ok()));
+    let f = s.fills();
+    assert_eq!(f.len(), 2);
+    // Bar 2: the sell fills 1 at 100, taker fee 0.2, and the order is done.
+    assert_eq!((f[1].order_id.0, f[1].time), (2, 2 * MIN));
+    assert_eq!(f[1].side, Side::Sell);
+    approx(f[1].qty, 1.0);
+    approx(f[1].fee, 0.2);
+    assert_eq!(s.orders()[1].status, OrderStatus::Filled);
+    // Bar 3: the second sell finds no position and is cancelled.
+    assert_eq!(
+        s.orders()[2].status,
+        OrderStatus::Cancelled("reduce-only order would not reduce the position".into())
+    );
+    let p = s.portfolio();
+    assert_eq!(p.position(), 0.0);
+    approx(p.cash(), 10_000.0 - 0.2 - 0.2);
+    assert!(s.open_orders().is_empty());
+}
+
 /// Records the history view's length and last bar on every callback.
 struct Recorder(Arc<Mutex<Vec<(usize, i64, i64)>>>);
 
