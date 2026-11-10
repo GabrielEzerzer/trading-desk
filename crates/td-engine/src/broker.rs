@@ -151,6 +151,11 @@ pub trait Broker: Send {
 /// market crosses on its way from the open to the liquidation price fill first, nearest the open
 /// first. Whenever the account is still liquidated, the rest of the bar's fills are skipped.
 ///
+/// shortcut: an attached stop of an entry filled between the bars is applied right after its
+/// entry even when the market reached the new position's liquidation price first on the way to
+/// the open. If equity at the stop's trigger is still above zero, the account keeps up to the
+/// maintenance margin (0.5% of notional) that a venue would have kept on liquidating first.
+///
 /// A spot buy is cut at fill time to the largest quantity, on the lot grid, whose value at the
 /// fill price plus its fee fits in the cash left at that point in the bar. The cash check at
 /// submission values a market buy at the decision close, so a gap up at the next open could
