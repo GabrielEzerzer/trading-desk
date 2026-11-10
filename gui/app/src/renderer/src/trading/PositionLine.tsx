@@ -4,7 +4,6 @@ import type { Fill, Instrument, InstrumentId, Order, SessionState, Status, Strat
 import { type ReactNode, useEffect, useState } from 'react'
 import { CheckIcon, ChevronIcon } from '../icons'
 import { readableName } from '../lab/source'
-import { pnlTone } from '../lab/format'
 import { type PaperSession, clock } from './hooks'
 import { formatStep, parseAmount } from './order'
 import { isRunning } from './session'
@@ -17,6 +16,12 @@ export function money(value: number, sign = false): string {
   const text = Math.abs(value).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
   if (value < 0 && Math.abs(value) >= 0.005) return MINUS + text
   return sign && value >= 0.005 ? `+${text}` : text
+}
+
+/** The colour role of an amount shown by `money`: ink when it rounds to zero. */
+export function moneyTone(value: number): 'gain' | 'loss' | undefined {
+  if (Math.abs(value) < 0.005) return undefined
+  return value > 0 ? 'gain' : 'loss'
 }
 
 export function strategyLabel(name: string): string {
@@ -138,13 +143,13 @@ export function PositionLine({ session, instrumentId, instrument, timeframe, str
                   </span>
                   <span className="line-item">
                     <span className="line-label">Unrealised</span>
-                    <span className="line-value" data-tone={pnlTone(position.unrealised_pnl)}>
+                    <span className="line-value" data-tone={moneyTone(position.unrealised_pnl)}>
                       {money(position.unrealised_pnl, true)}
                     </span>
                   </span>
                   <span className="line-item line-optional">
                     <span className="line-label">Realised</span>
-                    <span className="line-value" data-tone={pnlTone(position.realised_pnl)}>
+                    <span className="line-value" data-tone={moneyTone(position.realised_pnl)}>
                       {money(position.realised_pnl, true)}
                     </span>
                   </span>
@@ -363,7 +368,7 @@ function TradesTable({ trades, lot, tick }: { trades: Trade[]; lot: number; tick
             <td className="num">{formatStep(t.qty, lot)}</td>
             <td className="num">{formatStep(t.entry_price, tick)}</td>
             <td className="num">{formatStep(t.exit_price, tick)}</td>
-            <td className="num" data-tone={pnlTone(t.net_pnl)}>
+            <td className="num" data-tone={moneyTone(t.net_pnl)}>
               {money(t.net_pnl, true)}
             </td>
           </tr>
