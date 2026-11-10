@@ -1,7 +1,8 @@
-//! Saved backtest results: one directory per run under the runs directory.
+//! Saved results: one directory per run under the runs directory.
 //!
-//! A run is stored as `<runs_dir>/<run_id>/config.json` (the configuration alone, for reading
-//! by hand) and `result.json` (the whole [`BacktestResult`], configuration included).
+//! A run is stored as `<runs_dir>/<run_id>/config.json` (the backtest configuration or tester
+//! spec alone, for reading by hand) and `result.json` (the whole [`SavedRun`]: its kind and the
+//! result, which holds the configuration or spec, so any run can be run again).
 
 use std::fmt;
 use std::fs;
@@ -13,9 +14,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use td_core::{InstrumentId, Millis, Timeframe};
 
-use crate::BacktestResult;
 use crate::metrics::MetricsReport;
 use crate::runner::hex;
+use crate::{BacktestConfig, BacktestResult, OosResult, SweepResult, WalkForwardResult};
 
 const CONFIG_FILE: &str = "config.json";
 const RESULT_FILE: &str = "result.json";
@@ -82,11 +83,45 @@ impl fmt::Display for RunId {
     }
 }
 
-/// One row of the run list.
+/// What a saved run is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunKind {
+    Backtest,
+    Sweep,
+    Oos,
+    WalkForward,
+}
+
+/// A result as saved, tagged with its kind: `{"kind": "...", "result": {...}}`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "result", rename_all = "snake_case")]
+pub enum SavedRun {
+    Backtest(Box<BacktestResult>),
+    Sweep(Box<SweepResult>),
+    Oos(Box<OosResult>),
+    WalkForward(Box<WalkForwardResult>),
+}
+
+impl SavedRun {
+    pub fn kind(&self) -> RunKind {
+        match self {
+            SavedRun::Backtest(_) => RunKind::Backtest,
+            SavedRun::Sweep(_) => RunKind::Sweep,
+            SavedRun::Oos(_) => RunKind::Oos,
+            SavedRun::WalkForward(_) => RunKind::WalkForward,
+        }
+    }
+}
+
+/// One row of the run list. The strategy and range are the base configuration's. The metrics
+/// are the backtest's, the sweep's best run's (none if no run qualified), the out-of-sample
+/// segment's, or the stitched walk-forward curve's.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunSummary {
     pub id: RunId,
     pub created_at: Millis,
+    pub kind: RunKind,
     pub strategy: String,
     pub instrument: InstrumentId,
     pub timeframe: Timeframe,
@@ -103,9 +138,14 @@ pub struct RunSummary {
 ///
 /// Both files are written into a temporary directory inside `runs_dir`, which is then renamed to
 /// the run's id, so a run appears whole or not at all. `runs_dir` is created if needed.
-pub fn save(result: &BacktestResult, runs_dir: &Path) -> Result<RunId, StoreError> {
-    let config_json = to_json(&result.config, runs_dir)?;
-    let result_json = to_json(result, runs_dir)?;
+pub fn save(run: &SavedRun, runs_dir: &Path) -> Result<RunId, StoreError> {
+    let config_json = match run {
+        SavedRun::Backtest(r) => to_json(&r.config, runs_dir)?,
+        SavedRun::Sweep(r) => to_json(&r.spec, runs_dir)?,
+        SavedRun::Oos(r) => to_json(&r.spec, runs_dir)?,
+        SavedRun::WalkForward(r) => to_json(&r.spec, runs_dir)?,
+    };
+    let result_json = to_json(run, runs_dir)?;
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as Millis);
@@ -133,7 +173,7 @@ pub fn save(result: &BacktestResult, runs_dir: &Path) -> Result<RunId, StoreErro
 }
 
 /// Loads a saved result by id.
-pub fn load(runs_dir: &Path, id: &str) -> Result<BacktestResult, StoreError> {
+pub fn load(runs_dir: &Path, id: &str) -> Result<SavedRun, StoreError> {
     let id = RunId::parse(id)?;
     read_json(&runs_dir.join(id.as_str()).join(RESULT_FILE))
 }
@@ -150,12 +190,6 @@ pub fn list(runs_dir: &Path) -> Result<Vec<RunSummary>, StoreError> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(io_err(runs_dir)(e)),
     };
-    // Only the fields the list needs; serde skips the rest of the file.
-    #[derive(Deserialize)]
-    struct Head {
-        config: crate::BacktestConfig,
-        metrics: MetricsReport,
-    }
     let mut runs = Vec::new();
     for entry in entries {
         let entry = entry.map_err(io_err(runs_dir))?;
@@ -169,23 +203,73 @@ pub fn list(runs_dir: &Path) -> Result<Vec<RunSummary>, StoreError> {
         let Ok(head) = read_json::<Head>(&entry.path().join(RESULT_FILE)) else {
             continue;
         };
+        let (kind, config, metrics) = match head {
+            Head::Backtest { config, metrics } => (RunKind::Backtest, config, Some(metrics)),
+            Head::Sweep { spec, best } => (RunKind::Sweep, spec.base, best.map(|b| b.metrics)),
+            Head::Oos {
+                spec,
+                out_of_sample,
+            } => (RunKind::Oos, spec.sweep.base, Some(out_of_sample.metrics)),
+            Head::WalkForward { spec, metrics } => {
+                (RunKind::WalkForward, spec.sweep.base, Some(metrics))
+            }
+        };
+        let m = metrics.as_ref();
         runs.push(RunSummary {
             created_at: id.created_at(),
             id,
-            strategy: head.config.strategy,
-            instrument: head.config.instrument.id,
-            timeframe: head.config.timeframe,
-            from: head.config.from,
-            to: head.config.to,
-            total_return: head.metrics.total_return,
-            cagr: head.metrics.cagr,
-            sharpe: head.metrics.sharpe,
-            max_drawdown: head.metrics.max_drawdown,
-            trades: head.metrics.trades,
+            kind,
+            strategy: config.strategy,
+            instrument: config.instrument.id,
+            timeframe: config.timeframe,
+            from: config.from,
+            to: config.to,
+            total_return: m.and_then(|m| m.total_return),
+            cagr: m.and_then(|m| m.cagr),
+            sharpe: m.and_then(|m| m.sharpe),
+            max_drawdown: m.and_then(|m| m.max_drawdown),
+            trades: m.map_or(0, |m| m.trades),
         });
     }
     runs.sort_by(|a, b| b.id.cmp(&a.id));
     Ok(runs)
+}
+
+// Only the fields the run list needs; serde skips the rest of the file.
+#[derive(Deserialize)]
+#[serde(tag = "kind", content = "result", rename_all = "snake_case")]
+enum Head {
+    Backtest {
+        config: BacktestConfig,
+        metrics: MetricsReport,
+    },
+    Sweep {
+        spec: SweepHead,
+        best: Option<MetricsHead>,
+    },
+    Oos {
+        spec: TesterHead,
+        out_of_sample: MetricsHead,
+    },
+    WalkForward {
+        spec: TesterHead,
+        metrics: MetricsReport,
+    },
+}
+
+#[derive(Deserialize)]
+struct SweepHead {
+    base: BacktestConfig,
+}
+
+#[derive(Deserialize)]
+struct TesterHead {
+    sweep: SweepHead,
+}
+
+#[derive(Deserialize)]
+struct MetricsHead {
+    metrics: MetricsReport,
 }
 
 fn to_json<T: Serialize>(value: &T, path: &Path) -> Result<String, StoreError> {

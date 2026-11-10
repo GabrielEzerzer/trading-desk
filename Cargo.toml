@@ -26,6 +26,7 @@ zip = { version = "9.0.5", default-features = false, features = ["deflate-flate2
 
 # td-engine
 proptest = "1"
+rayon = "1"
 
 # td-server: the localhost API (#16) and paper sessions on live feeds (#15).
 axum = { version = "0.8.9", features = ["ws", "macros"] }
