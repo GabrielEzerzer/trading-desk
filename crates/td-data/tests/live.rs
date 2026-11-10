@@ -431,3 +431,203 @@ async fn frames_that_arrive_before_the_first_feed_runs_are_not_lost() {
     );
     feed.abort();
 }
+
+/// Feeds on sources other than the venues' own, through `SharedStream::open_on`.
+mod fake_sources {
+    use td_core::FeeSchedule;
+    use td_data::live::{Greeting, KlineUpdate, LiveStream};
+    use td_data::{DataSource, Http, InstrumentList, MinuteHistory};
+
+    use super::*;
+
+    /// A source whose stream greets with `hello` and sends one bar per frame as
+    /// `open_time,open,high,low,close,volume,quote_volume,closed`, and `ack` frames with no bar.
+    struct CsvStream;
+
+    /// A source with history only: no funding and no live stream.
+    struct HistoryOnly;
+
+    impl DataSource for CsvStream {
+        fn venue(&self) -> Venue {
+            Venue::Binance
+        }
+        fn kinds(&self) -> &'static [InstrumentKind] {
+            &[InstrumentKind::Spot]
+        }
+        fn instruments(&self, _: &Http, _: InstrumentKind) -> Result<InstrumentList, DataError> {
+            Ok(InstrumentList::default())
+        }
+        fn default_fees(&self, _: InstrumentKind) -> FeeSchedule {
+            FeeSchedule {
+                maker: 0.0,
+                taker: 0.0,
+            }
+        }
+        fn minute_history(
+            &self,
+            _: &Http,
+            _: &InstrumentId,
+            _: Millis,
+            _: Millis,
+            _: Millis,
+        ) -> Result<MinuteHistory, DataError> {
+            Ok(MinuteHistory::default())
+        }
+        fn live(&self) -> Result<&dyn LiveStream, DataError> {
+            Ok(self)
+        }
+    }
+
+    impl LiveStream for CsvStream {
+        fn url(&self, _: &InstrumentId) -> String {
+            "ws://127.0.0.1:9/".into()
+        }
+        fn greeting(&self, _: &InstrumentId) -> Greeting {
+            Greeting {
+                subscribe: Some("hello".into()),
+                heartbeat: None,
+            }
+        }
+        fn parse(&self, text: &str) -> Result<Vec<KlineUpdate>, DataError> {
+            if text == "ack" {
+                return Ok(Vec::new());
+            }
+            let bad = |reason: &str| DataError::Parse {
+                what: "a fake frame".into(),
+                reason: reason.into(),
+            };
+            let fields: Vec<&str> = text.split(',').collect();
+            let [t, o, h, l, c, v, q, closed] = fields[..] else {
+                return Err(bad("not 8 fields"));
+            };
+            let num = |s: &str| s.parse::<f64>().map_err(|_| bad(s));
+            let candle = Candle {
+                open_time: t.parse().map_err(|_| bad(t))?,
+                open: num(o)?,
+                high: num(h)?,
+                low: num(l)?,
+                close: num(c)?,
+                volume: num(v)?,
+                quote_volume: num(q)?,
+            };
+            Ok(vec![KlineUpdate {
+                candle,
+                closed: closed == "1",
+            }])
+        }
+        fn klines(
+            &self,
+            _: &Http,
+            _: &InstrumentId,
+            _: Timeframe,
+            _: Millis,
+            _: Millis,
+        ) -> Result<Vec<Candle>, DataError> {
+            Ok(Vec::new())
+        }
+    }
+
+    impl DataSource for HistoryOnly {
+        fn venue(&self) -> Venue {
+            Venue::Binance
+        }
+        fn kinds(&self) -> &'static [InstrumentKind] {
+            &[InstrumentKind::Spot]
+        }
+        fn instruments(&self, _: &Http, _: InstrumentKind) -> Result<InstrumentList, DataError> {
+            Ok(InstrumentList::default())
+        }
+        fn default_fees(&self, _: InstrumentKind) -> FeeSchedule {
+            FeeSchedule {
+                maker: 0.0,
+                taker: 0.0,
+            }
+        }
+        fn minute_history(
+            &self,
+            _: &Http,
+            _: &InstrumentId,
+            _: Millis,
+            _: Millis,
+            _: Millis,
+        ) -> Result<MinuteHistory, DataError> {
+            Ok(MinuteHistory::default())
+        }
+    }
+
+    fn csv(c: &Candle, closed: bool) -> String {
+        format!(
+            "{},{},{},{},{},{},{},{}",
+            c.open_time,
+            c.open,
+            c.high,
+            c.low,
+            c.close,
+            c.volume,
+            c.quote_volume,
+            u8::from(closed)
+        )
+    }
+
+    #[tokio::test]
+    async fn a_feed_reads_a_fake_sources_stream_through_its_greeting_and_parser() {
+        let all = minutes();
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let url = format!("ws://{}/", listener.local_addr().expect("address"));
+        let stream = Arc::new(SharedStream::open_on(&CsvStream, btc(Venue::Binance), url));
+        let rest = FakeRest::new(all.clone(), 0);
+        let (tx, mut rx) = mpsc::channel(64);
+        let feed = tokio::spawn(run_feed_on(
+            stream,
+            Timeframe::M1,
+            Some(T0),
+            rest.clone(),
+            tx,
+        ));
+        let (tcp, _) = listener.accept().await.expect("accept");
+        let mut socket = tokio_tungstenite::accept_async(tcp).await.expect("upgrade");
+
+        // The source's greeting comes first.
+        let hello = tokio::time::timeout(Duration::from_secs(5), socket.next())
+            .await
+            .expect("a greeting in time")
+            .expect("a frame")
+            .expect("reads");
+        assert_eq!(hello.to_text().expect("text"), "hello");
+        // Minute 0 in progress, a frame with no bar, then minutes 0, 1, 2 and 4 closed: minute 3
+        // is skipped and backfilled.
+        let mut script = vec![csv(&all[0], false), "ack".to_string()];
+        script.extend([0, 1, 2, 4].map(|i| csv(&all[i], true)));
+        for frame in script {
+            socket.send(Message::text(frame)).await.expect("sends");
+        }
+        let mut got = Vec::new();
+        for _ in 0..all.len() {
+            got.push(next_bar(&mut rx).await);
+        }
+        assert_eq!(got, all);
+        assert_eq!(rest.calls(), [(T0 + 3 * MIN, T0 + 4 * MIN)]);
+        feed.abort();
+    }
+
+    #[tokio::test]
+    async fn a_source_without_a_live_stream_says_so_instead_of_connecting() {
+        let id = btc(Venue::Binance);
+        let stream = Arc::new(SharedStream::open_on(&HistoryOnly, id, String::new()));
+        let (tx, mut rx) = mpsc::channel(64);
+        let feed = tokio::spawn(run_feed_on(
+            stream,
+            Timeframe::M1,
+            None,
+            FakeRest::new(Vec::new(), 0),
+            tx,
+        ));
+        let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("an event in time");
+        let error = DataError::NoLiveStream(Venue::Binance).to_string();
+        assert_eq!(error, "binance has no live stream");
+        assert_eq!(event, Some(FeedEvent::ConnectFailed { error }));
+        feed.abort();
+    }
+}
