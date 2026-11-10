@@ -1,12 +1,17 @@
 //! A paper session's state and its files: the engine [`Session`] it feeds, the config it was made
 //! from, and the append-only log of every bar fed, which is what a resume replays.
 //!
-//! Files live in `<data_dir>/paper/<session_id>/`: `config.json`, written once and synced to disk
-//! before it takes its name, and `events.jsonl`, one [`FedBar`] per line. A line is appended after
+//! Files live in `<data_dir>/paper/<session_id>/`: `config.json`, the config and the
+//! [`ENGINE_REVISION`] the session was made with, written once and synced to disk before it takes
+//! its name, and `events.jsonl`, one [`FedBar`] per line. A line is appended after
 //! its bar is applied, so the log never holds a bar the session refused. Each append goes straight
 //! to the operating system, so it survives the process dying. Each live bar's line is also synced
 //! to disk, with the warm-up lines before it, so a power cut loses at most the bar being written
 //! and any warm-up lines not yet followed by a live bar; a resume fetches those again.
+//!
+//! A session made by another engine revision still opens, so it can be listed and looked at, but
+//! its log is replayed by this engine's rules, so its numbers may differ from the ones it showed.
+//! It carries a warning saying so and cannot be resumed.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
@@ -15,7 +20,8 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use td_core::{Candle, FeeSchedule, Fill, Instrument, Millis, Timeframe};
 use td_engine::{
-    EquityPoint, Order, OrderStatus, Params, Portfolio, Session, SessionConfig, build_strategy,
+    ENGINE_REVISION, EquityPoint, Order, OrderStatus, Params, Portfolio, Session, SessionConfig,
+    build_strategy,
 };
 use tokio::sync::broadcast;
 use ts_rs::TS;
@@ -39,6 +45,29 @@ pub struct PaperConfig {
     pub slippage_bps: f64,
     /// Replaces the instrument's fee schedule when set.
     pub fees: Option<FeeSchedule>,
+    /// The largest perpetual position allowed, as its notional over equity, as in a backtest:
+    /// 1.0 means 1x, the default, which a config saved without it also gets. Spot ignores it.
+    #[serde(default = "default_max_leverage")]
+    pub max_leverage: f64,
+}
+
+fn default_max_leverage() -> f64 {
+    1.0
+}
+
+/// What `config.json` holds.
+#[derive(Serialize, Deserialize)]
+struct SavedConfig {
+    #[serde(flatten)]
+    config: PaperConfig,
+    /// The [`ENGINE_REVISION`] the session was made with. A config saved before it was recorded
+    /// reads as revision 1.
+    #[serde(default = "first_engine_revision")]
+    engine_revision: u32,
+}
+
+fn first_engine_revision() -> u32 {
+    1
 }
 
 /// A funding rate fed with a bar.
@@ -125,6 +154,8 @@ pub struct PaperSession {
     id: String,
     data_dir: PathBuf,
     config: PaperConfig,
+    /// The [`ENGINE_REVISION`] the session was made with.
+    engine_revision: u32,
     session: Session,
     log: File,
     log_path: PathBuf,
@@ -143,8 +174,9 @@ pub fn paper_dir(data_dir: &Path, id: &str) -> PathBuf {
 }
 
 impl PaperSession {
-    /// Makes a new session in `<data_dir>/paper/<id>/` and writes its config. The strategy and
-    /// money settings are checked before anything is written.
+    /// Makes a new session in `<data_dir>/paper/<id>/` and writes its config, with this engine's
+    /// [`ENGINE_REVISION`]. The strategy and money settings are checked before anything is
+    /// written.
     pub fn create(data_dir: &Path, id: &str, config: PaperConfig) -> Result<Self, PaperError> {
         check_id(id)?;
         let session = build_session(&config)?;
@@ -154,7 +186,11 @@ impl PaperSession {
             return Err(PaperError::Exists(dir));
         }
         fs::create_dir_all(&dir).map_err(PaperError::io(&dir))?;
-        let json = serde_json::to_vec_pretty(&config).map_err(|e| PaperError::BadFile {
+        let saved = SavedConfig {
+            config,
+            engine_revision: ENGINE_REVISION,
+        };
+        let json = serde_json::to_vec_pretty(&saved).map_err(|e| PaperError::BadFile {
             path: config_path.clone(),
             reason: e.to_string(),
         })?;
@@ -174,7 +210,8 @@ impl PaperSession {
         Ok(PaperSession {
             id: id.to_string(),
             data_dir: data_dir.to_path_buf(),
-            config,
+            config: saved.config,
+            engine_revision: saved.engine_revision,
             session,
             log,
             log_path,
@@ -193,12 +230,15 @@ impl PaperSession {
     /// A last line without its newline was torn by a crash mid-write: it is ignored, cut from the
     /// file so later lines append cleanly, and noted in [`PaperSession::warnings`]. Its bar is
     /// fetched again when the session goes live. Any other line that does not read is an error.
+    ///
+    /// A session made by another [`ENGINE_REVISION`] opens with a warning, and
+    /// [`PaperSession::check_resumable`] refuses it.
     pub fn open(data_dir: &Path, id: &str) -> Result<Self, PaperError> {
         check_id(id)?;
         let dir = paper_dir(data_dir, id);
         let config_path = dir.join(CONFIG_FILE);
         let text = fs::read_to_string(&config_path).map_err(PaperError::io(&config_path))?;
-        let config: PaperConfig = serde_json::from_str(&text).map_err(|e| PaperError::BadFile {
+        let saved: SavedConfig = serde_json::from_str(&text).map_err(|e| PaperError::BadFile {
             path: config_path.clone(),
             reason: e.to_string(),
         })?;
@@ -206,6 +246,14 @@ impl PaperSession {
         let bytes = fs::read(&log_path).map_err(PaperError::io(&log_path))?;
         let complete = bytes.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
         let mut warnings = Vec::new();
+        if saved.engine_revision != ENGINE_REVISION {
+            warnings.push(format!(
+                "this session was created with engine revision {} and its numbers are replayed \
+                 with engine revision {ENGINE_REVISION}, so they may differ from what it showed; \
+                 it cannot be resumed: start a new session",
+                saved.engine_revision
+            ));
+        }
         if complete < bytes.len() {
             warnings.push(format!(
                 "{}: ignored a torn last line of {} bytes",
@@ -226,8 +274,9 @@ impl PaperSession {
         let mut paper = PaperSession {
             id: id.to_string(),
             data_dir: data_dir.to_path_buf(),
-            session: build_session(&config)?,
-            config,
+            session: build_session(&saved.config)?,
+            config: saved.config,
+            engine_revision: saved.engine_revision,
             log,
             log_path: log_path.clone(),
             status: Status::Stopped,
@@ -375,6 +424,24 @@ impl PaperSession {
         &self.config
     }
 
+    /// The [`ENGINE_REVISION`] the session was made with.
+    pub fn engine_revision(&self) -> u32 {
+        self.engine_revision
+    }
+
+    /// Refuses to run a session made by another [`ENGINE_REVISION`]: its log replays by this
+    /// engine's rules, so going on from it would trade from numbers it never had.
+    pub fn check_resumable(&self) -> Result<(), PaperError> {
+        if self.engine_revision == ENGINE_REVISION {
+            Ok(())
+        } else {
+            Err(PaperError::EngineChanged {
+                created: self.engine_revision,
+                current: ENGINE_REVISION,
+            })
+        }
+    }
+
     pub fn status(&self) -> &Status {
         &self.status
     }
@@ -476,6 +543,7 @@ fn build_session(config: &PaperConfig) -> Result<Session, PaperError> {
         starting_cash: config.starting_cash,
         slippage_bps: config.slippage_bps,
         fees: config.fees,
+        max_leverage: config.max_leverage,
     };
     Ok(Session::new(
         strategy,
@@ -562,6 +630,7 @@ mod tests {
             starting_cash: 10_000.0,
             slippage_bps: 0.0,
             fees: None,
+            max_leverage: 1.0,
         }
     }
 
@@ -579,6 +648,7 @@ mod tests {
                 starting_cash: config.starting_cash,
                 slippage_bps: config.slippage_bps,
                 fees: config.fees,
+                max_leverage: config.max_leverage,
             },
         )
         .expect("session");

@@ -77,6 +77,7 @@ fn funding_paid(plan: Vec<(usize, Side)>, funding: &[(Millis, f64)]) -> f64 {
             maker: 0.0,
             taker: 0.0,
         }),
+        max_leverage: 1.0,
     };
     let s = run_backtest(
         Box::new(Plan(plan)),

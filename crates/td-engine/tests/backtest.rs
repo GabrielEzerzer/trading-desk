@@ -76,6 +76,7 @@ fn config() -> BacktestConfig {
         starting_cash: 10_000.0,
         slippage_bps: 5.0,
         fee_override: None,
+        max_leverage: 1.0,
         warmup_from: None,
         close_at_end: false,
     }

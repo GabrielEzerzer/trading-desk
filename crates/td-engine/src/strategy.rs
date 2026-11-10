@@ -26,6 +26,7 @@ pub struct Context<'a> {
     pub(crate) timeframe: Timeframe,
     pub(crate) fees: FeeSchedule,
     pub(crate) slippage_bps: f64,
+    pub(crate) max_leverage: f64,
     pub(crate) portfolio: &'a Portfolio,
     pub(crate) broker: &'a mut dyn Broker,
     pub(crate) orders: &'a mut Vec<Order>,
@@ -66,6 +67,12 @@ impl Context<'_> {
         self.slippage_bps
     }
 
+    /// The largest perpetual position the session allows, as its notional over equity; see
+    /// [`Context::submit`]. Spot ignores it.
+    pub fn max_leverage(&self) -> f64 {
+        self.max_leverage
+    }
+
     pub fn portfolio(&self) -> &Portfolio {
         self.portfolio
     }
@@ -97,9 +104,28 @@ impl Context<'_> {
     /// (buys down, sells up) so an order never trades worse than asked; triggers round to the
     /// nearest tick. On spot, a sell must fit in the holding less the open sells, and a buy must
     /// fit in the cash together with the open buys: each buy is valued at its limit price, its
-    /// trigger, or this bar's close for a market order, plus the taker fee. Every order is
-    /// rejected on a warm-up bar. A rejected order is recorded with its reason and returned as an
-    /// error.
+    /// trigger, or this bar's close for a market order, plus the taker fee. A spot buy is checked
+    /// again when it fills and cut to the cash then (see [`crate::SimBroker`]).
+    ///
+    /// On a perpetual, an order that is not reduce-only is rejected if the position it could
+    /// build is worth more than [`Context::max_leverage`] times the equity. With no position, or
+    /// on the side of the position, that is the position plus this order and the open orders on
+    /// its side that are not reduce-only. Against the position, this order and the open orders on
+    /// its side, reduce-only or not, are always allowed when together they are no larger than the
+    /// position, since they can then only shrink it, so a strategy can always reduce or close,
+    /// even when losses have taken it over the cap. When they are larger they could flip it: the
+    /// worst case is that the reduce-only orders close what they can first and the others open a
+    /// fresh position on the other side, and that fresh position is what is capped. The position
+    /// is valued at this bar's close, and each order at its limit price, its trigger, or this
+    /// bar's close for a market order, without the fee.
+    ///
+    /// shortcut: a reduce-only order is never checked, so one submitted after a plain order on
+    /// the same side that it would make room for (a reduce-only market close after a plain limit
+    /// that flips) can still let that order open past the cap. Check at fill time, against the
+    /// equity then, if strategies combine orders that way.
+    ///
+    /// Every order is rejected on a warm-up bar. A rejected order is recorded with its reason and
+    /// returned as an error.
     pub fn submit(&mut self, request: OrderRequest) -> Result<OrderId, OrderRejected> {
         self.send(request, None).map(|(id, _)| id)
     }
@@ -288,6 +314,62 @@ impl Context<'_> {
                      and open buys, {cash} available"
                 );
                 return (req, Err(reason));
+            }
+        }
+        if inst.id.kind == InstrumentKind::Perpetual && !req.reduce_only {
+            let close = self.bar().close;
+            let position = self.position();
+            // This order and the open orders on its side, and those of them that are not
+            // reduce-only, with their value.
+            let side: Vec<&OrderRequest> = self
+                .open_orders()
+                .iter()
+                .map(|o| &o.request)
+                .filter(|r| r.side == req.side)
+                .chain([&req])
+                .collect();
+            let total: f64 = side.iter().map(|r| r.qty).sum();
+            // The plain orders as (quantity, price), dearest first.
+            let mut plain: Vec<(f64, f64)> = side
+                .iter()
+                .filter(|r| !r.reduce_only)
+                .map(|r| (r.qty, reference_price(r.order_type, close)))
+                .collect();
+            plain.sort_by(|a, b| b.1.total_cmp(&a.1));
+            let plain_qty: f64 = plain.iter().map(|(q, _)| q).sum();
+            let plain_value: f64 = plain.iter().map(|(q, p)| q * p).sum();
+            let notional = if req.side.sign() * position < 0.0 {
+                // Against the position: the fresh position on the other side if it closes first.
+                // Any of the orders may be the ones that close it, so the fresh quantity is valued
+                // at the dearest of them, which is the largest it can be worth.
+                let fresh = plain_qty.min(total - position.abs());
+                (total > position.abs() * (1.0 + 1e-9)).then(|| {
+                    let mut left = fresh;
+                    let mut value = 0.0;
+                    for (qty, price) in &plain {
+                        let take = qty.min(left);
+                        value += take * price;
+                        left -= take;
+                        if left <= 0.0 {
+                            break;
+                        }
+                    }
+                    value
+                })
+            } else {
+                Some((position * close + req.side.sign() * plain_value).abs())
+            };
+            if let Some(notional) = notional {
+                let equity = self.equity();
+                let allowed = self.max_leverage * equity;
+                if notional > allowed * (1.0 + 1e-9) {
+                    let reason = format!(
+                        "over the leverage cap of {}x: the position would be worth {notional} with \
+                         the open orders on this side, {allowed} allowed on {equity} of equity",
+                        self.max_leverage
+                    );
+                    return (req, Err(reason));
+                }
             }
         }
         (req, Ok(()))
