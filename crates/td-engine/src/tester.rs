@@ -15,10 +15,10 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use td_core::{Candle, Fill, Millis, Side};
+use td_core::{Candle, Fill, Millis, Side, Timeframe};
 
 use crate::metrics::{self, EquitySeries, MetricsReport};
-use crate::runner::{benchmark_over, config_fingerprint, select_bars};
+use crate::runner::{compare, config_fingerprint, hold_over, select_bars};
 use crate::{
     BacktestConfig, BacktestResult, Benchmark, EngineError, EquityPoint, ParamKind, ParamSpec,
     ParamValue, Params, Trade, find_strategy, run,
@@ -186,7 +186,8 @@ impl OosSpec {
 
 impl WalkForwardSpec {
     /// [`SweepSpec::check`], plus the walk-forward rules that need no data. Whether the windows
-    /// fit the range is checked by the run.
+    /// fit the range, and whether every train window is long enough for the objective, is checked
+    /// by the run before it runs anything.
     pub fn check(&self) -> Result<(), TesterError> {
         refuse_base_warmup(&self.sweep)?;
         self.sweep.check()
@@ -957,11 +958,16 @@ pub struct WalkForwardResult {
     pub equity: Vec<EquityPoint>,
     /// Metrics of the stitched curve, its trades and its fills.
     pub metrics: MetricsReport,
-    /// Buy and hold over the stitched span: bought at the first test bar's open with the starting
-    /// cash and held to the last test bar's close, through any bars between test windows, with
-    /// the fill, fee and funding rules of a backtest's benchmark. Its excess return is the
-    /// stitched total return minus its own. `None` only in a result saved before walk-forwards
-    /// had a benchmark.
+    /// Buy and hold in each test window, stitched like the test runs: each window buys at its
+    /// first test bar's open with the starting cash and holds to its last test bar's close, with
+    /// the fill, fee and funding rules of a backtest's benchmark, and the windows are compounded
+    /// with [`stitch`] as the test segments are. The two curves are therefore exposed over the
+    /// same bars: with a step longer than the test, neither holds through the bars between test
+    /// windows. Its excess return is the stitched total return minus its own.
+    ///
+    /// Unlike a test run it never sells, so it pays one taker fee per window to the test run's
+    /// two, and it holds through each window's last bar, on whose open a test run closes out.
+    /// `None` only in a result saved before walk-forwards had a benchmark.
     #[serde(default)]
     pub benchmark: Option<Benchmark>,
     /// Every test segment's trades in time order, with quantities, P&L, fees and funding scaled
@@ -992,6 +998,12 @@ pub fn walk_forward(
     let plan = Plan::new(&spec.sweep)?;
     let (_, traded) = select_bars(base, bars)?;
     let windows = spec.windows.windows(traded.len())?;
+    refuse_short_train(
+        spec.sweep.objective.metric,
+        base.timeframe,
+        &traded,
+        &windows,
+    )?;
     let time_at = |i: usize| traded.get(i).map_or(base.to, |b| b.open_time);
 
     let per_window = plan.indices.len();
@@ -1043,23 +1055,15 @@ pub fn walk_forward(
         });
     }
 
+    let segments = test_segments(&results);
     let Stitched {
         series,
         equity,
         metrics,
         trades,
         fills,
-    } = stitched_report(base, &results);
-    // `windows` fails unless at least one window fits, so there is a first and a last.
-    let span = BacktestConfig {
-        from: results[0].test_from,
-        to: results[results.len() - 1].test_to,
-        warmup_from: None,
-        close_at_end: false,
-        ..base.clone()
-    };
-    let (_, span_bars) = select_bars(&span, bars)?;
-    let benchmark = benchmark_over(&span, &span_bars, funding, &series, &metrics);
+    } = stitched_report(base, &segments);
+    let benchmark = stitched_benchmark(base, &results, bars, funding, &series, &metrics)?;
     let param_changes = results
         .windows(2)
         .filter(|w| w[0].params != w[1].params)
@@ -1079,6 +1083,76 @@ pub fn walk_forward(
         param_changes,
         param_change_rate,
     })
+}
+
+/// Refuses a walk-forward whose objective is undefined on one of its train windows whatever the
+/// parameters: a Sharpe or Sortino objective on a window with fewer than
+/// [`metrics::MIN_DAILY_RETURNS`] daily returns, or a CAGR or Calmar objective on one shorter than
+/// [`metrics::MIN_CAGR_DAYS`] days. Every train sweep there would end without a qualifying run;
+/// this says why before anything runs. Each window's daily returns and length are counted from its
+/// bars as the train run's metrics count them, from the first bar's open to the last bar's close.
+fn refuse_short_train(
+    metric: Metric,
+    timeframe: Timeframe,
+    traded: &[Candle],
+    windows: &[Window],
+) -> Result<(), TesterError> {
+    let name = match metric {
+        Metric::Sharpe => "Sharpe",
+        Metric::Sortino => "Sortino",
+        Metric::Cagr => "CAGR",
+        Metric::Calmar => "Calmar",
+        _ => return Ok(()),
+    };
+    let step = timeframe.duration_ms();
+    for (k, w) in windows.iter().enumerate() {
+        let train = &traded[w.train.clone()];
+        // `windows` makes every train window at least one bar long.
+        let first = train[0].open_time;
+        let times: Vec<Millis> = std::iter::once(first)
+            .chain(train.iter().map(|b| b.open_time + step))
+            .collect();
+        let span = times[times.len() - 1] - first;
+        let length = format!("{} bars over {}", train.len(), describe_span(span));
+        match metric {
+            Metric::Sharpe | Metric::Sortino => {
+                let returns = metrics::daily_equity(&times, &vec![1.0; times.len()]).len() - 1;
+                if returns < metrics::MIN_DAILY_RETURNS {
+                    return Err(TesterError::InvalidSpec(format!(
+                        "a {name} objective needs at least {} daily returns in every train \
+                         window, and train window {k} ({length}) has {returns}",
+                        metrics::MIN_DAILY_RETURNS
+                    )));
+                }
+            }
+            _ => {
+                if span < metrics::MIN_CAGR_DAYS * metrics::DAY_MS {
+                    return Err(TesterError::InvalidSpec(format!(
+                        "a {name} objective needs train windows of at least {} days, and train \
+                         window {k} is {length}",
+                        metrics::MIN_CAGR_DAYS
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A span of time as whole days and hours, rounded down, such as "8 days 8 hours".
+fn describe_span(ms: Millis) -> String {
+    const HOUR_MS: Millis = 3_600_000;
+    let days = ms / metrics::DAY_MS;
+    let hours = ms % metrics::DAY_MS / HOUR_MS;
+    let unit = |n: Millis, one: &str| match n {
+        1 => format!("1 {one}"),
+        _ => format!("{n} {one}s"),
+    };
+    match (days, hours) {
+        (0, h) => unit(h, "hour"),
+        (d, 0) => unit(d, "day"),
+        (d, h) => format!("{} {}", unit(d, "day"), unit(h, "hour")),
+    }
 }
 
 /// The factor each segment's equity is multiplied by in the stitched curve: the stitched equity
@@ -1122,6 +1196,76 @@ pub fn stitch(starting_cash: f64, segments: &[&[EquityPoint]]) -> Vec<EquityPoin
         .collect()
 }
 
+/// One run stitched into a curve: a test run's, or buy and hold's in a test window.
+struct Segment<'a> {
+    equity: &'a [EquityPoint],
+    fills: &'a [Fill],
+    trades: &'a [Trade],
+    funding_paid: f64,
+}
+
+/// The windows' test runs as segments of the stitched curve.
+fn test_segments(windows: &[WindowResult]) -> Vec<Segment<'_>> {
+    windows
+        .iter()
+        .map(|w| {
+            let r = &w.out_of_sample;
+            Segment {
+                equity: &r.equity,
+                fills: &r.fills,
+                trades: &r.trades,
+                funding_paid: r.metrics.funding_paid,
+            }
+        })
+        .collect()
+}
+
+/// Buy and hold in each test window, stitched like the test runs and compared with the stitched
+/// curve: see [`WalkForwardResult::benchmark`].
+fn stitched_benchmark(
+    base: &BacktestConfig,
+    windows: &[WindowResult],
+    bars: &[Candle],
+    funding: &[(Millis, f64)],
+    strategy_series: &EquitySeries,
+    strategy_report: &MetricsReport,
+) -> Result<Benchmark, TesterError> {
+    let held = windows
+        .iter()
+        .map(|w| {
+            let config = BacktestConfig {
+                from: w.test_from,
+                to: w.test_to,
+                warmup_from: None,
+                close_at_end: false,
+                ..base.clone()
+            };
+            let (_, test_bars) = select_bars(&config, bars)?;
+            Ok(hold_over(&config, &test_bars, funding))
+        })
+        .collect::<Result<Vec<_>, TesterError>>()?;
+    let segments: Vec<Segment> = held
+        .iter()
+        .map(|h| Segment {
+            equity: &h.equity,
+            fills: &h.fills,
+            trades: &h.trades,
+            funding_paid: h.funding_paid,
+        })
+        .collect();
+    let stitched = stitched_report(base, &segments);
+    // `windows` fails unless at least one window fits, so there is a first.
+    Ok(compare(
+        held[0].qty,
+        held[0].entry_price,
+        stitched.equity,
+        &stitched.series,
+        stitched.metrics,
+        strategy_series,
+        strategy_report,
+    ))
+}
+
 /// The stitched curve with its metrics, trades and fills.
 struct Stitched {
     /// The stitched curve as the metrics read it, starting from the starting cash.
@@ -1136,12 +1280,9 @@ struct Stitched {
 /// scaled by the segment's factor, so trade P&L adds up to the stitched equity's changes. A
 /// segment with factor 0 (after ruin) contributes no trades or fills: zero-sized ones would
 /// count as trades in the statistics without having traded anything.
-fn stitched_report(base: &BacktestConfig, windows: &[WindowResult]) -> Stitched {
+fn stitched_report(base: &BacktestConfig, runs: &[Segment]) -> Stitched {
     let cash = base.starting_cash;
-    let segments: Vec<&[EquityPoint]> = windows
-        .iter()
-        .map(|w| w.out_of_sample.equity.as_slice())
-        .collect();
+    let segments: Vec<&[EquityPoint]> = runs.iter().map(|r| r.equity).collect();
     let equity = stitch(cash, &segments);
     let scales = segment_scales(cash, &segments);
     let lot = base.instrument.lot_size;
@@ -1149,13 +1290,12 @@ fn stitched_report(base: &BacktestConfig, windows: &[WindowResult]) -> Stitched 
     let mut fills: Vec<Fill> = Vec::new();
     let mut trades: Vec<Trade> = Vec::new();
     let mut funding = 0.0;
-    for (w, s) in windows.iter().zip(scales) {
-        let r = &w.out_of_sample;
+    for (r, s) in runs.iter().zip(scales) {
         // The position after each bar's fills, rebuilt from the fills (a fill's time is the open
         // time of the bar it filled on) and snapped to the lot size against rounding error.
         let mut position = 0.0;
         let mut next = 0;
-        for p in &r.equity {
+        for p in r.equity {
             while next < r.fills.len() && r.fills[next].time <= p.time {
                 let f = &r.fills[next];
                 position += match f.side {
@@ -1187,7 +1327,7 @@ fn stitched_report(base: &BacktestConfig, windows: &[WindowResult]) -> Stitched 
             net_pnl: t.net_pnl * s,
             ..t.clone()
         }));
-        funding += r.metrics.funding_paid * s;
+        funding += r.funding_paid * s;
     }
     let series = EquitySeries::new(cash, &equity, base.timeframe);
     let metrics = metrics::report(&series, &positions, &trades, &fills, funding);
@@ -1462,7 +1602,7 @@ mod tests {
         ruined.out_of_sample.equity.last_mut().unwrap().equity = 0.0;
         let windows = [ruined, window(20, 40)];
         let first = &windows[0].out_of_sample;
-        let st = stitched_report(&base, &windows);
+        let st = stitched_report(&base, &test_segments(&windows));
         assert_eq!(st.trades, first.trades);
         assert_eq!(st.fills, first.fills);
         assert_eq!(st.metrics.trades, first.metrics.trades);

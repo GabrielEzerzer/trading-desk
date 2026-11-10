@@ -33,7 +33,7 @@ use crate::{EquityPoint, Trade};
 
 /// Days in a year for annualising: crypto markets trade every day.
 pub const DAYS_PER_YEAR: f64 = 365.0;
-const DAY_MS: Millis = 86_400_000;
+pub(crate) const DAY_MS: Millis = 86_400_000;
 const MS_PER_YEAR: f64 = DAYS_PER_YEAR * DAY_MS as f64;
 
 /// The fewest daily returns the report computes volatility, Sharpe and Sortino from; below it they
@@ -41,6 +41,12 @@ const MS_PER_YEAR: f64 = DAYS_PER_YEAR * DAY_MS as f64;
 /// it by `sqrt(365)` turns a lucky day or two into a ratio that looks exceptional (a 26-hour run
 /// gave a Sharpe of 12.5). Thirty, about a month of daily returns, is a common rule-of-thumb
 /// minimum for a sample standard deviation.
+///
+/// The floor counts the UTC calendar days the equity curve spans (see [`daily_equity`]), not days
+/// with bars: a day inside a data gap, or between two walk-forward test windows in a stitched
+/// curve, counts as a daily return of zero. Zero returns lower the mean daily return more than
+/// its standard deviation, so they pull Sharpe and Sortino toward zero rather than inflate them
+/// (volatility comes out lower), but a gappy curve reaches the floor with fewer real returns.
 pub const MIN_DAILY_RETURNS: usize = 30;
 
 /// The shortest run, from the first bar's open to the last bar's close, the report computes CAGR

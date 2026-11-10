@@ -7,12 +7,12 @@ mod common;
 use std::ops::ControlFlow;
 use std::sync::Mutex;
 
-use td_core::{Candle, Millis, Timeframe};
+use td_core::{Candle, FeeSchedule, Millis, Timeframe};
 use td_engine::{
     BacktestConfig, Direction, EngineError, MAX_RUNS, Metric, Objective, OosSpec, ParamAxis,
     ParamSpace, ParamValue, Params, RunKind, SavedRun, Split, SweepMode, SweepSpec, TesterError,
-    WalkForwardSpec, WindowMode, WindowSpec, config_fingerprint, list, load, out_of_sample, run,
-    save, sweep, walk_forward,
+    WalkForwardResult, WalkForwardSpec, WindowMode, WindowSpec, config_fingerprint, list, load,
+    out_of_sample, run, save, sweep, walk_forward,
 };
 
 const HOUR: Millis = 3_600_000;
@@ -1104,29 +1104,57 @@ fn wf_benchmark_funding() -> Vec<(Millis, f64)> {
 }
 
 #[test]
-fn the_walk_forward_benchmark_buys_at_the_first_test_bar_and_holds_to_the_last() {
+fn the_walk_forward_benchmark_buys_and_holds_in_each_test_window_and_compounds_them() {
     let bars = rising_bars(300);
     let funding = wf_benchmark_funding();
     let r = walk_forward(&rising_wf_spec(), &bars, &funding, None).unwrap();
-    // Tests run from bar 50 to bar 299.
+    // Five contiguous test windows of 50 bars, from bar 50 to bar 299.
+    assert_eq!(r.windows.len(), 5);
     assert_eq!(r.windows[0].test_from, T0 + 50 * HOUR);
     let b = r.benchmark.as_ref().unwrap();
-    // Bar 50 opens at 124.5; with 5 bps of slippage 124.56225, rounded up to the tick.
+    // Each window buys again at its first bar's open, with 5 bps of slippage rounded up to the
+    // tick, and all its cash after the 0.2% taker fee rounded down to the lot. Bar 50 opens at
+    // 124.5: 124.56225 rounds up to 124.57, and 10 000 / (124.57 * 1.002) = 80.1159... rounds
+    // down to 80.115. Bar 100 opens at 149.5: 149.58 and 66.7205... -> 66.72. Bar 150: 174.59 and
+    // 57.1627... -> 57.162. Bar 200: 199.6 and 50.0002... -> 50. Bar 250: 224.62 and 44.4308...
+    // -> 44.43. Funding at bar 60's open is paid in the first window at that open (129.5), and
+    // the event inside bar 100 in the second window at bar 100's close (150), on that window's
+    // quantity. The events before bar 50 and at the end of the range are ignored.
+    let windows: [(i64, f64, f64, f64); 5] = [
+        (50, 124.57, 80.115, 80.115 * 129.5 * 0.0001),
+        (100, 149.58, 66.72, 66.72 * 150.0 * -0.00005),
+        (150, 174.59, 57.162, 0.0),
+        (200, 199.6, 50.0, 0.0),
+        (250, 224.62, 44.43, 0.0),
+    ];
+    // The benchmark reports the first window's purchase.
     assert_eq!(b.entry_price, 124.57);
-    // 10 000 / (124.57 * 1.002) = 80.1159..., rounded down to the lot.
     assert!((b.qty - 80.115).abs() < 1e-9, "{}", b.qty);
+    // It has the stitched curve's times.
+    assert_eq!(
+        b.equity.iter().map(|p| p.time).collect::<Vec<_>>(),
+        r.equity.iter().map(|p| p.time).collect::<Vec<_>>()
+    );
     assert_eq!(b.equity.len(), 250);
-    assert_eq!(b.equity[0].time, T0 + 50 * HOUR);
-    assert_eq!(b.equity.last().unwrap().time, T0 + 299 * HOUR);
-    // Held to the close of bar 299 at 249.5, less the entry fee and the two funding payments in
-    // the span: at the open of bar 60 (129.5) and inside bar 100, at its close (150).
-    let fee = 124.57 * 80.115 * 0.002;
-    let paid = 80.115 * 129.5 * 0.0001 + 80.115 * 150.0 * -0.00005;
-    let end = 10_000.0 - fee - paid + 80.115 * (249.5 - 124.57);
-    let got = b.equity.last().unwrap().equity;
-    assert!((got - end).abs() < 1e-9, "{got} vs {end}");
+    // Each window is held to the close of its last bar, 100 + 0.5 * (first + 49), less its entry
+    // fee and funding, and its return compounds on the windows before it, as the test runs do.
+    let mut level = 1.0;
+    let mut paid = 0.0;
+    for (first, price, qty, funding) in windows {
+        let close = 100.0 + 0.5 * (first + 49) as f64;
+        let end = 10_000.0 - price * qty * 0.002 - funding + qty * (close - price);
+        paid += funding * level;
+        level *= end / 10_000.0;
+        let last = T0 + (first + 49) * HOUR;
+        let got = b.equity.iter().find(|p| p.time == last).unwrap().equity;
+        assert!(
+            (got - 10_000.0 * level).abs() < 1e-8,
+            "{first}: {got} vs {}",
+            10_000.0 * level
+        );
+    }
     assert!((b.metrics.funding_paid - paid).abs() < 1e-12);
-    assert!((b.metrics.total_return.unwrap() - (end / 10_000.0 - 1.0)).abs() < 1e-12);
+    assert!((b.metrics.total_return.unwrap() - (level - 1.0)).abs() < 1e-12);
     assert_eq!(
         b.excess_return,
         Some(r.metrics.total_return.unwrap() - b.metrics.total_return.unwrap())
@@ -1134,31 +1162,192 @@ fn the_walk_forward_benchmark_buys_at_the_first_test_bar_and_holds_to_the_last()
     assert!(b.correlation.is_some());
 }
 
-#[test]
-fn the_walk_forward_benchmark_holds_through_the_gaps_between_test_windows() {
-    let bars = rising_bars(300);
+/// The test windows of [`gap_wf_spec`]: 40 bars every 50.
+const GAP_TESTS: [std::ops::Range<i64>; 5] = [60..100, 110..150, 160..200, 210..250, 260..300];
+
+/// Hourly bars, each opening at the previous close, that rise by 2 a bar outside the test windows
+/// of [`gap_wf_spec`]. Inside each, the first and last bars are flat and the others rise by 0.01,
+/// so a strategy that enters on the first bar's close and closes out on the last bar's open holds
+/// every price move of the window.
+fn gap_bars() -> Vec<Candle> {
+    let mut open = 100.0;
+    (0..300)
+        .map(|i| {
+            let close = match GAP_TESTS.iter().find(|t| t.contains(&i)) {
+                Some(t) if i == t.start || i == t.end - 1 => open,
+                Some(_) => open + 0.01,
+                None => open + 2.0,
+            };
+            let c = candle(i, open, close);
+            open = close;
+            c
+        })
+        .collect()
+}
+
+/// [`rising_wf_spec`] with tests of 40 bars every 50, all of the equity in, and no fees or
+/// slippage.
+fn gap_wf_spec() -> WalkForwardSpec {
     let mut s = rising_wf_spec();
-    // Tests of 40 bars every 50: 60..100, 110..150, ..., 260..300.
     s.windows.test_bars = 40;
-    let r = walk_forward(&s, &bars, &wf_benchmark_funding(), None).unwrap();
-    assert_eq!(r.windows[0].test_from, T0 + 60 * HOUR);
-    assert_eq!(r.equity.len(), 200);
+    let b = &mut s.sweep.base;
+    b.params = b
+        .params
+        .clone()
+        .with("equity_fraction", ParamValue::Float(1.0));
+    b.slippage_bps = 0.0;
+    b.fee_override = Some(FeeSchedule {
+        maker: 0.0,
+        taker: 0.0,
+    });
+    s
+}
+
+/// Pearson correlation, written out.
+fn pearson(a: &[f64], b: &[f64]) -> f64 {
+    let n = a.len() as f64;
+    let (ma, mb) = (a.iter().sum::<f64>() / n, b.iter().sum::<f64>() / n);
+    let cov: f64 = a.iter().zip(b).map(|(x, y)| (x - ma) * (y - mb)).sum();
+    let va: f64 = a.iter().map(|x| (x - ma).powi(2)).sum();
+    let vb: f64 = b.iter().map(|y| (y - mb).powi(2)).sum();
+    cov / (va * vb).sqrt()
+}
+
+#[test]
+fn the_walk_forward_benchmark_is_out_of_the_market_between_test_windows_like_the_strategy() {
+    let bars = gap_bars();
+    let r = walk_forward(&gap_wf_spec(), &bars, &[], None).unwrap();
+    let starts: Vec<Millis> = r.windows.iter().map(|w| w.test_from).collect();
+    assert_eq!(starts, GAP_TESTS.map(|t| T0 + t.start * HOUR));
+    // In every window the strategy buys on the second bar's open, at the first bar's flat price,
+    // and sells on the last bar's open, at the last bar's flat price: it holds every move.
+    for (w, t) in r.windows.iter().zip(GAP_TESTS) {
+        let fills = &w.out_of_sample.fills;
+        assert_eq!(fills.len(), 2, "{fills:?}");
+        let (first, last) = (t.start as usize, t.end as usize - 1);
+        assert_eq!(fills[0].time, T0 + (t.start + 1) * HOUR);
+        // Fill prices are on the 0.01 tick; the bars carry float error from adding 0.01.
+        assert!((fills[0].price - bars[first].close).abs() < 1e-9);
+        assert_eq!(fills[1].time, bars[last].open_time);
+        assert!((fills[1].price - bars[last].close).abs() < 1e-9);
+    }
     let b = r.benchmark.as_ref().unwrap();
-    // Bars 60 to 299, gaps included, held continuously.
-    assert_eq!(b.equity.len(), 240);
-    assert_eq!(b.equity[0].time, T0 + 60 * HOUR);
-    // Bar 60 opens at 129.5: 129.56475, rounded up to the tick.
-    assert_eq!(b.entry_price, 129.57);
-    // 10 000 / (129.57 * 1.002) = 77.0243..., rounded down to the lot.
-    let qty = 77.024;
-    assert!((b.qty - qty).abs() < 1e-9, "{}", b.qty);
-    // Funding at bar 60's open falls before the entry and is not charged; bar 100's is.
-    let fee = 129.57 * qty * 0.002;
-    let end = 10_000.0 - fee - qty * 150.0 * -0.00005 + qty * (249.5 - 129.57);
-    let got = b.equity.last().unwrap().equity;
-    assert!((got - end).abs() < 1e-9, "{got} vs {end}");
-    // The correlation pairs each stitched bar's return with the benchmark's over the same time.
-    assert!(b.correlation.is_some());
+    // Out of the market between test windows, as the stitched curve is: the same 200 times.
+    assert_eq!(
+        b.equity.iter().map(|p| p.time).collect::<Vec<_>>(),
+        r.equity.iter().map(|p| p.time).collect::<Vec<_>>()
+    );
+    assert_eq!(b.entry_price, 220.0);
+    // The strategy is long on the same bars, so the excess return is only the difference in size:
+    // in each window, entered at P and left at P + 0.38 from 10 000, the benchmark holds
+    // 10 000 / P and the strategy 0.995 * 10 000 / P (the reference strategies leave 0.5% of
+    // headroom), each rounded down to the 0.001 lot. Their returns differ by at most
+    // (0.005 / P + 0.001 / 10 000) * 0.38 <= (0.005 / 220 + 1e-7) * 0.38 = 8.7e-6 in a window, and
+    // the strategy holds less. Five windows, compounded on levels within 1% of 1, stay under
+    // 4.5e-5. Holding the benchmark through the gaps, which rise by 20 each, would put the 37%
+    // they add on the benchmark alone.
+    let excess = b.excess_return.unwrap();
+    assert!(excess < 0.0 && excess > -4.5e-5, "{excess}");
+    // The correlation pairs each stitched return with the benchmark's over the same interval: the
+    // benchmark's equity read at the stitched curve's times, both starting from the cash.
+    let at = |t: Millis| b.equity.iter().find(|p| p.time == t).unwrap().equity;
+    let strategy: Vec<f64> = std::iter::once(10_000.0)
+        .chain(r.equity.iter().map(|p| p.equity))
+        .collect();
+    let bench: Vec<f64> = std::iter::once(10_000.0)
+        .chain(r.equity.iter().map(|p| at(p.time)))
+        .collect();
+    let returns = |v: &[f64]| v.windows(2).map(|w| w[1] / w[0] - 1.0).collect::<Vec<_>>();
+    let expected = pearson(&returns(&strategy), &returns(&bench));
+    let got = b.correlation.unwrap();
+    assert!((got - expected).abs() < 1e-12, "{got} vs {expected}");
+    assert!(got > 0.99, "{got}");
+}
+
+/// [`rising_wf_spec`] with `train` bars of training, one test window of 50 bars and `metric` as
+/// the objective, over exactly the bars it needs, so the train window starts at 00:00 UTC.
+fn train_floor_spec(metric: Metric, train: usize) -> (WalkForwardSpec, Vec<Candle>) {
+    let mut s = rising_wf_spec();
+    s.sweep.objective.metric = metric;
+    s.windows.train_bars = train;
+    let n = train as i64 + 50;
+    s.sweep.base.to = T0 + n * HOUR;
+    (s, rising_bars(n))
+}
+
+#[test]
+fn a_walk_forward_whose_train_windows_are_too_short_for_its_objective_is_refused_before_running() {
+    let refused = |metric, train| {
+        let (s, bars) = train_floor_spec(metric, train);
+        let calls = Mutex::new(0usize);
+        let progress = |_: usize, _: usize| {
+            *calls.lock().unwrap() += 1;
+            ControlFlow::Continue(())
+        };
+        let err = walk_forward(&s, &bars, &[], Some(&progress)).unwrap_err();
+        assert_eq!(calls.into_inner().unwrap(), 0, "ran before refusing");
+        match err {
+            TesterError::InvalidSpec(m) => m,
+            other => panic!("{other:?}"),
+        }
+    };
+    // 50 hourly bars from 00:00 touch three UTC days.
+    assert_eq!(
+        refused(Metric::Sharpe, 50),
+        "a Sharpe objective needs at least 30 daily returns in every train window, and train \
+         window 0 (50 bars over 2 days 2 hours) has 3"
+    );
+    // 696 hourly bars are exactly 29 days: 29 daily returns, one short.
+    assert_eq!(
+        refused(Metric::Sortino, 696),
+        "a Sortino objective needs at least 30 daily returns in every train window, and train \
+         window 0 (696 bars over 29 days) has 29"
+    );
+    // An hour short of 90 days.
+    assert_eq!(
+        refused(Metric::Cagr, 2_159),
+        "a CAGR objective needs train windows of at least 90 days, and train window 0 is 2159 \
+         bars over 89 days 23 hours"
+    );
+    assert!(refused(Metric::Calmar, 50).starts_with("a Calmar objective needs"));
+
+    // One more bar reaches into a 30th day: the walk-forward runs and the train window has a
+    // Sharpe ratio, so the check refuses exactly what the train sweeps could not rank.
+    let (s, bars) = train_floor_spec(Metric::Sharpe, 697);
+    let r = walk_forward(&s, &bars, &[], None).unwrap();
+    assert!(r.windows[0].in_sample.sharpe.is_some());
+    let (s, bars) = train_floor_spec(Metric::Cagr, 2_160);
+    let r = walk_forward(&s, &bars, &[], None).unwrap();
+    assert!(r.windows[0].in_sample.cagr.is_some());
+    // Objectives without a floor are not checked.
+    let (s, bars) = train_floor_spec(Metric::TotalReturn, 50);
+    assert!(walk_forward(&s, &bars, &[], None).is_ok());
+}
+
+#[test]
+fn a_walk_forward_saved_before_it_had_a_benchmark_loads_without_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let wf = walk_forward(&rising_wf_spec(), &rising_bars(300), &[], None).unwrap();
+    let id = save(&SavedRun::WalkForward(Box::new(wf.clone())), dir.path()).unwrap();
+    // Rewrite result.json as a save from before walk-forwards had a benchmark: no `benchmark` key
+    // on the walk-forward result (each window's backtest keeps its own).
+    let path = dir.path().join(id.as_str()).join("result.json");
+    let mut json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let result = json["result"].as_object_mut().unwrap();
+    assert!(result.remove("benchmark").is_some());
+    std::fs::write(&path, serde_json::to_string(&json).unwrap()).unwrap();
+    let SavedRun::WalkForward(loaded) = load(dir.path(), id.as_str()).unwrap() else {
+        panic!("not a walk-forward");
+    };
+    assert_eq!(loaded.benchmark, None);
+    assert_eq!(
+        *loaded,
+        WalkForwardResult {
+            benchmark: None,
+            ..wf
+        }
+    );
 }
 
 #[test]
