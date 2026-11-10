@@ -778,19 +778,19 @@ error: ErrorBody | null,
  */
 cancel_requested: boolean, created_at: number, started_at: number | null, finished_at: number | null, };
 
-export type JobKind = "download" | "backtest" | "sweep" | "out_of_sample" | "walk_forward";
+export type JobKind = "download" | "backtest" | "sweep" | "oos" | "walk_forward";
 
 export type JobStatus = "queued" | "running" | "done" | "failed" | "cancelled";
 
 /**
  * What a job was asked to do, tagged by `kind`.
  */
-export type JobRequest = { "kind": "download" } & DownloadRequest | { "kind": "backtest" } & BacktestConfig | { "kind": "sweep" } & SweepSpec | { "kind": "out_of_sample" } & OosSpec | { "kind": "walk_forward" } & WalkForwardSpec;
+export type JobRequest = { "kind": "download" } & DownloadRequest | { "kind": "backtest" } & BacktestConfig | { "kind": "sweep" } & SweepSpec | { "kind": "oos" } & OosSpec | { "kind": "walk_forward" } & WalkForwardSpec;
 
 /**
  * What a finished job produced, tagged by `kind`.
  */
-export type JobResult = { "kind": "download" } & DownloadResult | { "kind": "backtest" } & RunDone | { "kind": "sweep" } & RunDone | { "kind": "out_of_sample" } & RunDone | { "kind": "walk_forward" } & RunDone;
+export type JobResult = { "kind": "download" } & DownloadResult | { "kind": "backtest" } & RunDone | { "kind": "sweep" } & RunDone | { "kind": "oos" } & RunDone | { "kind": "walk_forward" } & RunDone;
 
 /**
  * What a finished run job produced: the saved run's id and its row in the run list. The whole
@@ -798,7 +798,8 @@ export type JobResult = { "kind": "download" } & DownloadResult | { "kind": "bac
  */
 export type RunDone = { run_id: RunId, summary: RunSummary, 
 /**
- * How many buckets were left out as incomplete; the list is the result's `data.dropped`.
+ * How many buckets in the range have no bar, empty or incomplete; the list is the result's
+ * `data.dropped`, and the missing minutes are its `data.gaps`.
  */
 dropped_buckets: number, };
 
@@ -807,9 +808,14 @@ dropped_buckets: number, };
  */
 export type RunDetail = { id: RunId, run: SavedRun, 
 /**
- * The data the run was given; `null` for a run saved by another tool, without one.
+ * The data the run was given; `null` for a run saved without one (by another tool) or whose
+ * report cannot be read.
  */
 data: DataReport | null, 
+/**
+ * Why the run's data report cannot be read, when it has one that is damaged; `null` otherwise.
+ */
+data_error: string | null, 
 /**
  * Whether the run would come out the same today; set by `GET /runs/{id}`, `null` from
  * `GET /jobs/{id}/result`.
@@ -834,9 +840,9 @@ data_matches: boolean,
 engine_matches: boolean | null, };
 
 /**
- * The data a run was given: its bars at the run's timeframe, and the buckets td-data left out or
- * built with minutes missing. The engine does not record these; the API does, so the apps can
- * show them.
+ * The data a run was given: its bars at the run's timeframe, the minutes the store lacks, and the
+ * buckets left out or built with minutes missing. The engine does not record these; the API
+ * does, so the apps can show them.
  */
 export type DataReport = { 
 /**
@@ -844,9 +850,15 @@ export type DataReport = {
  */
 bars: number, 
 /**
- * Open times of the buckets left out because too many of their minutes are missing from the
- * store (td-data's rule: a bucket needs its first and last minute and at most 1% missing).
- * The run has no bar there.
+ * Every stretch of minutes in the range (warm-up included) the store has no candle for,
+ * oldest first, including any at the start or the end of the range. Each is shorter than a
+ * day; a longer one refuses the run.
+ */
+gaps: Array<GapInfo>, 
+/**
+ * Open times of every bucket in the range the run has no bar for: buckets with no minutes at
+ * all, and buckets left out because too many of their minutes are missing (td-data's rule: a
+ * bucket needs its first and last minute and at most 1% missing).
  */
 dropped: Array<number>, 
 /**

@@ -38,7 +38,9 @@ pub use metrics::MetricsReport;
 pub use params::{ParamKind, ParamSpec, ParamValue, Params};
 pub use portfolio::Portfolio;
 pub use registry::{StrategyEntry, build_strategy, find_strategy, strategies};
-pub use results::{RunId, RunKind, RunSummary, SavedRun, StoreError, list, load, save};
+pub use results::{
+    RunId, RunKind, RunSummary, SavedRun, StoreError, list, load, save, save_with_files,
+};
 pub use runner::{
     BacktestConfig, BacktestResult, Benchmark, ENGINE_REVISION, Rerun, config_fingerprint,
     data_fingerprint, rerun, run,

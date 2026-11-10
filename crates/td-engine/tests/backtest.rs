@@ -9,7 +9,7 @@ use serde_json::Value;
 use td_core::{Candle, Millis, Timeframe};
 use td_engine::{
     BacktestConfig, BacktestResult, ENGINE_REVISION, EngineError, ParamValue, Params, RunKind,
-    SavedRun, config_fingerprint, data_fingerprint, list, load, rerun, run, save,
+    SavedRun, config_fingerprint, data_fingerprint, list, load, rerun, run, save, save_with_files,
 };
 
 const HOUR: Millis = 3_600_000;
@@ -291,6 +291,35 @@ fn list_is_newest_first_and_skips_other_entries() {
         load(runs, "../outside"),
         Err(td_engine::StoreError::InvalidRunId(_))
     ));
+}
+
+#[test]
+fn extra_files_are_saved_with_the_run_and_only_under_plain_new_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let runs = dir.path();
+    let saved = SavedRun::Backtest(Box::new(run_synthetic()));
+    let id = save_with_files(&saved, runs, &[("data.json", "{}".as_bytes())]).unwrap();
+    let run_dir = runs.join(id.as_str());
+    assert_eq!(std::fs::read(run_dir.join("data.json")).unwrap(), b"{}");
+    assert!(run_dir.join("result.json").is_file());
+
+    for name in [
+        "result.json",
+        "config.json",
+        "../escape.json",
+        "a/b.json",
+        "..",
+    ] {
+        assert!(
+            matches!(
+                save_with_files(&saved, runs, &[(name, "{}".as_bytes())]),
+                Err(td_engine::StoreError::InvalidFileName(_))
+            ),
+            "{name}"
+        );
+    }
+    // Nothing but the first run was written.
+    assert_eq!(std::fs::read_dir(runs).unwrap().count(), 1);
 }
 
 #[test]

@@ -15,13 +15,19 @@
 //! - `GET /jobs`, `GET /jobs/{id}`, `POST /jobs/{id}/cancel`: background jobs (see [`jobs`]).
 //! - `POST /runs/backtest` (a `BacktestConfig`), `POST /runs/sweep` (a `SweepSpec`),
 //!   `POST /runs/out-of-sample` (an `OosSpec`), `POST /runs/walk-forward` (a `WalkForwardSpec`):
-//!   start a run job, answer `{job_id}`. The data is loaded from the store first: a range it does
-//!   not cover is a 422 `data_missing` naming the missing spans; a bad spec is a 400
-//!   (`invalid_config`, `invalid_spec`). Each finished run is saved (see [`runs`]).
+//!   start a run job, answer `{job_id}`. An out-of-sample run's job kind is `oos`, the same as its
+//!   saved run's kind; only the route spells it out. `from`, `to` and `warmup_from` must each be
+//!   where a bar of the timeframe opens. The data is loaded from the store first: a gap of a day
+//!   or more is a 422 `data_missing` naming the missing spans; shorter gaps are run and listed in
+//!   the result's data report (`gaps`, `dropped`). A bad spec is a 400 (`invalid_config`, which
+//!   includes an unknown strategy and range edges off a bar boundary, or `invalid_spec`). Each
+//!   finished run is saved (see [`runs`]).
 //! - `GET /jobs/{id}/result`: the saved run of a finished run job (`RunDetail`); 409
-//!   `job_not_done` before it is done.
+//!   `job_not_done` while it is queued or running (ask again later), 409 `no_result` once it has
+//!   finished without a saved run (failed, cancelled, or not a run job).
 //! - `GET /runs`: the saved runs, newest first, one summary row each. `GET /runs/{id}`: one saved
-//!   run with its data report and a check of whether its data and engine still match.
+//!   run with its data report (`data_error` says why when that report is damaged) and a check of
+//!   whether its data and engine still match.
 //! - `GET /ws`: topic subscriptions, `jobs` for now (see [`ws`]).
 //!
 //! On start the binary prints one line to stdout, `{"port":<n>,"token":"<hex>"}`

@@ -42,6 +42,11 @@ pub enum StoreError {
 
     #[error("a run with id {0} already exists")]
     RunExists(RunId),
+
+    #[error(
+        "{0:?} cannot be saved beside a run: it must be a plain file name other than {CONFIG_FILE} and {RESULT_FILE}"
+    )]
+    InvalidFileName(String),
 }
 
 /// A run's id: the save time in milliseconds since the epoch, zero-padded to 13 digits so ids
@@ -187,6 +192,23 @@ pub struct RunSummary {
 /// Both files are written into a temporary directory inside `runs_dir`, which is then renamed to
 /// the run's id, so a run appears whole or not at all. `runs_dir` is created if needed.
 pub fn save(run: &SavedRun, runs_dir: &Path) -> Result<RunId, StoreError> {
+    save_with_files(run, runs_dir, &[])
+}
+
+/// [`save`], with `files` (name and contents) written into the run's directory in the same atomic
+/// save, for what a caller keeps beside a run. Each name must be a plain file name other than the
+/// run's own files.
+pub fn save_with_files(
+    run: &SavedRun,
+    runs_dir: &Path,
+    files: &[(&str, &[u8])],
+) -> Result<RunId, StoreError> {
+    for &(name, _) in files {
+        let plain = Path::new(name).file_name().is_some_and(|n| n == name);
+        if !plain || name == CONFIG_FILE || name == RESULT_FILE {
+            return Err(StoreError::InvalidFileName(name.to_string()));
+        }
+    }
     let config_json = match run {
         SavedRun::Backtest(r) => to_json(&r.config, runs_dir)?,
         SavedRun::Sweep(r) => to_json(&r.spec, runs_dir)?,
@@ -208,9 +230,13 @@ pub fn save(run: &SavedRun, runs_dir: &Path) -> Result<RunId, StoreError> {
     let tmp = runs_dir.join(format!(".tmp-{id}"));
     let write = || -> Result<(), StoreError> {
         fs::create_dir(&tmp).map_err(io_err(&tmp))?;
-        for (name, json) in [(CONFIG_FILE, &config_json), (RESULT_FILE, &result_json)] {
+        let own = [
+            (CONFIG_FILE, config_json.as_bytes()),
+            (RESULT_FILE, result_json.as_bytes()),
+        ];
+        for &(name, contents) in own.iter().chain(files) {
             let path = tmp.join(name);
-            fs::write(&path, json).map_err(io_err(&path))?;
+            fs::write(&path, contents).map_err(io_err(&path))?;
         }
         fs::rename(&tmp, &dest).map_err(io_err(&dest))
     };

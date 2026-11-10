@@ -40,7 +40,7 @@ pub enum JobKind {
     Download,
     Backtest,
     Sweep,
-    OutOfSample,
+    Oos,
     WalkForward,
 }
 
@@ -70,7 +70,7 @@ pub enum JobRequest {
     Download(DownloadRequest),
     Backtest(BacktestConfig),
     Sweep(SweepSpec),
-    OutOfSample(OosSpec),
+    Oos(OosSpec),
     WalkForward(WalkForwardSpec),
 }
 
@@ -80,7 +80,7 @@ impl JobRequest {
             JobRequest::Download(_) => JobKind::Download,
             JobRequest::Backtest(_) => JobKind::Backtest,
             JobRequest::Sweep(_) => JobKind::Sweep,
-            JobRequest::OutOfSample(_) => JobKind::OutOfSample,
+            JobRequest::Oos(_) => JobKind::Oos,
             JobRequest::WalkForward(_) => JobKind::WalkForward,
         }
     }
@@ -101,7 +101,7 @@ pub enum JobResult {
     Download(DownloadResult),
     Backtest(RunDone),
     Sweep(RunDone),
-    OutOfSample(RunDone),
+    Oos(RunDone),
     WalkForward(RunDone),
 }
 
@@ -112,7 +112,7 @@ impl JobResult {
             JobResult::Download(_) => None,
             JobResult::Backtest(r)
             | JobResult::Sweep(r)
-            | JobResult::OutOfSample(r)
+            | JobResult::Oos(r)
             | JobResult::WalkForward(r) => Some(r),
         }
     }

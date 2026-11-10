@@ -13,6 +13,7 @@ use td_data::time::{DAY, MINUTE, parse_date};
 use td_data::{DataError, DownloadReport, InstrumentList, Store};
 use td_engine::{BacktestConfig, Params, SavedRun};
 use td_server::api::auth::Token;
+use td_server::api::data::GapInfo;
 use td_server::api::jobs::{JobInfo, JobResult, JobStatus};
 use td_server::api::runs::RunDetail;
 use td_server::api::source::MarketSource;
@@ -308,7 +309,12 @@ fn sweep_spec(days: i64, fast: (i64, i64), slow: (i64, i64)) -> Value {
 async fn a_backtest_through_the_api_equals_td_engine_run_on_the_same_candles() {
     let t = TestServer::seeded(10).await;
     let mut ws = t.websocket().await;
-    let config = config(InstrumentKind::Perpetual, 10);
+    // Two days of warm-up before the backtest proper; the outage on day two falls in it.
+    let config = BacktestConfig {
+        from: t0() + 2 * DAY,
+        warmup_from: Some(t0()),
+        ..config(InstrumentKind::Perpetual, 10)
+    };
     let job = t
         .start("/runs/backtest", &serde_json::to_value(&config).unwrap())
         .await;
@@ -327,16 +333,26 @@ async fn a_backtest_through_the_api_equals_td_engine_run_on_the_same_candles() {
     assert_eq!(detail.check, None);
     let data = detail.data.as_ref().expect("a data report");
     assert_eq!(data.dropped, vec![t0() + DAY + 10 * HOUR]);
+    let outage = t0() + DAY + 10 * HOUR;
+    assert_eq!(
+        data.gaps,
+        vec![GapInfo {
+            from: outage,
+            to: outage + 30 * MINUTE,
+            minutes: 30,
+        }]
+    );
     assert_eq!(data.bars, 10 * 24 - 1);
     assert_eq!(data.funding_rates, 30);
 
+    // The direct run reads from the warm-up start, as the API must.
     let id = &config.instrument.id;
     let loaded = t
         .store
-        .load_candles(id, Timeframe::H1, config.from, config.to, false)
+        .load_candles(id, Timeframe::H1, t0(), config.to, false)
         .unwrap();
     assert_eq!(loaded.dropped, data.dropped);
-    let funding = t.store.load_funding(id, config.from, config.to).unwrap();
+    let funding = t.store.load_funding(id, t0(), config.to).unwrap();
     let direct = td_engine::run(&config, &loaded.candles, &funding).unwrap();
     assert!(direct.metrics.trades > 0, "the test needs trades");
     let SavedRun::Backtest(through_api) = &detail.run else {
@@ -363,6 +379,26 @@ async fn a_backtest_through_the_api_equals_td_engine_run_on_the_same_candles() {
         json!({ "data_matches": true, "engine_matches": true })
     );
     assert_eq!(reopened["data"]["dropped"], json!([t0() + DAY + 10 * HOUR]));
+    assert_eq!(reopened["data_error"], Value::Null);
+
+    // A damaged data report reads as an error, not as a run saved without one.
+    let report = t
+        .store
+        .root()
+        .join("runs")
+        .join(finished.run_id.as_str())
+        .join("data.json");
+    std::fs::write(&report, "{ not json").unwrap();
+    let (status, damaged) = t.get(&format!("/runs/{}", finished.run_id)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(damaged["data"], Value::Null);
+    assert!(damaged["data_error"].is_string(), "{damaged}");
+    std::fs::remove_file(&report).unwrap();
+    let (_, absent) = t.get(&format!("/runs/{}", finished.run_id)).await;
+    assert_eq!(
+        (&absent["data"], &absent["data_error"]),
+        (&Value::Null, &Value::Null)
+    );
 
     // A changed candle in the range makes the data no longer match.
     let mut changed = t
@@ -408,7 +444,7 @@ async fn sweep_out_of_sample_and_walk_forward_jobs_report_progress_and_save_thei
     let job = t.start("/runs/out-of-sample", &oos).await;
     let done = ws.follow(job).await.pop().unwrap();
     assert_eq!(done.status, JobStatus::Done, "{:?}", done.error);
-    assert!(matches!(done.result, Some(JobResult::OutOfSample(_))));
+    assert!(matches!(done.result, Some(JobResult::Oos(_))));
     let detail = t.result(job).await;
     let SavedRun::Oos(result) = &detail.run else {
         panic!("an out-of-sample run");
@@ -488,6 +524,12 @@ async fn a_range_the_store_lacks_is_422_data_missing_and_starts_no_job() {
     unknown["strategy"] = json!("nope");
     let (status, body) = t.post("/runs/backtest", &unknown).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"]["code"], "invalid_config");
+    let mut unknown_sweep = sweep_spec(3, (3, 4), (10, 11));
+    unknown_sweep["base"]["strategy"] = json!("nope");
+    let (status, body) = t.post("/runs/sweep", &unknown_sweep).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"]["code"], "invalid_config");
     let mut crossed = serde_json::to_value(config(InstrumentKind::Spot, 3)).unwrap();
     crossed["params"] = json!({ "fast": 30, "slow": 10 });
     let (status, body) = t.post("/runs/backtest", &crossed).await;
@@ -536,8 +578,36 @@ async fn a_cancelled_sweep_stops_well_before_its_last_backtest() {
 
     let (_, runs) = t.get("/runs").await;
     assert_eq!(runs, json!([]), "a cancelled run is not saved");
-    let (status, _) = t.get(&format!("/jobs/{job}/result")).await;
+    let (status, body) = t.get(&format!("/jobs/{job}/result")).await;
     assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["error"]["code"], "no_result", "{body}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_run_job_answers_no_result_not_job_not_done() {
+    let t = TestServer::seeded(3).await;
+    let mut ws = t.websocket().await;
+    // No parameter set can make a million trades, so the out-of-sample run fails.
+    let mut sweep = sweep_spec(3, (3, 4), (10, 11));
+    sweep["min_trades"] = json!(1_000_000);
+    let job = t
+        .start(
+            "/runs/out-of-sample",
+            &json!({ "sweep": sweep, "split": { "fraction": 0.7 } }),
+        )
+        .await;
+    let last = ws.follow(job).await.pop().unwrap();
+    assert_eq!(last.status, JobStatus::Failed);
+    let (status, body) = t.get(&format!("/jobs/{job}/result")).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["error"]["code"], "no_result", "{body}");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("failed"),
+        "{body}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
