@@ -1,6 +1,6 @@
 import type { Instrument } from '@td/shared'
 import { describe, expect, it } from 'vitest'
-import { checkOrder, formatStep, onStep, parseAmount, stepDecimals } from './order'
+import { checkOrder, formatStep, onLot, onTick, parseAmount, stepDecimals } from './order'
 
 const btc: Instrument = {
   id: { venue: 'binance', symbol: 'BTCUSDT', kind: 'spot' },
@@ -37,12 +37,27 @@ describe('steps', () => {
   })
 
   it('accepts values on the step despite floating-point error', () => {
-    expect(onStep(0.3, 0.1)).toBe(true)
-    expect(onStep(1.23, 0.01)).toBe(true)
-    expect(onStep(64210.55, 0.05)).toBe(true)
-    expect(onStep(0.00123, 0.00001)).toBe(true)
-    expect(onStep(0.015, 0.01)).toBe(false)
-    expect(onStep(64210.53, 0.05)).toBe(false)
+    expect(onTick(0.3, 0.1)).toBe(true)
+    expect(onTick(1.23, 0.01)).toBe(true)
+    expect(onTick(64210.55, 0.01)).toBe(true)
+    expect(onTick(64210.55, 0.05)).toBe(true)
+    expect(onTick(98765432.1, 0.1)).toBe(true)
+    expect(onTick(1.2345, 0.0001)).toBe(true)
+    expect(onTick(0.0007, 0.0001)).toBe(true)
+    expect(onLot(0.00123, 0.00001)).toBe(true)
+    expect(onLot(0.3, 0.1)).toBe(true)
+    expect(onLot(12.3456, 0.0001)).toBe(true)
+    expect(onTick(0.015, 0.01)).toBe(false)
+    expect(onTick(64210.53, 0.05)).toBe(false)
+  })
+
+  // The engine's validate_order refuses any value that rounding to its step changes, however small
+  // the difference; a growing tolerance here let these through.
+  it('refuses values a hair off the step, as the engine does', () => {
+    expect(onTick(64210.55001, 0.01)).toBe(false)
+    expect(onTick(64210.5500001, 0.01)).toBe(false)
+    expect(onLot(0.0010000001, 0.00001)).toBe(false)
+    expect(onLot(1000.0000001, 0.01)).toBe(false)
   })
 
   it('formats in the step decimals', () => {
@@ -81,6 +96,8 @@ describe('checkOrder', () => {
     ['a missing limit price', limit('1', ''), 'Enter a limit price.'],
     ['a limit price off the tick', limit('1', '3000.03'), 'The price must be a multiple of 0.05 USDT.'],
     ['a zero limit price', limit('1', '0'), 'Enter a limit price above zero.'],
+    ['a limit price a hair off the tick', limit('1', '3000.05001'), 'The price must be a multiple of 0.05 USDT.'],
+    ['a size a hair off the lot step', market('1000.0000001'), 'The size must be a multiple of 0.01 ETH.'],
     ['an order under the minimum value', limit('0.01', '100'), "The order value is 1.00 USDT; the venue's minimum is 5.00 USDT."],
   ])('refuses %s with the reason', (_name, draft, reason) => {
     expect(checkOrder(perp, draft, 3000)).toEqual({ ok: false, reason })
@@ -91,6 +108,13 @@ describe('checkOrder', () => {
       ok: false,
       reason: 'Waiting for a price to check the order value.',
     })
+  })
+
+  it('refuses BTCUSDT limit prices the engine would reject', () => {
+    const reason = 'The price must be a multiple of 0.01 USDT.'
+    expect(checkOrder(btc, limit('0.001', '64210.55001'), null)).toEqual({ ok: false, reason })
+    expect(checkOrder(btc, limit('0.001', '64210.5500001'), null)).toEqual({ ok: false, reason })
+    expect(checkOrder(btc, limit('0.001', '64210.55'), null)).toMatchObject({ ok: true, price: 64210.55 })
   })
 
   it('accepts exactly the minimum value and size', () => {

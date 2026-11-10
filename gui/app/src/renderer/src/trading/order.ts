@@ -19,23 +19,40 @@ export type OrderCheck =
   | { ok: true; qty: number; price: number | null; notional: number }
   | { ok: false; reason: string }
 
-// Floating-point slack when checking that a value sits on a step: 0.3 / 0.1 is 2.9999999999999996.
+// Slack for the minimum size and value checks: 0.57 * 100 is 56.99999999999999.
 const EPSILON = 1e-9
 
-/** How many decimals a step needs: 0.001 needs 3, 0.5 needs 1, 1 needs 0. */
+// Rust's f64::round: halves go away from zero.
+const roundHalfAway = (x: number) => Math.sign(x) * Math.round(Math.abs(x))
+
+/** How many decimals a step needs: 0.001 needs 3, 0.5 needs 1, 1 needs 0. Capped at 15, as in td-core. */
 export function stepDecimals(step: number): number {
-  for (let d = 0; d <= 12; d++) {
+  for (let d = 0; d < 15; d++) {
     const scaled = step * 10 ** d
-    if (Math.abs(scaled - Math.round(scaled)) < EPSILON * Math.max(1, scaled)) return d
+    const whole = roundHalfAway(scaled)
+    if (whole >= 1 && Math.abs(scaled - whole) <= 1e-9 * whole) return d
   }
-  return 12
+  return 15
 }
 
-/** Whether `value` is a whole number of `step`s. */
-export function onStep(value: number, step: number): boolean {
-  if (step <= 0) return true
-  const steps = value / step
-  return Math.abs(steps - Math.round(steps)) < EPSILON * Math.max(1, Math.abs(steps))
+/** td-core's round_to_step: a value rounded to a multiple of `step`, down or to the nearest. */
+export function roundToStep(value: number, step: number, rounding: 'down' | 'nearest'): number {
+  const scale = 10 ** stepDecimals(step)
+  const stepUnits = roundHalfAway(step * scale)
+  const steps = (value * scale) / stepUnits
+  const eps = Math.max(Math.abs(steps) * 4 * Number.EPSILON, 1e-9)
+  const n = rounding === 'down' ? Math.floor(steps + eps) : roundHalfAway(steps)
+  return (n * stepUnits) / scale
+}
+
+/** Whether the engine takes `qty` as on the lot grid: Instrument::validate_order's round_qty check. */
+export function onLot(qty: number, lotSize: number): boolean {
+  return roundToStep(qty, lotSize, 'down') === qty
+}
+
+/** Whether the engine takes `price` as on the tick grid: validate_order's round_price check. */
+export function onTick(price: number, tickSize: number): boolean {
+  return roundToStep(price, tickSize, 'nearest') === price
 }
 
 /** A number in a step's decimals with thousands separators: 0.001 BTC, 64,210.50. */
@@ -65,7 +82,7 @@ export function checkOrder(instrument: Instrument, draft: OrderDraft, lastPrice:
   if (qty < min_qty - EPSILON * min_qty) {
     return { ok: false, reason: `The size must be at least ${formatStep(min_qty, lot_size)} ${base}.` }
   }
-  if (!onStep(qty, lot_size)) {
+  if (!onLot(qty, lot_size)) {
     return { ok: false, reason: `The size must be a multiple of ${formatStep(lot_size, lot_size)} ${base}.` }
   }
 
@@ -75,7 +92,7 @@ export function checkOrder(instrument: Instrument, draft: OrderDraft, lastPrice:
     price = parseAmount(draft.price)
     if (price === null) return { ok: false, reason: 'Enter the limit price as a number.' }
     if (price <= 0) return { ok: false, reason: 'Enter a limit price above zero.' }
-    if (!onStep(price, tick_size)) {
+    if (!onTick(price, tick_size)) {
       return { ok: false, reason: `The price must be a multiple of ${formatStep(tick_size, tick_size)} ${quote}.` }
     }
   }

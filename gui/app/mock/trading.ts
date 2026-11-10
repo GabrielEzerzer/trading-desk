@@ -24,7 +24,7 @@ import type {
   Trade,
 } from '@td/shared'
 import { TIMEFRAME_MS, addCandle } from '../src/renderer/src/trading/candles'
-import { onStep } from '../src/renderer/src/trading/order'
+import { onLot } from '../src/renderer/src/trading/order'
 import { sameInstrument } from '../src/renderer/src/trading/session'
 import { MANUAL, type ManualOrder, type SessionFeed, type TradingSource } from '../src/renderer/src/trading/source'
 import labFixtures from './lab.json'
@@ -599,7 +599,7 @@ export function createMockTradingSource({ liveMs = 1500, listMs = 400 }: MockTra
     async placeOrder(sessionId, order) {
       const session = sessionOf(sessionId)
       const lot = session.instrument.lot_size
-      if (!onStep(order.qty, lot)) throw new Error(`the size must be a multiple of ${lot}`)
+      if (!onLot(order.qty, lot)) throw new Error(`the size must be a multiple of ${lot}`)
       session.submit(order)
     },
   }
