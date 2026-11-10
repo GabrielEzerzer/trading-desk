@@ -1,9 +1,12 @@
 //! A paper session's state and its files: the engine [`Session`] it feeds, the config it was made
 //! from, and the append-only log of every bar fed, which is what a resume replays.
 //!
-//! Files live in `<data_dir>/paper/<session_id>/`: `config.json`, written once, and
-//! `events.jsonl`, one [`FedBar`] per line. A line is appended and flushed after its bar is
-//! applied, so the log never holds a bar the session refused.
+//! Files live in `<data_dir>/paper/<session_id>/`: `config.json`, written once and synced to disk
+//! before it takes its name, and `events.jsonl`, one [`FedBar`] per line. A line is appended after
+//! its bar is applied, so the log never holds a bar the session refused. Each append goes straight
+//! to the operating system, so it survives the process dying. Each live bar's line is also synced
+//! to disk, with the warm-up lines before it, so a power cut loses at most the bar being written
+//! and any warm-up lines not yet followed by a live bar; a resume fetches those again.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
@@ -110,7 +113,10 @@ impl PaperSession {
             reason: e.to_string(),
         })?;
         let temp = dir.join(format!("{CONFIG_FILE}.tmp"));
-        fs::write(&temp, json).map_err(PaperError::io(&temp))?;
+        // Synced before the rename, so a crash cannot leave an empty or partial config in place.
+        File::create(&temp)
+            .and_then(|mut file| file.write_all(&json).and_then(|()| file.sync_all()))
+            .map_err(PaperError::io(&temp))?;
         fs::rename(&temp, &config_path).map_err(PaperError::io(&config_path))?;
         let log_path = dir.join(EVENTS_FILE);
         let log = OpenOptions::new()
@@ -196,8 +202,10 @@ impl PaperSession {
     }
 
     /// Feeds one bar with its funding to the engine session, then appends it to the log. A
-    /// warm-up bar goes through [`Session::warm_up`], with trading disabled. On an engine error
-    /// nothing changes; on a log error the bar has been applied but not saved, so stop the session.
+    /// warm-up bar goes through [`Session::warm_up`], with trading disabled. A live bar's line is
+    /// synced to disk before this returns; warm-up lines are synced with the first live one. On
+    /// an engine error nothing changes; on a log error the bar has been applied but may not be
+    /// saved, so stop the session.
     pub fn feed(
         &mut self,
         bar: Candle,
@@ -215,9 +223,16 @@ impl PaperSession {
             reason: e.to_string(),
         })?;
         line.push('\n');
+        // A `File` has no buffer: the write reaches the operating system at once.
         self.log
             .write_all(line.as_bytes())
-            .and_then(|()| self.log.flush())
+            .and_then(|()| {
+                if warm_up {
+                    Ok(())
+                } else {
+                    self.log.sync_data()
+                }
+            })
             .map_err(PaperError::io(&self.log_path))
     }
 

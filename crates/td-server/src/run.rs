@@ -7,6 +7,12 @@
 //! Orders that were open when it stopped can fill on those bars. That keeps a resumed session
 //! identical to one that never stopped, at the cost of trades it could not really have made while
 //! it was down.
+//!
+//! A session that has not fed a live bar yet (it stopped or crashed during warm-up, or after it
+//! but before its first live bar) warms up again instead: it is fed, as warm-up, the bars from the
+//! end of its log up to the last closed bar, and goes live from the time it restarts. It holds no
+//! position or orders then, so nothing is lost, but one stopped right after warm-up goes live at
+//! the restart rather than backfilling the bars it missed.
 
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
@@ -71,14 +77,22 @@ pub fn start_with_stream(session: PaperSession, rest: Arc<dyn Rest>, url: String
     let (stop, mut stopped) = watch::channel(false);
     let shared = Arc::clone(&session);
     let task = tokio::spawn(async move {
-        let result = tokio::select! {
-            result = drive(&shared, rest, url) => result,
-            _ = stopped.changed() => Ok(()),
+        // The loop runs in its own task so that a panic in it is caught here and shows as an error.
+        let mut driver = tokio::spawn(drive(Arc::clone(&shared), rest, url));
+        let status = tokio::select! {
+            joined = &mut driver => match joined {
+                Ok(Ok(())) => Status::Stopped,
+                Ok(Err(e)) => Status::Error(e.to_string()),
+                Err(e) => Status::Error(format!("the session panicked: {}", panic_message(e))),
+            },
+            _ = stopped.changed() => {
+                // Wait for the cancelled loop to let go of the session.
+                driver.abort();
+                let _ = driver.await;
+                Status::Stopped
+            }
         };
-        lock(&shared).set_status(match result {
-            Ok(()) => Status::Stopped,
-            Err(e) => Status::Error(e.to_string()),
-        });
+        lock(&shared).set_status(status);
     });
     PaperHandle {
         session,
@@ -88,9 +102,23 @@ pub fn start_with_stream(session: PaperSession, rest: Arc<dyn Rest>, url: String
 }
 
 fn lock(session: &Mutex<PaperSession>) -> MutexGuard<'_, PaperSession> {
-    // A panic while holding the lock cannot leave the session half-updated: `feed` either applies
-    // a bar or returns an error before changing anything.
+    // A poisoned lock means the run loop panicked while holding it, possibly halfway through a
+    // bar. The loop is over by then and the session is never fed again: the guard is taken back
+    // only to set and read its status, which says the session failed.
     session.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The message a task panicked with.
+fn panic_message(error: tokio::task::JoinError) -> String {
+    match error.try_into_panic() {
+        Ok(panic) => match panic.downcast::<String>() {
+            Ok(message) => *message,
+            Err(panic) => panic
+                .downcast_ref::<&str>()
+                .map_or_else(|| "no message".to_owned(), |m| (*m).to_owned()),
+        },
+        Err(error) => error.to_string(),
+    }
 }
 
 /// Aborts a spawned task when dropped, so a stopped session takes its feed down with it.
@@ -113,31 +141,35 @@ async fn blocking<T: Send + 'static>(
 }
 
 async fn drive(
-    shared: &Mutex<PaperSession>,
+    shared: Arc<Mutex<PaperSession>>,
     rest: Arc<dyn Rest>,
     url: String,
 ) -> Result<(), PaperError> {
-    let (id, timeframe, data_dir, next) = {
+    let shared = &*shared;
+    let (id, timeframe, data_dir, next, live) = {
         let s = lock(shared);
         let config = s.config();
-        let next = s.next_bar_time();
         (
             config.instrument.id.clone(),
             config.timeframe,
             s.data_dir().to_path_buf(),
-            next,
+            s.next_bar_time(),
+            s.live_from().is_some(),
         )
     };
     let start = match next {
-        Some(next) => next,
-        None => {
+        Some(next) if live => next,
+        // Never live: warm up, or finish a warm-up the log holds part of, then go live from now.
+        _ => {
             lock(shared).set_status(Status::WarmingUp);
             let end = timeframe.floor(rest.now());
+            let from = next.unwrap_or(end - WARM_UP_BARS * timeframe.duration_ms());
             let (store, history_rest, history_id) =
                 (Store::new(data_dir), rest.clone(), id.clone());
-            let bars =
-                blocking(move || warm_up_bars(&store, &*history_rest, &history_id, timeframe, end))
-                    .await?;
+            let bars = blocking(move || {
+                warm_up_bars(&store, &*history_rest, &history_id, timeframe, from, end)
+            })
+            .await?;
             let mut s = lock(shared);
             for bar in bars {
                 s.feed(bar, Vec::new(), true)?;
@@ -179,24 +211,27 @@ async fn drive(
                     }
                     None => Vec::new(),
                 };
-                lock(shared).feed(bar, charged, false)?;
+                let mut s = lock(shared);
+                // Bars flow again, after a failed backfill too.
+                s.set_status(Status::Live);
+                s.feed(bar, charged, false)?;
             }
         }
     }
     Err(PaperError::FeedEnded)
 }
 
-/// The bars to warm up on: [`WARM_UP_BARS`] bars of `timeframe` before `end`, from the local
-/// store as far as it has them, the rest over REST at the timeframe itself (one request rather
-/// than hundreds of pages of minutes).
+/// The bars of `timeframe` to warm up on, opening in `[from, end)`: from the local store as far as
+/// it has them, the rest over REST at the timeframe itself (one request rather than hundreds of
+/// pages of minutes).
 fn warm_up_bars(
     store: &Store,
     rest: &dyn Rest,
     id: &InstrumentId,
     timeframe: Timeframe,
+    from: Millis,
     end: Millis,
 ) -> Result<Vec<Candle>, DataError> {
-    let from = end - WARM_UP_BARS * timeframe.duration_ms();
     let mut bars = store.load_candles(id, timeframe, from, end, false)?.candles;
     let rest_from = bars
         .last()

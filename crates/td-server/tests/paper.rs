@@ -229,12 +229,29 @@ fn ids_are_checked_and_a_session_is_never_overwritten() {
     assert!(!paper_dir(dir.path(), "other").exists());
 }
 
-/// Serves REST data from lists, as of `T0`.
+/// Serves REST data from lists, as of `now`.
 struct FakeRest {
     minutes: Vec<Candle>,
-    /// Bars of the session's timeframe before `T0`, for the warm-up.
+    /// Bars of the session's timeframe, for the warm-up.
     history: Vec<Candle>,
+    funding: Vec<(Millis, f64)>,
+    now: Millis,
+    /// How many more requests for minutes fail.
+    failures: Mutex<u32>,
     calls: Mutex<Vec<(Timeframe, Millis, Millis)>>,
+}
+
+impl FakeRest {
+    fn new(minutes: Vec<Candle>, history: Vec<Candle>, now: Millis) -> Self {
+        FakeRest {
+            minutes,
+            history,
+            funding: Vec::new(),
+            now,
+            failures: Mutex::new(0),
+            calls: Mutex::new(Vec::new()),
+        }
+    }
 }
 
 impl Rest for FakeRest {
@@ -247,6 +264,14 @@ impl Rest for FakeRest {
     ) -> Result<Vec<Candle>, DataError> {
         self.calls.lock().expect("lock").push((timeframe, from, to));
         let source = if timeframe == Timeframe::M1 {
+            let mut failures = self.failures.lock().expect("lock");
+            if *failures > 0 {
+                *failures -= 1;
+                return Err(DataError::Api {
+                    url: "fake".into(),
+                    message: "unavailable".into(),
+                });
+            }
             &self.minutes
         } else {
             &self.history
@@ -261,6 +286,39 @@ impl Rest for FakeRest {
     fn funding(
         &self,
         _id: &InstrumentId,
+        from: Millis,
+        to: Millis,
+    ) -> Result<Vec<(Millis, f64)>, DataError> {
+        Ok(self
+            .funding
+            .iter()
+            .copied()
+            .filter(|(t, _)| (from..to).contains(t))
+            .collect())
+    }
+
+    fn now(&self) -> Millis {
+        self.now
+    }
+}
+
+/// A source whose clock panics, to make the run loop panic.
+struct PanickingRest;
+
+impl Rest for PanickingRest {
+    fn klines(
+        &self,
+        _id: &InstrumentId,
+        _timeframe: Timeframe,
+        _from: Millis,
+        _to: Millis,
+    ) -> Result<Vec<Candle>, DataError> {
+        Ok(Vec::new())
+    }
+
+    fn funding(
+        &self,
+        _id: &InstrumentId,
         _from: Millis,
         _to: Millis,
     ) -> Result<Vec<(Millis, f64)>, DataError> {
@@ -268,7 +326,7 @@ impl Rest for FakeRest {
     }
 
     fn now(&self) -> Millis {
-        T0 + 30_000
+        panic!("the clock broke");
     }
 }
 
@@ -330,34 +388,41 @@ fn unwrap_session(shared: Arc<Mutex<PaperSession>>) -> PaperSession {
     }
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn a_live_session_warms_up_trades_stops_and_resumes_with_the_missed_minutes_backfilled() {
+/// Runs a session live, stops it across the funding time at 02:00, resumes it, and checks it ends
+/// in the same state as a session that saw every bar in one go.
+async fn live_session_stops_and_resumes(kind: InstrumentKind) {
     let tf = Timeframe::M5;
-    let cfg = config(InstrumentKind::Spot, tf);
+    let cfg = config(kind, tf);
     let history = resample(&minutes(-60..0), tf, false).candles;
+    // A rate every hour, the ones before the session only telling it the interval.
+    let funding: Vec<(Millis, f64)> = match kind {
+        InstrumentKind::Spot => Vec::new(),
+        InstrumentKind::Perpetual => (-3..=3)
+            .map(|h| (T0 + h * HOUR, 0.0001 * (1 + h.rem_euclid(3)) as f64))
+            .collect(),
+    };
     let rest = Arc::new(FakeRest {
-        minutes: minutes(0..60),
-        history: history.clone(),
-        calls: Mutex::new(Vec::new()),
+        funding: funding.clone(),
+        ..FakeRest::new(minutes(0..180), history.clone(), T0 + 30_000)
     });
     let dir = tempfile::tempdir().expect("temp dir");
 
     // First run: the stream starts at minute 2 and skips minute 7; REST fills 0, 1 and 7.
-    let first: Vec<String> = minutes(2..25)
+    let first: Vec<String> = minutes(2..70)
         .iter()
         .filter(|m| m.open_time != T0 + 7 * MIN)
         .map(frame)
         .collect();
     let paper = PaperSession::create(dir.path(), "live", cfg.clone()).expect("creates");
     let handle = td_server::start_with_stream(paper, rest.clone(), serve(first).await);
-    wait_for_bar(&handle, T0 + 20 * MIN).await;
+    wait_for_bar(&handle, T0 + 65 * MIN).await;
     assert_eq!(
         *handle.session().lock().expect("lock").status(),
         Status::Live
     );
     let stopped = unwrap_session(handle.stop().await);
     assert_eq!(*stopped.status(), Status::Stopped);
-    assert_eq!(stopped.session().bars().len(), history.len() + 5);
+    assert_eq!(stopped.session().bars().len(), history.len() + 14);
 
     // The log replays to the state the session stopped in.
     let reopened = PaperSession::open(dir.path(), "live").expect("opens");
@@ -371,10 +436,11 @@ async fn a_live_session_warms_up_trades_stops_and_resumes_with_the_missed_minute
         history.len()
     );
 
-    // Second run, after minutes 25 to 39 went by while stopped: REST backfills them.
-    let second: Vec<String> = minutes(40..60).iter().map(frame).collect();
+    // Second run, after minutes 70 to 149 went by while stopped, the funding time at 02:00
+    // among them: REST backfills them.
+    let second: Vec<String> = minutes(150..180).iter().map(frame).collect();
     let handle = td_server::start_with_stream(reopened, rest.clone(), serve(second).await);
-    wait_for_bar(&handle, T0 + 55 * MIN).await;
+    wait_for_bar(&handle, T0 + 175 * MIN).await;
     let resumed = unwrap_session(handle.stop().await);
 
     // The same as a session that saw every bar in one go.
@@ -385,11 +451,20 @@ async fn a_live_session_warms_up_trades_stops_and_resumes_with_the_missed_minute
     }
     feed_all(
         &mut reference,
-        &resample(&minutes(0..60), tf, false).candles,
-        &[],
+        &resample(&minutes(0..180), tf, false).candles,
+        &funding,
     );
     assert!(!reference.fills().is_empty(), "the strategy trades live");
     assert_same_state(&resumed, &reference);
+    assert_eq!(
+        resumed.portfolio().funding_paid(),
+        reference.portfolio().funding_paid()
+    );
+    if kind == InstrumentKind::Perpetual {
+        let due: Vec<Millis> = resumed.funding().iter().map(|f| f.due).collect();
+        assert_eq!(due, [T0, T0 + HOUR, T0 + 2 * HOUR]);
+        assert!(reference.portfolio().funding_paid() != 0.0);
+    }
 
     let calls = rest.calls.lock().expect("lock").clone();
     assert_eq!(
@@ -398,7 +473,117 @@ async fn a_live_session_warms_up_trades_stops_and_resumes_with_the_missed_minute
             (tf, T0 - 500 * tf.duration_ms(), T0),
             (Timeframe::M1, T0, T0 + 2 * MIN),
             (Timeframe::M1, T0 + 7 * MIN, T0 + 8 * MIN),
-            (Timeframe::M1, T0 + 25 * MIN, T0 + 40 * MIN),
+            (Timeframe::M1, T0 + 70 * MIN, T0 + 150 * MIN),
         ]
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_live_spot_session_warms_up_trades_stops_and_resumes_with_the_missed_minutes_backfilled()
+{
+    live_session_stops_and_resumes(InstrumentKind::Spot).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_live_perpetual_session_resumed_across_a_funding_time_charges_each_rate_once() {
+    live_session_stops_and_resumes(InstrumentKind::Perpetual).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_that_crashed_during_warm_up_finishes_it_and_goes_live_from_the_restart() {
+    let tf = Timeframe::M5;
+    let cfg = config(InstrumentKind::Spot, tf);
+    let history = resample(&minutes(-60..20), tf, false).candles;
+    let dir = tempfile::tempdir().expect("temp dir");
+    // The process died after writing five of the warm-up lines.
+    let mut paper = PaperSession::create(dir.path(), "crash", cfg.clone()).expect("creates");
+    for bar in &history[..5] {
+        paper.feed(*bar, Vec::new(), true).expect("warm-up bar");
+    }
+    drop(paper);
+
+    // It restarts at 00:20:30, with every minute since well before the crash on REST.
+    let rest = Arc::new(FakeRest::new(
+        minutes(-60..60),
+        history.clone(),
+        T0 + 20 * MIN + 30_000,
+    ));
+    let reopened = PaperSession::open(dir.path(), "crash").expect("opens");
+    assert_eq!(reopened.live_from(), None);
+    let stream: Vec<String> = minutes(20..40).iter().map(frame).collect();
+    let handle = td_server::start_with_stream(reopened, rest.clone(), serve(stream).await);
+    wait_for_bar(&handle, T0 + 35 * MIN).await;
+    let resumed = unwrap_session(handle.stop().await);
+
+    // None of the bars before the restart were traded: the first live bar is the one after it.
+    assert_eq!(resumed.live_from(), Some(T0 + 20 * MIN));
+    assert_eq!(resumed.equity()[0].time, T0 + 20 * MIN);
+    let ref_dir = tempfile::tempdir().expect("temp dir");
+    let mut reference = PaperSession::create(ref_dir.path(), "ref", cfg).expect("creates");
+    for bar in &history {
+        reference.feed(*bar, Vec::new(), true).expect("warm-up bar");
+    }
+    feed_all(
+        &mut reference,
+        &resample(&minutes(20..40), tf, false).candles,
+        &[],
+    );
+    assert_same_state(&resumed, &reference);
+    // The rest of the warm-up came from where the log ended; nothing was backfilled as live.
+    let calls = rest.calls.lock().expect("lock").clone();
+    assert_eq!(calls, [(tf, history[5].open_time, T0 + 20 * MIN)]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_is_live_again_once_a_failed_backfill_succeeds() {
+    let tf = Timeframe::M5;
+    let history = resample(&minutes(-60..0), tf, false).candles;
+    // The backfill of minutes 0 and 1 fails once and succeeds on its retry.
+    let rest = Arc::new(FakeRest {
+        failures: Mutex::new(1),
+        ..FakeRest::new(minutes(0..10), history, T0 + 30_000)
+    });
+    let dir = tempfile::tempdir().expect("temp dir");
+    let paper = PaperSession::create(dir.path(), "retry", config(InstrumentKind::Spot, tf))
+        .expect("creates");
+    let stream: Vec<String> = minutes(2..10).iter().map(frame).collect();
+    let handle = td_server::start_with_stream(paper, rest, serve(stream).await);
+    wait_for_bar(&handle, T0 + 5 * MIN).await;
+    {
+        let s = handle.session().lock().expect("lock");
+        assert!(
+            s.warnings().iter().any(|w| w.contains("backfill failed")),
+            "{:?}",
+            s.warnings()
+        );
+        assert_eq!(*s.status(), Status::Live);
+    }
+    handle.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_panic_in_the_run_loop_shows_as_an_error() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let paper = PaperSession::create(
+        dir.path(),
+        "panic",
+        config(InstrumentKind::Spot, Timeframe::M5),
+    )
+    .expect("creates");
+    let handle =
+        td_server::start_with_stream(paper, Arc::new(PanickingRest), serve(Vec::new()).await);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let status = handle.session().lock().expect("lock").status().clone();
+        if let Status::Error(message) = status {
+            assert!(message.contains("the clock broke"), "{message}");
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "still {status:?} after the loop panicked"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    handle.stop().await;
 }
