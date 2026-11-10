@@ -15,8 +15,9 @@ use crate::{
 /// change from a data change.
 ///
 /// Bump it whenever the engine's behaviour changes: fills, fees, funding, the trade list, metrics
-/// or the benchmark. In practice that is whenever `tests/fixtures/backtest_expected.json` has to
-/// be regenerated; bump it in the same change.
+/// or the benchmark, including changes the expected fixture does not cover (it has no gaps, for
+/// example). A regenerated `tests/fixtures/backtest_expected.json` always needs a bump, but an
+/// unchanged fixture does not mean the behaviour is unchanged.
 pub const ENGINE_REVISION: u32 = 1;
 
 /// Everything that defines a backtest apart from the data itself.
@@ -153,7 +154,6 @@ pub fn run(
     let series = EquitySeries::new(config.starting_cash, session.equity(), tf);
     let report = metrics::report(
         &series,
-        tf,
         &positions,
         &trades,
         &fills,
@@ -301,7 +301,6 @@ fn benchmark(
     let series = EquitySeries::new(config.starting_cash, &equity, config.timeframe);
     let report = metrics::report(
         &series,
-        config.timeframe,
         &positions,
         &trades,
         &fills,

@@ -828,6 +828,10 @@ pub struct WindowResult {
 /// before it, as many as the window's train length (fewer near the start of the range), the
 /// same warm-up its test run gets; the first window's, and every anchored window's, starts cold
 /// because no bars come before it.
+///
+/// The stitched metrics are computed like a single backtest's (see [`MetricsReport`]): the
+/// stitched Sharpe, Sortino and volatility come from the stitched curve's daily UTC returns, not
+/// from its per-bar returns, so they are comparable with a backtest's on any timeframe.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WalkForwardResult {
     pub spec: WalkForwardSpec,
@@ -1043,14 +1047,7 @@ fn stitched_report(base: &BacktestConfig, windows: &[WindowResult]) -> Stitched 
         funding += r.metrics.funding_paid * s;
     }
     let series = EquitySeries::new(cash, &equity, base.timeframe);
-    let metrics = metrics::report(
-        &series,
-        base.timeframe,
-        &positions,
-        &trades,
-        &fills,
-        funding,
-    );
+    let metrics = metrics::report(&series, &positions, &trades, &fills, funding);
     Stitched {
         equity,
         metrics,

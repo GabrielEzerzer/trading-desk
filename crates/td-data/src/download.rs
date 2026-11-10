@@ -48,7 +48,7 @@ pub fn download_candles(
                 &mut report.missing_files,
                 |period| binance::fetch_archive(http, id, period),
             )?,
-            Venue::Bybit => bybit::fetch_klines(http, id, lo, hi)?,
+            Venue::Bybit => bybit::fetch_klines(http, id, Timeframe::M1, lo, hi)?,
         };
         candles.retain(|c| (lo..hi).contains(&c.open_time));
         store.write_candles(id, &candles)?;

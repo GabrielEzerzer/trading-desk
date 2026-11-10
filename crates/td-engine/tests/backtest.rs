@@ -124,7 +124,8 @@ fn assert_json_eq(actual: &Value, expected: &Value, path: &str) {
 ///
 /// A change that needs this is an engine behaviour change: bump `ENGINE_REVISION` in
 /// `src/runner.rs` in the same change, before regenerating, so saved results from the old engine
-/// show `engine_matches: false` on a rerun.
+/// show `engine_matches: false` on a rerun. Behaviour changes this fixture does not exercise need
+/// the bump too.
 #[test]
 #[ignore = "regenerates tests/fixtures/backtest_expected.json"]
 fn regenerate_expected_result() {
