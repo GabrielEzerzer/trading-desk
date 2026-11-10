@@ -109,6 +109,13 @@ fn page_backwards<T>(
         if !full {
             break;
         }
+        // A full page whose oldest row is not older than the page asked for would page forever.
+        if oldest > page_end {
+            return Err(DataError::Parse {
+                what: "a page of rows".into(),
+                reason: format!("a full page ending at {page_end} held rows from {oldest}"),
+            });
+        }
         page_end = oldest - 1;
     }
     rows.retain(|row| (from..=end).contains(&time(row)));
@@ -179,6 +186,12 @@ pub fn fetch_funding(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_full_page_that_does_not_move_back_is_an_error() {
+        let result = page_backwards(0, 100, 2, |t: &Millis| *t, |_| Ok(vec![150, 160]));
+        assert!(matches!(result, Err(DataError::Parse { .. })));
+    }
 
     /// Pages backwards over `[from, end]` through a newest-first endpoint holding `times`, which
     /// answers with the newest `limit` of them in the range asked for. Returns the rows read and

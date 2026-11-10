@@ -266,6 +266,13 @@ fn page_forwards(
         if !full {
             break;
         }
+        // A full page whose last row is before the start asked for would page forever.
+        if last < start {
+            return Err(DataError::Parse {
+                what: "a page of funding rates".into(),
+                reason: format!("a full page starting at {start} ended at {last}"),
+            });
+        }
         start = last + 1;
     }
     Ok(rates)
@@ -274,6 +281,12 @@ fn page_forwards(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_full_page_that_does_not_move_forward_is_an_error() {
+        let result = page_forwards(100, 200, 2, |_| Ok(vec![(10, 0.0), (20, 0.0)]));
+        assert!(matches!(result, Err(DataError::Parse { .. })));
+    }
 
     /// Pages forwards over `[from, to)` through an oldest-first endpoint holding a rate at each of
     /// `times`, which answers with the oldest `limit` of them in the range asked for. Returns the
