@@ -29,7 +29,7 @@ const STABLE_CONNECTION: Duration = Duration::from_secs(60);
 
 /// What a connection sends after it opens: a subscription, and a heartbeat text to repeat.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct Greeting {
+pub struct Greeting {
     pub subscribe: Option<String>,
     pub heartbeat: Option<(Duration, String)>,
 }

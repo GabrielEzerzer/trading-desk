@@ -81,6 +81,9 @@ impl From<DataError> for ApiError {
             | DataError::InvalidDate(_)
             | DataError::EmptyRange { .. }
             | DataError::NotPerpetual(_)
+            | DataError::KindNotListed { .. }
+            | DataError::NoFunding(_)
+            | DataError::NoLiveStream(_)
             | DataError::InvalidInstrument { .. } => ApiError::bad_request(message),
             DataError::Http { .. } | DataError::Status { .. } | DataError::Api { .. } => {
                 ApiError::new(StatusCode::BAD_GATEWAY, "venue", message)
