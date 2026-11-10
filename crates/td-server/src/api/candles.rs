@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use td_core::{Candle, InstrumentId, Millis, Timeframe};
 use td_data::Store;
 use td_data::live::Rest;
-use td_data::time::Month;
+use td_data::time::{DAY, Month};
 use ts_rs::TS;
 
 use super::AppState;
@@ -25,6 +25,8 @@ use super::error::ApiError;
 
 /// The most bars one response holds, and the default `limit`.
 pub const MAX_CANDLES: usize = 5_000;
+/// How much time one read of the store covers at most: about a month's minutes in memory.
+const STORE_READ_MS: Millis = 31 * DAY;
 
 #[derive(Debug, Clone, Deserialize)]
 pub(super) struct CandlesQuery {
@@ -84,10 +86,6 @@ pub(super) async fn candles(
 type Slot = Option<(Candle, bool)>;
 
 /// Reads the bars from the store, fills what it lacks from the venue, and reports both. Blocks.
-///
-/// shortcut: the store part reads every stored minute in the range, so a 1d or 1w chart over
-/// years reads years of minutes (hundreds of MB for all of them since 2017); read month by month
-/// if it gets slow.
 fn read_candles(
     store: &Store,
     rest: &dyn Rest,
@@ -125,13 +123,21 @@ fn read_candles(
         ((from..end).contains(&t) && timeframe.floor(t) == t).then(|| ((t - from) / dur) as usize)
     };
     let mut slots: Vec<Slot> = vec![None; ((end - from) / dur) as usize];
-    for bar in store
-        .load_candles(&id, timeframe, from, end, false)?
-        .candles
-    {
-        if let Some(i) = slot_of(bar.open_time) {
-            slots[i] = Some((bar, false));
+    // The stored minutes are read about a month of bars at a time, so a daily or weekly chart
+    // over years never holds years of minutes at once. Each piece starts on a bar boundary.
+    let piece = (STORE_READ_MS / dur).max(1) * dur;
+    let mut start = from;
+    while start < end {
+        let stop = (start + piece).min(end);
+        for bar in store
+            .load_candles(&id, timeframe, start, stop, false)?
+            .candles
+        {
+            if let Some(i) = slot_of(bar.open_time) {
+                slots[i] = Some((bar, false));
+            }
         }
+        start = stop;
     }
     // One request over every slot the store lacks: at most `limit` bars, a few pages at most.
     if let (Some(first), Some(last)) = (

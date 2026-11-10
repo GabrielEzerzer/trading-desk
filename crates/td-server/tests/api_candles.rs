@@ -285,6 +285,32 @@ async fn higher_timeframes_aggregate_the_stored_minutes_as_the_store_does() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn daily_and_weekly_bars_over_months_match_the_store() {
+    // Six weeks from Monday 2024-01-01: the week of 29 January runs into February, and the store
+    // is read in pieces of about a month.
+    const DAY: Millis = 24 * HOUR;
+    let minutes = stored(0..42 * DAY / MIN);
+    let api = Api::start(&minutes, FakeRest::new(Vec::new(), T0 + 50 * DAY)).await;
+    for (timeframe, name, bars) in [(Timeframe::D1, "1d", 42), (Timeframe::W1, "1w", 6)] {
+        let got = api
+            .candles(&format!("&timeframe={name}&from={T0}&to={}", T0 + 42 * DAY))
+            .await;
+        assert_eq!(
+            got.candles,
+            resample(&minutes, timeframe, false).candles,
+            "{name}"
+        );
+        assert_eq!(got.candles.len(), bars, "{name}");
+        assert!(
+            got.missing.is_empty() && got.from_venue.is_empty(),
+            "{name}"
+        );
+    }
+    assert!(api.rest.calls().is_empty());
+    api.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_gap_in_the_store_is_filled_from_the_venue_and_not_stored() {
     let store_minutes: Vec<Candle> = stored((0..30).chain(45..120));
     // The venue lacks two of the minutes the store lacks too.
@@ -316,6 +342,28 @@ async fn a_gap_in_the_store_is_filled_from_the_venue_and_not_stored() {
         .read_month(&instrument_id(), td_data::time::Month::containing(T0))
         .expect("reads");
     assert_eq!(month, store_minutes);
+    api.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_hour_the_store_holds_only_part_of_comes_from_the_venue() {
+    // The store misses minute 01:40, so its 01:00 hour is incomplete and left out.
+    let store_minutes = stored((0..100).chain(101..240));
+    let venue = at_venue(0..240);
+    let api = Api::start(&store_minutes, FakeRest::new(venue.clone(), T0 + 10 * HOUR)).await;
+    let got = api
+        .candles(&format!("&timeframe=1h&from={T0}&to={}", T0 + 4 * HOUR))
+        .await;
+    let tf = Timeframe::H1;
+    let from_store = resample(&store_minutes, tf, false).candles;
+    let from_venue = resample(&venue, tf, false).candles;
+    assert_eq!(
+        got.candles,
+        [from_store[0], from_venue[1], from_store[1], from_store[2]]
+    );
+    assert_eq!(got.from_venue, [span(T0 + HOUR, T0 + 2 * HOUR, tf)]);
+    assert!(got.missing.is_empty());
+    assert_eq!(api.rest.calls(), [(tf, T0 + HOUR, T0 + 2 * HOUR)]);
     api.shutdown().await;
 }
 
