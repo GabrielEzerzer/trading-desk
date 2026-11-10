@@ -1339,7 +1339,8 @@
      "exitTime": 1611100800000,
      "entryPrice": 29742.52,
      "exitPrice": 28424.11,
-     "returnPct": -4.43
+     "returnPct": -4.43,
+     "open": false
     },
     {
      "id": 2,
@@ -1348,7 +1349,8 @@
      "exitTime": 1613606400000,
      "entryPrice": 38885.66,
      "exitPrice": 37129.14,
-     "returnPct": -4.52
+     "returnPct": -4.52,
+     "open": false
     },
     {
      "id": 3,
@@ -1357,7 +1359,8 @@
      "exitTime": 1618617600000,
      "entryPrice": 33734.58,
      "exitPrice": 38203.31,
-     "returnPct": 13.25
+     "returnPct": 13.25,
+     "open": false
     },
     {
      "id": 4,
@@ -1366,7 +1369,8 @@
      "exitTime": 1620345600000,
      "entryPrice": 20037.2,
      "exitPrice": 18108.4,
-     "returnPct": 9.63
+     "returnPct": 9.63,
+     "open": false
     },
     {
      "id": 5,
@@ -1375,7 +1379,8 @@
      "exitTime": 1624147200000,
      "entryPrice": 16145.41,
      "exitPrice": 15440.28,
-     "returnPct": -4.37
+     "returnPct": -4.37,
+     "open": false
     },
     {
      "id": 6,
@@ -1384,7 +1389,8 @@
      "exitTime": 1629331200000,
      "entryPrice": 21607.89,
      "exitPrice": 20932.75,
-     "returnPct": -3.12
+     "returnPct": -3.12,
+     "open": false
     },
     {
      "id": 7,
@@ -1393,7 +1399,8 @@
      "exitTime": 1630627200000,
      "entryPrice": 20095.94,
      "exitPrice": 21360.54,
-     "returnPct": -6.29
+     "returnPct": -6.29,
+     "open": false
     },
     {
      "id": 8,
@@ -1402,7 +1409,8 @@
      "exitTime": 1635292800000,
      "entryPrice": 20882.66,
      "exitPrice": 23327.08,
-     "returnPct": 11.71
+     "returnPct": 11.71,
+     "open": false
     },
     {
      "id": 9,
@@ -1411,7 +1419,8 @@
      "exitTime": 1638316800000,
      "entryPrice": 25979.86,
      "exitPrice": 27418.47,
-     "returnPct": -5.54
+     "returnPct": -5.54,
+     "open": false
     },
     {
      "id": 10,
@@ -1420,7 +1429,8 @@
      "exitTime": 1640736000000,
      "entryPrice": 23362.06,
      "exitPrice": 22430.65,
-     "returnPct": -3.99
+     "returnPct": -3.99,
+     "open": false
     },
     {
      "id": 11,
@@ -1429,7 +1439,8 @@
      "exitTime": 1645401600000,
      "entryPrice": 25010.05,
      "exitPrice": 24503.17,
-     "returnPct": -2.03
+     "returnPct": -2.03,
+     "open": false
     },
     {
      "id": 12,
@@ -1438,7 +1449,8 @@
      "exitTime": 1648425600000,
      "entryPrice": 28437.6,
      "exitPrice": 26638.93,
-     "returnPct": -6.32
+     "returnPct": -6.32,
+     "open": false
     },
     {
      "id": 13,
@@ -1447,7 +1459,8 @@
      "exitTime": 1652140800000,
      "entryPrice": 51241.07,
      "exitPrice": 58456.31,
-     "returnPct": 14.08
+     "returnPct": 14.08,
+     "open": false
     },
     {
      "id": 14,
@@ -1456,7 +1469,8 @@
      "exitTime": 1655856000000,
      "entryPrice": 45984.68,
      "exitPrice": 44481.18,
-     "returnPct": -3.27
+     "returnPct": -3.27,
+     "open": false
     },
     {
      "id": 15,
@@ -1465,7 +1479,8 @@
      "exitTime": 1658188800000,
      "entryPrice": 69235.64,
      "exitPrice": 72415.95,
-     "returnPct": -4.59
+     "returnPct": -4.59,
+     "open": false
     },
     {
      "id": 16,
@@ -1474,7 +1489,8 @@
      "exitTime": 1662508800000,
      "entryPrice": 67639.78,
      "exitPrice": 63788.38,
-     "returnPct": -5.69
+     "returnPct": -5.69,
+     "open": false
     },
     {
      "id": 17,
@@ -1483,7 +1499,8 @@
      "exitTime": 1667088000000,
      "entryPrice": 68925.62,
      "exitPrice": 71467.13,
-     "returnPct": -3.69
+     "returnPct": -3.69,
+     "open": false
     },
     {
      "id": 18,
@@ -1492,7 +1509,8 @@
      "exitTime": 1668816000000,
      "entryPrice": 71838.09,
      "exitPrice": 69648.7,
-     "returnPct": -3.05
+     "returnPct": -3.05,
+     "open": false
     },
     {
      "id": 19,
@@ -1501,7 +1519,8 @@
      "exitTime": 1671926400000,
      "entryPrice": 55151.66,
      "exitPrice": 52827.74,
-     "returnPct": -4.21
+     "returnPct": -4.21,
+     "open": false
     },
     {
      "id": 20,
@@ -1510,7 +1529,8 @@
      "exitTime": 1676419200000,
      "entryPrice": 86952.48,
      "exitPrice": 81869.96,
-     "returnPct": -5.85
+     "returnPct": -5.85,
+     "open": false
     },
     {
      "id": 21,
@@ -1519,7 +1539,8 @@
      "exitTime": 1680480000000,
      "entryPrice": 83505.76,
      "exitPrice": 86794,
-     "returnPct": -3.94
+     "returnPct": -3.94,
+     "open": false
     },
     {
      "id": 22,
@@ -1528,7 +1549,8 @@
      "exitTime": 1684022400000,
      "entryPrice": 72775.99,
      "exitPrice": 76422.5,
-     "returnPct": -5.01
+     "returnPct": -5.01,
+     "open": false
     },
     {
      "id": 23,
@@ -1537,7 +1559,8 @@
      "exitTime": 1686960000000,
      "entryPrice": 50028.77,
      "exitPrice": 48403.49,
-     "returnPct": -3.25
+     "returnPct": -3.25,
+     "open": false
     },
     {
      "id": 24,
@@ -1546,7 +1569,8 @@
      "exitTime": 1690934400000,
      "entryPrice": 35849.63,
      "exitPrice": 36545.97,
-     "returnPct": -1.94
+     "returnPct": -1.94,
+     "open": false
     },
     {
      "id": 25,
@@ -1555,7 +1579,8 @@
      "exitTime": 1694044800000,
      "entryPrice": 39747.63,
      "exitPrice": 38681.97,
-     "returnPct": -2.68
+     "returnPct": -2.68,
+     "open": false
     },
     {
      "id": 26,
@@ -1564,7 +1589,8 @@
      "exitTime": 1696377600000,
      "entryPrice": 44791.71,
      "exitPrice": 46327.36,
-     "returnPct": -3.43
+     "returnPct": -3.43,
+     "open": false
     },
     {
      "id": 27,
@@ -1573,7 +1599,8 @@
      "exitTime": 1702080000000,
      "entryPrice": 36556.17,
      "exitPrice": 35962.43,
-     "returnPct": -1.62
+     "returnPct": -1.62,
+     "open": false
     },
     {
      "id": 28,
@@ -1582,7 +1609,8 @@
      "exitTime": 1704844800000,
      "entryPrice": 38655.13,
      "exitPrice": 40440.07,
-     "returnPct": -4.62
+     "returnPct": -4.62,
+     "open": false
     },
     {
      "id": 29,
@@ -1591,7 +1619,8 @@
      "exitTime": 1707696000000,
      "entryPrice": 49854.39,
      "exitPrice": 42347.85,
-     "returnPct": 15.06
+     "returnPct": 15.06,
+     "open": false
     },
     {
      "id": 30,
@@ -1600,7 +1629,8 @@
      "exitTime": 1711843200000,
      "entryPrice": 70674.61,
      "exitPrice": 67155.79,
-     "returnPct": -4.98
+     "returnPct": -4.98,
+     "open": false
     },
     {
      "id": 31,
@@ -1609,7 +1639,8 @@
      "exitTime": 1716163200000,
      "entryPrice": 76844.42,
      "exitPrice": 81933.99,
-     "returnPct": 6.62
+     "returnPct": 6.62,
+     "open": false
     },
     {
      "id": 32,
@@ -1618,7 +1649,8 @@
      "exitTime": 1717891200000,
      "entryPrice": 65908.94,
      "exitPrice": 67123.44,
-     "returnPct": -1.84
+     "returnPct": -1.84,
+     "open": false
     },
     {
      "id": 33,
@@ -1627,7 +1659,8 @@
      "exitTime": 1721088000000,
      "entryPrice": 55670.66,
      "exitPrice": 63455.74,
-     "returnPct": 13.98
+     "returnPct": 13.98,
+     "open": false
     },
     {
      "id": 34,
@@ -1636,7 +1669,8 @@
      "exitTime": 1725148800000,
      "entryPrice": 37463.2,
      "exitPrice": 30991.79,
-     "returnPct": 17.27
+     "returnPct": 17.27,
+     "open": false
     },
     {
      "id": 35,
@@ -1645,7 +1679,8 @@
      "exitTime": 1727913600000,
      "entryPrice": 33315.45,
      "exitPrice": 32275.12,
-     "returnPct": -3.12
+     "returnPct": -3.12,
+     "open": false
     },
     {
      "id": 36,
@@ -1654,7 +1689,8 @@
      "exitTime": 1731110400000,
      "entryPrice": 35459.75,
      "exitPrice": 37791.28,
-     "returnPct": 6.58
+     "returnPct": 6.58,
+     "open": false
     },
     {
      "id": 37,
@@ -1663,7 +1699,8 @@
      "exitTime": 1735689600000,
      "entryPrice": 38938.57,
      "exitPrice": 43900.69,
-     "returnPct": 12.74
+     "returnPct": 12.74,
+     "open": false
     },
     {
      "id": 38,
@@ -1672,7 +1709,8 @@
      "exitTime": 1739750400000,
      "entryPrice": 48303.75,
      "exitPrice": 50993.73,
-     "returnPct": 5.57
+     "returnPct": 5.57,
+     "open": false
     },
     {
      "id": 39,
@@ -1681,7 +1719,8 @@
      "exitTime": 1741219200000,
      "entryPrice": 38948.2,
      "exitPrice": 41161.15,
-     "returnPct": 5.68
+     "returnPct": 5.68,
+     "open": false
     },
     {
      "id": 40,
@@ -1690,7 +1729,8 @@
      "exitTime": 1746403200000,
      "entryPrice": 45397.01,
      "exitPrice": 43022.49,
-     "returnPct": -5.23
+     "returnPct": -5.23,
+     "open": false
     },
     {
      "id": 41,
@@ -1699,7 +1739,8 @@
      "exitTime": 1749686400000,
      "entryPrice": 55998.56,
      "exitPrice": 52023.98,
-     "returnPct": 7.1
+     "returnPct": 7.1,
+     "open": false
     }
    ]
   },
@@ -3006,7 +3047,8 @@
      "exitTime": 1609545600000,
      "entryPrice": 730,
      "exitPrice": 711.53,
-     "returnPct": -2.53
+     "returnPct": -2.53,
+     "open": false
     },
     {
      "id": 2,
@@ -3015,7 +3057,8 @@
      "exitTime": 1610841600000,
      "entryPrice": 682.44,
      "exitPrice": 708.79,
-     "returnPct": 3.86
+     "returnPct": 3.86,
+     "open": false
     },
     {
      "id": 3,
@@ -3024,7 +3067,8 @@
      "exitTime": 1612051200000,
      "entryPrice": 767.43,
      "exitPrice": 750.95,
-     "returnPct": -2.15
+     "returnPct": -2.15,
+     "open": false
     },
     {
      "id": 4,
@@ -3033,7 +3077,8 @@
      "exitTime": 1613520000000,
      "entryPrice": 794.15,
      "exitPrice": 768.81,
-     "returnPct": -3.19
+     "returnPct": -3.19,
+     "open": false
     },
     {
      "id": 5,
@@ -3042,7 +3087,8 @@
      "exitTime": 1614211200000,
      "entryPrice": 959.37,
      "exitPrice": 987.82,
-     "returnPct": 2.97
+     "returnPct": 2.97,
+     "open": false
     },
     {
      "id": 6,
@@ -3051,7 +3097,8 @@
      "exitTime": 1615507200000,
      "entryPrice": 907.58,
      "exitPrice": 887.32,
-     "returnPct": -2.23
+     "returnPct": -2.23,
+     "open": false
     },
     {
      "id": 7,
@@ -3060,7 +3107,8 @@
      "exitTime": 1616803200000,
      "entryPrice": 1028.07,
      "exitPrice": 1060.41,
-     "returnPct": 3.15
+     "returnPct": 3.15,
+     "open": false
     },
     {
      "id": 8,
@@ -3069,7 +3117,8 @@
      "exitTime": 1617753600000,
      "entryPrice": 1254.35,
      "exitPrice": 1199.79,
-     "returnPct": -4.35
+     "returnPct": -4.35,
+     "open": false
     },
     {
      "id": 9,
@@ -3078,7 +3127,8 @@
      "exitTime": 1619395200000,
      "entryPrice": 978.66,
      "exitPrice": 934.29,
-     "returnPct": -4.53
+     "returnPct": -4.53,
+     "open": false
     },
     {
      "id": 10,
@@ -3087,7 +3137,8 @@
      "exitTime": 1619913600000,
      "entryPrice": 1035.81,
      "exitPrice": 1062.25,
-     "returnPct": 2.55
+     "returnPct": 2.55,
+     "open": false
     },
     {
      "id": 11,
@@ -3096,7 +3147,8 @@
      "exitTime": 1621641600000,
      "entryPrice": 1158.35,
      "exitPrice": 1113.46,
-     "returnPct": -3.88
+     "returnPct": -3.88,
+     "open": false
     },
     {
      "id": 12,
@@ -3105,7 +3157,8 @@
      "exitTime": 1622592000000,
      "entryPrice": 952.93,
      "exitPrice": 973.73,
-     "returnPct": 2.18
+     "returnPct": 2.18,
+     "open": false
     },
     {
      "id": 13,
@@ -3114,7 +3167,8 @@
      "exitTime": 1623369600000,
      "entryPrice": 916.24,
      "exitPrice": 871.63,
-     "returnPct": -4.87
+     "returnPct": -4.87,
+     "open": false
     },
     {
      "id": 14,
@@ -3123,7 +3177,8 @@
      "exitTime": 1624406400000,
      "entryPrice": 840.18,
      "exitPrice": 811.45,
-     "returnPct": -3.42
+     "returnPct": -3.42,
+     "open": false
     },
     {
      "id": 15,
@@ -3132,7 +3187,8 @@
      "exitTime": 1625616000000,
      "entryPrice": 762.79,
      "exitPrice": 771.63,
-     "returnPct": 1.16
+     "returnPct": 1.16,
+     "open": false
     },
     {
      "id": 16,
@@ -3141,7 +3197,8 @@
      "exitTime": 1626480000000,
      "entryPrice": 844.15,
      "exitPrice": 830.16,
-     "returnPct": -1.66
+     "returnPct": -1.66,
+     "open": false
     },
     {
      "id": 17,
@@ -3150,7 +3207,8 @@
      "exitTime": 1628294400000,
      "entryPrice": 944.98,
      "exitPrice": 925.65,
-     "returnPct": -2.05
+     "returnPct": -2.05,
+     "open": false
     },
     {
      "id": 18,
@@ -3159,7 +3217,8 @@
      "exitTime": 1629072000000,
      "entryPrice": 964.46,
      "exitPrice": 982.99,
-     "returnPct": 1.92
+     "returnPct": 1.92,
+     "open": false
     },
     {
      "id": 19,
@@ -3168,7 +3227,8 @@
      "exitTime": 1630281600000,
      "entryPrice": 914.31,
      "exitPrice": 871.86,
-     "returnPct": -4.64
+     "returnPct": -4.64,
+     "open": false
     },
     {
      "id": 20,
@@ -3177,7 +3237,8 @@
      "exitTime": 1631059200000,
      "entryPrice": 1020.83,
      "exitPrice": 1051.34,
-     "returnPct": 2.99
+     "returnPct": 2.99,
+     "open": false
     },
     {
      "id": 21,
@@ -3186,7 +3247,8 @@
      "exitTime": 1632268800000,
      "entryPrice": 1374.55,
      "exitPrice": 1398.19,
-     "returnPct": 1.72
+     "returnPct": 1.72,
+     "open": false
     },
     {
      "id": 22,
@@ -3195,7 +3257,8 @@
      "exitTime": 1633478400000,
      "entryPrice": 948.68,
      "exitPrice": 935.3,
-     "returnPct": -1.41
+     "returnPct": -1.41,
+     "open": false
     },
     {
      "id": 23,
@@ -3204,7 +3267,8 @@
      "exitTime": 1634688000000,
      "entryPrice": 743.44,
      "exitPrice": 772.4,
-     "returnPct": 3.9
+     "returnPct": 3.9,
+     "open": false
     },
     {
      "id": 24,
@@ -3213,7 +3277,8 @@
      "exitTime": 1635984000000,
      "entryPrice": 932.91,
      "exitPrice": 891.3,
-     "returnPct": -4.46
+     "returnPct": -4.46,
+     "open": false
     },
     {
      "id": 25,
@@ -3222,7 +3287,8 @@
      "exitTime": 1636848000000,
      "entryPrice": 639.75,
      "exitPrice": 661.2,
-     "returnPct": 3.35
+     "returnPct": 3.35,
+     "open": false
     },
     {
      "id": 26,
@@ -3231,7 +3297,8 @@
      "exitTime": 1638144000000,
      "entryPrice": 786.54,
      "exitPrice": 754.18,
-     "returnPct": -4.11
+     "returnPct": -4.11,
+     "open": false
     },
     {
      "id": 27,
@@ -3240,7 +3307,8 @@
      "exitTime": 1639267200000,
      "entryPrice": 788.41,
      "exitPrice": 813.8,
-     "returnPct": 3.22
+     "returnPct": 3.22,
+     "open": false
     },
     {
      "id": 28,
@@ -3249,7 +3317,8 @@
      "exitTime": 1640476800000,
      "entryPrice": 870.64,
      "exitPrice": 856.09,
-     "returnPct": -1.67
+     "returnPct": -1.67,
+     "open": false
     },
     {
      "id": 29,
@@ -3258,7 +3327,8 @@
      "exitTime": 1641600000000,
      "entryPrice": 589.46,
      "exitPrice": 603.14,
-     "returnPct": 2.32
+     "returnPct": 2.32,
+     "open": false
     },
     {
      "id": 30,
@@ -3267,7 +3337,8 @@
      "exitTime": 1642291200000,
      "entryPrice": 637.13,
      "exitPrice": 659.39,
-     "returnPct": 3.49
+     "returnPct": 3.49,
+     "open": false
     },
     {
      "id": 31,
@@ -3276,7 +3347,8 @@
      "exitTime": 1643500800000,
      "entryPrice": 743.38,
      "exitPrice": 706.72,
-     "returnPct": -4.93
+     "returnPct": -4.93,
+     "open": false
     },
     {
      "id": 32,
@@ -3285,7 +3357,8 @@
      "exitTime": 1644451200000,
      "entryPrice": 673.78,
      "exitPrice": 682.18,
-     "returnPct": 1.25
+     "returnPct": 1.25,
+     "open": false
     },
     {
      "id": 33,
@@ -3294,7 +3367,8 @@
      "exitTime": 1645833600000,
      "entryPrice": 718.42,
      "exitPrice": 696.09,
-     "returnPct": -3.11
+     "returnPct": -3.11,
+     "open": false
     },
     {
      "id": 34,
@@ -3303,7 +3377,8 @@
      "exitTime": 1646611200000,
      "entryPrice": 721.29,
      "exitPrice": 699.99,
-     "returnPct": -2.95
+     "returnPct": -2.95,
+     "open": false
     },
     {
      "id": 35,
@@ -3312,7 +3387,8 @@
      "exitTime": 1648080000000,
      "entryPrice": 759.6,
      "exitPrice": 785.86,
-     "returnPct": 3.46
+     "returnPct": 3.46,
+     "open": false
     },
     {
      "id": 36,
@@ -3321,7 +3397,8 @@
      "exitTime": 1649203200000,
      "entryPrice": 952.14,
      "exitPrice": 919.22,
-     "returnPct": -3.46
+     "returnPct": -3.46,
+     "open": false
     },
     {
      "id": 37,
@@ -3330,7 +3407,8 @@
      "exitTime": 1650153600000,
      "entryPrice": 783.05,
      "exitPrice": 801.74,
-     "returnPct": 2.39
+     "returnPct": 2.39,
+     "open": false
     },
     {
      "id": 38,
@@ -3339,7 +3417,8 @@
      "exitTime": 1651363200000,
      "entryPrice": 1093.5,
      "exitPrice": 1109.39,
-     "returnPct": 1.45
+     "returnPct": 1.45,
+     "open": false
     },
     {
      "id": 39,
@@ -3348,7 +3427,8 @@
      "exitTime": 1652659200000,
      "entryPrice": 994.61,
      "exitPrice": 950.68,
-     "returnPct": -4.42
+     "returnPct": -4.42,
+     "open": false
     },
     {
      "id": 40,
@@ -3357,7 +3437,8 @@
      "exitTime": 1653523200000,
      "entryPrice": 923.71,
      "exitPrice": 880.87,
-     "returnPct": -4.64
+     "returnPct": -4.64,
+     "open": false
     },
     {
      "id": 41,
@@ -3366,7 +3447,8 @@
      "exitTime": 1655251200000,
      "entryPrice": 655.01,
      "exitPrice": 675.73,
-     "returnPct": 3.16
+     "returnPct": 3.16,
+     "open": false
     },
     {
      "id": 42,
@@ -3375,7 +3457,8 @@
      "exitTime": 1656115200000,
      "entryPrice": 575.09,
      "exitPrice": 560.44,
-     "returnPct": -2.55
+     "returnPct": -2.55,
+     "open": false
     },
     {
      "id": 43,
@@ -3384,7 +3467,8 @@
      "exitTime": 1657238400000,
      "entryPrice": 548.71,
      "exitPrice": 522.06,
-     "returnPct": -4.86
+     "returnPct": -4.86,
+     "open": false
     },
     {
      "id": 44,
@@ -3393,7 +3477,8 @@
      "exitTime": 1657929600000,
      "entryPrice": 635.18,
      "exitPrice": 657.63,
-     "returnPct": 3.53
+     "returnPct": 3.53,
+     "open": false
     },
     {
      "id": 45,
@@ -3402,7 +3487,8 @@
      "exitTime": 1659744000000,
      "entryPrice": 625.51,
      "exitPrice": 634.84,
-     "returnPct": 1.49
+     "returnPct": 1.49,
+     "open": false
     },
     {
      "id": 46,
@@ -3411,7 +3497,8 @@
      "exitTime": 1660521600000,
      "entryPrice": 706.33,
      "exitPrice": 717.52,
-     "returnPct": 1.58
+     "returnPct": 1.58,
+     "open": false
     },
     {
      "id": 47,
@@ -3420,7 +3507,8 @@
      "exitTime": 1661385600000,
      "entryPrice": 635.27,
      "exitPrice": 619.85,
-     "returnPct": -2.43
+     "returnPct": -2.43,
+     "open": false
     },
     {
      "id": 48,
@@ -3429,7 +3517,8 @@
      "exitTime": 1662854400000,
      "entryPrice": 690.43,
      "exitPrice": 702.16,
-     "returnPct": 1.7
+     "returnPct": 1.7,
+     "open": false
     },
     {
      "id": 49,
@@ -3438,7 +3527,8 @@
      "exitTime": 1664064000000,
      "entryPrice": 879.87,
      "exitPrice": 900.24,
-     "returnPct": 2.32
+     "returnPct": 2.32,
+     "open": false
     },
     {
      "id": 50,
@@ -3447,7 +3537,8 @@
      "exitTime": 1664841600000,
      "entryPrice": 1056.59,
      "exitPrice": 1092.95,
-     "returnPct": 3.44
+     "returnPct": 3.44,
+     "open": false
     },
     {
      "id": 51,
@@ -3456,7 +3547,8 @@
      "exitTime": 1666051200000,
      "entryPrice": 1292.14,
      "exitPrice": 1337.1,
-     "returnPct": 3.48
+     "returnPct": 3.48,
+     "open": false
     },
     {
      "id": 52,
@@ -3465,7 +3557,8 @@
      "exitTime": 1667088000000,
      "entryPrice": 1315.14,
      "exitPrice": 1285.79,
-     "returnPct": -2.23
+     "returnPct": -2.23,
+     "open": false
     },
     {
      "id": 53,
@@ -3474,7 +3567,8 @@
      "exitTime": 1668124800000,
      "entryPrice": 1259.6,
      "exitPrice": 1228.09,
-     "returnPct": -2.5
+     "returnPct": -2.5,
+     "open": false
     },
     {
      "id": 54,
@@ -3483,7 +3577,8 @@
      "exitTime": 1669420800000,
      "entryPrice": 1413.5,
      "exitPrice": 1428.03,
-     "returnPct": 1.03
+     "returnPct": 1.03,
+     "open": false
     },
     {
      "id": 55,
@@ -3492,7 +3587,8 @@
      "exitTime": 1670630400000,
      "entryPrice": 1650.47,
      "exitPrice": 1588.13,
-     "returnPct": -3.78
+     "returnPct": -3.78,
+     "open": false
     },
     {
      "id": 56,
@@ -3501,7 +3597,8 @@
      "exitTime": 1671667200000,
      "entryPrice": 1328.38,
      "exitPrice": 1289.47,
-     "returnPct": -2.93
+     "returnPct": -2.93,
+     "open": false
     },
     {
      "id": 57,
@@ -3510,7 +3607,8 @@
      "exitTime": 1672704000000,
      "entryPrice": 1588.44,
      "exitPrice": 1606.72,
-     "returnPct": 1.15
+     "returnPct": 1.15,
+     "open": false
     },
     {
      "id": 58,
@@ -3519,7 +3617,8 @@
      "exitTime": 1673654400000,
      "entryPrice": 1965.91,
      "exitPrice": 2031.56,
-     "returnPct": 3.34
+     "returnPct": 3.34,
+     "open": false
     },
     {
      "id": 59,
@@ -3528,7 +3627,8 @@
      "exitTime": 1675036800000,
      "entryPrice": 1857.26,
      "exitPrice": 1762.88,
-     "returnPct": -5.08
+     "returnPct": -5.08,
+     "open": false
     },
     {
      "id": 60,
@@ -3537,7 +3637,8 @@
      "exitTime": 1676160000000,
      "entryPrice": 2107.53,
      "exitPrice": 2014.05,
-     "returnPct": -4.44
+     "returnPct": -4.44,
+     "open": false
     },
     {
      "id": 61,
@@ -3546,7 +3647,8 @@
      "exitTime": 1677196800000,
      "entryPrice": 2219.71,
      "exitPrice": 2293.96,
-     "returnPct": 3.35
+     "returnPct": 3.35,
+     "open": false
     },
     {
      "id": 62,
@@ -3555,7 +3657,8 @@
      "exitTime": 1678579200000,
      "entryPrice": 2172.15,
      "exitPrice": 2226.07,
-     "returnPct": 2.48
+     "returnPct": 2.48,
+     "open": false
     },
     {
      "id": 63,
@@ -3564,7 +3667,8 @@
      "exitTime": 1679616000000,
      "entryPrice": 1793.48,
      "exitPrice": 1829.82,
-     "returnPct": 2.03
+     "returnPct": 2.03,
+     "open": false
     },
     {
      "id": 64,
@@ -3573,7 +3677,8 @@
      "exitTime": 1680825600000,
      "entryPrice": 1687.8,
      "exitPrice": 1749.72,
-     "returnPct": 3.67
+     "returnPct": 3.67,
+     "open": false
     },
     {
      "id": 65,
@@ -3582,7 +3687,8 @@
      "exitTime": 1682121600000,
      "entryPrice": 1770.21,
      "exitPrice": 1823.59,
-     "returnPct": 3.02
+     "returnPct": 3.02,
+     "open": false
     },
     {
      "id": 66,
@@ -3591,7 +3697,8 @@
      "exitTime": 1682812800000,
      "entryPrice": 1563.33,
      "exitPrice": 1579.74,
-     "returnPct": 1.05
+     "returnPct": 1.05,
+     "open": false
     },
     {
      "id": 67,
@@ -3600,7 +3707,8 @@
      "exitTime": 1684368000000,
      "entryPrice": 1523.22,
      "exitPrice": 1548.24,
-     "returnPct": 1.64
+     "returnPct": 1.64,
+     "open": false
     },
     {
      "id": 68,
@@ -3609,7 +3717,8 @@
      "exitTime": 1685232000000,
      "entryPrice": 1378.28,
      "exitPrice": 1404.8,
-     "returnPct": 1.92
+     "returnPct": 1.92,
+     "open": false
     },
     {
      "id": 69,
@@ -3618,7 +3727,8 @@
      "exitTime": 1686009600000,
      "entryPrice": 1439.77,
      "exitPrice": 1464.82,
-     "returnPct": 1.74
+     "returnPct": 1.74,
+     "open": false
     },
     {
      "id": 70,
@@ -3627,7 +3737,8 @@
      "exitTime": 1687651200000,
      "entryPrice": 1200.22,
      "exitPrice": 1177.31,
-     "returnPct": -1.91
+     "returnPct": -1.91,
+     "open": false
     },
     {
      "id": 71,
@@ -3636,7 +3747,8 @@
      "exitTime": 1688860800000,
      "entryPrice": 1145.79,
      "exitPrice": 1175.57,
-     "returnPct": 2.6
+     "returnPct": 2.6,
+     "open": false
     },
     {
      "id": 72,
@@ -3645,7 +3757,8 @@
      "exitTime": 1689638400000,
      "entryPrice": 892.19,
      "exitPrice": 869.05,
-     "returnPct": -2.59
+     "returnPct": -2.59,
+     "open": false
     },
     {
      "id": 73,
@@ -3654,7 +3767,8 @@
      "exitTime": 1690502400000,
      "entryPrice": 1078.86,
      "exitPrice": 1117.95,
-     "returnPct": 3.62
+     "returnPct": 3.62,
+     "open": false
     },
     {
      "id": 74,
@@ -3663,7 +3777,8 @@
      "exitTime": 1692057600000,
      "entryPrice": 1250.13,
      "exitPrice": 1296.72,
-     "returnPct": 3.73
+     "returnPct": 3.73,
+     "open": false
     },
     {
      "id": 75,
@@ -3672,7 +3787,8 @@
      "exitTime": 1693267200000,
      "entryPrice": 1491.84,
      "exitPrice": 1520.77,
-     "returnPct": 1.94
+     "returnPct": 1.94,
+     "open": false
     },
     {
      "id": 76,
@@ -3681,7 +3797,8 @@
      "exitTime": 1694044800000,
      "entryPrice": 1696.58,
      "exitPrice": 1735.39,
-     "returnPct": 2.29
+     "returnPct": 2.29,
+     "open": false
     },
     {
      "id": 77,
@@ -3690,7 +3807,8 @@
      "exitTime": 1695168000000,
      "entryPrice": 1266.22,
      "exitPrice": 1302.4,
-     "returnPct": 2.86
+     "returnPct": 2.86,
+     "open": false
     },
     {
      "id": 78,
@@ -3699,7 +3817,8 @@
      "exitTime": 1696464000000,
      "entryPrice": 1093.48,
      "exitPrice": 1127.23,
-     "returnPct": 3.09
+     "returnPct": 3.09,
+     "open": false
     },
     {
      "id": 79,
@@ -3708,7 +3827,8 @@
      "exitTime": 1697328000000,
      "entryPrice": 1431.87,
      "exitPrice": 1394.5,
-     "returnPct": -2.61
+     "returnPct": -2.61,
+     "open": false
     },
     {
      "id": 80,
@@ -3717,7 +3837,8 @@
      "exitTime": 1698969600000,
      "entryPrice": 1554.81,
      "exitPrice": 1582.54,
-     "returnPct": 1.78
+     "returnPct": 1.78,
+     "open": false
     },
     {
      "id": 81,
@@ -3726,7 +3847,8 @@
      "exitTime": 1700179200000,
      "entryPrice": 1363.08,
      "exitPrice": 1341.17,
-     "returnPct": -1.61
+     "returnPct": -1.61,
+     "open": false
     },
     {
      "id": 82,
@@ -3735,7 +3857,8 @@
      "exitTime": 1700784000000,
      "entryPrice": 1283.9,
      "exitPrice": 1313.13,
-     "returnPct": 2.28
+     "returnPct": 2.28,
+     "open": false
     },
     {
      "id": 83,
@@ -3744,7 +3867,8 @@
      "exitTime": 1701820800000,
      "entryPrice": 1285.32,
      "exitPrice": 1336.49,
-     "returnPct": 3.98
+     "returnPct": 3.98,
+     "open": false
     },
     {
      "id": 84,
@@ -3753,7 +3877,8 @@
      "exitTime": 1703376000000,
      "entryPrice": 1432.29,
      "exitPrice": 1359.27,
-     "returnPct": -5.1
+     "returnPct": -5.1,
+     "open": false
     },
     {
      "id": 85,
@@ -3762,7 +3887,8 @@
      "exitTime": 1704067200000,
      "entryPrice": 1750.11,
      "exitPrice": 1671.8,
-     "returnPct": -4.47
+     "returnPct": -4.47,
+     "open": false
     },
     {
      "id": 86,
@@ -3771,7 +3897,8 @@
      "exitTime": 1705363200000,
      "entryPrice": 1849.09,
      "exitPrice": 1798.52,
-     "returnPct": -2.73
+     "returnPct": -2.73,
+     "open": false
     },
     {
      "id": 87,
@@ -3780,7 +3907,8 @@
      "exitTime": 1706313600000,
      "entryPrice": 1729.22,
      "exitPrice": 1663.05,
-     "returnPct": -3.83
+     "returnPct": -3.83,
+     "open": false
     },
     {
      "id": 88,
@@ -3789,7 +3917,8 @@
      "exitTime": 1707782400000,
      "entryPrice": 1706.78,
      "exitPrice": 1745.95,
-     "returnPct": 2.29
+     "returnPct": 2.29,
+     "open": false
     },
     {
      "id": 89,
@@ -3798,7 +3927,8 @@
      "exitTime": 1708819200000,
      "entryPrice": 1817.13,
      "exitPrice": 1864.95,
-     "returnPct": 2.63
+     "returnPct": 2.63,
+     "open": false
     },
     {
      "id": 90,
@@ -3807,7 +3937,8 @@
      "exitTime": 1710201600000,
      "entryPrice": 2313.06,
      "exitPrice": 2385.32,
-     "returnPct": 3.12
+     "returnPct": 3.12,
+     "open": false
     },
     {
      "id": 91,
@@ -3816,7 +3947,8 @@
      "exitTime": 1711238400000,
      "entryPrice": 2267.95,
      "exitPrice": 2183.81,
-     "returnPct": -3.71
+     "returnPct": -3.71,
+     "open": false
     },
     {
      "id": 92,
@@ -3825,7 +3957,8 @@
      "exitTime": 1712188800000,
      "entryPrice": 2231.57,
      "exitPrice": 2294.29,
-     "returnPct": 2.81
+     "returnPct": 2.81,
+     "open": false
     },
     {
      "id": 93,
@@ -3834,7 +3967,8 @@
      "exitTime": 1713571200000,
      "entryPrice": 1943.33,
      "exitPrice": 1882.06,
-     "returnPct": -3.15
+     "returnPct": -3.15,
+     "open": false
     },
     {
      "id": 94,
@@ -3843,7 +3977,8 @@
      "exitTime": 1714176000000,
      "entryPrice": 2244.23,
      "exitPrice": 2278.99,
-     "returnPct": 1.55
+     "returnPct": 1.55,
+     "open": false
     },
     {
      "id": 95,
@@ -3852,7 +3987,8 @@
      "exitTime": 1715558400000,
      "entryPrice": 2194.93,
      "exitPrice": 2278.19,
-     "returnPct": 3.79
+     "returnPct": 3.79,
+     "open": false
     },
     {
      "id": 96,
@@ -3861,7 +3997,8 @@
      "exitTime": 1716768000000,
      "entryPrice": 2886.51,
      "exitPrice": 2949.31,
-     "returnPct": 2.18
+     "returnPct": 2.18,
+     "open": false
     },
     {
      "id": 97,
@@ -3870,7 +4007,8 @@
      "exitTime": 1717891200000,
      "entryPrice": 2654.09,
      "exitPrice": 2617.12,
-     "returnPct": -1.39
+     "returnPct": -1.39,
+     "open": false
     },
     {
      "id": 98,
@@ -3879,7 +4017,8 @@
      "exitTime": 1718841600000,
      "entryPrice": 2930.53,
      "exitPrice": 2988.6,
-     "returnPct": 1.98
+     "returnPct": 1.98,
+     "open": false
     },
     {
      "id": 99,
@@ -3888,7 +4027,8 @@
      "exitTime": 1719964800000,
      "entryPrice": 2858.54,
      "exitPrice": 2763.87,
-     "returnPct": -3.31
+     "returnPct": -3.31,
+     "open": false
     },
     {
      "id": 100,
@@ -3897,7 +4037,8 @@
      "exitTime": 1721260800000,
      "entryPrice": 2724.31,
      "exitPrice": 2808.34,
-     "returnPct": 3.08
+     "returnPct": 3.08,
+     "open": false
     },
     {
      "id": 101,
@@ -3906,7 +4047,8 @@
      "exitTime": 1722470400000,
      "entryPrice": 3149.7,
      "exitPrice": 3029.98,
-     "returnPct": -3.8
+     "returnPct": -3.8,
+     "open": false
     },
     {
      "id": 102,
@@ -3915,7 +4057,8 @@
      "exitTime": 1723852800000,
      "entryPrice": 3528.95,
      "exitPrice": 3664.29,
-     "returnPct": 3.83
+     "returnPct": 3.83,
+     "open": false
     },
     {
      "id": 103,
@@ -3924,7 +4067,8 @@
      "exitTime": 1724198400000,
      "entryPrice": 4218.57,
      "exitPrice": 4340.06,
-     "returnPct": 2.88
+     "returnPct": 2.88,
+     "open": false
     },
     {
      "id": 104,
@@ -3933,7 +4077,8 @@
      "exitTime": 1725494400000,
      "entryPrice": 4042.07,
      "exitPrice": 3847.71,
-     "returnPct": -4.81
+     "returnPct": -4.81,
+     "open": false
     },
     {
      "id": 105,
@@ -3942,7 +4087,8 @@
      "exitTime": 1726704000000,
      "entryPrice": 4854.99,
      "exitPrice": 4690.13,
-     "returnPct": -3.4
+     "returnPct": -3.4,
+     "open": false
     },
     {
      "id": 106,
@@ -3951,7 +4097,8 @@
      "exitTime": 1727740800000,
      "entryPrice": 5523.63,
      "exitPrice": 5402.84,
-     "returnPct": -2.19
+     "returnPct": -2.19,
+     "open": false
     },
     {
      "id": 107,
@@ -3960,7 +4107,8 @@
      "exitTime": 1729296000000,
      "entryPrice": 4628.43,
      "exitPrice": 4491.2,
-     "returnPct": -2.96
+     "returnPct": -2.96,
+     "open": false
     },
     {
      "id": 108,
@@ -3969,7 +4117,8 @@
      "exitTime": 1730419200000,
      "entryPrice": 4463.6,
      "exitPrice": 4621.37,
-     "returnPct": 3.53
+     "returnPct": 3.53,
+     "open": false
     },
     {
      "id": 109,
@@ -3978,7 +4127,8 @@
      "exitTime": 1731024000000,
      "entryPrice": 5256.58,
      "exitPrice": 5319.76,
-     "returnPct": 1.2
+     "returnPct": 1.2,
+     "open": false
     },
     {
      "id": 110,
@@ -3987,7 +4137,8 @@
      "exitTime": 1732320000000,
      "entryPrice": 5587.54,
      "exitPrice": 5806.27,
-     "returnPct": 3.91
+     "returnPct": 3.91,
+     "open": false
     },
     {
      "id": 111,
@@ -3996,7 +4147,8 @@
      "exitTime": 1733443200000,
      "entryPrice": 5352.23,
      "exitPrice": 5414.01,
-     "returnPct": 1.15
+     "returnPct": 1.15,
+     "open": false
     },
     {
      "id": 112,
@@ -4005,7 +4157,8 @@
      "exitTime": 1734566400000,
      "entryPrice": 6064.94,
      "exitPrice": 6297.47,
-     "returnPct": 3.83
+     "returnPct": 3.83,
+     "open": false
     },
     {
      "id": 113,
@@ -4014,7 +4167,8 @@
      "exitTime": 1735948800000,
      "entryPrice": 4587.22,
      "exitPrice": 4724.35,
-     "returnPct": 2.99
+     "returnPct": 2.99,
+     "open": false
     },
     {
      "id": 114,
@@ -4023,7 +4177,8 @@
      "exitTime": 1736640000000,
      "entryPrice": 5078.9,
      "exitPrice": 5278.81,
-     "returnPct": 3.94
+     "returnPct": 3.94,
+     "open": false
     },
     {
      "id": 115,
@@ -4032,7 +4187,8 @@
      "exitTime": 1737590400000,
      "entryPrice": 5938.63,
      "exitPrice": 6009.86,
-     "returnPct": 1.2
+     "returnPct": 1.2,
+     "open": false
     },
     {
      "id": 116,
@@ -4041,7 +4197,8 @@
      "exitTime": 1739318400000,
      "entryPrice": 5139.03,
      "exitPrice": 5054.72,
-     "returnPct": -1.64
+     "returnPct": -1.64,
+     "open": false
     },
     {
      "id": 117,
@@ -4050,7 +4207,8 @@
      "exitTime": 1740528000000,
      "entryPrice": 4986.73,
      "exitPrice": 5062.52,
-     "returnPct": 1.52
+     "returnPct": 1.52,
+     "open": false
     },
     {
      "id": 118,
@@ -4059,7 +4217,8 @@
      "exitTime": 1741392000000,
      "entryPrice": 3745.85,
      "exitPrice": 3578.66,
-     "returnPct": -4.46
+     "returnPct": -4.46,
+     "open": false
     },
     {
      "id": 119,
@@ -4068,7 +4227,8 @@
      "exitTime": 1742860800000,
      "entryPrice": 3556.06,
      "exitPrice": 3507.8,
-     "returnPct": -1.36
+     "returnPct": -1.36,
+     "open": false
     },
     {
      "id": 120,
@@ -4077,7 +4237,8 @@
      "exitTime": 1743724800000,
      "entryPrice": 4284.12,
      "exitPrice": 4415.9,
-     "returnPct": 3.08
+     "returnPct": 3.08,
+     "open": false
     },
     {
      "id": 121,
@@ -4086,7 +4247,8 @@
      "exitTime": 1744588800000,
      "entryPrice": 4076.37,
      "exitPrice": 4168.75,
-     "returnPct": 2.27
+     "returnPct": 2.27,
+     "open": false
     },
     {
      "id": 122,
@@ -4095,7 +4257,8 @@
      "exitTime": 1745712000000,
      "entryPrice": 4511.45,
      "exitPrice": 4687.01,
-     "returnPct": 3.89
+     "returnPct": 3.89,
+     "open": false
     },
     {
      "id": 123,
@@ -4104,7 +4267,8 @@
      "exitTime": 1747008000000,
      "entryPrice": 4513.16,
      "exitPrice": 4389.95,
-     "returnPct": -2.73
+     "returnPct": -2.73,
+     "open": false
     },
     {
      "id": 124,
@@ -4113,7 +4277,8 @@
      "exitTime": 1747872000000,
      "entryPrice": 4213.07,
      "exitPrice": 4306.12,
-     "returnPct": 2.21
+     "returnPct": 2.21,
+     "open": false
     },
     {
      "id": 125,
@@ -4122,7 +4287,8 @@
      "exitTime": 1748995200000,
      "entryPrice": 3877.53,
      "exitPrice": 3746.59,
-     "returnPct": -3.38
+     "returnPct": -3.38,
+     "open": false
     },
     {
      "id": 126,
@@ -4131,7 +4297,8 @@
      "exitTime": 1750377600000,
      "entryPrice": 4536.44,
      "exitPrice": 4594.43,
-     "returnPct": 1.28
+     "returnPct": 1.28,
+     "open": false
     }
    ]
   }
@@ -5505,7 +5672,8 @@
       "exitTime": 1610236800000,
       "entryPrice": 1.5,
       "exitPrice": 1.61,
-      "returnPct": -7.29
+      "returnPct": -7.29,
+      "open": false
      },
      {
       "id": 2,
@@ -5514,7 +5682,8 @@
       "exitTime": 1612656000000,
       "entryPrice": 1.67,
       "exitPrice": 1.79,
-      "returnPct": -7.18
+      "returnPct": -7.18,
+      "open": false
      },
      {
       "id": 3,
@@ -5523,7 +5692,8 @@
       "exitTime": 1616025600000,
       "entryPrice": 1.39,
       "exitPrice": 1.36,
-      "returnPct": -2.28
+      "returnPct": -2.28,
+      "open": false
      },
      {
       "id": 4,
@@ -5532,7 +5702,8 @@
       "exitTime": 1617926400000,
       "entryPrice": 2.1,
       "exitPrice": 2.55,
-      "returnPct": 21.62
+      "returnPct": 21.62,
+      "open": false
      },
      {
       "id": 5,
@@ -5541,7 +5712,8 @@
       "exitTime": 1619568000000,
       "entryPrice": 2,
       "exitPrice": 1.91,
-      "returnPct": -4.81
+      "returnPct": -4.81,
+      "open": false
      },
      {
       "id": 6,
@@ -5550,7 +5722,8 @@
       "exitTime": 1622678400000,
       "entryPrice": 2.26,
       "exitPrice": 1.68,
-      "returnPct": 25.53
+      "returnPct": 25.53,
+      "open": false
      },
      {
       "id": 7,
@@ -5559,7 +5732,8 @@
       "exitTime": 1624320000000,
       "entryPrice": 2.12,
       "exitPrice": 2.17,
-      "returnPct": -2.25
+      "returnPct": -2.25,
+      "open": false
      },
      {
       "id": 8,
@@ -5568,7 +5742,8 @@
       "exitTime": 1627603200000,
       "entryPrice": 2.19,
       "exitPrice": 2.33,
-      "returnPct": -6.48
+      "returnPct": -6.48,
+      "open": false
      },
      {
       "id": 9,
@@ -5577,7 +5752,8 @@
       "exitTime": 1630368000000,
       "entryPrice": 2.95,
       "exitPrice": 2.44,
-      "returnPct": 17.29
+      "returnPct": 17.29,
+      "open": false
      },
      {
       "id": 10,
@@ -5586,7 +5762,8 @@
       "exitTime": 1632441600000,
       "entryPrice": 3.48,
       "exitPrice": 2.62,
-      "returnPct": 24.63
+      "returnPct": 24.63,
+      "open": false
      },
      {
       "id": 11,
@@ -5595,7 +5772,8 @@
       "exitTime": 1635033600000,
       "entryPrice": 3.35,
       "exitPrice": 3,
-      "returnPct": 10.5
+      "returnPct": 10.5,
+      "open": false
      },
      {
       "id": 12,
@@ -5604,7 +5782,8 @@
       "exitTime": 1637452800000,
       "entryPrice": 3.1,
       "exitPrice": 2.8,
-      "returnPct": 9.48
+      "returnPct": 9.48,
+      "open": false
      },
      {
       "id": 13,
@@ -5613,7 +5792,8 @@
       "exitTime": 1640390400000,
       "entryPrice": 2.61,
       "exitPrice": 3.26,
-      "returnPct": 24.85
+      "returnPct": 24.85,
+      "open": false
      },
      {
       "id": 14,
@@ -5622,7 +5802,8 @@
       "exitTime": 1642636800000,
       "entryPrice": 4.32,
       "exitPrice": 3.53,
-      "returnPct": 18.36
+      "returnPct": 18.36,
+      "open": false
      },
      {
       "id": 15,
@@ -5631,7 +5812,8 @@
       "exitTime": 1643932800000,
       "entryPrice": 4.42,
       "exitPrice": 4.73,
-      "returnPct": -7.09
+      "returnPct": -7.09,
+      "open": false
      },
      {
       "id": 16,
@@ -5640,7 +5822,8 @@
       "exitTime": 1646524800000,
       "entryPrice": 4.99,
       "exitPrice": 4.72,
-      "returnPct": -5.52
+      "returnPct": -5.52,
+      "open": false
      },
      {
       "id": 17,
@@ -5649,7 +5832,8 @@
       "exitTime": 1650153600000,
       "entryPrice": 6.57,
       "exitPrice": 7.06,
-      "returnPct": 7.51
+      "returnPct": 7.51,
+      "open": false
      },
      {
       "id": 18,
@@ -5658,7 +5842,8 @@
       "exitTime": 1651622400000,
       "entryPrice": 7.04,
       "exitPrice": 8.49,
-      "returnPct": 20.56
+      "returnPct": 20.56,
+      "open": false
      },
      {
       "id": 19,
@@ -5667,7 +5852,8 @@
       "exitTime": 1654905600000,
       "entryPrice": 7.39,
       "exitPrice": 7.05,
-      "returnPct": -4.56
+      "returnPct": -4.56,
+      "open": false
      },
      {
       "id": 20,
@@ -5676,7 +5862,8 @@
       "exitTime": 1656374400000,
       "entryPrice": 3.52,
       "exitPrice": 2.79,
-      "returnPct": 20.74
+      "returnPct": 20.74,
+      "open": false
      },
      {
       "id": 21,
@@ -5685,7 +5872,8 @@
       "exitTime": 1659052800000,
       "entryPrice": 3.6,
       "exitPrice": 3.81,
-      "returnPct": -5.86
+      "returnPct": -5.86,
+      "open": false
      },
      {
       "id": 22,
@@ -5694,7 +5882,8 @@
       "exitTime": 1662336000000,
       "entryPrice": 5.26,
       "exitPrice": 5.05,
-      "returnPct": -3.86
+      "returnPct": -3.86,
+      "open": false
      },
      {
       "id": 23,
@@ -5703,7 +5892,8 @@
       "exitTime": 1664409600000,
       "entryPrice": 5.55,
       "exitPrice": 5.7,
-      "returnPct": -2.7
+      "returnPct": -2.7,
+      "open": false
      },
      {
       "id": 24,
@@ -5712,7 +5902,8 @@
       "exitTime": 1665619200000,
       "entryPrice": 4.73,
       "exitPrice": 5.34,
-      "returnPct": 13.03
+      "returnPct": 13.03,
+      "open": false
      },
      {
       "id": 25,
@@ -5721,7 +5912,8 @@
       "exitTime": 1668729600000,
       "entryPrice": 4.49,
       "exitPrice": 4.63,
-      "returnPct": -3.18
+      "returnPct": -3.18,
+      "open": false
      },
      {
       "id": 26,
@@ -5730,7 +5922,8 @@
       "exitTime": 1670976000000,
       "entryPrice": 3.91,
       "exitPrice": 4.15,
-      "returnPct": -6.2
+      "returnPct": -6.2,
+      "open": false
      },
      {
       "id": 27,
@@ -5739,7 +5932,8 @@
       "exitTime": 1673913600000,
       "entryPrice": 2.79,
       "exitPrice": 3.23,
-      "returnPct": 15.7
+      "returnPct": 15.7,
+      "open": false
      },
      {
       "id": 28,
@@ -5748,7 +5942,8 @@
       "exitTime": 1675814400000,
       "entryPrice": 4.25,
       "exitPrice": 4.11,
-      "returnPct": -3.33
+      "returnPct": -3.33,
+      "open": false
      },
      {
       "id": 29,
@@ -5757,7 +5952,8 @@
       "exitTime": 1677974400000,
       "entryPrice": 6.46,
       "exitPrice": 7.75,
-      "returnPct": 19.91
+      "returnPct": 19.91,
+      "open": false
      },
      {
       "id": 30,
@@ -5766,7 +5962,8 @@
       "exitTime": 1680998400000,
       "entryPrice": 9.04,
       "exitPrice": 9.52,
-      "returnPct": -5.25
+      "returnPct": -5.25,
+      "open": false
      },
      {
       "id": 31,
@@ -5775,7 +5972,8 @@
       "exitTime": 1682640000000,
       "entryPrice": 15.88,
       "exitPrice": 18.97,
-      "returnPct": 19.51
+      "returnPct": 19.51,
+      "open": false
      },
      {
       "id": 32,
@@ -5784,7 +5982,8 @@
       "exitTime": 1686268800000,
       "entryPrice": 20.79,
       "exitPrice": 21.28,
-      "returnPct": -2.38
+      "returnPct": -2.38,
+      "open": false
      },
      {
       "id": 33,
@@ -5793,7 +5992,8 @@
       "exitTime": 1687996800000,
       "entryPrice": 33.15,
       "exitPrice": 25.55,
-      "returnPct": 22.92
+      "returnPct": 22.92,
+      "open": false
      },
      {
       "id": 34,
@@ -5802,7 +6002,8 @@
       "exitTime": 1690761600000,
       "entryPrice": 33.78,
       "exitPrice": 31.82,
-      "returnPct": -5.79
+      "returnPct": -5.79,
+      "open": false
      },
      {
       "id": 35,
@@ -5811,7 +6012,8 @@
       "exitTime": 1692576000000,
       "entryPrice": 24.54,
       "exitPrice": 19.67,
-      "returnPct": 19.84
+      "returnPct": 19.84,
+      "open": false
      },
      {
       "id": 36,
@@ -5820,7 +6022,8 @@
       "exitTime": 1695254400000,
       "entryPrice": 24.58,
       "exitPrice": 19.27,
-      "returnPct": 21.62
+      "returnPct": 21.62,
+      "open": false
      },
      {
       "id": 37,
@@ -5829,7 +6032,8 @@
       "exitTime": 1698278400000,
       "entryPrice": 30.43,
       "exitPrice": 31.54,
-      "returnPct": -3.66
+      "returnPct": -3.66,
+      "open": false
      },
      {
       "id": 38,
@@ -5838,7 +6042,8 @@
       "exitTime": 1700611200000,
       "entryPrice": 25.46,
       "exitPrice": 20.46,
-      "returnPct": 19.66
+      "returnPct": 19.66,
+      "open": false
      },
      {
       "id": 39,
@@ -5847,7 +6052,8 @@
       "exitTime": 1702944000000,
       "entryPrice": 18.4,
       "exitPrice": 18.79,
-      "returnPct": -2.15
+      "returnPct": -2.15,
+      "open": false
      },
      {
       "id": 40,
@@ -5856,7 +6062,8 @@
       "exitTime": 1705017600000,
       "entryPrice": 18.74,
       "exitPrice": 20.44,
-      "returnPct": 9.1
+      "returnPct": 9.1,
+      "open": false
      },
      {
       "id": 41,
@@ -5865,7 +6072,8 @@
       "exitTime": 1707523200000,
       "entryPrice": 20.41,
       "exitPrice": 19.36,
-      "returnPct": -5.16
+      "returnPct": -5.16,
+      "open": false
      },
      {
       "id": 42,
@@ -5874,7 +6082,8 @@
       "exitTime": 1709078400000,
       "entryPrice": 29.24,
       "exitPrice": 27.55,
-      "returnPct": -5.78
+      "returnPct": -5.78,
+      "open": false
      },
      {
       "id": 43,
@@ -5883,7 +6092,8 @@
       "exitTime": 1712966400000,
       "entryPrice": 32.94,
       "exitPrice": 36.77,
-      "returnPct": 11.63
+      "returnPct": 11.63,
+      "open": false
      },
      {
       "id": 44,
@@ -5892,7 +6102,8 @@
       "exitTime": 1714003200000,
       "entryPrice": 22.07,
       "exitPrice": 24.87,
-      "returnPct": 12.69
+      "returnPct": 12.69,
+      "open": false
      },
      {
       "id": 45,
@@ -5901,7 +6112,8 @@
       "exitTime": 1717372800000,
       "entryPrice": 16.34,
       "exitPrice": 17.57,
-      "returnPct": -7.5
+      "returnPct": -7.5,
+      "open": false
      },
      {
       "id": 46,
@@ -5910,7 +6122,8 @@
       "exitTime": 1719532800000,
       "entryPrice": 15.96,
       "exitPrice": 12.08,
-      "returnPct": 24.31
+      "returnPct": 24.31,
+      "open": false
      },
      {
       "id": 47,
@@ -5919,7 +6132,8 @@
       "exitTime": 1722038400000,
       "entryPrice": 19.44,
       "exitPrice": 16.02,
-      "returnPct": 17.6
+      "returnPct": 17.6,
+      "open": false
      },
      {
       "id": 48,
@@ -5928,7 +6142,8 @@
       "exitTime": 1724025600000,
       "entryPrice": 12.54,
       "exitPrice": 13.48,
-      "returnPct": 7.48
+      "returnPct": 7.48,
+      "open": false
      },
      {
       "id": 49,
@@ -5937,7 +6152,8 @@
       "exitTime": 1726531200000,
       "entryPrice": 12.93,
       "exitPrice": 12.58,
-      "returnPct": -2.69
+      "returnPct": -2.69,
+      "open": false
      },
      {
       "id": 50,
@@ -5946,7 +6162,8 @@
       "exitTime": 1728691200000,
       "entryPrice": 16.47,
       "exitPrice": 14.64,
-      "returnPct": 11.16
+      "returnPct": 11.16,
+      "open": false
      },
      {
       "id": 51,
@@ -5955,7 +6172,8 @@
       "exitTime": 1731801600000,
       "entryPrice": 14.5,
       "exitPrice": 12.32,
-      "returnPct": 15.03
+      "returnPct": 15.03,
+      "open": false
      },
      {
       "id": 52,
@@ -5964,7 +6182,8 @@
       "exitTime": 1734048000000,
       "entryPrice": 16.81,
       "exitPrice": 16.33,
-      "returnPct": -2.84
+      "returnPct": -2.84,
+      "open": false
      },
      {
       "id": 53,
@@ -5973,7 +6192,8 @@
       "exitTime": 1736035200000,
       "entryPrice": 17.9,
       "exitPrice": 16.75,
-      "returnPct": -6.42
+      "returnPct": -6.42,
+      "open": false
      },
      {
       "id": 54,
@@ -5982,7 +6202,8 @@
       "exitTime": 1738281600000,
       "entryPrice": 15.1,
       "exitPrice": 14.01,
-      "returnPct": -7.24
+      "returnPct": -7.24,
+      "open": false
      },
      {
       "id": 55,
@@ -5991,7 +6212,8 @@
       "exitTime": 1740441600000,
       "entryPrice": 19.39,
       "exitPrice": 16.73,
-      "returnPct": 13.74
+      "returnPct": 13.74,
+      "open": false
      },
      {
       "id": 56,
@@ -6000,7 +6222,8 @@
       "exitTime": 1743465600000,
       "entryPrice": 26.41,
       "exitPrice": 24.35,
-      "returnPct": -7.82
+      "returnPct": -7.82,
+      "open": false
      },
      {
       "id": 57,
@@ -6009,7 +6232,8 @@
       "exitTime": 1745971200000,
       "entryPrice": 30.35,
       "exitPrice": 36.34,
-      "returnPct": 19.77
+      "returnPct": 19.77,
+      "open": false
      }
     ]
    }

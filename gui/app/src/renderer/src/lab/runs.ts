@@ -124,6 +124,7 @@ export function toVerdict(detail: RunDetail): VerdictPreview {
       entryPrice: t.entry_price,
       exitPrice: t.exit_price,
       returnPct: t.return_on_notional * 100,
+      open: t.open,
     })),
   }
 }
@@ -138,15 +139,15 @@ export function toFinished(detail: RunDetail): FinishedRun {
 /** What a run that did not finish shows. */
 export type RunFailure =
   | { kind: 'cancelled' }
-  /** The store lacks the run's range: the "No data downloaded" state. */
+  /** The store lacks the run's range: the "Data missing" state. */
   | { kind: 'data_missing'; message: string }
-  /** The engine is running as many runs as it takes. */
-  | { kind: 'too_many_runs' }
+  /** The engine holds as many queued and running runs as it takes; the message says how many. */
+  | { kind: 'too_many_runs'; message: string }
   | { kind: 'failed'; message: string }
 
 export function runFailure(e: unknown): RunFailure {
   if (e instanceof RunCancelled) return { kind: 'cancelled' }
   if (e instanceof ApiError && e.code === 'data_missing') return { kind: 'data_missing', message: e.message }
-  if (e instanceof ApiError && e.code === 'too_many_runs') return { kind: 'too_many_runs' }
+  if (e instanceof ApiError && e.code === 'too_many_runs') return { kind: 'too_many_runs', message: e.message }
   return { kind: 'failed', message: e instanceof Error ? e.message : String(e) }
 }

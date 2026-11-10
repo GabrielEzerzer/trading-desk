@@ -41,14 +41,18 @@ function installBridgeStub(config) {
     for (const listener of messageListeners) listener({ type: 'job', job: structuredClone(job) })
   }
 
-  /** Starts a job that reports `steps` one `stepMs` apart, then ends as `finish` says. */
+  /**
+   * Starts a job that reports `steps` one `stepMs` apart, then ends as `finish` says. Like the
+   * engine's checkpoints, a cancel stops a running job before its next step, but not once its last
+   * step has started: then the job still ends as `finish` says.
+   */
   function startJob(kind, request, steps, finish) {
     const job = {
       id: nextJob++,
       kind,
       status: 'queued',
       progress: 0,
-      message: '',
+      message: 'queued',
       request: { kind, ...request },
       result: null,
       error: null,
@@ -62,7 +66,13 @@ function installBridgeStub(config) {
     emit(job)
     let i = 0
     const tick = () => {
+      // A queued job is cancelled at once, by the cancel route.
       if (job.status === 'cancelled') return
+      if (job.cancel_requested && i < steps.length) {
+        Object.assign(job, { status: 'cancelled', message: 'cancelled', finished_at: Date.now() })
+        emit(job)
+        return
+      }
       const step = steps[i++]
       if (step) {
         Object.assign(job, { status: 'running', started_at: job.started_at ?? Date.now() }, step)
@@ -79,7 +89,8 @@ function installBridgeStub(config) {
 
   function startBacktest(body) {
     if (backtest === 'too_many_runs') {
-      return fail(429, 'too_many_runs', '2 runs are already queued or running; wait for one to finish')
+      // The engine's text (td-server jobs.rs, MAX_RUN_JOBS = 8).
+      return fail(429, 'too_many_runs', '8 runs are already queued or running, the most this server takes; wait for one to finish or cancel one')
     }
     if (backtest === 'data_missing') {
       return fail(422, 'data_missing', `the store has no candles for ${key(body.instrument.id)} from 2024-03-04 00:00 to 2024-03-12 00:00 UTC; download them first`)
@@ -138,7 +149,15 @@ function installBridgeStub(config) {
       // A downloaded instrument without coverage of its own reads like the first stored one.
       const months = stored.has(id) ? (data.coverage[id] ?? Object.values(data.coverage)[0]) : []
       const [venue, symbol, kind] = id.split(':')
-      return ok({ instrument: { venue, symbol, kind }, months, funding: null })
+      // A perpetual reports its stored funding rates, one every 8 hours over the stored range; spot reports null.
+      let funding = null
+      if (kind === 'perpetual') {
+        const step = 8 * 3_600_000
+        const first = months.length ? Math.ceil(months[0].first / step) * step : null
+        const last = months.length ? Math.floor(months.at(-1).last / step) * step : null
+        funding = first === null ? { rates: 0, first: null, last: null } : { rates: (last - first) / step + 1, first, last }
+      }
+      return ok({ instrument: { venue, symbol, kind }, months, funding })
     }
     if (method === 'GET' && path === '/instruments') {
       const instruments = data.instruments.filter((i) => i.id.venue === query.venue && i.id.kind === query.kind)
@@ -146,15 +165,18 @@ function installBridgeStub(config) {
     }
     if (method === 'POST' && path === '/runs/backtest') return startBacktest(body)
     if (method === 'POST' && path === '/data/download') return startDownload(body)
-    m = /^\/jobs\/(\d+)\/(cancel|result)$/.exec(path)
+    m = /^\/jobs\/(\d+)(?:\/(cancel|result))?$/.exec(path)
     const job = m && jobs.get(Number(m[1]))
     if (m && !job) return fail(404, 'not_found', `no job ${m[1]}`)
     if (method === 'POST' && m?.[2] === 'cancel') {
-      if (job.status !== 'queued' && job.status !== 'running') return fail(409, 'job_finished', `job ${job.id} has finished`)
-      Object.assign(job, { status: 'cancelled', cancel_requested: true, finished_at: Date.now() })
+      if (job.status !== 'queued' && job.status !== 'running') return fail(409, 'job_finished', `job ${job.id} has already finished`)
+      // A queued job is cancelled at once; a running one only asks, and ends at its next step.
+      job.cancel_requested = true
+      if (job.status === 'queued') Object.assign(job, { status: 'cancelled', message: 'cancelled', finished_at: Date.now() })
       emit(job)
       return { ok: true, status: 202, body: structuredClone(job) }
     }
+    if (method === 'GET' && m && !m[2]) return ok(structuredClone(job))
     if (method === 'GET' && m?.[2] === 'result') {
       if (job.status !== 'done') return fail(409, 'job_not_done', `job ${job.id} is ${job.status}, not done yet`)
       return ok(data.details[job.result.run_id])

@@ -140,7 +140,7 @@ export function Result({ strategy, verdict, fresh, onCounted }: Props) {
                 <td className="num muted">{t.id}</td>
                 <td>{t.side === 'long' ? 'Long' : 'Short'}</td>
                 <td>{formatDay(t.entryTime)}</td>
-                <td>{formatDay(t.exitTime)}</td>
+                <td>{t.open ? 'Open' : formatDay(t.exitTime)}</td>
                 <td className="num">{formatPrice(t.entryPrice)}</td>
                 <td className="num">{formatPrice(t.exitPrice)}</td>
                 <td className="num" data-tone={pnlTone(t.returnPct, 'return_pct')}>

@@ -30,13 +30,17 @@ const defaults = (info: StrategyInfo | undefined): Params =>
 
 /**
  * Starts a job and follows it on the `jobs` topic until it ends: resolves with the finished job,
- * rejects with the job's error, or with `RunCancelled` once `cancel` is called.
+ * rejects with the job's error, or with `RunCancelled` when it ends cancelled.
+ *
+ * `cancel` asks the engine to stop the job and keeps following it, since a running job stops only
+ * at its next checkpoint and one cancelled after its last checkpoint still ends `done`.
  */
 function followJob(start: () => Promise<number>, onUpdate: (job: JobInfo) => void): LabJob<JobInfo> {
   let jobId: number | null = null
   let cancelled = false
   let off = () => {}
   let reject: (reason: unknown) => void = () => {}
+  let stop: (id: number) => void = () => {}
   // Messages can arrive before `start` returns the id, so the latest state of each job is kept.
   const seen = new Map<number, JobInfo>()
 
@@ -46,7 +50,6 @@ function followJob(start: () => Promise<number>, onUpdate: (job: JobInfo) => voi
       rejectJob(reason)
     }
     const take = (job: JobInfo) => {
-      if (cancelled) return
       if (job.status === 'done') {
         off()
         resolve(job)
@@ -54,10 +57,16 @@ function followJob(start: () => Promise<number>, onUpdate: (job: JobInfo) => voi
         reject(new Error(job.error?.message ?? 'The job failed.'))
       } else if (job.status === 'cancelled') {
         reject(new RunCancelled())
-      } else {
+      } else if (!cancelled) {
         onUpdate(job)
       }
     }
+    stop = (id) =>
+      api.cancelJob(id).then(take, (e: unknown) => {
+        // 409: the job had already finished; read how it ended.
+        if (e instanceof ApiError && e.status === 409) return api.job(id).then(take)
+        throw e
+      }).catch(() => reject(new RunCancelled()))
     off = window.td.onMessage((message) => {
       if (message.type !== 'job') return
       if (jobId === null) seen.set(message.job.id, message.job)
@@ -71,13 +80,10 @@ function followJob(start: () => Promise<number>, onUpdate: (job: JobInfo) => voi
       .then(
         (id) => {
           jobId = id
-          if (cancelled) {
-            void api.cancelJob(id).catch(() => {})
-            return
-          }
           const early = seen.get(id)
           seen.clear()
           if (early) take(early)
+          if (cancelled) stop(id)
         },
         (e: unknown) => reject(e),
       )
@@ -88,9 +94,7 @@ function followJob(start: () => Promise<number>, onUpdate: (job: JobInfo) => voi
     cancel() {
       if (cancelled) return
       cancelled = true
-      // A job that has already finished answers 409; there is nothing left to stop.
-      if (jobId !== null) void api.cancelJob(jobId).catch(() => {})
-      reject(new RunCancelled())
+      if (jobId !== null) stop(jobId)
     },
   }
 }
@@ -99,6 +103,7 @@ const strategyInfo = new Map<string, StrategyInfo>()
 
 export const engineLabSource: LabSource = {
   defaultInstrument: CANDIDATES[0] as InstrumentId,
+  neverRunText: 'Run it to backtest it on the chosen data.',
 
   async strategies() {
     const [list, runs] = await Promise.all([api.strategies(), api.runs()])

@@ -7962,17 +7962,17 @@
       {
        "side": "long",
        "entry_time": 1747785600000,
-       "exit_time": 1748649600000,
-       "open": false,
+       "exit_time": 1751241600000,
+       "open": true,
        "qty": 0.0823,
        "entry_price": 121575.16,
-       "exit_price": 117461.11,
-       "gross_pnl": -338.59,
-       "fees": 9.84,
+       "exit_price": 100942.07,
+       "gross_pnl": -1698.1,
+       "fees": 5,
        "funding": 0,
-       "net_pnl": -348.43,
-       "return_on_notional": -0.0348,
-       "bars_held": 10
+       "net_pnl": -1703.1,
+       "return_on_notional": -0.1702,
+       "bars_held": 40
       }
      ],
      "metrics": {
@@ -7989,13 +7989,13 @@
       "calmar": 8.19,
       "trades": 22,
       "win_rate": 0.4545,
-      "profit_factor": 2.08,
-      "avg_trade_pnl": 266.36,
+      "profit_factor": 1.67,
+      "avg_trade_pnl": 204.78,
       "median_trade_pnl": -232.11,
-      "avg_bars_held": 7.4,
+      "avg_bars_held": 8.8,
       "exposure": 0.42,
       "turnover": 3.1,
-      "fees_paid": 219.47,
+      "fees_paid": 214.63,
       "funding_paid": 0
      },
      "benchmark": {

@@ -46,10 +46,14 @@ export interface TradeRow {
   id: number
   side: 'long' | 'short'
   entryTime: Millis
+  /** The last bar's time for a trade still open at the end. */
   exitTime: Millis
   entryPrice: number
+  /** The price the trade closed at, or the last close for a trade still open at the end. */
   exitPrice: number
   returnPct: number
+  /** Still open when the run ended. */
+  open: boolean
 }
 
 // shortcut: replace with the engine's verdict type from #32
@@ -142,6 +146,8 @@ export interface LabSource {
   datasets(): Promise<InstrumentId[]>
   /** The instrument to offer for download when nothing is stored. */
   readonly defaultInstrument: InstrumentId
+  /** What Run does, for a strategy that has never run. */
+  readonly neverRunText: string
   /** The full result of a strategy's latest run. */
   open(last: LastRun): Promise<VerdictPreview>
   run(name: string, target: RunTarget, onProgress: (progress: RunProgress) => void): LabRun

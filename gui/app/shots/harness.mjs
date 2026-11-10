@@ -313,7 +313,7 @@ export const STATES = [
       await chooseRow(page, /Donchian breakout/)
       await page.getByRole('button', { name: 'Run', exact: true }).click()
       await page.mouse.move(0, 0)
-      await page.getByText('Another run is in progress. Try again when it finishes.').waitFor()
+      await page.getByText(/runs are already queued or running/).waitFor()
     },
   },
   {

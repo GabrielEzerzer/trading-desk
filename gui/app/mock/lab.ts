@@ -70,6 +70,7 @@ function play<T>(steps: (() => void)[], stepMs: number, finish: () => T | Error)
 export function createMockLabSource({ stepMs = 700, listMs = 300, now = Date.now }: MockOptions = {}): LabSource {
   return {
     defaultInstrument: data.datasets[0] as InstrumentId,
+    neverRunText: 'Run its test plan to get a verdict.',
     strategies: () =>
       new Promise((resolve) => {
         setTimeout(() => resolve(data.strategies.map((s) => ({ ...s, label: readableName(s.name) }))), listMs)

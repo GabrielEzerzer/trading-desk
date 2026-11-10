@@ -92,6 +92,7 @@ function trades({ seed, count, from, days, price, winRate, avgWin, avgLoss, allo
       entryPrice: round(entry, 2),
       exitPrice: round(exit, 2),
       returnPct: round(r * 100, 2),
+      open: false,
     })
   }
   return out
@@ -274,28 +275,36 @@ function metricsReport(curve, list, short) {
   }
 }
 
-/** A saved backtest as GET /runs/{id} returns it, and its row in GET /runs. */
-function savedBacktest({ id, strategy, params, instrument, from, days, walk, trade, short = false }) {
+/**
+ * A saved backtest as GET /runs/{id} returns it, and its row in GET /runs. With `openLast`, the last
+ * trade is still open at the end, like the engine's: its exit is the last bar, marked at the last
+ * close, with no exit fee.
+ */
+function savedBacktest({ id, strategy, params, instrument, from, days, walk, trade, short = false, openLast = false }) {
   const s = series({ ...walk, from, days })
-  const list = trades({ ...trade, from, days, price: s.price }).map((t) => {
+  const generated = trades({ ...trade, from, days, price: s.price })
+  const list = generated.map((t, i) => {
+    const open = openLast && i === generated.length - 1
+    const exitTime = open ? from + (days - 1) * DAY : t.exitTime
+    const exitPrice = open ? round(s.price[days - 1], 2) : t.exitPrice
     const qty = round(STARTING_CASH / t.entryPrice, 4)
     const sign = t.side === 'long' ? 1 : -1
-    const gross = round(sign * qty * (t.exitPrice - t.entryPrice), 2)
-    const fees = round(qty * (t.entryPrice + t.exitPrice) * 0.0005, 2)
+    const gross = round(sign * qty * (exitPrice - t.entryPrice), 2)
+    const fees = round(qty * (t.entryPrice + (open ? 0 : exitPrice)) * 0.0005, 2)
     return {
       side: t.side,
       entry_time: t.entryTime,
-      exit_time: t.exitTime,
-      open: false,
+      exit_time: exitTime,
+      open,
       qty,
       entry_price: t.entryPrice,
-      exit_price: t.exitPrice,
+      exit_price: exitPrice,
       gross_pnl: gross,
       fees,
       funding: 0,
       net_pnl: round(gross - fees, 2),
       return_on_notional: round((gross - fees) / (t.entryPrice * qty), 4),
-      bars_held: Math.max(1, Math.round((t.exitTime - t.entryTime) / DAY)),
+      bars_held: Math.max(1, Math.round((exitTime - t.entryTime) / DAY)),
     }
   })
   const to = from + days * DAY
@@ -377,7 +386,7 @@ const rsiShort = savedBacktest({
   short: true,
 })
 
-// What a backtest job saves in the stub's run flows.
+// What a backtest job saves in the stub's run flows; its last trade is still open at the end.
 const donchianRun = savedBacktest({
   id: runId(Date.UTC(2026, 10, 10, 12, 0), '0d1e2f3a'),
   strategy: 'donchian_breakout',
@@ -387,6 +396,7 @@ const donchianRun = savedBacktest({
   days: ENGINE_DAYS,
   walk: { seed: 61, startPrice: 42_000, drift: 0.0012, vol: 0.03, exposure: 0.15, edge: 0.0009, edgeVol: 0.008 },
   trade: { seed: 63, count: 22, winRate: 0.41, avgWin: 0.12, avgLoss: 0.04, allowShort: true },
+  openLast: true,
 })
 
 /** GET /data/coverage's months for a stored range, one entry per calendar month. */

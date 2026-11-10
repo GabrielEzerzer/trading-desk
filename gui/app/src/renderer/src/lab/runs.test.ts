@@ -14,6 +14,7 @@ const detail = (id: string) => {
 }
 const SMA = '1794242520000-9e4b7a10'
 const RSI_SHORT = '1794299400000-b7c8d9e0'
+const DONCHIAN = engine.runResult
 
 describe('a saved backtest as the result screen', () => {
   it('has no verdict or criteria until #32, and reads the numbers of the backtest', () => {
@@ -35,6 +36,12 @@ describe('a saved backtest as the result screen', () => {
     expect(v.metrics.find((m) => m.label === 'Trades')).toMatchObject({ strategy: metrics.trades, benchmark: null })
     expect(v.trades).toHaveLength(d.run.result.trades.length)
     expect(v.trades[0]?.returnPct).toBeCloseTo((d.run.result.trades[0]?.return_on_notional ?? 0) * 100)
+  })
+
+  it('keeps a trade still open at the end of the run marked as open', () => {
+    const trades = toVerdict(detail(DONCHIAN)).trades
+    expect(trades.at(-1)?.open).toBe(true)
+    expect(trades.slice(0, -1).every((t) => t.open === false)).toBe(true)
   })
 
   it('draws growth of one unit of starting cash for the strategy and buy and hold', () => {
@@ -127,7 +134,10 @@ describe('a failed run as the state to show', () => {
       kind: 'data_missing',
       message: 'no candles before March 2024',
     })
-    expect(runFailure(new ApiError(429, 'too_many_runs', 'two runs are already queued'))).toEqual({ kind: 'too_many_runs' })
+    expect(runFailure(new ApiError(429, 'too_many_runs', '8 runs are already queued or running'))).toEqual({
+      kind: 'too_many_runs',
+      message: '8 runs are already queued or running',
+    })
     expect(runFailure(new ApiError(400, 'invalid_config', 'fast must be below slow'))).toEqual({
       kind: 'failed',
       message: 'fast must be below slow',

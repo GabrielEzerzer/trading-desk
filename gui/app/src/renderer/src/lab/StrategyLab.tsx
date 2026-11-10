@@ -23,7 +23,7 @@ interface ActiveRun {
   cancel(): void
 }
 
-/** A download of an instrument's history, from the "No data downloaded" state. */
+/** A download of an instrument's history, from the "No data downloaded" or "Data missing" state. */
 interface ActiveDownload {
   instrument: InstrumentId
   fraction: number
@@ -117,21 +117,29 @@ export function StrategyLab() {
     const name = selected.name
     const target = { instrument, timeframe }
     setFailure(null)
+    // Cancel leaves the running screen at once. The source settles the result only when the job
+    // has ended, and a cancel that came too late still saves the run, so its result is kept.
+    let cancelled = false
+    const cancel = () => {
+      cancelled = true
+      handle.cancel()
+      setRun((r) => (r?.cancel === cancel ? null : r))
+    }
     const handle = source.run(name, target, (progress) =>
-      setRun((r) => (r && r.name === name ? { ...r, progress } : r)),
+      setRun((r) => (r?.cancel === cancel ? { ...r, progress } : r)),
     )
-    setRun({ name, progress: null, cancel: handle.cancel })
+    setRun({ name, progress: null, cancel })
     handle.result.then(
       (finished) => {
         setResults((r) => ({ ...r, [finished.last.id]: finished.verdict }))
         setStrategies((list) => list?.map((s) => (s.name === name ? { ...s, last: finished.last } : s)) ?? list)
-        setFresh(name)
-        setRun(null)
+        if (!cancelled) setFresh(name)
+        setRun((r) => (r?.cancel === cancel ? null : r))
       },
       (e: unknown) => {
-        setRun(null)
+        setRun((r) => (r?.cancel === cancel ? null : r))
         const f = runFailure(e)
-        if (f.kind !== 'cancelled') setFailure({ name, failure: f, instrument: target.instrument })
+        if (!cancelled && f.kind !== 'cancelled') setFailure({ name, failure: f, instrument: target.instrument })
       },
     )
   }
@@ -187,12 +195,14 @@ export function StrategyLab() {
     body = <StrategyList strategies={strategies} onChoose={select} />
   } else if (run?.name === selected.name) {
     body = <Running strategy={selected} run={run} />
-  } else if (noData && (download || failed || !last)) {
+  } else if (noData) {
+    // With nothing stored this shows even over a saved result, so a download is always on offer.
     const target = failed?.instrument ?? source.defaultInstrument
     body = (
       <NoData
         strategy={selected}
         instrument={download?.instrument ?? target}
+        title={failed?.failure.kind === 'data_missing' ? 'Data missing' : 'No data downloaded'}
         reason={
           failed?.failure.kind === 'data_missing'
             ? sentence(failed.failure.message)
@@ -208,7 +218,7 @@ export function StrategyLab() {
       <div className="state">
         <p className="eyebrow">{selected.label}</p>
         <p className="state-text" role="status">
-          Another run is in progress. Try again when it finishes.
+          {sentence(failed.failure.message)}
         </p>
       </div>
     )
@@ -256,7 +266,7 @@ export function StrategyLab() {
           {selected.kind && <span className="verdict-kind">{selected.kind}</span>}
         </div>
         <p className="state-text">{selected.description}</p>
-        <p className="state-text">Run its test plan to get a verdict.</p>
+        <p className="state-text">{source.neverRunText}</p>
       </div>
     )
   }
@@ -329,6 +339,7 @@ function StrategyList({ strategies, onChoose }: { strategies: LabStrategy[]; onC
 interface NoDataProps {
   strategy: LabStrategy
   instrument: InstrumentId
+  title: string
   reason: string
   download: ActiveDownload | null
   error: string | null
@@ -336,13 +347,13 @@ interface NoDataProps {
 }
 
 /** The store lacks the run's data: the offer to download the instrument's history, then its progress. */
-function NoData({ strategy, instrument, reason, download, error, onDownload }: NoDataProps) {
+function NoData({ strategy, instrument, title, reason, download, error, onDownload }: NoDataProps) {
   return (
     <div className="state">
       <p className="eyebrow">{strategy.label}</p>
       <div className="verdict-line">
         <p className="verdict" data-decision="none">
-          No data downloaded
+          {title}
         </p>
       </div>
       {download ? (
@@ -375,7 +386,7 @@ function NoData({ strategy, instrument, reason, download, error, onDownload }: N
 }
 
 function Running({ strategy, run }: { strategy: LabStrategy; run: ActiveRun }) {
-  // The bar shows the whole test plan; the label names the step it is on.
+  // The bar shows how far the whole run has got; the label names the step it is on.
   return (
     <div className="state">
       <p className="eyebrow">{strategy.label}</p>
@@ -383,7 +394,7 @@ function Running({ strategy, run }: { strategy: LabStrategy; run: ActiveRun }) {
         label={run.progress ? progressLabel(run.progress) : 'Starting the run'}
         name="Run progress"
         value={run.progress ? overallProgress(run.progress) : 0}
-        valueText={(percent) => `${percent}% of the test plan`}
+        valueText={(percent) => `${percent}% done`}
       />
     </div>
   )

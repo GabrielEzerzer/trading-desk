@@ -168,6 +168,7 @@ test.describe('running on the engine', () => {
   test('Run sends one backtest on the defaults over the chosen data, then shows the result', async ({ page, open }) => {
     await open(engine)
     await page.getByRole('button', { name: /Donchian breakout/ }).click()
+    await expect(page.getByText('Run it to backtest it on the chosen data.')).toBeVisible()
     await page.getByRole('button', { name: 'Overrides' }).click()
     await expect(page.getByRole('menuitemradio', { name: 'BTCUSDT perpetual, Binance' })).toHaveAttribute('aria-checked', 'true')
     await page.getByRole('menuitemradio', { name: '1d' }).click()
@@ -175,9 +176,10 @@ test.describe('running on the engine', () => {
     await expect(page.getByText('Step 1 of 1 · Running the backtest')).toBeVisible()
     await expect(page.locator('#verdict')).toHaveText('No verdict rule yet', { timeout: 10_000 })
 
-    const sent = (await calls(page)).find((c) => c.method === 'POST' && c.path === '/runs/backtest')
+    const sent = (await calls(page)).filter((c) => c.method === 'POST' && c.path === '/runs/backtest')
+    expect(sent).toHaveLength(1)
     // The whole stored range of BTCUSDT perpetual (2024-01-01 to 2025-07-01), in whole days.
-    expect(sent?.body).toMatchObject({
+    expect(sent[0]?.body).toMatchObject({
       strategy: 'donchian_breakout',
       params: { channel: 20 },
       instrument: { id: { venue: 'binance', symbol: 'BTCUSDT', kind: 'perpetual' } },
@@ -185,6 +187,10 @@ test.describe('running on the engine', () => {
       from: Date.UTC(2024, 0, 1),
       to: Date.UTC(2025, 6, 1),
     })
+    // The run's last trade is still open at the end: no close date.
+    const lastTrade = page.locator('.table-trades tbody tr').last()
+    await expect(lastTrade.locator('td').nth(3)).toHaveText('Open')
+    await expect(page.locator('.table-trades tbody tr').first().locator('td').nth(3)).not.toHaveText('Open')
     await page.locator('.pill').click()
     await page.getByRole('menuitem', { name: 'All strategies' }).click()
     await expect(page.getByRole('button', { name: /Donchian breakout/ })).toContainText('10 Nov 2026 ·')
@@ -201,11 +207,25 @@ test.describe('running on the engine', () => {
     await expect.poll(() => cancelSent(page)).toBe(true)
   })
 
+  test('a cancel that lands after the last checkpoint still shows the saved result', async ({ page, open }) => {
+    await open(engine)
+    await page.getByRole('button', { name: /Donchian breakout/ }).click()
+    await page.getByRole('button', { name: 'Run', exact: true }).click()
+    // The stub, like the engine, saves the run once its last step has started, cancel or not.
+    await expect(page.getByText('Step 1 of 1 · Saving the result')).toBeVisible()
+    await page.getByRole('button', { name: 'Cancel the run' }).click()
+    await expect(page.getByRole('progressbar')).toHaveCount(0)
+    await expect(page.locator('#verdict')).toHaveText('No verdict rule yet', { timeout: 10_000 })
+    await expect(page.getByRole('alert')).toHaveCount(0)
+    expect(await cancelSent(page)).toBe(true)
+  })
+
   test('a run refused for missing data offers the download, then runs', async ({ page, open }) => {
     await open({ ...engine, backtest: 'data_missing' })
     await page.getByRole('button', { name: /Donchian breakout/ }).click()
     await page.getByRole('button', { name: 'Run', exact: true }).click()
-    await expect(page.getByText('No data downloaded')).toBeVisible()
+    await expect(page.getByText('Data missing', { exact: true })).toBeVisible()
+    await expect(page.getByText('No data downloaded')).toHaveCount(0)
     await expect(page.getByText(/store has no candles for binance:BTCUSDT:perpetual/i)).toBeVisible()
     await page.getByRole('button', { name: 'Download BTCUSDT history' }).click()
     await expect(page.getByRole('progressbar', { name: 'Download progress' })).toBeVisible()
@@ -237,6 +257,16 @@ test.describe('running on the engine', () => {
     await expect(page.getByRole('menuitemradio', { name: 'BTCUSDT spot, Binance' })).toHaveAttribute('aria-checked', 'true')
   })
 
+  test('with nothing stored, a strategy with a saved run still offers the download', async ({ page, open }) => {
+    await open({ ...engine, noData: true })
+    await page.getByRole('button', { name: /SMA cross/ }).click()
+    await expect(page.getByText('No data downloaded')).toBeVisible()
+    await page.getByRole('button', { name: 'Download BTCUSDT history' }).click()
+    await expect(page.getByRole('progressbar', { name: 'Download progress' })).toBeVisible()
+    // Once the data is stored, the saved result shows again.
+    await expect(page.locator('#verdict')).toHaveText('No verdict rule yet', { timeout: 10_000 })
+  })
+
   test('a download can be cancelled', async ({ page, open }) => {
     await open({ ...engine, noData: true })
     await page.getByRole('button', { name: /Donchian breakout/ }).click()
@@ -247,11 +277,13 @@ test.describe('running on the engine', () => {
     await expect.poll(() => cancelSent(page)).toBe(true)
   })
 
-  test('a busy engine says so in one line where the verdict goes', async ({ page, open }) => {
+  test('a busy engine says so in one line where the verdict goes, in its own words', async ({ page, open }) => {
     await open({ ...engine, backtest: 'too_many_runs' })
     await page.getByRole('button', { name: /Donchian breakout/ }).click()
     await page.getByRole('button', { name: 'Run', exact: true }).click()
-    await expect(page.getByText('Another run is in progress. Try again when it finishes.')).toBeVisible()
+    await expect(
+      page.getByText('8 runs are already queued or running, the most this server takes; wait for one to finish or cancel one.'),
+    ).toBeVisible()
     await expect(page.getByRole('alert')).toHaveCount(0)
     await expect(page.getByRole('button', { name: 'Run', exact: true })).not.toHaveAttribute('aria-disabled', 'true')
   })
