@@ -13,6 +13,9 @@ import {
 } from './format'
 import type { LabStrategy, VerdictPreview } from './source'
 
+/** What a metric the engine could not compute shows, as the tables already write a missing value. */
+const MISSING = '–'
+
 interface Props {
   strategy: LabStrategy
   verdict: VerdictPreview
@@ -23,11 +26,11 @@ interface Props {
 
 /**
  * The answer first, then the evidence: verdict and kind, one line per criterion, the key numbers,
- * the equity curve against its benchmark, then the metrics and trade tables.
+ * the equity curve against its benchmark, then the metrics and trade tables. A run with no verdict
+ * rule yet (#32) says so where the verdict goes and has no criteria.
  */
 export function Result({ strategy, verdict, fresh, onCounted }: Props) {
   const progress = useCountUp(fresh, onCounted)
-  const trade = verdict.decision === 'trade'
   // Counting numbers are scaled toward their true value; at progress 1 they are exact.
   const count = (value: number) => (progress === 1 ? value : value * progress)
 
@@ -38,32 +41,35 @@ export function Result({ strategy, verdict, fresh, onCounted }: Props) {
         {formatMonth(verdict.period.to)}
       </p>
       <div className="verdict-line">
-        <h2 id="verdict" className="verdict" data-decision={verdict.decision}>
-          {trade ? 'Trade' : 'No trade'}
+        <h2 id="verdict" className="verdict" data-decision={verdict.decision ?? 'none'}>
+          {verdict.decision === null ? 'No verdict rule yet' : verdict.decision === 'trade' ? 'Trade' : 'No trade'}
         </h2>
         {strategy.kind && <span className="verdict-kind">{strategy.kind}</span>}
       </div>
 
-      <ul className="criteria" aria-label="Criteria">
-        {verdict.criteria.map((c) => (
-          <li key={c.label} className="criterion" data-pass={c.pass}>
-            <span className="criterion-label">{c.label}</span>
-            <span className="criterion-value">{formatNumber(count(c.value), c.format)}</span>
-            <span className="criterion-limit">{formatLimit(c)}</span>
-            <span className="criterion-result">
-              {c.pass ? <CheckIcon /> : <CrossIcon />}
-              {c.pass ? 'Pass' : 'Fail'}
-            </span>
-          </li>
-        ))}
-      </ul>
+      {verdict.criteria.length > 0 && (
+        <ul className="criteria" aria-label="Criteria">
+          {verdict.criteria.map((c) => (
+            <li key={c.label} className="criterion" data-pass={c.pass}>
+              <span className="criterion-label">{c.label}</span>
+              <span className="criterion-value">{formatNumber(count(c.value), c.format)}</span>
+              <span className="criterion-limit">{formatLimit(c)}</span>
+              <span className="criterion-result">
+                {c.pass ? <CheckIcon /> : <CrossIcon />}
+                {c.pass ? 'Pass' : 'Fail'}
+              </span>
+            </li>
+          ))}
+        </ul>
+      )}
 
       <dl className="key-numbers">
         {verdict.keyNumbers.map((k) => (
           <div key={k.label} className="key-number">
             <dt>{k.label}</dt>
-            <dd data-tone={k.tone === 'pnl' ? pnlTone(k.value, k.format) : undefined}>
-              {formatNumber(count(k.value), k.format, { sign: k.tone === 'pnl' })}
+            {/* A number the engine could not compute is a dash, in the ink, never gain or loss. */}
+            <dd data-tone={k.tone === 'pnl' && k.value !== null ? pnlTone(k.value, k.format) : undefined}>
+              {k.value === null ? MISSING : formatNumber(count(k.value), k.format, { sign: k.tone === 'pnl' })}
             </dd>
           </div>
         ))}
@@ -96,8 +102,8 @@ export function Result({ strategy, verdict, fresh, onCounted }: Props) {
             {verdict.metrics.map((m) => (
               <tr key={m.label}>
                 <th scope="row">{m.label}</th>
-                <td className="num">{formatNumber(m.strategy, m.format)}</td>
-                <td className="num muted">{m.benchmark === null ? '–' : formatNumber(m.benchmark, m.format)}</td>
+                <td className="num">{m.strategy === null ? MISSING : formatNumber(m.strategy, m.format)}</td>
+                <td className="num muted">{m.benchmark === null ? MISSING : formatNumber(m.benchmark, m.format)}</td>
               </tr>
             ))}
           </tbody>

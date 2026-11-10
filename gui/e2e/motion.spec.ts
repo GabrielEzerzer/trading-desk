@@ -7,7 +7,7 @@ import { expect, test } from './fixtures'
 
 test.use({ viewport: { width: 1100, height: 720 } })
 
-const MOTION_STATES = ['engine-starting', 'lab-list', 'lab-strategy-menu', 'lab-running', 'lab-result-trade', 'lab-engine-cannot-run']
+const MOTION_STATES = ['engine-starting', 'lab-list', 'lab-strategy-menu', 'lab-running', 'lab-result-trade', 'lab-engine-downloading']
 
 for (const name of MOTION_STATES) {
   const state = STATES.find((s) => s.name === name)

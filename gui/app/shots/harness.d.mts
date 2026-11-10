@@ -8,11 +8,22 @@ export interface Size {
   height: number
 }
 
+/** The bridge stub's config (bridge-stub.js); the fixtures are added by `stubScript`. */
+export interface StubConfig {
+  engine: 'starting' | 'failed' | 'running'
+  mock: boolean
+  hangStrategies?: boolean
+  /** Nothing is stored until a download. */
+  noData?: boolean
+  /** How POST /runs/backtest answers. */
+  backtest?: 'ok' | 'data_missing' | 'too_many_runs' | 'fails'
+}
+
 export interface State {
   name: string
   /** Set for states outside the Strategy Lab. */
   section?: 'trading'
-  config: { engine: 'starting' | 'failed' | 'running'; mock: boolean; hangStrategies?: boolean }
+  config: StubConfig
   /** Runs the page on Playwright's clock, so the steps can stop time. */
   clock?: boolean
   steps(page: Page): Promise<unknown>

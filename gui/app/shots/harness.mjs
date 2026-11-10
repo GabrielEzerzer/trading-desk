@@ -12,7 +12,7 @@ import { fileURLToPath } from 'node:url'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const root = resolve(here, '..', 'out', 'renderer')
-const fixtures = JSON.parse(readFileSync(join(here, '..', 'mock', 'lab.json'), 'utf8'))
+const engineData = JSON.parse(readFileSync(join(here, '..', 'mock', 'engine.json'), 'utf8'))
 const stubSource = readFileSync(join(here, 'bridge-stub.js'), 'utf8')
 
 /** The window sizes: the minimum window, a common laptop window and a large one. */
@@ -45,12 +45,9 @@ export function serve() {
   })
 }
 
-/** The engine's strategy list, as GET /strategies returns it. */
-const engineStrategies = fixtures.strategies.map((s) => ({ name: s.name, description: s.description, params: [] }))
-
 /** The init script that installs the bridge stub with this config before the page loads. */
 export function stubScript(config) {
-  const full = { strategies: engineStrategies, hangStrategies: false, ...config }
+  const full = { hangStrategies: false, engineData, ...config }
   return `${stubSource}\ninstallBridgeStub(${JSON.stringify(full)})`
 }
 
@@ -248,13 +245,84 @@ export const STATES = [
       await page.getByText('Run failed').waitFor({ timeout: 10_000 })
     },
   },
+  // The engine source, on the stub's fake engine (app/mock/engine.json).
   {
-    name: 'lab-engine-cannot-run',
+    name: 'lab-engine-past-result',
     config: { engine: 'running', mock: false },
     steps: async (page) => {
       await chooseRow(page, /SMA cross/)
-      await page.hover('.run')
-      await page.getByRole('tooltip').waitFor()
+      await page.getByRole('heading', { name: 'No verdict rule yet' }).waitFor()
+    },
+  },
+  {
+    name: 'lab-engine-null-metrics',
+    config: { engine: 'running', mock: false },
+    steps: async (page) => {
+      await chooseRow(page, /RSI reversion/)
+      await page.getByRole('heading', { name: 'No verdict rule yet' }).waitFor()
+    },
+  },
+  {
+    name: 'lab-engine-null-metrics-table',
+    config: { engine: 'running', mock: false },
+    steps: async (page) => {
+      await chooseRow(page, /RSI reversion/)
+      await page.getByRole('heading', { name: 'No verdict rule yet' }).waitFor()
+      await page.evaluate(() => document.getElementById('metrics-title')?.scrollIntoView({ block: 'start' }))
+      await page.waitForFunction(() => (document.querySelector('.lab-scroll')?.scrollTop ?? 0) > 0)
+    },
+  },
+  {
+    name: 'lab-engine-no-data',
+    config: { engine: 'running', mock: false, noData: true },
+    steps: async (page) => {
+      await chooseRow(page, /Donchian breakout/)
+      await page.getByRole('button', { name: 'Download BTCUSDT history' }).waitFor()
+    },
+  },
+  {
+    name: 'lab-engine-downloading',
+    config: { engine: 'running', mock: false, noData: true },
+    clock: true,
+    steps: async (page) => {
+      await chooseRow(page, /Donchian breakout/)
+      await page.getByRole('button', { name: 'Download BTCUSDT history' }).waitFor()
+      // Stop time before the download starts, then move on to its second report (the stub reports
+      // every 700 ms), so it holds at half way while it is looked at.
+      await page.clock.pauseAt((await page.evaluate(() => Date.now())) + 500)
+      await page.getByRole('button', { name: 'Download BTCUSDT history' }).click()
+      await page.mouse.move(0, 0)
+      await page.clock.runFor(800)
+      await page.locator('[role=progressbar][aria-valuenow="50"]').waitFor()
+    },
+  },
+  {
+    name: 'lab-engine-data-missing',
+    config: { engine: 'running', mock: false, backtest: 'data_missing' },
+    steps: async (page) => {
+      await chooseRow(page, /Donchian breakout/)
+      await page.getByRole('button', { name: 'Run', exact: true }).click()
+      await page.mouse.move(0, 0)
+      await page.getByRole('button', { name: 'Download BTCUSDT history' }).waitFor()
+    },
+  },
+  {
+    name: 'lab-engine-too-many-runs',
+    config: { engine: 'running', mock: false, backtest: 'too_many_runs' },
+    steps: async (page) => {
+      await chooseRow(page, /Donchian breakout/)
+      await page.getByRole('button', { name: 'Run', exact: true }).click()
+      await page.mouse.move(0, 0)
+      await page.getByText('Another run is in progress. Try again when it finishes.').waitFor()
+    },
+  },
+  {
+    name: 'lab-engine-overrides-menu',
+    config: { engine: 'running', mock: false },
+    steps: async (page) => {
+      await chooseRow(page, /Donchian breakout/)
+      await page.getByRole('button', { name: 'Overrides' }).click()
+      await page.getByRole('menuitemradio', { name: 'BTCUSDT perpetual, Binance' }).waitFor()
     },
   },
   {

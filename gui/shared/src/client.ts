@@ -2,6 +2,7 @@
 // in the renderer that goes through `window.td`, in the main process straight to the engine.
 
 import type {
+  BacktestConfig,
   CoverageResponse,
   DownloadRequest,
   HealthResponse,
@@ -10,6 +11,8 @@ import type {
   InstrumentsResponse,
   JobCreated,
   JobInfo,
+  RunDetail,
+  RunSummary,
   StrategyInfo,
   Venue,
 } from './api-types'
@@ -58,6 +61,13 @@ export function createClient(send: Send) {
     jobs: () => call<JobInfo[]>({ method: 'GET', path: '/jobs' }),
     job: (id: number) => call<JobInfo>({ method: 'GET', path: `/jobs/${id}` }),
     cancelJob: (id: number) => call<JobInfo>({ method: 'POST', path: `/jobs/${id}/cancel` }),
+    /** A finished run job's saved run; 409 `job_not_done` until it is done. */
+    jobResult: (id: number) => call<RunDetail>({ method: 'GET', path: `/jobs/${id}/result` }),
+    /** Starts a backtest job; 422 `data_missing` when the store lacks the range, 429 `too_many_runs`. */
+    startBacktest: (config: BacktestConfig) =>
+      call<JobCreated>({ method: 'POST', path: '/runs/backtest', body: config }),
+    runs: () => call<RunSummary[]>({ method: 'GET', path: '/runs' }),
+    run: (id: string) => call<RunDetail>({ method: 'GET', path: `/runs/${id}` }),
   }
 }
 

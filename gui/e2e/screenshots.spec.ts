@@ -13,6 +13,12 @@ const KEY_STATES = [
   'lab-result-trade',
   'lab-result-evidence',
   'lab-run-failed',
+  'lab-list-engine',
+  'lab-engine-past-result',
+  'lab-engine-null-metrics',
+  'lab-engine-no-data',
+  'lab-engine-downloading',
+  'lab-engine-too-many-runs',
 ]
 
 test.skip(process.platform !== 'linux', "Baselines are made and compared on CI's Linux runner")

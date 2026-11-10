@@ -1,8 +1,8 @@
-// Where the Lab's data comes from. The Lab only talks to a `LabSource`: the engine one reads the
-// real strategy list, and the mock one (app/mock/lab.ts, chosen with TD_MOCK=1) reads fixtures.
+// Where the Lab's data comes from. The Lab only talks to a `LabSource`: the engine one
+// (engine-source.ts) runs backtests on the engine, and the mock one (app/mock/lab.ts, chosen with
+// TD_MOCK=1) reads fixtures.
 
-import type { InstrumentId } from '@td/shared'
-import { api } from '../api'
+import type { InstrumentId, Timeframe } from '@td/shared'
 
 /** Milliseconds since the Unix epoch, UTC. */
 export type Millis = number
@@ -20,7 +20,8 @@ export interface Criterion {
 
 export interface KeyNumber {
   label: string
-  value: number
+  /** Null when the engine cannot compute it, for example a Sharpe ratio over a short run. */
+  value: number | null
   format: NumberFormat
   /** `pnl` numbers take the gain or loss colour by sign. */
   tone?: 'pnl'
@@ -30,12 +31,13 @@ export interface KeyNumber {
 export interface EquityPoint {
   t: Millis
   strategy: number
-  benchmark: number
+  /** Null when the run carries no benchmark curve at this time. */
+  benchmark: number | null
 }
 
 export interface MetricRow {
   label: string
-  strategy: number
+  strategy: number | null
   benchmark: number | null
   format: NumberFormat
 }
@@ -52,16 +54,27 @@ export interface TradeRow {
 
 // shortcut: replace with the engine's verdict type from #32
 export interface VerdictPreview {
-  decision: 'trade' | 'no_trade'
+  /** Null while the strategy has no verdict rule (#32). */
+  decision: 'trade' | 'no_trade' | null
   instrument: InstrumentId
   period: { from: Millis; to: Millis }
   finishedAt: Millis
+  /** Empty while the strategy has no verdict rule. */
   criteria: Criterion[]
   keyNumbers: KeyNumber[]
   benchmarkLabel: string
   equity: EquityPoint[]
   metrics: MetricRow[]
   trades: TradeRow[]
+}
+
+/** A strategy's latest finished run, as the strategy list shows it. */
+export interface LastRun {
+  /** Where the full result is, for `LabSource.open`. */
+  id: string
+  finishedAt: Millis
+  totalReturn: number | null
+  decision: 'trade' | 'no_trade' | null
 }
 
 export interface LabStrategy {
@@ -72,8 +85,14 @@ export interface LabStrategy {
   /** For example "Trend following"; null while the engine does not say. */
   kind: string | null
   description: string
-  /** The last finished run's verdict, or null when it never ran. */
-  last: VerdictPreview | null
+  /** The latest finished run, or null when it never ran. */
+  last: LastRun | null
+}
+
+/** What a run runs on: the overrides menu's instrument and timeframe. */
+export interface RunTarget {
+  instrument: InstrumentId
+  timeframe: Timeframe
 }
 
 /** Where a run is in its test plan: the step, and how far that step has counted when it counts. */
@@ -86,13 +105,29 @@ export interface RunProgress {
   /** Items this step has finished, and how many it has, when the step counts items. */
   done?: number
   total?: number
+  /** How far the step has run, from 0 to 1, when it reports a share instead of a count. */
+  fraction?: number
 }
 
-export interface LabRun {
-  /** Resolves with the verdict, rejects with the reason it failed, or with `RunCancelled`. */
-  result: Promise<VerdictPreview>
+/** How far a download has run. */
+export interface DownloadProgress {
+  /** From 0 to 1. */
+  fraction: number
+}
+
+/** Work the engine does in the background: it resolves, rejects with why, or with `RunCancelled`. */
+export interface LabJob<T> {
+  result: Promise<T>
   cancel(): void
 }
+
+/** A run that finished: its row for the strategy list, and its result. */
+export interface FinishedRun {
+  last: LastRun
+  verdict: VerdictPreview
+}
+
+export type LabRun = LabJob<FinishedRun>
 
 export class RunCancelled extends Error {
   override name = 'RunCancelled'
@@ -102,11 +137,16 @@ export class RunCancelled extends Error {
 }
 
 export interface LabSource {
-  /** False while the source cannot run test plans; the Run button says why. */
-  readonly canRun: boolean
-  readonly cannotRunReason?: string
   strategies(): Promise<LabStrategy[]>
-  run(name: string, onProgress: (progress: RunProgress) => void): LabRun
+  /** The instruments with candles stored, the default first. */
+  datasets(): Promise<InstrumentId[]>
+  /** The instrument to offer for download when nothing is stored. */
+  readonly defaultInstrument: InstrumentId
+  /** The full result of a strategy's latest run. */
+  open(last: LastRun): Promise<VerdictPreview>
+  run(name: string, target: RunTarget, onProgress: (progress: RunProgress) => void): LabRun
+  /** Downloads an instrument's history into the store. */
+  download(instrument: InstrumentId, onProgress: (progress: DownloadProgress) => void): LabJob<void>
 }
 
 const ACRONYMS = new Set(['sma', 'ema', 'rsi', 'atr', 'macd', 'vwap'])
@@ -124,23 +164,12 @@ export function readableName(id: string): string {
     .join(' ')
 }
 
-/** The real engine: its strategy list, with no results until the engine runs test plans (#32). */
-export const engineLabSource: LabSource = {
-  canRun: false,
-  cannotRunReason: 'The engine cannot run test plans yet.',
-  async strategies() {
-    const list = await api.strategies()
-    // shortcut: the engine reports no kind or past verdicts yet; read them from it with #32.
-    return list.map((s) => ({ name: s.name, label: readableName(s.name), kind: null, description: s.description, last: null }))
-  },
-  run() {
-    return { result: Promise.reject(new Error('The engine cannot run test plans yet.')), cancel() {} }
-  },
-}
-
 /** The engine, or the fixtures in app/mock/ when the app was started with TD_MOCK=1. */
 export async function chooseLabSource(): Promise<LabSource> {
-  if (!window.td.mock) return engineLabSource
+  if (!window.td.mock) {
+    const { engineLabSource } = await import('./engine-source')
+    return engineLabSource
+  }
   const { mockLabSource } = await import('../../../../mock/lab')
   return mockLabSource
 }
