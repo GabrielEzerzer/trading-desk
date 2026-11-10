@@ -53,4 +53,19 @@ describe('spawnWatchdog', () => {
       if (watchdog) await ensureGone(watchdog)
     }
   })
+
+  it('exits as soon as the process it watches has gone, without waiting for the delay', async () => {
+    const target = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 200)'], { stdio: 'ignore', windowsHide: true })
+    let watchdog: ChildProcess | undefined
+    try {
+      expect(target.pid).toBeDefined()
+      const started = Date.now()
+      watchdog = spawnWatchdog(target.pid!, 20_000)
+      await within(once(watchdog, 'exit'), 10_000, 'the watchdog did not exit after its target')
+      expect(Date.now() - started).toBeLessThan(10_000)
+    } finally {
+      await ensureGone(target)
+      if (watchdog) await ensureGone(watchdog)
+    }
+  })
 })
