@@ -207,7 +207,10 @@ impl Jobs {
     /// Must be called from inside the Tokio runtime.
     ///
     /// A download of an instrument that already has an unfinished download job is refused with
-    /// 409 `conflict`: two jobs would fetch the same data twice and race on the same files.
+    /// 409 `conflict`: two jobs would fetch the same data twice. This is a courtesy within one
+    /// server process only; the store's per-file locks hold across processes, so a duplicate
+    /// download started by another server on the same data folder (the other app's sidecar) is
+    /// safe, just redundant.
     pub fn submit<F>(self: &Arc<Self>, request: JobRequest, work: F) -> Result<JobInfo, ApiError>
     where
         F: FnOnce(&JobCtx) -> Result<JobResult, JobError> + Send + 'static,
