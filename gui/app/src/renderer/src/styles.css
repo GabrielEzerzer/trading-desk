@@ -1,0 +1,851 @@
+/* The app's layout and components. Every colour, size and duration is a token from
+   @td/shared/theme.css. */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  overflow: hidden;
+  background: var(--ground);
+  color: var(--ink);
+  font-family: var(--font-sans);
+  font-size: var(--text-body);
+  line-height: var(--text-body-line);
+  letter-spacing: var(--text-body-tracking);
+  font-weight: var(--weight-regular);
+  /* Numbers are always tabular, so prices and P&L stay still as they change. */
+  font-variant-numeric: tabular-nums;
+  -webkit-font-smoothing: antialiased;
+  user-select: none;
+}
+
+button {
+  font: inherit;
+  color: inherit;
+  letter-spacing: inherit;
+  cursor: default;
+}
+
+:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+@keyframes fade-in {
+  from {
+    opacity: 0;
+  }
+}
+
+.fade-in {
+  animation: fade-in var(--duration-fade) var(--ease-standard) both;
+}
+
+/* Window: the ground, the title strip on it, and the sheet with the ground showing around it. */
+
+.app {
+  display: grid;
+  grid-template-rows: var(--titlebar-height) minmax(0, 1fr);
+  height: 100%;
+  padding: 0 var(--ground-strip) var(--ground-strip);
+}
+
+/* No native title bar: this strip is the drag region, and stops short of the window controls
+   that titleBarOverlay draws on the right. */
+.titlebar {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  max-width: calc(env(titlebar-area-width, 100%) - var(--ground-strip));
+  -webkit-app-region: drag;
+}
+
+.sheet {
+  position: relative;
+  min-height: 0;
+  overflow: hidden;
+  background: var(--sheet);
+  border-radius: var(--radius-sheet);
+  box-shadow: var(--shadow-sheet);
+}
+
+.sheet-content {
+  height: 100%;
+  animation: fade-in var(--duration-fade) var(--ease-standard) both;
+}
+
+.sheet-content[hidden] {
+  display: none;
+}
+
+/* Section toggle: a white floating pill; the thumb springs between the two halves. */
+
+.toggle {
+  position: relative;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  height: var(--control-small);
+  padding: 3px;
+  background: var(--sheet);
+  border-radius: var(--radius-pill);
+  box-shadow: var(--shadow-float);
+  -webkit-app-region: no-drag;
+}
+
+.toggle-thumb {
+  position: absolute;
+  top: 3px;
+  bottom: 3px;
+  left: 3px;
+  width: calc((100% - 6px) / 2);
+  background: var(--fill);
+  border-radius: var(--radius-pill);
+  transition: transform var(--duration-thumb) var(--ease-spring);
+}
+
+.toggle[data-index='1'] .toggle-thumb {
+  transform: translateX(100%);
+}
+
+.toggle button {
+  position: relative;
+  padding: 0 var(--space-4);
+  border: 0;
+  border-radius: var(--radius-pill);
+  background: none;
+  color: var(--grey-1);
+  font-weight: var(--weight-medium);
+  white-space: nowrap;
+  transition: color var(--duration-hover) var(--ease-standard);
+}
+
+.toggle button:hover,
+.toggle button[aria-checked='true'] {
+  color: var(--ink);
+}
+
+.toggle button:active {
+  opacity: var(--press-opacity);
+}
+
+/* Engine dot: only while starting (accent: work in progress) or failed (ink). */
+
+.engine-dot {
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-pill);
+  background: none;
+  -webkit-app-region: no-drag;
+}
+
+.engine-dot span {
+  width: 8px;
+  height: 8px;
+  border-radius: var(--radius-pill);
+  background: var(--accent);
+}
+
+.engine-dot[data-state-engine='failed'] span {
+  background: var(--ink);
+}
+
+/* Temporary layers: frosted. */
+
+.tooltip,
+.menu {
+  background: var(--menu-surface);
+  backdrop-filter: blur(var(--menu-blur));
+  box-shadow:
+    0 0 0 1px var(--hairline),
+    var(--shadow-float);
+}
+
+.tooltip {
+  max-width: 320px;
+  padding: var(--space-1) var(--space-3);
+  border-radius: var(--radius-item);
+  font-size: var(--text-label);
+  line-height: var(--text-label-line);
+  padding-block: 6px;
+  animation: fade-in var(--duration-popover) var(--ease-standard);
+}
+
+@keyframes pop-in {
+  from {
+    opacity: 0;
+    transform: scale(var(--scale-popover-from));
+  }
+}
+
+@keyframes pop-out {
+  to {
+    opacity: 0;
+    transform: scale(var(--scale-popover-from));
+  }
+}
+
+.menu {
+  min-width: 248px;
+  padding: 6px;
+  border-radius: var(--radius-menu);
+  transform-origin: var(--radix-dropdown-menu-content-transform-origin);
+  animation: pop-in var(--duration-popover) var(--ease-standard);
+}
+
+.menu[data-state='closed'] {
+  animation: pop-out var(--duration-popover) var(--ease-standard);
+}
+
+.menu-item {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  min-height: 40px;
+  padding: 0 var(--space-3) 0 36px;
+  border-radius: var(--radius-item);
+  outline: none;
+  transition: background-color var(--duration-hover) var(--ease-standard);
+}
+
+.menu-item[data-highlighted] {
+  background: var(--fill-hover);
+}
+
+.menu-item[data-disabled] {
+  color: var(--grey-1);
+}
+
+/* The selected option is the accent's job. */
+.menu-check {
+  position: absolute;
+  left: 10px;
+  display: flex;
+  color: var(--accent);
+}
+
+.menu-item[data-state='checked'] .menu-label {
+  font-weight: var(--weight-medium);
+}
+
+.menu-hint {
+  margin-left: auto;
+  color: var(--grey-1);
+  font-size: var(--text-label);
+}
+
+.menu-stack {
+  display: flex;
+  flex-direction: column;
+  padding: var(--space-2) 0;
+  line-height: 18px;
+}
+
+.menu-stack .menu-hint {
+  margin-left: 0;
+}
+
+.menu-separator {
+  height: 1px;
+  margin: 6px var(--space-1);
+  background: var(--hairline);
+}
+
+/* The Lab: a centred reading column that scrolls, with the composer floating over its foot. */
+
+.lab {
+  /* From the sheet's foot to the composer's top edge (the composer is the control plus 6px padding
+     on each side), and the fade above it where content dissolves before reaching the composer. */
+  --composer-clear: calc(var(--space-5) + var(--control) + 12px);
+  --composer-fade: var(--space-7);
+  position: relative;
+  height: 100%;
+}
+
+.lab-scroll {
+  height: 100%;
+  overflow-y: auto;
+  scrollbar-gutter: stable both-edges;
+}
+
+.lab-scroll:focus-visible {
+  box-shadow: inset 0 0 0 2px var(--accent);
+}
+
+.lab-scroll::-webkit-scrollbar {
+  width: 12px;
+}
+
+.lab-scroll::-webkit-scrollbar-thumb {
+  border: 4px solid var(--sheet);
+  border-radius: var(--radius-pill);
+  background: var(--fill-hover);
+}
+
+.column {
+  max-width: calc(var(--column) + 2 * var(--space-5));
+  margin: 0 auto;
+  /* The foot lets the last content scroll fully above the composer and its fade. */
+  padding: var(--space-8) var(--space-5) calc(var(--composer-clear) + var(--composer-fade) + var(--space-5));
+}
+
+.eyebrow {
+  margin: 0 0 var(--space-2);
+  color: var(--grey-1);
+  font-size: var(--text-body);
+  font-weight: var(--weight-regular);
+}
+
+/* States: engine, loading, failed, never run. They sit where the verdict goes. */
+
+.state-title {
+  margin: 0 0 var(--space-2);
+  font-size: var(--text-step);
+  line-height: var(--text-step-line);
+  letter-spacing: var(--text-step-tracking);
+  font-weight: var(--weight-medium);
+}
+
+.state-text {
+  max-width: 56ch;
+  margin: 0 0 var(--space-4);
+  color: var(--grey-1);
+}
+
+.state-quiet {
+  margin: 0;
+  color: var(--grey-1);
+}
+
+.state .verdict {
+  margin-bottom: var(--space-4);
+}
+
+.state .verdict-line {
+  margin-bottom: var(--space-4);
+}
+
+.button-float {
+  height: var(--control);
+  margin-top: var(--space-2);
+  padding: 0 var(--space-5);
+  border: 0;
+  border-radius: var(--radius-pill);
+  background: var(--sheet);
+  font-weight: var(--weight-medium);
+  box-shadow:
+    0 0 0 1px var(--hairline),
+    var(--shadow-float);
+  transition: background-color var(--duration-hover) var(--ease-standard);
+}
+
+.button-float:hover {
+  background: var(--fill);
+}
+
+.button-float:active,
+.button-float[aria-disabled='true'] {
+  opacity: var(--press-opacity);
+}
+
+/* The running cue: a slow shimmer across the status text, only while work runs. */
+
+.shimmer {
+  background: linear-gradient(90deg, var(--ink) 35%, var(--grey-2) 50%, var(--ink) 65%) 0 0 / 250% 100%;
+  background-clip: text;
+  color: transparent;
+  animation: shimmer var(--duration-shimmer) linear infinite;
+}
+
+@keyframes shimmer {
+  from {
+    background-position: 100% 0;
+  }
+  to {
+    background-position: 0% 0;
+  }
+}
+
+.run-status {
+  margin: 0 0 var(--space-5);
+  font-size: var(--text-step);
+  line-height: var(--text-step-line);
+  letter-spacing: var(--text-step-tracking);
+  font-weight: var(--weight-medium);
+}
+
+/* A running test's progress is the accent's job. The fill scales, so it never causes layout. */
+.progress {
+  height: 4px;
+  overflow: hidden;
+  border-radius: var(--radius-pill);
+  background: var(--fill);
+}
+
+.progress-fill {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+  transform: scaleX(var(--progress, 0));
+  transform-origin: left;
+  transition: transform var(--duration-progress) var(--ease-standard);
+}
+
+/* Strategy list: the empty state, names with their kind and last verdict, no boxes. */
+
+.strategy-list {
+  margin: var(--space-3) calc(-1 * var(--space-4)) 0;
+  padding: 0;
+  list-style: none;
+}
+
+.strategy-row {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-3);
+  width: 100%;
+  padding: var(--space-3) var(--space-4);
+  border: 0;
+  border-radius: var(--radius-row);
+  background: none;
+  text-align: left;
+  transition: background-color var(--duration-hover) var(--ease-standard);
+}
+
+.strategy-row:hover {
+  background: var(--fill-hover);
+}
+
+.strategy-row:active {
+  opacity: var(--press-opacity);
+}
+
+.strategy-name {
+  font-size: var(--text-step);
+  line-height: var(--text-step-line);
+  letter-spacing: var(--text-step-tracking);
+}
+
+.strategy-meta {
+  color: var(--grey-1);
+}
+
+/* Composer. */
+
+.composer-dock {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  display: flex;
+  justify-content: center;
+  padding: 0 var(--space-5) var(--space-5);
+  pointer-events: none;
+}
+
+/* Content dissolves into the sheet just above the composer instead of running under it: solid
+   sheet up to the composer's top edge, then a fade above it. */
+.composer-dock::before {
+  content: '';
+  position: absolute;
+  inset: auto 0 0 0;
+  height: calc(var(--composer-clear) + var(--composer-fade));
+  background: linear-gradient(to top, var(--sheet) var(--composer-clear), transparent);
+}
+
+.composer {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  width: 100%;
+  max-width: var(--column);
+  padding: 6px;
+  border-radius: var(--radius-pill);
+  background: var(--sheet);
+  box-shadow:
+    0 0 0 1px var(--hairline),
+    var(--shadow-float);
+  pointer-events: auto;
+}
+
+.composer-spacer {
+  flex: 1;
+}
+
+.pill {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 320px;
+  height: var(--control);
+  padding: 0 var(--space-3) 0 18px;
+  border: 0;
+  border-radius: var(--radius-pill);
+  background: var(--fill);
+  font-weight: var(--weight-medium);
+  transition: background-color var(--duration-hover) var(--ease-standard);
+}
+
+.pill-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pill svg {
+  flex: none;
+  color: var(--grey-1);
+}
+
+.pill:hover,
+.pill[data-state='open'] {
+  background: var(--fill-hover);
+}
+
+.pill[data-disabled] {
+  color: var(--grey-1);
+}
+
+.icon-button {
+  display: grid;
+  place-items: center;
+  width: var(--control);
+  height: var(--control);
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-pill);
+  background: none;
+  color: var(--grey-1);
+  transition:
+    background-color var(--duration-hover) var(--ease-standard),
+    color var(--duration-hover) var(--ease-standard);
+}
+
+.icon-button:hover,
+.icon-button[data-state='open'] {
+  background: var(--fill-hover);
+  color: var(--ink);
+}
+
+/* Run: the one dark shape in the window. It turns quiet when it cannot run. */
+.run {
+  display: grid;
+  place-items: center;
+  width: var(--control);
+  height: var(--control);
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-pill);
+  background: var(--ink);
+  color: var(--on-ink);
+  transition: background-color var(--duration-hover) var(--ease-standard);
+}
+
+.run:active {
+  opacity: var(--press-opacity);
+}
+
+.run[aria-disabled='true'] {
+  background: var(--fill);
+  color: var(--grey-1);
+}
+
+.pill:active,
+.icon-button:active {
+  opacity: var(--press-opacity);
+}
+
+/* Round controls answer clicks across their whole square, not only inside the circle. */
+.icon-button,
+.run,
+.engine-dot {
+  position: relative;
+}
+
+.icon-button::before,
+.run::before,
+.engine-dot::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+}
+
+/* Result. */
+
+.verdict-line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-3);
+  margin-bottom: var(--space-6);
+}
+
+.verdict {
+  margin: 0;
+  font-size: var(--text-verdict);
+  line-height: var(--text-verdict-line);
+  letter-spacing: var(--text-verdict-tracking);
+  font-weight: var(--weight-medium);
+}
+
+/* "Trade" in the gain colour; "No trade" stays in the ink, never red. */
+.verdict[data-decision='trade'] {
+  color: var(--gain);
+}
+
+.verdict[data-decision='none'] {
+  color: var(--grey-1);
+}
+
+.verdict-kind {
+  color: var(--grey-1);
+}
+
+.criteria {
+  margin: 0 0 var(--space-6);
+  padding: 0;
+  list-style: none;
+  border-bottom: 1px solid var(--hairline);
+}
+
+.criterion {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 96px 132px 64px;
+  gap: var(--space-4);
+  align-items: center;
+  min-height: 44px;
+  border-top: 1px solid var(--hairline);
+}
+
+.criterion-value {
+  text-align: right;
+}
+
+.criterion-limit {
+  color: var(--grey-1);
+}
+
+.criterion-result {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--space-1);
+  color: var(--grey-1);
+}
+
+/* A failed criterion carries the weight; a pass stays quiet. */
+.criterion[data-pass='false'] .criterion-result {
+  color: var(--ink);
+  font-weight: var(--weight-medium);
+}
+
+.key-numbers {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: var(--space-5);
+  margin: 0 0 var(--space-7);
+}
+
+.key-number dt {
+  color: var(--grey-1);
+  font-size: var(--text-label);
+  line-height: var(--text-label-line);
+}
+
+.key-number dd {
+  margin: var(--space-1) 0 0;
+  font-size: var(--text-step);
+  line-height: var(--text-step-line);
+  letter-spacing: var(--text-step-tracking);
+  font-weight: var(--weight-medium);
+}
+
+[data-tone='gain'] {
+  color: var(--gain);
+}
+
+[data-tone='loss'] {
+  color: var(--loss);
+}
+
+.evidence {
+  margin-bottom: var(--space-7);
+}
+
+.section-label {
+  margin: 0 0 var(--space-3);
+  font-size: var(--text-body);
+  line-height: var(--text-body-line);
+  font-weight: var(--weight-medium);
+}
+
+.section-count {
+  margin-left: var(--space-1);
+  color: var(--grey-1);
+  font-weight: var(--weight-regular);
+}
+
+.chart {
+  margin: 0;
+}
+
+.chart-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-5);
+  margin-bottom: var(--space-3);
+  color: var(--grey-1);
+}
+
+.legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.legend-value {
+  color: var(--ink);
+}
+
+.legend-swatch {
+  width: 16px;
+  height: 2px;
+  border-radius: var(--radius-pill);
+  background: var(--ink);
+}
+
+.legend-swatch[data-series='benchmark'] {
+  background: var(--grey-2);
+}
+
+.chart-plot {
+  display: block;
+  width: 100%;
+  height: 200px;
+  overflow: visible;
+}
+
+.chart-line {
+  fill: none;
+  stroke: var(--ink);
+  stroke-width: 1.75;
+  stroke-linejoin: round;
+  vector-effect: non-scaling-stroke;
+}
+
+.chart-line[data-series='benchmark'] {
+  stroke: var(--grey-2);
+  stroke-width: 1.25;
+}
+
+.chart-baseline {
+  stroke: var(--grey-2);
+  stroke-width: 1;
+  stroke-dasharray: 2 4;
+  vector-effect: non-scaling-stroke;
+}
+
+.chart-axis {
+  display: flex;
+  justify-content: space-between;
+  margin-top: var(--space-2);
+  color: var(--grey-1);
+  font-size: var(--text-label);
+  line-height: var(--text-label-line);
+}
+
+.table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.table th,
+.table td {
+  height: 36px;
+  padding: 0 var(--space-3) 0 0;
+  border-bottom: 1px solid var(--hairline);
+  text-align: left;
+  font-weight: var(--weight-regular);
+  white-space: nowrap;
+}
+
+.table th:last-child,
+.table td:last-child {
+  padding-right: 0;
+}
+
+.table thead th {
+  position: sticky;
+  top: 0;
+  height: 32px;
+  background: var(--sheet);
+  color: var(--grey-1);
+  font-size: var(--text-label);
+}
+
+.table .num {
+  text-align: right;
+}
+
+.table .muted {
+  color: var(--grey-1);
+}
+
+.footnote {
+  margin: 0;
+  color: var(--grey-1);
+  font-size: var(--text-label);
+}
+
+/* Trading placeholder. */
+
+.placeholder {
+  display: grid;
+  place-items: center;
+  height: 100%;
+  color: var(--grey-1);
+}
+
+.placeholder p {
+  margin: 0;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+
+  .shimmer {
+    background: none;
+    color: var(--ink);
+    animation: none;
+  }
+}
