@@ -72,8 +72,9 @@ const ASK_COLUMNS: [&str; 4] = ["ask_open", "ask_high", "ask_low", "ask_close"];
 const ASK_READ_COLUMNS: [&str; 5] = ["open_time", "ask_open", "ask_high", "ask_low", "ask_close"];
 const FUNDING_COLUMNS: [&str; 2] = ["time", "rate"];
 /// The most decoded candles one [`Store`] keeps in memory, in bytes: five years of one instrument's
-/// 1-minute candles is about 147 MB.
-const MONTH_CACHE_BYTES: usize = 256 << 20;
+/// 1-minute candles is about 147 MB, and BTCUSDT since 2017 about 272 MB. A range larger than
+/// this is decoded again on every pass over it, since each month read evicts one still to come.
+const MONTH_CACHE_BYTES: usize = 512 << 20;
 
 /// A run of missing minutes: open times `from`, `from + 1m`, ... up to but not including `to`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -397,6 +398,9 @@ impl Store {
             let lock = file_lock(&path);
             let _held = hold(&lock);
             let _locked = lock_across_processes(&path)?;
+            // The rows merged into are decoded under the lock, never taken from memory: a stale
+            // entry here would be written back over another process's rows.
+            self.months.forget(&path);
             let mut merged: BTreeMap<Millis, T> = read(month)?
                 .into_iter()
                 .map(|r| (open_time(&r), r))
@@ -2137,12 +2141,110 @@ mod tests {
         // The other store's write changes the file's length, which this store sees.
         other.write_candles(&id, &all[2..]).expect("writes");
         assert_eq!(store.read_month(&id, jan).expect("reads"), all);
-        // A write that leaves the file the same length still drops this store's entry: the
-        // merge's read is served from the cache, and the read after the write decodes again.
+        // A merge decodes the file under its lock, and the read after the write decodes again.
         let before = decodes(&store);
         store.write_candles(&id, &all).expect("writes");
         assert_eq!(store.read_month(&id, jan).expect("reads"), all);
-        assert_eq!(decodes(&store), before + 1);
+        assert_eq!(decodes(&store), before + 2);
+    }
+
+    /// Rewrites nothing: sets the month file's modified time, so a rewrite of the same length
+    /// looks to the cache like the file it decoded.
+    fn set_modified(path: &Path, to: SystemTime) {
+        let file = File::options().write(true).open(path).expect("opens");
+        file.set_modified(to).expect("sets the time");
+    }
+
+    fn stamp_of(path: &Path) -> FileStamp {
+        file_stamp(&fs::metadata(path).expect("metadata")).expect("a stamp")
+    }
+
+    /// `rows` with other prices, which encode to a month file of the same length.
+    fn repriced(rows: &[Candle]) -> Vec<Candle> {
+        rows.iter()
+            .map(|c| Candle {
+                open: c.open + 1.0,
+                high: c.high + 1.0,
+                low: c.low + 1.0,
+                close: c.close + 1.0,
+                ..*c
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_write_drops_the_entry_even_when_the_file_looks_unchanged() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let store = Store::new(dir.path());
+        let id = spot_id();
+        let jan = Month::containing(JAN_2024);
+        let path = store.candle_path(&id, jan).expect("a path");
+        let first = minutes_of(jan, 3);
+        store.write_candles(&id, &first).expect("writes");
+        assert_eq!(store.read_month(&id, jan).expect("reads"), first);
+        let cached_stamp = stamp_of(&path);
+        let second = repriced(&first);
+        store.write_candles(&id, &second).expect("writes");
+        set_modified(&path, cached_stamp.1);
+        assert_eq!(
+            stamp_of(&path),
+            cached_stamp,
+            "the rewrite must look unchanged"
+        );
+        assert_eq!(store.read_month(&id, jan).expect("reads"), second);
+    }
+
+    #[test]
+    fn a_merge_reads_the_file_not_the_cache() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let store = Store::new(dir.path());
+        let other = Store::new(dir.path());
+        let id = spot_id();
+        let jan = Month::containing(JAN_2024);
+        let path = store.candle_path(&id, jan).expect("a path");
+        let all = minutes_of(jan, 4);
+        store.write_candles(&id, &all[..3]).expect("writes");
+        assert_eq!(store.read_month(&id, jan).expect("reads"), all[..3]);
+        let cached_stamp = stamp_of(&path);
+        // Another store rewrites the month so that this store's entry still looks current.
+        let theirs = repriced(&all[..3]);
+        other.write_candles(&id, &theirs).expect("writes");
+        set_modified(&path, cached_stamp.1);
+        assert_eq!(
+            stamp_of(&path),
+            cached_stamp,
+            "the rewrite must look unchanged"
+        );
+        // This store's merge keeps their rows.
+        store.write_candles(&id, &all[3..]).expect("writes");
+        let mut expected = theirs;
+        expected.push(all[3]);
+        assert_eq!(store.read_month(&id, jan).expect("reads"), expected);
+    }
+
+    #[test]
+    fn rows_decoded_before_a_write_are_not_cached_after_it() {
+        let cache = MonthCache::new(1 << 20);
+        let path = Path::new("2024-01.parquet");
+        let stamp = (1, SystemTime::UNIX_EPOCH);
+        let rows = Arc::new(vec![flat_candle(JAN_2024)]);
+        let generation = cache
+            .get(path, &CANDLE_COLUMNS)
+            .expect_err("nothing cached");
+        cache.insert(
+            path.to_path_buf(),
+            &CANDLE_COLUMNS,
+            stamp,
+            generation,
+            rows.clone(),
+        );
+        assert_eq!(hold(&cache.state).entries.len(), 1);
+        // A decode that started before a write finishes after it.
+        let generation = cache.get(path, &CANDLE_COLUMNS).expect_err("no such file");
+        cache.forget(path);
+        cache.insert(path.to_path_buf(), &CANDLE_COLUMNS, stamp, generation, rows);
+        let state = hold(&cache.state);
+        assert_eq!((state.entries.len(), state.bytes), (0, 0));
     }
 
     #[test]

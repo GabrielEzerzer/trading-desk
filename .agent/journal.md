@@ -200,3 +200,24 @@ Checksum `1bc2d4ff4b411ddc` in all nine runs: no result changed.
 - **Taught:** even with every core busy, parallel decoding still gained a third or more.
 
 Against the target (at most 2,436 ms, half of the quiet baseline 4,872.2 ms): load only adds time, so any run of rounds 2 and 3 at or under 2,436 ms meets it. Not yet seen under this load; more runs follow when the machine is quieter.
+
+## Finish line met, test scored (2026-11-11 14:38 to 14:41 UTC, `.agent/logs/final23.log`)
+
+The machine was quieter for a few minutes. Rounds 2 and 3 (`ed844b4` with the final bench), reps 5:
+
+| Split | Base `510af3d` | Rounds 2 and 3 | |
+|---|---|---|---|
+| dev | 4,872.2 (quiet baseline) | 2,075.9 / 2,175.7 / **2,060.0** | 42% of the baseline; the target was at most 2,436 |
+| test, interleaved | **4,956.5** / 5,161.6 | 2,457.3 / **1,887.7** | 38% of the base in the same minutes |
+
+- Checksums: dev `1bc2d4ff4b411ddc`, test `5ecd3911e0a8641c`, in every run, equal to the baseline's. No result changed.
+- The five-year Lab backtest on dev, best run: coverage 130, check 133, load 164, run 25, save 46, result 50, reopen 373 ms. It was 674, 656, 813, 23, 50, 65 and 897 ms.
+- Test sits beside dev (38% against 42%), so the gain is not fitted to the dev workloads.
+- **The hillclimb stops here:** the finish line is met after two kept rounds, none reverted. The engine rounds (shared sweep preparation, incremental indicators) are not started; they are what is open if more speed is wanted. What is left of a Lab backtest is now the reopen (one cold decode of the range in a later session) and the save and result reads.
+
+## PR 2 review
+
+- reviewer round 1 on `53a0d8d`: CHANGES REQUESTED, two shoulds and a nit, all three checked against the code and accepted.
+  1. A merge read the month through the cache. The entry is valid by length and modified time only, so a rewrite by another process that the stamp cannot tell apart would be merged from stale rows and written back over the other process's rows. Fixed: `merge_months` forgets the path under the cross-process lock before it reads, so a merge always decodes the file. A write decodes its month as it did before the cache existed.
+  2. No test failed without `forget` or without the generation guard. Added three: a same-length rewrite through the store with the modified time set back is read as the new rows; a merge after another store's same-looking rewrite keeps that store's rows; rows decoded before a `forget` are not cached after it.
+  3. The 256 MB cap is under BTCUSDT's full history (about 111 months, 272 MB), and a range over the cap gets no hits on a repeated pass. Raised to 512 MB and the limit is written beside the constant. The laptop has 31.7 GB. Listed for Gabriel as a memory-against-speed choice.
