@@ -7,12 +7,12 @@ mod common;
 use std::ops::ControlFlow;
 use std::sync::Mutex;
 
-use td_core::{Candle, Millis, Timeframe};
+use td_core::{Candle, FeeSchedule, Millis, Timeframe};
 use td_engine::{
     BacktestConfig, Direction, EngineError, MAX_RUNS, Metric, Objective, OosSpec, ParamAxis,
     ParamSpace, ParamValue, Params, RunKind, SavedRun, Split, SweepMode, SweepSpec, TesterError,
-    WalkForwardSpec, WindowMode, WindowSpec, config_fingerprint, list, load, out_of_sample, run,
-    save, sweep, walk_forward,
+    WalkForwardResult, WalkForwardSpec, WindowMode, WindowSpec, config_fingerprint, list, load,
+    out_of_sample, run, save, sweep, walk_forward,
 };
 
 const HOUR: Millis = 3_600_000;
@@ -422,9 +422,9 @@ fn out_of_sample_warms_up_on_the_in_sample_bars() {
     )
     .unwrap();
     assert_eq!(cold.orders[0].submitted_at, r.split_at + 4 * HOUR);
-    // A total-return objective is compared by CAGR, since the segments may differ in length.
-    let expected = o.metrics.cagr.unwrap() / best.metrics.cagr.unwrap();
-    assert_eq!(r.degradation, Some(expected));
+    // Both segments are too short for a CAGR, so there is no degradation; the CAGR ratio is
+    // checked on long segments in the next test.
+    assert_eq!(r.degradation, None);
 
     // A split at a time gives the same segments.
     let at = OosSpec {
@@ -1006,4 +1006,655 @@ fn checking_a_spec_without_data_finds_what_the_run_would_refuse_first() {
     assert_eq!(wf.check(), Ok(()));
     wf.sweep = warm;
     assert_eq!(wf.check(), walk_forward(&wf, &bars, &[], None).map(|_| ()));
+}
+
+#[test]
+fn a_parameter_set_that_never_trades_ranks_last_when_minimising_drawdown_by_default() {
+    // slow 1000 is longer than the 500 bars, so that set never trades and has no drawdown at
+    // all: ranked by drawdown alone it would come first.
+    let mut b = base(common::perp(), 500);
+    b.params = Params::new().with("fast", ParamValue::Int(6));
+    let mut s = spec(b, vec![values("slow", &ints(&[1000, 24, 12]))]);
+    s.objective = Objective {
+        metric: Metric::MaxDrawdown,
+        direction: Direction::Minimize,
+    };
+    // A spec that leaves min_trades out, as the apps may.
+    let mut json = serde_json::to_value(&s).unwrap();
+    json.as_object_mut().unwrap().remove("min_trades");
+    let s: SweepSpec = serde_json::from_value(json).unwrap();
+    assert_eq!(s.min_trades, 1);
+    let r = sweep(&s, &wavy_bars(500), &[], None).unwrap();
+    let last = r.rows.last().unwrap();
+    assert_eq!(int(&last.params, "slow"), 1000);
+    assert_eq!(last.metrics.unwrap().trades, 0);
+    assert_eq!(last.metrics.unwrap().max_drawdown, Some(0.0));
+    assert!(!last.qualified);
+    assert!(r.rows[..2].iter().all(|row| row.qualified));
+    assert_ne!(int(&r.best.as_ref().unwrap().config.params, "slow"), 1000);
+}
+
+#[test]
+fn an_objective_undefined_on_a_short_range_qualifies_no_run_and_ranks_in_grid_order() {
+    // 500 hourly bars are under 21 days: too few daily returns for a Sharpe ratio.
+    let mut s = wavy_spec();
+    s.objective = Objective {
+        metric: Metric::Sharpe,
+        direction: Direction::Maximize,
+    };
+    let r = sweep(&s, &wavy_bars(500), &[], None).unwrap();
+    assert!(
+        r.rows
+            .iter()
+            .all(|row| !row.qualified && row.metrics.unwrap().sharpe.is_none())
+    );
+    let order: Vec<u64> = r.rows.iter().map(|row| row.index).collect();
+    assert_eq!(order, (0..48).collect::<Vec<_>>());
+    assert!(r.best.is_none());
+}
+
+#[test]
+fn a_sharpe_objective_ranks_a_run_without_a_sharpe_ratio_after_every_run_with_one() {
+    // 60 days of hourly bars, enough daily returns; the set that never trades has a flat
+    // curve, so no Sharpe ratio, and ranks after the sets that do.
+    let n = 60 * 24;
+    let mut b = base(common::perp(), n);
+    b.params = Params::new().with("fast", ParamValue::Int(6));
+    let mut s = spec(b, vec![values("slow", &ints(&[5000, 24, 12]))]);
+    s.objective = Objective {
+        metric: Metric::Sharpe,
+        direction: Direction::Maximize,
+    };
+    s.min_trades = 0;
+    let r = sweep(&s, &wavy_bars(n), &[], None).unwrap();
+    assert!(r.rows[..2].iter().all(|row| row.qualified));
+    let last = r.rows.last().unwrap();
+    assert_eq!(int(&last.params, "slow"), 5000);
+    assert_eq!(last.metrics.unwrap().sharpe, None);
+    assert!(!last.qualified);
+}
+
+#[test]
+fn a_total_return_degradation_is_undefined_when_a_segment_is_too_short_for_a_cagr() {
+    // 300 hourly bars split in half: both segments are under 90 days, so neither has a CAGR.
+    let r = out_of_sample(
+        &OosSpec {
+            sweep: rising_spec(),
+            split: Split::Fraction(0.5),
+        },
+        &rising_bars(300),
+        &[],
+        None,
+    )
+    .unwrap();
+    assert_eq!(r.out_of_sample.metrics.cagr, None);
+    assert!(r.out_of_sample.metrics.total_return.is_some());
+    assert_eq!(r.degradation, None);
+}
+
+/// Funding for the walk-forward benchmark test: one event before the first test bar (ignored),
+/// one at the open of bar 60, one inside bar 100 and one at the end of the range (ignored).
+fn wf_benchmark_funding() -> Vec<(Millis, f64)> {
+    vec![
+        (T0 + 300 * HOUR, 0.0003),
+        (T0 + 60 * HOUR, 0.0001),
+        (T0 + 100 * HOUR + 30 * 60_000, -0.00005),
+        (T0 + 10 * HOUR, 0.0002),
+    ]
+}
+
+#[test]
+fn the_walk_forward_benchmark_buys_and_holds_in_each_test_window_and_compounds_them() {
+    let bars = rising_bars(300);
+    let funding = wf_benchmark_funding();
+    let r = walk_forward(&rising_wf_spec(), &bars, &funding, None).unwrap();
+    // Five contiguous test windows of 50 bars, from bar 50 to bar 299.
+    assert_eq!(r.windows.len(), 5);
+    assert_eq!(r.windows[0].test_from, T0 + 50 * HOUR);
+    let b = r.benchmark.as_ref().unwrap();
+    // Each window buys again at its first bar's open, with 5 bps of slippage rounded up to the
+    // tick, and all its cash after the 0.2% taker fee rounded down to the lot. Bar 50 opens at
+    // 124.5: 124.56225 rounds up to 124.57, and 10 000 / (124.57 * 1.002) = 80.1159... rounds
+    // down to 80.115. Bar 100 opens at 149.5: 149.58 and 66.7205... -> 66.72. Bar 150: 174.59 and
+    // 57.1627... -> 57.162. Bar 200: 199.6 and 50.0002... -> 50. Bar 250: 224.62 and 44.4308...
+    // -> 44.43. Funding at bar 60's open is paid in the first window at that open (129.5), and
+    // the event inside bar 100 in the second window at bar 100's close (150), on that window's
+    // quantity. The events before bar 50 and at the end of the range are ignored.
+    let windows: [(i64, f64, f64, f64); 5] = [
+        (50, 124.57, 80.115, 80.115 * 129.5 * 0.0001),
+        (100, 149.58, 66.72, 66.72 * 150.0 * -0.00005),
+        (150, 174.59, 57.162, 0.0),
+        (200, 199.6, 50.0, 0.0),
+        (250, 224.62, 44.43, 0.0),
+    ];
+    // The benchmark reports the first window's purchase.
+    assert_eq!(b.entry_price, 124.57);
+    assert!((b.qty - 80.115).abs() < 1e-9, "{}", b.qty);
+    // It has the stitched curve's times.
+    assert_eq!(
+        b.equity.iter().map(|p| p.time).collect::<Vec<_>>(),
+        r.equity.iter().map(|p| p.time).collect::<Vec<_>>()
+    );
+    assert_eq!(b.equity.len(), 250);
+    // Each window is held to the close of its last bar, 100 + 0.5 * (first + 49), less its entry
+    // fee and funding, and its return compounds on the windows before it, as the test runs do.
+    let mut level = 1.0;
+    let mut paid = 0.0;
+    for (first, price, qty, funding) in windows {
+        let close = 100.0 + 0.5 * (first + 49) as f64;
+        let end = 10_000.0 - price * qty * 0.002 - funding + qty * (close - price);
+        paid += funding * level;
+        level *= end / 10_000.0;
+        let last = T0 + (first + 49) * HOUR;
+        let got = b.equity.iter().find(|p| p.time == last).unwrap().equity;
+        assert!(
+            (got - 10_000.0 * level).abs() < 1e-8,
+            "{first}: {got} vs {}",
+            10_000.0 * level
+        );
+    }
+    assert!((b.metrics.funding_paid - paid).abs() < 1e-12);
+    assert!((b.metrics.total_return.unwrap() - (level - 1.0)).abs() < 1e-12);
+    assert_eq!(
+        b.excess_return,
+        Some(r.metrics.total_return.unwrap() - b.metrics.total_return.unwrap())
+    );
+    assert!(b.correlation.is_some());
+}
+
+/// The test windows of [`gap_wf_spec`]: 40 bars every 50.
+const GAP_TESTS: [std::ops::Range<i64>; 5] = [60..100, 110..150, 160..200, 210..250, 260..300];
+
+/// Hourly bars, each opening at the previous close, that rise by 2 a bar outside the test windows
+/// of [`gap_wf_spec`]. Inside each, the first and last bars are flat and the 38 others rise by
+/// 0.25, so a strategy that enters on the first bar's close and closes out on the last bar's open
+/// holds every price move of the window. Every price is exact in binary and on the 0.01 tick.
+fn gap_bars() -> Vec<Candle> {
+    let mut open = 100.0;
+    (0..300)
+        .map(|i| {
+            let close = match GAP_TESTS.iter().find(|t| t.contains(&i)) {
+                Some(t) if i == t.start || i == t.end - 1 => open,
+                Some(_) => open + 0.25,
+                None => open + 2.0,
+            };
+            let c = candle(i, open, close);
+            open = close;
+            c
+        })
+        .collect()
+}
+
+/// [`rising_wf_spec`] with tests of 40 bars every 50, all of the equity in, and no fees or
+/// slippage.
+fn gap_wf_spec() -> WalkForwardSpec {
+    let mut s = rising_wf_spec();
+    s.windows.test_bars = 40;
+    let b = &mut s.sweep.base;
+    b.params = b
+        .params
+        .clone()
+        .with("equity_fraction", ParamValue::Float(1.0));
+    b.slippage_bps = 0.0;
+    b.fee_override = Some(FeeSchedule {
+        maker: 0.0,
+        taker: 0.0,
+    });
+    s
+}
+
+/// Pearson correlation, written out.
+fn pearson(a: &[f64], b: &[f64]) -> f64 {
+    let n = a.len() as f64;
+    let (ma, mb) = (a.iter().sum::<f64>() / n, b.iter().sum::<f64>() / n);
+    let cov: f64 = a.iter().zip(b).map(|(x, y)| (x - ma) * (y - mb)).sum();
+    let va: f64 = a.iter().map(|x| (x - ma).powi(2)).sum();
+    let vb: f64 = b.iter().map(|y| (y - mb).powi(2)).sum();
+    cov / (va * vb).sqrt()
+}
+
+#[test]
+fn the_walk_forward_benchmark_is_out_of_the_market_between_test_windows_like_the_strategy() {
+    let bars = gap_bars();
+    let r = walk_forward(&gap_wf_spec(), &bars, &[], None).unwrap();
+    let starts: Vec<Millis> = r.windows.iter().map(|w| w.test_from).collect();
+    assert_eq!(starts, GAP_TESTS.map(|t| T0 + t.start * HOUR));
+    // In every window the strategy buys on the second bar's open, at the first bar's flat price,
+    // and sells on the last bar's open, at the last bar's flat price: it holds every move.
+    for (w, t) in r.windows.iter().zip(GAP_TESTS) {
+        let fills = &w.out_of_sample.fills;
+        assert_eq!(fills.len(), 2, "{fills:?}");
+        let (first, last) = (t.start as usize, t.end as usize - 1);
+        assert_eq!(fills[0].time, T0 + (t.start + 1) * HOUR);
+        assert_eq!(fills[0].price, bars[first].close);
+        assert_eq!(fills[1].time, bars[last].open_time);
+        assert_eq!(fills[1].price, bars[last].close);
+    }
+    let b = r.benchmark.as_ref().unwrap();
+    // Out of the market between test windows, as the stitched curve is: the same 200 times.
+    assert_eq!(
+        b.equity.iter().map(|p| p.time).collect::<Vec<_>>(),
+        r.equity.iter().map(|p| p.time).collect::<Vec<_>>()
+    );
+
+    // Each window opens at 220 + 29.5 k (38 rises of 0.25 in a window, then 10 of 2 before the
+    // next), and buy and hold spends the starting cash on as many 0.001 lots as it buys:
+    // 10 000 / 220 = 45.4545... -> 45.454, / 249.5 = 40.0801... -> 40.08, / 279 = 35.8422... ->
+    // 35.842, / 308.5 = 32.4149... -> 32.414, / 338 = 29.5857... -> 29.585.
+    let held = [45.454, 40.08, 35.842, 32.414, 29.585];
+    assert_eq!(b.entry_price, 220.0);
+    assert_eq!(b.qty, held[0]);
+    // The strategy's quantity in each window, from its entry fill.
+    let traded: Vec<f64> = r
+        .windows
+        .iter()
+        .map(|w| w.out_of_sample.fills[0].qty)
+        .collect();
+    // Holding `q` from 10 000 through a window makes q * 9.5, and the windows compound: the
+    // benchmark's total return, with nothing for the gaps between windows, which rise by 20 each.
+    let level = |qs: &[f64]| qs.iter().map(|q| 1.0 + q * 9.5 / 10_000.0).product::<f64>();
+    let total = b.metrics.total_return.unwrap();
+    assert!((total - (level(&held) - 1.0)).abs() < 1e-12, "{total}");
+    assert!((r.metrics.total_return.unwrap() - (level(&traded) - 1.0)).abs() < 1e-12);
+    assert_eq!(
+        b.excess_return,
+        Some(r.metrics.total_return.unwrap() - total)
+    );
+
+    // The correlation pairs each stitched bar's return with the benchmark's over the same bar.
+    // Holding `q` through a window from 10 000, the return of its j-th bar is nothing on the flat
+    // first and last bars, and q * 0.25 over the equity before it, 10 000 + q * 0.25 * (j - 1),
+    // on the others. A window's first return is measured from the end of the window before (or
+    // the starting cash), at which the stitched curves stand at 10 000 times their factor.
+    let returns = |qs: &[f64]| {
+        qs.iter()
+            .flat_map(|&q| {
+                (0..40).map(move |j| match j {
+                    0 | 39 => 0.0,
+                    _ => q * 0.25 / (10_000.0 + q * 0.25 * (j - 1) as f64),
+                })
+            })
+            .collect::<Vec<f64>>()
+    };
+    let expected = pearson(&returns(&traded), &returns(&held));
+    let got = b.correlation.unwrap();
+    assert!((got - expected).abs() < 1e-10, "{got} vs {expected}");
+    // The two hold the same bars in sizes within 0.5% of each other.
+    assert!(got > 0.9999, "{got}");
+}
+
+/// [`rising_wf_spec`] with `train` bars of training, one test window of 50 bars and `metric` as
+/// the objective, over exactly the bars it needs, so the train window starts at 00:00 UTC.
+fn train_floor_spec(metric: Metric, train: usize) -> (WalkForwardSpec, Vec<Candle>) {
+    let mut s = rising_wf_spec();
+    s.sweep.objective.metric = metric;
+    s.windows.train_bars = train;
+    let n = train as i64 + 50;
+    s.sweep.base.to = T0 + n * HOUR;
+    (s, rising_bars(n))
+}
+
+/// Runs `s` and returns its refusal's message, checking that nothing ran before it.
+fn refused_before_running(s: &WalkForwardSpec, bars: &[Candle]) -> String {
+    let calls = Mutex::new(0usize);
+    let progress = |_: usize, _: usize| {
+        *calls.lock().unwrap() += 1;
+        ControlFlow::Continue(())
+    };
+    let err = walk_forward(s, bars, &[], Some(&progress)).unwrap_err();
+    assert_eq!(calls.into_inner().unwrap(), 0, "ran before refusing");
+    match err {
+        TesterError::InvalidSpec(m) => m,
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn checking_a_walk_forward_refuses_train_windows_that_cannot_be_long_enough_for_its_objective() {
+    let check = |metric, train, mode| {
+        let (mut s, bars) = train_floor_spec(metric, train);
+        s.windows.mode = mode;
+        let checked = s.check();
+        // The run refuses the same, before anything runs.
+        if let Err(TesterError::InvalidSpec(m)) = &checked {
+            assert_eq!(&refused_before_running(&s, &bars), m);
+        }
+        checked
+    };
+    let refusal = |m: &str| Err(TesterError::InvalidSpec(m.into()));
+    use WindowMode::{Anchored, Rolling};
+    // 50 hourly bars starting at 23:00 run to 01:00 three days on: four UTC days end in them.
+    assert_eq!(
+        check(Metric::Sharpe, 50, Rolling),
+        refusal(
+            "a Sharpe objective needs at least 30 daily returns in every train window, and a \
+             train window of 50 1h bars has at most 4"
+        )
+    );
+    // 673 hourly bars starting at 23:00 end at 00:00 29 days on: 29 daily returns. One more bar
+    // reaches into a 30th day.
+    assert_eq!(
+        check(Metric::Sortino, 673, Rolling),
+        refusal(
+            "a Sortino objective needs at least 30 daily returns in every train window, and a \
+             train window of 673 1h bars has at most 29"
+        )
+    );
+    assert_eq!(check(Metric::Sortino, 674, Rolling).map(|_| ()), Ok(()));
+    // Anchored, the first train window also takes the bars left over before the first test,
+    // fewer than the step of 50: at most 99 bars.
+    assert_eq!(
+        check(Metric::Sharpe, 50, Anchored),
+        refusal(
+            "a Sharpe objective needs at least 30 daily returns in every train window, and the \
+             first train window, at most 99 1h bars, has at most 6"
+        )
+    );
+    // An hour short of 90 days, and 90 days.
+    assert_eq!(
+        check(Metric::Cagr, 2_159, Rolling),
+        refusal(
+            "a CAGR objective needs train windows of at least 90 days, and a train window of 2159 \
+             1h bars spans 89 days 23 hours"
+        )
+    );
+    assert_eq!(check(Metric::Cagr, 2_160, Rolling), Ok(()));
+    // 2112 bars are 88 days, but an anchored first train window may have 49 more.
+    assert_eq!(check(Metric::Cagr, 2_112, Anchored), Ok(()));
+    assert!(matches!(
+        check(Metric::Calmar, 50, Rolling),
+        Err(TesterError::InvalidSpec(m)) if m.starts_with("a Calmar objective needs")
+    ));
+    // Objectives without a floor are not checked.
+    assert_eq!(check(Metric::TotalReturn, 50, Rolling), Ok(()));
+
+    // Daily bars start at 00:00: 29 of them hold 29 daily returns.
+    let (mut s, _) = train_floor_spec(Metric::Sharpe, 29);
+    s.sweep.base.timeframe = Timeframe::D1;
+    assert_eq!(
+        s.check(),
+        refusal(
+            "a Sharpe objective needs at least 30 daily returns in every train window, and a \
+             train window of 29 1d bars has at most 29"
+        )
+    );
+    s.windows.train_bars = 30;
+    assert_eq!(s.check(), Ok(()));
+
+    // Five weekly bars span 35 days, but 30 of those daily returns are zeros carried forward: the
+    // ratio would come from five weekly moves, so the window also needs 30 bars.
+    let (mut s, _) = train_floor_spec(Metric::Sharpe, 5);
+    s.sweep.base.timeframe = Timeframe::W1;
+    assert_eq!(
+        s.check(),
+        refusal(
+            "a Sharpe objective needs at least 30 bars as well as 30 daily returns in every train \
+             window, and a train window of 5 1w bars is shorter"
+        )
+    );
+    s.windows.train_bars = 30;
+    assert_eq!(s.check(), Ok(()));
+}
+
+const WEEK: Millis = 7 * 24 * HOUR;
+
+/// [`rising_bars`] one a week from `T0`, a Monday.
+fn weekly_bars(n: i64) -> Vec<Candle> {
+    rising_bars(n)
+        .into_iter()
+        .zip(0..)
+        .map(|(b, i)| Candle {
+            open_time: T0 + i * WEEK,
+            ..b
+        })
+        .collect()
+}
+
+/// [`rising_wf_spec`] on weekly bars with a Sharpe objective, over `n` weekly bars.
+fn weekly_wf_spec(n: i64, windows: WindowSpec) -> (WalkForwardSpec, Vec<Candle>) {
+    let mut s = rising_wf_spec();
+    s.sweep.objective.metric = Metric::Sharpe;
+    s.sweep.base.timeframe = Timeframe::W1;
+    s.sweep.base.to = T0 + n * WEEK;
+    s.windows = windows;
+    (s, weekly_bars(n))
+}
+
+#[test]
+fn a_walk_forward_on_weekly_bars_needs_30_bars_in_every_train_window() {
+    let rolling = |train_bars| WindowSpec {
+        train_bars,
+        test_bars: 5,
+        step_bars: 5,
+        mode: WindowMode::Rolling,
+    };
+    let (s, bars) = weekly_wf_spec(10, rolling(5));
+    assert_eq!(
+        refused_before_running(&s, &bars),
+        "a Sharpe objective needs at least 30 bars as well as 30 daily returns in every train \
+         window, and a train window of 5 1w bars is shorter"
+    );
+    // Anchored, the spec allows a first train window of up to 34 bars; over exactly the bars one
+    // window needs it has 25, which the run refuses before running.
+    let (s, bars) = weekly_wf_spec(
+        35,
+        WindowSpec {
+            train_bars: 25,
+            test_bars: 10,
+            step_bars: 10,
+            mode: WindowMode::Anchored,
+        },
+    );
+    assert_eq!(s.check(), Ok(()));
+    assert_eq!(
+        refused_before_running(&s, &bars),
+        "a Sharpe objective needs at least 30 daily returns on days with a bar close in every \
+         train window, and train window 0 (25 bars over 175 days) has 25"
+    );
+    // Thirty weekly bars are enough: the train window has a Sharpe ratio.
+    let (s, bars) = weekly_wf_spec(35, rolling(30));
+    let r = walk_forward(&s, &bars, &[], None).unwrap();
+    assert!(r.windows[0].in_sample.sharpe.is_some());
+}
+
+#[test]
+fn an_out_of_sample_test_whose_in_sample_segment_is_too_short_for_its_objective_is_refused_before_running()
+ {
+    let oos = |days: i64, metric| {
+        let n = days * 24;
+        let mut sweep = rising_spec();
+        sweep.base.to = T0 + n * HOUR;
+        sweep.objective.metric = metric;
+        let s = OosSpec {
+            sweep,
+            split: Split::Fraction(0.5),
+        };
+        let calls = Mutex::new(0usize);
+        let progress = |_: usize, _: usize| {
+            *calls.lock().unwrap() += 1;
+            ControlFlow::Continue(())
+        };
+        let r = out_of_sample(&s, &rising_bars(n), &[], Some(&progress));
+        (r, calls.into_inner().unwrap())
+    };
+    // 40 days of hourly bars split in half: the in-sample segment has 20 daily returns.
+    let (r, calls) = oos(40, Metric::Sharpe);
+    assert_eq!(calls, 0, "ran before refusing");
+    assert_eq!(
+        r.unwrap_err(),
+        TesterError::InvalidSpec(
+            "a Sharpe objective needs at least 30 daily returns in the in-sample segment, and it \
+             (480 bars over 20 days) has 20"
+                .into()
+        )
+    );
+    let (r, calls) = oos(120, Metric::Cagr);
+    assert_eq!(calls, 0, "ran before refusing");
+    assert_eq!(
+        r.unwrap_err(),
+        TesterError::InvalidSpec(
+            "a CAGR objective needs an in-sample segment of at least 90 days, and it is 1440 bars \
+             over 60 days"
+                .into()
+        )
+    );
+    // 70 days split in half: 35 daily returns in sample, and the whole test runs.
+    let (r, calls) = oos(70, Metric::Sharpe);
+    assert!(r.unwrap().in_sample.best.unwrap().metrics.sharpe.is_some());
+    assert_eq!(calls, 6);
+}
+
+/// Hourly [`rising_bars`] over the first `n` hours, without those `keep` rejects.
+fn gappy_bars(n: i64, keep: impl Fn(i64) -> bool) -> Vec<Candle> {
+    rising_bars(n)
+        .into_iter()
+        .filter(|b| keep((b.open_time - T0) / HOUR))
+        .collect()
+}
+
+#[test]
+fn a_segment_whose_daily_returns_are_mostly_carried_across_a_gap_is_refused_before_running() {
+    // In sample, 30 hourly bars, 15 on day 0 and 15 on day 29: 30 daily returns and 30 bars, but
+    // only two days hold a bar close. Then 50 bars out of sample.
+    let split = 29 * 24 + 15;
+    let bars = gappy_bars(split + 50, |h| !(15..29 * 24).contains(&h));
+    let mut sweep = rising_spec();
+    sweep.base.to = T0 + (split + 50) * HOUR;
+    sweep.objective.metric = Metric::Sharpe;
+    let s = OosSpec {
+        sweep,
+        split: Split::At(T0 + split * HOUR),
+    };
+    let calls = Mutex::new(0usize);
+    let progress = |_: usize, _: usize| {
+        *calls.lock().unwrap() += 1;
+        ControlFlow::Continue(())
+    };
+    let r = out_of_sample(&s, &bars, &[], Some(&progress));
+    assert_eq!(calls.into_inner().unwrap(), 0, "ran before refusing");
+    assert_eq!(
+        r.unwrap_err(),
+        TesterError::InvalidSpec(
+            "a Sharpe objective needs at least 30 daily returns on days with a bar close in the \
+             in-sample segment, and it (30 bars over 29 days 15 hours) has 2"
+                .into()
+        )
+    );
+
+    // A train window of 696 hourly bars passes the spec check. Without day 14 they run over 30
+    // days, so 30 daily returns, but close on 29 of them.
+    let (mut s, _) = train_floor_spec(Metric::Sharpe, 696);
+    s.sweep.base.to = T0 + 770 * HOUR;
+    let bars = gappy_bars(770, |h| h / 24 != 14);
+    assert_eq!(s.check(), Ok(()));
+    assert_eq!(
+        refused_before_running(&s, &bars),
+        "a Sharpe objective needs at least 30 daily returns on days with a bar close in every \
+         train window, and train window 0 (696 bars over 30 days) has 29"
+    );
+}
+
+#[test]
+fn a_walk_forward_whose_train_windows_in_the_data_are_too_short_for_its_objective_is_refused_before_running()
+ {
+    // 696 hourly bars could hold 30 daily returns, so the spec passes its check, but from 00:00
+    // they are exactly 29 days: 29 daily returns, one short.
+    let (s, bars) = train_floor_spec(Metric::Sortino, 696);
+    assert_eq!(s.check(), Ok(()));
+    assert_eq!(
+        refused_before_running(&s, &bars),
+        "a Sortino objective needs at least 30 daily returns in every train window, and train \
+         window 0 (696 bars over 29 days) has 29"
+    );
+    // Anchored over exactly the bars one window needs, the first train window has no leftover
+    // bars: 2112 bars, 88 days.
+    let (mut s, bars) = train_floor_spec(Metric::Cagr, 2_112);
+    s.windows.mode = WindowMode::Anchored;
+    assert_eq!(s.check(), Ok(()));
+    assert_eq!(
+        refused_before_running(&s, &bars),
+        "a CAGR objective needs train windows of at least 90 days, and train window 0 is 2112 \
+         bars over 88 days"
+    );
+
+    // One more bar reaches into a 30th day: the walk-forward runs and the train window has a
+    // Sharpe ratio, so the run refuses exactly what the train sweeps could not rank.
+    let (s, bars) = train_floor_spec(Metric::Sharpe, 697);
+    let r = walk_forward(&s, &bars, &[], None).unwrap();
+    assert!(r.windows[0].in_sample.sharpe.is_some());
+    let (s, bars) = train_floor_spec(Metric::Cagr, 2_160);
+    let r = walk_forward(&s, &bars, &[], None).unwrap();
+    assert!(r.windows[0].in_sample.cagr.is_some());
+    // Objectives without a floor are not checked.
+    let (s, bars) = train_floor_spec(Metric::TotalReturn, 50);
+    assert!(walk_forward(&s, &bars, &[], None).is_ok());
+}
+
+#[test]
+fn a_walk_forward_saved_before_it_had_a_benchmark_loads_without_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let wf = walk_forward(&rising_wf_spec(), &rising_bars(300), &[], None).unwrap();
+    let id = save(&SavedRun::WalkForward(Box::new(wf.clone())), dir.path()).unwrap();
+    // Rewrite result.json as a save from before walk-forwards had a benchmark: no `benchmark` key
+    // on the walk-forward result (each window's backtest keeps its own).
+    let path = dir.path().join(id.as_str()).join("result.json");
+    let mut json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let result = json["result"].as_object_mut().unwrap();
+    assert!(result.remove("benchmark").is_some());
+    std::fs::write(&path, serde_json::to_string(&json).unwrap()).unwrap();
+    let SavedRun::WalkForward(loaded) = load(dir.path(), id.as_str()).unwrap() else {
+        panic!("not a walk-forward");
+    };
+    assert_eq!(loaded.benchmark, None);
+    assert_eq!(
+        *loaded,
+        WalkForwardResult {
+            benchmark: None,
+            ..wf
+        }
+    );
+}
+
+#[test]
+fn walk_forward_tests_up_to_the_last_bar_and_warms_the_first_train_sweep_on_the_leftover() {
+    // 310 bars with 50-bar windows: 10 bars are left over at the start, not at the end.
+    let bars = rising_bars(310);
+    let mut s = rising_wf_spec();
+    s.sweep.base.to = T0 + 310 * HOUR;
+    let r = walk_forward(&s, &bars, &[], None).unwrap();
+    assert_eq!(r.windows.len(), 5);
+    assert_eq!(r.windows.last().unwrap().test_to, T0 + 310 * HOUR);
+    assert_eq!(r.equity.last().unwrap().time, T0 + 309 * HOUR);
+    let first = &r.windows[0];
+    assert_eq!(
+        (first.train_from, first.test_from),
+        (T0 + 10 * HOUR, T0 + 60 * HOUR)
+    );
+    // The first train sweep is warmed up on the 10 leftover bars.
+    let warmed = run(
+        &BacktestConfig {
+            from: first.train_from,
+            to: first.train_to,
+            warmup_from: Some(T0),
+            close_at_end: true,
+            ..with(&s.sweep.base, &first.params)
+        },
+        &bars,
+        &[],
+    )
+    .unwrap();
+    assert_eq!(first.in_sample.total_return, warmed.metrics.total_return);
+    let cold = run(
+        &BacktestConfig {
+            from: first.train_from,
+            to: first.train_to,
+            close_at_end: true,
+            ..with(&s.sweep.base, &first.params)
+        },
+        &bars,
+        &[],
+    )
+    .unwrap();
+    assert_ne!(first.in_sample.total_return, cold.metrics.total_return);
 }
