@@ -250,10 +250,13 @@ correlation: number | null,
 /**
  * The strategy's annualised alpha against the benchmark, on the same per-bar returns as the
  * correlation: the intercept of the least-squares fit of the strategy's returns on the
- * benchmark's, times the bars in a 365-day year of the timeframe (simple, not compounded),
- * with a risk-free rate of zero; see [`metrics::alpha_beta`]. A return across a gap in the
- * bars, or between two walk-forward test windows, counts as one bar's. `None` when the
- * correlation would be, and in a result saved before benchmarks had it.
+ * benchmark's, times the returns observed per 365-day year (simple, not compounded), with a
+ * risk-free rate of zero; see [`metrics::alpha_beta`]. The returns per year are their count
+ * over the time from the first to the last point of the strategy's equity series, so a market
+ * that closes (FX at weekends) or a gap in the data is not counted as bars it did not have. A
+ * return across a gap in the bars, or between two walk-forward test windows, counts as one
+ * return. `None` when the correlation would be, and in a result saved before benchmarks had
+ * it.
  */
 alpha: number | null, 
 /**

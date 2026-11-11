@@ -648,18 +648,24 @@ fn equity_extremes_bracket_each_close_and_feed_the_intrabar_metrics() {
 }
 
 #[test]
-fn alpha_and_beta_are_on_aligned_per_bar_returns_annualised_by_bars_per_year() {
+fn alpha_and_beta_are_on_aligned_per_bar_returns_annualised_by_returns_per_year() {
     use td_engine::metrics::{EquitySeries, alpha_beta, per_bar_returns};
     let r = run_synthetic();
     let s = EquitySeries::new(r.config.starting_cash, &r.equity, Timeframe::H1);
     let b = EquitySeries::new(r.config.starting_cash, &r.benchmark.equity, Timeframe::H1);
     assert_eq!(s.times, b.times);
+    // The returns over the years from the first time to the last.
+    let years = (s.times.last().unwrap() - s.times[0]) as f64 / (365.0 * 86_400_000.0);
     let s = per_bar_returns(&s.values).unwrap();
     let b = per_bar_returns(&b.values).unwrap();
-    // 365 days of 24 hourly bars.
-    let (alpha, beta) = alpha_beta(&s, &b, 8760.0).unwrap();
+    let per_year = s.len() as f64 / years;
+    // The synthetic bars have no gaps, so that is 365 days of 24 hourly bars.
+    assert!((per_year - 8760.0).abs() < 1e-9, "{per_year}");
+    let (alpha, beta) = alpha_beta(&s, &b, per_year).unwrap();
     assert_eq!(r.benchmark.alpha, Some(alpha));
     assert_eq!(r.benchmark.beta, Some(beta));
+    let (alpha_by_timeframe, _) = alpha_beta(&s, &b, 8760.0).unwrap();
+    assert!((alpha - alpha_by_timeframe).abs() <= 1e-12 * alpha.abs().max(1.0));
 }
 
 #[test]

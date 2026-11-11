@@ -1437,7 +1437,6 @@ fn stitched_benchmark(
         stitched.metrics,
         strategy_series,
         strategy_report,
-        base.timeframe,
     ))
 }
 

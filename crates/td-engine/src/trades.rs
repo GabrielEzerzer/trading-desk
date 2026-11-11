@@ -207,14 +207,14 @@ impl Building {
 ///
 /// The excursions (`mae`, `mfe`) are the unrealised P&L of the position, against the entry price
 /// so far, at the prices it met on the fill model's path through each bar: the open, for a
-/// position held into the bar; the price of each fill that reduces it, for the position before
-/// that fill; and the whole bar range, for the position after the bar's fills, since the session
-/// counts the whole range as coming after them (see [`crate::Session::on_bar`]). A fill that adds
-/// to the position is not counted at its own price: within the bar's range the range after it
-/// counts a loss at least as large, and a price slipped beyond the range is not one the market
-/// traded at. A position reduced by a maker fill
-/// (a limit, which fills after the stops inside the range, in the order worse for the strategy)
-/// is counted at the bar's adverse extreme too. A taker fill happened at the open or at a stop's
+/// position held into the bar; the price of each fill, for the position before that fill; and the
+/// whole bar range, for the position after the bar's fills, since the session counts the whole
+/// range as coming after them (see [`crate::Session::on_bar`]). A fill that adds to an open trade
+/// counts at its price held to the bar's range, since a price slipped beyond the range is not one
+/// the market traded at; it matters because the add moves the entry price, so the range after it
+/// can count a smaller gain or loss than the smaller position met before it. A position reduced by
+/// a maker fill (a limit, which fills after the stops inside the range, in the order worse for the
+/// strategy) is counted at the bar's adverse extreme too. A taker fill happened at the open or at a stop's
 /// trigger, which the market reached before going further, so the position before it met no worse
 /// price. `stop` and `r_multiple` are left empty; [`attach_stops`] fills them.
 pub fn build_trades(fills: &[Fill], bars: &[Candle], bar_funding: &[BarFunding]) -> Vec<Trade> {
@@ -293,6 +293,8 @@ pub fn build_trades_with_fills(
                     ));
                 }
             } else if let Some(t) = current.as_mut() {
+                // The position before the add met the fill's price, within the bar's range.
+                t.excursion(fill.price.clamp(bar.low, bar.high), f64::abs(pos));
                 t.entry_qty += qty;
                 t.entry_notional += qty * fill.price;
                 t.fees += fill.fee;
@@ -329,7 +331,9 @@ pub fn build_trades_with_fills(
 /// The rule: a trade takes its stop from the bar of its first fill (`stops[k]` for the bar
 /// `bars[k]` that opens at its `entry_time`). It is the nearest reduce-only stop on the trade's
 /// closing side, a sell stop for a long and a buy stop for a short, among those placed on that
-/// bar, filled on it, or open once the strategy has handled it (see [`crate::Session::bar_stops`]).
+/// bar or filled on it from the bar's last fill that opened a position on, and those open once
+/// the strategy has handled it (see [`crate::Session::bar_stops`]). So the stop of a trade that a
+/// stop closed on the same bar does not count.
 /// So a stop attached to the entry ([`crate::Context::submit_with_stop`]) counts, since it is
 /// placed the moment the entry fills, even when it fills on the same bar; so do a reduce-only stop
 /// resting from before and one the strategy submits on the entry bar's close in reaction to the
@@ -597,6 +601,29 @@ mod tests {
     }
 
     #[test]
+    fn an_add_counts_the_position_before_it_at_the_fill_price() {
+        let b = [
+            candle(0, 100.0, 100.0, 100.0, 100.0),
+            candle(1, 100.0, 110.0, 99.0, 105.0),
+        ];
+        let fills = [
+            // Long 1 @ 100.
+            fill(0, Side::Buy, 1.0, 100.0, 0.0),
+            // Bar 1 opens at 100 and rises: a buy stop adds 1 @ 108, where the long 1 is +8.
+            fill(1, Side::Buy, 1.0, 108.0, 0.0),
+            // A maker sell limit takes 1 off @ 105. The entry is now 104 on 2, so the range after
+            // the fills meets at most 1 * (110 - 104) = +6: the +8 is met only before the add.
+            maker(fill(1, Side::Sell, 1.0, 105.0, 0.0)),
+        ];
+        let t = build_trades(&fills, &b, &in_bar(&[0.0; 2]));
+        assert_eq!(t.len(), 1);
+        approx(t[0].entry_price, 104.0);
+        approx(t[0].mfe.unwrap(), 8.0);
+        // The limit fills after the low, 99: 2 * (99 - 104) = -10.
+        approx(t[0].mae.unwrap(), 10.0);
+    }
+
+    #[test]
     fn a_trade_that_never_goes_against_its_entry_has_zero_mae() {
         let b = [
             candle(0, 10.0, 12.0, 10.0, 11.0),
@@ -660,6 +687,12 @@ mod tests {
         attach_stops(&mut t, &b, &[stop(Some(100.0), None)]);
         assert_eq!((t[0].stop, t[0].r_multiple), (Some(100.0), None));
 
+        // A stop beyond the entry price risks nothing either. A sell stop at 101 above a long's
+        // entry at 100 gives a negative risk, 2 * -1, whose finite R of 12 / -2 is dropped.
+        let mut t = build_trades(&fills, &b, &in_bar(&[0.0; 3]));
+        attach_stops(&mut t, &b, &[stop(Some(101.0), None)]);
+        assert_eq!((t[0].stop, t[0].r_multiple), (Some(101.0), None));
+
         // Short 2 @ 100 (entry bar 1), bought back @ 107: net -14. A buy stop at 103 risks
         // 2 * 3 = 6, so R = -14 / 6.
         let fills = [
@@ -674,5 +707,11 @@ mod tests {
         );
         assert_eq!(t[0].stop, Some(103.0));
         approx(t[0].r_multiple.unwrap(), -14.0 / 6.0);
+
+        // A buy stop at 95, below the short's entry at 100, is beyond it: a risk of 2 * -5 and a
+        // finite R of -14 / -10 that is dropped.
+        let mut t = build_trades(&fills, &b, &in_bar(&[0.0; 3]));
+        attach_stops(&mut t, &b, &[stop(None, None), stop(None, Some(95.0))]);
+        assert_eq!((t[0].stop, t[0].r_multiple), (Some(95.0), None));
     }
 }

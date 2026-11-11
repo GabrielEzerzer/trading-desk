@@ -169,10 +169,13 @@ pub struct Benchmark {
     pub correlation: Option<f64>,
     /// The strategy's annualised alpha against the benchmark, on the same per-bar returns as the
     /// correlation: the intercept of the least-squares fit of the strategy's returns on the
-    /// benchmark's, times the bars in a 365-day year of the timeframe (simple, not compounded),
-    /// with a risk-free rate of zero; see [`metrics::alpha_beta`]. A return across a gap in the
-    /// bars, or between two walk-forward test windows, counts as one bar's. `None` when the
-    /// correlation would be, and in a result saved before benchmarks had it.
+    /// benchmark's, times the returns observed per 365-day year (simple, not compounded), with a
+    /// risk-free rate of zero; see [`metrics::alpha_beta`]. The returns per year are their count
+    /// over the time from the first to the last point of the strategy's equity series, so a market
+    /// that closes (FX at weekends) or a gap in the data is not counted as bars it did not have. A
+    /// return across a gap in the bars, or between two walk-forward test windows, counts as one
+    /// return. `None` when the correlation would be, and in a result saved before benchmarks had
+    /// it.
     #[serde(default)]
     pub alpha: Option<f64>,
     /// The slope of that fit, `cov(strategy, benchmark) / var(benchmark)`: how much of the
@@ -445,14 +448,12 @@ fn benchmark(
         report,
         strategy_series,
         strategy_report,
-        config.timeframe,
     )
 }
 
 /// The benchmark from buy and hold's curve and metrics, with the strategy's excess return over it,
 /// the correlation of their per-bar returns, and the strategy's alpha and beta against it on the
-/// same returns, the alpha annualised by the bars in a 365-day year of `timeframe`.
-#[allow(clippy::too_many_arguments)]
+/// same returns: see [`annualised_alpha_beta`].
 pub(crate) fn compare(
     qty: f64,
     entry_price: f64,
@@ -461,7 +462,6 @@ pub(crate) fn compare(
     report: MetricsReport,
     strategy_series: &EquitySeries,
     strategy_report: &MetricsReport,
-    timeframe: Timeframe,
 ) -> Benchmark {
     let excess_return = match (strategy_report.total_return, report.total_return) {
         (Some(s), Some(b)) => Some(s - b),
@@ -471,10 +471,9 @@ pub(crate) fn compare(
     let correlation = returns
         .as_ref()
         .and_then(|(s, b)| metrics::correlation(s, b));
-    let bars_per_year = DAYS_PER_YEAR * DAY_MS as f64 / timeframe.duration_ms() as f64;
     let alpha_beta = returns
         .as_ref()
-        .and_then(|(s, b)| metrics::alpha_beta(s, b, bars_per_year));
+        .and_then(|r| annualised_alpha_beta(&strategy_series.times, r));
     Benchmark {
         qty,
         entry_price,
@@ -577,6 +576,21 @@ fn aligned_returns(strategy: &EquitySeries, bench: &EquitySeries) -> Option<(Vec
     Some((s, b))
 }
 
+/// The strategy's alpha and beta against the benchmark on `returns`, their aligned per-bar returns
+/// over the strategy series' `times`, with the alpha annualised by the returns observed per
+/// 365-day year: their count over the years from the first time to the last. Without gaps that is
+/// the bars in a year of the timeframe; across gaps, such as an FX market's weekends, it is fewer,
+/// as many as the market had. `None` when [`metrics::alpha_beta`] is, or the times span no time.
+fn annualised_alpha_beta(times: &[Millis], returns: &(Vec<f64>, Vec<f64>)) -> Option<(f64, f64)> {
+    let (&first, &last) = (times.first()?, times.last()?);
+    if last <= first {
+        return None;
+    }
+    let years = (last - first) as f64 / (DAYS_PER_YEAR * DAY_MS as f64);
+    let (s, b) = returns;
+    metrics::alpha_beta(s, b, s.len() as f64 / years)
+}
+
 /// SHA-256, as lowercase hex, over the bars and funding in a fixed byte form: the bar count as a
 /// little-endian u64, then per bar the open time as a little-endian i64 and open, high, low,
 /// close, volume and quote volume as the little-endian bits of each f64; then the funding count
@@ -600,4 +614,44 @@ pub fn data_fingerprint(bars: &[Candle], funding: &[(Millis, f64)]) -> String {
 
 pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const HOUR: Millis = 3_600_000;
+
+    #[test]
+    fn alpha_is_annualised_by_the_returns_observed_per_year_across_weekend_gaps() {
+        // Two FX weeks of hourly bars, Monday 00:00 to Friday 24:00, with the 48-hour weekend
+        // between them. The series is the first bar's open, then each bar's close: 1h to 120h,
+        // then 169h to 288h after the weekend.
+        let mut times = vec![0];
+        times.extend((1..=120).map(|h| h * HOUR));
+        times.extend((169..=288).map(|h| h * HOUR));
+        // The benchmark alternates +1% and -1%; the strategy makes 0.1% a bar plus half of it, so
+        // beta is 0.5 and alpha 0.001 a bar.
+        let bench_returns: Vec<f64> = (0..240)
+            .map(|k| if k % 2 == 0 { 0.01 } else { -0.01 })
+            .collect();
+        let curve = |returns: &mut dyn Iterator<Item = f64>| {
+            let mut values = vec![10_000.0];
+            for r in returns {
+                values.push(values.last().unwrap() * (1.0 + r));
+            }
+            EquitySeries {
+                times: times.clone(),
+                values,
+            }
+        };
+        let bench = curve(&mut bench_returns.iter().copied());
+        let strategy = curve(&mut bench_returns.iter().map(|b| 0.001 + 0.5 * b));
+        let returns = aligned_returns(&strategy, &bench).unwrap();
+        let (alpha, beta) = annualised_alpha_beta(&strategy.times, &returns).unwrap();
+        assert!((beta - 0.5).abs() < 1e-9, "beta {beta}");
+        // 240 returns over 288 hours, a year being 8760: 240 * 8760 / 288 = 7300 a year, so alpha
+        // is 0.001 * 7300 = 7.3. A year of the timeframe's bars, 8760, would give 8.76.
+        assert!((alpha - 7.3).abs() < 1e-9, "alpha {alpha}");
+    }
 }
