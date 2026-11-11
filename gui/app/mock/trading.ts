@@ -10,10 +10,10 @@
 
 import type {
   Candle,
-  Fill,
+  PaperFill as Fill,
   Instrument,
   InstrumentId,
-  Order,
+  PaperOrder as Order,
   SessionEvent,
   SessionState,
   SessionSummary,
@@ -21,7 +21,7 @@ import type {
   Status,
   StrategyInfo,
   Timeframe,
-  Trade,
+  PaperTrade as Trade,
 } from '@td/shared'
 import { TIMEFRAME_MS, addCandle } from '../src/renderer/src/trading/candles'
 import { onLot, onTick } from '../src/renderer/src/trading/order'
@@ -253,6 +253,7 @@ class MockSession {
   /** Accepts or rejects an order now; an accepted one fills on a later bar. */
   submit(request: ManualOrder): void {
     const order: Order = {
+      source: 'manual',
       id: this.nextOrderId++,
       request: {
         instrument: this.instrument.id,
@@ -419,7 +420,7 @@ class MockSession {
       liquidity = 'maker'
     } else return
     const fee = qty * price * this.instrument.fees[liquidity]
-    const fill: Fill = { order_id: order.id, instrument: this.instrument.id, side, time: bar.open_time, price, qty, fee, liquidity }
+    const fill: Fill = { source: 'manual', order_id: order.id, instrument: this.instrument.id, side, time: bar.open_time, price, qty, fee, liquidity }
     this.applyFill(fill)
     this.fills.push(fill)
     this.emit({ event: 'fill', fill })
@@ -481,6 +482,7 @@ class MockSession {
     const gross_pnl = sign * exitQty * (exit_price - entry_price)
     const net_pnl = gross_pnl - t.fees
     return {
+      source: 'manual',
       side: t.side,
       entry_time: t.entry_time,
       exit_time: exitTime ?? this.lastBar?.open_time ?? t.entry_time,
