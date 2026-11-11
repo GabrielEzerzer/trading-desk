@@ -539,3 +539,237 @@ fn a_two_bar_one_minute_run_has_no_infinite_metric_and_round_trips() {
     let id = save(&saved, dir.path()).unwrap();
     assert_eq!(load(dir.path(), id.as_str()).unwrap(), saved);
 }
+
+fn donchian(c: &mut BacktestConfig) {
+    c.strategy = "donchian_breakout".into();
+    c.params = Params::new()
+        .with("entry", ParamValue::Int(12))
+        .with("exit", ParamValue::Int(6))
+        .with("atr_stop", ParamValue::Float(1.0))
+        .with("allow_short", ParamValue::Bool(true));
+}
+
+#[test]
+fn trades_keep_the_stop_attached_to_their_entry_and_its_r_multiple() {
+    let mut c = config();
+    donchian(&mut c);
+    let r = run(&c, &synthetic_bars(), &synthetic_funding()).unwrap();
+    let mut with_stop = 0;
+    for t in &r.trades {
+        // The stop attached to the order whose fill opened the trade.
+        let attached = r
+            .orders
+            .iter()
+            .filter(|o| {
+                r.fills
+                    .iter()
+                    .any(|f| f.order_id == o.id && f.time == t.entry_time)
+            })
+            .find_map(|o| o.attached_stop);
+        let Some(stop) = attached else { continue };
+        with_stop += 1;
+        assert_eq!(
+            t.stop,
+            Some(stop.trigger),
+            "trade entered at {}",
+            t.entry_time
+        );
+        let risk = t.qty * (t.entry_price - stop.trigger).abs();
+        let r_multiple = t.r_multiple.unwrap();
+        assert!((r_multiple - t.net_pnl / risk).abs() < 1e-12);
+    }
+    assert!(with_stop >= 4, "{with_stop} trades with a stop");
+    let rs: Vec<f64> = r
+        .trades
+        .iter()
+        .filter(|t| !t.open)
+        .filter_map(|t| t.r_multiple)
+        .collect();
+    let mean = rs.iter().sum::<f64>() / rs.len() as f64;
+    assert!((r.metrics.expectancy_r.unwrap() - mean).abs() < 1e-12);
+    // An exit price is one the position met, so the excursions cover the trade's own result.
+    for t in &r.trades {
+        assert!(t.mae.unwrap() >= (-t.gross_pnl).max(0.0) - 1e-9);
+        assert!(t.mfe.unwrap() >= t.gross_pnl.max(0.0) - 1e-9);
+    }
+    // The SMA cross places no stops, so no trade has one.
+    let sma = run_synthetic();
+    assert!(
+        sma.trades
+            .iter()
+            .all(|t| t.stop.is_none() && t.r_multiple.is_none())
+    );
+    assert_eq!(sma.metrics.expectancy_r, None);
+}
+
+#[test]
+fn the_close_out_at_the_end_counts_as_a_forced_close() {
+    let open_at_end = run_synthetic();
+    assert!(
+        open_at_end.trades.last().unwrap().open,
+        "the run must end in a position"
+    );
+    assert_eq!(open_at_end.metrics.force_closed_trades, 0);
+    assert!(open_at_end.trades.iter().all(|t| !t.force_closed));
+
+    let mut c = config();
+    c.close_at_end = true;
+    let r = run(&c, &synthetic_bars(), &synthetic_funding()).unwrap();
+    let (last, rest) = r.trades.split_last().unwrap();
+    // Closed by the market order decided on the second-to-last close, at the last bar's open.
+    assert!(!last.open && last.force_closed);
+    assert_eq!(last.exit_time, T0 + 489 * HOUR);
+    assert!(rest.iter().all(|t| !t.force_closed));
+    assert_eq!(r.metrics.force_closed_trades, 1);
+}
+
+#[test]
+fn equity_extremes_bracket_each_close_and_feed_the_intrabar_metrics() {
+    let r = run_synthetic();
+    assert_eq!(r.equity_extremes.len(), r.equity.len());
+    for (x, p) in r.equity_extremes.iter().zip(&r.equity) {
+        assert!(
+            x.low <= p.equity && p.equity <= x.high,
+            "{x:?} around {}",
+            p.equity
+        );
+    }
+    let m = &r.metrics;
+    assert!(m.max_drawdown_intrabar.unwrap() >= m.max_drawdown.unwrap());
+    assert!(m.static_drawdown_intrabar.unwrap() >= m.static_drawdown.unwrap());
+    assert!(m.worst_daily_loss_intrabar.unwrap() >= m.worst_daily_loss.unwrap());
+    // The strategy puts 90% of its equity in the position, so leverage peaks near 0.9.
+    let lev = m.peak_leverage.unwrap();
+    assert!(lev > 0.85 && lev < 1.1, "peak leverage {lev}");
+    // Buy and hold has all its cash in the position from the first bar.
+    let b = &r.benchmark.metrics;
+    assert!(b.peak_leverage.unwrap() > 0.98);
+    assert_eq!(b.force_closed_trades, 0);
+}
+
+#[test]
+fn alpha_and_beta_are_on_aligned_per_bar_returns_annualised_by_returns_per_year() {
+    use td_engine::metrics::{EquitySeries, alpha_beta, per_bar_returns};
+    let r = run_synthetic();
+    let s = EquitySeries::new(r.config.starting_cash, &r.equity, Timeframe::H1);
+    let b = EquitySeries::new(r.config.starting_cash, &r.benchmark.equity, Timeframe::H1);
+    assert_eq!(s.times, b.times);
+    // The returns over the years from the first time to the last.
+    let years = (s.times.last().unwrap() - s.times[0]) as f64 / (365.0 * 86_400_000.0);
+    let s = per_bar_returns(&s.values).unwrap();
+    let b = per_bar_returns(&b.values).unwrap();
+    let per_year = s.len() as f64 / years;
+    // The synthetic bars have no gaps, so that is 365 days of 24 hourly bars.
+    assert!((per_year - 8760.0).abs() < 1e-9, "{per_year}");
+    let (alpha, beta) = alpha_beta(&s, &b, per_year).unwrap();
+    assert_eq!(r.benchmark.alpha, Some(alpha));
+    assert_eq!(r.benchmark.beta, Some(beta));
+    let (alpha_by_timeframe, _) = alpha_beta(&s, &b, 8760.0).unwrap();
+    assert!((alpha - alpha_by_timeframe).abs() <= 1e-12 * alpha.abs().max(1.0));
+}
+
+#[test]
+fn slippage_defaults_by_instrument_when_the_config_leaves_it_out() {
+    let mut value = serde_json::to_value(config()).unwrap();
+    let with_base = |value: &Value, base: &str, slippage: Option<Value>| {
+        let mut v = value.clone();
+        v["instrument"]["base"] = Value::from(base);
+        match slippage {
+            Some(s) => v["slippage_bps"] = s,
+            None => {
+                v.as_object_mut().unwrap().remove("slippage_bps");
+            }
+        }
+        serde_json::from_value::<BacktestConfig>(v).unwrap()
+    };
+    assert_eq!(with_base(&value, "BTC", None).slippage_bps, 2.0);
+    assert_eq!(
+        with_base(&value, "ETH", Some(Value::Null)).slippage_bps,
+        2.0
+    );
+    assert_eq!(with_base(&value, "SOL", None).slippage_bps, 5.0);
+    // A slippage given explicitly wins, zero included.
+    assert_eq!(
+        with_base(&value, "BTC", Some(Value::from(0.0))).slippage_bps,
+        0.0
+    );
+    assert_eq!(
+        with_base(&value, "SOL", Some(Value::from(1.5))).slippage_bps,
+        1.5
+    );
+    // The other defaults still apply.
+    let obj = value.as_object_mut().unwrap();
+    for key in [
+        "params",
+        "fee_override",
+        "max_leverage",
+        "warmup_from",
+        "close_at_end",
+    ] {
+        obj.remove(key);
+    }
+    let c = with_base(&value, "BTC", None);
+    assert_eq!(c.params, Params::new());
+    assert_eq!(
+        (c.fee_override, c.warmup_from, c.close_at_end),
+        (None, None, false)
+    );
+    assert_eq!(c.max_leverage, 1.0);
+    // A config round-trips with the slippage it ran with.
+    let c = config();
+    let back: BacktestConfig = serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
+    assert_eq!(back, c);
+}
+
+#[test]
+fn a_result_saved_before_the_risk_measures_still_loads() {
+    let mut c = config();
+    donchian(&mut c);
+    let r = run(&c, &synthetic_bars(), &synthetic_funding()).unwrap();
+    let mut v = serde_json::to_value(&r).unwrap();
+    v.as_object_mut()
+        .unwrap()
+        .remove("equity_extremes")
+        .unwrap();
+    for key in [
+        "max_drawdown_intrabar",
+        "static_drawdown",
+        "static_drawdown_intrabar",
+        "worst_daily_loss",
+        "worst_daily_loss_intrabar",
+        "peak_leverage",
+        "expectancy_r",
+        "payoff_ratio",
+        "longest_losing_streak",
+        "force_closed_trades",
+    ] {
+        v["metrics"].as_object_mut().unwrap().remove(key).unwrap();
+        v["benchmark"]["metrics"]
+            .as_object_mut()
+            .unwrap()
+            .remove(key)
+            .unwrap();
+    }
+    for key in ["alpha", "beta"] {
+        v["benchmark"].as_object_mut().unwrap().remove(key).unwrap();
+    }
+    for t in v["trades"].as_array_mut().unwrap() {
+        for key in ["stop", "r_multiple", "mae", "mfe", "force_closed"] {
+            t.as_object_mut().unwrap().remove(key).unwrap();
+        }
+    }
+    let old: BacktestResult = serde_json::from_value(v).unwrap();
+    assert!(old.equity_extremes.is_empty());
+    assert_eq!(old.metrics.peak_leverage, None);
+    assert_eq!(old.metrics.longest_losing_streak, 0);
+    assert_eq!(old.benchmark.alpha, None);
+    assert!(
+        old.trades
+            .iter()
+            .all(|t| t.stop.is_none() && t.mae.is_none() && !t.force_closed)
+    );
+    // Everything that was there is unchanged.
+    assert_eq!(old.equity, r.equity);
+    assert_eq!(old.metrics.sharpe, r.metrics.sharpe);
+    assert_eq!(old.trades.len(), r.trades.len());
+}
