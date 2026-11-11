@@ -510,31 +510,33 @@ impl Store {
                         unrecognised.push(self.relative(&symbol_dir));
                         continue;
                     }
+                    // Months are read only from a `1m` that is a real folder; `named_dirs` reports a
+                    // file or a link of that name.
+                    let mut months = Vec::new();
                     for (name, dir) in self.named_dirs(&symbol_dir, &mut unrecognised)? {
                         if name != "1m" {
                             unrecognised.push(self.relative(&dir));
+                            continue;
                         }
-                    }
-                    let id = InstrumentId {
-                        venue,
-                        symbol,
-                        kind,
-                    };
-                    let dir = self.candle_dir(&id)?;
-                    let mut months = Vec::new();
-                    for name in dir_names(&dir, &mut unrecognised, &self.root)? {
-                        match month_of_file(&name) {
-                            Some((month, true)) => {
-                                if let Some(bytes) = file_bytes(&dir.join(&name))? {
-                                    months.push(StoredMonth { month, bytes });
+                        for name in dir_names(&dir, &mut unrecognised, &self.root)? {
+                            match month_of_file(&name) {
+                                Some((month, true)) => {
+                                    if let Some(bytes) = file_bytes(&dir.join(&name))? {
+                                        months.push(StoredMonth { month, bytes });
+                                    }
                                 }
+                                Some((_, false)) => {} // a lock sidecar or a temp file
+                                None => unrecognised.push(self.relative(&dir.join(&name))),
                             }
-                            Some((_, false)) => {} // a lock sidecar or a temp file
-                            None => unrecognised.push(self.relative(&dir.join(&name))),
                         }
                     }
                     months.sort_by_key(|m| m.month);
                     if !months.is_empty() {
+                        let id = InstrumentId {
+                            venue,
+                            symbol,
+                            kind,
+                        };
                         found.insert(
                             id.clone(),
                             StoredInstrument {

@@ -842,6 +842,15 @@ fn link_dir(target: &std::path::Path, link: &std::path::Path) {
     std::os::unix::fs::symlink(target, link).expect("a symlink");
 }
 
+/// The store's [`StoredData::unrecognised`] paths with `/` separators.
+fn strays(stored: &StoredData) -> Vec<String> {
+    stored
+        .unrecognised
+        .iter()
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+        .collect()
+}
+
 #[test]
 fn a_delete_does_not_follow_a_link_out_of_the_store() {
     let dir = tempfile::tempdir().expect("a temp dir");
@@ -896,6 +905,48 @@ fn a_delete_does_not_follow_a_link_out_of_the_store() {
     for file in ["1m/2024-01.parquet", "XRPUSDT.parquet"] {
         assert_eq!(std::fs::read(outside.join(file)).expect("reads"), b"keep");
     }
+}
+
+#[test]
+fn a_file_named_1m_is_reported_and_the_rest_of_the_store_is_listed() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let store = Store::new(dir.path());
+    let spot = btc(InstrumentKind::Spot);
+    store
+        .write_candles(&spot, &flat_minutes(month("2024-01").start(), 0..10))
+        .expect("writes");
+    let stray = dir.path().join("candles/binance/spot/ETHUSDT/1m");
+    std::fs::create_dir_all(stray.parent().unwrap()).expect("a folder");
+    std::fs::write(&stray, b"x").expect("writes");
+
+    let stored = store.stored().expect("lists");
+    let ids: Vec<InstrumentId> = stored.instruments.iter().map(|i| i.id.clone()).collect();
+    assert_eq!(ids, [spot]);
+    assert_eq!(strays(&stored), ["candles/binance/spot/ETHUSDT/1m"]);
+}
+
+#[test]
+fn a_1m_link_is_reported_and_not_read() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let store = Store::new(dir.path().join("store"));
+    let outside = dir.path().join("outside");
+    std::fs::create_dir_all(&outside).expect("a folder");
+    std::fs::write(outside.join("2024-01.parquet"), b"x").expect("writes");
+    let eth = InstrumentId {
+        symbol: "ETHUSDT".into(),
+        ..btc(InstrumentKind::Spot)
+    };
+    let month_file = store.candle_path(&eth, month("2024-01")).unwrap();
+    let link = month_file.parent().unwrap();
+    std::fs::create_dir_all(link.parent().unwrap()).expect("a folder");
+    link_dir(&outside, link);
+
+    let stored = store.stored().expect("lists");
+    assert!(
+        stored.instruments.is_empty(),
+        "nothing is read through the link: {stored:?}"
+    );
+    assert_eq!(strays(&stored), ["candles/binance/spot/ETHUSDT/1m"]);
 }
 
 #[test]
