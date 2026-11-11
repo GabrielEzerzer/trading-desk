@@ -201,6 +201,10 @@ pub enum ChartEvent {
     /// stream, and at the end of a bucket that gives no closed bar (the first one, when the feed
     /// joined it after it started). The closed [`FeedEvent::Bar`] of the same open time, when it
     /// comes, comes after it and replaces it. Display only.
+    ///
+    /// shortcut: a bucket whose closed bar never comes (the one joined late, or one the builder
+    /// dropped for a missing minute) keeps its last forming bar on the chart; send a correction
+    /// when the bucket ends if a chart is seen holding a wrong bar.
     Forming(Candle),
 }
 
@@ -487,8 +491,9 @@ impl Feed {
             let fetched =
                 tokio::task::spawn_blocking(move || rest.klines(&id, Timeframe::M1, from, to))
                     .await;
-            // shortcut: one try per bucket, so a failed fetch leaves the bar without its first
-            // minutes until the bucket ends; retry with backoff if that shows on the charts.
+            // shortcut: one try per bucket. The bucket a chart joins late gets no closed bar, so
+            // after a failed fetch its bar lacks its first minutes for as long as the chart stays
+            // open; retry at the end of the bucket if that shows on the charts.
             let minutes = match fetched {
                 Ok(Ok(minutes)) => minutes,
                 _ => Vec::new(),

@@ -16,7 +16,8 @@ use tokio::task::JoinHandle;
 
 use super::source::LiveSource;
 
-/// Bars buffered per `candles:` subscriber; one that falls further behind skips bars.
+/// Messages (closed and forming bars) buffered per `candles:` subscriber; one that falls further
+/// behind skips messages.
 const CANDLE_BUFFER: usize = 256;
 
 /// What a `candles:` topic sends: a closed bar, or the bar still forming, which is for display

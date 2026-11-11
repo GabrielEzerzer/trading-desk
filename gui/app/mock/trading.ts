@@ -118,7 +118,6 @@ function seedOf(text: string): number {
   return h >>> 0
 }
 
-/** One instrument and timeframe's live bars, shared by the chart and every session on it. */
 /**
  * When the bar in progress is shown between two closes, as fractions of `liveMs`. Late in the
  * cycle, so the screenshots' quiet moment (0.6 of the cycle, harness.mjs `quiet`) still shows the
@@ -126,6 +125,7 @@ function seedOf(text: string): number {
  */
 const FORMING_AT = [0.75, 0.9] as const
 
+/** One instrument and timeframe's live bars, shared by the chart and every session on it. */
 class Feed {
   readonly bars: Candle[]
   private readonly listeners = new Set<Partial<CandleFeed>>()
