@@ -24,7 +24,9 @@
 //!   a 400 `bad_request`, and so is the venue refusing the request with a 4xx (other than its
 //!   rate limit), as Binance does for a symbol it does not list, with the venue's message. Any
 //!   other venue failure while filling in is a 502 `venue` with its message.
-//! - `GET /strategies`: the registered strategies and their parameter specs.
+//! - `GET /strategies`: the registered strategies, examples first and then the private ones when
+//!   their folder is checked out, each with its parameter specs, its rule's kind, its test plan
+//!   and its verdict rule.
 //! - `GET /jobs`, `GET /jobs/{id}`, `POST /jobs/{id}/cancel`: background jobs (see [`jobs`]).
 //! - `POST /runs/backtest` (a `BacktestConfig`), `POST /runs/sweep` (a `SweepSpec`),
 //!   `POST /runs/out-of-sample` (an `OosSpec`), `POST /runs/walk-forward` (a `WalkForwardSpec`):
@@ -91,7 +93,7 @@ use axum::{Json, Router, middleware};
 use serde::{Deserialize, Serialize};
 use td_core::{InstrumentKind, Venue};
 use td_data::Store;
-use td_engine::ParamSpec;
+use td_engine::{ParamSpec, RuleKind, StrategyEntry, TestPlan, VerdictRule};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -287,25 +289,35 @@ async fn health() -> Json<HealthResponse> {
     })
 }
 
-/// A strategy the apps can run, with the parameters it takes.
+/// A strategy the apps can run, with the parameters it takes, the plan the battery tests it on
+/// and the rule its verdict is judged by.
 #[derive(Debug, Clone, PartialEq, Serialize, TS)]
 pub struct StrategyInfo {
     pub name: String,
     pub description: String,
     pub params: Vec<ParamSpec>,
+    /// The rule's kind, for the Lab's picker; the same as `rule.kind`.
+    pub kind: RuleKind,
+    pub plan: TestPlan,
+    pub rule: VerdictRule,
 }
 
 async fn strategies() -> Json<Vec<StrategyInfo>> {
-    Json(
-        td_engine::strategies()
-            .into_iter()
-            .map(|e| StrategyInfo {
-                name: e.name.to_string(),
-                description: e.description.to_string(),
-                params: e.params,
-            })
-            .collect(),
-    )
+    Json(strategy_infos(td_engine::strategies()))
+}
+
+fn strategy_infos(entries: Vec<StrategyEntry>) -> Vec<StrategyInfo> {
+    entries
+        .into_iter()
+        .map(|e| StrategyInfo {
+            name: e.name.to_string(),
+            description: e.description.to_string(),
+            params: e.params,
+            kind: e.rule.kind(),
+            plan: e.plan,
+            rule: e.rule,
+        })
+        .collect()
 }
 
 async fn list_jobs(State(state): State<Arc<AppState>>) -> Json<Vec<JobInfo>> {
@@ -414,6 +426,28 @@ mod tests {
         let body = response.text().await.unwrap();
         server.abort();
         (status, body)
+    }
+
+    /// The listing maps every registered entry, so a private strategy added after the examples
+    /// is listed with its kind, plan and rule like they are.
+    #[test]
+    fn every_registered_strategy_is_listed_with_its_kind_plan_and_rule() {
+        let mut entries = td_engine::strategies();
+        let mut private = entries[0].clone();
+        private.name = "private_example";
+        private.rule = VerdictRule::HighRisk {
+            limits: td_engine::HighRiskLimits::default(),
+        };
+        entries.push(private.clone());
+        let infos = strategy_infos(entries.clone());
+        assert_eq!(infos.len(), entries.len());
+        for (info, entry) in infos.iter().zip(&entries) {
+            assert_eq!(info.name, entry.name);
+            assert_eq!(info.kind, entry.rule.kind());
+            assert_eq!(info.plan, entry.plan);
+            assert_eq!(info.rule, entry.rule);
+        }
+        assert_eq!(infos.last().unwrap().kind, RuleKind::HighRisk);
     }
 
     #[tokio::test(flavor = "multi_thread")]

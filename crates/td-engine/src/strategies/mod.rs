@@ -1,7 +1,22 @@
-//! Reference strategies.
+//! The example strategies, and the private ones when their repo is checked out.
+//!
+//! One strategy is one file in three parts: the `Strategy` implementation with its parameters, its
+//! test plan and its verdict rule (see `sma_cross.rs`). An example is registered in
+//! [`crate::registry`]; a private strategy, a file in `private/`, is found by build.rs.
 
 pub mod donchian;
 pub mod sma_cross;
+
+/// The strategies in `private/`, compiled in by build.rs; an empty list without the folder.
+pub(crate) mod private {
+    include!(concat!(env!("OUT_DIR"), "/private_strategies.rs"));
+}
+
+/// The fixture strategies in `tests/fixtures/private_strategies/`, compiled in the same way.
+#[cfg(test)]
+pub(crate) mod fixture {
+    include!(concat!(env!("OUT_DIR"), "/fixture_strategies.rs"));
+}
 
 use td_core::{OrderRequest, OrderType, Side, TimeInForce};
 
