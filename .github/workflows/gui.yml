@@ -1,6 +1,7 @@
 # CI for the GUI workspace in gui/. Rules: D:/code/CLAUDE.md, "Test suites".
-# It runs on pushes to branches other than the default and on manual dispatch, so each push starts one run
-# and a branch has results before its PR exists.
+# It runs on pushes to branches other than the default that touch gui/ or this file, and on manual dispatch,
+# so a branch has results before its PR exists. A Rust-only push skips it: Rust reaches the GUI only through
+# gui/shared/src/api-types.ts, which ci.yml regenerates and checks, and a change to it is a change under gui/.
 # It runs the TypeScript suite: typecheck, the vitest tests and the electron-vite build, then the
 # Playwright UI gates against the built renderer in headless Chromium (never Electron). The test that
 # starts the real td-server binary skips itself here, since this workflow builds no Rust; ci.yml covers Rust.
@@ -13,6 +14,9 @@ name: gui
 on:
   push:
     branches-ignore: [main]
+    paths:
+      - 'gui/**'
+      - '.github/workflows/gui.yml'
   workflow_dispatch:
 
 concurrency:
@@ -60,11 +64,11 @@ jobs:
       - name: Install Chromium's system libraries
         id: deps
         continue-on-error: true
-        timeout-minutes: 5
+        timeout-minutes: 2
         run: pnpm exec playwright install-deps chromium
       - name: Warn that the system libraries were not installed
         if: steps.deps.outcome == 'failure'
-        run: echo "::warning::Ubuntu's mirrors could not be reached; the UI gates ran on the runner image's own libraries."
+        run: echo "::warning::Chromium's system libraries were not installed; the UI gates ran on the runner image's own libraries."
       - name: UI gates
         run: pnpm gates
       # Playwright writes a missing baseline and passes, so a run that wrote one compared nothing.
