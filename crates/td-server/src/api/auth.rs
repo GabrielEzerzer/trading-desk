@@ -6,10 +6,10 @@
 //! `td-token.<token>` in `Sec-WebSocket-Protocol` instead; the `/ws` handler echoes that
 //! subprotocol back.
 //!
-//! The apps send their HTTP calls through Electron's main process, which holds the token; the
-//! renderer gets it only for the read-only WebSocket streams. If the WebSocket ever gains
-//! commands that change state, the main process must hand the renderer a WebSocket-only token or
-//! a single-use ticket instead of the API token.
+//! The apps send their HTTP calls and hold their one WebSocket in Electron's main process, which
+//! keeps the token; the renderer never receives it. If the renderer ever opens a socket of its
+//! own, the main process must hand it a WebSocket-only token or a single-use ticket, never the
+//! API token.
 //!
 //! The Host check stops DNS rebinding: a web page whose domain was re-pointed at 127.0.0.1 still
 //! sends its own domain in `Host`. No CORS headers are sent, so browsers keep other origins from

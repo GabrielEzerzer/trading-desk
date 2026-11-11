@@ -1,9 +1,11 @@
 // Adapted from tipping-point engine/src/store/import.rs at 7dc6d12 (SHA-256 of an archive, the
 // published .CHECKSUM, and reading an archive's one member) and engine/src/venue/binance/archive.rs
-// at 7dc6d12 (archive URLs and CSV rows).
+// at 7dc6d12 (archive URLs and CSV rows), and engine/src/venue/binance/rest.rs at 7dc6d12 (reading
+// the PRICE_FILTER and LOT_SIZE filters from exchangeInfo).
 
-//! Binance history: 1-minute klines from the public archive at data.binance.vision, recent klines
-//! from the spot and USD-M REST APIs, and funding rates from the USD-M REST API.
+//! Binance as a [`DataSource`]: spot and USD-M perpetual instruments from `exchangeInfo`,
+//! 1-minute history from the public archive at data.binance.vision, recent klines from the spot
+//! and USD-M REST APIs, funding rates from the USD-M REST API, and the public kline streams.
 //!
 //! Archive files are `<SYMBOL>-1m-<YYYY-MM>.zip` (monthly) and `<SYMBOL>-1m-<YYYY-MM-DD>.zip`
 //! (daily), each holding one CSV of the same name and published with a `.CHECKSUM` beside it
@@ -18,15 +20,22 @@ use std::time::Duration;
 
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use td_core::{Candle, InstrumentId, InstrumentKind, Millis, Timeframe};
-
-use crate::DataError;
-use crate::http::Http;
-use crate::time::{
-    MINUTE, Month, ROUNDING_PAD, format_date, funding_on_the_minute, now_ms, round_to_minute,
+use td_core::{
+    Candle, FeeSchedule, Instrument, InstrumentId, InstrumentKind, Millis, Timeframe, Venue,
 };
 
+use crate::http::Http;
+use crate::instruments::number;
+use crate::live::{KlineUpdate, LiveStream, frame_number};
+use crate::source::{DataSource, MinuteHistory};
+use crate::time::{
+    DAY, MINUTE, Month, ROUNDING_PAD, format_date, funding_on_the_minute, now_ms, round_to_minute,
+};
+use crate::{DataError, InstrumentList};
+
 const ARCHIVE: &str = "https://data.binance.vision/data";
+const SPOT_INFO_URL: &str = "https://api.binance.com/api/v3/exchangeInfo";
+const USDM_INFO_URL: &str = "https://fapi.binance.com/fapi/v1/exchangeInfo";
 const SPOT_KLINES_URL: &str = "https://api.binance.com/api/v3/klines";
 const USDM_KLINES_URL: &str = "https://fapi.binance.com/fapi/v1/klines";
 /// The most rows a kline request returns on spot (USD-M allows 1500; one limit keeps it simple).
@@ -41,6 +50,120 @@ const FUNDING_LIMIT: usize = 1000;
 const FUNDING_DELAY: Duration = Duration::from_millis(600);
 /// Times at or above this are microseconds: 1e14 ms is the year 5138, 1e14 µs is 1973.
 const MICROS_FROM: i64 = 100_000_000_000_000;
+
+// Base-tier fees: the regular user (VIP 0) rates without the BNB discount, from
+// binance.com/en/fee/schedule. Written on 2026-11-10 from the rates as known then; the page could
+// not be fetched that day to re-check them, so check before relying on them.
+
+/// Binance spot: 0.1% maker, 0.1% taker.
+pub const BINANCE_SPOT_FEES: FeeSchedule = FeeSchedule {
+    maker: 0.001,
+    taker: 0.001,
+};
+/// Binance USD-M futures: 0.02% maker, 0.05% taker.
+pub const BINANCE_USDM_FEES: FeeSchedule = FeeSchedule {
+    maker: 0.0002,
+    taker: 0.0005,
+};
+
+/// Binance spot and USD-M perpetuals.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Binance;
+
+impl DataSource for Binance {
+    fn venue(&self) -> Venue {
+        Venue::Binance
+    }
+
+    fn kinds(&self) -> &'static [InstrumentKind] {
+        &[InstrumentKind::Spot, InstrumentKind::Perpetual]
+    }
+
+    fn instruments(&self, http: &Http, kind: InstrumentKind) -> Result<InstrumentList, DataError> {
+        match kind {
+            InstrumentKind::Spot => parse_binance_spot(&http.get_text(SPOT_INFO_URL, &[])?),
+            InstrumentKind::Perpetual => parse_binance_usdm(&http.get_text(USDM_INFO_URL, &[])?),
+        }
+    }
+
+    fn default_fees(&self, kind: InstrumentKind) -> FeeSchedule {
+        match kind {
+            InstrumentKind::Spot => BINANCE_SPOT_FEES,
+            InstrumentKind::Perpetual => BINANCE_USDM_FEES,
+        }
+    }
+
+    /// From the archive: the monthly file for a whole past month (falling back to daily files if
+    /// the monthly one is not published yet) and daily files for the current month, which exist up
+    /// to yesterday.
+    fn minute_history(
+        &self,
+        http: &Http,
+        id: &InstrumentId,
+        from: Millis,
+        to: Millis,
+        now: Millis,
+    ) -> Result<MinuteHistory, DataError> {
+        let mut missing_files = Vec::new();
+        let candles = archive_month(
+            &id.symbol,
+            Month::containing(from),
+            (from, to),
+            now,
+            &mut missing_files,
+            |period| fetch_archive(http, id, period),
+        )?;
+        Ok(MinuteHistory {
+            candles,
+            missing_files,
+        })
+    }
+
+    fn funding(
+        &self,
+        http: &Http,
+        id: &InstrumentId,
+        from: Millis,
+        to: Millis,
+    ) -> Result<Vec<(Millis, f64)>, DataError> {
+        fetch_funding(http, &id.symbol, from, to)
+    }
+
+    fn live(&self) -> Result<&dyn LiveStream, DataError> {
+        Ok(self)
+    }
+}
+
+impl LiveStream for Binance {
+    fn url(&self, id: &InstrumentId) -> String {
+        let lower = id.symbol.to_lowercase();
+        match id.kind {
+            InstrumentKind::Spot => format!("wss://stream.binance.com:9443/ws/{lower}@kline_1m"),
+            // USD-M serves market streams under `/market`; the old `/ws/<stream>` path still accepts
+            // the connection but sent no frames when checked on 2026-11-10.
+            InstrumentKind::Perpetual => {
+                format!("wss://fstream.binance.com/market/ws/{lower}@kline_1m")
+            }
+        }
+    }
+
+    // The stream is named in the URL and the server does the pinging, so the greeting is empty.
+
+    fn parse(&self, text: &str) -> Result<Vec<KlineUpdate>, DataError> {
+        parse_stream_frame(text).map(|update| update.into_iter().collect())
+    }
+
+    fn klines(
+        &self,
+        http: &Http,
+        id: &InstrumentId,
+        timeframe: Timeframe,
+        from: Millis,
+        to: Millis,
+    ) -> Result<Vec<Candle>, DataError> {
+        fetch_klines(http, id, timeframe, from, to)
+    }
+}
 
 /// The span one archive file covers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,6 +220,38 @@ pub fn fetch_archive(
     verify_checksum(&file, &zip, &String::from_utf8_lossy(&checksum))?;
     let csv = read_archive_csv(&file, &zip)?;
     parse_kline_csv(&file, &csv).map(Some)
+}
+
+/// One month of klines from the archive, where `fetch` downloads one archive file (`None`
+/// when the archive has no such file). A month before the current one comes from its monthly
+/// file; when that is not published, and for the current month, the daily files for the days that
+/// overlap `[lo, hi)` up to yesterday are used instead, and the names of those the archive lacks
+/// are added to `missing`.
+fn archive_month(
+    symbol: &str,
+    month: Month,
+    (lo, hi): (Millis, Millis),
+    now: Millis,
+    missing: &mut Vec<String>,
+    mut fetch: impl FnMut(ArchivePeriod) -> Result<Option<Vec<Candle>>, DataError>,
+) -> Result<Vec<Candle>, DataError> {
+    if month < Month::containing(now)
+        && let Some(candles) = fetch(ArchivePeriod::Month(month))?
+    {
+        return Ok(candles);
+    }
+    let today = now.div_euclid(DAY) * DAY;
+    let mut candles = Vec::new();
+    let mut day = lo.div_euclid(DAY) * DAY;
+    while day < hi && day < today {
+        let period = ArchivePeriod::Day(day);
+        match fetch(period)? {
+            Some(rows) => candles.extend(rows),
+            None => missing.push(archive_file_name(symbol, period)),
+        }
+        day += DAY;
+    }
+    Ok(candles)
 }
 
 /// The SHA-256 of `bytes`, in lower-case hex.
@@ -392,9 +547,219 @@ fn page_forwards<T>(
     Ok(rows)
 }
 
+#[derive(Debug, Deserialize)]
+struct BinanceInfo {
+    symbols: Vec<BinanceSymbol>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BinanceSymbol {
+    symbol: String,
+    status: String,
+    base_asset: String,
+    quote_asset: String,
+    /// USD-M only: `PERPETUAL`, `CURRENT_QUARTER`, `TRADIFI_PERPETUAL`, ...
+    contract_type: Option<String>,
+    filters: Vec<BinanceFilter>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BinanceFilter {
+    filter_type: String,
+    tick_size: Option<String>,
+    step_size: Option<String>,
+    min_qty: Option<String>,
+    /// Spot's NOTIONAL and MIN_NOTIONAL filters.
+    min_notional: Option<String>,
+    /// USD-M's MIN_NOTIONAL filter.
+    notional: Option<String>,
+}
+
+/// Reads `/api/v3/exchangeInfo`: every spot symbol with status `TRADING`.
+pub fn parse_binance_spot(body: &str) -> Result<InstrumentList, DataError> {
+    parse_binance(body, InstrumentKind::Spot)
+}
+
+/// Reads `/fapi/v1/exchangeInfo`: every `PERPETUAL` contract with status `TRADING`. Quarterly
+/// futures and TradFi perpetuals are left out.
+pub fn parse_binance_usdm(body: &str) -> Result<InstrumentList, DataError> {
+    parse_binance(body, InstrumentKind::Perpetual)
+}
+
+fn parse_binance(body: &str, kind: InstrumentKind) -> Result<InstrumentList, DataError> {
+    let info: BinanceInfo =
+        serde_json::from_str(body).map_err(|e| DataError::parse("Binance exchangeInfo", e))?;
+    let mut list = InstrumentList::default();
+    for s in &info.symbols {
+        let listed = s.status == "TRADING"
+            && match kind {
+                InstrumentKind::Spot => true,
+                InstrumentKind::Perpetual => s.contract_type.as_deref() == Some("PERPETUAL"),
+            };
+        if listed {
+            list.push(&s.symbol, binance_instrument(s, kind));
+        }
+    }
+    Ok(list)
+}
+
+fn binance_instrument(s: &BinanceSymbol, kind: InstrumentKind) -> Result<Instrument, String> {
+    let filter = |name: &str| s.filters.iter().find(|f| f.filter_type == name);
+    let field = |name: &str, value: Option<&Option<String>>| -> Result<f64, String> {
+        let text = value
+            .and_then(Option::as_deref)
+            .ok_or_else(|| format!("no {name} filter value"))?;
+        number(name, text)
+    };
+    let price = filter("PRICE_FILTER");
+    let lot = filter("LOT_SIZE");
+    let min_notional = match kind {
+        // Spot moved from MIN_NOTIONAL to NOTIONAL in 2023; read whichever is there.
+        InstrumentKind::Spot => {
+            let f = filter("NOTIONAL").or_else(|| filter("MIN_NOTIONAL"));
+            field("NOTIONAL.minNotional", f.map(|f| &f.min_notional))?
+        }
+        InstrumentKind::Perpetual => field(
+            "MIN_NOTIONAL.notional",
+            filter("MIN_NOTIONAL").map(|f| &f.notional),
+        )?,
+    };
+    Ok(Instrument {
+        id: InstrumentId {
+            venue: Venue::Binance,
+            symbol: s.symbol.clone(),
+            kind,
+        },
+        base: s.base_asset.clone(),
+        quote: s.quote_asset.clone(),
+        tick_size: field("PRICE_FILTER.tickSize", price.map(|f| &f.tick_size))?,
+        lot_size: field("LOT_SIZE.stepSize", lot.map(|f| &f.step_size))?,
+        min_qty: field("LOT_SIZE.minQty", lot.map(|f| &f.min_qty))?,
+        min_notional,
+        fees: Binance.default_fees(kind),
+    })
+}
+
+#[derive(Debug, Deserialize)]
+struct BinanceEvent {
+    k: Option<BinanceKline>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BinanceKline {
+    t: Millis,
+    i: String,
+    o: String,
+    h: String,
+    l: String,
+    c: String,
+    v: String,
+    q: String,
+    x: bool,
+}
+
+/// Reads a Binance `<symbol>@kline_1m` frame (spot and USD-M use the same format).
+pub fn parse_stream_frame(text: &str) -> Result<Option<KlineUpdate>, DataError> {
+    let what = "a Binance kline frame";
+    let event: BinanceEvent = serde_json::from_str(text).map_err(|e| DataError::parse(what, e))?;
+    let Some(k) = event.k else {
+        return Ok(None);
+    };
+    if k.i != "1m" {
+        return Err(DataError::parse(
+            what,
+            format!("interval {:?}, not 1m", k.i),
+        ));
+    }
+    let candle = Candle {
+        open_time: k.t,
+        open: frame_number(what, &k.o)?,
+        high: frame_number(what, &k.h)?,
+        low: frame_number(what, &k.l)?,
+        close: frame_number(what, &k.c)?,
+        volume: frame_number(what, &k.v)?,
+        quote_volume: frame_number(what, &k.q)?,
+    };
+    Ok(Some(KlineUpdate {
+        candle,
+        closed: k.x,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Reads `month` through [`archive_month`] from an archive that holds the files `has` says it
+    /// holds, each with one candle at the start of its period. Returns the open times read, the
+    /// files asked for and the names reported missing.
+    fn month_from_archive(
+        month: Month,
+        range: (Millis, Millis),
+        now: Millis,
+        has: impl Fn(ArchivePeriod) -> bool,
+    ) -> (Vec<Millis>, Vec<ArchivePeriod>, Vec<String>) {
+        let (mut asked, mut missing) = (Vec::new(), Vec::new());
+        let candles = archive_month("BTCUSDT", month, range, now, &mut missing, |period| {
+            asked.push(period);
+            let open_time = match period {
+                ArchivePeriod::Month(m) => m.start(),
+                ArchivePeriod::Day(day) => day,
+            };
+            let candle = Candle {
+                open_time,
+                open: 1.0,
+                high: 1.0,
+                low: 1.0,
+                close: 1.0,
+                volume: 0.0,
+                quote_volume: 0.0,
+            };
+            Ok(has(period).then(|| vec![candle]))
+        })
+        .expect("reads");
+        let times = candles.iter().map(|c| c.open_time).collect();
+        (times, asked, missing)
+    }
+
+    #[test]
+    fn a_missing_monthly_file_falls_back_to_the_daily_files() {
+        let jan = Month::parse("2024-01").expect("a month");
+        let now = jan.end() + 40 * DAY;
+        // 2024-01-10 up to 2024-01-13, from an archive with no monthly file and no file for the 11th.
+        let [d10, d11, d12] = [9, 10, 11].map(|n| jan.start() + n * DAY);
+        let has = |p| !matches!(p, ArchivePeriod::Month(_)) && p != ArchivePeriod::Day(d11);
+        let (read, asked, missing) = month_from_archive(jan, (d10, d12 + DAY), now, has);
+        assert_eq!(
+            asked,
+            [
+                ArchivePeriod::Month(jan),
+                ArchivePeriod::Day(d10),
+                ArchivePeriod::Day(d11),
+                ArchivePeriod::Day(d12)
+            ]
+        );
+        assert_eq!(read, [d10, d12]);
+        assert_eq!(missing, ["BTCUSDT-1m-2024-01-11.zip"]);
+    }
+
+    #[test]
+    fn a_published_monthly_file_is_used_alone_and_the_current_month_reads_up_to_yesterday() {
+        let jan = Month::parse("2024-01").expect("a month");
+        let (read, asked, missing) =
+            month_from_archive(jan, (jan.start(), jan.end()), jan.end() + DAY, |_| true);
+        assert_eq!(asked, [ArchivePeriod::Month(jan)]);
+        assert_eq!(read, [jan.start()]);
+        assert!(missing.is_empty());
+        // At noon on 2024-01-03 the month has no monthly file yet, and today has no daily file.
+        let now = jan.start() + 2 * DAY + DAY / 2;
+        let (read, asked, _) = month_from_archive(jan, (jan.start(), now), now, |_| true);
+        let days = [jan.start(), jan.start() + DAY];
+        assert_eq!(asked, days.map(ArchivePeriod::Day));
+        assert_eq!(read, days);
+    }
 
     #[test]
     fn a_full_page_that_does_not_move_forward_is_an_error() {

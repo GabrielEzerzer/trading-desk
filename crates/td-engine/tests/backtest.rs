@@ -515,7 +515,9 @@ fn spot_benchmark_buys_with_all_cash_at_the_first_open() {
 
 #[test]
 fn a_two_bar_one_minute_run_has_no_infinite_metric_and_round_trips() {
-    // The benchmark gains about 0.8% in two minutes, which compounds past f64::MAX a year.
+    // The benchmark gains about 0.8% in two minutes, which would compound past f64::MAX a year;
+    // the run is far under the 90 days a CAGR needs, so it has none (the overflow guard itself
+    // is checked in the metrics unit tests).
     let bars = [
         common::bar(0, 100.0, 100.6, 99.9, 100.5),
         common::bar(1, 100.5, 101.0, 100.4, 101.0),
