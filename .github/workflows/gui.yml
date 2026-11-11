@@ -1,6 +1,9 @@
 # CI for the GUI workspace in gui/. Rules: D:/code/CLAUDE.md, "Test suites".
 # It runs on pushes to branches other than the default and on manual dispatch, so each push starts one run
-# and a branch has results before its PR exists.
+# and a branch has results before its PR exists. On a push whose branch differs from main nowhere under gui/
+# or in this file, every step after the comparison is skipped and the run passes in seconds: this workflow
+# reads nothing outside gui/ and runs no Rust, so its result could not differ from main's. The comparison is
+# with the whole branch, not the push, so a later Rust-only push on a branch that changed gui/ still runs it.
 # It runs the TypeScript suite: typecheck, the vitest tests and the electron-vite build, then the
 # Playwright UI gates against the built renderer in headless Chromium (never Electron). The test that
 # starts the real td-server binary skips itself here, since this workflow builds no Rust; ci.yml covers Rust.
@@ -31,46 +34,68 @@ jobs:
         working-directory: gui
     steps:
       - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
+        with:
+          fetch-depth: 0
+      - name: Compare the branch with main
+        id: changes
+        working-directory: .
+        run: |
+          if [ "${{ github.event_name }}" != push ] || ! git diff --quiet origin/main...HEAD -- gui .github/workflows/gui.yml; then
+            echo "gui=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::Nothing under gui/ or in this workflow differs from main, so the GUI suite was skipped."
+          fi
+      - if: steps.changes.outputs.gui == 'true'
+        uses: pnpm/action-setup@v4
         with:
           package_json_file: gui/package.json
-      - uses: actions/setup-node@v4
+      - if: steps.changes.outputs.gui == 'true'
+        uses: actions/setup-node@v4
         with:
           node-version: 24
           cache: pnpm
           cache-dependency-path: gui/pnpm-lock.yaml
       - name: Install
+        if: steps.changes.outputs.gui == 'true'
         run: pnpm install --frozen-lockfile
       - name: Typecheck
+        if: steps.changes.outputs.gui == 'true'
         run: pnpm typecheck
       - name: Test
+        if: steps.changes.outputs.gui == 'true'
         run: pnpm test
       - name: Build
+        if: steps.changes.outputs.gui == 'true'
         run: pnpm build
       - name: Cache Playwright's Chromium
+        if: steps.changes.outputs.gui == 'true'
         uses: actions/cache@v4
         with:
           path: ~/.cache/ms-playwright
           key: playwright-${{ runner.os }}-${{ hashFiles('gui/pnpm-lock.yaml') }}
       - name: Install Chromium
+        if: steps.changes.outputs.gui == 'true'
         run: pnpm exec playwright install --only-shell chromium
       # Its system libraries come from Ubuntu's mirrors. When those cannot be reached, the gates run on
       # the libraries the runner image already carries for its own Chrome; a missing library or font
       # then fails the gates or their screenshots, so nothing passes unchecked.
       - name: Install Chromium's system libraries
+        if: steps.changes.outputs.gui == 'true'
         id: deps
         continue-on-error: true
-        timeout-minutes: 5
+        timeout-minutes: 2
         run: pnpm exec playwright install-deps chromium
       - name: Warn that the system libraries were not installed
-        if: steps.deps.outcome == 'failure'
-        run: echo "::warning::Ubuntu's mirrors could not be reached; the UI gates ran on the runner image's own libraries."
+        if: steps.changes.outputs.gui == 'true' && steps.deps.outcome == 'failure'
+        run: echo "::warning::Chromium's system libraries were not installed; the UI gates ran on the runner image's own libraries."
       - name: UI gates
+        if: steps.changes.outputs.gui == 'true'
         run: pnpm gates
       # Playwright writes a missing baseline and passes, so a run that wrote one compared nothing.
       - name: Check every screenshot baseline is committed
+        if: steps.changes.outputs.gui == 'true'
         run: |
-          written=$(git status --porcelain -- e2e/__screenshots__)
+          written=$(git status --porcelain --ignored -- e2e/__screenshots__)
           if [ -n "$written" ]; then
             echo "::error::Screenshot baselines are missing from the commit. The ui-gates artifact holds them; look at them and commit them."
             echo "$written"
