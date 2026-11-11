@@ -607,7 +607,7 @@ fn unwrap_session(shared: Arc<Mutex<PaperSession>>) -> PaperSession {
 async fn live_session_stops_and_resumes(kind: InstrumentKind) {
     let tf = Timeframe::M5;
     let cfg = config(kind, tf);
-    let history = resample(&minutes(-60..0), tf, false).candles;
+    let history = resample(InstrumentKind::Spot, &minutes(-60..0), tf, false).candles;
     // A rate every hour, the ones before the session only telling it the interval.
     let funding: Vec<(Millis, f64)> = if kind.rules().funding {
         (-3..=3)
@@ -666,7 +666,7 @@ async fn live_session_stops_and_resumes(kind: InstrumentKind) {
     }
     feed_all(
         &mut reference,
-        &resample(&minutes(0..180), tf, false).candles,
+        &resample(InstrumentKind::Spot, &minutes(0..180), tf, false).candles,
         &funding,
     );
     assert!(!reference.fills().is_empty(), "the strategy trades live");
@@ -708,7 +708,7 @@ async fn a_live_perpetual_session_resumed_across_a_funding_time_charges_each_rat
 async fn a_session_that_crashed_during_warm_up_finishes_it_and_goes_live_from_the_restart() {
     let tf = Timeframe::M5;
     let cfg = config(InstrumentKind::Spot, tf);
-    let history = resample(&minutes(-60..20), tf, false).candles;
+    let history = resample(InstrumentKind::Spot, &minutes(-60..20), tf, false).candles;
     let dir = tempfile::tempdir().expect("temp dir");
     // The process died after writing five of the warm-up lines.
     let mut paper = PaperSession::create(dir.path(), "crash", cfg.clone()).expect("creates");
@@ -740,7 +740,7 @@ async fn a_session_that_crashed_during_warm_up_finishes_it_and_goes_live_from_th
     }
     feed_all(
         &mut reference,
-        &resample(&minutes(20..40), tf, false).candles,
+        &resample(InstrumentKind::Spot, &minutes(20..40), tf, false).candles,
         &[],
     );
     assert_same_state(&resumed, &reference);
@@ -754,7 +754,13 @@ async fn a_warm_up_restarted_long_after_it_crashed_is_fed_one_warm_up_of_bars_at
     let tf = Timeframe::M5;
     let cfg = config(InstrumentKind::Spot, tf);
     const DAY: i64 = 1440;
-    let history = resample(&minutes(-60..30 * DAY + 20), tf, false).candles;
+    let history = resample(
+        InstrumentKind::Spot,
+        &minutes(-60..30 * DAY + 20),
+        tf,
+        false,
+    )
+    .candles;
     let dir = tempfile::tempdir().expect("temp dir");
     // The process died after writing five of the warm-up lines...
     let mut paper = PaperSession::create(dir.path(), "late", cfg).expect("creates");
@@ -805,7 +811,7 @@ async fn a_warm_up_restarted_long_after_it_crashed_is_fed_one_warm_up_of_bars_at
 #[tokio::test(flavor = "multi_thread")]
 async fn a_session_is_live_again_once_a_failed_backfill_succeeds() {
     let tf = Timeframe::M5;
-    let history = resample(&minutes(-60..0), tf, false).candles;
+    let history = resample(InstrumentKind::Spot, &minutes(-60..0), tf, false).candles;
     // The backfill of minutes 0 and 1 fails once and succeeds on its retry.
     let rest = Arc::new(FakeRest {
         failures: Mutex::new(1),
