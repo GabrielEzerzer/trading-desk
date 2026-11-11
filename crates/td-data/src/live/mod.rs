@@ -15,8 +15,13 @@
 //! The feed never asks the clock: a gap is noticed when the next closed minute arrives, so after a
 //! reconnect the missing minutes are backfilled when the first closed minute comes in, at most a
 //! minute later. By then REST has published every minute before it.
+//!
+//! A chart feed ([`run_chart_feed_on`]) reports the same events and, beside them, the bar still
+//! forming ([`ChartEvent::Forming`]), built from the minutes in progress the stream also sends. It
+//! is for display only: paper sessions run plain feeds, which never build it.
 
 mod bars;
+mod forming;
 mod ws;
 
 use std::future::Future;
@@ -28,6 +33,7 @@ use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::{broadcast, mpsc};
 
 pub use bars::{BarBuilder, Placement};
+pub use forming::FormingBar;
 pub use ws::Greeting;
 
 pub use crate::source::LiveStream;
@@ -185,6 +191,19 @@ pub enum FeedEvent {
     BadMessage { error: String },
 }
 
+/// What a chart feed ([`run_chart_feed_on`]) reports: every event a feed reports, in the same order,
+/// and the bar still forming between them.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ChartEvent {
+    Feed(FeedEvent),
+    /// The bar of the feed's timeframe still forming, as it stands: the bucket's closed minutes so
+    /// far and the minute in progress ([`FormingBar`]). Sent on each in-progress update from the
+    /// stream, and at the end of a bucket that gives no closed bar (the first one, when the feed
+    /// joined it after it started). The closed [`FeedEvent::Bar`] of the same open time, when it
+    /// comes, comes after it and replaces it. Display only.
+    Forming(Candle),
+}
+
 /// Runs a feed on its own connection until `tx`'s receiver is dropped.
 pub async fn run_feed(spec: FeedSpec, rest: Arc<dyn Rest>, tx: mpsc::Sender<FeedEvent>) {
     let stream = Arc::new(SharedStream::open(spec.id, spec.url));
@@ -293,6 +312,31 @@ pub fn run_feed_on(
     rest: Arc<dyn Rest>,
     tx: mpsc::Sender<FeedEvent>,
 ) -> impl Future<Output = ()> + Send + 'static {
+    run_on(stream, timeframe, start, rest, Out::Feed(tx))
+}
+
+/// [`run_feed_on`] for a chart: the same events, wrapped in [`ChartEvent::Feed`], and the bar still
+/// forming as [`ChartEvent::Forming`]. When the stream was joined after the current bucket started,
+/// the bucket's earlier minutes are fetched over REST once, so the forming bar covers the whole
+/// bucket.
+pub fn run_chart_feed_on(
+    stream: Arc<SharedStream>,
+    timeframe: Timeframe,
+    start: Option<Millis>,
+    rest: Arc<dyn Rest>,
+    tx: mpsc::Sender<ChartEvent>,
+) -> impl Future<Output = ()> + Send + 'static {
+    let forming = FormingBar::new(timeframe);
+    run_on(stream, timeframe, start, rest, Out::Chart { tx, forming })
+}
+
+fn run_on(
+    stream: Arc<SharedStream>,
+    timeframe: Timeframe,
+    start: Option<Millis>,
+    rest: Arc<dyn Rest>,
+    out: Out,
+) -> impl Future<Output = ()> + Send + 'static {
     let first = stream
         .first
         .lock()
@@ -309,7 +353,7 @@ pub fn run_feed_on(
         id: stream.id.clone(),
         source: stream.source,
         rest,
-        tx,
+        out,
     };
     async move {
         // Keeps the connection open while the feed runs.
@@ -345,12 +389,23 @@ impl Drop for AbortOnDrop {
 /// The receiver of a feed's events is gone.
 struct Gone;
 
+/// Where a feed's events go.
+enum Out {
+    /// A plain feed: closed bars only.
+    Feed(mpsc::Sender<FeedEvent>),
+    /// A chart feed: the same events and the bar still forming.
+    Chart {
+        tx: mpsc::Sender<ChartEvent>,
+        forming: FormingBar,
+    },
+}
+
 struct Feed {
     id: InstrumentId,
     source: &'static dyn DataSource,
     builder: BarBuilder,
     rest: Arc<dyn Rest>,
-    tx: mpsc::Sender<FeedEvent>,
+    out: Out,
 }
 
 impl Feed {
@@ -365,8 +420,12 @@ impl Feed {
                     self.send(FeedEvent::BadMessage { error }).await
                 }
                 Ok(updates) => {
-                    for update in updates.into_iter().filter(|u| u.closed) {
-                        self.closed_minute(update.candle).await?;
+                    for update in updates {
+                        if update.closed {
+                            self.closed_minute(update.candle).await?;
+                        } else {
+                            self.minute_in_progress(update.candle).await?;
+                        }
                     }
                     Ok(())
                 }
@@ -385,7 +444,61 @@ impl Feed {
             Placement::Next => {}
         }
         let built = self.builder.push(minute);
+        // A chart's bucket that ends without a closed bar (joined late, so the builder drops it)
+        // gets its forming bar once more, now whole, so the chart does not keep a stale one.
+        let unclosed = match &mut self.out {
+            Out::Chart { forming, .. } => {
+                forming.push(minute, true)
+                    && forming.ends_bucket(minute.open_time)
+                    && forming
+                        .bucket()
+                        .is_some_and(|b| !built.candles.iter().any(|bar| bar.open_time == b))
+            }
+            Out::Feed(_) => false,
+        };
+        if unclosed {
+            self.send_forming().await?;
+        }
         self.emit(built).await
+    }
+
+    /// Takes an update of the minute in progress. Only a chart feed uses it: it updates the bar
+    /// still forming and sends it. An update that does not read as a bar is skipped here; its
+    /// minute's closed update is checked, and reported, when it comes.
+    async fn minute_in_progress(&mut self, minute: Candle) -> Result<(), Gone> {
+        let Out::Chart { forming, .. } = &mut self.out else {
+            return Ok(());
+        };
+        if check_minute(&minute).is_err() || !forming.push(minute, false) {
+            return Ok(());
+        }
+        self.send_forming().await
+    }
+
+    /// Sends a chart feed's bar still forming, first fetching the bucket's minutes before the first
+    /// one seen when it was joined after it started.
+    async fn send_forming(&mut self) -> Result<(), Gone> {
+        let Out::Chart { tx, forming } = &mut self.out else {
+            return Ok(());
+        };
+        if let Some((from, to)) = forming.missing_start() {
+            let rest = Arc::clone(&self.rest);
+            let id = self.id.clone();
+            let fetched =
+                tokio::task::spawn_blocking(move || rest.klines(&id, Timeframe::M1, from, to))
+                    .await;
+            // shortcut: one try per bucket, so a failed fetch leaves the bar without its first
+            // minutes until the bucket ends; retry with backoff if that shows on the charts.
+            let minutes = match fetched {
+                Ok(Ok(minutes)) => minutes,
+                _ => Vec::new(),
+            };
+            forming.fill(minutes.into_iter().filter(|m| check_minute(m).is_ok()));
+        }
+        match forming.bar() {
+            Some(bar) => tx.send(ChartEvent::Forming(bar)).await.map_err(|_| Gone),
+            None => Ok(()),
+        }
     }
 
     /// Fetches the minutes `[from, to)` over REST and takes them, retrying with backoff until the
@@ -423,6 +536,9 @@ impl Feed {
                 self.emit(built).await?;
             }
             let built = self.builder.push(minute);
+            if let Out::Chart { forming, .. } = &mut self.out {
+                forming.push(minute, true);
+            }
             self.emit(built).await?;
         }
         let built = self.builder.settle(to);
@@ -450,7 +566,11 @@ impl Feed {
     }
 
     async fn send(&self, event: FeedEvent) -> Result<(), Gone> {
-        self.tx.send(event).await.map_err(|_| Gone)
+        let sent = match &self.out {
+            Out::Feed(tx) => tx.send(event).await.is_ok(),
+            Out::Chart { tx, .. } => tx.send(ChartEvent::Feed(event)).await.is_ok(),
+        };
+        if sent { Ok(()) } else { Err(Gone) }
     }
 }
 
