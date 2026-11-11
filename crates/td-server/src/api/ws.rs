@@ -15,7 +15,15 @@
 //!   each closed bar from the venue's live stream from now on, as
 //!   `{"type":"candle","topic":...,"candle":<Candle>}`. A bar that the stream skipped is
 //!   backfilled; the first bar of a timeframe above a minute comes once a whole bucket has been
-//!   seen. Every subscriber of an instrument, and every paper session on it, shares one upstream
+//!   seen. Between them comes the bar still forming, for display, as
+//!   `{"type":"candle_forming","topic":...,"candle":<Candle>}`: the bucket's closed minutes so far
+//!   and the minute in progress, sent each time the venue updates that minute (about every two
+//!   seconds) and opening at the bucket's start. A later one of the same open time replaces it,
+//!   and so does the closed `candle` of that open time, which comes after it. When the topic
+//!   starts after a bucket did, the bucket's earlier minutes are fetched from the venue first, so
+//!   the forming bar covers the whole bucket; that first bucket gives no closed `candle`, so its
+//!   last `candle_forming`, sent when its last minute closes, is whole. Paper sessions never see
+//!   forming bars. Every subscriber of an instrument, and every paper session on it, shares one upstream
 //!   connection, which closes when the last of them is gone. A subscriber that falls far behind
 //!   skips bars. One connection may hold at most [`MAX_CANDLE_TOPICS`] `candles:` topics at once,
 //!   since each instrument's first opens a venue connection and venues limit connections per IP;
@@ -53,7 +61,7 @@ use super::auth::WS_TOKEN_PROTOCOL_PREFIX;
 use super::data::parse_instrument;
 use super::error::{ApiError, ErrorBody};
 use super::jobs::JobInfo;
-use super::live::{AbortOnDrop, CandleFeed};
+use super::live::{AbortOnDrop, CandleFeed, ChartBar};
 use super::sessions::{SessionState, Sessions};
 use crate::SessionEvent;
 
@@ -91,6 +99,12 @@ pub enum ServerMessage {
     },
     /// A closed bar (`candles:` topics).
     Candle {
+        topic: String,
+        candle: Candle,
+    },
+    /// The bar still forming (`candles:` topics), for display only: it replaces an earlier one of
+    /// the same open time, and the closed `Candle` of that open time replaces it.
+    CandleForming {
         topic: String,
         candle: Candle,
     },
@@ -371,16 +385,21 @@ fn parse_topic(topic: &str, state: &AppState) -> Result<Topic, (&'static str, St
     Ok(Topic::Candles(id, timeframe))
 }
 
-/// Sends a `candles:` topic's bars to the connection. A subscriber that fell behind skips bars.
-async fn forward_candles(topic: String, mut bars: broadcast::Receiver<Candle>, sink: Sink) {
+/// Sends a `candles:` topic's bars, closed and forming, to the connection. A subscriber that fell
+/// behind skips bars.
+async fn forward_candles(topic: String, mut bars: broadcast::Receiver<ChartBar>, sink: Sink) {
     loop {
-        let candle = match bars.recv().await {
-            Ok(candle) => candle,
+        let bar = match bars.recv().await {
+            Ok(bar) => bar,
             Err(RecvError::Lagged(_)) => continue,
             Err(RecvError::Closed) => return,
         };
         let topic = topic.clone();
-        if !sink.send(ServerMessage::Candle { topic, candle }).await {
+        let message = match bar {
+            ChartBar::Closed(candle) => ServerMessage::Candle { topic, candle },
+            ChartBar::Forming(candle) => ServerMessage::CandleForming { topic, candle },
+        };
+        if !sink.send(message).await {
             return;
         }
     }

@@ -1,6 +1,7 @@
 // Types for harness.mjs, for the TypeScript specs in app/e2e.
 import type { Page } from '@playwright/test'
 import type { Server } from 'node:http'
+import type { Candle } from '@td/shared'
 
 export interface Size {
   name: string
@@ -21,6 +22,13 @@ export interface StubConfig {
   stepMs?: number
   /** GET /sessions fails this many times before it answers. */
   failSessions?: number
+  /**
+   * How GET /candles answers, by instrument (`venue:symbol:kind`) or `*`: after that many
+   * milliseconds, never (`hang`), or with the engine's 502 (`fail`). At once without an entry.
+   */
+  history?: Record<string, number | 'hang' | 'fail'>
+  /** Live bars on every `candles:` topic: a closed bar each `everyMs`, walking on from `start`. */
+  candles?: { start: Candle; everyMs: number } | null
 }
 
 export interface State {
