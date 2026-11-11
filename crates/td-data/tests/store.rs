@@ -949,6 +949,42 @@ fn a_1m_link_is_reported_and_not_read() {
     assert_eq!(strays(&stored), ["candles/binance/spot/ETHUSDT/1m"]);
 }
 
+#[test]
+fn a_candles_or_funding_link_is_reported_and_neither_listed_nor_deleted_through() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let store = Store::new(dir.path().join("store"));
+    let outside = dir.path().join("outside");
+    let perp = btc(InstrumentKind::Perpetual);
+    // Month and funding files laid out as the store lays them out, in a folder outside it.
+    for (top, file) in [
+        (
+            "candles",
+            store.candle_path(&perp, month("2024-01")).unwrap(),
+        ),
+        ("funding", store.funding_path(&perp).unwrap()),
+    ] {
+        let below = file.strip_prefix(store.root().join(top)).expect("under it");
+        let target = outside.join(top);
+        std::fs::create_dir_all(target.join(below).parent().unwrap()).expect("a folder");
+        std::fs::write(target.join(below), b"keep").expect("writes");
+        std::fs::create_dir_all(store.root()).expect("a folder");
+        link_dir(&target, &store.root().join(top));
+    }
+    let before = tree(&outside);
+
+    let stored = store.stored().expect("lists");
+    assert!(
+        stored.instruments.is_empty(),
+        "nothing is listed through the links: {stored:?}"
+    );
+    assert_eq!(strays(&stored), ["candles", "funding"]);
+    assert_eq!(
+        store.delete_instrument(&perp).expect("deletes nothing"),
+        DeleteReport::default()
+    );
+    assert_eq!(tree(&outside), before, "nothing outside was removed");
+}
+
 /// A file another program holds open without sharing cannot be removed on Windows; elsewhere an
 /// open file can be.
 #[cfg(windows)]

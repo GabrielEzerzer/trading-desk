@@ -495,7 +495,7 @@ impl Store {
     pub fn stored(&self) -> Result<StoredData, DataError> {
         let mut found: BTreeMap<InstrumentId, StoredInstrument> = BTreeMap::new();
         let mut unrecognised = Vec::new();
-        for (venue, venue_dir) in self.named_dirs(&self.root.join("candles"), &mut unrecognised)? {
+        for (venue, venue_dir) in self.venue_dirs("candles", &mut unrecognised)? {
             let Some(venue) = parse_name::<Venue>(&venue) else {
                 unrecognised.push(self.relative(&venue_dir));
                 continue;
@@ -549,7 +549,7 @@ impl Store {
                 }
             }
         }
-        for (venue, venue_dir) in self.named_dirs(&self.root.join("funding"), &mut unrecognised)? {
+        for (venue, venue_dir) in self.venue_dirs("funding", &mut unrecognised)? {
             let Some(venue) = parse_name::<Venue>(&venue) else {
                 unrecognised.push(self.relative(&venue_dir));
                 continue;
@@ -639,6 +639,24 @@ impl Store {
             }
         }
         Ok(report)
+    }
+
+    /// The venue folders under the root's `candles` or `funding`. A link or a file of that name
+    /// is reported and not read, as [`Store::named_dirs`] does for everything below it, so the
+    /// listing never shows data a delete refuses to touch.
+    fn venue_dirs(
+        &self,
+        top: &str,
+        unrecognised: &mut Vec<PathBuf>,
+    ) -> Result<Vec<(String, PathBuf)>, DataError> {
+        let dir = self.root.join(top);
+        match fs::symlink_metadata(&dir) {
+            Ok(meta) if !meta.is_dir() => {
+                unrecognised.push(self.relative(&dir));
+                Ok(Vec::new())
+            }
+            _ => self.named_dirs(&dir, unrecognised),
+        }
     }
 
     /// The subfolders of `dir` with their names, sorted; a missing `dir` has none. A file, or a
