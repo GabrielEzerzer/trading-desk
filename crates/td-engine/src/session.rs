@@ -178,7 +178,9 @@ impl Session {
 
     /// [`Session::on_bar`] for a market with a bid and an ask: `bar` is the bid candle and `ask`
     /// the ask candle of the same bar. A kind whose rules have quotes needs an ask on every bar, and
-    /// any other kind must not have one; the ask must be a valid candle with the bar's open time.
+    /// any other kind must not have one; the ask must be a valid candle with the bar's open time,
+    /// and each of its open, high, low and close at or above the bid's (see
+    /// [`EngineError::CrossedQuote`]).
     ///
     /// Each order sees the candle of its own side (see [`SimBroker`]), and an open position is
     /// marked at the close of the side that would close it: a long at the bid close and a short at
@@ -443,7 +445,7 @@ impl Session {
     }
 
     /// Checks that `ask` is the ask candle `bar` needs: one for a kind whose rules have quotes,
-    /// with the bar's open time, and none for any other kind.
+    /// with the bar's open time and never below the bid, and none for any other kind.
     fn check_ask(&self, bar: &Candle, ask: Option<Candle>) -> Result<(), EngineError> {
         let kind = self.instrument.id.kind;
         match ask {
@@ -456,7 +458,21 @@ impl Session {
             Some(ask) if ask.open_time != bar.open_time => Err(EngineError::UnmatchedAsk {
                 time: ask.open_time,
             }),
-            Some(ask) => Ok(ask.validate()?),
+            Some(ask) => {
+                ask.validate()?;
+                // The ask is at or above the bid at every instant, so also at the open and the
+                // close, at the highest bid and at the lowest ask.
+                if ask.open < bar.open
+                    || ask.high < bar.high
+                    || ask.low < bar.low
+                    || ask.close < bar.close
+                {
+                    return Err(EngineError::CrossedQuote {
+                        time: bar.open_time,
+                    });
+                }
+                Ok(())
+            }
         }
     }
 

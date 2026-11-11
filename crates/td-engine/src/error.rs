@@ -34,6 +34,11 @@ pub enum EngineError {
     #[error("the ask at {time} matches no bar")]
     UnmatchedAsk { time: Millis },
 
+    /// An ask whose open, high, low or close is below the bid's: real quotes never cross, so the
+    /// series are wrong, for example swapped. Equal is a zero spread and allowed.
+    #[error("the ask for the bar at {time} is below the bid")]
+    CrossedQuote { time: Millis },
+
     #[error("bar at {time} lies wholly in the market's closed hours")]
     ClosedBar { time: Millis },
 

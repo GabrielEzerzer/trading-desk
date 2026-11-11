@@ -194,21 +194,30 @@ fn a_shorts_stop_triggers_on_the_ask_high_and_fills_at_the_ask_open_or_the_trigg
 
 #[test]
 fn a_shorts_stop_ignores_the_bid_high() {
-    // The bid high, 150.550, crosses the 150.500 stop, but the ask high, 150.490, does not. The
-    // quote is crossed at the high, which real data never is; it isolates which side the stop
-    // reads. A buy stop reads the ask, so it stays open.
+    // Short 1000 at bar 0's close with a stop at 150.500; bars 1 and 2 have a 0.050 spread.
+    // Bar 1: the entry sells at the bid open, 150.000, and the stop rests, since the ask high,
+    // 150.150, is short of it. Bar 2: the ask high, 150.530, reaches 150.500 while the bid high,
+    // 150.480, stays below it. A resting buy stop reads the ask, so it fills on bar 2 at
+    // max(150.150, 150.500) = 150.500; read on the bid it would still be open.
     let s = run_fx(
         vec![(0, Send::WithStop(market(Side::Sell, 1000.0), 150.500))],
         &[
             DECIDE,
             (
-                [150.000, 150.550, 149.900, 150.100],
-                [150.020, 150.490, 149.920, 150.120],
+                [150.000, 150.100, 149.900, 150.050],
+                [150.050, 150.150, 149.950, 150.100],
+            ),
+            (
+                [150.100, 150.480, 150.000, 150.200],
+                [150.150, 150.530, 150.050, 150.250],
             ),
         ],
     );
-    assert_eq!(fills(&s), [(Side::Sell, 150.000, 1000.0)]);
-    assert_eq!(s.open_orders().len(), 1);
+    assert_eq!(
+        fills(&s),
+        [(Side::Sell, 150.000, 1000.0), (Side::Buy, 150.500, 1000.0)]
+    );
+    assert_eq!(s.fills()[1].time, 2 * MIN);
 }
 
 #[test]
@@ -232,20 +241,30 @@ fn a_longs_stop_triggers_on_the_bid_low_and_ignores_the_ask_low() {
         [(Side::Buy, 150.020, 1000.0), (Side::Sell, 149.500, 1000.0)]
     );
 
-    // The ask low, 149.490, crosses the stop but the bid low, 149.510, does not: crossed at the
-    // low, as above, to isolate the side. The sell stop stays open.
+    // The same stop resting to a later bar, with a 0.050 spread. Bar 1: the entry buys at the ask
+    // open, 150.050, and the stop rests, since the bid low, 149.900, is above it. Bar 2: the bid
+    // low, 149.480, reaches 149.500 while the ask low, 149.530, stays above it. A resting sell
+    // stop reads the bid, so it fills on bar 2 at min(149.900, 149.500) = 149.500; read on the ask
+    // it would still be open.
     let s = run_fx(
         vec![(0, Send::WithStop(market(Side::Buy, 1000.0), 149.500))],
         &[
             DECIDE,
             (
-                [150.000, 150.100, 149.510, 149.800],
-                [150.020, 150.120, 149.490, 149.820],
+                [150.000, 150.100, 149.900, 149.950],
+                [150.050, 150.150, 149.950, 150.000],
+            ),
+            (
+                [149.900, 150.000, 149.480, 149.700],
+                [149.950, 150.050, 149.530, 149.750],
             ),
         ],
     );
-    assert_eq!(fills(&s), [(Side::Buy, 150.020, 1000.0)]);
-    assert_eq!(s.open_orders().len(), 1);
+    assert_eq!(
+        fills(&s),
+        [(Side::Buy, 150.050, 1000.0), (Side::Sell, 149.500, 1000.0)]
+    );
+    assert_eq!(s.fills()[1].time, 2 * MIN);
 }
 
 #[test]
@@ -597,6 +616,76 @@ fn an_fx_run_needs_matching_asks_and_a_spot_run_refuses_them() {
             kind: InstrumentKind::Spot
         }
     );
+}
+
+#[test]
+fn an_ask_below_the_bid_is_refused() {
+    // Every bar's bid, and an ask 0.020 above it at each price.
+    let bid = [150.000, 150.100, 149.900, 150.050];
+    let ask = [150.020, 150.120, 149.920, 150.070];
+    // The ask with its open, high, low or close 0.010 below the bid's, still a valid candle.
+    let crossed = [
+        [149.990, 150.120, 149.920, 150.070],
+        [150.020, 150.090, 149.920, 150.070],
+        [150.020, 150.120, 149.890, 150.070],
+        [150.020, 150.120, 149.920, 150.040],
+    ];
+    let config = fx_backtest(8);
+    let bids: Vec<Candle> = (0..8).map(|i| candle(i, bid)).collect();
+    let asks_with = |at_3: [f64; 4]| -> Vec<Candle> {
+        (0..8)
+            .map(|i| candle(i, if i == 3 { at_3 } else { ask }))
+            .collect()
+    };
+    assert!(td_engine::run(&config, &bids, &asks_with(ask), &[]).is_ok());
+    for prices in crossed {
+        // In a run, at minute 3.
+        assert_eq!(
+            td_engine::run(&config, &bids, &asks_with(prices), &[]).unwrap_err(),
+            EngineError::CrossedQuote { time: 3 * MIN },
+            "{prices:?}"
+        );
+        // On a session, after one good bar: refused, and nothing fed.
+        let mut s =
+            Session::new(Box::new(Plan(vec![])), usdjpy(), Timeframe::M1, fx_config()).unwrap();
+        s.on_bar_with_ask(candle(0, bid), Some(candle(0, ask)), &[])
+            .unwrap();
+        assert_eq!(
+            s.on_bar_with_ask(candle(1, bid), Some(candle(1, prices)), &[]),
+            Err(EngineError::CrossedQuote { time: MIN }),
+            "{prices:?}"
+        );
+        assert_eq!(s.bars().len(), 1);
+    }
+    // The two series swapped, as a loader that mixed up the files would pass them: the "ask" is
+    // then 0.020 below the "bid" at every price, and each round trip would earn the spread.
+    assert_eq!(
+        td_engine::run(&config, &asks_with(ask), &bids, &[]).unwrap_err(),
+        EngineError::CrossedQuote { time: 0 }
+    );
+}
+
+#[test]
+fn a_zero_spread_is_accepted() {
+    // The ask equal to the bid at every price. A buy and a sell sent at bar 0's close both fill at
+    // bar 1's open, 150.000, so the round trip costs nothing.
+    let flat = [150.000, 150.000, 150.000, 150.000];
+    let ranged = [150.000, 150.100, 149.900, 150.050];
+    let s = run_fx(
+        vec![
+            (0, Send::Plain(market(Side::Buy, 1000.0))),
+            (0, Send::Plain(market(Side::Sell, 1000.0))),
+        ],
+        &[(flat, flat), (ranged, ranged)],
+    );
+    assert_eq!(
+        fills(&s),
+        [(Side::Buy, 150.000, 1000.0), (Side::Sell, 150.000, 1000.0)]
+    );
+    approx(s.portfolio().cash(), 1_000_000.0);
+    // In a run, too.
+    let bids: Vec<Candle> = (0..8).map(|i| candle(i, ranged)).collect();
+    assert!(td_engine::run(&fx_backtest(8), &bids, &bids, &[]).is_ok());
 }
 
 #[test]
