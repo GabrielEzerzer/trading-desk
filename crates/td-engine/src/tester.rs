@@ -20,6 +20,7 @@ use td_core::{Candle, Fill, Millis, Side, Timeframe};
 use crate::metrics::{self, EquitySeries, MetricsReport};
 use crate::permute::permute_bars;
 use crate::rng::{SplitMix64, derive_seed};
+use crate::risk::{EquityRange, Intrabar};
 use crate::runner::{compare, config_fingerprint, hold_over, select_bars};
 use crate::{
     BacktestConfig, BacktestResult, Benchmark, EngineError, EquityPoint, ParamKind, ParamSpec,
@@ -250,6 +251,12 @@ impl Headline {
 pub struct SweepRow {
     /// Position in the grid order. Runs that rank equal are ordered by it.
     pub index: u64,
+    /// The row's place on each axis of the grid, in the order of the spec's axes: the position
+    /// of its value in that axis's values, from 0. The grid index is these coordinates read as a
+    /// mixed-radix number with the last axis as its lowest digit. Empty in a result saved before
+    /// rows had them.
+    #[serde(default)]
+    pub coords: Vec<u64>,
     /// The full parameter set the run used, defaults included.
     pub params: Params,
     /// Whether the run ranks by its objective: it ran, made at least `min_trades` closed trades
@@ -381,13 +388,23 @@ impl Plan {
 
     /// The swept values at grid index `index` on top of the base's fixed values. The last axis
     /// changes fastest.
-    fn params(&self, base: &Params, mut index: u64) -> Params {
+    fn params(&self, base: &Params, index: u64) -> Params {
         let mut p = base.clone();
-        for a in self.axes.iter().rev() {
-            p.set(&a.name, a.value(index % a.count));
-            index /= a.count;
+        for (a, k) in self.axes.iter().zip(self.coords(index)) {
+            p.set(&a.name, a.value(k));
         }
         p
+    }
+
+    /// The position on each axis, in axis order, of grid index `index`. The last axis changes
+    /// fastest.
+    fn coords(&self, mut index: u64) -> Vec<u64> {
+        let mut coords = vec![0; self.axes.len()];
+        for (c, a) in coords.iter_mut().zip(&self.axes).rev() {
+            *c = index % a.count;
+            index /= a.count;
+        }
+        coords
     }
 }
 
@@ -629,6 +646,7 @@ fn run_row(
             let qualified = h.trades >= spec.min_trades && h.value(spec.objective.metric).is_some();
             Ok(SweepRow {
                 index,
+                coords: plan.coords(index),
                 params,
                 qualified,
                 metrics: Some(h),
@@ -637,6 +655,7 @@ fn run_row(
         }
         Err(e @ EngineError::InvalidParam { .. }) => Ok(SweepRow {
             index,
+            coords: plan.coords(index),
             params,
             qualified: false,
             metrics: None,
@@ -1120,6 +1139,11 @@ pub struct WalkForwardResult {
     pub equity: Vec<EquityPoint>,
     /// Metrics of the stitched curve, its trades and its fills.
     pub metrics: MetricsReport,
+    /// The stitched equity's range through each bar, one per point of `equity`: each test run's
+    /// [`BacktestResult::equity_extremes`] scaled by its segment's factor. Empty in a result saved
+    /// before walk-forwards had them, or when a test run has none.
+    #[serde(default)]
+    pub equity_extremes: Vec<EquityRange>,
     /// Buy and hold in each test window, stitched like the test runs: each window buys at its
     /// first test bar's open with the starting cash and holds to its last test bar's close, with
     /// the fill, fee and funding rules of a backtest's benchmark, and the windows are compounded
@@ -1222,6 +1246,7 @@ pub fn walk_forward(
     let Stitched {
         series,
         equity,
+        ranges,
         metrics,
         trades,
         fills,
@@ -1240,6 +1265,7 @@ pub fn walk_forward(
         windows: results,
         equity,
         metrics,
+        equity_extremes: ranges,
         benchmark: Some(benchmark),
         trades,
         fills,
@@ -1490,6 +1516,9 @@ pub fn stitch(starting_cash: f64, segments: &[&[EquityPoint]]) -> Vec<EquityPoin
 /// One run stitched into a curve: a test run's, or buy and hold's in a test window.
 struct Segment<'a> {
     equity: &'a [EquityPoint],
+    /// The equity's range through each bar, one per point of `equity`, or empty.
+    ranges: &'a [EquityRange],
+    peak_leverage: Option<f64>,
     fills: &'a [Fill],
     trades: &'a [Trade],
     funding_paid: f64,
@@ -1503,6 +1532,8 @@ fn test_segments(windows: &[WindowResult]) -> Vec<Segment<'_>> {
             let r = &w.out_of_sample;
             Segment {
                 equity: &r.equity,
+                ranges: &r.equity_extremes,
+                peak_leverage: r.metrics.peak_leverage,
                 fills: &r.fills,
                 trades: &r.trades,
                 funding_paid: r.metrics.funding_paid,
@@ -1539,6 +1570,8 @@ fn stitched_benchmark(
         .iter()
         .map(|h| Segment {
             equity: &h.equity,
+            ranges: &h.intrabar.ranges,
+            peak_leverage: h.intrabar.peak_leverage,
             fills: &h.fills,
             trades: &h.trades,
             funding_paid: h.funding_paid,
@@ -1562,6 +1595,9 @@ struct Stitched {
     /// The stitched curve as the metrics read it, starting from the starting cash.
     series: EquitySeries,
     equity: Vec<EquityPoint>,
+    /// The stitched equity's range through each bar, or empty unless every segment has one per
+    /// bar.
+    ranges: Vec<EquityRange>,
     metrics: MetricsReport,
     trades: Vec<Trade>,
     fills: Vec<Fill>,
@@ -1571,6 +1607,12 @@ struct Stitched {
 /// scaled by the segment's factor, so trade P&L adds up to the stitched equity's changes. A
 /// segment with factor 0 (after ruin) contributes no trades or fills: zero-sized ones would
 /// count as trades in the statistics without having traded anything.
+///
+/// Each segment's equity range through a bar is scaled by the same factor, since the stitched
+/// account holds the scaled position, so the intrabar metrics are those of the stitched account.
+/// They are left out (as in a result without ranges) unless every segment has a range per bar.
+/// The peak leverage, a ratio the scaling leaves unchanged, is the highest of the segments with a
+/// factor above 0.
 fn stitched_report(base: &BacktestConfig, runs: &[Segment]) -> Stitched {
     let cash = base.starting_cash;
     let segments: Vec<&[EquityPoint]> = runs.iter().map(|r| r.equity).collect();
@@ -1581,7 +1623,14 @@ fn stitched_report(base: &BacktestConfig, runs: &[Segment]) -> Stitched {
     let mut fills: Vec<Fill> = Vec::new();
     let mut trades: Vec<Trade> = Vec::new();
     let mut funding = 0.0;
+    let mut ranges: Vec<EquityRange> = Vec::with_capacity(equity.len());
+    let mut peak_leverage: Option<f64> = None;
+    let has_ranges = runs.iter().all(|r| r.ranges.len() == r.equity.len());
     for (r, s) in runs.iter().zip(scales) {
+        ranges.extend(r.ranges.iter().map(|x| EquityRange {
+            low: x.low * s,
+            high: x.high * s,
+        }));
         // The position after each bar's fills, rebuilt from the fills (a fill's time is the open
         // time of the bar it filled on) and snapped to the lot size against rounding error.
         let mut position = 0.0;
@@ -1605,6 +1654,9 @@ fn stitched_report(base: &BacktestConfig, runs: &[Segment]) -> Stitched {
         if s == 0.0 {
             continue;
         }
+        if let Some(l) = r.peak_leverage {
+            peak_leverage = Some(peak_leverage.map_or(l, |p| p.max(l)));
+        }
         fills.extend(r.fills.iter().map(|f| Fill {
             qty: f.qty * s,
             fee: f.fee * s,
@@ -1616,15 +1668,32 @@ fn stitched_report(base: &BacktestConfig, runs: &[Segment]) -> Stitched {
             fees: t.fees * s,
             funding: t.funding * s,
             net_pnl: t.net_pnl * s,
+            mae: t.mae.map(|x| x * s),
+            mfe: t.mfe.map(|x| x * s),
             ..t.clone()
         }));
         funding += r.funding_paid * s;
     }
+    if !has_ranges {
+        ranges.clear();
+    }
+    let intrabar = Intrabar {
+        ranges,
+        peak_leverage,
+    };
     let series = EquitySeries::new(cash, &equity, base.timeframe);
-    let metrics = metrics::report(&series, &positions, &trades, &fills, funding);
+    let metrics = metrics::report_with(
+        &series,
+        has_ranges.then_some(&intrabar),
+        &positions,
+        &trades,
+        &fills,
+        funding,
+    );
     Stitched {
         series,
         equity,
+        ranges: intrabar.ranges,
         metrics,
         trades,
         fills,

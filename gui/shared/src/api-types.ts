@@ -134,6 +134,10 @@ export type Params = { [key in string]: ParamValue };
 
 /**
  * Everything that defines a backtest apart from the data itself.
+ *
+ * It loads from JSON as it saves, except that `slippage_bps` may be left out or null: it then
+ * takes [`default_slippage_bps`] for the instrument, and the configuration holds that number
+ * from then on, so the saved result records the slippage the run used.
  */
 export type BacktestConfig = { 
 /**
@@ -153,7 +157,9 @@ from: number, to: number,
  */
 starting_cash: number, 
 /**
- * Slippage on market and stop fills, in basis points of price.
+ * Slippage on market and stop fills, in basis points of price. Left out when loading, it is
+ * the instrument's default ([`default_slippage_bps`]); a value given, zero included, is
+ * used as it is.
  */
 slippage_bps: number, 
 /**
@@ -207,7 +213,12 @@ equity: Array<EquityPoint>,
 /**
  * Every order submitted, rejected ones included (warm-up bars' too), in submission order.
  */
-orders: Array<Order>, fills: Array<Fill>, trades: Array<Trade>, metrics: MetricsReport, benchmark: Benchmark, };
+orders: Array<Order>, fills: Array<Fill>, trades: Array<Trade>, metrics: MetricsReport, benchmark: Benchmark, 
+/**
+ * The lowest and highest equity inside each bar, one per bar like `equity`; see
+ * [`risk::intrabar`]. Empty in a result saved before results had them.
+ */
+equity_extremes: Array<EquityRange>, };
 
 /**
  * Buy and hold of the same instrument over the same bars: a backtest's traded bars, or in a
@@ -235,12 +246,34 @@ excess_return: number | null,
  * In a backtest the two have the same bars, and in a walk-forward the same test windows, so
  * the times match one to one.
  */
-correlation: number | null, };
+correlation: number | null, 
+/**
+ * The strategy's annualised alpha against the benchmark, on the same per-bar returns as the
+ * correlation: the intercept of the least-squares fit of the strategy's returns on the
+ * benchmark's, times the returns observed per 365-day year (simple, not compounded), with a
+ * risk-free rate of zero; see [`metrics::alpha_beta`]. The returns per year are their count
+ * over the time from the first to the last point of the strategy's equity series, so a market
+ * that closes (FX at weekends) or a gap in the data is not counted as bars it did not have. A
+ * return across a gap in the bars, or between two walk-forward test windows, counts as one
+ * return. `None` when the correlation would be, and in a result saved before benchmarks had
+ * it.
+ */
+alpha: number | null, 
+/**
+ * The slope of that fit, `cov(strategy, benchmark) / var(benchmark)`: how much of the
+ * benchmark's move the strategy's equity follows.
+ */
+beta: number | null, };
 
 /**
  * Equity at the close of the bar that opened at `time`.
  */
 export type EquityPoint = { time: number, equity: number, };
+
+/**
+ * The lowest and highest equity one bar reached, in the quote asset.
+ */
+export type EquityRange = { low: number, high: number, };
 
 /**
  * An order the session accepted or rejected, with its request as rounded at submission.
@@ -332,7 +365,34 @@ return_on_notional: number,
  * gap it understates how long the position was held. For a closed trade, the time between
  * the entry and exit fills' bars is `exit_time - entry_time`.
  */
-bars_held: number, };
+bars_held: number, 
+/**
+ * The protective stop in force when the trade opened, if any: see [`attach_stops`]. `None`
+ * without one, and in a result saved before trades kept their stop.
+ */
+stop: number | null, 
+/**
+ * `net_pnl` over the initial risk, `qty * |entry_price - stop|`: the trade's result in
+ * multiples of what it risked at its stop; see [`attach_stops`]. `None` without a stop, with
+ * a stop at or beyond the entry price (no risk), or when not finite.
+ */
+r_multiple: number | null, 
+/**
+ * Maximum adverse excursion: the largest unrealised loss of the open position at any price
+ * it met, in the quote asset, before fees and funding; 0 if it never went against the
+ * entry. See [`build_trades`] for the prices counted. `None` in a result saved before
+ * trades had it.
+ */
+mae: number | null, 
+/**
+ * Maximum favourable excursion: the largest unrealised gain, measured like `mae`.
+ */
+mfe: number | null, 
+/**
+ * Closed by the end-of-run close-out (see [`crate::BacktestConfig::close_at_end`]) rather
+ * than by the strategy: in a walk-forward, at the end of its test window.
+ */
+force_closed: boolean, };
 
 export type TradeSide = "long" | "short";
 
@@ -414,7 +474,56 @@ fees_paid: number,
 /**
  * Net funding paid; negative when the position received funding.
  */
-funding_paid: number, };
+funding_paid: number, 
+/**
+ * The drawdown from the running peak measured inside bars: see
+ * [`risk::trailing_drawdown`], with each bar's equity range. `None` when the report was
+ * built without ranges (see [`report_with`]), and in a result saved before reports had it.
+ */
+max_drawdown_intrabar: number | null, 
+/**
+ * The fall from the starting equity to the lowest close, as a fraction of the starting
+ * equity; see [`risk::static_drawdown`].
+ */
+static_drawdown: number | null, 
+/**
+ * [`MetricsReport::static_drawdown`] to the lowest equity inside any bar. `None` without
+ * ranges.
+ */
+static_drawdown_intrabar: number | null, 
+/**
+ * The largest loss from one UTC day's start to its end, as a fraction of the starting
+ * equity; see [`risk::worst_daily_loss`]. Other day rollovers are in [`risk::daily_pnl`].
+ */
+worst_daily_loss: number | null, 
+/**
+ * The largest fall from one UTC day's start to its lowest equity inside a bar, as a
+ * fraction of the starting equity; see [`risk::worst_daily_loss_intraday`]. `None` without
+ * ranges.
+ */
+worst_daily_loss_intrabar: number | null, 
+/**
+ * See [`risk::Intrabar::peak_leverage`]. `None` without ranges.
+ */
+peak_leverage: number | null, 
+/**
+ * Mean R multiple of the closed trades that have one (see [`crate::attach_stops`]); trades
+ * without a stop are left out. The P&L expectancy per trade is `avg_trade_pnl`.
+ */
+expectancy_r: number | null, 
+/**
+ * See [`payoff_ratio`].
+ */
+payoff_ratio: number | null, 
+/**
+ * See [`longest_losing_streak`].
+ */
+longest_losing_streak: number, 
+/**
+ * Closed trades the end-of-run close-out closed (see [`Trade::force_closed`]): at most one
+ * in a backtest with `close_at_end`, up to one per test window in a walk-forward.
+ */
+force_closed_trades: number, };
 
 /**
  * The values one parameter takes in a sweep.
@@ -481,6 +590,13 @@ export type SweepRow = {
  * Position in the grid order. Runs that rank equal are ordered by it.
  */
 index: number, 
+/**
+ * The row's place on each axis of the grid, in the order of the spec's axes: the position
+ * of its value in that axis's values, from 0. The grid index is these coordinates read as a
+ * mixed-radix number with the last axis as its lowest digit. Empty in a result saved before
+ * rows had them.
+ */
+coords: Array<number>, 
 /**
  * The full parameter set the run used, defaults included.
  */
@@ -659,6 +775,12 @@ equity: Array<EquityPoint>,
  */
 metrics: MetricsReport, 
 /**
+ * The stitched equity's range through each bar, one per point of `equity`: each test run's
+ * [`BacktestResult::equity_extremes`] scaled by its segment's factor. Empty in a result saved
+ * before walk-forwards had them, or when a test run has none.
+ */
+equity_extremes: Array<EquityRange>, 
+/**
  * Buy and hold in each test window, stitched like the test runs: each window buys at its
  * first test bar's open with the starting cash and holds to its last test bar's close, with
  * the fill, fee and funding rules of a backtest's benchmark, and the windows are compounded
@@ -715,6 +837,291 @@ export type SavedRun = { "kind": "backtest", "result": BacktestResult } | { "kin
  * segment's, or the stitched walk-forward curve's.
  */
 export type RunSummary = { id: RunId, created_at: number, kind: RunKind, strategy: string, instrument: InstrumentId, timeframe: Timeframe, from: number, to: number, total_return: number | null, cagr: number | null, sharpe: number | null, max_drawdown: number | null, trades: number, };
+
+/**
+ * Everything the battery needs to test a strategy, with no data.
+ */
+export type TestPlan = { 
+/**
+ * Each instrument is tested on its own and gets its own verdict.
+ */
+instruments: Array<InstrumentId>, timeframe: Timeframe, period: Period, backtest: BacktestSettings, sweep: SweepPlan, walk_forward: WalkForwardPlan, 
+/**
+ * A single in-sample / out-of-sample split, reported only. `None` leaves it out.
+ */
+out_of_sample: Split | null, evidence: EvidenceSettings, };
+
+/**
+ * Bars that open at or after `from` and before `to`. Both must be bar boundaries.
+ */
+export type Period = { from: number, to: number, };
+
+/**
+ * What every run of the plan shares.
+ */
+export type BacktestSettings = { 
+/**
+ * Starting balance in the quote asset.
+ */
+starting_cash: number, 
+/**
+ * The perpetual leverage cap, as in [`BacktestConfig::max_leverage`]; 1.0 is 1x.
+ */
+max_leverage: number, 
+/**
+ * Slippage set for some of the plan's instruments. An instrument not listed here uses the
+ * backtest config's default slippage for that instrument (#35: 2 bps on BTC and ETH, 5 bps
+ * on other large caps); an empty list uses the default everywhere.
+ */
+slippage: Array<SlippageOverride>, };
+
+/**
+ * One instrument's slippage, overriding the backtest config's default for it.
+ */
+export type SlippageOverride = { 
+/**
+ * One of the plan's instruments.
+ */
+instrument: InstrumentId, 
+/**
+ * Slippage on market and stop fills, in basis points of price.
+ */
+bps: number, };
+
+/**
+ * The parameter grid. It always runs as a full grid, because the plateau test (R5) reads each
+ * set's neighbours on it.
+ */
+export type SweepPlan = { 
+/**
+ * Parameters the sweep does not vary; the rest take the strategy's defaults.
+ */
+fixed: Params, axes: Array<ParamAxis>, objective: Objective, 
+/**
+ * See [`SweepSpec::min_trades`].
+ */
+min_trades: number, };
+
+/**
+ * Rolling walk-forward windows, in days of bars: a day is 24 hours of bars of the plan's
+ * timeframe, so on an FX pair, closed at weekends, a window spans more calendar days. Each test
+ * segment starts where the previous one ended, so the stitched out-of-sample curve has no holes.
+ * Both lengths must be whole bars of the timeframe.
+ */
+export type WalkForwardPlan = { train_days: number, test_days: number, };
+
+/**
+ * The common evidence layer (#35, R2 to R6). Every field is a number: there is no way to switch a
+ * test off. The defaults are #35's.
+ */
+export type EvidenceSettings = { min_sample: MinSample, luck: LuckTest, 
+/**
+ * R4: fees and slippage are multiplied by this, and the strategy must stay profitable.
+ */
+cost_stress: number, plateau: Plateau, 
+/**
+ * R6: how many different start offsets must all give a result of the same sign.
+ */
+start_offsets: number, };
+
+/**
+ * R2: below any of these, the verdict is `not_enough_evidence`.
+ *
+ * A day here is a day of bars, as in [`WalkForwardPlan`]: 24 hours of the market's open bars,
+ * so the days a market is closed (an FX pair's weekends) do not count. It is the unit the
+ * walk-forward windows are laid in, so a run's out-of-sample days are its windows times
+ * `test_days`.
+ */
+export type MinSample = { 
+/**
+ * Closed out-of-sample trades.
+ */
+trades: number, 
+/**
+ * Days of bars covered by the stitched out-of-sample curve, as defined above.
+ */
+days: number, 
+/**
+ * Walk-forward windows.
+ */
+windows: number, };
+
+/**
+ * R3: the same sweep repeated on bar permutations.
+ */
+export type LuckTest = { permutations: number, 
+/**
+ * p at or below this passes.
+ */
+pass_p: number, 
+/**
+ * p above `pass_p` and at or below this gives `not_enough_evidence`; above it fails.
+ */
+inconclusive_p: number, };
+
+/**
+ * R5: how the best parameter set's neighbours on the grid must do.
+ */
+export type Plateau = { 
+/**
+ * The neighbours' median objective over the best set's must be at least this.
+ */
+min_median_ratio: number, 
+/**
+ * At least this share of the neighbours must be profitable.
+ */
+min_positive_share: number, };
+
+export type RuleKind = "prop_firm" | "portfolio" | "high_risk";
+
+/**
+ * What counts as tradable for one strategy: a kind with that strategy's limits. Each kind's
+ * limits default to #35's; a strategy overrides a field by naming it.
+ */
+export type VerdictRule = { "kind": "prop_firm", firm: FirmLimits, limits: PropFirmLimits, } | { "kind": "portfolio", benchmark: PortfolioBenchmark, limits: PortfolioLimits, } | { "kind": "high_risk", limits: HighRiskLimits, };
+
+/**
+ * A prop firm's own rules. Losses and drawdowns are fractions of the starting balance.
+ *
+ * shortcut: no time limit on the challenge; add one if a firm the desk trades on has it.
+ */
+export type FirmLimits = { 
+/**
+ * The largest loss allowed within one day.
+ */
+daily_loss: number, 
+/**
+ * The largest drawdown allowed, measured as `drawdown` says.
+ */
+max_drawdown: number, drawdown: DrawdownMode, 
+/**
+ * The profit that passes the challenge.
+ */
+profit_target: number, };
+
+export type DrawdownMode = "static" | "trailing";
+
+export type PropFirmLimits = { 
+/**
+ * The worst daily loss and the max drawdown, measured inside bars, must stay within this
+ * share of the firm's limits.
+ */
+share_of_firm_limits: number, 
+/**
+ * The chance of reaching the profit target before breaching a limit must be at least this.
+ */
+min_pass_probability: number, 
+/**
+ * The chance of breaching a limit within `breach_horizon_days` must be at most this.
+ */
+max_breach_probability: number, breach_horizon_days: number, };
+
+export type PortfolioBenchmark = "buy_and_hold" | "cash";
+
+export type PortfolioLimits = { 
+/**
+ * Out-of-sample Sharpe at least this.
+ */
+min_sharpe: number, 
+/**
+ * Max drawdown, as a fraction of its peak, at most this.
+ */
+max_drawdown: number, 
+/**
+ * Max drawdown at most this share of the benchmark's. Not judged against `cash`, which has
+ * none.
+ */
+max_drawdown_vs_benchmark: number, 
+/**
+ * Annualised alpha against the benchmark strictly above this.
+ */
+min_alpha: number, 
+/**
+ * The bootstrap chance that the mean daily return is zero or less, at most this.
+ */
+max_p_mean_not_positive: number, };
+
+export type HighRiskLimits = { 
+/**
+ * Closed out-of-sample trades, at least this many.
+ */
+min_trades: number, 
+/**
+ * Mean net P&L per closed trade strictly above this, in the quote asset.
+ */
+min_expectancy: number, 
+/**
+ * The bootstrap's lower bound on that mean strictly above this.
+ */
+min_expectancy_lower_bound: number, 
+/**
+ * Profit factor at least this.
+ */
+min_profit_factor: number, 
+/**
+ * The chance of losing `ruin_drawdown` of the account, at most this.
+ */
+max_risk_of_ruin: number, 
+/**
+ * The drawdown from the peak that counts as ruin.
+ */
+ruin_drawdown: number, 
+/**
+ * The out-of-sample return with the single best trade removed, strictly above this.
+ */
+min_return_without_best_trade: number, };
+
+export type Layer = "integrity" | "evidence" | "kind";
+
+/**
+ * How a value is held against its limit.
+ */
+export type Comparison = "at_least" | "above" | "at_most";
+
+/**
+ * How the GUI writes a value and its limit.
+ */
+export type Unit = "percent" | "ratio" | "count" | "days" | "quote";
+
+export type Outcome = "pass" | "warn" | "fail" | "inconclusive";
+
+/**
+ * One criterion of a verdict.
+ */
+export type Criterion = { layer: Layer, 
+/**
+ * A stable key, such as `max_drawdown`.
+ */
+id: string, 
+/**
+ * What the GUI shows, such as "Max drawdown".
+ */
+name: string, 
+/**
+ * `None` when the battery could not compute it; the criterion then does not pass.
+ */
+value: number | null, comparison: Comparison, 
+/**
+ * `None` when there is no limit to hold the value against, such as a drawdown against a
+ * benchmark whose drawdown is missing; the line is then inconclusive and `note` says why.
+ */
+limit: number | null, unit: Unit, outcome: Outcome, 
+/**
+ * Why the line warns or is inconclusive, in words the GUI shows. `None` when the value and
+ * the limit say it all.
+ */
+note: string | null, };
+
+export type VerdictState = "trade" | "no_trade" | "not_enough_evidence" | "invalid";
+
+/**
+ * One instrument's verdict.
+ */
+export type Verdict = { instrument: InstrumentId, state: VerdictState, 
+/**
+ * Every line of every layer that was judged, integrity first.
+ */
+criteria: Array<Criterion>, };
 
 /**
  * The line the binary prints to stdout once it listens, for the app that started it.
@@ -910,9 +1317,14 @@ missing: Array<BarSpan>, };
 export type BarSpan = { from: number, to: number, bars: number, };
 
 /**
- * A strategy the apps can run, with the parameters it takes.
+ * A strategy the apps can run, with the parameters it takes, the plan the battery tests it on
+ * and the rule its verdict is judged by.
  */
-export type StrategyInfo = { name: string, description: string, params: Array<ParamSpec>, };
+export type StrategyInfo = { name: string, description: string, params: Array<ParamSpec>, 
+/**
+ * The rule's kind, for the Lab's picker; the same as `rule.kind`.
+ */
+kind: RuleKind, plan: TestPlan, rule: VerdictRule, };
 
 /**
  * Returned when a job is accepted.
@@ -1017,14 +1429,15 @@ export type DataReport = {
 bars: number, 
 /**
  * Every stretch of minutes in the range (warm-up included) the store has no candle for,
- * oldest first, including any at the start or the end of the range. Each is shorter than a
- * day; a longer one refuses the run.
+ * oldest first, including any at the start or the end of the range, in the instrument's open
+ * hours. Each is shorter than a day; a longer one refuses the run.
  */
 gaps: Array<GapInfo>, 
 /**
  * Open times of every bucket in the range the run has no bar for: buckets with no minutes at
  * all, and buckets left out because too many of their minutes are missing (td-data's rule: a
- * bucket needs its first and last minute and at most 1% missing).
+ * bucket needs its first and last open minute and at most 1% of its open minutes missing). A
+ * bucket wholly inside the market's closed hours is not listed.
  */
 dropped: Array<number>, 
 /**
@@ -1223,7 +1636,34 @@ return_on_notional: number,
  * gap it understates how long the position was held. For a closed trade, the time between
  * the entry and exit fills' bars is `exit_time - entry_time`.
  */
-bars_held: number, };
+bars_held: number, 
+/**
+ * The protective stop in force when the trade opened, if any: see [`attach_stops`]. `None`
+ * without one, and in a result saved before trades kept their stop.
+ */
+stop: number | null, 
+/**
+ * `net_pnl` over the initial risk, `qty * |entry_price - stop|`: the trade's result in
+ * multiples of what it risked at its stop; see [`attach_stops`]. `None` without a stop, with
+ * a stop at or beyond the entry price (no risk), or when not finite.
+ */
+r_multiple: number | null, 
+/**
+ * Maximum adverse excursion: the largest unrealised loss of the open position at any price
+ * it met, in the quote asset, before fees and funding; 0 if it never went against the
+ * entry. See [`build_trades`] for the prices counted. `None` in a result saved before
+ * trades had it.
+ */
+mae: number | null, 
+/**
+ * Maximum favourable excursion: the largest unrealised gain, measured like `mae`.
+ */
+mfe: number | null, 
+/**
+ * Closed by the end-of-run close-out (see [`crate::BacktestConfig::close_at_end`]) rather
+ * than by the strategy: in a walk-forward, at the end of its test window.
+ */
+force_closed: boolean, };
 
 /**
  * `POST /sessions/{id}/orders`: an order placed by hand. It goes through the same rounding,

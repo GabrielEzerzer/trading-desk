@@ -23,8 +23,12 @@ pub fn source(venue: Venue) -> &'static dyn DataSource {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct MinuteHistory {
     /// The 1-minute candles fetched, oldest first. They may reach outside the range asked for;
-    /// the caller keeps the ones inside it.
+    /// the caller keeps the ones inside it. For a kind whose rules require quotes these are the
+    /// bids.
     pub candles: Vec<Candle>,
+    /// For a kind whose rules require quotes, the ask candle of each minute in `candles`, in the
+    /// same order; empty for any other kind. Their volumes are not stored.
+    pub asks: Vec<Candle>,
     /// Files the source publishes history in that it does not have (before the symbol listed, or
     /// not yet published).
     pub missing_files: Vec<String>,
@@ -49,8 +53,9 @@ pub trait DataSource: Send + Sync {
     fn default_fees(&self, kind: InstrumentKind) -> Result<FeeSchedule, DataError>;
 
     /// The 1-minute candles of `id` with open times in `[from, to)`, which lies inside one
-    /// calendar month and ends no later than `now`. A source that publishes history as files
-    /// names the ones it lacks in [`MinuteHistory::missing_files`] rather than failing.
+    /// calendar month and ends no later than `now`, with their asks when `id`'s kind requires
+    /// quotes. A source that publishes history as files names the ones it lacks in
+    /// [`MinuteHistory::missing_files`] rather than failing.
     fn minute_history(
         &self,
         http: &Http,
@@ -106,7 +111,8 @@ pub trait LiveStream: Send + Sync {
 }
 
 /// A fake source for tests, shaped like an FX history provider: one file of 1-minute candles per
-/// day, a fixed list of spot instruments, no funding and no live stream.
+/// day, a fixed list of spot instruments, no funding and no live stream. It leaves out the minutes
+/// its kind is closed, and returns asks when told to.
 #[cfg(test)]
 pub(crate) mod fake {
     use std::sync::Mutex;
@@ -117,6 +123,10 @@ pub(crate) mod fake {
     pub(crate) struct DailyFiles {
         /// The day files it does not have, by the midnight they start at.
         pub missing_days: Vec<Millis>,
+        /// The kind whose open minutes it returns.
+        pub kind: InstrumentKind,
+        /// Whether it returns an ask for each minute.
+        pub asks: bool,
         /// Each `(from, to)` asked of [`DataSource::minute_history`].
         pub asked: Mutex<Vec<(Millis, Millis)>>,
     }
@@ -125,8 +135,32 @@ pub(crate) mod fake {
         pub(crate) fn new(missing_days: Vec<Millis>) -> Self {
             DailyFiles {
                 missing_days,
+                kind: InstrumentKind::Spot,
+                asks: false,
                 asked: Mutex::new(Vec::new()),
             }
+        }
+
+        /// A source of FX minutes, closed at weekends, with or without their asks.
+        pub(crate) fn fx(asks: bool) -> Self {
+            DailyFiles {
+                kind: InstrumentKind::Fx,
+                asks,
+                ..DailyFiles::new(Vec::new())
+            }
+        }
+    }
+
+    /// The ask of [`candle`]'s minute.
+    pub(crate) fn ask(open_time: Millis) -> Candle {
+        Candle {
+            open: 1.0002,
+            high: 1.0002,
+            low: 1.0002,
+            close: 1.0002,
+            volume: 0.0,
+            quote_volume: 0.0,
+            ..candle(open_time)
         }
     }
 
@@ -181,8 +215,15 @@ pub(crate) mod fake {
                         .missing_files
                         .push(format!("{}.csv.gz", format_date(day)));
                 } else {
-                    let minutes = (0..DAY / MINUTE).map(|m| candle(day + m * MINUTE));
-                    history.candles.extend(minutes);
+                    let minutes = (0..DAY / MINUTE)
+                        .map(|m| day + m * MINUTE)
+                        .filter(|&t| self.kind.is_open(t));
+                    for t in minutes {
+                        history.candles.push(candle(t));
+                        if self.asks {
+                            history.asks.push(ask(t));
+                        }
+                    }
                 }
                 day += DAY;
             }

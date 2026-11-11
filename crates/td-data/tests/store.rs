@@ -97,21 +97,24 @@ fn five_minute_bars() -> [Candle; 3] {
 fn resampling_matches_hand_computed_bars() {
     let t = day("2024-01-01");
     let expected = five_minute_bars();
-    let strict = resample(&minutes(), Timeframe::M5, false);
+    let strict = resample(InstrumentKind::Spot, &minutes(), Timeframe::M5, false);
     assert_eq!(strict.candles, expected[..1]);
     assert_eq!(strict.dropped, [t + 5 * MINUTE, t + 10 * MINUTE]);
     assert!(strict.tolerated.is_empty());
-    let all = resample(&minutes(), Timeframe::M5, true);
+    let all = resample(InstrumentKind::Spot, &minutes(), Timeframe::M5, true);
     assert_eq!(all.candles, expected);
     assert!(all.dropped.is_empty());
     assert_eq!(
-        resample(&minutes(), Timeframe::M1, false),
+        resample(InstrumentKind::Spot, &minutes(), Timeframe::M1, false),
         LoadedCandles {
             candles: minutes(),
             ..LoadedCandles::default()
         }
     );
-    assert_eq!(resample(&[], Timeframe::H1, true), LoadedCandles::default());
+    assert_eq!(
+        resample(InstrumentKind::Spot, &[], Timeframe::H1, true),
+        LoadedCandles::default()
+    );
 }
 
 #[test]
@@ -121,7 +124,7 @@ fn resampling_to_days_and_weeks_uses_utc_midnight_and_monday() {
     let mut input = vec![flat(sunday - MINUTE, 1.0)];
     input.extend((0..1440).map(|m| flat(sunday + m * MINUTE, 2.0)));
     input.push(flat(day("2024-01-08"), 3.0));
-    let days = resample(&input, Timeframe::D1, false);
+    let days = resample(InstrumentKind::Spot, &input, Timeframe::D1, false);
     // Saturday's bucket holds only its last minute and Monday's only its first, so both are
     // dropped as incomplete.
     assert_eq!(days.dropped, [day("2024-01-06"), day("2024-01-08")]);
@@ -130,7 +133,7 @@ fn resampling_to_days_and_weeks_uses_utc_midnight_and_monday() {
         (days.candles[0].open_time, days.candles[0].volume),
         (sunday, 1440.0)
     );
-    let weeks = resample(&input, Timeframe::W1, true).candles;
+    let weeks = resample(InstrumentKind::Spot, &input, Timeframe::W1, true).candles;
     assert_eq!(weeks.len(), 2);
     assert_eq!(weeks[0].open_time, day("2024-01-01"));
     assert_eq!((weeks[0].open, weeks[0].close), (1.0, 2.0));
@@ -140,7 +143,12 @@ fn resampling_to_days_and_weeks_uses_utc_midnight_and_monday() {
 #[test]
 fn gaps_are_runs_of_missing_minutes() {
     let t = day("2024-01-01");
-    let gaps = missing_minutes(&minutes(), t - 2 * MINUTE, t + 14 * MINUTE);
+    let gaps = missing_minutes(
+        InstrumentKind::Spot,
+        &minutes(),
+        t - 2 * MINUTE,
+        t + 14 * MINUTE,
+    );
     assert_eq!(
         gaps,
         [
@@ -159,9 +167,9 @@ fn gaps_are_runs_of_missing_minutes() {
         ]
     );
     assert_eq!(gaps[0].minutes(), 2);
-    assert!(missing_minutes(&minutes(), t, t + 7 * MINUTE).is_empty());
+    assert!(missing_minutes(InstrumentKind::Spot, &minutes(), t, t + 7 * MINUTE).is_empty());
     assert_eq!(
-        missing_minutes(&[], t, t + 3 * MINUTE),
+        missing_minutes(InstrumentKind::Spot, &[], t, t + 3 * MINUTE),
         [Gap {
             from: t,
             to: t + 3 * MINUTE
@@ -353,7 +361,12 @@ fn a_bucket_missing_its_first_minute_is_dropped() {
     assert_eq!(open_times(&loaded.candles), [ten + HOUR]);
     assert_eq!(loaded.dropped, [ten]);
     // One missing first minute is enough.
-    let loaded = resample(&flat_minutes(ten, 1..120), Timeframe::H1, false);
+    let loaded = resample(
+        InstrumentKind::Spot,
+        &flat_minutes(ten, 1..120),
+        Timeframe::H1,
+        false,
+    );
     assert_eq!(open_times(&loaded.candles), [ten + HOUR]);
     assert_eq!(loaded.dropped, [ten]);
 }
@@ -362,7 +375,7 @@ fn a_bucket_missing_its_first_minute_is_dropped() {
 fn an_hour_missing_one_middle_minute_is_dropped() {
     let t = day("2024-01-01");
     let input = flat_minutes(t, (0..120).filter(|&m| m != 30));
-    let loaded = resample(&input, Timeframe::H1, false);
+    let loaded = resample(InstrumentKind::Spot, &input, Timeframe::H1, false);
     assert_eq!(open_times(&loaded.candles), [t + HOUR]);
     assert_eq!(loaded.dropped, [t]);
     assert!(loaded.tolerated.is_empty());
@@ -382,14 +395,14 @@ fn a_day_missing_up_to_one_percent_of_its_middle_minutes_is_tolerated_and_report
     input.extend(day_missing(t + DAY, 14));
     input.extend(day_missing(t + 2 * DAY, 15));
     input.extend(day_missing(t + 3 * DAY, 0));
-    let loaded = resample(&input, Timeframe::D1, false);
+    let loaded = resample(InstrumentKind::Spot, &input, Timeframe::D1, false);
     assert_eq!(open_times(&loaded.candles), [t, t + DAY, t + 3 * DAY]);
     assert_eq!(loaded.tolerated, [(t, 10), (t + DAY, 14)]);
     assert_eq!(loaded.dropped, [t + 2 * DAY]);
     // A tolerated bar is built from the minutes that are there.
     assert_eq!(loaded.candles[0].volume, 1430.0);
     // Asking for incomplete bars keeps the day missing 15 and still reports the tolerated ones.
-    let all = resample(&input, Timeframe::D1, true);
+    let all = resample(InstrumentKind::Spot, &input, Timeframe::D1, true);
     assert_eq!(
         open_times(&all.candles),
         [t, t + DAY, t + 2 * DAY, t + 3 * DAY]
@@ -404,7 +417,7 @@ fn a_day_missing_its_first_or_last_minute_is_dropped() {
     let mut input = flat_minutes(t, 1..1440);
     input.extend(flat_minutes(t + DAY, 0..1439));
     input.extend(flat_minutes(t + 2 * DAY, 0..1440));
-    let loaded = resample(&input, Timeframe::D1, false);
+    let loaded = resample(InstrumentKind::Spot, &input, Timeframe::D1, false);
     assert_eq!(open_times(&loaded.candles), [t + 2 * DAY]);
     assert_eq!(loaded.dropped, [t, t + DAY]);
     assert!(loaded.tolerated.is_empty());

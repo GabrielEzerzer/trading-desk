@@ -25,9 +25,11 @@ mod fill;
 pub mod metrics;
 mod params;
 mod permute;
+mod plan;
 mod portfolio;
 mod registry;
 mod results;
+pub mod risk;
 mod rng;
 mod runner;
 mod session;
@@ -36,6 +38,12 @@ mod strategies;
 mod strategy;
 mod tester;
 mod trades;
+mod verdict;
+
+/// build.rs's generator for the private strategies, compiled here for its tests.
+#[cfg(test)]
+#[path = "../build/private_strategies.rs"]
+mod private_strategies_build;
 
 pub use broker::{AttachedStop, Broker, BrokerEvent, Order, OrderStatus, SimBroker};
 pub use error::{EngineError, OrderRejected};
@@ -43,17 +51,24 @@ pub use fill::{CandleFillModel, FillCheck, FillModel};
 pub use metrics::MetricsReport;
 pub use params::{ParamKind, ParamSpec, ParamValue, Params};
 pub use permute::permute_bars;
+pub use plan::{
+    BacktestSettings, EvidenceSettings, LuckTest, MIN_PERMUTATIONS, MIN_PROFITABLE_WINDOWS,
+    MinSample, Period, PlanError, Plateau, SlippageOverride, SweepPlan, TestPlan, WalkForwardPlan,
+    date,
+};
 pub use portfolio::Portfolio;
 pub use registry::{StrategyEntry, build_strategy, find_strategy, strategies};
 pub use results::{
     RunId, RunKind, RunSummary, SavedRun, StoreError, list, load, save, save_with_files,
 };
+pub use risk::{DayRollover, EquityRange};
 pub use runner::{
     BacktestConfig, BacktestResult, Benchmark, ENGINE_REVISION, Rerun, config_fingerprint,
-    data_fingerprint, rerun, run,
+    data_fingerprint, default_slippage_bps, rerun, run,
 };
 pub use session::{
-    EquityPoint, LIQUIDATION_TAG, MAINTENANCE_MARGIN_RATE, Session, SessionConfig, run_backtest,
+    CLOSE_OUT_TAG, EquityPoint, LIQUIDATION_TAG, MAINTENANCE_MARGIN_RATE, Session, SessionConfig,
+    run_backtest,
 };
 pub use strategies::gotobi_calendar;
 pub use strategy::{Context, Strategy};
@@ -63,4 +78,11 @@ pub use tester::{
     SweepSpec, TesterError, WalkForwardResult, WalkForwardSpec, Window, WindowMode, WindowResult,
     WindowSpec, out_of_sample, permutation_test, stitch, sweep, walk_forward,
 };
-pub use trades::{BarFunding, Trade, TradeSide, build_trades, build_trades_with_fills};
+pub use trades::{
+    BarFunding, BarStops, Trade, TradeSide, attach_stops, build_trades, build_trades_with_fills,
+};
+pub use verdict::{
+    Comparison, Criterion, DrawdownMode, EvidenceInputs, FirmLimits, HighRiskLimits, KindInputs,
+    Layer, Outcome, PortfolioBenchmark, PortfolioLimits, PropFirmLimits, RuleKind, Unit, Verdict,
+    VerdictRule, VerdictState, combine, evaluate, evaluate_evidence,
+};

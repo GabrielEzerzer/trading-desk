@@ -1658,3 +1658,89 @@ fn walk_forward_tests_up_to_the_last_bar_and_warms_the_first_train_sweep_on_the_
     .unwrap();
     assert_ne!(first.in_sample.total_return, cold.metrics.total_return);
 }
+
+#[test]
+fn rows_carry_their_coordinates_on_each_axis() {
+    // slow [20, 5, 10] x equity_fraction [0.5, 0.9]: the last axis changes fastest, so index i
+    // is at (i / 2, i % 2).
+    let r = sweep(&rising_spec(), &rising_bars(300), &[], None).unwrap();
+    let slows = [20, 5, 10];
+    let fractions = [0.5, 0.9];
+    for row in &r.rows {
+        let i = row.index;
+        assert_eq!(row.coords, vec![i / 2, i % 2]);
+        assert_eq!(int(&row.params, "slow"), slows[row.coords[0] as usize]);
+        assert_eq!(
+            row.params.float("equity_fraction"),
+            Ok(fractions[row.coords[1] as usize])
+        );
+    }
+    // The best row, index 3, is slow 5 with fraction 0.9.
+    assert_eq!(r.rows[0].coords, vec![1, 1]);
+
+    // fast 3..=8 x slow [12, 18, 24, 30] x allow_short [false, true]: 13 = 1 * 8 + 2 * 2 + 1.
+    let r = sweep(&wavy_spec(), &wavy_bars(500), &[], None).unwrap();
+    let row = r.rows.iter().find(|row| row.index == 13).unwrap();
+    assert_eq!(row.coords, vec![1, 2, 1]);
+    assert_eq!(int(&row.params, "fast"), 4);
+    assert_eq!(int(&row.params, "slow"), 24);
+    assert_eq!(row.params.bool("allow_short"), Ok(true));
+}
+
+#[test]
+fn walk_forward_counts_the_trades_closed_at_each_test_end() {
+    let bars = wavy_bars(500);
+    let r = walk_forward(&wf_spec(WindowMode::Rolling), &bars, &[], None).unwrap();
+    let mut forced = 0;
+    for w in &r.windows {
+        let o = &w.out_of_sample;
+        let closed_out: Vec<_> = o.trades.iter().filter(|t| t.force_closed).collect();
+        assert!(closed_out.len() <= 1);
+        // Closed at the open of the window's last test bar.
+        for t in &closed_out {
+            assert_eq!(t.exit_time, w.test_to - HOUR);
+        }
+        assert_eq!(o.metrics.force_closed_trades, closed_out.len());
+        forced += closed_out.len();
+    }
+    assert!(forced > 0, "no test window ended in a position");
+    assert_eq!(r.metrics.force_closed_trades, forced);
+    assert_eq!(r.trades.iter().filter(|t| t.force_closed).count(), forced);
+}
+
+#[test]
+fn walk_forward_scales_each_windows_extremes_like_its_equity() {
+    let bars = wavy_bars(500);
+    let r = walk_forward(&wf_spec(WindowMode::Rolling), &bars, &[], None).unwrap();
+    assert_eq!(r.equity_extremes.len(), r.equity.len());
+    let mut level = 10_000.0;
+    let mut i = 0;
+    let mut j = 0;
+    let mut peak: f64 = 0.0;
+    for w in &r.windows {
+        let o = &w.out_of_sample;
+        let scale = level / 10_000.0;
+        for x in &o.equity_extremes {
+            assert!((r.equity_extremes[i].low - x.low * scale).abs() < 1e-9);
+            assert!((r.equity_extremes[i].high - x.high * scale).abs() < 1e-9);
+            i += 1;
+        }
+        for t in &o.trades {
+            assert!((r.trades[j].mae.unwrap() - t.mae.unwrap() * scale).abs() < 1e-9);
+            assert!((r.trades[j].mfe.unwrap() - t.mfe.unwrap() * scale).abs() < 1e-9);
+            assert_eq!(r.trades[j].r_multiple, t.r_multiple);
+            j += 1;
+        }
+        peak = peak.max(o.metrics.peak_leverage.unwrap());
+        level = r.equity[i - 1].equity;
+    }
+    assert_eq!(r.metrics.peak_leverage, Some(peak));
+    let m = &r.metrics;
+    assert!(m.max_drawdown_intrabar.unwrap() >= m.max_drawdown.unwrap());
+    assert!(m.static_drawdown_intrabar.is_some());
+    // The stitched buy and hold has its own extremes, and alpha and beta against it.
+    let b = r.benchmark.as_ref().unwrap();
+    assert!(b.metrics.peak_leverage.unwrap() > 0.98);
+    assert!(b.metrics.max_drawdown_intrabar.is_some());
+    assert!(b.alpha.is_some() && b.beta.is_some());
+}
