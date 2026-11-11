@@ -9,7 +9,8 @@ use serde_json::Value;
 use td_core::{Candle, Millis, Timeframe};
 use td_engine::{
     BacktestConfig, BacktestResult, ENGINE_REVISION, EngineError, ParamValue, Params, RunKind,
-    SavedRun, config_fingerprint, data_fingerprint, list, load, rerun, run, save, save_with_files,
+    SavedRun, build_strategy, config_fingerprint, data_fingerprint, list, load, rerun, run,
+    run_strategy, save, save_with_files,
 };
 
 const HOUR: Millis = 3_600_000;
@@ -141,6 +142,22 @@ fn full_backtest_matches_the_expected_result_file() {
     let expected: Value =
         serde_json::from_str(&std::fs::read_to_string(expected_path()).unwrap()).unwrap();
     assert_json_eq(&serde_json::to_value(&result).unwrap(), &expected, "result");
+}
+
+/// A strategy the caller built runs exactly as the registry's would, and an unregistered name is
+/// only a label then.
+#[test]
+fn run_strategy_with_a_built_strategy_matches_run() {
+    let mut c = config();
+    let strategy = build_strategy(&c.strategy, &c.params).unwrap();
+    c.strategy = "not_registered".into();
+    let built = run_strategy(&c, strategy, &synthetic_bars(), &[], &synthetic_funding()).unwrap();
+    let registered = run_synthetic();
+    assert!(!built.fills.is_empty());
+    assert_eq!(built.fills, registered.fills);
+    assert_eq!(built.equity, registered.equity);
+    assert_eq!(built.metrics, registered.metrics);
+    assert_eq!(built.config.strategy, "not_registered");
 }
 
 #[test]
