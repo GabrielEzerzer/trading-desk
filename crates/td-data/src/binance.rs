@@ -81,15 +81,18 @@ impl DataSource for Binance {
 
     fn instruments(&self, http: &Http, kind: InstrumentKind) -> Result<InstrumentList, DataError> {
         match kind {
-            InstrumentKind::Spot => parse_binance_spot(&http.get_text(SPOT_INFO_URL, &[])?),
+            InstrumentKind::Spot => fetch_spot_instruments(http, SPOT_INFO_URL),
+            // `/fapi/v1/exchangeInfo` takes no filters; gzip alone shrinks it.
             InstrumentKind::Perpetual => parse_binance_usdm(&http.get_text(USDM_INFO_URL, &[])?),
+            InstrumentKind::Fx => Err(not_listed(kind)),
         }
     }
 
-    fn default_fees(&self, kind: InstrumentKind) -> FeeSchedule {
+    fn default_fees(&self, kind: InstrumentKind) -> Result<FeeSchedule, DataError> {
         match kind {
-            InstrumentKind::Spot => BINANCE_SPOT_FEES,
-            InstrumentKind::Perpetual => BINANCE_USDM_FEES,
+            InstrumentKind::Spot => Ok(BINANCE_SPOT_FEES),
+            InstrumentKind::Perpetual => Ok(BINANCE_USDM_FEES),
+            InstrumentKind::Fx => Err(not_listed(kind)),
         }
     }
 
@@ -104,6 +107,8 @@ impl DataSource for Binance {
         to: Millis,
         now: Millis,
     ) -> Result<MinuteHistory, DataError> {
+        // Refused here as well as per file, so a range that needs no file is refused too.
+        archive_market(id.kind)?;
         let mut missing_files = Vec::new();
         let candles = archive_month(
             &id.symbol,
@@ -144,6 +149,9 @@ impl LiveStream for Binance {
             InstrumentKind::Perpetual => {
                 format!("wss://fstream.binance.com/market/ws/{lower}@kline_1m")
             }
+            // Never connected to: a stream for a kind the source does not list refuses to open
+            // (see `SharedStream::open_on`).
+            InstrumentKind::Fx => String::new(),
         }
     }
 
@@ -165,6 +173,18 @@ impl LiveStream for Binance {
     }
 }
 
+/// The spot symbols open for trading, from the exchangeInfo at `url`. Binance is asked for those
+/// symbols only and without their permission sets, which td-data does not read: 2.5 MB instead of
+/// 17.8 MB before gzip. [`parse_binance_spot`] keeps only `TRADING` symbols either way, so the
+/// list is the same as from the full response.
+fn fetch_spot_instruments(http: &Http, url: &str) -> Result<InstrumentList, DataError> {
+    let query = [
+        ("symbolStatus", "TRADING".to_string()),
+        ("showPermissionSets", "false".to_string()),
+    ];
+    parse_binance_spot(&http.get_text(url, &query)?)
+}
+
 /// The span one archive file covers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArchivePeriod {
@@ -183,20 +203,33 @@ pub fn archive_file_name(symbol: &str, period: ArchivePeriod) -> String {
 }
 
 /// Where the archive publishes the 1-minute klines of `id` for `period`.
-pub fn archive_url(id: &InstrumentId, period: ArchivePeriod) -> String {
-    let market = match id.kind {
-        InstrumentKind::Spot => "spot",
-        InstrumentKind::Perpetual => "futures/um",
-    };
+pub fn archive_url(id: &InstrumentId, period: ArchivePeriod) -> Result<String, DataError> {
+    let market = archive_market(id.kind)?;
     let span = match period {
         ArchivePeriod::Month(_) => "monthly",
         ArchivePeriod::Day(_) => "daily",
     };
-    format!(
+    Ok(format!(
         "{ARCHIVE}/{market}/{span}/klines/{sym}/1m/{file}",
         sym = id.symbol,
         file = archive_file_name(&id.symbol, period)
-    )
+    ))
+}
+
+/// The archive's folder for a kind.
+fn archive_market(kind: InstrumentKind) -> Result<&'static str, DataError> {
+    match kind {
+        InstrumentKind::Spot => Ok("spot"),
+        InstrumentKind::Perpetual => Ok("futures/um"),
+        InstrumentKind::Fx => Err(not_listed(kind)),
+    }
+}
+
+fn not_listed(kind: InstrumentKind) -> DataError {
+    DataError::KindNotListed {
+        venue: Venue::Binance,
+        kind,
+    }
 }
 
 /// Downloads one archive file, checks it against its `.CHECKSUM` and parses its klines. `None`
@@ -206,7 +239,7 @@ pub fn fetch_archive(
     id: &InstrumentId,
     period: ArchivePeriod,
 ) -> Result<Option<Vec<Candle>>, DataError> {
-    let url = archive_url(id, period);
+    let url = archive_url(id, period)?;
     let file = archive_file_name(&id.symbol, period);
     let Some(zip) = http.get_bytes(&url)? else {
         return Ok(None);
@@ -414,6 +447,7 @@ pub fn fetch_klines(
     let url = match id.kind {
         InstrumentKind::Spot => SPOT_KLINES_URL,
         InstrumentKind::Perpetual => USDM_KLINES_URL,
+        InstrumentKind::Fx => return Err(not_listed(id.kind)),
     };
     let to = to.min(timeframe.floor(now_ms()));
     let open_time = |c: &Candle| c.open_time;
@@ -597,6 +631,7 @@ fn parse_binance(body: &str, kind: InstrumentKind) -> Result<InstrumentList, Dat
             && match kind {
                 InstrumentKind::Spot => true,
                 InstrumentKind::Perpetual => s.contract_type.as_deref() == Some("PERPETUAL"),
+                InstrumentKind::Fx => false,
             };
         if listed {
             list.push(&s.symbol, binance_instrument(s, kind));
@@ -625,6 +660,7 @@ fn binance_instrument(s: &BinanceSymbol, kind: InstrumentKind) -> Result<Instrum
             "MIN_NOTIONAL.notional",
             filter("MIN_NOTIONAL").map(|f| &f.notional),
         )?,
+        InstrumentKind::Fx => return Err(not_listed(kind).to_string()),
     };
     Ok(Instrument {
         id: InstrumentId {
@@ -638,7 +674,7 @@ fn binance_instrument(s: &BinanceSymbol, kind: InstrumentKind) -> Result<Instrum
         lot_size: field("LOT_SIZE.stepSize", lot.map(|f| &f.step_size))?,
         min_qty: field("LOT_SIZE.minQty", lot.map(|f| &f.min_qty))?,
         min_notional,
-        fees: Binance.default_fees(kind),
+        fees: Binance.default_fees(kind).map_err(|e| e.to_string())?,
     })
 }
 
@@ -691,6 +727,42 @@ pub fn parse_stream_frame(text: &str) -> Result<Option<KlineUpdate>, DataError> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::http::stub;
+
+    /// The spot list is asked for with the filters, and a gzipped, filtered response reads the same
+    /// as the full response did.
+    #[test]
+    fn spot_instruments_are_asked_for_filtered_and_read_the_same_as_the_full_list() {
+        let full = include_str!("../tests/fixtures/binance_spot_exchange_info.json");
+        // What Binance sends for the filtered request: the same document without the symbols that
+        // are not trading.
+        let mut filtered: serde_json::Value = serde_json::from_str(full).expect("JSON");
+        let symbols = filtered["symbols"].as_array_mut().expect("symbols");
+        let before = symbols.len();
+        symbols.retain(|s| s["status"] == "TRADING");
+        assert!(
+            symbols.len() < before,
+            "the fixture has a symbol that is not trading"
+        );
+        let (base, server) = stub::serve_once(
+            &[
+                ("Content-Type", "application/json"),
+                ("Content-Encoding", "gzip"),
+            ],
+            stub::gzip(&filtered.to_string()),
+        );
+        let http = Http::new().expect("an HTTP client");
+        let url = format!("{base}/api/v3/exchangeInfo");
+        let list = fetch_spot_instruments(&http, &url).expect("lists");
+        assert_eq!(list, parse_binance_spot(full).expect("parses"));
+        let request = server.join().expect("the server");
+        let line = request.lines().next().unwrap_or_default();
+        assert_eq!(
+            line, "get /api/v3/exchangeinfo?symbolstatus=trading&showpermissionsets=false http/1.1",
+            "{request}"
+        );
+        assert!(request.contains("accept-encoding: gzip"), "{request}");
+    }
 
     /// Reads `month` through [`archive_month`] from an archive that holds the files `has` says it
     /// holds, each with one candle at the start of its period. Returns the open times read, the

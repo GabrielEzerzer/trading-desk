@@ -95,6 +95,145 @@ const chooseRow = async (page, name) => {
   await page.mouse.move(0, 0)
 }
 
+// Trading. Its states carry `section: 'trading'`. Those past the engine's start run on
+// Playwright's clock, held still: the mock emits a bar every 1.5 s and the engine stub one every
+// 250 ms, so a state reached in real time would show however many bars had come by then. `hold`
+// stops the page's time before Trading opens, so its feeds start at that instant; from then on
+// only `tick` moves it. Each state then shows the same bars, prices and fills on every run, which
+// the screenshot baselines need. The steps still wait for what each state must show.
+
+const trading = JSON.parse(readFileSync(join(here, '..', 'mock', 'trading.json'), 'utf8'))
+const instruments = trading.instruments.map((i) => i.instrument)
+const btc = instruments.find((i) => i.id.symbol === 'BTCUSDT' && i.id.venue === 'binance' && i.id.kind === 'spot')
+const engineStart = { open_time: trading.end, open: 64180, high: 64230, low: 64150, close: 64210, volume: 14, quote_volume: 14 * 64210 }
+
+/** A running strategy session as the engine reports it, for Trading on the engine. */
+const engineSession = {
+  id: '1794311000000-sma',
+  config: { strategy: 'sma_cross', params: {}, instrument: btc, timeframe: '1m', starting_cash: 10000, slippage_bps: 2, fees: null, max_leverage: 1 },
+  status: { status: 'live' },
+  cash: 2302.4,
+  equity: 10009.6,
+  position: { qty: 0.12, avg_entry: 64142.5, mark_price: 64210, unrealised_pnl: 8.1, realised_pnl: 0, fees_paid: 7.7, funding_paid: 0 },
+  equity_curve: [],
+  open_orders: [],
+  fills: [],
+  trades: [],
+  funding: [],
+  live_from: trading.end - 3_600_000,
+  last_bar: engineStart,
+  dropped: [],
+  warnings: [],
+}
+
+/** Trading on the engine: instruments from the fixtures and a closed bar every 250 ms. */
+export const engineTrading = { engine: 'running', mock: false, instruments, candles: { start: engineStart, everyMs: 250 } }
+
+/** Milliseconds between the mock's live bars (`liveMs` in app/mock/trading.ts). */
+const LIVE_MS = 1500
+/** Milliseconds between the engine stub's bars (`engineTrading.candles.everyMs`). */
+const ENGINE_MS = 250
+
+/** How far each held page's time has moved since `hold`. */
+const elapsed = new WeakMap()
+
+/** Stops the page's time. Call it before Trading opens, so its feeds start at this instant. */
+const hold = async (page) => {
+  await page.clock.pauseAt((await page.evaluate(() => Date.now())) + 1000)
+  elapsed.set(page, 0)
+}
+
+/** Moves a held page's time on by `ms`, running the timers and animation frames due in it. */
+const tick = async (page, ms) => {
+  await page.clock.runFor(ms)
+  elapsed.set(page, (elapsed.get(page) ?? 0) + ms)
+}
+
+/** Moves the time to 100 ms past the mock's next bar, so whatever that bar fills has filled. */
+const nextBar = async (page) => {
+  const now = elapsed.get(page) ?? 0
+  await tick(page, (Math.floor(now / LIVE_MS) + 1) * LIVE_MS + 100 - now)
+}
+
+/**
+ * Lets React commit what the last timers changed, then runs 100 ms of frames so the chart draws
+ * it. React commits on message tasks, which the clock does not hold, so a long `tick` can end with
+ * the page's text a bar ahead of the chart's canvas.
+ */
+const draw = async (page) => {
+  await page.evaluate(async () => {
+    for (let i = 0; i < 3; i++) {
+      await new Promise((resolve) => {
+        const channel = new MessageChannel()
+        channel.port1.onmessage = resolve
+        channel.port2.postMessage(null)
+      })
+    }
+  })
+  await tick(page, 100)
+}
+
+/**
+ * Moves the time to 1 s past the mock's latest bar (past the next one when that is less than a
+ * frame away) and draws: the price's 700 ms tint has gone, and no bar is due.
+ */
+const quiet = async (page) => {
+  const now = elapsed.get(page) ?? 0
+  let to = Math.floor(now / LIVE_MS) * LIVE_MS + 900
+  if (to < now + 20) to += LIVE_MS
+  await tick(page, to - now)
+  await draw(page)
+}
+
+/** Lets the engine stub emit `count` bars, waits until it has, and draws them. */
+const engineBars = async (page, count) => {
+  await tick(page, count * ENGINE_MS + 50)
+  await page.waitForFunction((n) => (window.__stubCandles ?? 0) >= n, count)
+  await draw(page)
+}
+
+const toTrading = async (page) => {
+  await page.keyboard.press('Control+2')
+  await page.locator('main[aria-label="Trading"]').waitFor()
+}
+
+/** Trading on a held clock, with its source chosen, its feeds subscribed and its sessions read. */
+const heldTrading = async (page) => {
+  await hold(page)
+  await toTrading(page)
+  await page.locator('.position-line .line-button').first().waitFor()
+}
+
+/** Trading on the mock source, ready: instruments loaded, sessions read and a price shown. */
+const readyTrading = async (page) => {
+  await heldTrading(page)
+  // The mock's instrument lists take 400 ms.
+  await tick(page, 500)
+  await page.getByText('Start a paper session to place orders.').waitFor()
+  await page.locator('.ticker-price').filter({ hasText: /\d/ }).waitFor()
+}
+
+const startManual = async (page) => {
+  await readyTrading(page)
+  await page.getByRole('button', { name: 'Start a session' }).click()
+  await page.getByRole('button', { name: 'Start', exact: true }).click()
+  await page.locator('.position-summary').waitFor()
+}
+
+const placeOrder = async (page, side, size) => {
+  await page.getByPlaceholder('Size').fill(size)
+  await page.getByRole('button', { name: side, exact: true }).click()
+}
+
+/** Starts a Manual session and buys 0.05 BTC at market; the mock fills it at the next bar's open. */
+const holdBtc = async (page) => {
+  await startManual(page)
+  await placeOrder(page, 'Buy', '0.05')
+  await page.getByText('Buy 0.05000 BTC at market sent.').waitFor()
+  await nextBar(page)
+  await page.locator('.position-summary').filter({ hasText: /0\.05000 BTC/ }).waitFor()
+}
+
 // Each state: the stub's config and the steps that bring the page there. Every step list ends by
 // waiting for something the state must show, never on a fixed sleep.
 export const STATES = [
@@ -329,9 +468,276 @@ export const STATES = [
     name: 'trading',
     section: 'trading',
     config: { engine: 'running', mock: true },
+    clock: true,
     steps: async (page) => {
-      await page.keyboard.press('Control+2')
-      await page.locator('main[aria-label="Trading"]').waitFor()
+      await readyTrading(page)
+      await page.getByText('No paper session on BTCUSDT').waitFor()
+      await quiet(page)
+    },
+  },
+  {
+    name: 'trading-engine-starting',
+    section: 'trading',
+    config: { engine: 'starting', mock: true },
+    steps: async (page) => {
+      await toTrading(page)
+      await page.getByText('Starting the engine').filter({ visible: true }).waitFor()
+    },
+  },
+  {
+    name: 'trading-engine-failed',
+    section: 'trading',
+    config: { engine: 'failed', mock: true },
+    steps: async (page) => {
+      await toTrading(page)
+      await page.getByText('The engine failed').filter({ visible: true }).waitFor()
+    },
+  },
+  {
+    name: 'trading-instruments-loading',
+    section: 'trading',
+    config: { ...engineTrading, hangInstruments: true, candles: null },
+    clock: true,
+    steps: async (page) => {
+      await heldTrading(page)
+      await page.locator('.chart-empty').getByText('Loading instruments').waitFor()
+      await quiet(page)
+    },
+  },
+  {
+    name: 'trading-instruments-failed',
+    section: 'trading',
+    config: { ...engineTrading, failInstruments: true, candles: null },
+    clock: true,
+    steps: async (page) => {
+      await heldTrading(page)
+      await page.locator('.chart-empty').getByText('The instrument lists did not load.').waitFor()
+      await quiet(page)
+    },
+  },
+  {
+    name: 'trading-engine-empty',
+    section: 'trading',
+    config: { ...engineTrading, candles: null },
+    clock: true,
+    steps: async (page) => {
+      await heldTrading(page)
+      await page.getByText('Waiting for the first closed 1m bar').waitFor()
+      await page.getByText('No paper session on BTCUSDT').waitFor()
+      await quiet(page)
+    },
+  },
+  {
+    name: 'trading-engine-filling',
+    section: 'trading',
+    config: engineTrading,
+    clock: true,
+    steps: async (page) => {
+      await heldTrading(page)
+      await engineBars(page, 36)
+    },
+  },
+  {
+    name: 'trading-engine-session',
+    section: 'trading',
+    config: { ...engineTrading, session: engineSession },
+    clock: true,
+    steps: async (page) => {
+      await heldTrading(page)
+      await engineBars(page, 24)
+      await page.locator('.position-summary').filter({ hasText: 'SMA cross · Live' }).waitFor()
+    },
+  },
+  {
+    name: 'trading-engine-start',
+    section: 'trading',
+    config: engineTrading,
+    clock: true,
+    steps: async (page) => {
+      await heldTrading(page)
+      await engineBars(page, 12)
+      await page.getByRole('button', { name: 'Start a session' }).click()
+      await page.getByRole('button', { name: /^Strategy:/ }).click()
+      await page.getByRole('menu').waitFor()
+    },
+  },
+  {
+    name: 'trading-ticker-menu',
+    section: 'trading',
+    config: { engine: 'running', mock: true },
+    clock: true,
+    steps: async (page) => {
+      await readyTrading(page)
+      await page.keyboard.press('Control+k')
+      await page.getByRole('listbox', { name: 'Instruments' }).waitFor()
+      await quiet(page)
+    },
+  },
+  {
+    name: 'trading-ticker-search',
+    section: 'trading',
+    config: { engine: 'running', mock: true },
+    clock: true,
+    steps: async (page) => {
+      await readyTrading(page)
+      await page.keyboard.press('Control+k')
+      await page.getByRole('combobox', { name: 'Search instruments' }).fill('eth')
+      await page.getByRole('option', { name: /ETHUSDT.*Binance spot/, selected: true }).waitFor()
+      await page.keyboard.press('ArrowDown')
+      await page.getByRole('option', { name: /ETHBTC/, selected: true }).waitFor()
+      await quiet(page)
+    },
+  },
+  {
+    name: 'trading-ticker-perpetual',
+    section: 'trading',
+    config: { engine: 'running', mock: true },
+    clock: true,
+    steps: async (page) => {
+      await readyTrading(page)
+      await page.keyboard.press('Control+k')
+      await page.getByRole('combobox', { name: 'Search instruments' }).fill('ethusdt')
+      await page.getByRole('option', { name: /ETHUSDT.*Bybit perpetual/ }).click()
+      await page.locator('.ticker-venue').filter({ hasText: 'Bybit perpetual' }).waitFor()
+      await page.locator('.ticker-price').filter({ hasText: /^3,/ }).waitFor()
+      await page.keyboard.press('Control+k')
+      await page.getByRole('radio', { name: 'Perpetual' }).click()
+      await page.getByRole('radio', { name: 'Perpetual', checked: true }).waitFor()
+      await quiet(page)
+    },
+  },
+  {
+    name: 'trading-start-session',
+    section: 'trading',
+    config: { engine: 'running', mock: true },
+    clock: true,
+    steps: async (page) => {
+      await readyTrading(page)
+      await page.getByRole('button', { name: 'Start a session' }).click()
+      await page.locator('.start-panel').getByText('Start a paper session', { exact: true }).waitFor()
+      await quiet(page)
+    },
+  },
+  {
+    name: 'trading-order-invalid',
+    section: 'trading',
+    config: { engine: 'running', mock: true },
+    clock: true,
+    steps: async (page) => {
+      await startManual(page)
+      await page.getByPlaceholder('Size').fill('0.00005')
+      await page.mouse.move(0, 0)
+      await page.getByText(/the venue’s minimum is|the venue's minimum is/).waitFor()
+      await quiet(page)
+    },
+  },
+  {
+    name: 'trading-session-running',
+    section: 'trading',
+    config: { engine: 'running', mock: true },
+    clock: true,
+    steps: async (page) => {
+      await holdBtc(page)
+      // The second bar ends the warm-up.
+      await nextBar(page)
+      await page.locator('.position-summary').filter({ hasText: 'Manual · Live' }).waitFor()
+      await page.mouse.move(0, 0)
+      await quiet(page)
+    },
+  },
+  {
+    name: 'trading-position-panel',
+    section: 'trading',
+    config: { engine: 'running', mock: true },
+    clock: true,
+    steps: async (page) => {
+      await holdBtc(page)
+      await placeOrder(page, 'Sell', '0.02')
+      await page.getByText('Sell 0.02000 BTC at market sent.').waitFor()
+      await nextBar(page)
+      await page.locator('.position-summary').filter({ hasText: /0\.03000 BTC/ }).waitFor()
+      await page.locator('.position-summary').click()
+      await page.getByRole('tab', { name: /Fills/ }).click()
+      await page.getByRole('tab', { name: /Fills/, selected: true }).waitFor()
+      await quiet(page)
+    },
+  },
+  {
+    name: 'trading-limit-order',
+    section: 'trading',
+    config: { engine: 'running', mock: true },
+    clock: true,
+    steps: async (page) => {
+      await startManual(page)
+      await page.getByPlaceholder('Size').fill('0.05')
+      await page.getByRole('button', { name: /^Order type:/ }).click()
+      await page.getByRole('menuitemradio', { name: 'Limit' }).click()
+      await page.getByPlaceholder('Price').fill('63800')
+      await page.getByRole('button', { name: 'Buy', exact: true }).click()
+      await page.mouse.move(0, 0)
+      await page.getByText('Buy 0.05000 BTC at 63,800.00 sent.').waitFor()
+      await quiet(page)
+    },
+  },
+  {
+    name: 'trading-order-rejected',
+    section: 'trading',
+    config: { engine: 'running', mock: true },
+    clock: true,
+    steps: async (page) => {
+      await startManual(page)
+      await placeOrder(page, 'Sell', '0.05')
+      await page.mouse.move(0, 0)
+      await page.getByText(/^Order rejected:/).waitFor()
+      await quiet(page)
+    },
+  },
+  {
+    name: 'trading-reconnecting',
+    section: 'trading',
+    config: { engine: 'running', mock: true },
+    clock: true,
+    steps: async (page) => {
+      await holdBtc(page)
+      await page.evaluate(() => window.tdMockTrading?.reconnect())
+      await page.mouse.move(0, 0)
+      await page.locator('.position-summary').filter({ hasText: 'Reconnecting to the feed' }).waitFor()
+      await quiet(page)
+    },
+  },
+  {
+    name: 'trading-dropped',
+    section: 'trading',
+    config: { engine: 'running', mock: true },
+    clock: true,
+    steps: async (page) => {
+      await startManual(page)
+      // Two bars of warm-up, then the session is live.
+      await nextBar(page)
+      await nextBar(page)
+      await page.locator('.position-summary').filter({ hasText: 'Manual · Live' }).waitFor()
+      await page.evaluate(() => window.tdMockTrading?.dropBucket())
+      await page.mouse.move(0, 0)
+      await page.locator('.position-notice').waitFor()
+      await quiet(page)
+    },
+  },
+  {
+    name: 'trading-session-stopped',
+    section: 'trading',
+    config: { engine: 'running', mock: true },
+    clock: true,
+    steps: async (page) => {
+      await holdBtc(page)
+      await page.locator('.position-summary').click()
+      // The panel starts listening for a click outside it on its next task.
+      await tick(page, 100)
+      await page.getByRole('button', { name: 'Stop', exact: true }).click()
+      await page.locator('.position-summary').filter({ hasText: 'Manual · Stopped' }).waitFor()
+      await page.mouse.click(300, 200)
+      await page.locator('.session-panel').waitFor({ state: 'detached' })
+      await page.mouse.move(0, 0)
+      await quiet(page)
     },
   },
 ]

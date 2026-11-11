@@ -16,9 +16,11 @@ use crate::{
 ///
 /// Bump it whenever the engine's behaviour changes: fills, fees, funding, the trade list, metrics
 /// or the benchmark, including changes the expected fixture does not cover (it has no gaps, for
-/// example). A regenerated `tests/fixtures/backtest_expected.json` always needs a bump, but an
-/// unchanged fixture does not mean the behaviour is unchanged.
-pub const ENGINE_REVISION: u32 = 3;
+/// example). Order ids, and which orders are accepted or rejected, count as behaviour too: paper
+/// sessions save manual orders by id, so a change there shifts those ids in saved sessions. A
+/// regenerated `tests/fixtures/backtest_expected.json` always needs a bump, but an unchanged
+/// fixture does not mean the behaviour is unchanged.
+pub const ENGINE_REVISION: u32 = 4;
 
 /// Everything that defines a backtest apart from the data itself.
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -76,20 +78,26 @@ fn is_default_max_leverage(max_leverage: &f64) -> bool {
     *max_leverage == default_max_leverage()
 }
 
-/// Buy and hold of the same instrument over the same bars.
+/// Buy and hold of the same instrument over the same bars: a backtest's traded bars, or in a
+/// walk-forward each test window's bars, stitched like the test runs (see
+/// [`crate::WalkForwardResult::benchmark`]).
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Benchmark {
     /// Quantity bought at the first bar's open: all starting cash, after the taker fee, rounded
-    /// down to the lot size.
+    /// down to the lot size. In a walk-forward, the first test window's purchase.
     pub qty: f64,
-    /// The first bar's open with slippage, rounded up to the tick.
+    /// The first bar's open with slippage, rounded up to the tick. In a walk-forward, the first
+    /// test window's.
     pub entry_price: f64,
     pub equity: Vec<EquityPoint>,
     pub metrics: MetricsReport,
     /// Strategy total return minus benchmark total return.
     pub excess_return: Option<f64>,
-    /// Pearson correlation of the strategy's per-bar returns with the benchmark's.
+    /// Pearson correlation of the strategy's per-bar returns with the benchmark's over the same
+    /// intervals: the benchmark's equity is read at each time of the strategy's equity series.
+    /// In a backtest the two have the same bars, and in a walk-forward the same test windows, so
+    /// the times match one to one.
     pub correlation: Option<f64>,
 }
 
@@ -265,10 +273,35 @@ pub fn rerun(
     })
 }
 
-/// Buys at the first bar's open with all starting cash (taker fee, the run's slippage) and holds
-/// to the last close, paying funding on a perpetual like the session does: funding due at a bar's
-/// open or in the gap before it on the position held going into the bar, at the open price, so
-/// none at the first open, and funding due later in the bar at the close.
+/// The record of buying and holding over one range, before it is compared with a strategy.
+pub(crate) struct Held {
+    pub(crate) qty: f64,
+    pub(crate) entry_price: f64,
+    /// One point per bar, stamped with the bar's open time.
+    pub(crate) equity: Vec<EquityPoint>,
+    /// The position after each bar's fills.
+    pub(crate) positions: Vec<f64>,
+    /// The one entry fill, or none if the cash buys less than a lot.
+    pub(crate) fills: Vec<Fill>,
+    /// The entry as one trade, still open at the end.
+    pub(crate) trades: Vec<Trade>,
+    pub(crate) funding_paid: f64,
+}
+
+/// [`hold`] over `bars`, the bars of `config`'s range, with `funding` in any order and the same
+/// rules as [`run`]: an event in a gap between bars is charged at the next bar's open, and events
+/// before the first bar or from the last bar's end on are ignored.
+pub(crate) fn hold_over(
+    config: &BacktestConfig,
+    bars: &[Candle],
+    funding: &[(Millis, f64)],
+) -> Held {
+    let funding = sorted_funding(funding);
+    let ranges = funding_ranges(config.timeframe, bars, &funding);
+    hold(config, bars, &funding, &ranges)
+}
+
+/// Buy and hold over `bars`, compared with the strategy: see [`hold`] and [`compare`].
 fn benchmark(
     config: &BacktestConfig,
     bars: &[Candle],
@@ -277,6 +310,61 @@ fn benchmark(
     strategy_series: &EquitySeries,
     strategy_report: &MetricsReport,
 ) -> Benchmark {
+    let held = hold(config, bars, funding, ranges);
+    let series = EquitySeries::new(config.starting_cash, &held.equity, config.timeframe);
+    let report = metrics::report(
+        &series,
+        &held.positions,
+        &held.trades,
+        &held.fills,
+        held.funding_paid,
+    );
+    compare(
+        held.qty,
+        held.entry_price,
+        held.equity,
+        &series,
+        report,
+        strategy_series,
+        strategy_report,
+    )
+}
+
+/// The benchmark from buy and hold's curve and metrics, with the strategy's excess return over it
+/// and the correlation of their per-bar returns.
+pub(crate) fn compare(
+    qty: f64,
+    entry_price: f64,
+    equity: Vec<EquityPoint>,
+    series: &EquitySeries,
+    report: MetricsReport,
+    strategy_series: &EquitySeries,
+    strategy_report: &MetricsReport,
+) -> Benchmark {
+    let excess_return = match (strategy_report.total_return, report.total_return) {
+        (Some(s), Some(b)) => Some(s - b),
+        _ => None,
+    };
+    Benchmark {
+        qty,
+        entry_price,
+        equity,
+        metrics: report,
+        excess_return,
+        correlation: aligned_correlation(strategy_series, series),
+    }
+}
+
+/// Buys at the first bar's open with all starting cash (taker fee, the run's slippage) and holds
+/// to the last close, paying funding on a perpetual like the session does: funding due at a bar's
+/// open or in the gap before it on the position held going into the bar, at the open price, so
+/// none at the first open, and funding due later in the bar at the close.
+fn hold(
+    config: &BacktestConfig,
+    bars: &[Candle],
+    funding: &[(Millis, f64)],
+    ranges: &[std::ops::Range<usize>],
+) -> Held {
     let inst = &config.instrument;
     let fees = config.fee_override.unwrap_or(inst.fees);
     let model = CandleFillModel {
@@ -323,33 +411,36 @@ fn benchmark(
     }
 
     let trades = build_trades(&fills, bars, &bar_funding);
-    let series = EquitySeries::new(config.starting_cash, &equity, config.timeframe);
-    let report = metrics::report(
-        &series,
-        &positions,
-        &trades,
-        &fills,
-        portfolio.funding_paid(),
-    );
-    let excess_return = match (strategy_report.total_return, report.total_return) {
-        (Some(s), Some(b)) => Some(s - b),
-        _ => None,
-    };
-    let correlation = match (
-        metrics::per_bar_returns(&strategy_series.values),
-        metrics::per_bar_returns(&series.values),
-    ) {
-        (Some(s), Some(b)) => metrics::correlation(&s, &b),
-        _ => None,
-    };
-    Benchmark {
+    Held {
         qty: fills.first().map_or(0.0, |f| f.qty),
         entry_price: price,
         equity,
-        metrics: report,
-        excess_return,
-        correlation,
+        positions,
+        fills,
+        trades,
+        funding_paid: portfolio.funding_paid(),
     }
+}
+
+/// The correlation of the strategy's per-bar returns with the benchmark's, with the benchmark's
+/// equity read at the strategy series' times. Every strategy time must be one of the benchmark's
+/// (both are the first bar's open, then bar closes, and the benchmark holds through every bar);
+/// `None` otherwise. With equal times this is the plain correlation of the two return series.
+fn aligned_correlation(strategy: &EquitySeries, bench: &EquitySeries) -> Option<f64> {
+    let mut sampled = Vec::with_capacity(strategy.times.len());
+    let mut j = 0;
+    for &t in &strategy.times {
+        while j < bench.times.len() && bench.times[j] < t {
+            j += 1;
+        }
+        if bench.times.get(j) != Some(&t) {
+            return None;
+        }
+        sampled.push(bench.values[j]);
+    }
+    let s = metrics::per_bar_returns(&strategy.values)?;
+    let b = metrics::per_bar_returns(&sampled)?;
+    metrics::correlation(&s, &b)
 }
 
 /// SHA-256, as lowercase hex, over the bars and funding in a fixed byte form: the bar count as a

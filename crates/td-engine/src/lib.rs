@@ -50,6 +50,7 @@ pub use runner::{
 pub use session::{
     EquityPoint, LIQUIDATION_TAG, MAINTENANCE_MARGIN_RATE, Session, SessionConfig, run_backtest,
 };
+pub use strategies::gotobi_calendar;
 pub use strategy::{Context, Strategy};
 pub use tester::{
     Direction, Headline, MAX_RUNS, Metric, Objective, OosResult, OosSpec, ParamAxis, ParamSpace,
@@ -57,4 +58,4 @@ pub use tester::{
     WalkForwardSpec, Window, WindowMode, WindowResult, WindowSpec, out_of_sample, stitch, sweep,
     walk_forward,
 };
-pub use trades::{BarFunding, Trade, TradeSide, build_trades};
+pub use trades::{BarFunding, Trade, TradeSide, build_trades, build_trades_with_fills};

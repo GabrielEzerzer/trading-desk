@@ -1,5 +1,4 @@
-// Adapted from tipping-point engine/src/store/run.rs at 7dc6d12 (the civil-date functions) and
-// engine/src/venue/archive.rs at 7dc6d12 (date parsing).
+// Adapted from tipping-point engine/src/venue/archive.rs at 7dc6d12 (date parsing).
 
 //! UTC calendar arithmetic on [`Millis`]: dates, months and minute counts. No time zones, no
 //! date crate.
@@ -8,37 +7,12 @@ use std::fmt;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use td_core::Millis;
+pub use td_core::{civil_from_days, days_from_civil};
 
 use crate::DataError;
 
 pub const MINUTE: Millis = 60_000;
 pub const DAY: Millis = 24 * 60 * MINUTE;
-
-/// Days since 1970-01-01 of a proleptic Gregorian date: Howard Hinnant's `days_from_civil`.
-pub fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
-    let (month, day) = (i64::from(month), i64::from(day));
-    let year = if month <= 2 { year - 1 } else { year };
-    let era = year.div_euclid(400);
-    let yoe = year.rem_euclid(400);
-    let doy = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146_097 + doe - 719_468
-}
-
-/// The (year, month, day) of a day count since 1970-01-01: Howard Hinnant's `civil_from_days`.
-pub fn civil_from_days(days: i64) -> (i64, u32, u32) {
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = yoe + era * 400 + i64::from(month <= 2);
-    // Both are in range by construction: month 1..=12, day 1..=31.
-    (year, month as u32, day as u32)
-}
 
 /// Reads `YYYY-MM-DD` as midnight UTC that starts the day.
 pub fn parse_date(text: &str) -> Result<Millis, DataError> {
@@ -203,14 +177,6 @@ impl fmt::Display for Month {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn days_from_civil_inverts_civil_from_days() {
-        for days in [-719_468, -1, 0, 1, 11_016, 19_723, 20_746, 2_932_896] {
-            let (year, month, day) = civil_from_days(days);
-            assert_eq!(days_from_civil(year, month, day), days);
-        }
-    }
 
     #[test]
     fn dates_parse_to_midnight_utc() {

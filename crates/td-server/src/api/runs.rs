@@ -261,9 +261,10 @@ fn read_data(store: &Store, config: &BacktestConfig) -> Result<StoreData, ApiErr
     }
     let gaps = missing_minutes(&minutes, from, to);
     let loaded = resample(&minutes, config.timeframe, false);
-    let funding = match id.kind {
-        InstrumentKind::Perpetual => store.load_funding(id, from, to)?,
-        InstrumentKind::Spot => Vec::new(),
+    let funding = if id.kind.rules().funding {
+        store.load_funding(id, from, to)?
+    } else {
+        Vec::new()
     };
     Ok(StoreData {
         loaded,
@@ -314,9 +315,10 @@ pub fn check_run_data(store: &Store, config: &BacktestConfig) -> Result<(), ApiE
     }
     long.extend(open.filter(is_long));
     any_bar = any_bar || !resample(&pending, timeframe, false).candles.is_empty();
-    let funding = match id.kind {
-        InstrumentKind::Perpetual => store.load_funding(id, from, to)?,
-        InstrumentKind::Spot => Vec::new(),
+    let funding = if id.kind.rules().funding {
+        store.load_funding(id, from, to)?
+    } else {
+        Vec::new()
     };
     match refusal(config, &long, any_bar, &funding) {
         Some(e) => Err(e),

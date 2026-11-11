@@ -6,7 +6,7 @@
  */
 export type Venue = "binance" | "bybit";
 
-export type InstrumentKind = "spot" | "perpetual";
+export type InstrumentKind = "spot" | "perpetual" | "fx";
 
 /**
  * Identifies an instrument across venues. The same symbol can exist as spot and as a perpetual on
@@ -210,16 +210,19 @@ equity: Array<EquityPoint>,
 orders: Array<Order>, fills: Array<Fill>, trades: Array<Trade>, metrics: MetricsReport, benchmark: Benchmark, };
 
 /**
- * Buy and hold of the same instrument over the same bars.
+ * Buy and hold of the same instrument over the same bars: a backtest's traded bars, or in a
+ * walk-forward each test window's bars, stitched like the test runs (see
+ * [`crate::WalkForwardResult::benchmark`]).
  */
 export type Benchmark = { 
 /**
  * Quantity bought at the first bar's open: all starting cash, after the taker fee, rounded
- * down to the lot size.
+ * down to the lot size. In a walk-forward, the first test window's purchase.
  */
 qty: number, 
 /**
- * The first bar's open with slippage, rounded up to the tick.
+ * The first bar's open with slippage, rounded up to the tick. In a walk-forward, the first
+ * test window's.
  */
 entry_price: number, equity: Array<EquityPoint>, metrics: MetricsReport, 
 /**
@@ -227,7 +230,10 @@ entry_price: number, equity: Array<EquityPoint>, metrics: MetricsReport,
  */
 excess_return: number | null, 
 /**
- * Pearson correlation of the strategy's per-bar returns with the benchmark's.
+ * Pearson correlation of the strategy's per-bar returns with the benchmark's over the same
+ * intervals: the benchmark's equity is read at each time of the strategy's equity series.
+ * In a backtest the two have the same bars, and in a walk-forward the same test windows, so
+ * the times match one to one.
  */
 correlation: number | null, };
 
@@ -241,7 +247,10 @@ export type EquityPoint = { time: number, equity: number, };
  */
 export type Order = { id: OrderId, request: OrderRequest, 
 /**
- * Open time of the bar the order was decided on. It can first fill on a later bar.
+ * Open time of the bar the order was decided on. It can first fill on a later bar. For a
+ * strategy's order that is the bar at whose close it was sent; for one placed between bars
+ * from outside the strategy, such as a manual order, it is the bar in progress when it was
+ * accepted, so it never fills on a price from before then.
  */
 submitted_at: number, 
 /**
@@ -336,11 +345,13 @@ export type MetricsReport = { start_equity: number, end_equity: number,
  */
 total_return: number | null, 
 /**
- * See [`cagr`].
+ * See [`cagr`]. `None` for a run shorter than [`MIN_CAGR_DAYS`].
  */
 cagr: number | null, 
 /**
- * Annualised volatility of daily returns; see [`volatility`] and [`daily_equity`].
+ * Annualised volatility of daily returns; see [`volatility`] and [`daily_equity`]. `None`
+ * with fewer than [`MIN_DAILY_RETURNS`] daily returns on days with a bar close, as are
+ * Sharpe and Sortino.
  */
 volatility: number | null, 
 /**
@@ -360,7 +371,7 @@ max_drawdown: number | null,
  */
 max_drawdown_duration_ms: number | null, max_drawdown_duration_bars: number | null, 
 /**
- * See [`calmar`].
+ * See [`calmar`]. `None` whenever CAGR is, so for a run shorter than [`MIN_CAGR_DAYS`].
  */
 calmar: number | null, 
 /**
@@ -419,6 +430,12 @@ export type SweepMode = "grid" | { "random": { samples: number, seed: number, } 
 
 /**
  * A metrics report field a sweep can rank by.
+ *
+ * `Sharpe` and `Sortino` are undefined on a range with fewer than
+ * [`metrics::MIN_DAILY_RETURNS`] daily returns on days with a bar close, and `Cagr` and `Calmar`
+ * on a range shorter than [`metrics::MIN_CAGR_DAYS`] days; a run whose objective is undefined
+ * does not qualify (see [`SweepRow::qualified`]). In a walk-forward that applies to each train
+ * window's length, and in an out-of-sample test to the in-sample segment's.
  */
 export type Metric = "total_return" | "cagr" | "sharpe" | "sortino" | "calmar" | "profit_factor" | "win_rate" | "max_drawdown";
 
@@ -441,7 +458,9 @@ base: BacktestConfig,
  */
 axes: Array<ParamAxis>, mode: SweepMode, objective: Objective, 
 /**
- * Runs with fewer closed trades than this rank after every run that has enough.
+ * Runs with fewer closed trades than this rank after every run that has enough. Defaults to
+ * 1 when left out, so a parameter set that never trades (no drawdown, no losses) cannot top
+ * a ranking by drawdown; set 0 to rank such sets too.
  */
 min_trades: number, };
 
@@ -468,8 +487,9 @@ index: number,
 params: Params, 
 /**
  * Whether the run ranks by its objective: it ran, made at least `min_trades` closed trades
- * and its objective is defined. Other runs rank after all qualified ones: first those that
- * ran, then those the strategy refused, each in grid order.
+ * and its objective is defined (see [`Metric`] for when it is not). Other runs rank after
+ * all qualified ones: first those that ran, then those the strategy refused, each in grid
+ * order.
  */
 qualified: boolean, 
 /**
@@ -540,6 +560,13 @@ out_of_sample: BacktestResult,
  * cumulative return grows with it. `None` if either value is undefined or the in-sample
  * value is zero. For a maximised metric below 1 is worse out of sample; for a minimised one
  * above 1 is worse. Not meaningful when the in-sample value is negative.
+ *
+ * With `TotalReturn`, `Cagr` or `Calmar` it is therefore `None` when either segment is
+ * shorter than [`metrics::MIN_CAGR_DAYS`] days, and with `Sharpe` or `Sortino` when either
+ * has fewer than [`metrics::MIN_DAILY_RETURNS`] daily returns on days with a bar close (the
+ * in-sample segment is refused up front then, so this is the out-of-sample one). It does not
+ * fall back to the ratio of total returns, which would compare segments of different
+ * lengths; compare the two runs' metrics directly then.
  */
 degradation: number | null, };
 
@@ -548,11 +575,18 @@ export type WindowMode = "rolling" | "anchored";
 /**
  * Walk-forward windows, in bars of the base range.
  *
- * Window k tests bars `train + k * step .. train + k * step + test`. Its train window is the
- * `train` bars before that (rolling) or every bar before it (anchored), so a test segment never
- * overlaps its own train window. `step` must be at least `test`, so test segments never overlap
- * each other; with `step == test` they are contiguous. Trailing bars that do not fill a whole
- * test segment are not tested.
+ * The windows are laid back from the end of the range, so the most recent bars are always
+ * tested: the last test segment ends on the last bar, and each earlier one starts `step` bars
+ * before the next. There are as many windows as fit with a whole train window before the first
+ * test segment. A window's train window is the `train` bars before its test segment (rolling)
+ * or every bar before it (anchored), so a test segment never overlaps its own train window.
+ * `step` must be at least `test`, so test segments never overlap each other; with
+ * `step == test` they are contiguous, and with a longer step the untested bars sit before each
+ * test segment.
+ *
+ * The leftover bars at the start, fewer than `step`, are never tested. In rolling mode the first
+ * train sweep is warmed up on them (as many as the train length); in anchored mode every train
+ * window starts at the first bar, so they are part of each one's training data.
  */
 export type WindowSpec = { train_bars: number, test_bars: number, step_bars: number, mode: WindowMode, };
 
@@ -601,12 +635,15 @@ out_of_sample: BacktestResult, };
  * Train sweeps close out the same way, so a window's in-sample and out-of-sample trade counts
  * (and `min_trades`) count a position held at the end alike. A rolling window's train sweep is
  * warmed up on the bars just before it, as many as the window's train length (fewer near the
- * start of the range), the same warm-up its test run gets; the first window's, and every
- * anchored window's, starts cold because no bars come before it.
+ * start of the range), the same warm-up its test run gets; the first window's uses the leftover
+ * bars before it (see [`WindowSpec`]) and starts cold if there are none. Every anchored window's
+ * starts cold, because its train window begins at the first bar.
  *
  * The stitched metrics are computed like a single backtest's (see [`MetricsReport`]): the
  * stitched Sharpe, Sortino and volatility come from the stitched curve's daily UTC returns, not
- * from its per-bar returns, so they are comparable with a backtest's on any timeframe.
+ * from its per-bar returns, so they are comparable with a backtest's on any timeframe. The floors
+ * on annualised metrics apply to the stitched curve as a whole, so it can have a Sharpe ratio or
+ * a CAGR when no single test window is long enough for one.
  */
 export type WalkForwardResult = { spec: WalkForwardSpec, engine_version: string, 
 /**
@@ -621,6 +658,19 @@ equity: Array<EquityPoint>,
  * Metrics of the stitched curve, its trades and its fills.
  */
 metrics: MetricsReport, 
+/**
+ * Buy and hold in each test window, stitched like the test runs: each window buys at its
+ * first test bar's open with the starting cash and holds to its last test bar's close, with
+ * the fill, fee and funding rules of a backtest's benchmark, and the windows are compounded
+ * with [`stitch`] as the test segments are. The two curves are therefore exposed over the
+ * same bars: with a step longer than the test, neither holds through the bars between test
+ * windows. Its excess return is the stitched total return minus its own.
+ *
+ * Unlike a test run it never sells, so it pays one taker fee per window to the test run's
+ * two, and it holds through each window's last bar, on whose open a test run closes out.
+ * `None` only in a result saved before walk-forwards had a benchmark.
+ */
+benchmark: Benchmark | null, 
 /**
  * Every test segment's trades in time order, with quantities, P&L, fees and funding scaled
  * by the same factor as the segment's equity, so they add up to the stitched equity's
@@ -761,9 +811,69 @@ first: number, last: number,
 /**
  * Missing minutes between `first` and `last`.
  */
-gaps: Array<GapInfo>, };
+gaps: Array<GapInfo>, 
+/**
+ * The month file's size on disk.
+ */
+bytes: number, };
 
 export type FundingCoverage = { rates: number, first: number | null, last: number | null, };
+
+export type StoredResponse = { 
+/**
+ * Every instrument with at least one month file or a funding file, in instrument order.
+ */
+instruments: Array<StoredInstrumentInfo>, 
+/**
+ * Paths in the data folder, relative to it, that name no venue, kind, symbol or month the
+ * store writes. They are neither counted nor deleted.
+ */
+unrecognised: Array<string>, };
+
+/**
+ * What the store holds for one instrument.
+ */
+export type StoredInstrumentInfo = { instrument: InstrumentId, 
+/**
+ * The month files, oldest first; empty when only a funding file is stored.
+ */
+months: Array<StoredMonthInfo>, 
+/**
+ * The funding file's size; `null` when there is none, which is always so for spot.
+ */
+funding_bytes: number | null, 
+/**
+ * The month files and the funding file together.
+ */
+bytes: number, };
+
+/**
+ * One month file of an instrument's candles and its size on disk.
+ */
+export type StoredMonthInfo = { 
+/**
+ * `YYYY-MM`.
+ */
+month: string, bytes: number, };
+
+/**
+ * What to delete: the candles of `instrument` for the months `from` to `to`, both included, or,
+ * with neither given, every month and a perpetual's funding file.
+ */
+export type DeleteRequest = { instrument: InstrumentId, 
+/**
+ * `YYYY-MM`; give both `from` and `to`, or neither.
+ */
+from?: string, 
+/**
+ * `YYYY-MM`, included.
+ */
+to?: string, };
+
+/**
+ * What a delete removed: data files, and temp files a crashed download left beside them.
+ */
+export type DeleteResult = { files: number, bytes: number, };
 
 /**
  * `GET /candles`: closed bars, oldest first.
@@ -932,10 +1042,15 @@ funding_rates: number, };
 export type ToleratedBucket = { open_time: number, missing_minutes: number, };
 
 /**
- * What a paper session runs: a registered strategy with its parameters, on one instrument and
- * timeframe, with the same money settings as a backtest.
+ * What a paper session runs: a registered strategy with its parameters, or none for a manual
+ * session, on one instrument and timeframe, with the same money settings as a backtest.
  */
-export type PaperConfig = { strategy: string, params: Params, 
+export type PaperConfig = { 
+/**
+ * A registered strategy, or `none` ([`MANUAL_STRATEGY`]) for a manual session, which takes no
+ * parameters.
+ */
+strategy: string, params: Params, 
 /**
  * The instrument with the trading rules it had when the session was made. Fixed for the
  * session's life, so a resume replays against the same rules.
@@ -976,7 +1091,8 @@ export type Status = { "status": "warming_up" } | { "status": "live" } | { "stat
  */
 export type StartSessionRequest = { 
 /**
- * A registered strategy, as `GET /strategies` lists it.
+ * A registered strategy, as `GET /strategies` lists it, or `none` for a manual session, where
+ * only manual orders trade; it takes no parameters.
  */
 strategy: string, params: Params, instrument: InstrumentId, timeframe: Timeframe, starting_cash: number, slippage_bps: number, 
 /**
@@ -1007,6 +1123,136 @@ qty: number, avg_entry: number, mark_price: number, unrealised_pnl: number, real
 funding_paid: number, };
 
 /**
+ * Who placed an order, and so whose its fills are.
+ */
+export type OrderSource = "strategy" | "manual" | "liquidation";
+
+/**
+ * An order with who placed it.
+ */
+export type PaperOrder = { source: OrderSource, id: OrderId, request: OrderRequest, 
+/**
+ * Open time of the bar the order was decided on. It can first fill on a later bar. For a
+ * strategy's order that is the bar at whose close it was sent; for one placed between bars
+ * from outside the strategy, such as a manual order, it is the bar in progress when it was
+ * accepted, so it never fills on a price from before then.
+ */
+submitted_at: number, 
+/**
+ * Close of the bar the order was decided on: the last price before it was sent.
+ */
+decision_close: number, 
+/**
+ * The protective stop to place when this order fills, if one was attached.
+ */
+attached_stop: AttachedStop | null, status: OrderStatus, };
+
+/**
+ * A fill with who placed its order.
+ */
+export type PaperFill = { source: OrderSource, order_id: OrderId, instrument: InstrumentId, side: Side, time: number, price: number, qty: number, 
+/**
+ * The fee paid, in the quote asset. Negative for a rebate.
+ */
+fee: number, liquidity: Liquidity, };
+
+/**
+ * Whose fills make up a trade. A liquidation's fill does not count: it only closes a trade that
+ * the strategy or a person opened.
+ */
+export type TradeSource = "strategy" | "manual" | "mixed";
+
+/**
+ * A round trip with whose fills it is made of.
+ */
+export type PaperTrade = { source: TradeSource, side: TradeSide, 
+/**
+ * Open time of the bar of the first fill.
+ */
+entry_time: number, 
+/**
+ * Open time of the bar of the fill that closed the trade, or of the last bar for an open
+ * trade.
+ */
+exit_time: number, 
+/**
+ * Still open at the end of the run; its exit is the remaining position marked at the last
+ * close, with no exit fee.
+ */
+open: boolean, 
+/**
+ * The largest absolute position during the trade.
+ */
+qty: number, 
+/**
+ * Volume-weighted price of the fills that opened or added to the position.
+ */
+entry_price: number, 
+/**
+ * Volume-weighted price of the fills that reduced or closed it (and the mark, if open).
+ */
+exit_price: number, 
+/**
+ * `sign * exit_qty * (exit_price - entry_price)`, before fees and funding. Over a closed
+ * round trip this is the exit notional minus the entry notional (reversed for a short),
+ * which is what the portfolio's average-cost realised P&L adds up to.
+ */
+gross_pnl: number, 
+/**
+ * Fees of the trade's fills. A fill that flips the position splits its fee between the two
+ * trades in proportion to the quantity that closed and that opened.
+ */
+fees: number, 
+/**
+ * Funding charged on the trade's position: at a bar's open (including funding due in a gap
+ * before the bar) while it was held going into the bar, and later in a bar while it was held
+ * after the bar's fills.
+ */
+funding: number, 
+/**
+ * `gross_pnl - fees - funding`.
+ */
+net_pnl: number, 
+/**
+ * `net_pnl / (entry_price * qty)`: net P&L over the largest entry notional.
+ */
+return_on_notional: number, 
+/**
+ * Bars from the entry fill's bar to the exit fill's bar; for an open trade, to the end of the
+ * last bar. It counts bars fed, not time: missing bars in a gap are not counted, so across a
+ * gap it understates how long the position was held. For a closed trade, the time between
+ * the entry and exit fills' bars is `exit_time - entry_time`.
+ */
+bars_held: number, };
+
+/**
+ * `POST /sessions/{id}/orders`: an order placed by hand. It goes through the same rounding,
+ * checks and broker as a strategy's order, checked at the close of the last bar fed, and takes
+ * effect from the first bar that opens at or after the moment it is accepted.
+ */
+export type ManualOrder = { side: Side, 
+/**
+ * In the base asset; rounded down to the lot size.
+ */
+qty: number, type: ManualOrderType, 
+/**
+ * Required for a limit order and refused on a market one. Rounded to the tick in the order's
+ * favour: a buy down, a sell up.
+ */
+limit_price?: number, 
+/**
+ * Only reduce the open position; false when left out.
+ */
+reduce_only?: boolean, };
+
+/**
+ * A manual order's type. A market order fills at the open of the first bar that opens at or after
+ * it is accepted; a limit order rests, good till cancelled, until a bar from then on reaches its
+ * price.
+ */
+export type ManualOrderType = "market" | "limit";
+
+/**
  * Everything about one session: `GET /sessions/{id}`, and the first message of a `session:`
  * subscription.
  */
@@ -1018,11 +1264,11 @@ equity: number, position: PositionInfo,
 /**
  * Equity at each live bar's close.
  */
-equity_curve: Array<EquityPoint>, open_orders: Array<Order>, fills: Array<Fill>, 
+equity_curve: Array<EquityPoint>, open_orders: Array<PaperOrder>, fills: Array<PaperFill>, 
 /**
  * Round trips so far; one still open is marked at the last close.
  */
-trades: Array<Trade>, 
+trades: Array<PaperTrade>, 
 /**
  * Funding rates charged.
  */
@@ -1047,7 +1293,7 @@ warnings: Array<string>, };
  * subscriber never sees a bar that a resume would fetch and report again. Replaying the log
  * reports nothing.
  */
-export type SessionEvent = { "event": "funding", funding: Funding, } | { "event": "fill", fill: Fill, } | { "event": "order", order: Order, } | { "event": "bar", bar: Candle, warm_up: boolean, equity: number | null, } | { "event": "status", status: Status, } | { "event": "dropped", open_time: number, } | { "event": "warning", message: string, };
+export type SessionEvent = { "event": "funding", funding: Funding, } | { "event": "fill", fill: PaperFill, } | { "event": "order", order: PaperOrder, } | { "event": "bar", bar: Candle, warm_up: boolean, equity: number | null, } | { "event": "status", status: Status, } | { "event": "dropped", open_time: number, } | { "event": "warning", message: string, };
 
 /**
  * A message from the client.

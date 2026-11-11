@@ -108,7 +108,7 @@ describe('latest runs for the strategy list', () => {
 describe('the range of a dataset', () => {
   const coverage = (first: number, last: number): CoverageResponse => ({
     instrument: { venue: 'binance', symbol: 'BTCUSDT', kind: 'spot' },
-    months: [{ month: '2024-03', minutes: 0, month_minutes: 0, first, last, gaps: [] }],
+    months: [{ month: '2024-03', minutes: 0, month_minutes: 0, bytes: 0, first, last, gaps: [] }],
     funding: null,
   })
   const H = 3_600_000

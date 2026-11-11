@@ -28,11 +28,20 @@ const ROUTES: readonly Route[] = [
   { method: 'GET', path: /^\/runs$/ },
   // A run id: the save time as 13 digits, `-`, then 8 lowercase hex digits (td_engine::RunId).
   { method: 'GET', path: /^\/runs\/\d{13}-[0-9a-f]{8}$/ },
+  { method: 'GET', path: /^\/sessions$/ },
+  { method: 'POST', path: /^\/sessions$/, body: true },
+  { method: 'GET', path: /^\/sessions\/[A-Za-z0-9_-]{1,64}$/ },
+  { method: 'POST', path: /^\/sessions\/[A-Za-z0-9_-]{1,64}\/(?:stop|resume)$/ },
 ]
 
-// The WebSocket topics the engine serves (crates/td-server/src/api/ws.rs). Add `candles:` and
-// `session:` here when the engine starts serving them.
-const TOPICS: readonly RegExp[] = [/^jobs$/]
+// The WebSocket topics the engine serves (crates/td-server/src/api/ws.rs). Symbols follow the
+// store's rule (crates/td-data/src/store.rs `check_symbol`, narrowed to ASCII) and session ids the
+// paper session's (crates/td-server/src/paper.rs `check_id`).
+const TOPICS: readonly RegExp[] = [
+  /^jobs$/,
+  /^candles:(?:binance|bybit):[A-Z0-9_-]{1,32}:(?:spot|perpetual):(?:1m|5m|15m|30m|1h|4h|1d|1w)$/,
+  /^session:[A-Za-z0-9_-]{1,64}$/,
+]
 
 const MAX_QUERY_VALUE = 256
 const MAX_BODY_BYTES = 64 * 1024

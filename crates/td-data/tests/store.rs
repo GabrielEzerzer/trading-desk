@@ -2,7 +2,9 @@
 
 use td_core::{Candle, CoreError, InstrumentId, InstrumentKind, Millis, Timeframe, Venue};
 use td_data::time::{DAY, MINUTE, Month, parse_date};
-use td_data::{DataError, Gap, LoadedCandles, Store, missing_minutes, resample};
+use td_data::{
+    DataError, DeleteReport, Gap, LoadedCandles, Store, StoredData, missing_minutes, resample,
+};
 
 const HOUR: Millis = 60 * MINUTE;
 
@@ -473,4 +475,587 @@ fn funding_round_trip() {
         store.load_funding(&btc(InstrumentKind::Spot), t, t + h8),
         Err(DataError::NotPerpetual(_))
     ));
+}
+
+/// The paths of every file and folder under `root`, relative to it with `/` separators, sorted.
+fn tree(root: &std::path::Path) -> Vec<String> {
+    fn walk(root: &std::path::Path, dir: &std::path::Path, out: &mut Vec<String>) {
+        for entry in std::fs::read_dir(dir).expect("listable") {
+            let path = entry.expect("an entry").path();
+            let relative = path.strip_prefix(root).expect("under the root");
+            out.push(relative.to_string_lossy().replace('\\', "/"));
+            if path.is_dir() {
+                walk(root, &path, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, root, &mut out);
+    out.sort();
+    out
+}
+
+fn month(text: &str) -> Month {
+    Month::parse(text).expect("a month")
+}
+
+fn file_size(path: std::path::PathBuf) -> u64 {
+    std::fs::metadata(path).expect("a file").len()
+}
+
+/// Stores an hour of candles in each of 2024-01, 2024-02 and 2024-03 for `id`, and two funding
+/// rates when it is a perpetual.
+fn store_three_months(store: &Store, id: &InstrumentId) {
+    for m in ["2024-01", "2024-02", "2024-03"] {
+        store
+            .write_candles(id, &flat_minutes(month(m).start(), 0..60))
+            .expect("writes");
+    }
+    if id.kind == InstrumentKind::Perpetual {
+        let t = day("2024-01-01");
+        store
+            .write_funding(id, &[(t, 0.0001), (t + 8 * HOUR, 0.0002)])
+            .expect("writes");
+    }
+}
+
+#[test]
+fn the_listing_shows_each_instrument_with_its_months_and_bytes_and_reports_strays() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let store = Store::new(dir.path());
+    assert_eq!(store.stored().expect("lists"), StoredData::default());
+    let perp = btc(InstrumentKind::Perpetual);
+    let spot = btc(InstrumentKind::Spot);
+    store_three_months(&store, &perp);
+    store
+        .write_candles(&spot, &flat_minutes(month("2024-02").start(), 0..10))
+        .expect("writes");
+    // A perpetual with funding stored but no candles.
+    let eth = InstrumentId {
+        venue: Venue::Bybit,
+        symbol: "ETHUSDT".into(),
+        kind: InstrumentKind::Perpetual,
+    };
+    store
+        .write_funding(&eth, &[(day("2024-01-01"), 0.0001)])
+        .expect("writes");
+    // Things the store never writes.
+    let root = dir.path();
+    for stray in [
+        "candles/kraken/spot/BTCUSDT/1m",
+        "candles/binance/future/BTCUSDT/1m",
+        "candles/binance/spot/btc..usdt/1m",
+        "candles/binance/spot/BTCUSDT/5m",
+    ] {
+        std::fs::create_dir_all(root.join(stray)).expect("a folder");
+    }
+    for stray in [
+        "candles/binance/spot/BTCUSDT/1m/notes.txt",
+        "candles/binance/spot/BTCUSDT/1m/2024-13.parquet",
+        "funding/bybit/odd name.parquet",
+    ] {
+        std::fs::write(root.join(stray), b"x").expect("writes");
+    }
+
+    let stored = store.stored().expect("lists");
+    let ids: Vec<String> = stored
+        .instruments
+        .iter()
+        .map(|i| i.id.to_string())
+        .collect();
+    assert_eq!(
+        ids,
+        [
+            "binance:BTCUSDT:spot",
+            "binance:BTCUSDT:perpetual",
+            "bybit:ETHUSDT:perpetual"
+        ]
+    );
+    let perp_listed = &stored.instruments[1];
+    let months: Vec<Month> = perp_listed.months.iter().map(|m| m.month).collect();
+    assert_eq!(
+        months,
+        [month("2024-01"), month("2024-02"), month("2024-03")]
+    );
+    for m in &perp_listed.months {
+        assert!(m.bytes > 0);
+        assert_eq!(
+            m.bytes,
+            file_size(store.candle_path(&perp, m.month).unwrap())
+        );
+    }
+    let funding_bytes = file_size(store.funding_path(&perp).unwrap());
+    assert_eq!(perp_listed.funding_bytes, Some(funding_bytes));
+    assert_eq!(
+        perp_listed.bytes(),
+        perp_listed.months.iter().map(|m| m.bytes).sum::<u64>() + funding_bytes
+    );
+    assert_eq!(stored.instruments[0].funding_bytes, None);
+    assert_eq!(stored.instruments[0].months.len(), 1);
+    assert!(stored.instruments[2].months.is_empty());
+    assert!(stored.instruments[2].funding_bytes.is_some());
+    // Coverage reports the same bytes per month.
+    let coverage: Vec<u64> = store
+        .coverage(&perp)
+        .expect("covers")
+        .iter()
+        .map(|m| m.bytes)
+        .collect();
+    let listed: Vec<u64> = perp_listed.months.iter().map(|m| m.bytes).collect();
+    assert_eq!(coverage, listed);
+
+    let strays: Vec<String> = stored
+        .unrecognised
+        .iter()
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+        .collect();
+    assert_eq!(
+        strays,
+        [
+            "candles/binance/future",
+            "candles/binance/spot/BTCUSDT/1m/2024-13.parquet",
+            "candles/binance/spot/BTCUSDT/1m/notes.txt",
+            "candles/binance/spot/BTCUSDT/5m",
+            "candles/binance/spot/btc..usdt",
+            "candles/kraken",
+            "funding/bybit/odd name.parquet",
+        ]
+    );
+}
+
+#[test]
+fn deleting_a_month_range_leaves_the_other_months_readable() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let store = Store::new(dir.path());
+    let id = btc(InstrumentKind::Perpetual);
+    store_three_months(&store, &id);
+    let feb = store.candle_path(&id, month("2024-02")).unwrap();
+    let feb_bytes = file_size(feb.clone());
+    // A temp file a crashed writer left beside the February file.
+    std::fs::write(feb.with_extension("parquet.999.0.tmp"), b"half").expect("writes");
+
+    let report = store
+        .delete_months(&id, month("2024-02"), month("2024-02"))
+        .expect("deletes");
+    assert_eq!(
+        report,
+        DeleteReport {
+            files: 2,
+            bytes: feb_bytes + 4
+        }
+    );
+    assert_eq!(
+        store.months(&id).expect("lists"),
+        [month("2024-01"), month("2024-03")]
+    );
+    for m in ["2024-01", "2024-03"] {
+        assert_eq!(store.read_month(&id, month(m)).expect("reads").len(), 60);
+    }
+    let february: Vec<String> = tree(dir.path())
+        .into_iter()
+        .filter(|f| f.contains("2024-02"))
+        .collect();
+    assert_eq!(
+        february,
+        ["candles/binance/perpetual/BTCUSDT/1m/2024-02.parquet.lock"],
+        "the February file and the temp file are gone, and its lock file stays"
+    );
+    assert_eq!(
+        store
+            .load_funding(&id, i64::MIN, i64::MAX)
+            .expect("loads")
+            .len(),
+        2
+    );
+
+    // A range reaching past what is stored deletes only what is there.
+    let jan_bytes = file_size(store.candle_path(&id, month("2024-01")).unwrap());
+    let report = store
+        .delete_months(&id, month("2023-01"), month("2024-02"))
+        .expect("deletes");
+    assert_eq!(
+        report,
+        DeleteReport {
+            files: 1,
+            bytes: jan_bytes
+        }
+    );
+    assert_eq!(store.months(&id).expect("lists"), [month("2024-03")]);
+    // Deleting what is not there is not an error.
+    let none = store
+        .delete_months(&id, month("2025-01"), month("2025-12"))
+        .expect("deletes");
+    assert_eq!(none, DeleteReport::default());
+    // A deleted month can be written again.
+    store
+        .write_candles(&id, &flat_minutes(month("2024-02").start(), 0..5))
+        .expect("writes");
+    assert_eq!(
+        store
+            .read_month(&id, month("2024-02"))
+            .expect("reads")
+            .len(),
+        5
+    );
+}
+
+#[test]
+fn deleting_a_whole_perpetual_removes_its_candles_and_funding_and_leaves_its_lock_files() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let store = Store::new(dir.path());
+    let perp = btc(InstrumentKind::Perpetual);
+    let spot = btc(InstrumentKind::Spot);
+    store_three_months(&store, &perp);
+    store_three_months(&store, &spot);
+    let perp_bytes = store
+        .stored()
+        .expect("lists")
+        .instruments
+        .iter()
+        .find(|i| i.id == perp)
+        .expect("listed")
+        .bytes();
+
+    let report = store.delete_instrument(&perp).expect("deletes");
+    assert_eq!(
+        report,
+        DeleteReport {
+            files: 4,
+            bytes: perp_bytes
+        }
+    );
+    assert!(store.months(&perp).expect("lists").is_empty());
+    assert!(
+        store
+            .load_funding(&perp, i64::MIN, i64::MAX)
+            .expect("loads")
+            .is_empty()
+    );
+    let stored = store.stored().expect("lists");
+    let ids: Vec<InstrumentId> = stored.instruments.into_iter().map(|i| i.id).collect();
+    assert_eq!(ids, std::slice::from_ref(&spot));
+    assert_eq!(stored.unrecognised, Vec::<std::path::PathBuf>::new());
+    // Of the perpetual, only its lock files are left, empty, as writers leave them.
+    let perp_files: Vec<String> = tree(dir.path())
+        .into_iter()
+        .filter(|f| f.contains("perpetual") || f.starts_with("funding"))
+        .filter(|f| dir.path().join(f).is_file())
+        .collect();
+    assert_eq!(
+        perp_files,
+        [
+            "candles/binance/perpetual/BTCUSDT/1m/2024-01.parquet.lock",
+            "candles/binance/perpetual/BTCUSDT/1m/2024-02.parquet.lock",
+            "candles/binance/perpetual/BTCUSDT/1m/2024-03.parquet.lock",
+            "funding/binance/BTCUSDT.parquet.lock",
+        ]
+    );
+    for file in &perp_files {
+        assert_eq!(file_size(dir.path().join(file)), 0, "{file}");
+    }
+
+    // Deleting what is not stored removes nothing and creates nothing, not even a folder or a
+    // lock file.
+    let before = tree(dir.path());
+    let eth = InstrumentId {
+        symbol: "ETHUSDT".into(),
+        ..perp.clone()
+    };
+    for id in [&perp, &eth] {
+        assert_eq!(
+            store.delete_instrument(id).expect("deletes nothing"),
+            DeleteReport::default()
+        );
+        assert_eq!(
+            store
+                .delete_months(id, month("2020-01"), month("2030-12"))
+                .expect("deletes nothing"),
+            DeleteReport::default()
+        );
+    }
+    assert_eq!(tree(dir.path()), before);
+
+    // The deleted month and funding can be written and read again.
+    store
+        .write_candles(&perp, &flat_minutes(month("2024-02").start(), 0..5))
+        .expect("writes");
+    assert_eq!(
+        store
+            .read_month(&perp, month("2024-02"))
+            .expect("reads")
+            .len(),
+        5
+    );
+    let t = day("2024-02-01");
+    store.write_funding(&perp, &[(t, 0.0003)]).expect("writes");
+    assert_eq!(
+        store
+            .load_funding(&perp, i64::MIN, i64::MAX)
+            .expect("loads"),
+        [(t, 0.0003)]
+    );
+}
+
+#[test]
+fn a_lock_file_with_bytes_in_it_holds_up_no_write_or_delete() {
+    // The store never writes into a lock file, and what one holds does not matter: writes and
+    // deletes lock it as it is, and a delete leaves it as it was.
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let store = Store::new(dir.path());
+    let id = btc(InstrumentKind::Spot);
+    let jan = month("2024-01");
+    store
+        .write_candles(&id, &flat_minutes(jan.start(), 0..5))
+        .expect("writes");
+    let lock_file = store
+        .candle_path(&id, jan)
+        .unwrap()
+        .with_extension("parquet.lock");
+    std::fs::write(&lock_file, b"x").expect("writes");
+    store
+        .write_candles(&id, &flat_minutes(jan.start(), 5..10))
+        .expect("writes");
+    assert_eq!(store.read_month(&id, jan).expect("reads").len(), 10);
+    assert_eq!(
+        store.delete_months(&id, jan, jan).expect("deletes").files,
+        1
+    );
+    assert_eq!(std::fs::read(&lock_file).expect("stays"), b"x");
+    assert!(store.months(&id).expect("lists").is_empty());
+}
+
+/// Makes `link` a link to the folder `target`: a junction on Windows, which needs no privilege,
+/// and a symlink elsewhere.
+fn link_dir(target: &std::path::Path, link: &std::path::Path) {
+    #[cfg(windows)]
+    {
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .stdout(std::process::Stdio::null())
+            .status()
+            .expect("cmd runs");
+        assert!(status.success(), "mklink /J {link:?} {target:?}: {status}");
+    }
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(target, link).expect("a symlink");
+}
+
+/// The store's [`StoredData::unrecognised`] paths with `/` separators.
+fn strays(stored: &StoredData) -> Vec<String> {
+    stored
+        .unrecognised
+        .iter()
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+        .collect()
+}
+
+#[test]
+fn a_delete_does_not_follow_a_link_out_of_the_store() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let store = Store::new(dir.path().join("store"));
+    // Outside the store, a folder laid out as an instrument's folder is, holding a month file, and
+    // a funding file beside it.
+    let outside = dir.path().join("outside");
+    std::fs::create_dir_all(outside.join("1m")).expect("a folder");
+    std::fs::write(outside.join("1m/2024-01.parquet"), b"keep").expect("writes");
+    std::fs::write(outside.join("XRPUSDT.parquet"), b"keep").expect("writes");
+    let spot = InstrumentId {
+        venue: Venue::Binance,
+        symbol: "XRPUSDT".into(),
+        kind: InstrumentKind::Spot,
+    };
+    let perp = InstrumentId {
+        kind: InstrumentKind::Perpetual,
+        ..spot.clone()
+    };
+    let parent = |path: std::path::PathBuf| path.parent().expect("a folder").to_path_buf();
+    let month_dir = |id: &InstrumentId| parent(store.candle_path(id, month("2024-01")).unwrap());
+    // Links inside the store to it: the spot symbol folder, the perpetual's month folder, and the
+    // venue's funding folder.
+    for (link, target) in [
+        (parent(month_dir(&spot)), outside.clone()),
+        (month_dir(&perp), outside.join("1m")),
+        (parent(store.funding_path(&perp).unwrap()), outside.clone()),
+    ] {
+        std::fs::create_dir_all(parent(link.clone())).expect("a folder");
+        link_dir(&target, &link);
+    }
+
+    for id in [&spot, &perp] {
+        assert_eq!(
+            store.delete_instrument(id).expect("deletes nothing"),
+            DeleteReport::default(),
+            "{id}"
+        );
+        assert_eq!(
+            store
+                .delete_months(id, month("2024-01"), month("2024-01"))
+                .expect("deletes nothing"),
+            DeleteReport::default(),
+            "{id}"
+        );
+    }
+    assert_eq!(
+        tree(&outside),
+        ["1m", "1m/2024-01.parquet", "XRPUSDT.parquet"],
+        "nothing outside was removed or added"
+    );
+    for file in ["1m/2024-01.parquet", "XRPUSDT.parquet"] {
+        assert_eq!(std::fs::read(outside.join(file)).expect("reads"), b"keep");
+    }
+}
+
+#[test]
+fn a_file_named_1m_is_reported_and_the_rest_of_the_store_is_listed() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let store = Store::new(dir.path());
+    let spot = btc(InstrumentKind::Spot);
+    store
+        .write_candles(&spot, &flat_minutes(month("2024-01").start(), 0..10))
+        .expect("writes");
+    let stray = dir.path().join("candles/binance/spot/ETHUSDT/1m");
+    std::fs::create_dir_all(stray.parent().unwrap()).expect("a folder");
+    std::fs::write(&stray, b"x").expect("writes");
+
+    let stored = store.stored().expect("lists");
+    let ids: Vec<InstrumentId> = stored.instruments.iter().map(|i| i.id.clone()).collect();
+    assert_eq!(ids, [spot]);
+    assert_eq!(strays(&stored), ["candles/binance/spot/ETHUSDT/1m"]);
+}
+
+#[test]
+fn a_1m_link_is_reported_and_not_read() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let store = Store::new(dir.path().join("store"));
+    let outside = dir.path().join("outside");
+    std::fs::create_dir_all(&outside).expect("a folder");
+    std::fs::write(outside.join("2024-01.parquet"), b"x").expect("writes");
+    let eth = InstrumentId {
+        symbol: "ETHUSDT".into(),
+        ..btc(InstrumentKind::Spot)
+    };
+    let month_file = store.candle_path(&eth, month("2024-01")).unwrap();
+    let link = month_file.parent().unwrap();
+    std::fs::create_dir_all(link.parent().unwrap()).expect("a folder");
+    link_dir(&outside, link);
+
+    let stored = store.stored().expect("lists");
+    assert!(
+        stored.instruments.is_empty(),
+        "nothing is read through the link: {stored:?}"
+    );
+    assert_eq!(strays(&stored), ["candles/binance/spot/ETHUSDT/1m"]);
+}
+
+#[test]
+fn a_candles_or_funding_link_is_reported_and_neither_listed_nor_deleted_through() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let store = Store::new(dir.path().join("store"));
+    let outside = dir.path().join("outside");
+    let perp = btc(InstrumentKind::Perpetual);
+    // Month and funding files laid out as the store lays them out, in a folder outside it.
+    for (top, file) in [
+        (
+            "candles",
+            store.candle_path(&perp, month("2024-01")).unwrap(),
+        ),
+        ("funding", store.funding_path(&perp).unwrap()),
+    ] {
+        let below = file.strip_prefix(store.root().join(top)).expect("under it");
+        let target = outside.join(top);
+        std::fs::create_dir_all(target.join(below).parent().unwrap()).expect("a folder");
+        std::fs::write(target.join(below), b"keep").expect("writes");
+        std::fs::create_dir_all(store.root()).expect("a folder");
+        link_dir(&target, &store.root().join(top));
+    }
+    let before = tree(&outside);
+
+    let stored = store.stored().expect("lists");
+    assert!(
+        stored.instruments.is_empty(),
+        "nothing is listed through the links: {stored:?}"
+    );
+    assert_eq!(strays(&stored), ["candles", "funding"]);
+    assert_eq!(
+        store.delete_instrument(&perp).expect("deletes nothing"),
+        DeleteReport::default()
+    );
+    assert_eq!(tree(&outside), before, "nothing outside was removed");
+}
+
+/// A file another program holds open without sharing cannot be removed on Windows; elsewhere an
+/// open file can be.
+#[cfg(windows)]
+#[test]
+fn a_delete_that_stops_part_way_says_how_much_it_removed() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let store = Store::new(dir.path());
+    let id = btc(InstrumentKind::Spot);
+    store_three_months(&store, &id);
+    let jan_bytes = file_size(store.candle_path(&id, month("2024-01")).unwrap());
+    let held = std::fs::File::options()
+        .read(true)
+        .share_mode(0)
+        .open(store.candle_path(&id, month("2024-02")).unwrap())
+        .expect("opens");
+
+    let error = store
+        .delete_instrument(&id)
+        .expect_err("February cannot be removed")
+        .to_string();
+    assert!(
+        error.contains(&format!("files removed before it: 1, {jan_bytes} bytes")),
+        "{error}"
+    );
+    drop(held);
+    assert_eq!(
+        store.months(&id).expect("lists"),
+        [month("2024-02"), month("2024-03")]
+    );
+}
+
+#[test]
+fn a_hostile_symbol_cannot_make_a_delete_leave_the_store() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let store = Store::new(dir.path().join("store"));
+    // A file outside the store that an escaping path could reach.
+    std::fs::write(dir.path().join("keep.parquet"), b"keep").expect("writes");
+    store_three_months(&store, &btc(InstrumentKind::Perpetual));
+    let before = tree(dir.path());
+    for symbol in [
+        "..",
+        "../..",
+        "../../../keep",
+        "..\\..\\..\\keep",
+        "/",
+        "C:",
+        "C:\\",
+        "BTC/USDT",
+        "",
+        ".",
+        "btcusdt",
+    ] {
+        let id = InstrumentId {
+            symbol: symbol.into(),
+            ..btc(InstrumentKind::Perpetual)
+        };
+        assert!(
+            matches!(
+                store.delete_instrument(&id),
+                Err(DataError::InvalidSymbol(_))
+            ),
+            "{symbol:?}"
+        );
+        assert!(
+            matches!(
+                store.delete_months(&id, month("2000-01"), month("2099-12")),
+                Err(DataError::InvalidSymbol(_))
+            ),
+            "{symbol:?}"
+        );
+    }
+    assert_eq!(tree(dir.path()), before, "nothing was touched");
 }

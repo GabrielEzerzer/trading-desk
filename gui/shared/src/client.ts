@@ -13,6 +13,9 @@ import type {
   JobInfo,
   RunDetail,
   RunSummary,
+  SessionState,
+  SessionSummary,
+  StartSessionRequest,
   StrategyInfo,
   Venue,
 } from './api-types'
@@ -68,6 +71,17 @@ export function createClient(send: Send) {
       call<JobCreated>({ method: 'POST', path: '/runs/backtest', body: config }),
     runs: () => call<RunSummary[]>({ method: 'GET', path: '/runs' }),
     run: (id: string) => call<RunDetail>({ method: 'GET', path: `/runs/${id}` }),
+    /** Every paper session, oldest first. */
+    sessions: () => call<SessionSummary[]>({ method: 'GET', path: '/sessions' }),
+    session: (id: string) => call<SessionState>({ method: 'GET', path: `/sessions/${encodeURIComponent(id)}` }),
+    /** Creates a paper session and starts it. */
+    startSession: (request: StartSessionRequest) =>
+      call<SessionSummary>({ method: 'POST', path: '/sessions', body: request }),
+    stopSession: (id: string) =>
+      call<SessionSummary>({ method: 'POST', path: `/sessions/${encodeURIComponent(id)}/stop` }),
+    /** Replays a stopped session and starts it again. */
+    resumeSession: (id: string) =>
+      call<SessionSummary>({ method: 'POST', path: `/sessions/${encodeURIComponent(id)}/resume` }),
   }
 }
 

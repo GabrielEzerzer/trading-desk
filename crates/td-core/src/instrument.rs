@@ -29,6 +29,8 @@ pub enum InstrumentKind {
     Spot,
     /// A perpetual futures contract (linear, settled in the quote asset).
     Perpetual,
+    /// A spot currency pair, for example USD/JPY.
+    Fx,
 }
 
 impl fmt::Display for InstrumentKind {
@@ -36,6 +38,7 @@ impl fmt::Display for InstrumentKind {
         f.write_str(match self {
             InstrumentKind::Spot => "spot",
             InstrumentKind::Perpetual => "perpetual",
+            InstrumentKind::Fx => "fx",
         })
     }
 }
@@ -478,5 +481,20 @@ mod tests {
     #[test]
     fn instrument_id_displays_as_venue_symbol_kind() {
         assert_eq!(btc_perp().id.to_string(), "binance:BTCUSDT:perpetual");
+    }
+
+    #[test]
+    fn kinds_serialise_and_display_as_their_names() {
+        for (kind, name) in [
+            (InstrumentKind::Spot, "spot"),
+            (InstrumentKind::Perpetual, "perpetual"),
+            (InstrumentKind::Fx, "fx"),
+        ] {
+            assert_eq!(kind.to_string(), name);
+            let json = serde_json::to_string(&kind).unwrap();
+            assert_eq!(json, format!("\"{name}\""));
+            assert_eq!(serde_json::from_str::<InstrumentKind>(&json).unwrap(), kind);
+        }
+        assert!(serde_json::from_str::<InstrumentKind>("\"forex\"").is_err());
     }
 }

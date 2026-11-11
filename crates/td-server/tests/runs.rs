@@ -341,7 +341,8 @@ fn config(kind: InstrumentKind, days: i64) -> BacktestConfig {
     }
 }
 
-/// A sweep over fast x slow on the perpetual, with shorts.
+/// A sweep over fast x slow on the perpetual, with shorts, ranked by total return: the seeded
+/// ranges are days long, too short for a Sharpe ratio or a CAGR.
 fn sweep_spec(days: i64, fast: (i64, i64), slow: (i64, i64)) -> Value {
     let mut base = serde_json::to_value(config(InstrumentKind::Perpetual, days)).unwrap();
     base["params"] = json!({ "allow_short": true });
@@ -352,7 +353,7 @@ fn sweep_spec(days: i64, fast: (i64, i64), slow: (i64, i64)) -> Value {
             { "name": "slow", "space": { "kind": "range", "from": slow.0, "to": slow.1, "step": 1 } },
         ],
         "mode": "grid",
-        "objective": { "metric": "sharpe", "direction": "maximize" },
+        "objective": { "metric": "total_return", "direction": "maximize" },
         "min_trades": 0,
     })
 }

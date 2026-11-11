@@ -19,6 +19,8 @@ export interface StubConfig {
   backtest?: 'ok' | 'data_missing' | 'too_many_runs' | 'fails'
   /** Time between a job's steps, 700 ms by default. */
   stepMs?: number
+  /** GET /sessions fails this many times before it answers. */
+  failSessions?: number
 }
 
 export interface State {
@@ -33,6 +35,8 @@ export interface State {
 
 export const SIZES: Size[]
 export const STATES: State[]
+/** Trading on the engine stub: instruments from the fixtures and a closed bar every 250 ms. */
+export const engineTrading: State['config']
 export function serve(): Promise<{ server: Server; url: string }>
 export function stubScript(config: State['config']): string
 export function openApp(page: Page, url: string, config: State['config'], options?: { clock?: boolean }): Promise<void>

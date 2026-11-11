@@ -7,9 +7,20 @@
 //
 // `config`: { engine: 'starting' | 'failed' | 'running', mock: boolean, hangStrategies: boolean,
 //             engineData: engine.json, noData?: boolean,
-//             backtest?: 'ok' | 'data_missing' | 'too_many_runs' | 'fails', stepMs?: number }
+//             backtest?: 'ok' | 'data_missing' | 'too_many_runs' | 'fails', stepMs?: number,
+//             instruments?: Instrument[], hangInstruments?: boolean, failInstruments?: boolean,
+//             candles?: { start: Candle, everyMs: number } | null, session?: SessionState | null,
+//             failSessions?: number }
 //
 // Every request is recorded in `window.__tdCalls`, so a flow can check what the app sent.
+//
+// For Trading in engine mode it answers GET /instruments from `config.instruments` (else the
+// engine.json fixtures), GET /sessions and GET /sessions/{id} from `config.session`, and on a
+// `candles:` subscription emits a closed bar every `config.candles.everyMs`, walking from
+// `config.candles.start`; `window.__stubCandles` counts them, so a state can wait for the chart to
+// fill. GET /sessions fails the first `config.failSessions` times. POST /sessions answers after
+// 300 ms with a new warming-up session, which GET /sessions then lists; `window.__stubStarts`
+// counts the requests.
 
 function installBridgeStub(config) {
   const listeners = new Set()
@@ -36,9 +47,11 @@ function installBridgeStub(config) {
   const ok = (body) => ({ ok: true, status: 200, body })
   const fail = (status, code, message) => ({ ok: false, status, error: { code, message } })
 
-  const emit = (job) => {
-    if (!subscribed) return
-    for (const listener of messageListeners) listener({ type: 'job', job: structuredClone(job) })
+  const emit = (message) => {
+    for (const listener of messageListeners) listener(message)
+  }
+  const emitJob = (job) => {
+    if (subscribed) emit({ type: 'job', job: structuredClone(job) })
   }
 
   /**
@@ -63,25 +76,25 @@ function installBridgeStub(config) {
     }
     jobs.set(job.id, job)
     // Like the engine, the queued job is published before the route answers.
-    emit(job)
+    emitJob(job)
     let i = 0
     const tick = () => {
       // A queued job is cancelled at once, by the cancel route.
       if (job.status === 'cancelled') return
       if (job.cancel_requested && i < steps.length) {
         Object.assign(job, { status: 'cancelled', message: 'cancelled', finished_at: Date.now() })
-        emit(job)
+        emitJob(job)
         return
       }
       const step = steps[i++]
       if (step) {
         Object.assign(job, { status: 'running', started_at: job.started_at ?? Date.now() }, step)
-        emit(job)
+        emitJob(job)
         setTimeout(tick, stepMs)
         return
       }
       Object.assign(job, { finished_at: Date.now() }, finish())
-      emit(job)
+      emitJob(job)
     }
     setTimeout(tick, 0)
     return { ok: true, status: 202, body: { job_id: job.id } }
@@ -160,7 +173,7 @@ function installBridgeStub(config) {
       return ok({ instrument: { venue, symbol, kind }, months, funding })
     }
     if (method === 'GET' && path === '/instruments') {
-      const instruments = data.instruments.filter((i) => i.id.venue === query.venue && i.id.kind === query.kind)
+      const instruments = (config.instruments ?? data.instruments).filter((i) => i.id.venue === query.venue && i.id.kind === query.kind)
       return ok({ instruments, rejected: [] })
     }
     if (method === 'POST' && path === '/runs/backtest') return startBacktest(body)
@@ -173,7 +186,7 @@ function installBridgeStub(config) {
       // A queued job is cancelled at once; a running one only asks, and ends at its next step.
       job.cancel_requested = true
       if (job.status === 'queued') Object.assign(job, { status: 'cancelled', message: 'cancelled', finished_at: Date.now() })
-      emit(job)
+      emitJob(job)
       return { ok: true, status: 202, body: structuredClone(job) }
     }
     if (method === 'GET' && m && !m[2]) return ok(structuredClone(job))
@@ -184,23 +197,108 @@ function installBridgeStub(config) {
     return fail(404, 'not_found', `${method} ${path} is not stubbed`)
   }
 
+  const timers = new Map()
+  const summary = (state) => ({
+    id: state.id,
+    strategy: state.config.strategy,
+    instrument: state.config.instrument.id,
+    timeframe: state.config.timeframe,
+    status: state.status,
+    equity: state.equity,
+  })
+
+  function emitCandles(topic) {
+    if (!config.candles || timers.has(topic)) return
+    const step = { '1m': 60_000, '5m': 300_000, '15m': 900_000, '1h': 3_600_000, '4h': 14_400_000 }[topic.split(':')[4]] ?? 60_000
+    let bar = { ...config.candles.start }
+    let n = 0
+    timers.set(
+      topic,
+      setInterval(() => {
+        // A small deterministic walk, enough to see the chart fill.
+        const drift = Math.sin(n / 3) * bar.close * 0.0012 + Math.cos(n / 7) * bar.close * 0.0006
+        const open = bar.close
+        const close = open + drift
+        bar = {
+          open_time: bar.open_time + step,
+          open,
+          high: Math.max(open, close) + Math.abs(drift) * 0.6,
+          low: Math.min(open, close) - Math.abs(drift) * 0.5,
+          close,
+          volume: 12 + (n % 5),
+          quote_volume: (12 + (n % 5)) * close,
+        }
+        n += 1
+        window.__stubCandles = (window.__stubCandles ?? 0) + 1
+        emit({ type: 'candle', topic, candle: bar })
+      }, config.candles.everyMs),
+    )
+  }
+
   window.td = {
     mock: config.mock,
     async request(request) {
       calls.push(structuredClone(request))
-      if (request.method === 'GET' && request.path === '/strategies' && config.hangStrategies) return new Promise(() => {})
+      const { method, path } = request
+      if (method === 'GET' && path === '/strategies' && config.hangStrategies) return new Promise(() => {})
+      if (method === 'GET' && path === '/instruments') {
+        if (config.hangInstruments) return new Promise(() => {})
+        if (config.failInstruments) {
+          return fail(502, 'upstream', `${request.query?.venue} did not answer: connection timed out`)
+        }
+      }
+      if (method === 'GET' && path === '/sessions') {
+        if (config.failSessions > 0) {
+          config.failSessions -= 1
+          return fail(500, 'internal', 'the session store did not answer')
+        }
+        return ok(config.session ? [summary(config.session)] : [])
+      }
+      if (method === 'POST' && path === '/sessions') {
+        window.__stubStarts = (window.__stubStarts ?? 0) + 1
+        const body = request.body
+        const instrument = (config.instruments ?? data.instruments).find(
+          (i) => i.id.venue === body.instrument.venue && i.id.symbol === body.instrument.symbol && i.id.kind === body.instrument.kind,
+        )
+        await new Promise((resolve) => setTimeout(resolve, 300))
+        config.session = {
+          id: `stub-${window.__stubStarts}`,
+          config: { ...body, instrument, fees: null, max_leverage: 1 },
+          status: { status: 'warming_up' },
+          cash: body.starting_cash,
+          equity: body.starting_cash,
+          position: { qty: 0, avg_entry: 0, mark_price: 0, unrealised_pnl: 0, realised_pnl: 0, fees_paid: 0, funding_paid: 0 },
+          equity_curve: [],
+          open_orders: [],
+          fills: [],
+          trades: [],
+          funding: [],
+          live_from: null,
+          last_bar: null,
+          dropped: [],
+          warnings: [],
+        }
+        return ok(summary(config.session))
+      }
+      if (method === 'GET' && config.session && path === `/sessions/${config.session.id}`) return ok(config.session)
       return route(request)
     },
     async subscribe(topic) {
+      if (topic.startsWith('candles:')) emitCandles(topic)
+      if (config.session && topic === `session:${config.session.id}`) {
+        setTimeout(() => emit({ type: 'session_state', session: config.session }), 0)
+      }
       if (topic !== 'jobs' || subscribed) return
       subscribed = true
       // Right after subscribing, the engine sends the state of every job.
       setTimeout(() => {
-        for (const job of jobs.values()) emit(job)
+        for (const job of jobs.values()) emitJob(job)
       }, 0)
     },
     async unsubscribe(topic) {
       if (topic === 'jobs') subscribed = false
+      clearInterval(timers.get(topic))
+      timers.delete(topic)
     },
     onMessage(listener) {
       messageListeners.add(listener)
