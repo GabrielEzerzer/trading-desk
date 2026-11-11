@@ -3,8 +3,10 @@
 //! One strategy is one file in three parts: the `Strategy` implementation with its parameters, its
 //! test plan and its verdict rule (see `sma_cross.rs`). An example is registered in
 //! [`crate::registry`]; a private strategy, a file in `private/`, is found by build.rs.
+//! `gotobi_calendar` is a calendar for strategies to use, not a strategy.
 
 pub mod donchian;
+pub mod gotobi_calendar;
 pub mod sma_cross;
 
 /// The strategies in `private/`, compiled in by build.rs; an empty list without the folder.

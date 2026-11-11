@@ -19,7 +19,10 @@ use super::jobs::{JobCreated, JobInfo, JobKind, JobRequest, JobResult, JobStatus
 use super::runs::{DataReport, RunCheck, RunDetail, RunDone, ToleratedBucket};
 use super::sessions::{PositionInfo, SessionState, SessionSummary, StartSessionRequest};
 use super::ws::{ClientMessage, ServerMessage};
-use crate::{Funding, PaperConfig, SessionEvent, Status};
+use crate::{
+    Funding, ManualOrder, ManualOrderType, OrderSource, PaperConfig, PaperFill, PaperOrder,
+    PaperTrade, SessionEvent, Status, TradeSource,
+};
 
 /// Where the declarations live, from the repository root.
 pub const OUTPUT: &str = "gui/shared/src/api-types.ts";
@@ -160,6 +163,13 @@ pub fn render() -> String {
         StartSessionRequest,
         SessionSummary,
         PositionInfo,
+        OrderSource,
+        PaperOrder,
+        PaperFill,
+        TradeSource,
+        PaperTrade,
+        ManualOrder,
+        ManualOrderType,
         SessionState,
         SessionEvent,
         ClientMessage,

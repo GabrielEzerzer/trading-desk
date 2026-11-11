@@ -56,6 +56,7 @@ describe('applySessionEvent', () => {
 
   it('reads a rejection from an order event', () => {
     const order = {
+      source: 'manual',
       id: 1,
       request: { instrument: btc, side: 'buy', qty: 1, order_type: { type: 'market' }, tif: 'gtc', reduce_only: false, client_tag: null },
       submitted_at: 0,
