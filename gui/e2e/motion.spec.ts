@@ -14,7 +14,7 @@ const MOTION_STATES = [
   'lab-strategy-menu',
   'lab-running',
   'lab-result-trade',
-  'lab-engine-cannot-run',
+  'lab-engine-downloading',
   'trading',
   'trading-instruments-loading',
   'trading-ticker-menu',

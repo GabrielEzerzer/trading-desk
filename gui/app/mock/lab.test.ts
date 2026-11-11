@@ -3,6 +3,8 @@ import { overallProgress } from '../src/renderer/src/lab/progress'
 import { RunCancelled } from '../src/renderer/src/lab/source'
 import { createMockLabSource } from './lab'
 
+const target = { instrument: { venue: 'binance', symbol: 'BTCUSDT', kind: 'perpetual' }, timeframe: '1h' } as const
+
 describe('mock Lab source', () => {
   beforeEach(() => vi.useFakeTimers())
   afterEach(() => vi.useRealTimers())
@@ -16,26 +18,38 @@ describe('mock Lab source', () => {
     expect(list.map((s) => s.last?.decision ?? null)).toEqual(['trade', 'no_trade', null, null])
   })
 
+  it('opens a saved result by its run id', async () => {
+    const source = createMockLabSource({ listMs: 0 })
+    const listing = source.strategies()
+    await vi.advanceTimersByTimeAsync(0)
+    const [sma] = await listing
+    if (!sma?.last) throw new Error('SMA cross has a result in the fixtures')
+    const verdict = await source.open(sma.last)
+    expect(verdict.decision).toBe('trade')
+    expect(verdict.finishedAt).toBe(sma.last.finishedAt)
+  })
+
   it('reports progress in order and finishes with a Trade verdict stamped now', async () => {
     const source = createMockLabSource({ stepMs: 100, now: () => 42 })
     const seen: number[] = []
     const steps: number[] = []
-    const run = source.run('donchian_breakout', (p) => {
+    const run = source.run('donchian_breakout', target, (p) => {
       seen.push(overallProgress(p))
       steps.push(p.step)
       expect(p.steps).toBe(4)
     })
     await vi.advanceTimersByTimeAsync(10_000)
-    const verdict = await run.result
+    const { last, verdict } = await run.result
     expect(verdict.decision).toBe('trade')
     expect(verdict.finishedAt).toBe(42)
+    expect(last).toMatchObject({ finishedAt: 42, decision: 'trade', totalReturn: verdict.keyNumbers[0]?.value })
     expect(steps.at(-1)).toBe(4)
     expect(seen).toEqual([...seen].sort((a, b) => a - b))
   })
 
   it('fails with the server-style message', async () => {
     const source = createMockLabSource({ stepMs: 100 })
-    const run = source.run('funding_carry', () => {})
+    const run = source.run('funding_carry', target, () => {})
     const outcome = expect(run.result).rejects.toThrow(/No funding rates are stored/)
     await vi.advanceTimersByTimeAsync(10_000)
     await outcome
@@ -44,7 +58,7 @@ describe('mock Lab source', () => {
   it('stops reporting and rejects with RunCancelled when cancelled', async () => {
     const source = createMockLabSource({ stepMs: 100 })
     const seen: number[] = []
-    const run = source.run('donchian_breakout', (p) => seen.push(p.step))
+    const run = source.run('donchian_breakout', target, (p) => seen.push(p.step))
     await vi.advanceTimersByTimeAsync(150)
     run.cancel()
     await expect(run.result).rejects.toBeInstanceOf(RunCancelled)
