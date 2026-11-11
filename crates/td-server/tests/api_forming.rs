@@ -404,7 +404,19 @@ async fn a_candles_topic_sends_the_bar_forming_then_the_closed_bar_that_replaces
         })
     );
 
-    // Each minute: its two updates as forming bars, then its closed bar.
+    // Each minute: its two updates as forming bars, then its closed bar. The two topics are
+    // separate streams with no order between them, so the 1m bars can still be arriving after
+    // the 5m bar closed: read on to the last 1m close.
+    let last_minute = T0 + 9 * MIN;
+    let closed_last_minute = |messages: &[(Value, ServerMessage)]| {
+        messages.iter().any(|(_, m)| {
+            matches!(m, ServerMessage::Candle { topic, candle } if *topic == m1 && candle.open_time == last_minute)
+        })
+    };
+    let mut messages = messages;
+    if !closed_last_minute(&messages) {
+        messages.extend(ws.until_candle(&m1, last_minute).await);
+    }
     let one: Vec<&ServerMessage> = messages
         .iter()
         .map(|(_, m)| m)
