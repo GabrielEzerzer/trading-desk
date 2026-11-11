@@ -888,11 +888,12 @@ mod source_tests {
         thursday() + d * DAY
     }
 
-    /// Thursday to Sunday as the bucket would serve them, with no Saturday file. Thursday has two
-    /// quiet minutes (10:00 and 10:01) and a crossed tick at 11:00; Friday a tick after the close
+    /// Thursday to Sunday as the bucket would serve them, with no Saturday file. Thursday's ticks
+    /// start at 00:05, with two quiet minutes (10:00 and 10:01) and a crossed tick at 11:00; Friday
+    /// has a tick after the close
     /// at 23:00; Sunday's ticks start at minute `sunday_first`.
     fn bucket(sunday_first: u32) -> Files {
-        let mut thu = tick_day(day(0), 0, &[600, 601]);
+        let mut thu = tick_day(day(0), 5, &[600, 601]);
         thu.push((660 * 60_000 + 15_000, 150_000, 150_010, 1.0, 1.0));
         thu.sort_by_key(|r| r.0);
         let mut fri = tick_day(day(1), 0, &[]);
@@ -945,6 +946,7 @@ mod source_tests {
         (0..4 * DAY / MINUTE)
             .map(|i| day(0) + i * MINUTE)
             .filter(|&t| InstrumentKind::Fx.is_open(t))
+            .filter(|&t| t >= day(0) + 5 * MINUTE)
             .filter(|&t| t < day(3) || t >= day(3) + Millis::from(sunday_first) * MINUTE)
             .collect()
     }
@@ -959,9 +961,10 @@ mod source_tests {
         let ask_times: Vec<Millis> = history.asks.iter().map(|c| c.open_time).collect();
         assert_eq!(bid_times, covered(22 * 60 + 3));
         assert_eq!(ask_times, bid_times);
-        // Thursday whole, Friday to 22:00, nothing on Saturday, Sunday from its first tick at
-        // 22:03: after the missing Saturday nothing is filled before it.
-        assert_eq!(bid_times.len(), 1440 + 1320 + 117);
+        // Thursday from its first tick at 00:05, as nothing before it is filled; Friday to 22:00;
+        // nothing on Saturday; Sunday from its first tick at 22:03, as after the missing Saturday
+        // nothing is filled before it.
+        assert_eq!(bid_times.len(), 1435 + 1320 + 117);
         assert_eq!(
             counts,
             Counts {
@@ -1323,7 +1326,12 @@ mod source_tests {
         assert_eq!(report.months, [(month, served.candles.len())]);
         assert_eq!(served.candles.len(), covered(22 * 60).len());
         assert_eq!(report.missing_files, [day_key("USDJPY", day(2))]);
-        assert_eq!(report.gaps, []);
+        // The minutes before the first tick are the only gap: the weekend is not one.
+        let before_first = [crate::Gap {
+            from: day(0),
+            to: day(0) + 5 * MINUTE,
+        }];
+        assert_eq!(report.gaps, before_first);
 
         let stored_bids = store.read_month(&id, month).expect("bids");
         assert_eq!(stored_bids, served.candles);
@@ -1343,8 +1351,9 @@ mod source_tests {
         let coverage = store.coverage(&id).expect("coverage");
         assert_eq!(coverage.len(), 1);
         assert_eq!(coverage[0].minutes, covered(22 * 60).len());
-        assert_eq!(coverage[0].first, day(0));
+        assert_eq!(coverage[0].first, day(0) + 5 * MINUTE);
         assert_eq!(coverage[0].last, day(4) - MINUTE);
+        // Coverage counts gaps from the first stored minute, so it has none.
         assert_eq!(coverage[0].gaps, []);
 
         let stored = store.stored().expect("the listing");
