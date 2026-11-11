@@ -521,12 +521,14 @@ fn read_record(dir: &Path) -> Option<VerdictRecord> {
 
 /// The part of a plan, as JSON, that the battery on `instrument` reads: the plan with its
 /// per-instrument fields, `instruments` and `backtest.slippage`, cut down to `instrument`'s
-/// entry. A battery reads no other instrument's entry, and the seed is the strategy's and the
-/// instrument's, so adding, removing or reordering another instrument, or changing another
-/// instrument's slippage, leaves this instrument's verdict current. A field that is missing or not
+/// entry, and without `out_of_sample`, the single split that only plan validation reads. A
+/// battery reads no other instrument's entry, and the seed is the strategy's and the
+/// instrument's, so adding, removing or reordering another instrument, changing another
+/// instrument's slippage or changing the split leaves this instrument's verdict current. A field that is missing or not
 /// shaped as expected is left as it is, so the plan compares unequal to the registered one.
 fn instrument_view(mut plan: Value, instrument: &Value) -> Value {
     if let Some(fields) = plan.as_object_mut() {
+        fields.remove("out_of_sample");
         if let Some(instruments) = fields.get_mut("instruments") {
             *instruments = Value::Array(vec![instrument.clone()]);
         }

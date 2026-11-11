@@ -696,6 +696,16 @@ async fn a_cancel_keeps_finished_instruments_and_one_stopped_in_its_luck_test() 
     // The perpetual has no complete battery, so its stopped one is its row, marked incomplete.
     let complete: Vec<bool> = rows.iter().map(|r| r.complete).collect();
     assert_eq!(complete, [false, true]);
+
+    // Read from `result.json` alone, the stopped battery is still incomplete.
+    let record = t
+        .runs_dir()
+        .join(kept[1].run_id.as_str())
+        .join("verdict.json");
+    std::fs::remove_file(&record).unwrap();
+    let rows = t.verdicts("").await;
+    let complete: Vec<bool> = rows.iter().map(|r| r.complete).collect();
+    assert_eq!(complete, [false, true]);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -936,11 +946,14 @@ async fn the_verdict_list_flags_a_changed_plan_and_prefers_a_complete_battery() 
         instrument: everything_else.plan.instruments[0].clone(),
         bps: 3.0,
     }];
+    let mut other_split = entry(49);
+    other_split.plan.out_of_sample = Some(td_engine::Split::Fraction(0.3));
     for current in [
         another_instrument,
         reordered,
         other_slippage,
         everything_else,
+        other_split,
     ] {
         let changed = t.restarted(vec![current.clone()]).await;
         let r = row(changed.verdicts("").await);
