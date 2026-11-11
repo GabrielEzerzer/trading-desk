@@ -81,6 +81,8 @@ pub struct Session {
     equity: Vec<EquityPoint>,
     bar_funding: Vec<BarFunding>,
     bar_stops: Vec<BarStops>,
+    /// The reason the strategy stopped the run on the bar being fed ([`Context::fail`]).
+    failure: Option<String>,
 }
 
 impl Session {
@@ -158,6 +160,7 @@ impl Session {
             equity: Vec::new(),
             bar_funding: Vec::new(),
             bar_stops: Vec::new(),
+            failure: None,
         })
     }
 
@@ -309,7 +312,7 @@ impl Session {
             add_stop(&mut stops, order);
         }
         self.bar_stops.push(stops);
-        Ok(())
+        self.strategy_failure()
     }
 
     /// Feeds a closed bar that only adds to the strategy's history, before the first live bar.
@@ -330,7 +333,16 @@ impl Session {
         self.check_bar(&bar, funding)?;
         self.bars.push(bar);
         self.call_strategy(&bar, self.fills.len(), true);
-        Ok(())
+        self.strategy_failure()
+    }
+
+    /// The error for a strategy that called [`Context::fail`] on the bar just fed. The bar itself
+    /// has been fed in full, so the session's state is that of a session that saw it.
+    fn strategy_failure(&mut self) -> Result<(), EngineError> {
+        match self.failure.take() {
+            Some(reason) => Err(EngineError::StrategyFailed(reason)),
+            None => Ok(()),
+        }
     }
 
     /// Closes out at the end of a run, after the second-to-last bar: cancels every open order
@@ -427,6 +439,7 @@ impl Session {
             broker: &mut *self.broker,
             orders: &mut self.orders,
             warming_up: false,
+            failure: &mut self.failure,
         }
     }
 
@@ -590,6 +603,7 @@ impl Session {
             broker: &mut *self.broker,
             orders: &mut self.orders,
             warming_up,
+            failure: &mut self.failure,
         };
         if ctx.bars.len() == 1 {
             self.strategy.on_start(&mut ctx);
@@ -855,6 +869,66 @@ mod tests {
 
     impl Strategy for Idle {
         fn on_bar(&mut self, _ctx: &mut Context, _bar: &Candle) {}
+    }
+
+    /// Fails on the bar with the given number of bars seen, twice, to show the first reason is
+    /// the one kept.
+    struct FailOn(usize);
+
+    impl Strategy for FailOn {
+        fn on_bar(&mut self, ctx: &mut Context, _bar: &Candle) {
+            if ctx.bars().len() == self.0 {
+                ctx.fail("first reason");
+                ctx.fail("second reason");
+            }
+        }
+    }
+
+    /// A strategy's `fail` turns the bar it was called on into an error, on a live bar and on a
+    /// warm-up bar, and the bars before it are fed as usual.
+    #[test]
+    fn a_strategy_that_fails_stops_the_run_with_its_reason() {
+        let config = SessionConfig {
+            starting_cash: 10_000.0,
+            slippage_bps: 0.0,
+            fees: None,
+            max_leverage: 1.0,
+            account_currency: AccountCurrency::Quote,
+        };
+        let bars: Vec<Candle> = (0..4).map(|i| bar(i, 100.0)).collect();
+        let failed = EngineError::StrategyFailed("first reason".into());
+        let err = run_backtest(
+            Box::new(FailOn(3)),
+            perp(),
+            Timeframe::M1,
+            &bars,
+            &[],
+            &[],
+            config,
+        )
+        .err();
+        assert_eq!(err, Some(failed.clone()));
+        let mut s = Session::new(Box::new(FailOn(3)), perp(), Timeframe::M1, config).unwrap();
+        s.on_bar(bars[0], &[]).unwrap();
+        s.on_bar(bars[1], &[]).unwrap();
+        assert_eq!(s.on_bar(bars[2], &[]), Err(failed.clone()));
+        assert_eq!(s.equity().len(), 3);
+        let mut s = Session::new(Box::new(FailOn(2)), perp(), Timeframe::M1, config).unwrap();
+        s.warm_up(bars[0], &[]).unwrap();
+        assert_eq!(s.warm_up(bars[1], &[]), Err(failed));
+        // A strategy that never fails runs to the end.
+        assert!(
+            run_backtest(
+                Box::new(FailOn(9)),
+                perp(),
+                Timeframe::M1,
+                &bars,
+                &[],
+                &[],
+                config
+            )
+            .is_ok()
+        );
     }
 
     #[test]
