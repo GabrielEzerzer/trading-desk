@@ -32,8 +32,13 @@ const TOKEN_VAR: &str = "OANDA_API_TOKEN";
 const PAGE: usize = 5_000;
 /// The shortest run of open minutes without a candle that is taken for a closure or an outage
 /// rather than a quiet market, and so left missing instead of filled. Quiet stretches in an open FX
-/// market are minutes long: the gaps inside the week in OANDA's USD/JPY minutes are 1 to 5 minutes.
-/// A market holiday the weekend rule does not know, such as 25 December, is a whole day.
+/// market are minutes long: in OANDA's USD/JPY minutes for 2016 to 2026 the longest is 52 minutes
+/// and 2.3% of the stored minutes are fills. A market holiday the weekend rule does not know, such
+/// as 25 December, is a whole day.
+// shortcut: a fill keeps the last quoted bid and ask, so its spread is the one before the quiet
+// stretch. About two thirds of the fills fall between 20:00 and 24:00 UTC, around the New York
+// close, where the spread a trade would really pay widens; a strategy that trades in those hours
+// is flattered by them. Leave minutes there missing, or mark fills as not tradeable, when one does.
 const CLOSURE_MINUTES: i64 = 60;
 /// The pauses before each retry of a page after a failed connection, a 429 or a 5xx: five tries
 /// over about 40 seconds.
