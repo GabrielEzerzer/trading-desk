@@ -2,8 +2,8 @@ use std::ops::Range;
 
 use serde::{Deserialize, Serialize};
 use td_core::{
-    Candle, FeeSchedule, Fill, Instrument, Liquidity, Millis, OrderId, OrderRequest, OrderType,
-    Rounding, Side, TimeInForce, Timeframe,
+    AccountCurrency, Candle, FeeSchedule, Fill, Instrument, Liquidity, Millis, OrderId,
+    OrderRequest, OrderType, Rounding, Side, TimeInForce, Timeframe,
 };
 
 use crate::broker::ENTRY_CANCELLED;
@@ -36,7 +36,7 @@ pub const MAINTENANCE_MARGIN_RATE: f64 = 0.005;
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct SessionConfig {
-    /// Starting balance in the quote asset.
+    /// Starting balance in the account currency.
     pub starting_cash: f64,
     /// Slippage applied to market and stop fills, in basis points of price.
     pub slippage_bps: f64,
@@ -46,6 +46,10 @@ pub struct SessionConfig {
     /// account's equity: 1.0 means 1x. Checked when an order is submitted (see
     /// [`Context::submit`]). A kind without margin, such as spot, ignores it.
     pub max_leverage: f64,
+    /// The currency the account holds and reports every amount in; see [`Session::new`] for the
+    /// kinds that allow [`AccountCurrency::Base`].
+    #[serde(skip_serializing_if = "AccountCurrency::is_quote")]
+    pub account_currency: AccountCurrency,
 }
 
 /// Equity at the close of the bar that opened at `time`.
@@ -81,6 +85,15 @@ pub struct Session {
 
 impl Session {
     /// A session on the simulated broker with the candle fill model.
+    ///
+    /// A [`AccountCurrency::Base`] account is allowed only on a margined kind without funding or
+    /// liquidation, which today is FX:
+    /// - on spot (no margin) the account pays for what it holds in the quote currency, so its
+    ///   balance cannot be in the base currency it is buying;
+    /// - on a perpetual (funding and liquidation) the funding payment and the liquidation price
+    ///   are worked out in the quote currency, the linear contract's settlement asset, and venues
+    ///   margin a linear perpetual in that asset. An account in the coin would be an inverse
+    ///   (coin-margined) contract, whose P&L is a different formula, not this conversion.
     pub fn new(
         strategy: Box<dyn Strategy>,
         instrument: Instrument,
@@ -102,6 +115,19 @@ impl Session {
                 "max leverage must be a finite number above zero",
             ));
         }
+        let rules = instrument.id.kind.rules();
+        if config.account_currency == AccountCurrency::Base {
+            if !rules.margin {
+                return Err(EngineError::InvalidConfig(
+                    "a base-currency account needs a margined market: spot pays for what it buys                      in the quote currency",
+                ));
+            }
+            if rules.funding || rules.liquidation {
+                return Err(EngineError::InvalidConfig(
+                    "a base-currency account is not modelled on a market with funding or                      liquidation (a perpetual), whose margin is in the quote currency",
+                ));
+            }
+        }
         let fees = config.fees.unwrap_or(instrument.fees);
         if !(fees.maker.is_finite() && fees.taker.is_finite() && fees.per_unit.is_finite()) {
             return Err(EngineError::InvalidConfig("fees must be finite numbers"));
@@ -112,7 +138,11 @@ impl Session {
         let broker = SimBroker::new(instrument.clone(), fees, model);
         Ok(Session {
             strategy,
-            portfolio: Portfolio::new(instrument.id.kind, config.starting_cash),
+            portfolio: Portfolio::new_in(
+                instrument.id.kind,
+                config.starting_cash,
+                config.account_currency,
+            ),
             instrument,
             timeframe,
             fees,
@@ -832,6 +862,7 @@ mod tests {
             slippage_bps: 0.0,
             fees: None,
             max_leverage: 1.0,
+            account_currency: AccountCurrency::Quote,
         };
         let mut s = Session::new(Box::new(Idle), perp(), Timeframe::M1, config).unwrap();
         let req = |side, qty, order_type| OrderRequest {
@@ -919,6 +950,7 @@ mod tests {
             slippage_bps: 0.0,
             fees: None,
             max_leverage: 1.0,
+            account_currency: AccountCurrency::Quote,
         };
         let mut s = Session::new(Box::new(Idle), perp(), Timeframe::H1, config).unwrap();
         let req = |side, order_type| OrderRequest {
@@ -1009,6 +1041,7 @@ mod tests {
             slippage_bps: 10.0,
             fees: None,
             max_leverage: 1.0,
+            account_currency: AccountCurrency::Quote,
         };
         let mut s = Session::new(Box::new(ShortThenRest), inst, Timeframe::M1, config).unwrap();
         for i in 0..3 {
@@ -1112,6 +1145,7 @@ mod tests {
             slippage_bps: 0.0,
             fees: None,
             max_leverage: 1.0,
+            account_currency: AccountCurrency::Quote,
         };
         let strategy = Box::new(Scripted(script));
         let mut s = Session::new(strategy, perp(), Timeframe::M1, config).unwrap();
@@ -1123,8 +1157,15 @@ mod tests {
 
     /// The trades of a session with their stops attached.
     fn trades_of(s: &Session) -> Vec<crate::Trade> {
-        let mut t = crate::build_trades(s.fills(), s.bars(), &[], s.bar_funding());
-        crate::attach_stops(&mut t, s.bars(), s.bar_stops());
+        let mut t = crate::build_trades(
+            s.fills(),
+            s.bars(),
+            &[],
+            s.bar_funding(),
+            AccountCurrency::Quote,
+            None,
+        );
+        crate::attach_stops(&mut t, s.bars(), s.bar_stops(), AccountCurrency::Quote);
         t
     }
 
@@ -1213,6 +1254,7 @@ mod tests {
             slippage_bps: 0.0,
             fees: None,
             max_leverage: 1.0,
+            account_currency: AccountCurrency::Quote,
         };
         let mut s = Session::new(Box::new(StopsThreeWays), inst, Timeframe::M1, config).unwrap();
         let opens = [100.0, 100.0, 101.0, 102.0, 89.0];
