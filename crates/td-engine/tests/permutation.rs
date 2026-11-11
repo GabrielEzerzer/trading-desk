@@ -168,7 +168,7 @@ fn the_p_value_counts_copies_at_least_as_good_as_the_real_best() {
     assert_eq!(r.at_least_as_good, count);
     assert_eq!(r.p_value, (1 + count) as f64 / (1 + qualified) as f64);
     // The real best is the plain sweep's best.
-    let swept = td_engine::sweep(&r.spec.sweep, &noise_bars(42), &[], None).unwrap();
+    let swept = td_engine::sweep(&r.spec.sweep, &noise_bars(42), &[], &[], None).unwrap();
     let top = swept.rows[0].metrics.unwrap().total_return.unwrap();
     assert_eq!(r.real_best, top);
 

@@ -24,7 +24,7 @@ use crate::{
 // ---------------------------------------------------------------------------------------------
 
 /// Long while the fast simple moving average of closes is above the slow one, flat otherwise.
-/// With `allow_short` on a perpetual, short while the fast average is below the slow one.
+/// With `allow_short` on a kind that can short (perpetual, FX), short while the fast average is below the slow one.
 ///
 /// The position is `equity_fraction` of equity, capped so that its value plus the taker fee,
 /// slippage and a small margin fits in the equity, so a spot buy passes the cash check.
@@ -40,7 +40,7 @@ pub(crate) fn entry() -> StrategyEntry {
     StrategyEntry {
         name: "sma_cross",
         description: "Long while the fast moving average of closes is above the slow one, flat \
-                      otherwise; optionally short below it on perpetuals.",
+                      otherwise; optionally short below it where the market allows shorts.",
         params: vec![
             ParamSpec {
                 name: "fast",
@@ -64,8 +64,8 @@ pub(crate) fn entry() -> StrategyEntry {
                 default: ParamValue::Bool(false),
                 min: None,
                 max: None,
-                description: "Go short when the fast average is below the slow one. Perpetuals \
-                              only; ignored on spot.",
+                description: "Go short when the fast average is below the slow one, on markets \
+                              that allow shorts (perpetuals, FX); ignored on spot.",
             },
             ParamSpec {
                 name: "equity_fraction",
@@ -112,7 +112,7 @@ impl Strategy for SmaCross {
             return;
         }
         let (fast, slow) = (sma(bars, self.fast), sma(bars, self.slow));
-        let can_short = self.allow_short && ctx.instrument().id.kind == InstrumentKind::Perpetual;
+        let can_short = self.allow_short && ctx.instrument().id.kind.rules().can_short;
         let want = if fast > slow {
             1.0
         } else if fast < slow && can_short {

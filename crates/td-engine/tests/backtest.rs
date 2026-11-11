@@ -83,7 +83,7 @@ fn config() -> BacktestConfig {
 }
 
 fn run_synthetic() -> BacktestResult {
-    run(&config(), &synthetic_bars(), &synthetic_funding()).unwrap()
+    run(&config(), &synthetic_bars(), &[], &synthetic_funding()).unwrap()
 }
 
 fn expected_path() -> PathBuf {
@@ -196,7 +196,7 @@ fn trades_close_on_attached_stops_and_the_result_round_trips() {
         .with("exit", ParamValue::Int(6))
         .with("atr_stop", ParamValue::Float(1.0))
         .with("allow_short", ParamValue::Bool(true));
-    let r = run(&c, &synthetic_bars(), &synthetic_funding()).unwrap();
+    let r = run(&c, &synthetic_bars(), &[], &synthetic_funding()).unwrap();
     let stops: Vec<_> = r
         .orders
         .iter()
@@ -239,7 +239,7 @@ fn save_load_and_rerun_reproduce_the_result_exactly() {
     assert_eq!(serde_json::to_string(&loaded).unwrap(), original);
     assert_eq!(*loaded, result);
 
-    let again = rerun(&loaded, &synthetic_bars(), &synthetic_funding()).unwrap();
+    let again = rerun(&loaded, &synthetic_bars(), &[], &synthetic_funding()).unwrap();
     assert!(again.fingerprint_matches);
     assert!(again.engine_matches);
     assert_eq!(serde_json::to_string(&again.result).unwrap(), original);
@@ -258,7 +258,7 @@ fn save_load_and_rerun_reproduce_the_result_exactly() {
     assert!(s.created_at > T0);
     assert_eq!(&saved.summary(id.clone()), s);
     assert_eq!(
-        config_fingerprint(&config(), &synthetic_bars(), &synthetic_funding()).unwrap(),
+        config_fingerprint(&config(), &synthetic_bars(), &[], &synthetic_funding()).unwrap(),
         result.data_fingerprint
     );
     // No temporary directory is left behind.
@@ -391,7 +391,7 @@ fn funding_in_gaps_is_charged_at_the_next_open_and_attributed_to_the_trade_held(
     let funding = synthetic_funding();
     let mut c = config();
     c.params = c.params.with("allow_short", ParamValue::Bool(false));
-    let r = run(&c, &bars, &funding).unwrap();
+    let r = run(&c, &bars, &[], &funding).unwrap();
     assert!(r.metrics.funding_paid != 0.0);
     // Long-only, so some exits leave the position flat on a bar right after a gap: the funding due
     // at that open belongs to the trade that was closed, not to nothing.
@@ -419,7 +419,7 @@ fn funding_in_gaps_is_charged_at_the_next_open_and_attributed_to_the_trade_held(
         .position(|&(t, _)| t == T0 + 16 * HOUR)
         .unwrap();
     rates[k].1 += 1e-6;
-    assert!(!rerun(&r, &bars, &rates).unwrap().fingerprint_matches);
+    assert!(!rerun(&r, &bars, &[], &rates).unwrap().fingerprint_matches);
 }
 
 #[test]
@@ -428,7 +428,7 @@ fn a_result_from_another_engine_revision_does_not_match() {
     assert_eq!(saved.engine_revision, ENGINE_REVISION);
     // A saved run from an engine that behaved differently, on the same data.
     saved.engine_revision = ENGINE_REVISION + 1;
-    let again = rerun(&saved, &synthetic_bars(), &synthetic_funding()).unwrap();
+    let again = rerun(&saved, &synthetic_bars(), &[], &synthetic_funding()).unwrap();
     assert!(again.fingerprint_matches);
     assert!(!again.engine_matches);
     assert_eq!(again.result.engine_revision, ENGINE_REVISION);
@@ -438,12 +438,12 @@ fn a_result_from_another_engine_revision_does_not_match() {
 fn a_changed_bar_changes_the_fingerprint() {
     let bars = synthetic_bars();
     let funding = synthetic_funding();
-    let base = run(&config(), &bars, &funding).unwrap();
+    let base = run(&config(), &bars, &[], &funding).unwrap();
 
     // Bar 200 is in range: a close moved by one cent changes the fingerprint.
     let mut changed = bars.clone();
     changed[200].close += 0.01;
-    let r = rerun(&base, &changed, &funding).unwrap();
+    let r = rerun(&base, &changed, &[], &funding).unwrap();
     assert!(!r.fingerprint_matches);
     assert_ne!(r.result.data_fingerprint, base.data_fingerprint);
 
@@ -453,16 +453,20 @@ fn a_changed_bar_changes_the_fingerprint() {
     outside[495].close += 0.01;
     let mut extra_funding = funding.clone();
     extra_funding.push((T0 - 3 * HOUR, 0.5));
-    let r = rerun(&base, &outside, &extra_funding).unwrap();
+    let r = rerun(&base, &outside, &[], &extra_funding).unwrap();
     assert!(r.fingerprint_matches);
 
     // A changed funding rate inside the range changes it too.
     let mut rates = funding.clone();
     rates[5].1 += 1e-6;
-    assert!(!rerun(&base, &bars, &rates).unwrap().fingerprint_matches);
+    assert!(
+        !rerun(&base, &bars, &[], &rates)
+            .unwrap()
+            .fingerprint_matches
+    );
     assert_ne!(
-        data_fingerprint(&bars, &[]),
-        data_fingerprint(&bars[1..], &[])
+        data_fingerprint(&bars, &[], &[]),
+        data_fingerprint(&bars[1..], &[], &[])
     );
 }
 
@@ -472,20 +476,20 @@ fn bad_configurations_are_errors() {
     let mut c = config();
     c.to = c.from;
     assert!(matches!(
-        run(&c, &bars, &[]),
+        run(&c, &bars, &[], &[]),
         Err(EngineError::InvalidConfig(_))
     ));
     let mut c = config();
     c.from = T0 + 1000 * HOUR;
     c.to = T0 + 1100 * HOUR;
     assert!(matches!(
-        run(&c, &bars, &[]),
+        run(&c, &bars, &[], &[]),
         Err(EngineError::NoBarsInRange { .. })
     ));
     let mut c = config();
     c.strategy = "nope".into();
     assert!(matches!(
-        run(&c, &bars, &[]),
+        run(&c, &bars, &[], &[]),
         Err(EngineError::UnknownStrategy(_))
     ));
 }
@@ -495,7 +499,7 @@ fn spot_benchmark_buys_with_all_cash_at_the_first_open() {
     let mut c = config();
     c.instrument = common::spot();
     c.params = Params::new();
-    let r = run(&c, &synthetic_bars(), &[]).unwrap();
+    let r = run(&c, &synthetic_bars(), &[], &[]).unwrap();
     let b = &r.benchmark;
     // Bar 10 opens at price(9); 5 bps slippage rounded up to the cent, then all cash after the
     // 0.2% taker fee, rounded down to 0.001.
@@ -529,7 +533,7 @@ fn a_two_bar_one_minute_run_has_no_infinite_metric_and_round_trips() {
     c.from = 0;
     c.to = 2 * common::MIN;
     c.slippage_bps = 0.0;
-    let r = run(&c, &bars, &[]).unwrap();
+    let r = run(&c, &bars, &[], &[]).unwrap();
     assert!(r.benchmark.metrics.total_return.unwrap() > 0.007);
     assert_eq!(r.benchmark.metrics.cagr, None);
     assert_eq!(r.benchmark.metrics.calmar, None);
@@ -553,7 +557,7 @@ fn donchian(c: &mut BacktestConfig) {
 fn trades_keep_the_stop_attached_to_their_entry_and_its_r_multiple() {
     let mut c = config();
     donchian(&mut c);
-    let r = run(&c, &synthetic_bars(), &synthetic_funding()).unwrap();
+    let r = run(&c, &synthetic_bars(), &[], &synthetic_funding()).unwrap();
     let mut with_stop = 0;
     for t in &r.trades {
         // The stop attached to the order whose fill opened the trade.
@@ -614,7 +618,7 @@ fn the_close_out_at_the_end_counts_as_a_forced_close() {
 
     let mut c = config();
     c.close_at_end = true;
-    let r = run(&c, &synthetic_bars(), &synthetic_funding()).unwrap();
+    let r = run(&c, &synthetic_bars(), &[], &synthetic_funding()).unwrap();
     let (last, rest) = r.trades.split_last().unwrap();
     // Closed by the market order decided on the second-to-last close, at the last bar's open.
     assert!(!last.open && last.force_closed);
@@ -725,7 +729,7 @@ fn slippage_defaults_by_instrument_when_the_config_leaves_it_out() {
 fn a_result_saved_before_the_risk_measures_still_loads() {
     let mut c = config();
     donchian(&mut c);
-    let r = run(&c, &synthetic_bars(), &synthetic_funding()).unwrap();
+    let r = run(&c, &synthetic_bars(), &[], &synthetic_funding()).unwrap();
     let mut v = serde_json::to_value(&r).unwrap();
     v.as_object_mut()
         .unwrap()

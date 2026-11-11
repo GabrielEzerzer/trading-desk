@@ -30,6 +30,7 @@ fn perp() -> Instrument {
         fees: FeeSchedule {
             maker: 0.001,
             taker: 0.002,
+            per_unit: 0.0,
         },
     }
 }
@@ -76,6 +77,7 @@ fn funding_paid(plan: Vec<(usize, Side)>, funding: &[(Millis, f64)]) -> f64 {
         fees: Some(FeeSchedule {
             maker: 0.0,
             taker: 0.0,
+            per_unit: 0.0,
         }),
         max_leverage: 1.0,
     };
@@ -84,6 +86,7 @@ fn funding_paid(plan: Vec<(usize, Side)>, funding: &[(Millis, f64)]) -> f64 {
         perp(),
         Timeframe::M1,
         &bars,
+        &[],
         funding,
         config,
     )

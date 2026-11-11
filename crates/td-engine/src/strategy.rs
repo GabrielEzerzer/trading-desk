@@ -1,6 +1,6 @@
 use td_core::{
-    Candle, FeeSchedule, Fill, Instrument, InstrumentKind, Millis, OrderId, OrderRequest,
-    OrderType, Rounding, Side, Timeframe,
+    Candle, FeeSchedule, Fill, Instrument, Millis, OrderId, OrderRequest, OrderType, Rounding,
+    Side, Timeframe,
 };
 
 use crate::broker::ENTRY_CANCELLED;
@@ -22,6 +22,8 @@ pub trait Strategy: Send {
 /// What a strategy can see and do during a callback.
 pub struct Context<'a> {
     pub(crate) bars: &'a [Candle],
+    /// The current bar's ask candle, for a market with an ask series.
+    pub(crate) ask: Option<Candle>,
     pub(crate) instrument: &'a Instrument,
     pub(crate) timeframe: Timeframe,
     pub(crate) fees: FeeSchedule,
@@ -67,8 +69,8 @@ impl Context<'_> {
         self.slippage_bps
     }
 
-    /// The largest perpetual position the session allows, as its notional over equity; see
-    /// [`Context::submit`]. Spot ignores it.
+    /// The largest position the session allows on a margined kind, as its notional over equity;
+    /// see [`Context::submit`]. A kind without margin, such as spot, ignores it.
     pub fn max_leverage(&self) -> f64 {
         self.max_leverage
     }
@@ -104,10 +106,12 @@ impl Context<'_> {
     /// (buys down, sells up) so an order never trades worse than asked; triggers round to the
     /// nearest tick. On spot, a sell must fit in the holding less the open sells, and a buy must
     /// fit in the cash together with the open buys: each buy is valued at its limit price, its
-    /// trigger, or this bar's close for a market order, plus the taker fee. A spot buy is checked
+    /// trigger, or this bar's close for a market order, plus the taker fee and any per-unit
+    /// commission. A spot buy is checked
     /// again when it fills and cut to the cash then (see [`crate::SimBroker`]).
     ///
-    /// On a perpetual, an order that is not reduce-only is rejected if the position it could
+    /// On a margined kind (perpetual, FX), an order that is not reduce-only is rejected if the
+    /// position it could
     /// build is worth more than [`Context::max_leverage`] times the equity. With no position, or
     /// on the side of the position, that is the position plus this order and the open orders on
     /// its side that are not reduce-only. Against the position, this order and the open orders on
@@ -179,7 +183,11 @@ impl Context<'_> {
         submitted_at: Millis,
     ) -> Result<(OrderId, Option<OrderId>), OrderRejected> {
         let id = OrderId(self.orders.len() as u64 + 1);
-        let decision_close = self.bar().close;
+        // A buy is decided against the ask, a sell against the bid.
+        let decision_close = match (request.side, self.ask) {
+            (Side::Buy, Some(ask)) => ask.close,
+            _ => self.bar().close,
+        };
         let (request, mut check) = self.prepare(request);
         if self.warming_up {
             check = Err(WARM_UP.into());
@@ -255,7 +263,7 @@ impl Context<'_> {
         if entry.reduce_only {
             return Err("a reduce-only order cannot have a protective stop attached".into());
         }
-        if inst.id.kind == InstrumentKind::Spot && entry.side == Side::Sell {
+        if !inst.id.kind.rules().can_short && entry.side == Side::Sell {
             return Err("spot cannot attach a protective stop to a sell: it has no short".into());
         }
         let close = self.bar().close;
@@ -298,7 +306,8 @@ impl Context<'_> {
         if let Err(e) = inst.validate_order(&req, self.bar().close) {
             return (req, Err(e.to_string()));
         }
-        if inst.id.kind == InstrumentKind::Spot && req.side == Side::Sell {
+        let rules = inst.id.kind.rules();
+        if !rules.can_short && req.side == Side::Sell {
             // Open sells count against the holding, so several sells cannot add up to a short.
             let pending: f64 = self
                 .open_orders()
@@ -315,11 +324,12 @@ impl Context<'_> {
                 return (req, Err(reason));
             }
         }
-        if inst.id.kind == InstrumentKind::Spot && req.side == Side::Buy {
+        if !rules.margin && req.side == Side::Buy {
             // Open buys count against the cash too, so several buys cannot add up to more than it.
             let close = self.bar().close;
             let cost = |r: &OrderRequest| {
                 r.qty * reference_price(r.order_type, close) * (1.0 + self.fees.taker)
+                    + r.qty * self.fees.per_unit
             };
             let pending: f64 = self
                 .open_orders()
@@ -337,7 +347,7 @@ impl Context<'_> {
                 return (req, Err(reason));
             }
         }
-        if inst.id.kind == InstrumentKind::Perpetual && !req.reduce_only {
+        if rules.margin && !req.reduce_only {
             let close = self.bar().close;
             let position = self.position();
             // This order and the open orders on its side, and those of them that are not

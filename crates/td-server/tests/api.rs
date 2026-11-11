@@ -72,6 +72,7 @@ fn instrument(venue: Venue, kind: InstrumentKind, symbol: &str) -> Instrument {
         fees: FeeSchedule {
             maker: 0.001,
             taker: 0.001,
+            per_unit: 0.0,
         },
     }
 }

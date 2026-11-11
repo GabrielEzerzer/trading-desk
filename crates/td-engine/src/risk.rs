@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use td_core::{Candle, Fill, Liquidity, Millis, civil_from_days, days_from_civil};
 
 use crate::metrics::{DAY_MS, EquitySeries};
+use crate::trades::closing_side;
 use crate::{BarFunding, EquityPoint};
 
 const HOUR_MS: Millis = 3_600_000;
@@ -43,21 +44,24 @@ pub struct Intrabar {
     pub peak_leverage: Option<f64>,
 }
 
-/// The equity each bar reached inside its range, and the peak leverage, from a run's bars, its
-/// equity at each bar's close, its fills and the funding charged on each bar.
+/// The equity each bar reached inside its range, and the peak leverage, from a run's bars, their
+/// asks, its equity at each bar's close, its fills and the funding charged on each bar.
 ///
 /// Equity moves with the price by the position held: for spot and perpetuals alike it is a
-/// constant plus `position * price`. The candle model does not know the path inside a bar, so
-/// each bar is evaluated at the points of the path the fill model assumes, as
-/// [`crate::build_trades`] does for a trade's excursions:
+/// constant plus `position * price`. On a market with quotes, `asks[k]` is the ask candle of bar
+/// k, and every price below is on the candle the position would close on, as the session marks
+/// it: the ask for a short and the bar, which holds the bid, for a long. Without quotes `asks` is
+/// empty, or `None` for every bar, and every price is the bar's. The candle model does not know
+/// the path inside a bar, so each bar is evaluated at the points of the path the fill model
+/// assumes, as [`crate::build_trades`] does for a trade's excursions:
 ///
 /// - the open, with the position held into the bar, from the previous close's equity moved by
 ///   the gap and less the funding charged at the open;
 /// - each fill's price, with the position before that fill (each fill then takes its fee off);
 ///   for a fill that reduces the position as a maker (a limit, which the model fills after the
-///   stops inside the range, the order worse for the strategy) also the bar's adverse extreme, the
-///   low for a long and the high for a short;
-/// - the bar's low and high with the position after all its fills, from the equity at the close,
+///   stops inside the range, the order worse for the strategy) also the adverse extreme, the low
+///   for a long and the high for a short;
+/// - the low and high with the position after all the bar's fills, from the equity at the close,
 ///   because the session counts the whole range as coming after the fills (see
 ///   [`crate::Session::on_bar`]), and the close itself.
 ///
@@ -67,11 +71,13 @@ pub struct Intrabar {
 /// before going further, so the position before one meets no worse price. Funding due later in a
 /// bar is in the close's equity only, as the session charges it there.
 ///
-/// `equity`, `bars` and `funding` must have one entry per bar and `fills` must be in time order,
-/// stamped with their bar's open time, as a session records them.
+/// `equity`, `bars` and `funding` must have one entry per bar, and so must `asks` unless it is
+/// empty; `fills` must be in time order, stamped with their bar's open time, as a session records
+/// them.
 pub fn intrabar(
     starting_cash: f64,
     bars: &[Candle],
+    asks: &[Option<Candle>],
     equity: &[EquityPoint],
     fills: &[Fill],
     funding: &[BarFunding],
@@ -79,8 +85,10 @@ pub fn intrabar(
     let mut ranges = Vec::with_capacity(bars.len());
     let mut peak: Option<f64> = (!bars.is_empty()).then_some(0.0);
     let (mut pos, mut next) = (0.0, 0);
+    // The equity at the previous close and the price it marked the position at.
     let (mut prev_equity, mut prev_close) = (starting_cash, 0.0);
     for (k, (bar, point)) in bars.iter().zip(equity).enumerate() {
+        let ask = asks.get(k).copied().flatten();
         let (mut low, mut high) = (f64::INFINITY, f64::NEG_INFINITY);
         let mut see = |q: f64, price: f64, e: f64| {
             low = low.min(e);
@@ -94,18 +102,27 @@ pub fn intrabar(
         };
         let at_open = funding.get(k).map_or(0.0, |f| f.at_open);
         // `e` is the equity at price `p` with position `pos`, as the path goes through the bar.
-        let mut e = prev_equity + pos * (bar.open - prev_close) - at_open;
-        let mut p = bar.open;
+        let open = closing_side(bar, ask, pos).open;
+        let mut e = prev_equity + pos * (open - prev_close) - at_open;
+        let mut p = open;
         see(pos, p, e);
         while next < fills.len() && fills[next].time <= bar.open_time {
             let f = &fills[next];
             next += 1;
+            // A fill that reduces the position is on the side the position closes on.
+            // shortcut: on a market with quotes a fill that adds to the position is on the other
+            // side, so the position before it is valued at the fill's price instead of the
+            // closing price at that moment (the fill's price and the spread then), which the
+            // candles do not give; it overstates the equity at that point by up to the spread on
+            // that position. Take the closing side's price at the fill when the fill model records
+            // it.
             let at_fill = e + pos * (f.price - p);
             see(pos, f.price, at_fill);
             let dq = f.side.sign() * f.qty;
             let reducing = pos != 0.0 && f64::signum(pos) != dq.signum();
             if reducing && f.liquidity == Liquidity::Maker {
-                let adverse = if pos > 0.0 { bar.low } else { bar.high };
+                let c = closing_side(bar, ask, pos);
+                let adverse = if pos > 0.0 { c.low } else { c.high };
                 see(pos, adverse, e + pos * (adverse - p));
             }
             (e, p) = (at_fill - f.fee, f.price);
@@ -120,14 +137,15 @@ pub fn intrabar(
         // The range is priced before the funding due later in the bar, which the session
         // charges or credits at the close: a credit must not cover a loss taken before it.
         let before = close + funding.get(k).map_or(0.0, |f| f.in_bar);
-        see(pos, bar.low, before + pos * (bar.low - bar.close));
-        see(pos, bar.high, before + pos * (bar.high - bar.close));
-        see(pos, bar.close, close);
+        let c = closing_side(bar, ask, pos);
+        see(pos, c.low, before + pos * (c.low - c.close));
+        see(pos, c.high, before + pos * (c.high - c.close));
+        see(pos, c.close, close);
         ranges.push(EquityRange {
             low: low.max(0.0),
             high,
         });
-        (prev_equity, prev_close) = (close, bar.close);
+        (prev_equity, prev_close) = (close, c.close);
     }
     Intrabar {
         ranges,
@@ -439,7 +457,14 @@ mod tests {
                 in_bar: -10.0,
             },
         ];
-        let x = intrabar(1000.0, &bars, &points(&[1000.0, 1010.0]), &fills, &funding);
+        let x = intrabar(
+            1000.0,
+            &bars,
+            &[],
+            &points(&[1000.0, 1010.0]),
+            &fills,
+            &funding,
+        );
         approx(x.ranges[1].low, 990.0);
         approx(x.ranges[1].high, 1010.0);
     }
@@ -464,7 +489,7 @@ mod tests {
             BarFunding::default(),
         ];
         let equity = points(&[1003.8, 1010.7, 1010.7]);
-        let x = intrabar(1000.0, &bars, &equity, &fills, &funding);
+        let x = intrabar(1000.0, &bars, &[], &equity, &fills, &funding);
         let r = &x.ranges;
         assert_eq!(r.len(), 3);
         approx(r[0].low, 993.8);
@@ -492,7 +517,7 @@ mod tests {
             fill(1, Side::Buy, 1.0, 103.0, 0.0, Liquidity::Taker),
         ];
         let equity = points(&[1000.0, 997.0]);
-        let x = intrabar(1000.0, &bars, &equity, &fills, &[]);
+        let x = intrabar(1000.0, &bars, &[], &equity, &fills, &[]);
         assert_eq!(
             x.ranges[1],
             EquityRange {
@@ -508,7 +533,7 @@ mod tests {
                 ..fills[1].clone()
             },
         ];
-        let x = intrabar(1000.0, &bars, &equity, &maker, &[]);
+        let x = intrabar(1000.0, &bars, &[], &equity, &maker, &[]);
         assert_eq!(
             x.ranges[1],
             EquityRange {
@@ -521,7 +546,7 @@ mod tests {
     #[test]
     fn a_flat_run_has_flat_ranges_and_zero_leverage() {
         let bars = [bar(0, 10.0, 12.0, 8.0, 11.0)];
-        let x = intrabar(500.0, &bars, &points(&[500.0]), &[], &[]);
+        let x = intrabar(500.0, &bars, &[], &points(&[500.0]), &[], &[]);
         assert_eq!(
             x.ranges,
             vec![EquityRange {
@@ -530,7 +555,7 @@ mod tests {
             }]
         );
         assert_eq!(x.peak_leverage, Some(0.0));
-        assert_eq!(intrabar(500.0, &[], &[], &[], &[]).peak_leverage, None);
+        assert_eq!(intrabar(500.0, &[], &[], &[], &[], &[]).peak_leverage, None);
     }
 
     #[test]
@@ -539,7 +564,7 @@ mod tests {
         // 200 - 20 * 60 = -1000, but an account cannot go below zero.
         let bars = [bar(0, 100.0, 100.0, 0.0, 60.0)];
         let fills = [fill(0, Side::Buy, 20.0, 100.0, 0.0, Liquidity::Taker)];
-        let x = intrabar(1000.0, &bars, &points(&[200.0]), &fills, &[]);
+        let x = intrabar(1000.0, &bars, &[], &points(&[200.0]), &fills, &[]);
         assert_eq!(
             x.ranges[0],
             EquityRange {
