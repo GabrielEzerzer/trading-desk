@@ -1,5 +1,6 @@
 // Starts the real td-server binary and talks to it the way main does. Build it first with
-// `cargo build --release -p td-server`; without the binary (JS-only CI) the test is skipped.
+// `cargo build --release -p td-server --bin td-server`; without the binary (JS-only CI) the test
+// is skipped.
 
 import { existsSync } from 'node:fs'
 import { mkdtemp, rm } from 'node:fs/promises'
@@ -17,7 +18,7 @@ const BIN = sidecarBin(process.env, APP_PATH, false)
 const present = existsSync(BIN)
 
 if (!present) {
-  console.warn(`Skipping the td-server integration test: no binary at ${BIN}. Run cargo build --release -p td-server.`)
+  console.warn(`Skipping the td-server integration test: no binary at ${BIN}. Run cargo build --release -p td-server --bin td-server.`)
 }
 
 describe.skipIf(!present)('the real td-server', () => {

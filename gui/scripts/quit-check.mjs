@@ -17,7 +17,7 @@ const gui = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const exe = process.platform === 'win32' ? 'td-server.exe' : 'td-server'
 const bin = process.env.TD_SERVER_BIN ?? join(gui, '..', 'target', 'release', exe)
 if (!existsSync(bin)) {
-  console.error(`quit-check: no engine binary at ${bin}; run cargo build --release -p td-server`)
+  console.error(`quit-check: no engine binary at ${bin}; run cargo build --release -p td-server --bin td-server`)
   process.exit(2)
 }
 const QUIT_WITHIN_MS = 5_000

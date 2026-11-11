@@ -12,7 +12,7 @@ The renderer never sees the engine's token. Every HTTP call goes renderer → IP
 Run these from `gui/`, with pnpm 10 and Node 24.
 
 - `pnpm install`: install the workspace.
-- `pnpm dev`: build the engine optimised (`cargo build --release -p td-server`) and open the app with hot reload. The first build takes several minutes; later ones rebuild only what changed. `pnpm --filter @td/app dev` opens it without building the engine.
+- `pnpm dev`: build the engine optimised (`cargo build --release -p td-server --bin td-server`) and open the app with hot reload. The first build takes several minutes; later ones rebuild only what changed. `pnpm --filter @td/app dev` opens it without building the engine.
 - `pnpm test`: the vitest tests. The test that starts the real engine skips itself unless `target/release/td-server` exists.
 - `pnpm typecheck` and `pnpm build`: TypeScript checks and the production bundle in `app/out`.
 - `pnpm shots`: builds the app and takes headless screenshots of every renderer state at three window sizes into `gui/shots/` (git-ignored). It never starts Electron: it serves `app/out/renderer` on a local port for the length of the run, opens one headless Chromium, and stands in for `window.td` with `app/shots/bridge-stub.js`. Pass a pattern to take only some states, for example `node app/shots/shots.mjs lab-result`. Needs `npx playwright install --only-shell chromium` once.
