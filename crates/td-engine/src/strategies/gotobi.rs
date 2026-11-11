@@ -47,10 +47,10 @@ const EXIT_UTC: Millis = 90 * MINUTE;
 ///   measured from the bid close at the decision, not from the fill. It is a buy stop, so it
 ///   triggers when the ask reaches it: the spread counts against it.
 /// - **Exit.** At the close of the first bar that closes at or after 01:30 UTC (10:30 Tokyo) on
-///   the entry's day while the position is open, the stop is cancelled and a reduce-only market
-///   buy for the whole position is sent. It fills at the next bar's open, the bar that opens at
-///   01:30, on the ask. A stop that has already filled has ended the trade, and nothing happens at
-///   01:30.
+///   the entry's day, which is a later bar when the data has a gap there, while the position is
+///   open, the stop is cancelled and a reduce-only market buy for the whole position is sent. It
+///   fills at the next bar's open, the bar that opens at 01:30 when there is no gap, on the ask. A
+///   stop that has already filled has ended the trade, and nothing happens at 01:30.
 /// - **Size.** `risk_pct` percent of the equity is lost if the stop is hit: the quantity is
 ///   `risk_pct / 100 * equity / to_account(stop distance)`, rounded down to the lot size by
 ///   [`Context::submit`]. On a dollar account the stop distance, in yen per unit, is converted to
@@ -239,7 +239,10 @@ impl Strategy for Gotobi {
 ///   starting cash. The 30x cap is the retail FX limit on majors in Japan and the EU; at 0.5% risk
 ///   on a 12-pip stop a trade is about 6x, so the cap only refuses entries from much larger risk
 ///   settings. Slippage is 0 because the bid and ask bars already carry the cost of crossing the
-///   spread, which is the cost the published result is stated after.
+///   spread, which is the cost the published result is stated after. The cost stress (R4)
+///   multiplies fees and slippage, which are both 0 here, and not the spread, so it has nothing to
+///   stress on this plan; a comparison with the published figure after a commission needs a run
+///   with the commission set.
 /// - **Sweep.** Only `stop_pips`, from 6 to 24 in steps of 3, so 12 has two neighbours on each
 ///   side for the plateau test (R5) and a stop twice as tight or twice as wide is tried.
 ///   `risk_pct` is fixed at its default: it only scales the size, and sweeping it would have the
@@ -255,9 +258,10 @@ impl Strategy for Gotobi {
 /// - **Out-of-sample split.** None: the walk-forward already gives the out-of-sample curve, and a
 ///   single split is one more draw, reported only.
 /// - **Evidence.** The defaults, with the minimum sample raised to 200 out-of-sample trades. The
-///   published per-trade spread is about 12 pips (2.35 pips at t = 5.5 over 775 trades), so a mean
-///   of about 2 pips sits two standard errors above zero only from about 140 trades on; below
-///   200 the sample is too small to tell an edge of that size from none.
+///   published trade outcomes have a standard deviation of about 12 pips (2.35 pips at t = 5.5
+///   over 775 trades), so a mean of about 2 pips sits two standard errors above zero only from
+///   about 140 trades on; below 200 the sample is too small to tell an edge of that size from
+///   none.
 fn plan() -> TestPlan {
     let usdjpy = || InstrumentId {
         venue: Venue::Dukascopy,
@@ -319,8 +323,7 @@ fn plan() -> TestPlan {
 
 /// Judged as `HighRisk`, the kind judged per trade: the published claim is a mean per trade, and
 /// this kind is the one whose criteria are the mean net P&L per trade and the bootstrap's lower
-/// bound on it. The effect counts as real on this desk's data when, out of sample and after the
-/// spread:
+/// bound on it. The rule passes when, out of sample and after the spread:
 ///
 /// - the mean net P&L per trade is above zero, and so is the bootstrap's lower bound on it, which
 ///   is the margin of error. Every trade risks the same share of the account, so the mean in
@@ -329,10 +332,16 @@ fn plan() -> TestPlan {
 /// - the default profit factor of 1.3, risk of ruin at most 5% of a 50% drawdown, and a positive
 ///   return without the single best trade, so one lucky day cannot carry the result.
 ///
-/// The published numbers (775 trades, +2.35 pips, t = 5.5, 58% winners) are what a run is read
-/// against, not pass marks: an edge half that size would still be real, and the rule should pass
-/// it. Their profit factor is not published; a rough estimate from a mean of 2.35 pips on a
-/// per-trade spread of about 12 puts it near 1.5, so 1.3 refuses an edge much smaller than the published one, not the published one itself.
+/// The lower bound above zero is what says the effect is real. The profit factor of 1.3 is a
+/// second bar, on the effect's size. A profit factor is 1 plus the mean over the gross loss per
+/// trade. With trade outcomes whose standard deviation is about 12 pips, the gross loss per trade
+/// is about 0.4 of that, 4.8 pips, when there is no edge; holding it there, a profit factor of 1.3
+/// asks for a mean of about 1.4 pips, roughly 60% of the published 2.35, which would itself give
+/// about 1.5. That is a rough figure from a simple model, not a measurement, and the source
+/// publishes no profit factor to check it against. A real but smaller effect therefore ends as
+/// not passing, on purpose, because the published edge also has to pay a commission that this
+/// plan does not charge. The published numbers (775 trades, +2.35 pips, t = 5.5, 58% winners) are
+/// what a run is read against, not pass marks.
 fn rule() -> VerdictRule {
     VerdictRule::HighRisk {
         limits: HighRiskLimits {
