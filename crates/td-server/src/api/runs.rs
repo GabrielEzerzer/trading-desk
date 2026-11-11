@@ -128,6 +128,9 @@ pub struct RunCheck {
 /// Candles and funding loaded for a run, with what was left out.
 pub struct RunData {
     pub bars: Vec<Candle>,
+    /// The ask bars beside `bars` for a kind whose rules have quotes, resampled from the same
+    /// minutes, so there is one for every bar; empty for any other kind.
+    pub asks: Vec<Candle>,
     pub funding: Vec<(Millis, f64)>,
     pub report: DataReport,
 }
@@ -247,29 +250,36 @@ fn invalid_config(message: String) -> ApiError {
 struct StoreData {
     /// The bars at the configuration's timeframe, with the buckets left out.
     loaded: LoadedCandles,
+    /// The ask bars beside the bars, from the same minutes; empty for a kind without quotes.
+    asks: Vec<Candle>,
     /// The missing minutes.
     gaps: Vec<Gap>,
     /// A perpetual's funding rates; empty for spot.
     funding: Vec<(Millis, f64)>,
 }
 
-/// Reads the 1-minute candles of the configuration's range, resamples them to its timeframe, and
-/// reads a perpetual's funding.
+/// Reads the 1-minute candles of the configuration's range, and for a kind with quotes their asks,
+/// resamples both to its timeframe by the same rule over the same minutes, and reads a perpetual's
+/// funding.
 fn read_data(store: &Store, config: &BacktestConfig) -> Result<StoreData, ApiError> {
     let id = &config.instrument.id;
     let (from, to) = data_range(config)?;
-    let mut minutes = Vec::new();
+    let in_range = |c: &Candle| (from..to).contains(&c.open_time);
+    let (mut minutes, mut ask_minutes) = (Vec::new(), Vec::new());
     for month in Month::range(from, to) {
         let stored = store.read_month(id, month)?;
-        check_asks(store, id, month, &stored)?;
-        minutes.extend(
-            stored
+        ask_minutes.extend(
+            month_asks(store, id, month, &stored)?
                 .into_iter()
-                .filter(|c| (from..to).contains(&c.open_time)),
+                .filter(in_range),
         );
+        minutes.extend(stored.into_iter().filter(in_range));
     }
     let gaps = missing_minutes(id.kind, &minutes, from, to);
     let loaded = resample(id.kind, &minutes, config.timeframe, false);
+    // The asks share the bids' rows in the store, so these are the same minutes and resample
+    // builds the same buckets from them.
+    let asks = resample(id.kind, &ask_minutes, config.timeframe, false).candles;
     let funding = if id.kind.rules().funding {
         store.load_funding(id, from, to)?
     } else {
@@ -277,6 +287,7 @@ fn read_data(store: &Store, config: &BacktestConfig) -> Result<StoreData, ApiErr
     };
     Ok(StoreData {
         loaded,
+        asks,
         gaps,
         funding,
     })
@@ -299,7 +310,8 @@ pub fn check_run_data(store: &Store, config: &BacktestConfig) -> Result<(), ApiE
     for month in Month::range(from, to) {
         let (start, end) = (month.start().max(from), month.end().min(to));
         let stored = store.read_month(id, month)?;
-        check_asks(store, id, month, &stored)?;
+        // Read only to check the month has them; the load reads them again with the bids.
+        month_asks(store, id, month, &stored)?;
         let minutes: Vec<Candle> = stored
             .into_iter()
             .filter(|c| (start..end).contains(&c.open_time))
@@ -339,20 +351,21 @@ pub fn check_run_data(store: &Store, config: &BacktestConfig) -> Result<(), ApiE
     }
 }
 
-/// Refuses with 422 `data_missing` a stored month of a kind whose rules require quotes when its
-/// file has no ask prices: a run on its bids alone would trade at no spread. `stored` is the
-/// month's bids; a month with none needs no asks.
-fn check_asks(
+/// The stored 1-minute asks of a month of a kind whose rules require quotes, one per bid in
+/// `stored` (the month's bids); empty, with no file read, for a kind without quotes or a month
+/// with no bids. Refuses with 422 `data_missing` a month whose file has no ask prices: a run on
+/// its bids alone would trade at no spread.
+fn month_asks(
     store: &Store,
     id: &InstrumentId,
     month: Month,
     stored: &[Candle],
-) -> Result<(), ApiError> {
+) -> Result<Vec<Candle>, ApiError> {
     if !id.kind.rules().quotes || stored.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
     match store.read_month_asks(id, month) {
-        Ok(_) => Ok(()),
+        Ok(asks) => Ok(asks),
         Err(DataError::NoAskColumns { .. }) => Err(data_missing(format!(
             "the store's {id} candles for {month} have no ask prices; delete the month and \
              download it again"
@@ -417,6 +430,7 @@ pub fn load_run_data(store: &Store, config: &BacktestConfig) -> Result<RunData, 
     let (from, to) = data_range(config)?;
     let StoreData {
         loaded,
+        asks,
         gaps,
         funding,
     } = read_data(store, config)?;
@@ -451,6 +465,7 @@ pub fn load_run_data(store: &Store, config: &BacktestConfig) -> Result<RunData, 
     };
     Ok(RunData {
         bars: loaded.candles,
+        asks,
         funding,
         report,
     })
@@ -505,6 +520,7 @@ fn execute(
     ctx.progress(0.0, "loading the data");
     let RunData {
         bars,
+        asks,
         funding,
         report,
     } = load_run_data(store, base).map_err(changed_since_accepted)?;
@@ -516,22 +532,24 @@ fn execute(
         }
         JobRequest::Backtest(config) => {
             ctx.progress(0.0, "running the backtest");
-            let result = td_engine::run(config, &bars, &[], &funding).map_err(engine_error)?;
+            let result = td_engine::run(config, &bars, &asks, &funding).map_err(engine_error)?;
             SavedRun::Backtest(Box::new(result))
         }
         JobRequest::Sweep(spec) => {
             let result =
-                own_pool(|| td_engine::sweep(spec, &bars, &[], &funding, Some(&progress)))?;
+                own_pool(|| td_engine::sweep(spec, &bars, &asks, &funding, Some(&progress)))?;
             SavedRun::Sweep(Box::new(result.map_err(tester_job_error)?))
         }
         JobRequest::Oos(spec) => {
-            let result =
-                own_pool(|| td_engine::out_of_sample(spec, &bars, &[], &funding, Some(&progress)))?;
+            let result = own_pool(|| {
+                td_engine::out_of_sample(spec, &bars, &asks, &funding, Some(&progress))
+            })?;
             SavedRun::Oos(Box::new(result.map_err(tester_job_error)?))
         }
         JobRequest::WalkForward(spec) => {
-            let result =
-                own_pool(|| td_engine::walk_forward(spec, &bars, &[], &funding, Some(&progress)))?;
+            let result = own_pool(|| {
+                td_engine::walk_forward(spec, &bars, &asks, &funding, Some(&progress))
+            })?;
             SavedRun::WalkForward(Box::new(result.map_err(tester_job_error)?))
         }
     };
@@ -633,7 +651,7 @@ fn check_run(store: &Store, run: &SavedRun) -> RunCheck {
     let base = run.base_config();
     let data_matches = read_data(store, base)
         .ok()
-        .and_then(|d| config_fingerprint(base, &d.loaded.candles, &[], &d.funding).ok())
+        .and_then(|d| config_fingerprint(base, &d.loaded.candles, &d.asks, &d.funding).ok())
         .is_some_and(|fingerprint| fingerprint == run.data_fingerprint());
     RunCheck {
         data_matches,
@@ -720,9 +738,19 @@ pub(super) async fn job_result(
     Ok(Json(detail))
 }
 
-/// Engine errors from what the client asked for are 400 `invalid_config`; the rest are internal.
+/// Engine errors from what the client asked for are 400 `invalid_config`; quote errors, which mean
+/// the stored bids and asks cannot be run, are 422 `data_missing`; the rest are internal.
 fn engine_error(e: EngineError) -> ApiError {
     match e {
+        EngineError::MissingAsk { .. }
+        | EngineError::UnmatchedAsk { .. }
+        | EngineError::DuplicateAsk { .. }
+        | EngineError::CrossedQuote { .. }
+        | EngineError::ClosedBar { .. }
+        | EngineError::AsksWithoutQuotes { .. } => data_missing(format!(
+            "the store's bids and asks cannot be run: {e}; delete the months and download them \
+             again"
+        )),
         EngineError::InvalidConfig(_)
         | EngineError::UnknownStrategy(_)
         | EngineError::InvalidParam { .. }
@@ -1005,6 +1033,68 @@ mod tests {
         store.write_candles(&daily.instrument.id, &stored).unwrap();
         let e = checked(&store, &daily).err().expect("no bar");
         assert_eq!(e.body.code, "data_missing");
+    }
+
+    #[test]
+    fn engine_quote_errors_are_422_data_missing() {
+        let kind = InstrumentKind::Fx;
+        for e in [
+            EngineError::MissingAsk { time: 0, kind },
+            EngineError::UnmatchedAsk { time: 0 },
+            EngineError::DuplicateAsk { time: 0 },
+            EngineError::CrossedQuote { time: 0 },
+            EngineError::ClosedBar { time: 0 },
+            EngineError::AsksWithoutQuotes {
+                kind: InstrumentKind::Spot,
+            },
+        ] {
+            let api = engine_error(e.clone());
+            assert_eq!(
+                (api.status.as_u16(), api.body.code.as_str()),
+                (422, "data_missing"),
+                "{e:?}"
+            );
+            assert!(api.body.message.contains(&e.to_string()), "{api:?}");
+        }
+    }
+
+    #[test]
+    fn fx_data_carries_one_ask_bar_per_bar_and_spot_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path());
+        let monday = parse_date("2024-01-08").unwrap();
+        let fx = config(InstrumentKind::Fx, monday, monday + 7 * DAY);
+        let bids: Vec<Candle> = minutes(monday, monday + 7 * DAY)
+            .into_iter()
+            .filter(|c| InstrumentKind::Fx.is_open(c.open_time))
+            .collect();
+        let asks: Vec<Candle> = bids
+            .iter()
+            .map(|b| Candle {
+                open: 100.5,
+                high: 101.5,
+                low: 99.5,
+                close: 100.5,
+                ..*b
+            })
+            .collect();
+        store.write_quotes(&fx.instrument.id, &bids, &asks).unwrap();
+        let data = checked(&store, &fx).unwrap();
+        assert_eq!(data.asks.len(), data.bars.len());
+        assert_eq!(data.bars.len(), 5 * 24);
+        for (bar, ask) in data.bars.iter().zip(&data.asks) {
+            assert_eq!(ask.open_time, bar.open_time);
+            assert_eq!(
+                (ask.open, ask.high, ask.low, ask.close),
+                (100.5, 101.5, 99.5, 100.5)
+            );
+        }
+
+        let spot = config(InstrumentKind::Spot, monday, monday + 3 * DAY);
+        store
+            .write_candles(&spot.instrument.id, &minutes(monday, monday + 3 * DAY))
+            .unwrap();
+        assert_eq!(checked(&store, &spot).unwrap().asks, []);
     }
 
     fn span_of(from: Millis, to: Millis) -> GapInfo {
