@@ -1,9 +1,21 @@
-use td_core::{Candle, OrderId, OrderType, Rounding, Side};
+//! An example strategy file in three parts: the strategy, its test plan and its verdict rule
+//! (see `sma_cross.rs`).
 
-use super::{affordable_qty, order};
-use crate::{
-    Context, EngineError, ParamKind, ParamSpec, ParamValue, Params, Strategy, StrategyEntry,
+use td_core::{
+    Candle, InstrumentId, InstrumentKind, OrderId, OrderType, Rounding, Side, Timeframe, Venue,
 };
+
+use crate::strategies::{affordable_qty, order};
+use crate::{
+    BacktestSettings, Context, Direction, DrawdownMode, EngineError, EvidenceSettings, FirmLimits,
+    Metric, Objective, ParamAxis, ParamKind, ParamSpace, ParamSpec, ParamValue, Params, Period,
+    PropFirmLimits, Strategy, StrategyEntry, SweepPlan, TestPlan, VerdictRule, WalkForwardPlan,
+    date,
+};
+
+// ---------------------------------------------------------------------------------------------
+// 1. The strategy
+// ---------------------------------------------------------------------------------------------
 
 /// Donchian channel breakout with volatility-based sizing.
 ///
@@ -76,6 +88,8 @@ pub(crate) fn entry() -> StrategyEntry {
             },
         ],
         build,
+        plan: plan(),
+        rule: rule(),
     }
 }
 
@@ -174,5 +188,83 @@ impl Strategy for DonchianBreakout {
                 let _ = ctx.submit(order(ctx, side, position.abs(), OrderType::Market, true));
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// 2. The test plan
+// ---------------------------------------------------------------------------------------------
+
+fn plan() -> TestPlan {
+    TestPlan {
+        instruments: vec![InstrumentId {
+            venue: Venue::Binance,
+            symbol: "BTCUSDT".into(),
+            kind: InstrumentKind::Perpetual,
+        }],
+        timeframe: Timeframe::H4,
+        period: Period {
+            from: date(2022, 1, 1),
+            to: date(2025, 1, 1),
+        },
+        backtest: BacktestSettings {
+            starting_cash: 100_000.0,
+            max_leverage: 1.0,
+            // Each instrument takes the backtest config's default slippage; list a
+            // SlippageOverride here to set one.
+            slippage: Vec::new(),
+        },
+        sweep: SweepPlan {
+            fixed: Params::new()
+                .with("allow_short", ParamValue::Bool(true))
+                .with("risk", ParamValue::Float(0.005)),
+            axes: vec![
+                ParamAxis {
+                    name: "entry".into(),
+                    space: ParamSpace::Range {
+                        from: 10.0,
+                        to: 40.0,
+                        step: 10.0,
+                    },
+                },
+                ParamAxis {
+                    name: "exit".into(),
+                    space: ParamSpace::Range {
+                        from: 5.0,
+                        to: 20.0,
+                        step: 5.0,
+                    },
+                },
+            ],
+            objective: Objective {
+                metric: Metric::Sharpe,
+                direction: Direction::Maximize,
+            },
+            min_trades: 10,
+        },
+        walk_forward: WalkForwardPlan {
+            train_days: 360,
+            test_days: 90,
+        },
+        out_of_sample: None,
+        evidence: EvidenceSettings::default(),
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// 3. The verdict rule
+// ---------------------------------------------------------------------------------------------
+
+/// A two-step challenge account: 5% daily loss and 10% max drawdown from the starting balance,
+/// passed at 10% profit.
+fn rule() -> VerdictRule {
+    VerdictRule::PropFirm {
+        firm: FirmLimits {
+            daily_loss: 0.05,
+            max_drawdown: 0.10,
+            drawdown: DrawdownMode::Static,
+            profit_target: 0.10,
+        },
+        limits: PropFirmLimits::default(),
     }
 }

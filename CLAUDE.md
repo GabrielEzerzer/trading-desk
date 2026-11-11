@@ -14,7 +14,7 @@ A private workspace for my own trading: two Electron desktop apps on one Rust en
 
 - Prices and quantities are `f64`. They are rounded to the instrument's tick and lot size when an order is submitted, with `Instrument::round_price` and `Instrument::round_qty`, then checked with `Instrument::validate_order`.
 - Timestamps are `i64` milliseconds since the Unix epoch, UTC (`td_core::Millis`).
-- Strategies are Rust, behind the one `Strategy` trait.
+- Strategies are Rust, behind the one `Strategy` trait. Each is one file with its test plan and verdict rule; private ones go in the git-ignored `crates/td-engine/src/strategies/private/` (README, "Writing a strategy").
 - Tests never touch the network. Use fixtures.
 - New logic gets at least one small test.
 - Never commit market data. The data directory lives outside the repo.
