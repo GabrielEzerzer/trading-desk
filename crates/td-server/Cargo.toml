@@ -18,6 +18,8 @@ subtle.workspace = true
 td-core = { workspace = true, features = ["ts"] }
 td-data.workspace = true
 td-engine = { workspace = true, features = ["ts"] }
+# td-bench writes its datasets and saved runs into fresh temporary directories.
+tempfile.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 ts-rs.workspace = true
@@ -25,6 +27,5 @@ ts-rs.workspace = true
 [dev-dependencies]
 futures-util.workspace = true
 reqwest.workspace = true
-tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 tokio-tungstenite.workspace = true

@@ -1,11 +1,14 @@
 //! Times the engine's real work on synthetic data, so a speed change can be measured.
 //!
 //! Reads the frozen workloads in `harness/evals/perf-workloads.json`, writes each workload's
-//! synthetic 1-minute candles (and a perpetual's funding) through the real [`Store`] once, then
-//! times each workload `--reps` times: for `load`, the data check and load a run makes; for the
-//! others, only the engine call, on data loaded beforehand. Prints one `WORKLOAD` line per workload
-//! and one `BENCH` line to stdout; progress goes to stderr. A workload whose result differs between
-//! repetitions stops the run with a non-zero exit.
+//! synthetic 1-minute candles (and a perpetual's funding) through the real [`Store`] into a fresh
+//! temporary directory, removed when the run ends, then times each workload `--reps` times: for
+//! `load`, the data check and load a run makes; for `lab_backtest`, the whole of a Strategy Lab
+//! backtest as the server does it (check, load, run, save, the job-result read and the saved-run
+//! read); for the others, only the engine call, on data loaded beforehand. Prints one `WORKLOAD`
+//! line per workload, a `PHASES` line per `lab_backtest` workload, and one `BENCH` line to stdout;
+//! progress goes to stderr. A workload whose result differs between repetitions stops the run
+//! with a non-zero exit.
 
 use std::fs;
 use std::ops::ControlFlow;
@@ -22,24 +25,20 @@ use td_data::Store;
 use td_data::binance::sha256_hex;
 use td_data::time::{MINUTE, Month};
 use td_engine::{
-    BacktestConfig, BacktestResult, EngineError, Objective, ParamAxis, Params, SweepMode,
+    BacktestConfig, BacktestResult, EngineError, Objective, ParamAxis, Params, SavedRun, SweepMode,
     SweepResult, SweepSpec, TesterError, WalkForwardResult, WalkForwardSpec, WindowSpec,
 };
 use td_server::api::error::ApiError;
-use td_server::api::runs::{RunData, check_run_data, load_run_data};
-
-/// Changes whenever the generator's output changes, so datasets made by an older one are not
-/// reused.
-const GENERATOR: &str = "g1";
+use td_server::api::jobs::JobError;
+use td_server::api::runs::{
+    RunData, RunDone, check_run, check_run_data, load_run_data, read_run, save_run,
+};
 
 /// Every dataset starts at 2022-01-01T00:00Z.
 const DATASET_START: Month = Month {
     year: 2022,
     month: 1,
 };
-
-/// The file that marks a dataset as completely written.
-const MARKER: &str = "complete";
 
 #[derive(Parser)]
 #[command(about = "Times the engine's real work on synthetic data")]
@@ -53,9 +52,6 @@ struct Args {
     /// Run only workloads whose name contains this.
     #[arg(long)]
     filter: Option<String>,
-    /// Where the synthetic datasets are written (default: `<temp dir>/td-bench-data`).
-    #[arg(long)]
-    data_dir: Option<PathBuf>,
     /// The workloads file (default: `harness/evals/perf-workloads.json` in the workspace).
     #[arg(long)]
     workloads: Option<PathBuf>,
@@ -112,6 +108,8 @@ enum Mode {
         sweep: SweepSettings,
         windows: WindowSpec,
     },
+    /// A Strategy Lab backtest: the strategy's default parameters, overlaid with `params`.
+    LabBacktest,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -128,6 +126,19 @@ struct Measured {
     median_ms: f64,
     /// SHA-256 of the result's JSON, in hex; the same on every repetition.
     checksum: String,
+    /// For `lab_backtest`, each phase's time in the fastest repetition.
+    phases: Option<Phases>,
+}
+
+/// The phases of a `lab_backtest` repetition, in milliseconds, in the order they run.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+struct Phases {
+    check: f64,
+    load: f64,
+    run: f64,
+    save: f64,
+    result: f64,
+    open: f64,
 }
 
 fn main() -> ExitCode {
@@ -151,10 +162,12 @@ fn bench_all(args: &Args) -> Result<(), String> {
     let text = fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
     let file: WorkloadFile =
         serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
-    let data_dir = args
-        .data_dir
-        .clone()
-        .unwrap_or_else(|| std::env::temp_dir().join("td-bench-data"));
+    // Fresh for every run, so no dataset an older binary wrote is ever timed; removed when the
+    // run ends, with an error too.
+    let data_dir = tempfile::Builder::new()
+        .prefix("td-bench-data-")
+        .tempdir()
+        .map_err(|e| format!("cannot make the data directory: {e}"))?;
     let chosen: Vec<&Workload> = file
         .workloads
         .iter()
@@ -173,19 +186,23 @@ fn bench_all(args: &Args) -> Result<(), String> {
     let mut checksums = String::new();
     for w in chosen {
         let (from, to) = dataset_range(w.months);
-        let store = ensure_dataset(&data_dir, w, from, to)?;
+        let store = ensure_dataset(data_dir.path(), w, from, to)?;
         eprintln!("running {} ({} reps)", w.name, args.reps);
         let m = bench(w, &store, from, to, args.reps)?;
         total_ms += m.min_ms;
         checksums.push_str(&m.checksum);
         lines.push(workload_line(w, args.reps, &m));
+        if let Some(p) = &m.phases {
+            lines.push(phases_line(w, p));
+        }
     }
+    let workloads = lines.iter().filter(|l| l.starts_with("WORKLOAD")).count();
     for line in &lines {
         println!("{line}");
     }
     println!(
         "{}",
-        bench_line(args.split.as_str(), lines.len(), total_ms, &checksums)
+        bench_line(args.split.as_str(), workloads, total_ms, &checksums)
     );
     Ok(())
 }
@@ -198,6 +215,14 @@ fn workload_line(w: &Workload, reps: usize, m: &Measured) -> String {
         m.min_ms,
         m.median_ms,
         &m.checksum[..16]
+    )
+}
+
+fn phases_line(w: &Workload, p: &Phases) -> String {
+    format!(
+        "PHASES name={} check_ms={:.1} load_ms={:.1} run_ms={:.1} save_ms={:.1} result_ms={:.1} \
+         open_ms={:.1}",
+        w.name, p.check, p.load, p.run, p.save, p.result, p.open
     )
 }
 
@@ -231,13 +256,27 @@ fn bench(
     let config = base_config(w, from, to);
     let mut times = Vec::with_capacity(reps);
     let mut checksum: Option<String> = None;
+    let mut fastest: Option<(f64, Phases)> = None;
     // Loaded once, outside the timed section, for the modes that time only the engine.
     let data = match w.mode {
-        Mode::Load => None,
+        Mode::Load | Mode::LabBacktest => None,
         _ => Some(load_run_data(store, &config).map_err(api_error)?),
     };
     for rep in 0..reps {
         let (ms, json) = match (&w.mode, &data) {
+            (Mode::LabBacktest, _) => {
+                let (phases, json) = lab_backtest(&lab_config(&config)?, store, rep)?;
+                let ms = phases.check
+                    + phases.load
+                    + phases.run
+                    + phases.save
+                    + phases.result
+                    + phases.open;
+                if fastest.is_none_or(|(best, _)| ms < best) {
+                    fastest = Some((ms, phases));
+                }
+                (ms, json)
+            }
             (Mode::Load, _) => {
                 let start = Instant::now();
                 check_run_data(store, &config).map_err(api_error)?;
@@ -306,7 +345,7 @@ fn bench(
                 );
                 (ms, to_json(&result)?)
             }
-            (_, None) => unreachable!("data is loaded for every mode but load"),
+            (_, None) => unreachable!("data is loaded for every engine-only mode"),
         };
         let hash = sha256_hex(&json);
         match &checksum {
@@ -334,7 +373,71 @@ fn bench(
         min_ms: times[0],
         median_ms,
         checksum: checksum.unwrap_or_default(),
+        phases: fastest.map(|(_, p)| p),
     })
+}
+
+/// The Lab's configuration: every parameter the strategy has, at its default unless the workload
+/// sets it, as the Lab sends the defaults it reads from `GET /strategies`.
+fn lab_config(base: &BacktestConfig) -> Result<BacktestConfig, String> {
+    let entry = td_engine::find_strategy(&base.strategy)
+        .ok_or_else(|| format!("no strategy {}", base.strategy))?;
+    let params = base
+        .params
+        .resolve(&entry.params)
+        .map_err(|e| e.to_string())?;
+    Ok(BacktestConfig {
+        params,
+        ..base.clone()
+    })
+}
+
+/// One Lab backtest, timed phase by phase as the server runs it: `start`'s data check, the job
+/// (`execute`: load, run, save), the Lab's `GET /jobs/{id}/result`, then opening the saved run
+/// with `GET /runs/{id}`. Saves into an empty runs directory made and removed outside the timed
+/// phases. Returns the phases and the JSON to checksum: the saved backtest as read back and the
+/// run's check, without the run id, which carries the save time.
+fn lab_backtest(
+    config: &BacktestConfig,
+    store: &Store,
+    rep: usize,
+) -> Result<(Phases, Vec<u8>), String> {
+    let runs = tempfile::Builder::new()
+        .prefix("td-bench-runs-")
+        .tempdir()
+        .map_err(|e| format!("cannot make the runs directory: {e}"))?;
+    let mut p = Phases::default();
+    let mut lap = Instant::now();
+    let mut split = |phase: &mut f64| {
+        *phase = elapsed_ms(lap);
+        lap = Instant::now();
+    };
+
+    check_run_data(store, config).map_err(api_error)?;
+    split(&mut p.check);
+    let data = load_run_data(store, config).map_err(api_error)?;
+    split(&mut p.load);
+    let result = engine_run(config, &data).map_err(|e| e.to_string())?;
+    split(&mut p.run);
+    let trades = result.trades.len();
+    let saved = SavedRun::Backtest(Box::new(result));
+    let id = save_run(&saved, &data.report, runs.path()).map_err(job_error)?;
+    let done = RunDone {
+        summary: saved.summary(id.clone()),
+        run_id: id,
+        dropped_buckets: data.report.dropped.len(),
+    };
+    split(&mut p.save);
+    let detail = read_run(runs.path(), done.run_id.as_str()).map_err(api_error)?;
+    to_json(&detail)?;
+    split(&mut p.result);
+    let mut opened = read_run(runs.path(), done.run_id.as_str()).map_err(api_error)?;
+    opened.check = Some(check_run(store, &opened.run));
+    to_json(&opened)?;
+    split(&mut p.open);
+
+    eprintln!("  rep {rep}: {trades} trades, check {:?}", opened.check);
+    Ok((p, to_json(&(&opened.run, &opened.check))?))
 }
 
 fn elapsed_ms(start: Instant) -> f64 {
@@ -347,6 +450,13 @@ fn to_json(value: &impl Serialize) -> Result<Vec<u8>, String> {
 
 fn api_error(e: ApiError) -> String {
     format!("{}: {}", e.body.code, e.body.message)
+}
+
+fn job_error(e: JobError) -> String {
+    match e {
+        JobError::Cancelled => "cancelled".into(),
+        JobError::Failed(body) => format!("{}: {}", body.code, body.message),
+    }
 }
 
 /// A rayon pool of its own, as the server builds one per tester run (`own_pool` in
@@ -432,26 +542,22 @@ fn instrument(kind: InstrumentKind) -> Instrument {
 // Synthetic data
 // ---------------------------------------------------------------------------------------------
 
-/// The store holding a workload's dataset, writing the dataset first unless its marker says it is
-/// complete. Each dataset has a store of its own, so datasets of one instrument never mix.
+/// The store holding a workload's dataset in this run's `data_dir`, writing the dataset first
+/// unless an earlier workload of the run wrote it. Each dataset has a store of its own, so
+/// datasets of one instrument never mix.
 fn ensure_dataset(
     data_dir: &Path,
     w: &Workload,
     from: Millis,
     to: Millis,
 ) -> Result<Store, String> {
-    let dir = data_dir.join(format!("{GENERATOR}-{}-s{}-{}mo", w.kind, w.seed, w.months));
+    let dir = data_dir.join(format!("{}-s{}-{}mo", w.kind, w.seed, w.months));
+    let written = dir.exists();
     let store = Store::new(&dir);
-    if dir.join(MARKER).exists() {
-        return Ok(store);
+    if !written {
+        eprintln!("writing dataset {}", dir.display());
+        write_dataset(&store, w.kind, w.seed, from, to)?;
     }
-    if dir.exists() {
-        // A dataset whose writing stopped part-way: start it again.
-        fs::remove_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    }
-    eprintln!("writing dataset {}", dir.display());
-    write_dataset(&store, w.kind, w.seed, from, to)?;
-    fs::write(dir.join(MARKER), "").map_err(|e| format!("{}: {e}", dir.display()))?;
     Ok(store)
 }
 
@@ -623,19 +729,99 @@ mod tests {
         assert_eq!(funding(3, from, to).len(), 6);
     }
 
-    #[test]
-    fn a_tiny_backtest_gives_the_same_checksum_twice_and_a_parsable_summary() {
+    /// Runs `w` twice (one bench of two repetitions, which fails if they differ, then one more)
+    /// over a month of its dataset and checks both give the same checksum.
+    fn bench_twice(w: &Workload) -> Measured {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::new(dir.path());
-        let w = workload(Mode::Backtest);
-        let (from, to) = (DATASET_START.start(), DATASET_START.start() + 3 * DAY);
+        let (from, to) = dataset_range(1);
         write_dataset(&store, w.kind, w.seed, from, to).unwrap();
-
-        let first = bench(&w, &store, from, to, 2).unwrap();
-        let second = bench(&w, &store, from, to, 1).unwrap();
+        let first = bench(w, &store, from, to, 2).unwrap();
+        let second = bench(w, &store, from, to, 1).unwrap();
         assert_eq!(first.checksum, second.checksum);
         assert_eq!(first.checksum.len(), 64);
         assert!(first.min_ms <= first.median_ms);
+        first
+    }
+
+    fn tiny_sweep() -> SweepSettings {
+        serde_json::from_value(serde_json::json!({
+            "axes": [
+                { "name": "fast", "space": { "kind": "values", "values": [5, 10] } },
+                { "name": "slow", "space": { "kind": "values", "values": [20, 40] } }
+            ],
+            "objective": { "metric": "total_return", "direction": "maximize" },
+            "min_trades": 0
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_tiny_load_gives_the_same_checksum_twice() {
+        assert!(bench_twice(&workload(Mode::Load)).phases.is_none());
+    }
+
+    #[test]
+    fn a_tiny_sweep_gives_the_same_checksum_twice() {
+        let w = Workload {
+            timeframe: Timeframe::H1,
+            ..workload(Mode::Sweep {
+                sweep: tiny_sweep(),
+            })
+        };
+        bench_twice(&w);
+    }
+
+    #[test]
+    fn a_tiny_walk_forward_gives_the_same_checksum_twice() {
+        let windows = serde_json::from_value(serde_json::json!(
+            { "train_bars": 240, "test_bars": 120, "step_bars": 120, "mode": "rolling" }
+        ))
+        .unwrap();
+        let w = Workload {
+            timeframe: Timeframe::H1,
+            ..workload(Mode::WalkForward {
+                sweep: tiny_sweep(),
+                windows,
+            })
+        };
+        bench_twice(&w);
+    }
+
+    #[test]
+    fn a_tiny_lab_backtest_gives_the_same_checksum_twice_and_a_parsable_phase_line() {
+        let w = Workload {
+            kind: InstrumentKind::Perpetual,
+            ..workload(Mode::LabBacktest)
+        };
+        let m = bench_twice(&w);
+        let p = m.phases.expect("a lab backtest times its phases");
+        let total = p.check + p.load + p.run + p.save + p.result + p.open;
+        assert!((total - m.min_ms).abs() < 1e-9);
+        let line = phases_line(&w, &p);
+        let f = fields(&line, "PHASES");
+        let keys: Vec<&str> = f.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(
+            keys,
+            [
+                "name",
+                "check_ms",
+                "load_ms",
+                "run_ms",
+                "save_ms",
+                "result_ms",
+                "open_ms"
+            ]
+        );
+        for (_, v) in &f[1..] {
+            v.parse::<f64>().unwrap();
+        }
+    }
+
+    #[test]
+    fn a_tiny_backtest_gives_the_same_checksum_twice_and_a_parsable_summary() {
+        let w = workload(Mode::Backtest);
+        let first = bench_twice(&w);
 
         let line = workload_line(&w, 2, &first);
         let f = fields(&line, "WORKLOAD");
@@ -655,12 +841,25 @@ mod tests {
         assert_eq!(f[3].1.len(), 16);
     }
 
+    /// The workloads file is frozen for the speed hillclimb: its hash changes only together with a
+    /// new baseline. `\r` is dropped first, since Windows checks the file out with CRLF.
+    #[test]
+    fn the_workloads_file_is_unchanged() {
+        let path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../harness/evals/perf-workloads.json");
+        let text = fs::read_to_string(path).unwrap().replace('\r', "");
+        assert_eq!(
+            sha256_hex(text.as_bytes()),
+            "12b983ff0a16224d7c953306081ffa5678f7a67aec35fcb238517fe9d42e93f7"
+        );
+    }
+
     #[test]
     fn the_workloads_file_parses() {
         let path =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../harness/evals/perf-workloads.json");
         let file: WorkloadFile = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
-        assert_eq!(file.workloads.len(), 8);
+        assert_eq!(file.workloads.len(), 10);
         for w in &file.workloads {
             assert!(w.split == "dev" || w.split == "test", "{}", w.name);
             if let Mode::Sweep { sweep } | Mode::WalkForward { sweep, .. } = &w.mode {

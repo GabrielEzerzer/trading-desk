@@ -137,6 +137,32 @@
         "min_trades": 1
       },
       "windows": { "train_bars": 2190, "test_bars": 540, "step_bars": 540, "mode": "rolling" }
+    },
+    {
+      "name": "lab_sma_1h_60mo",
+      "split": "dev",
+      "seed": 1,
+      "kind": "spot",
+      "months": 60,
+      "timeframe": "1h",
+      "strategy": "sma_cross",
+      "params": {},
+      "starting_cash": 10000,
+      "slippage_bps": 2,
+      "mode": "lab_backtest"
+    },
+    {
+      "name": "lab_donchian_15m_48mo",
+      "split": "test",
+      "seed": 2,
+      "kind": "perpetual",
+      "months": 48,
+      "timeframe": "15m",
+      "strategy": "donchian_breakout",
+      "params": {},
+      "starting_cash": 10000,
+      "slippage_bps": 2,
+      "mode": "lab_backtest"
     }
   ]
 }
