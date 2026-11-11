@@ -411,8 +411,9 @@ fn lab_config(base: &BacktestConfig) -> Result<BacktestConfig, String> {
 /// Lab's `GET /jobs/{id}/result`, then opening the saved run with `GET /runs/{id}`. The Lab opens
 /// a saved run only in a later session, so that phase reads through a store of its own and shares
 /// nothing the earlier phases kept in memory. Saves into an empty runs directory made and removed
-/// outside the timed phases. Returns the phases and the JSON to checksum: the coverage, the saved
-/// backtest as read back and the run's check, without the run id, which carries the save time.
+/// outside the timed phases. Returns the phases and the JSON to checksum: the coverage without the
+/// files' sizes, the saved backtest as read back and the run's check, without the run id, which
+/// carries the save time.
 fn lab_backtest(
     config: &BacktestConfig,
     store: &Store,
@@ -430,7 +431,7 @@ fn lab_backtest(
         lap = Instant::now();
     };
 
-    let coverage = read_coverage(store, config.instrument.id.clone()).map_err(api_error)?;
+    let mut coverage = read_coverage(store, config.instrument.id.clone()).map_err(api_error)?;
     to_json(&coverage)?;
     split(&mut p.coverage);
     check_run_data(store, config).map_err(api_error)?;
@@ -457,6 +458,11 @@ fn lab_backtest(
     split(&mut p.open);
 
     eprintln!("  rep {rep}: {trades} trades, check {:?}", opened.check);
+    // A month file's size is how the store wrote it, not a result: left out of the checksum, so a
+    // change to the files that keeps every candle does not look like a changed result.
+    for month in &mut coverage.months {
+        month.bytes = 0;
+    }
     Ok((p, to_json(&(&coverage, &opened.run, &opened.check))?))
 }
 
@@ -861,6 +867,7 @@ mod tests {
         );
         assert_eq!(f[6].1, first.checksum[..16]);
         f[3].1.parse::<f64>().unwrap();
+        f[4].1.parse::<f64>().unwrap();
 
         let summary = bench_line("dev", 1, first.min_ms, &first.checksum);
         let f = fields(&summary, "BENCH");
