@@ -127,6 +127,7 @@ fn a_paper_session_fed_the_backtest_bars_matches_the_backtest() {
             cfg.instrument.clone(),
             cfg.timeframe,
             &bars,
+            &[],
             &funding,
             SessionConfig {
                 starting_cash: cfg.starting_cash,
@@ -205,6 +206,7 @@ fn paper_matches_backtest(cfg: PaperConfig, bars: &[Candle], funding: &[(Millis,
         cfg.instrument.clone(),
         cfg.timeframe,
         bars,
+        &[],
         funding,
         SessionConfig {
             starting_cash: cfg.starting_cash,

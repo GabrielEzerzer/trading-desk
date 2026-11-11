@@ -407,7 +407,7 @@ async fn a_backtest_through_the_api_equals_td_engine_run_on_the_same_candles() {
         .unwrap();
     assert_eq!(loaded.dropped, data.dropped);
     let funding = t.store.load_funding(id, t0(), config.to).unwrap();
-    let direct = td_engine::run(&config, &loaded.candles, &funding).unwrap();
+    let direct = td_engine::run(&config, &loaded.candles, &[], &funding).unwrap();
     assert!(direct.metrics.trades > 0, "the test needs trades");
     let SavedRun::Backtest(through_api) = &detail.run else {
         panic!("a saved backtest");

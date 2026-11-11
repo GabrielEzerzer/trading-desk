@@ -162,7 +162,7 @@ fn the_sweep_finds_the_best_parameters_known_by_construction() {
     // On a rising line an earlier entry and a larger position both earn more, so the best set
     // is the shortest slow average with the largest fraction, and for each fraction the ranking
     // follows slow ascending. The best set is fourth in grid order, so a tie-break cannot fake it.
-    let r = sweep(&rising_spec(), &rising_bars(300), &[], None).unwrap();
+    let r = sweep(&rising_spec(), &rising_bars(300), &[], &[], None).unwrap();
     assert_eq!(r.rows.len(), 6);
     let top = &r.rows[0];
     assert_eq!(top.index, 3);
@@ -201,7 +201,7 @@ fn runs_below_the_minimum_trades_rank_last_and_leave_no_best() {
     // The rising-line runs hold one open trade and close none.
     let mut s = rising_spec();
     s.min_trades = 1;
-    let r = sweep(&s, &rising_bars(300), &[], None).unwrap();
+    let r = sweep(&s, &rising_bars(300), &[], &[], None).unwrap();
     assert!(r.rows.iter().all(|row| !row.qualified));
     // Unqualified rows stay in grid order.
     let order: Vec<u64> = r.rows.iter().map(|row| row.index).collect();
@@ -215,7 +215,7 @@ fn parameter_sets_the_strategy_refuses_become_rows_with_errors() {
     let mut b = base(common::spot(), 300);
     b.params = Params::new().with("slow", ParamValue::Int(5));
     let s = spec(b, vec![values("fast", &ints(&[6, 1, 2]))]);
-    let r = sweep(&s, &rising_bars(300), &[], None).unwrap();
+    let r = sweep(&s, &rising_bars(300), &[], &[], None).unwrap();
     assert_eq!(r.rows.len(), 3);
     let refused = r.rows.last().unwrap();
     assert_eq!(int(&refused.params, "fast"), 6);
@@ -229,7 +229,7 @@ fn parameter_sets_the_strategy_refuses_become_rows_with_errors() {
 fn oversized_grids_and_invalid_spaces_are_errors() {
     let bars = rising_bars(50);
     let check = |axes: Vec<ParamAxis>, ok: fn(&TesterError) -> bool| {
-        let err = sweep(&spec(base(common::spot(), 50), axes), &bars, &[], None).unwrap_err();
+        let err = sweep(&spec(base(common::spot(), 50), axes), &bars, &[], &[], None).unwrap_err();
         assert!(ok(&err), "{err}");
     };
     // 1000 x 999 runs.
@@ -274,7 +274,7 @@ fn oversized_grids_and_invalid_spaces_are_errors() {
     let mut fixed = spec(base(common::spot(), 50), vec![values("fast", &ints(&[1]))]);
     fixed.base.params = Params::new().with("fast", ParamValue::Int(2));
     assert!(matches!(
-        sweep(&fixed, &bars, &[], None),
+        sweep(&fixed, &bars, &[], &[], None),
         Err(TesterError::InvalidSpace { .. })
     ));
     let mut s = spec(base(common::spot(), 50), vec![range("fast", 1.0, 5.0, 1.0)]);
@@ -283,7 +283,7 @@ fn oversized_grids_and_invalid_spaces_are_errors() {
         seed: 1,
     };
     assert!(matches!(
-        sweep(&s, &bars, &[], None),
+        sweep(&s, &bars, &[], &[], None),
         Err(TesterError::InvalidSpec(_))
     ));
     s.mode = SweepMode::Random {
@@ -291,7 +291,7 @@ fn oversized_grids_and_invalid_spaces_are_errors() {
         seed: 1,
     };
     assert!(matches!(
-        sweep(&s, &bars, &[], None),
+        sweep(&s, &bars, &[], &[], None),
         Err(TesterError::TooManyRuns { .. })
     ));
     // Random mode may sample a space larger than the grid limit.
@@ -306,7 +306,7 @@ fn oversized_grids_and_invalid_spaces_are_errors() {
         samples: 3,
         seed: 1,
     };
-    assert_eq!(sweep(&big, &bars, &[], None).unwrap().rows.len(), 3);
+    assert_eq!(sweep(&big, &bars, &[], &[], None).unwrap().rows.len(), 3);
 }
 
 #[test]
@@ -316,7 +316,7 @@ fn ranges_expand_in_order_and_floats_stop_at_the_end() {
         .with("fast", ParamValue::Int(1))
         .with("slow", ParamValue::Int(5));
     let s = spec(b, vec![range("equity_fraction", 0.1, 1.0, 0.3)]);
-    let r = sweep(&s, &rising_bars(300), &[], None).unwrap();
+    let r = sweep(&s, &rising_bars(300), &[], &[], None).unwrap();
     let mut by_index: Vec<(u64, f64)> = r
         .rows
         .iter()
@@ -344,8 +344,8 @@ fn random_mode_is_reproducible_with_a_seed() {
         samples: 15,
         seed: 7,
     };
-    let a = sweep(&s, &bars, &[], None).unwrap();
-    let b = sweep(&s, &bars, &[], None).unwrap();
+    let a = sweep(&s, &bars, &[], &[], None).unwrap();
+    let b = sweep(&s, &bars, &[], &[], None).unwrap();
     assert_eq!(a, b);
     assert_eq!(a.rows.len(), 15);
     let mut indices: Vec<u64> = a.rows.iter().map(|r| r.index).collect();
@@ -358,7 +358,7 @@ fn random_mode_is_reproducible_with_a_seed() {
         samples: 15,
         seed: 8,
     };
-    let c = sweep(&s, &bars, &[], None).unwrap();
+    let c = sweep(&s, &bars, &[], &[], None).unwrap();
     let sets = |r: &td_engine::SweepResult| {
         let mut v: Vec<u64> = r.rows.iter().map(|row| row.index).collect();
         v.sort_unstable();
@@ -376,8 +376,8 @@ fn parallel_and_serial_sweeps_give_identical_results() {
         calls.lock().unwrap().push((done, total));
         ControlFlow::Continue(())
     };
-    let serial = pool(1).install(|| sweep(&s, &bars, &[], Some(&progress)).unwrap());
-    let parallel = pool(4).install(|| sweep(&s, &bars, &[], None).unwrap());
+    let serial = pool(1).install(|| sweep(&s, &bars, &[], &[], Some(&progress)).unwrap());
+    let parallel = pool(4).install(|| sweep(&s, &bars, &[], &[], None).unwrap());
     assert_eq!(serial.rows.len(), 48);
     assert_eq!(
         serde_json::to_string(&serial).unwrap(),
@@ -398,7 +398,7 @@ fn out_of_sample_warms_up_on_the_in_sample_bars() {
         sweep: rising_spec(),
         split: Split::Fraction(0.5),
     };
-    let r = out_of_sample(&oos, &bars, &[], None).unwrap();
+    let r = out_of_sample(&oos, &bars, &[], &[], None).unwrap();
     assert_eq!(r.split_at, T0 + 150 * HOUR);
     assert_eq!(r.in_sample.spec.base.to, r.split_at);
     let best = r.in_sample.best.as_ref().unwrap();
@@ -419,6 +419,7 @@ fn out_of_sample_warms_up_on_the_in_sample_bars() {
         },
         &bars,
         &[],
+        &[],
     )
     .unwrap();
     assert_eq!(cold.orders[0].submitted_at, r.split_at + 4 * HOUR);
@@ -431,7 +432,7 @@ fn out_of_sample_warms_up_on_the_in_sample_bars() {
         split: Split::At(T0 + 150 * HOUR),
         ..oos.clone()
     };
-    let r2 = out_of_sample(&at, &bars, &[], None).unwrap();
+    let r2 = out_of_sample(&at, &bars, &[], &[], None).unwrap();
     assert_eq!(r2.out_of_sample, r.out_of_sample);
 }
 
@@ -473,7 +474,7 @@ fn total_return_degradation_compares_annualised_growth_across_unequal_segments()
         ),
         split: Split::At(T0 + IS_DAYS * DAY),
     };
-    let r = out_of_sample(&oos, &bars, &[], None).unwrap();
+    let r = out_of_sample(&oos, &bars, &[], &[], None).unwrap();
     let is = &r.in_sample.best.as_ref().unwrap().metrics;
     let o = &r.out_of_sample.metrics;
     // The cumulative return is smaller out of sample, the annualised one larger.
@@ -503,7 +504,7 @@ fn bad_splits_and_preset_warmup_are_errors() {
         };
         assert!(
             matches!(
-                out_of_sample(&s, &bars, &[], None),
+                out_of_sample(&s, &bars, &[], &[], None),
                 Err(TesterError::InvalidSpec(_))
             ),
             "{split:?}"
@@ -515,14 +516,14 @@ fn bad_splits_and_preset_warmup_are_errors() {
     };
     s.sweep.base.warmup_from = Some(T0);
     assert!(matches!(
-        out_of_sample(&s, &bars, &[], None),
+        out_of_sample(&s, &bars, &[], &[], None),
         Err(TesterError::InvalidSpec(_))
     ));
     s.sweep.base.warmup_from = None;
     // Every in-sample run holds one trade, closed out at the end.
     s.sweep.min_trades = 2;
     assert!(matches!(
-        out_of_sample(&s, &bars, &[], None),
+        out_of_sample(&s, &bars, &[], &[], None),
         Err(TesterError::NoQualifyingRun {
             min_trades: 2,
             window: None
@@ -556,7 +557,14 @@ fn walk_forward_tests_each_window_after_its_train_and_stitches_the_tests() {
         *calls.lock().unwrap() += 1;
         ControlFlow::Continue(())
     };
-    let r = walk_forward(&wf_spec(WindowMode::Rolling), &bars, &[], Some(&progress)).unwrap();
+    let r = walk_forward(
+        &wf_spec(WindowMode::Rolling),
+        &bars,
+        &[],
+        &[],
+        Some(&progress),
+    )
+    .unwrap();
     assert_eq!(calls.into_inner().unwrap(), 36);
     // Tests start at bars 200, 250, ... 450.
     assert_eq!(r.windows.len(), 6);
@@ -582,7 +590,7 @@ fn walk_forward_tests_each_window_after_its_train_and_stitches_the_tests() {
             .filter(|b| b.open_time < w.test_to)
             .copied()
             .collect();
-        assert_eq!(&run(&o.config, &known, &[]).unwrap(), o);
+        assert_eq!(&run(&o.config, &known, &[], &[]).unwrap(), o);
         assert!(o.fills.iter().all(|f| f.time >= w.test_from));
         assert!(o.trades.iter().all(|t| t.entry_time >= w.test_from));
     }
@@ -630,7 +638,7 @@ fn walk_forward_tests_each_window_after_its_train_and_stitches_the_tests() {
 #[test]
 fn anchored_walk_forward_trains_from_the_start() {
     let bars = wavy_bars(500);
-    let r = walk_forward(&wf_spec(WindowMode::Anchored), &bars, &[], None).unwrap();
+    let r = walk_forward(&wf_spec(WindowMode::Anchored), &bars, &[], &[], None).unwrap();
     assert_eq!(r.windows.len(), 6);
     for w in &r.windows {
         assert_eq!(w.train_from, T0);
@@ -644,14 +652,15 @@ fn sweeps_and_walk_forwards_save_and_load_with_their_kind() {
     let dir = tempfile::tempdir().unwrap();
     let runs = dir.path();
     let bars = wavy_bars(500);
-    let swept = sweep(&wavy_spec(), &bars, &[], None).unwrap();
-    let wf = walk_forward(&wf_spec(WindowMode::Rolling), &bars, &[], None).unwrap();
+    let swept = sweep(&wavy_spec(), &bars, &[], &[], None).unwrap();
+    let wf = walk_forward(&wf_spec(WindowMode::Rolling), &bars, &[], &[], None).unwrap();
     let oos = out_of_sample(
         &OosSpec {
             sweep: rising_spec(),
             split: Split::Fraction(0.5),
         },
         &rising_bars(300),
+        &[],
         &[],
         None,
     )
@@ -677,7 +686,7 @@ fn sweeps_and_walk_forwards_save_and_load_with_their_kind() {
     let spec_json =
         std::fs::read_to_string(runs.join(ids[0].as_str()).join("config.json")).unwrap();
     let spec: SweepSpec = serde_json::from_str(&spec_json).unwrap();
-    assert_eq!(sweep(&spec, &bars, &[], None).unwrap(), swept);
+    assert_eq!(sweep(&spec, &bars, &[], &[], None).unwrap(), swept);
 
     let listed = list(runs).unwrap();
     let kind_of = |id| listed.iter().find(|s| &s.id == id).unwrap();
@@ -701,11 +710,11 @@ fn sweeps_and_walk_forwards_save_and_load_with_their_kind() {
     }
     assert_eq!(saved[0].data_fingerprint(), swept.data_fingerprint);
     assert_eq!(
-        config_fingerprint(&swept.spec.base, &bars, &[]).unwrap(),
+        config_fingerprint(&swept.spec.base, &bars, &[], &[]).unwrap(),
         swept.data_fingerprint
     );
     assert_eq!(
-        config_fingerprint(&wf.spec.sweep.base, &bars, &[]).unwrap(),
+        config_fingerprint(&wf.spec.sweep.base, &bars, &[], &[]).unwrap(),
         wf.data_fingerprint
     );
 }
@@ -754,7 +763,7 @@ fn assert_closed_out(o: &td_engine::BacktestResult, bars: &[Candle], to: Millis)
 #[test]
 fn walk_forward_closes_every_test_window_with_a_real_exit_fill() {
     let bars = rising_bars(300);
-    let r = walk_forward(&rising_wf_spec(), &bars, &[], None).unwrap();
+    let r = walk_forward(&rising_wf_spec(), &bars, &[], &[], None).unwrap();
     assert_eq!(r.windows.len(), 5);
     let mut exit_fees = 0.0;
     for w in &r.windows {
@@ -785,6 +794,7 @@ fn the_out_of_sample_run_is_closed_out_at_its_end() {
         },
         &bars,
         &[],
+        &[],
         None,
     )
     .unwrap();
@@ -797,7 +807,7 @@ fn the_out_of_sample_run_is_closed_out_at_its_end() {
 #[test]
 fn rolling_train_sweeps_after_the_first_warm_up_on_the_bars_before_them() {
     let bars = rising_bars(300);
-    let r = walk_forward(&rising_wf_spec(), &bars, &[], None).unwrap();
+    let r = walk_forward(&rising_wf_spec(), &bars, &[], &[], None).unwrap();
     for (k, w) in r.windows.iter().enumerate() {
         let warm = (k > 0).then(|| w.train_from - 50 * HOUR);
         let expected = run(
@@ -809,6 +819,7 @@ fn rolling_train_sweeps_after_the_first_warm_up_on_the_bars_before_them() {
                 ..with(&rising_wf_spec().sweep.base, &w.params)
             },
             &bars,
+            &[],
             &[],
         )
         .unwrap();
@@ -828,6 +839,7 @@ fn rolling_train_sweeps_after_the_first_warm_up_on_the_bars_before_them() {
         },
         &bars,
         &[],
+        &[],
     )
     .unwrap();
     assert_ne!(w.in_sample.total_return, cold.metrics.total_return);
@@ -845,6 +857,7 @@ fn a_position_held_at_the_end_counts_alike_in_and_out_of_sample() {
         },
         &bars,
         &[],
+        &[],
         None,
     )
     .unwrap();
@@ -859,7 +872,7 @@ fn a_position_held_at_the_end_counts_alike_in_and_out_of_sample() {
         m.trades == 1
     }));
 
-    let wf = walk_forward(&rising_wf_spec(), &bars, &[], None).unwrap();
+    let wf = walk_forward(&rising_wf_spec(), &bars, &[], &[], None).unwrap();
     for (k, w) in wf.windows.iter().enumerate() {
         assert_eq!(w.in_sample.trades, 1, "window {k}");
         assert_eq!(w.out_of_sample.metrics.trades, 1, "window {k}");
@@ -886,7 +899,7 @@ fn walk_forwards_over_the_run_limit_are_refused_before_running() {
         mode: WindowMode::Rolling,
     };
     let started = |_: usize, _: usize| panic!("the walk-forward started running");
-    let err = walk_forward(&s, &rising_bars(300), &[], Some(&started)).unwrap_err();
+    let err = walk_forward(&s, &rising_bars(300), &[], &[], Some(&started)).unwrap_err();
     assert!(
         matches!(err, TesterError::TooManyRuns { runs: 299_000, limit } if limit == MAX_RUNS),
         "{err}"
@@ -896,7 +909,7 @@ fn walk_forwards_over_the_run_limit_are_refused_before_running() {
 #[test]
 fn the_walk_forward_result_lists_the_stitched_trades_and_fills() {
     let bars = rising_bars(300);
-    let r = walk_forward(&rising_wf_spec(), &bars, &[], None).unwrap();
+    let r = walk_forward(&rising_wf_spec(), &bars, &[], &[], None).unwrap();
     let fills: usize = r.windows.iter().map(|w| w.out_of_sample.fills.len()).sum();
     assert_eq!(r.fills.len(), fills);
     assert_eq!(r.trades.len(), 5);
@@ -941,14 +954,21 @@ fn a_progress_callback_that_breaks_stops_the_sweep_before_its_remaining_runs() {
     };
     // One thread, so the runs go one at a time and none starts after the stop.
     let progress = stop_after(3);
-    let r = pool(1).install(|| sweep(&wavy_spec(), &bars, &[], Some(&progress)));
+    let r = pool(1).install(|| sweep(&wavy_spec(), &bars, &[], &[], Some(&progress)));
     assert_eq!(r, Err(TesterError::Cancelled));
     assert_eq!(*calls.lock().unwrap(), 3, "48 runs, stopped after 3");
 
     *calls.lock().unwrap() = 0;
     let progress = stop_after(8);
-    let r = pool(1)
-        .install(|| walk_forward(&wf_spec(WindowMode::Rolling), &bars, &[], Some(&progress)));
+    let r = pool(1).install(|| {
+        walk_forward(
+            &wf_spec(WindowMode::Rolling),
+            &bars,
+            &[],
+            &[],
+            Some(&progress),
+        )
+    });
     assert_eq!(r, Err(TesterError::Cancelled));
     assert_eq!(
         *calls.lock().unwrap(),
@@ -962,7 +982,7 @@ fn a_progress_callback_that_breaks_stops_the_sweep_before_its_remaining_runs() {
         split: Split::Fraction(0.5),
     };
     let progress = stop_after(1);
-    let r = pool(1).install(|| out_of_sample(&oos, &bars, &[], Some(&progress)));
+    let r = pool(1).install(|| out_of_sample(&oos, &bars, &[], &[], Some(&progress)));
     assert_eq!(r, Err(TesterError::Cancelled));
     assert_eq!(*calls.lock().unwrap(), 1);
 }
@@ -971,8 +991,8 @@ fn a_progress_callback_that_breaks_stops_the_sweep_before_its_remaining_runs() {
 fn a_progress_callback_that_continues_leaves_the_result_unchanged() {
     let bars = wavy_bars(500);
     let progress = |_: usize, _: usize| ControlFlow::Continue(());
-    let with = sweep(&wavy_spec(), &bars, &[], Some(&progress)).unwrap();
-    let without = sweep(&wavy_spec(), &bars, &[], None).unwrap();
+    let with = sweep(&wavy_spec(), &bars, &[], &[], Some(&progress)).unwrap();
+    let without = sweep(&wavy_spec(), &bars, &[], &[], None).unwrap();
     assert_eq!(with, without);
 }
 
@@ -983,12 +1003,12 @@ fn checking_a_spec_without_data_finds_what_the_run_would_refuse_first() {
     let mut bad = wavy_spec();
     bad.axes.push(values("fast", &ints(&[2])));
     assert!(matches!(bad.check(), Err(TesterError::InvalidSpace { .. })));
-    assert_eq!(bad.check(), sweep(&bad, &bars, &[], None).map(|_| ()));
+    assert_eq!(bad.check(), sweep(&bad, &bars, &[], &[], None).map(|_| ()));
     let mut unknown = wavy_spec();
     unknown.base.strategy = "nope".into();
     assert_eq!(
         unknown.check(),
-        sweep(&unknown, &bars, &[], None).map(|_| ())
+        sweep(&unknown, &bars, &[], &[], None).map(|_| ())
     );
 
     let mut warm = wavy_spec();
@@ -1000,12 +1020,15 @@ fn checking_a_spec_without_data_finds_what_the_run_would_refuse_first() {
     assert!(matches!(oos.check(), Err(TesterError::InvalidSpec(_))));
     assert_eq!(
         oos.check(),
-        out_of_sample(&oos, &bars, &[], None).map(|_| ())
+        out_of_sample(&oos, &bars, &[], &[], None).map(|_| ())
     );
     let mut wf = wf_spec(WindowMode::Rolling);
     assert_eq!(wf.check(), Ok(()));
     wf.sweep = warm;
-    assert_eq!(wf.check(), walk_forward(&wf, &bars, &[], None).map(|_| ()));
+    assert_eq!(
+        wf.check(),
+        walk_forward(&wf, &bars, &[], &[], None).map(|_| ())
+    );
 }
 
 #[test]
@@ -1024,7 +1047,7 @@ fn a_parameter_set_that_never_trades_ranks_last_when_minimising_drawdown_by_defa
     json.as_object_mut().unwrap().remove("min_trades");
     let s: SweepSpec = serde_json::from_value(json).unwrap();
     assert_eq!(s.min_trades, 1);
-    let r = sweep(&s, &wavy_bars(500), &[], None).unwrap();
+    let r = sweep(&s, &wavy_bars(500), &[], &[], None).unwrap();
     let last = r.rows.last().unwrap();
     assert_eq!(int(&last.params, "slow"), 1000);
     assert_eq!(last.metrics.unwrap().trades, 0);
@@ -1042,7 +1065,7 @@ fn an_objective_undefined_on_a_short_range_qualifies_no_run_and_ranks_in_grid_or
         metric: Metric::Sharpe,
         direction: Direction::Maximize,
     };
-    let r = sweep(&s, &wavy_bars(500), &[], None).unwrap();
+    let r = sweep(&s, &wavy_bars(500), &[], &[], None).unwrap();
     assert!(
         r.rows
             .iter()
@@ -1066,7 +1089,7 @@ fn a_sharpe_objective_ranks_a_run_without_a_sharpe_ratio_after_every_run_with_on
         direction: Direction::Maximize,
     };
     s.min_trades = 0;
-    let r = sweep(&s, &wavy_bars(n), &[], None).unwrap();
+    let r = sweep(&s, &wavy_bars(n), &[], &[], None).unwrap();
     assert!(r.rows[..2].iter().all(|row| row.qualified));
     let last = r.rows.last().unwrap();
     assert_eq!(int(&last.params, "slow"), 5000);
@@ -1083,6 +1106,7 @@ fn a_total_return_degradation_is_undefined_when_a_segment_is_too_short_for_a_cag
             split: Split::Fraction(0.5),
         },
         &rising_bars(300),
+        &[],
         &[],
         None,
     )
@@ -1107,7 +1131,7 @@ fn wf_benchmark_funding() -> Vec<(Millis, f64)> {
 fn the_walk_forward_benchmark_buys_and_holds_in_each_test_window_and_compounds_them() {
     let bars = rising_bars(300);
     let funding = wf_benchmark_funding();
-    let r = walk_forward(&rising_wf_spec(), &bars, &funding, None).unwrap();
+    let r = walk_forward(&rising_wf_spec(), &bars, &[], &funding, None).unwrap();
     // Five contiguous test windows of 50 bars, from bar 50 to bar 299.
     assert_eq!(r.windows.len(), 5);
     assert_eq!(r.windows[0].test_from, T0 + 50 * HOUR);
@@ -1217,7 +1241,7 @@ fn pearson(a: &[f64], b: &[f64]) -> f64 {
 #[test]
 fn the_walk_forward_benchmark_is_out_of_the_market_between_test_windows_like_the_strategy() {
     let bars = gap_bars();
-    let r = walk_forward(&gap_wf_spec(), &bars, &[], None).unwrap();
+    let r = walk_forward(&gap_wf_spec(), &bars, &[], &[], None).unwrap();
     let starts: Vec<Millis> = r.windows.iter().map(|w| w.test_from).collect();
     assert_eq!(starts, GAP_TESTS.map(|t| T0 + t.start * HOUR));
     // In every window the strategy buys on the second bar's open, at the first bar's flat price,
@@ -1302,7 +1326,7 @@ fn refused_before_running(s: &WalkForwardSpec, bars: &[Candle]) -> String {
         *calls.lock().unwrap() += 1;
         ControlFlow::Continue(())
     };
-    let err = walk_forward(s, bars, &[], Some(&progress)).unwrap_err();
+    let err = walk_forward(s, bars, &[], &[], Some(&progress)).unwrap_err();
     assert_eq!(calls.into_inner().unwrap(), 0, "ran before refusing");
     match err {
         TesterError::InvalidSpec(m) => m,
@@ -1454,7 +1478,7 @@ fn a_walk_forward_on_weekly_bars_needs_30_bars_in_every_train_window() {
     );
     // Thirty weekly bars are enough: the train window has a Sharpe ratio.
     let (s, bars) = weekly_wf_spec(35, rolling(30));
-    let r = walk_forward(&s, &bars, &[], None).unwrap();
+    let r = walk_forward(&s, &bars, &[], &[], None).unwrap();
     assert!(r.windows[0].in_sample.sharpe.is_some());
 }
 
@@ -1475,7 +1499,7 @@ fn an_out_of_sample_test_whose_in_sample_segment_is_too_short_for_its_objective_
             *calls.lock().unwrap() += 1;
             ControlFlow::Continue(())
         };
-        let r = out_of_sample(&s, &rising_bars(n), &[], Some(&progress));
+        let r = out_of_sample(&s, &rising_bars(n), &[], &[], Some(&progress));
         (r, calls.into_inner().unwrap())
     };
     // 40 days of hourly bars split in half: the in-sample segment has 20 daily returns.
@@ -1531,7 +1555,7 @@ fn a_segment_whose_daily_returns_are_mostly_carried_across_a_gap_is_refused_befo
         *calls.lock().unwrap() += 1;
         ControlFlow::Continue(())
     };
-    let r = out_of_sample(&s, &bars, &[], Some(&progress));
+    let r = out_of_sample(&s, &bars, &[], &[], Some(&progress));
     assert_eq!(calls.into_inner().unwrap(), 0, "ran before refusing");
     assert_eq!(
         r.unwrap_err(),
@@ -1581,20 +1605,20 @@ fn a_walk_forward_whose_train_windows_in_the_data_are_too_short_for_its_objectiv
     // One more bar reaches into a 30th day: the walk-forward runs and the train window has a
     // Sharpe ratio, so the run refuses exactly what the train sweeps could not rank.
     let (s, bars) = train_floor_spec(Metric::Sharpe, 697);
-    let r = walk_forward(&s, &bars, &[], None).unwrap();
+    let r = walk_forward(&s, &bars, &[], &[], None).unwrap();
     assert!(r.windows[0].in_sample.sharpe.is_some());
     let (s, bars) = train_floor_spec(Metric::Cagr, 2_160);
-    let r = walk_forward(&s, &bars, &[], None).unwrap();
+    let r = walk_forward(&s, &bars, &[], &[], None).unwrap();
     assert!(r.windows[0].in_sample.cagr.is_some());
     // Objectives without a floor are not checked.
     let (s, bars) = train_floor_spec(Metric::TotalReturn, 50);
-    assert!(walk_forward(&s, &bars, &[], None).is_ok());
+    assert!(walk_forward(&s, &bars, &[], &[], None).is_ok());
 }
 
 #[test]
 fn a_walk_forward_saved_before_it_had_a_benchmark_loads_without_one() {
     let dir = tempfile::tempdir().unwrap();
-    let wf = walk_forward(&rising_wf_spec(), &rising_bars(300), &[], None).unwrap();
+    let wf = walk_forward(&rising_wf_spec(), &rising_bars(300), &[], &[], None).unwrap();
     let id = save(&SavedRun::WalkForward(Box::new(wf.clone())), dir.path()).unwrap();
     // Rewrite result.json as a save from before walk-forwards had a benchmark: no `benchmark` key
     // on the walk-forward result (each window's backtest keeps its own).
@@ -1623,7 +1647,7 @@ fn walk_forward_tests_up_to_the_last_bar_and_warms_the_first_train_sweep_on_the_
     let bars = rising_bars(310);
     let mut s = rising_wf_spec();
     s.sweep.base.to = T0 + 310 * HOUR;
-    let r = walk_forward(&s, &bars, &[], None).unwrap();
+    let r = walk_forward(&s, &bars, &[], &[], None).unwrap();
     assert_eq!(r.windows.len(), 5);
     assert_eq!(r.windows.last().unwrap().test_to, T0 + 310 * HOUR);
     assert_eq!(r.equity.last().unwrap().time, T0 + 309 * HOUR);
@@ -1643,6 +1667,7 @@ fn walk_forward_tests_up_to_the_last_bar_and_warms_the_first_train_sweep_on_the_
         },
         &bars,
         &[],
+        &[],
     )
     .unwrap();
     assert_eq!(first.in_sample.total_return, warmed.metrics.total_return);
@@ -1654,6 +1679,7 @@ fn walk_forward_tests_up_to_the_last_bar_and_warms_the_first_train_sweep_on_the_
             ..with(&s.sweep.base, &first.params)
         },
         &bars,
+        &[],
         &[],
     )
     .unwrap();

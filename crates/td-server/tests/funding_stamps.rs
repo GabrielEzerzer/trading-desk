@@ -86,6 +86,7 @@ fn funding_paid(plan: Vec<(usize, Side)>, funding: &[(Millis, f64)]) -> f64 {
         perp(),
         Timeframe::M1,
         &bars,
+        &[],
         funding,
         config,
     )

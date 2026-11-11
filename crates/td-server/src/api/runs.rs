@@ -479,21 +479,22 @@ fn execute(
         }
         JobRequest::Backtest(config) => {
             ctx.progress(0.0, "running the backtest");
-            let result = td_engine::run(config, &bars, &funding).map_err(engine_error)?;
+            let result = td_engine::run(config, &bars, &[], &funding).map_err(engine_error)?;
             SavedRun::Backtest(Box::new(result))
         }
         JobRequest::Sweep(spec) => {
-            let result = own_pool(|| td_engine::sweep(spec, &bars, &funding, Some(&progress)))?;
+            let result =
+                own_pool(|| td_engine::sweep(spec, &bars, &[], &funding, Some(&progress)))?;
             SavedRun::Sweep(Box::new(result.map_err(tester_job_error)?))
         }
         JobRequest::Oos(spec) => {
             let result =
-                own_pool(|| td_engine::out_of_sample(spec, &bars, &funding, Some(&progress)))?;
+                own_pool(|| td_engine::out_of_sample(spec, &bars, &[], &funding, Some(&progress)))?;
             SavedRun::Oos(Box::new(result.map_err(tester_job_error)?))
         }
         JobRequest::WalkForward(spec) => {
             let result =
-                own_pool(|| td_engine::walk_forward(spec, &bars, &funding, Some(&progress)))?;
+                own_pool(|| td_engine::walk_forward(spec, &bars, &[], &funding, Some(&progress)))?;
             SavedRun::WalkForward(Box::new(result.map_err(tester_job_error)?))
         }
     };
@@ -595,7 +596,7 @@ fn check_run(store: &Store, run: &SavedRun) -> RunCheck {
     let base = run.base_config();
     let data_matches = read_data(store, base)
         .ok()
-        .and_then(|d| config_fingerprint(base, &d.loaded.candles, &d.funding).ok())
+        .and_then(|d| config_fingerprint(base, &d.loaded.candles, &[], &d.funding).ok())
         .is_some_and(|fingerprint| fingerprint == run.data_fingerprint());
     RunCheck {
         data_matches,
