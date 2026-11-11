@@ -20,7 +20,7 @@ use td_data::{DataError, Store};
 use ts_rs::TS;
 
 use super::AppState;
-use super::data::{EARLIEST_FROM, parse_instrument};
+use super::data::{earliest_from, parse_instrument};
 use super::error::ApiError;
 
 /// The most bars one response holds, and the default `limit`.
@@ -54,7 +54,7 @@ pub struct CandlesResponse {
     /// The bar slots the response covers: open times in `[from, to)`, each on a bar boundary. `to`
     /// is the asked `to` rounded up to a boundary, but no later than the open time of the bar
     /// still forming; `from` is later than asked when the limit cut the range, and never before
-    /// 2017-01-01.
+    /// the venue's earliest download date (2017-01-01, or 2005-01-01 for oanda).
     pub from: Millis,
     pub to: Millis,
     /// `from` was given and the range held more than `limit` bar slots, so the oldest were left
@@ -112,10 +112,11 @@ fn read_candles(
         if floor == t { t } else { floor + dur }
     };
     // Clamped first, so the arithmetic below cannot overflow. The bar open at `now` is not closed.
-    let clamp = |t: Millis| t.clamp(EARLIEST_FROM, now.max(EARLIEST_FROM));
+    let (earliest, _) = earliest_from(id.venue);
+    let clamp = |t: Millis| t.clamp(earliest, now.max(earliest));
     let end = ceil(clamp(to)).min(timeframe.floor(now));
     let window = end - limit as i64 * dur;
-    let asked = ceil(clamp(query.from.unwrap_or(EARLIEST_FROM)));
+    let asked = ceil(clamp(query.from.unwrap_or(earliest)));
     let from = asked.max(window).min(end);
     let truncated = query.from.is_some() && asked < window;
 
