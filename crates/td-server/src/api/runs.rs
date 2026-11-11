@@ -433,7 +433,7 @@ pub fn load_run_data(store: &Store, config: &BacktestConfig) -> Result<RunData, 
     let dropped: Vec<Millis> = (0..(to - from) / step)
         .map(|i| from + i * step)
         .filter(|&t| bar_times.next_if_eq(&t).is_none())
-        .filter(|&t| kind.closed_spans(t, t + step) != [t..t + step])
+        .filter(|&t| kind.closed_spans(t, t + step).first() != Some(&(t..t + step)))
         .collect();
     let report = DataReport {
         bars: loaded.candles.len(),
