@@ -1,6 +1,6 @@
 use td_core::{
-    Candle, FeeSchedule, Fill, Instrument, InstrumentKind, OrderId, OrderRequest, OrderType,
-    Rounding, Side, Timeframe,
+    Candle, FeeSchedule, Fill, Instrument, InstrumentKind, Millis, OrderId, OrderRequest,
+    OrderType, Rounding, Side, Timeframe,
 };
 
 use crate::broker::ENTRY_CANCELLED;
@@ -127,7 +127,20 @@ impl Context<'_> {
     /// Every order is rejected on a warm-up bar. A rejected order is recorded with its reason and
     /// returned as an error.
     pub fn submit(&mut self, request: OrderRequest) -> Result<OrderId, OrderRejected> {
-        self.send(request, None).map(|(id, _)| id)
+        let decided_on = self.bar().open_time;
+        self.send(request, None, decided_on).map(|(id, _)| id)
+    }
+
+    /// [`Context::submit`] for an order placed from outside the strategy while the bar that
+    /// opened at `decided_on` was in progress, at or after this bar: it is checked against this
+    /// bar's close, as any order, but first fills on the bar after `decided_on`.
+    pub(crate) fn submit_during(
+        &mut self,
+        request: OrderRequest,
+        decided_on: Millis,
+    ) -> Result<OrderId, OrderRejected> {
+        debug_assert!(decided_on >= self.bar().open_time);
+        self.send(request, None, decided_on).map(|(id, _)| id)
     }
 
     /// Submits an entry with a protective stop attached. When the entry fills, a reduce-only stop
@@ -151,19 +164,22 @@ impl Context<'_> {
         stop_trigger: f64,
     ) -> Result<(OrderId, OrderId), OrderRejected> {
         let trigger = self.instrument.round_price(stop_trigger, Rounding::Nearest);
-        let (id, stop) = self.send(request, Some(trigger))?;
+        let decided_on = self.bar().open_time;
+        let (id, stop) = self.send(request, Some(trigger), decided_on)?;
         Ok((id, stop.expect("an accepted entry has its stop attached")))
     }
 
     /// Records the order and sends it to the broker if it passes the checks, with a protective
-    /// stop attached when `stop_trigger` is set. Returns the order's id and its stop's.
+    /// stop attached when `stop_trigger` is set, as decided on the bar that opened at
+    /// `submitted_at` (see [`Order::submitted_at`]). Returns the order's id and its stop's.
     fn send(
         &mut self,
         request: OrderRequest,
         stop_trigger: Option<f64>,
+        submitted_at: Millis,
     ) -> Result<(OrderId, Option<OrderId>), OrderRejected> {
         let id = OrderId(self.orders.len() as u64 + 1);
-        let (submitted_at, decision_close) = (self.bar().open_time, self.bar().close);
+        let decision_close = self.bar().close;
         let (request, mut check) = self.prepare(request);
         if self.warming_up {
             check = Err(WARM_UP.into());
@@ -212,12 +228,17 @@ impl Context<'_> {
     /// Cancels an open order. Returns false if it is not open. Cancelling an entry that has not
     /// filled also cancels its attached stop.
     pub fn cancel(&mut self, id: OrderId) -> bool {
+        self.cancel_with(id, "cancelled by the strategy")
+    }
+
+    /// [`Context::cancel`] with the reason the order records.
+    pub(crate) fn cancel_with(&mut self, id: OrderId, reason: &str) -> bool {
         if !self.broker.cancel(id) {
             return false;
         }
         let mut attached = None;
         if let Some(order) = self.orders.iter_mut().find(|o| o.id == id) {
-            order.status = OrderStatus::Cancelled("cancelled by the strategy".into());
+            order.status = OrderStatus::Cancelled(reason.into());
             attached = order.attached_stop;
         }
         if let Some(stop) = attached

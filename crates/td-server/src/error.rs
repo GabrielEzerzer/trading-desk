@@ -40,6 +40,39 @@ pub enum PaperError {
 
     #[error("a background task failed: {0}")]
     Task(String),
+
+    #[error("the session's log could not be written, so it takes no more bars or orders: {0}")]
+    LogFailed(String),
+}
+
+/// Why a manual order or cancel was refused.
+#[derive(Debug, thiserror::Error)]
+pub enum ManualError {
+    #[error("the session has not fed its first live bar yet; orders can be placed once it has")]
+    NotLive,
+
+    /// The last bar fed is more than one bar behind the last closed bar (see
+    /// [`crate::PaperSession::place`]).
+    #[error(
+        "the session is still replaying bars it missed; orders can be placed once it has caught up"
+    )]
+    CatchingUp,
+
+    /// The engine's reason, or a request it cannot take.
+    #[error("{0}")]
+    Rejected(String),
+
+    #[error("no order {0} in this session")]
+    NoSuchOrder(u64),
+
+    #[error("order {0} was placed by the strategy; only manual orders can be cancelled")]
+    NotManual(u64),
+
+    #[error("order {id} is {state}, so it cannot be cancelled")]
+    Done { id: u64, state: &'static str },
+
+    #[error(transparent)]
+    Paper(#[from] PaperError),
 }
 
 impl PaperError {
