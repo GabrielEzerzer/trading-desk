@@ -1251,8 +1251,6 @@ async fn fx_sweeps_out_of_sample_and_walk_forward_runs_trade_on_the_asks() {
     assert!(buys > 0 && sells > 0, "{buys} buys and {sells} sells");
 }
 
-/// Sets the ask high of the minute at `open_time` in its stored month file to `high`, past the
-/// store's checks.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_fx_run_goes_over_a_holiday_but_two_days_missing_or_a_spot_day_is_refused() {
     // FX_DAYS days of FX minutes from Monday 8 January 2024. EURUSD lacks 25 hours of open time
@@ -1393,6 +1391,8 @@ async fn fx_minutes_missing_either_side_of_a_weekend_are_judged_together_and_ref
     assert_eq!(jobs.as_array().map(Vec::len), Some(0));
 }
 
+/// Sets the ask high of the minute at `open_time` in its stored month file to `high`, past the
+/// store's checks.
 fn plant_ask_high(store: &Store, id: &InstrumentId, open_time: Millis, high: f64) {
     use arrow::array::{Array, ArrayRef, Float64Array, Int64Array};
     use arrow::record_batch::RecordBatch;

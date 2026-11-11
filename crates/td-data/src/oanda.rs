@@ -325,8 +325,12 @@ struct Quote {
 /// matter.
 ///
 /// shortcut: a run is measured only up to the end of the read (the month's end or the present), so
-/// a closure that starts less than an hour before that is filled up to it; read on past the end if
-/// a closure ever starts in a month's last hour or a download runs in a closure's first hour.
+/// a closure that starts less than an hour before that is filled up to it. A download that runs in
+/// a closure's first hour stores flat candles with no volume from the closure's start up to the
+/// present, and a later download leaves them there, because [`crate::Store::write_quotes`] merges
+/// and never deletes; only deleting the month and downloading it again clears them. Leave unfilled
+/// a trailing run that has no candle after it if a closure ever starts in a month's last hour or a
+/// download runs in a closure's first hour.
 fn fill(
     kind: InstrumentKind,
     to: Millis,
