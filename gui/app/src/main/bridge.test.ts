@@ -20,6 +20,11 @@ describe('validateRequest', () => {
     })
   })
 
+  it('passes the candle history the chart asks for', () => {
+    const query = { instrument: 'binance:BTCUSDT:spot', timeframe: '5m', limit: '500' }
+    expect(validateRequest({ method: 'GET', path: '/candles', query })).toEqual({ method: 'GET', path: '/candles', query })
+  })
+
   it('passes the run routes the Lab uses', () => {
     const id = '1794242520000-0a1b2c3d'
     expect(validateRequest({ method: 'GET', path: '/runs' })).toEqual({ method: 'GET', path: '/runs' })
@@ -127,7 +132,11 @@ describe('paper session routes', () => {
     ['a start with an array body', { method: 'POST', path: '/sessions', body: [start] }],
     ['a query on the session list', { method: 'GET', path: '/sessions', query: { status: 'live' } }],
     ['manual orders, which do not exist yet (#36)', { method: 'POST', path: '/sessions/abc/orders', body: {} }],
-    ['candle history, which does not exist yet (#36)', { method: 'GET', path: '/candles' }],
+    ['candle history without its query', { method: 'GET', path: '/candles' }],
+    [
+      'candle history with a range',
+      { method: 'GET', path: '/candles', query: { instrument: 'binance:BTCUSDT:spot', timeframe: '1m', limit: '500', from: '1' } },
+    ],
   ])('refuses %s', (_name, input) => {
     expect(() => validateRequest(input)).toThrow(RefusedRequest)
   })

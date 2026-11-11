@@ -78,7 +78,8 @@ function TradingDesk() {
     () => instruments.list?.instruments.find((i) => sameInstrument(i.id, instrumentId)) ?? null,
     [instruments.list, instrumentId],
   )
-  const { candles, revision } = useCandles(source, instrumentId, timeframe)
+  const history = useCandles(source, instrumentId, timeframe)
+  const { candles, revision } = history
   const session = usePaperSession(source, instrumentId)
   const last = candles.at(-1) ?? null
   const lastPrice = last?.close ?? null
@@ -143,14 +144,19 @@ function TradingDesk() {
         <div className="chart-empty" role="status">
           <p className="state-quiet shimmer">Loading instruments</p>
         </div>
+      ) : source && history.error ? (
+        <div className="chart-empty" role="alert">
+          <p className="state-quiet">The candle history did not load.</p>
+          <p className="chart-empty-note">{history.error}</p>
+          <button type="button" className="button-float" onClick={history.retry}>
+            Retry
+          </button>
+        </div>
       ) : (
         source &&
-        candles.length === 0 && (
+        history.loading && (
           <div className="chart-empty" role="status">
-            <p className="state-quiet">Waiting for the first closed {timeframe} bar</p>
-            {!window.td.mock && (
-              <p className="chart-empty-note">The engine has no candle history yet (#36), so the chart fills from the live stream.</p>
-            )}
+            <p className="state-quiet shimmer">Loading candle history</p>
           </div>
         )
       )}

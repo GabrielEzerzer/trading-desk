@@ -19,6 +19,7 @@ const ROUTES: readonly Route[] = [
   { method: 'GET', path: /^\/instruments$/, query: ['venue', 'kind'] },
   { method: 'POST', path: /^\/data\/download$/, body: true },
   { method: 'GET', path: /^\/data\/coverage$/, query: ['instrument'] },
+  { method: 'GET', path: /^\/candles$/, query: ['instrument', 'timeframe', 'limit'] },
   { method: 'GET', path: /^\/strategies$/ },
   { method: 'GET', path: /^\/jobs$/ },
   { method: 'GET', path: /^\/jobs\/\d{1,15}$/ },

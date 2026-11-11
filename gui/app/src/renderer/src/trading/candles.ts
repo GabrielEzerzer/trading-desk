@@ -1,4 +1,4 @@
-// The chart's candles: history (when the source has any) merged with the live stream's closed bars.
+// The chart's candles: the history merged with the live stream, whose last bar may still be forming.
 
 import type { Candle, Timeframe } from '@td/shared'
 
@@ -35,6 +35,52 @@ export function addCandle(list: readonly Candle[], candle: Candle): { list: Cand
   if (!last || candle.open_time > last.open_time) return { list: [...list, candle], change: 'update' }
   if (candle.open_time === last.open_time) return { list: [...list.slice(0, -1), candle], change: 'update' }
   return { list: mergeCandles(list, [candle]), change: 'reset' }
+}
+
+/** The bars a chart draws. Only the last one can still be forming. */
+export interface CandleSeries {
+  candles: Candle[]
+  /** Bumps when the list changed anywhere but its end, so the chart redraws it whole. */
+  revision: number
+  /** The open time of the newest closed bar, or null before any; a later bar is still forming. */
+  closed: number | null
+}
+
+export const EMPTY_SERIES: CandleSeries = { candles: [], revision: 0, closed: null }
+
+function withBar<S extends CandleSeries>(series: S, candle: Candle): S {
+  const { list, change } = addCandle(series.candles, candle)
+  return { ...series, candles: list, revision: change === 'reset' ? series.revision + 1 : series.revision }
+}
+
+/** A closed bar: it takes its open time's place, the forming bar's included. */
+export function withClosed<S extends CandleSeries>(series: S, candle: Candle): S {
+  const next = withBar(series, candle)
+  return { ...next, closed: Math.max(series.closed ?? candle.open_time, candle.open_time) }
+}
+
+/** The forming bar: drawn as the last candle, unless a closed bar at or after it has arrived. */
+export function withForming<S extends CandleSeries>(series: S, candle: Candle): S {
+  if (series.closed !== null && candle.open_time <= series.closed) return series
+  return withBar(series, candle)
+}
+
+/**
+ * The history under the live bars. A live bar wins over history at the same open time, except a
+ * forming bar that history already holds closed, which history replaces.
+ */
+export function withHistory<S extends CandleSeries>(series: S, history: readonly Candle[]): S {
+  const end = history.at(-1)?.open_time
+  if (end === undefined) return series
+  const last = series.candles.at(-1)
+  const forming = last && (series.closed === null || last.open_time > series.closed) ? last : undefined
+  const live = forming && forming.open_time <= end ? series.candles.slice(0, -1) : series.candles
+  return {
+    ...series,
+    candles: mergeCandles(history, live),
+    revision: series.revision + 1,
+    closed: Math.max(series.closed ?? end, end),
+  }
 }
 
 /** The open time of the bar that holds `time`. */

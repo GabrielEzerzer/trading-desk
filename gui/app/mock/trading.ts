@@ -2,7 +2,7 @@
 // It reads trading.json (made by generate-trading.mjs): instruments for both venues and candle
 // history for BTCUSDT and ETHUSDT. Other instruments reuse BTCUSDT's path scaled to their own
 // price. Live bars continue the history quickly (one closed bar every `liveMs`, whatever the
-// timeframe), and paper sessions run on them: manual orders fill at the next bar's open, and a
+// timeframe, with the bar in progress shown twice before it closes), and paper sessions run on them: manual orders fill at the next bar's open, and a
 // strategy session trades a simple moving-average cross so its markers can be designed.
 //
 // It also exposes `window.tdMockTrading` so the screenshots can show the feed reconnecting and a
@@ -28,7 +28,7 @@ import type {
 import { TIMEFRAME_MS, addCandle } from '../src/renderer/src/trading/candles'
 import { onLot, onTick } from '../src/renderer/src/trading/order'
 import { sameInstrument } from '../src/renderer/src/trading/session'
-import { MANUAL, type ManualOrder, type SessionFeed, type TradingSource } from '../src/renderer/src/trading/source'
+import { type CandleFeed, MANUAL, type ManualOrder, type SessionFeed, type TradingSource } from '../src/renderer/src/trading/source'
 import labFixtures from './lab.json'
 import fixtures from './trading.json'
 
@@ -119,10 +119,20 @@ function seedOf(text: string): number {
 }
 
 /** One instrument and timeframe's live bars, shared by the chart and every session on it. */
+/**
+ * When the bar in progress is shown between two closes, as fractions of `liveMs`. Late in the
+ * cycle, so the screenshots' quiet moment (0.6 of the cycle, harness.mjs `quiet`) still shows the
+ * last closed bar with the price's tint gone.
+ */
+const FORMING_AT = [0.75, 0.9] as const
+
 class Feed {
   readonly bars: Candle[]
-  private readonly listeners = new Set<(c: Candle) => void>()
+  private readonly listeners = new Set<Partial<CandleFeed>>()
   private timer: ReturnType<typeof setInterval> | undefined
+  private forming: ReturnType<typeof setTimeout>[] = []
+  /** The next bar and the four prices it passes through, worked out before its close. */
+  private pending: { candle: Candle; path: number[] } | null = null
   private readonly rand: () => number
   private readonly span: number
   private readonly tick: number
@@ -139,42 +149,76 @@ class Feed {
     this.tick = findInstrument(id)?.instrument.tick_size ?? 0.01
   }
 
-  listen(listener: (c: Candle) => void): () => void {
+  /** Each closed bar, and the bar in progress twice between closes. */
+  listen(listener: Partial<CandleFeed>): () => void {
     this.listeners.add(listener)
-    this.timer ??= setInterval(() => this.next(), this.liveMs)
+    if (!this.timer) {
+      this.timer = setInterval(() => this.next(), this.liveMs)
+      this.scheduleForming()
+    }
     return () => {
       this.listeners.delete(listener)
       if (this.listeners.size === 0) {
         clearInterval(this.timer)
         this.timer = undefined
+        for (const t of this.forming) clearTimeout(t)
+        this.forming = []
       }
     }
   }
 
-  private next(): void {
+  private scheduleForming(): void {
+    for (const t of this.forming) clearTimeout(t)
+    this.forming = FORMING_AT.map((at, i) => setTimeout(() => this.showForming(i + 2), at * this.liveMs))
+  }
+
+  /** The next bar, the same for the same seed however often it is shown before it closes. */
+  private upcoming(): { candle: Candle; path: number[] } | null {
+    if (this.pending) return this.pending
     const last = this.bars.at(-1)
-    if (!last) return
+    if (!last) return null
     const vol = 0.0009 * Math.sqrt(this.span / 60_000) ** 0.5
     let price = last.close
-    let high = price
-    let low = price
+    const path: number[] = []
     for (let k = 0; k < 4; k++) {
       price *= Math.exp(vol * (this.rand() + this.rand() + this.rand() - 1.5))
-      high = Math.max(high, price)
-      low = Math.min(low, price)
+      path.push(price)
     }
     const volume = Math.round(last.volume * (0.6 + this.rand() * 0.8) * 1000) / 1000
-    const candle: Candle = {
+    this.pending = { candle: this.barThrough(last, path, volume), path }
+    return this.pending
+  }
+
+  private barThrough(last: Candle, path: readonly number[], volume: number): Candle {
+    const price = path.at(-1) ?? last.close
+    return {
       open_time: last.open_time + this.span,
       open: last.close,
-      high: roundTo(high, this.tick),
-      low: roundTo(low, this.tick),
+      high: roundTo(Math.max(last.close, ...path), this.tick),
+      low: roundTo(Math.min(last.close, ...path), this.tick),
       close: roundTo(price, this.tick),
       volume,
       quote_volume: Math.round(volume * price * 100) / 100,
     }
-    this.bars.push(candle)
-    for (const listener of this.listeners) listener(candle)
+  }
+
+  /** The next bar as it stands after the first `steps` of its four prices. */
+  private showForming(steps: number): void {
+    const last = this.bars.at(-1)
+    const next = this.upcoming()
+    if (!last || !next) return
+    const volume = Math.round(next.candle.volume * (steps / 4) * 1000) / 1000
+    const candle = this.barThrough(last, next.path.slice(0, steps), volume)
+    for (const listener of this.listeners) listener.onForming?.(candle)
+  }
+
+  private next(): void {
+    const next = this.upcoming()
+    if (!next) return
+    this.pending = null
+    this.bars.push(next.candle)
+    for (const listener of this.listeners) listener.onClosed?.(next.candle)
+    this.scheduleForming()
   }
 }
 
@@ -232,7 +276,7 @@ class MockSession {
   }
 
   start(): void {
-    this.off = this.feed.listen((bar) => this.onBar(bar))
+    this.off = this.feed.listen({ onClosed: (bar) => this.onBar(bar) })
     this.setStatus(this.warm > 0 ? { status: 'warming_up' } : { status: 'live' })
   }
 
@@ -620,7 +664,7 @@ export function createMockTradingSource({ liveMs = 1500, listMs = 400 }: MockTra
       ),
     strategies: async () => strategies,
     history: async (id, timeframe) => feedFor(id, timeframe).bars.slice(),
-    candles: (id, timeframe, onCandle) => feedFor(id, timeframe).listen(onCandle),
+    candles: (id, timeframe, feed) => feedFor(id, timeframe).listen(feed),
     sessions: async () => [...sessions.values()].map((s) => s.summary()),
     session: async (id) => sessionOf(id).state(),
     async startSession(request) {

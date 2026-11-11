@@ -1,6 +1,6 @@
-import type { Candle, InstrumentId, ServerMessage, SessionEvent, SessionState } from '@td/shared'
+import type { ApiRequest, ApiResult, Candle, InstrumentId, ServerMessage, SessionEvent, SessionState } from '@td/shared'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { engineTradingSource } from './source'
+import { HISTORY_BARS, engineTradingSource } from './source'
 
 // A stand-in for the preload's `window.td`: the parts a subscription uses.
 function fakeBridge() {
@@ -36,23 +36,52 @@ beforeEach(() => {
 afterEach(() => vi.unstubAllGlobals())
 
 describe('engine candle stream', () => {
-  it('passes on its own topic only and unsubscribes on stop', () => {
-    const onCandle = vi.fn()
-    const stop = engineTradingSource.candles(btc, '1m', onCandle)
+  it('passes on its own topic only, forming and closed, and unsubscribes on stop', () => {
+    const feed = { onClosed: vi.fn(), onForming: vi.fn() }
+    const stop = engineTradingSource.candles(btc, '1m', feed)
     const topic = 'candles:binance:BTCUSDT:spot:1m'
     expect(bridge.td.subscribe).toHaveBeenCalledWith(topic)
 
+    const forming = { ...candle, close: 1.2 }
+    bridge.emit({ type: 'candle_forming', topic, candle: forming })
     bridge.emit({ type: 'candle', topic, candle })
     bridge.emit({ type: 'candle', topic: 'candles:binance:BTCUSDT:spot:5m', candle })
+    bridge.emit({ type: 'candle_forming', topic: 'candles:binance:BTCUSDT:spot:5m', candle })
     bridge.emit({ type: 'session', id: 'a', event: bar })
-    expect(onCandle).toHaveBeenCalledTimes(1)
-    expect(onCandle).toHaveBeenCalledWith(candle)
+    expect(feed.onForming.mock.calls).toEqual([[forming]])
+    expect(feed.onClosed.mock.calls).toEqual([[candle]])
 
     stop()
     expect(bridge.td.unsubscribe).toHaveBeenCalledWith(topic)
     expect(bridge.listeners.size).toBe(0)
     bridge.emit({ type: 'candle', topic, candle })
-    expect(onCandle).toHaveBeenCalledTimes(1)
+    bridge.emit({ type: 'candle_forming', topic, candle })
+    expect(feed.onClosed).toHaveBeenCalledTimes(1)
+    expect(feed.onForming).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('engine candle history', () => {
+  it('asks GET /candles for the last bars of the instrument and timeframe', async () => {
+    const request = vi.fn(async (_r: ApiRequest): Promise<ApiResult> => ({
+      ok: true,
+      status: 200,
+      body: { instrument: btc, timeframe: '5m', from: 0, to: 1, truncated: false, candles: [candle], from_venue: [], missing: [] },
+    }))
+    vi.stubGlobal('window', { td: { ...bridge.td, request } })
+    expect(await engineTradingSource.history(btc, '5m')).toEqual([candle])
+    expect(request).toHaveBeenCalledWith({
+      method: 'GET',
+      path: '/candles',
+      query: { instrument: 'binance:BTCUSDT:spot', timeframe: '5m', limit: String(HISTORY_BARS) },
+    })
+  })
+
+  it('rejects with the engine’s words when the venue fails', async () => {
+    const message = 'fetching binance:BTCUSDT:spot 5m bars from the venue failed: timed out'
+    const request = vi.fn(async (): Promise<ApiResult> => ({ ok: false, status: 502, error: { code: 'venue', message } }))
+    vi.stubGlobal('window', { td: { ...bridge.td, request } })
+    await expect(engineTradingSource.history(btc, '5m')).rejects.toThrow(message)
   })
 })
 

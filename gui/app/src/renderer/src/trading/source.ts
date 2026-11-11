@@ -42,6 +42,17 @@ export interface SessionFeed {
   onEvent(event: SessionEvent): void
 }
 
+/** What a `candles:` subscription delivers: the bar still forming as it changes, and each bar as it closes. */
+export interface CandleFeed {
+  /** A closed bar. It replaces the forming bar with the same open time. */
+  onClosed(candle: Candle): void
+  /** The bar in progress so far. It is drawn as the last candle until its closed bar arrives. */
+  onForming(candle: Candle): void
+}
+
+/** How many closed bars a chart loads before the live stream continues it. */
+export const HISTORY_BARS = 500
+
 /** A capability the source may lack, with the sentence that says so where the control is. */
 export type Capability = { available: true } | { available: false; reason: string }
 
@@ -52,10 +63,10 @@ export interface TradingSource {
   readonly manualSessions: Capability
   instruments(): Promise<InstrumentList>
   strategies(): Promise<StrategyInfo[]>
-  /** Closed bars before now, oldest first; empty when the source has no history. */
+  /** About the last `HISTORY_BARS` closed bars before now, oldest first. */
   history(id: InstrumentId, timeframe: Timeframe): Promise<Candle[]>
-  /** Each closed bar from now on. Returns a function that stops it. */
-  candles(id: InstrumentId, timeframe: Timeframe, onCandle: (candle: Candle) => void): () => void
+  /** The bar forming and each closed bar from now on. Returns a function that stops it. */
+  candles(id: InstrumentId, timeframe: Timeframe, feed: CandleFeed): () => void
   sessions(): Promise<SessionSummary[]>
   session(id: string): Promise<SessionState>
   startSession(request: StartSessionRequest): Promise<SessionSummary>
@@ -111,20 +122,20 @@ function follow(topic: string, onMessage: (message: ServerMessage) => void): () 
 }
 
 /**
- * The real engine. It has no candle history and no manual orders yet (#36), so the chart starts
- * empty and fills from the live stream, and the composer says orders are not available.
+ * The real engine. It has no manual orders yet (#36), so the composer says orders are not
+ * available.
  */
 export const engineTradingSource: TradingSource = {
   orders: { available: false, reason: UNTIL_36 },
   manualSessions: { available: false, reason: 'Manual sessions arrive with the order endpoint (#36).' },
   instruments: () => loadInstrumentLists(async (venue, kind) => (await api.instruments(venue, kind)).instruments),
   strategies: () => api.strategies(),
-  // shortcut: the engine serves no candle history yet (#36); the chart fills from the live stream.
-  history: async () => [],
-  candles(id, timeframe, onCandle) {
+  history: async (id, timeframe) => (await api.candles(id, timeframe, HISTORY_BARS)).candles,
+  candles(id, timeframe, feed) {
     const topic = candleTopic(id, timeframe)
     return follow(topic, (m) => {
-      if (m.type === 'candle' && m.topic === topic) onCandle(m.candle)
+      if (m.type === 'candle' && m.topic === topic) feed.onClosed(m.candle)
+      else if (m.type === 'candle_forming' && m.topic === topic) feed.onForming(m.candle)
     })
   },
   sessions: () => api.sessions(),
