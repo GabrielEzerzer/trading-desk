@@ -18,6 +18,8 @@ use serde::{Deserialize, Serialize};
 use td_core::{Candle, Fill, Millis, Side, Timeframe};
 
 use crate::metrics::{self, EquitySeries, MetricsReport};
+use crate::permute::permute_bars;
+use crate::rng::{SplitMix64, derive_seed};
 use crate::runner::{compare, config_fingerprint, hold_over, select_bars};
 use crate::{
     BacktestConfig, BacktestResult, Benchmark, EngineError, EquityPoint, ParamKind, ParamSpec,
@@ -478,30 +480,6 @@ fn axis(a: &ParamAxis, specs: &[ParamSpec], base: &Params) -> Result<Axis, Teste
     Ok(axis)
 }
 
-/// SplitMix64: a small, fast PRNG with a 64-bit state, enough to draw sweep samples.
-struct SplitMix64(u64);
-
-impl SplitMix64 {
-    fn next(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
-    }
-
-    /// Uniform in `0..n`, by rejecting draws from the incomplete last block.
-    fn below(&mut self, n: u64) -> u64 {
-        let limit = u64::MAX - u64::MAX % n;
-        loop {
-            let x = self.next();
-            if x < limit {
-                return x % n;
-            }
-        }
-    }
-}
-
 /// `samples` distinct indices in `0..total`, ascending; `samples < total`.
 fn sample_indices(total: u64, samples: usize, seed: u64) -> Vec<u64> {
     let mut rng = SplitMix64(seed);
@@ -554,6 +532,30 @@ fn sweep_planned(
     progress: Option<Progress>,
 ) -> Result<SweepResult, TesterError> {
     let data_fingerprint = config_fingerprint(&spec.base, bars, funding)?;
+    let rows = ranked_rows(spec, plan, bars, funding, progress)?;
+    let best = match rows.first() {
+        Some(top) if top.qualified => {
+            Some(run(&with_params(&spec.base, &top.params), bars, funding)?)
+        }
+        _ => None,
+    };
+    Ok(SweepResult {
+        spec: spec.clone(),
+        engine_version: env!("CARGO_PKG_VERSION").to_string(),
+        data_fingerprint,
+        rows,
+        best,
+    })
+}
+
+/// Runs every parameter set of the plan and ranks the rows, best first.
+fn ranked_rows(
+    spec: &SweepSpec,
+    plan: &Plan,
+    bars: &[Candle],
+    funding: &[(Millis, f64)],
+    progress: Option<Progress>,
+) -> Result<Vec<SweepRow>, TesterError> {
     let total = plan.indices.len();
     let done = AtomicUsize::new(0);
     let stopped = AtomicBool::new(false);
@@ -599,19 +601,7 @@ fn sweep_planned(
             )
             .then(a.index.cmp(&b.index))
     });
-    let best = match rows.first() {
-        Some(top) if top.qualified => {
-            Some(run(&with_params(&spec.base, &top.params), bars, funding)?)
-        }
-        _ => None,
-    };
-    Ok(SweepResult {
-        spec: spec.clone(),
-        engine_version: env!("CARGO_PKG_VERSION").to_string(),
-        data_fingerprint,
-        rows,
-        best,
-    })
+    Ok(rows)
 }
 
 fn objective_value(row: &SweepRow, objective: Objective) -> Option<f64> {
@@ -664,6 +654,138 @@ fn refuse_base_warmup(spec: &SweepSpec) -> Result<(), TesterError> {
         ));
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------------------------
+// The luck test by bar permutation
+// ---------------------------------------------------------------------------------------------
+
+/// A luck test by bar permutation (R3 in #35): the same sweep on the real bars and on
+/// `permutations` shuffled copies of them.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PermutationSpec {
+    pub sweep: SweepSpec,
+    /// Shuffled copies to sweep; #35 uses 199, so the smallest possible p-value is 0.005.
+    pub permutations: usize,
+    /// Copy k is shuffled with a seed derived from this one and k, so the same seed shuffles the
+    /// same copies.
+    pub seed: u64,
+}
+
+/// The result of a luck test by bar permutation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PermutationResult {
+    pub spec: PermutationSpec,
+    pub engine_version: String,
+    /// The fingerprint of the real data in the base range; see [`crate::data_fingerprint`].
+    pub data_fingerprint: String,
+    /// The best objective value of the sweep on the real bars.
+    pub real_best: f64,
+    /// The best objective value of each shuffled copy's sweep, in copy order; `None` when no run
+    /// on that copy qualified.
+    pub permuted_best: Vec<Option<f64>>,
+    /// Copies whose best is at least as good as the real best: at or above it when maximising,
+    /// at or below it when minimising. A copy with no qualifying run found nothing, and does not
+    /// count.
+    pub at_least_as_good: usize,
+    /// `(1 + at_least_as_good) / (1 + permutations)`: the chance of a best this good if the bars'
+    /// order carried no information. Counting the real sweep as one of the draws keeps it above
+    /// zero and makes it a valid p-value (Phipson and Smyth, 2010).
+    pub p_value: f64,
+}
+
+/// Runs a luck test by bar permutation: the sweep on the real bars, then on each shuffled copy,
+/// keeping each sweep's best objective value, and the p-value of the real best against the
+/// copies'.
+///
+/// A copy shuffles the traded bars, those in the base range, with [`crate::permute_bars`];
+/// warm-up bars before the range and funding stay as they are, and the first traded bar is
+/// unchanged, so a copy joins the warm-up bars where the real data does. Copy k's seed is
+/// derived from the spec's seed and k, so a copy does not depend on the others.
+///
+/// The sweeps run one after another, each in parallel on the current rayon pool as [`sweep`]
+/// does, and each keeps only its ranked rows: the best run is not run again. All the runs
+/// together, the real sweep's included, count against [`MAX_RUNS`] before anything runs.
+/// Progress counts over all of them, so the callback sees one total; when it asks to stop, the
+/// call returns [`TesterError::Cancelled`] and no p-value, since one from part of the copies
+/// would be a different test.
+///
+/// shortcut: copies run one after another, so a grid smaller than the core count leaves cores
+/// idle; run copies in parallel if small grids become common.
+pub fn permutation_test(
+    spec: &PermutationSpec,
+    bars: &[Candle],
+    funding: &[(Millis, f64)],
+    progress: Option<Progress>,
+) -> Result<PermutationResult, TesterError> {
+    let copies = spec.permutations;
+    if copies == 0 {
+        return Err(TesterError::InvalidSpec(
+            "a permutation test needs at least one shuffled copy".into(),
+        ));
+    }
+    let plan = Plan::new(&spec.sweep)?;
+    let per_sweep = plan.indices.len();
+    let runs = per_sweep as u128 * (copies as u128 + 1);
+    if runs > MAX_RUNS as u128 {
+        return Err(TesterError::TooManyRuns {
+            runs,
+            limit: MAX_RUNS,
+        });
+    }
+    let base = &spec.sweep.base;
+    let data_fingerprint = config_fingerprint(base, bars, funding)?;
+    let total = per_sweep * (copies + 1);
+    let objective = spec.sweep.objective;
+    let best_of = |sweep_no: usize, bars: &[Candle]| -> Result<Option<f64>, TesterError> {
+        let offset = sweep_no * per_sweep;
+        let sweep_progress = |done: usize, _: usize| match progress {
+            Some(report) => report(offset + done, total),
+            None => ControlFlow::Continue(()),
+        };
+        let rows = ranked_rows(&spec.sweep, &plan, bars, funding, Some(&sweep_progress))?;
+        Ok(rows
+            .first()
+            .filter(|top| top.qualified)
+            .and_then(|top| objective_value(top, objective)))
+    };
+
+    let real_best = best_of(0, bars)?.ok_or(TesterError::NoQualifyingRun {
+        min_trades: spec.sweep.min_trades,
+        window: None,
+    })?;
+    let traded: Vec<usize> = (0..bars.len())
+        .filter(|&i| (base.from..base.to).contains(&bars[i].open_time))
+        .collect();
+    let originals: Vec<Candle> = traded.iter().map(|&i| bars[i]).collect();
+    let mut copy = bars.to_vec();
+    let mut permuted_best = Vec::with_capacity(copies);
+    for k in 0..copies {
+        let shuffled = permute_bars(&originals, derive_seed(spec.seed, k as u64))
+            .map_err(EngineError::from)?;
+        for (&i, bar) in traded.iter().zip(shuffled) {
+            copy[i] = bar;
+        }
+        permuted_best.push(best_of(k + 1, &copy)?);
+    }
+
+    let at_least_as_good = permuted_best
+        .iter()
+        .flatten()
+        .filter(|&&x| match objective.direction {
+            Direction::Maximize => x >= real_best,
+            Direction::Minimize => x <= real_best,
+        })
+        .count();
+    Ok(PermutationResult {
+        spec: spec.clone(),
+        engine_version: env!("CARGO_PKG_VERSION").to_string(),
+        data_fingerprint,
+        real_best,
+        permuted_best,
+        at_least_as_good,
+        p_value: (1 + at_least_as_good) as f64 / (1 + copies) as f64,
+    })
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1484,6 +1606,90 @@ fn stitched_report(base: &BacktestConfig, runs: &[Segment]) -> Stitched {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn each_copy_is_the_traded_bars_shuffled_with_its_derived_seed_after_the_real_warm_up() {
+        use td_core::{FeeSchedule, Instrument, InstrumentId, InstrumentKind, Venue};
+        const HOUR: Millis = 3_600_000;
+        let bars: Vec<Candle> = (0..260)
+            .map(|i| {
+                let x = i as f64;
+                let close = 100.0 + 0.02 * x + 3.0 * (x / 17.0).sin() + 1.5 * (x / 5.3).cos();
+                let open = 100.0 + 0.02 * (x - 1.0) + 3.0 * ((x - 1.0) / 17.0).sin();
+                Candle {
+                    open_time: i * HOUR,
+                    open,
+                    high: open.max(close) + 0.2,
+                    low: open.min(close) - 0.2,
+                    close,
+                    volume: 1.0,
+                    quote_volume: close,
+                }
+            })
+            .collect();
+        let instrument = Instrument {
+            id: InstrumentId {
+                venue: Venue::Binance,
+                symbol: "TESTUSDT".into(),
+                kind: InstrumentKind::Spot,
+            },
+            base: "TEST".into(),
+            quote: "USDT".into(),
+            tick_size: 0.01,
+            lot_size: 0.001,
+            min_qty: 0.001,
+            min_notional: 1.0,
+            fees: FeeSchedule {
+                maker: 0.001,
+                taker: 0.002,
+            },
+        };
+        // Warm-up on bars 0..40, traded range 40..220, and bars after the range in the input.
+        let spec = PermutationSpec {
+            sweep: SweepSpec {
+                base: BacktestConfig {
+                    strategy: "sma_cross".into(),
+                    params: Params::new(),
+                    instrument,
+                    timeframe: Timeframe::H1,
+                    from: 40 * HOUR,
+                    to: 220 * HOUR,
+                    starting_cash: 10_000.0,
+                    slippage_bps: 0.0,
+                    fee_override: None,
+                    max_leverage: 1.0,
+                    warmup_from: Some(0),
+                    close_at_end: false,
+                },
+                axes: vec![ParamAxis {
+                    name: "slow".into(),
+                    space: ParamSpace::Values {
+                        values: vec![ParamValue::Int(15), ParamValue::Int(25)],
+                    },
+                }],
+                mode: SweepMode::Grid,
+                objective: Objective {
+                    metric: Metric::TotalReturn,
+                    direction: Direction::Maximize,
+                },
+                min_trades: 0,
+            },
+            permutations: 3,
+            seed: 77,
+        };
+        let r = permutation_test(&spec, &bars, &[], None).unwrap();
+        let best = |bars: &[Candle]| {
+            let swept = sweep(&spec.sweep, bars, &[], None).unwrap();
+            swept.rows[0].metrics.unwrap().total_return
+        };
+        assert_eq!(Some(r.real_best), best(&bars));
+        for k in 0..3 {
+            let shuffled = permute_bars(&bars[40..220], derive_seed(77, k as u64)).unwrap();
+            let copy: Vec<Candle> = bars[..40].iter().chain(&shuffled).copied().collect();
+            assert_eq!(r.permuted_best[k], best(&copy), "copy {k}");
+            assert_ne!(copy, bars[..220]);
+        }
+    }
 
     fn point(time: Millis, equity: f64) -> EquityPoint {
         EquityPoint { time, equity }
