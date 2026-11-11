@@ -734,7 +734,7 @@ async fn bad_requests_get_json_errors_with_matching_statuses() {
 }
 
 /// The earliest `from` is the venue's: Binance and Bybit keep 2017-01-01 and its message, and
-/// OANDA's FX history downloads from 2016, back to 2005-01-01.
+/// OANDA's FX history downloads from 2016, back to 2007-01-01.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_earliest_download_from_is_the_venues() {
     let t = TestServer::start(FakeSource::default()).await;
@@ -762,14 +762,19 @@ async fn the_earliest_download_from_is_the_venues() {
     }
     assert_eq!(t.get("/jobs").await.1, json!([]), "no job was started");
 
-    assert_eq!(OANDA_EARLIEST_FROM, day("2005-01-01"));
-    let early = download("oanda", "USDJPY", "fx", OANDA_EARLIEST_FROM - MINUTE);
-    let (status, answer) = t.post("/data/download", &early).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{answer}");
-    assert_eq!(
-        answer["error"]["message"],
-        "`from` must not be before 2005-01-01 00:00 UTC (1104537600000) for oanda"
-    );
+    // 2005 and 2006 are refused: the FX market hours follow the US daylight-saving rule of 2007.
+    assert_eq!(OANDA_EARLIEST_FROM, day("2007-01-01"));
+    for from in [OANDA_EARLIEST_FROM - MINUTE, day("2005-01-01")] {
+        let early = download("oanda", "USDJPY", "fx", from);
+        let (status, answer) = t.post("/data/download", &early).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{answer}");
+        assert_eq!(
+            answer["error"]["message"],
+            "`from` must not be before 2007-01-01 00:00 UTC (1167609600000) for oanda: the FX \
+             market hours follow the US daylight-saving rule in force since 2007"
+        );
+    }
+    assert_eq!(t.get("/jobs").await.1, json!([]), "no job was started");
     for from in [day("2016-01-01"), OANDA_EARLIEST_FROM] {
         let body = download("oanda", "USDJPY", "fx", from);
         let (status, created) = t.post("/data/download", &body).await;

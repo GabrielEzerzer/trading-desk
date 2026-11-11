@@ -1221,7 +1221,7 @@ export type RejectedInstrument = { symbol: string, reason: string, };
 export type DownloadRequest = { instrument: InstrumentId, 
 /**
  * Not before 2017-01-01 00:00 UTC (1483228800000) for binance and bybit, or before
- * 2005-01-01 00:00 UTC (1104537600000) for oanda; earlier is a 400.
+ * 2007-01-01 00:00 UTC (1167609600000) for oanda; earlier is a 400.
  */
 from: number, to: number, };
 
@@ -1360,7 +1360,7 @@ export type CandlesResponse = { instrument: InstrumentId, timeframe: Timeframe,
  * The bar slots the response covers: open times in `[from, to)`, each on a bar boundary. `to`
  * is the asked `to` rounded up to a boundary, but no later than the open time of the bar
  * still forming; `from` is later than asked when the limit cut the range, and never before
- * the venue's earliest download date (2017-01-01, or 2005-01-01 for oanda).
+ * the venue's earliest download date (2017-01-01, or 2007-01-01 for oanda).
  */
 from: number, to: number, 
 /**

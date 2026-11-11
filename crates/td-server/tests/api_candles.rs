@@ -515,7 +515,7 @@ fn store_usdjpy_hour(store: &Store) -> Vec<Candle> {
 }
 
 /// A chart starts no earlier than the venue's earliest download date: OANDA's stored FX minutes
-/// from 2016 are served, back to 2005-01-01, while Binance keeps 2017-01-01.
+/// from 2016 are served, back to 2007-01-01, while Binance keeps 2017-01-01.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_earliest_bar_is_the_venues_earliest_download_date() {
     let api = Api::start(&[], FakeRest::new(Vec::new(), T0)).await;
@@ -535,12 +535,12 @@ async fn the_earliest_bar_is_the_venues_earliest_download_date() {
     assert_eq!(got.from, monday);
     assert_eq!(got.candles, bids);
 
-    // 2004-06-01 to 2005-03-01: OANDA's range starts at 2005-01-01, Binance's is empty at
+    // 2006-06-01 to 2007-03-01: OANDA's range starts at 2007-01-01, Binance's is empty at
     // 2017-01-01.
-    let (june_2004, march_2005) = (1_086_048_000_000, 1_109_635_200_000);
-    let got = get(path("oanda:USDJPY:fx", "1d", june_2004, march_2005)).await;
-    assert_eq!((got.from, got.to), (1_104_537_600_000, march_2005));
-    let got = get(path(INSTRUMENT, "1d", june_2004, march_2005)).await;
+    let (june_2006, march_2007) = (1_149_120_000_000, 1_172_707_200_000);
+    let got = get(path("oanda:USDJPY:fx", "1d", june_2006, march_2007)).await;
+    assert_eq!((got.from, got.to), (1_167_609_600_000, march_2007));
+    let got = get(path(INSTRUMENT, "1d", june_2006, march_2007)).await;
     assert_eq!((got.from, got.to), (1_483_228_800_000, 1_483_228_800_000));
     assert!(got.candles.is_empty());
     api.shutdown().await;

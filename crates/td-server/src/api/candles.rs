@@ -55,7 +55,7 @@ pub struct CandlesResponse {
     /// The bar slots the response covers: open times in `[from, to)`, each on a bar boundary. `to`
     /// is the asked `to` rounded up to a boundary, but no later than the open time of the bar
     /// still forming; `from` is later than asked when the limit cut the range, and never before
-    /// the venue's earliest download date (2017-01-01, or 2005-01-01 for oanda).
+    /// the venue's earliest download date (2017-01-01, or 2007-01-01 for oanda).
     pub from: Millis,
     pub to: Millis,
     /// `from` was given and the range held more than `limit` bar slots, so the oldest were left

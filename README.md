@@ -4,7 +4,7 @@ A trading workspace for my own trading, in two desktop apps on one shared Rust e
 
 ## FX history from OANDA
 
-FX pairs (`--venue oanda --kind fx`) download bid and ask minutes from OANDA's REST API on a free practice account, from 2005 on. The download reads the account's API token from `OANDA_API_TOKEN`, so it runs through hush, for example:
+FX pairs (`--venue oanda --kind fx`) download bid and ask minutes from OANDA's REST API on a free practice account, from 2007 on. The desk's FX market hours follow the US daylight-saving rule in force since 2007, so the app refuses an earlier start; the CLI does not check it, so keep `--from` at 2007-01-01 or later. The download reads the account's API token from `OANDA_API_TOKEN`, so it runs through hush, for example:
 
 ```
 hush run -- cargo run --release -p td-data -- download --venue oanda --kind fx --symbol USDJPY --from 2016-01-01 --to 2026-11-01
