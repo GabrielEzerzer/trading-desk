@@ -151,6 +151,9 @@ pub struct MonthCoverage {
     pub month: Month,
     /// Stored 1-minute candles.
     pub minutes: usize,
+    /// The month's open minutes by the instrument's trading hours, which a complete month stores:
+    /// every minute for a market that never closes, the minutes outside its weekends for FX.
+    pub open_minutes: i64,
     pub first: Millis,
     pub last: Millis,
     /// Missing minutes between `first` and `last`, by the instrument's trading hours.
@@ -517,9 +520,16 @@ impl Store {
             let (Some(first), Some(last)) = (candles.first(), candles.last()) else {
                 continue;
             };
+            let closed: Millis = id
+                .kind
+                .closed_spans(month.start(), month.end())
+                .iter()
+                .map(|s| s.end - s.start)
+                .sum();
             coverage.push(MonthCoverage {
                 month,
                 minutes: candles.len(),
+                open_minutes: month.minutes() - closed / MINUTE,
                 first: first.open_time,
                 last: last.open_time,
                 gaps: missing_minutes(id.kind, &candles, first.open_time, last.open_time + MINUTE),

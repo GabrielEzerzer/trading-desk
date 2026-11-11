@@ -1074,7 +1074,7 @@ min_profit_factor: number,
  */
 max_risk_of_ruin: number, 
 /**
- * The drawdown from the peak that counts as ruin.
+ * The drawdown from the running peak of equity that counts as ruin, above 0 and below 1.
  */
 ruin_drawdown: number, 
 /**
@@ -1220,7 +1220,9 @@ month: string,
  */
 minutes: number, 
 /**
- * Minutes in the whole month.
+ * The month's open minutes by the instrument's trading hours, which a complete month stores:
+ * every minute of the month for a market that never closes, the minutes outside its weekends
+ * for FX.
  */
 month_minutes: number, 
 /**
