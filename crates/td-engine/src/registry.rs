@@ -1,7 +1,8 @@
-use crate::strategies::{donchian, sma_cross};
-use crate::{EngineError, ParamSpec, Params, Strategy};
+use crate::strategies::{donchian, private, sma_cross};
+use crate::{EngineError, ParamSpec, Params, Strategy, TestPlan, VerdictRule};
 
-/// A strategy the tester and the API can list and build from parameters.
+/// A strategy the tester and the API can list and build from parameters, with the plan the
+/// battery tests it on and the rule its verdict is judged by.
 #[derive(Debug, Clone)]
 pub struct StrategyEntry {
     pub name: &'static str,
@@ -9,11 +10,21 @@ pub struct StrategyEntry {
     pub params: Vec<ParamSpec>,
     /// Builds the strategy from resolved parameters (see [`Params::resolve`]).
     pub build: fn(&Params) -> Result<Box<dyn Strategy>, EngineError>,
+    pub plan: TestPlan,
+    pub rule: VerdictRule,
 }
 
-/// Every registered strategy.
+/// Every registered strategy: the examples, then the private strategies when their folder is
+/// checked out (see build.rs).
 pub fn strategies() -> Vec<StrategyEntry> {
-    vec![sma_cross::entry(), donchian::entry()]
+    with_private(private::entries())
+}
+
+/// The examples, then `private`. Registering an example is one line here.
+fn with_private(private: Vec<StrategyEntry>) -> Vec<StrategyEntry> {
+    let mut all = vec![sma_cross::entry(), donchian::entry()];
+    all.extend(private);
+    all
 }
 
 pub fn find_strategy(name: &str) -> Option<StrategyEntry> {
@@ -40,6 +51,39 @@ mod tests {
                 entry.name
             );
         }
+    }
+
+    /// Every strategy's plan and rule pass their checks and names are unique. With the private
+    /// folder checked out this covers the private strategies too.
+    #[test]
+    fn every_plan_and_rule_is_valid_and_names_are_unique() {
+        let all = strategies();
+        for (i, entry) in all.iter().enumerate() {
+            assert_eq!(entry.plan.validate(entry.name), Ok(()), "{}", entry.name);
+            assert_eq!(entry.rule.validate(), Ok(()), "{}", entry.name);
+            assert!(
+                all[..i].iter().all(|e| e.name != entry.name),
+                "{} is registered twice",
+                entry.name
+            );
+        }
+    }
+
+    /// A private strategy file, compiled in through the same generated module as the private
+    /// folder, is listed after the examples, builds and has a valid plan and rule.
+    #[test]
+    fn private_strategies_are_listed_after_the_examples() {
+        let all = with_private(crate::strategies::fixture::entries());
+        let names: Vec<&str> = all.iter().map(|e| e.name).collect();
+        assert_eq!(names, ["sma_cross", "donchian_breakout", "fixture_hold"]);
+        let fixture = &all[2];
+        assert!((fixture.build)(&Params::new().resolve(&fixture.params).unwrap()).is_ok());
+        // The full plan check looks the strategy up in the registry, which the fixture is not in.
+        assert_eq!(fixture.plan.evidence.validate(), Ok(()));
+        assert_eq!(fixture.rule.validate(), Ok(()));
+        assert_eq!(fixture.rule.kind(), crate::RuleKind::HighRisk);
+        // Without a private folder, which is how CI builds, only the examples are listed.
+        assert_eq!(with_private(Vec::new()).len(), 2);
     }
 
     #[test]

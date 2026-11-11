@@ -474,6 +474,41 @@ async fn strategies_list_their_parameter_specs() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn strategies_list_their_kind_plan_and_rule() {
+    let t = TestServer::start(FakeSource::default()).await;
+    let (status, body) = t.get("/strategies").await;
+    assert_eq!(status, StatusCode::OK);
+    let list = body.as_array().expect("a list");
+    for entry in td_engine::strategies() {
+        let s = list
+            .iter()
+            .find(|s| s["name"] == entry.name)
+            .unwrap_or_else(|| panic!("{} is listed", entry.name));
+        assert_eq!(s["plan"], serde_json::to_value(&entry.plan).unwrap());
+        assert_eq!(s["rule"], serde_json::to_value(entry.rule).unwrap());
+        assert_eq!(s["kind"], s["rule"]["kind"]);
+    }
+    let sma = list.iter().find(|s| s["name"] == "sma_cross").unwrap();
+    assert_eq!(sma["kind"], "portfolio");
+    assert_eq!(sma["rule"]["benchmark"], "buy_and_hold");
+    assert_eq!(sma["rule"]["limits"]["min_sharpe"], 1.0);
+    assert_eq!(sma["plan"]["timeframe"], "1h");
+    assert_eq!(sma["plan"]["instruments"][0]["symbol"], "BTCUSDT");
+    assert_eq!(sma["plan"]["walk_forward"]["train_days"], 180);
+    assert_eq!(sma["plan"]["evidence"]["luck"]["permutations"], 199);
+    assert_eq!(sma["plan"]["evidence"]["min_sample"]["trades"], 30);
+    let donchian = list
+        .iter()
+        .find(|s| s["name"] == "donchian_breakout")
+        .unwrap();
+    assert_eq!(donchian["kind"], "prop_firm");
+    assert_eq!(donchian["rule"]["firm"]["daily_loss"], 0.05);
+    assert_eq!(donchian["rule"]["firm"]["drawdown"], "static");
+    assert_eq!(donchian["rule"]["limits"]["share_of_firm_limits"], 0.5);
+    assert_eq!(donchian["plan"]["out_of_sample"], Value::Null);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_download_job_reaches_done_on_the_jobs_topic_and_shows_in_coverage() {
     let t = TestServer::start(FakeSource::default()).await;
     let mut ws = t.websocket().await;
