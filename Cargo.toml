@@ -18,8 +18,9 @@ thiserror = "2"
 # td-data (#11): history download, the Parquet candle store and the td-data CLI.
 arrow = { version = "58", default-features = false }
 clap = { version = "4", features = ["derive"] }
+flate2 = "1"
 parquet = { version = "58", default-features = false, features = ["arrow", "zstd"] }
-reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "blocking", "query"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "blocking", "query", "gzip"] }
 sha2 = "0.11"
 tempfile = "3"
 zip = { version = "9.0.5", default-features = false, features = ["deflate-flate2-zlib-rs"] }
