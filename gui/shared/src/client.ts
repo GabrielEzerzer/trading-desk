@@ -3,6 +3,7 @@
 
 import type {
   BacktestConfig,
+  CandlesResponse,
   CoverageResponse,
   DownloadRequest,
   HealthResponse,
@@ -17,6 +18,7 @@ import type {
   SessionSummary,
   StartSessionRequest,
   StrategyInfo,
+  Timeframe,
   Venue,
 } from './api-types'
 import type { ApiRequest, ApiResult } from './bridge'
@@ -59,6 +61,17 @@ export function createClient(send: Send) {
         method: 'GET',
         path: '/data/coverage',
         query: { instrument: `${instrument.venue}:${instrument.symbol}:${instrument.kind}` },
+      }),
+    /** The last `limit` closed bars, oldest first; the engine caps `limit` at 5000. */
+    candles: (instrument: InstrumentId, timeframe: Timeframe, limit: number) =>
+      call<CandlesResponse>({
+        method: 'GET',
+        path: '/candles',
+        query: {
+          instrument: `${instrument.venue}:${instrument.symbol}:${instrument.kind}`,
+          timeframe,
+          limit: String(limit),
+        },
       }),
     strategies: () => call<StrategyInfo[]>({ method: 'GET', path: '/strategies' }),
     jobs: () => call<JobInfo[]>({ method: 'GET', path: '/jobs' }),

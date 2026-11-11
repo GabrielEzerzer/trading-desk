@@ -3,7 +3,7 @@
 import type { Candle, InstrumentId, SessionState, SessionSummary, StartSessionRequest, Timeframe } from '@td/shared'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { sentence } from '../engine'
-import { addCandle, mergeCandles } from './candles'
+import { type CandleSeries, EMPTY_SERIES, withClosed, withForming, withHistory } from './candles'
 import { applySessionEvent, pickSession, refetches, rejection } from './session'
 import type { InstrumentList, TradingSource } from './source'
 
@@ -28,40 +28,78 @@ export function useInstruments(source: TradingSource | null) {
   return { list, error, retry: () => setAttempt((n) => n + 1) }
 }
 
-export interface CandleView {
-  candles: Candle[]
-  /** Bumps when the list changed anywhere but its end, so the chart redraws it whole. */
-  revision: number
+export interface CandleView extends CandleSeries {
+  /** The history is loading; live bars may already be drawn. */
+  loading: boolean
+  /** Why the history did not load, in the source's words; live bars still fill the chart. */
+  error: string | null
 }
 
-/** History, if the source has any, then the live stream's closed bars, merged by open time. */
-export function useCandles(source: TradingSource | null, id: InstrumentId, timeframe: Timeframe): CandleView {
-  const [view, setView] = useState<CandleView>({ candles: [], revision: 0 })
+const EMPTY_VIEW: CandleView = { ...EMPTY_SERIES, loading: true, error: null }
+
+/**
+ * Follows one instrument and timeframe: subscribes to its live bars, then loads the history and
+ * merges it under them. `onChange` gets every new view until `stop`; `retry` loads the history
+ * again after it failed. A history answer or a bar that arrives after `stop` is dropped.
+ */
+export function followCandles(
+  source: Pick<TradingSource, 'history' | 'candles'>,
+  id: InstrumentId,
+  timeframe: Timeframe,
+  onChange: (view: CandleView) => void,
+): { stop(): void; retry(): void } {
+  let view = EMPTY_VIEW
+  let live = true
+  const set = (next: CandleView) => {
+    view = next
+    onChange(view)
+  }
+  const stopFeed = source.candles(id, timeframe, {
+    onClosed: (candle) => live && set(withClosed(view, candle)),
+    onForming: (candle) => live && set(withForming(view, candle)),
+  })
+  const load = () => {
+    set({ ...view, loading: true, error: null })
+    source.history(id, timeframe).then(
+      (history) => live && set({ ...withHistory(view, history), loading: false }),
+      (e: unknown) => live && set({ ...view, loading: false, error: errorText(e) }),
+    )
+  }
+  load()
+  return {
+    stop() {
+      live = false
+      stopFeed()
+    },
+    retry() {
+      if (live && !view.loading) load()
+    },
+  }
+}
+
+/** The chart's bars for an instrument and timeframe: history, then the live stream's bars. */
+export function useCandles(
+  source: TradingSource | null,
+  id: InstrumentId,
+  timeframe: Timeframe,
+): CandleView & { retry(): void } {
   const { venue, symbol, kind } = id
+  const key = `${venue}:${symbol}:${kind}:${timeframe}`
+  // Keyed, so the render right after a switch shows nothing of the previous choice.
+  const [state, setState] = useState<{ key: string; view: CandleView }>({ key, view: EMPTY_VIEW })
+  const follow = useRef<{ retry(): void } | null>(null)
   useEffect(() => {
     if (!source) return
-    const instrument = { venue, symbol, kind }
-    let live = true
-    // Bars that arrive before the history are kept and merged with it.
-    setView((v) => ({ candles: [], revision: v.revision + 1 }))
-    const stop = source.candles(instrument, timeframe, (candle) => {
-      if (!live) return
-      setView((v) => {
-        const { list, change } = addCandle(v.candles, candle)
-        return { candles: list, revision: change === 'reset' ? v.revision + 1 : v.revision }
-      })
-    })
-    source.history(instrument, timeframe).then(
-      (history) => live && setView((v) => ({ candles: mergeCandles(history, v.candles), revision: v.revision + 1 })),
-      // A failed history leaves the live stream to fill the chart.
-      () => {},
-    )
+    const shown = `${venue}:${symbol}:${kind}:${timeframe}`
+    const f = followCandles(source, { venue, symbol, kind }, timeframe, (view) => setState({ key: shown, view }))
+    follow.current = f
     return () => {
-      live = false
-      stop()
+      follow.current = null
+      f.stop()
     }
   }, [source, venue, symbol, kind, timeframe])
-  return view
+  const retry = useCallback(() => follow.current?.retry(), [])
+  return { ...(state.key === key ? state.view : EMPTY_VIEW), retry }
 }
 
 export interface PaperSession {

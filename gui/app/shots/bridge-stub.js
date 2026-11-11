@@ -10,15 +10,22 @@
 //             backtest?: 'ok' | 'data_missing' | 'too_many_runs' | 'fails', stepMs?: number,
 //             instruments?: Instrument[], hangInstruments?: boolean, failInstruments?: boolean,
 //             candles?: { start: Candle, everyMs: number } | null, session?: SessionState | null,
-//             failSessions?: number }
+//             failSessions?: number,
+//             history?: Record<string, number | 'hang' | 'fail'> }
 //
-// Every request is recorded in `window.__tdCalls`, so a flow can check what the app sent.
+// Every request is recorded in `window.__tdCalls`, and the topics subscribed now in
+// `window.__stubSubscribed`, so a flow can check what the app sent.
 //
 // For Trading in engine mode it answers GET /instruments from `config.instruments` (else the
 // engine.json fixtures), GET /sessions and GET /sessions/{id} from `config.session`, and on a
 // `candles:` subscription emits a closed bar every `config.candles.everyMs`, walking from
-// `config.candles.start`; `window.__stubCandles` counts them, so a state can wait for the chart to
-// fill. GET /sessions fails the first `config.failSessions` times. POST /sessions answers after
+// `config.candles.start`, with the next bar forming half way between; `window.__stubCandles` counts
+// the closed ones and `window.__stubFormed` the forming ones, so a state can wait for the chart to
+// fill. GET /candles answers with `limit` bars
+// ending at `config.candles.start` (none without `config.candles`). `config.history` keys an
+// instrument (`venue:symbol:kind`) or `*` to how its history answers: after that many
+// milliseconds, never (`hang`), or with the engine's 502 (`fail`); without an entry it answers at
+// once. GET /sessions fails the first `config.failSessions` times. POST /sessions answers after
 // 300 ms with a new warming-up session, which GET /sessions then lists; `window.__stubStarts`
 // counts the requests.
 
@@ -43,6 +50,9 @@ function installBridgeStub(config) {
   let subscribed = false
   const calls = []
   window.__tdCalls = calls
+  // A flow can change how GET /candles answers from here on.
+  const history = { ...config.history }
+  window.__stubHistory = history
 
   const ok = (body) => ({ ok: true, status: 200, body })
   const fail = (status, code, message) => ({ ok: false, status, error: { code, message } })
@@ -207,32 +217,97 @@ function installBridgeStub(config) {
     equity: state.equity,
   })
 
+  const STEPS = { '1m': 60_000, '5m': 300_000, '15m': 900_000, '30m': 1_800_000, '1h': 3_600_000, '4h': 14_400_000 }
+
+  /** `limit` bars ending at `config.candles.start`, a small deterministic walk back from it. */
+  function historyBars(timeframe, limit) {
+    if (!config.candles) return []
+    const step = STEPS[timeframe] ?? 60_000
+    const start = config.candles.start
+    const bars = [{ ...start }]
+    let close = start.open
+    for (let k = 1; k < limit; k++) {
+      const drift = Math.sin(k / 5) * close * 0.0015 + Math.cos(k / 11) * close * 0.0008
+      const open = close - drift
+      const volume = 12 + (k % 5)
+      bars.unshift({
+        open_time: start.open_time - k * step,
+        open,
+        high: Math.max(open, close) + Math.abs(drift) * 0.6,
+        low: Math.min(open, close) - Math.abs(drift) * 0.5,
+        close,
+        volume,
+        quote_volume: volume * close,
+      })
+      close = open
+    }
+    return bars
+  }
+
+  async function candles(query) {
+    const how = history[query.instrument] ?? history['*']
+    if (how === 'hang') return new Promise(() => {})
+    if (typeof how === 'number') await new Promise((resolve) => setTimeout(resolve, how))
+    if (how === 'fail') {
+      // The engine's words for a venue that did not answer (td-server candles.rs, venue_error).
+      return fail(502, 'venue', `fetching ${query.instrument} ${query.timeframe} bars from the venue failed: connection timed out`)
+    }
+    const [venue, symbol, kind] = query.instrument.split(':')
+    const bars = historyBars(query.timeframe, Number(query.limit))
+    return ok({
+      instrument: { venue, symbol, kind },
+      timeframe: query.timeframe,
+      from: bars[0]?.open_time ?? 0,
+      to: (bars.at(-1)?.open_time ?? 0) + (STEPS[query.timeframe] ?? 60_000),
+      truncated: false,
+      candles: bars,
+      from_venue: [],
+      missing: [],
+    })
+  }
+
   function emitCandles(topic) {
     if (!config.candles || timers.has(topic)) return
-    const step = { '1m': 60_000, '5m': 300_000, '15m': 900_000, '1h': 3_600_000, '4h': 14_400_000 }[topic.split(':')[4]] ?? 60_000
+    const step = STEPS[topic.split(':')[4]] ?? 60_000
     let bar = { ...config.candles.start }
     let n = 0
-    timers.set(
-      topic,
-      setInterval(() => {
-        // A small deterministic walk, enough to see the chart fill.
-        const drift = Math.sin(n / 3) * bar.close * 0.0012 + Math.cos(n / 7) * bar.close * 0.0006
-        const open = bar.close
-        const close = open + drift
-        bar = {
-          open_time: bar.open_time + step,
-          open,
-          high: Math.max(open, close) + Math.abs(drift) * 0.6,
-          low: Math.min(open, close) - Math.abs(drift) * 0.5,
-          close,
-          volume: 12 + (n % 5),
-          quote_volume: (12 + (n % 5)) * close,
-        }
-        n += 1
-        window.__stubCandles = (window.__stubCandles ?? 0) + 1
-        emit({ type: 'candle', topic, candle: bar })
-      }, config.candles.everyMs),
-    )
+    const forming = []
+    const next = () => {
+      // A small deterministic walk, enough to see the chart fill.
+      const drift = Math.sin(n / 3) * bar.close * 0.0012 + Math.cos(n / 7) * bar.close * 0.0006
+      const open = bar.close
+      const close = open + drift
+      return {
+        open_time: bar.open_time + step,
+        open,
+        high: Math.max(open, close) + Math.abs(drift) * 0.6,
+        low: Math.min(open, close) - Math.abs(drift) * 0.5,
+        close,
+        volume: 12 + (n % 5),
+        quote_volume: (12 + (n % 5)) * close,
+      }
+    }
+    // Half way to each close, the bar so far: its open, half its move and half its volume.
+    const showForming = () => {
+      const whole = next()
+      const close = whole.open + (whole.close - whole.open) / 2
+      const volume = whole.volume / 2
+      const candle = { ...whole, high: Math.max(whole.open, close), low: Math.min(whole.open, close), close, volume, quote_volume: volume * close }
+      window.__stubFormed = (window.__stubFormed ?? 0) + 1
+      emit({ type: 'candle_forming', topic, candle })
+    }
+    forming.push(setTimeout(showForming, config.candles.everyMs / 2))
+    const interval = setInterval(() => {
+      bar = next()
+      n += 1
+      window.__stubCandles = (window.__stubCandles ?? 0) + 1
+      emit({ type: 'candle', topic, candle: bar })
+      forming.push(setTimeout(showForming, config.candles.everyMs / 2))
+    }, config.candles.everyMs)
+    timers.set(topic, () => {
+      clearInterval(interval)
+      for (const t of forming) clearTimeout(t)
+    })
   }
 
   window.td = {
@@ -281,9 +356,11 @@ function installBridgeStub(config) {
         return ok(summary(config.session))
       }
       if (method === 'GET' && config.session && path === `/sessions/${config.session.id}`) return ok(config.session)
+      if (method === 'GET' && path === '/candles') return candles(request.query)
       return route(request)
     },
     async subscribe(topic) {
+      window.__stubSubscribed = [...(window.__stubSubscribed ?? []), topic]
       if (topic.startsWith('candles:')) emitCandles(topic)
       if (config.session && topic === `session:${config.session.id}`) {
         setTimeout(() => emit({ type: 'session_state', session: config.session }), 0)
@@ -296,8 +373,9 @@ function installBridgeStub(config) {
       }, 0)
     },
     async unsubscribe(topic) {
+      window.__stubSubscribed = (window.__stubSubscribed ?? []).filter((t) => t !== topic)
       if (topic === 'jobs') subscribed = false
-      clearInterval(timers.get(topic))
+      timers.get(topic)?.()
       timers.delete(topic)
     },
     onMessage(listener) {
