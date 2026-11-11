@@ -1066,9 +1066,69 @@ first: number, last: number,
 /**
  * Missing minutes between `first` and `last`.
  */
-gaps: Array<GapInfo>, };
+gaps: Array<GapInfo>, 
+/**
+ * The month file's size on disk.
+ */
+bytes: number, };
 
 export type FundingCoverage = { rates: number, first: number | null, last: number | null, };
+
+export type StoredResponse = { 
+/**
+ * Every instrument with at least one month file or a funding file, in instrument order.
+ */
+instruments: Array<StoredInstrumentInfo>, 
+/**
+ * Paths in the data folder, relative to it, that name no venue, kind, symbol or month the
+ * store writes. They are neither counted nor deleted.
+ */
+unrecognised: Array<string>, };
+
+/**
+ * What the store holds for one instrument.
+ */
+export type StoredInstrumentInfo = { instrument: InstrumentId, 
+/**
+ * The month files, oldest first; empty when only a funding file is stored.
+ */
+months: Array<StoredMonthInfo>, 
+/**
+ * The funding file's size; `null` when there is none, which is always so for spot.
+ */
+funding_bytes: number | null, 
+/**
+ * The month files and the funding file together.
+ */
+bytes: number, };
+
+/**
+ * One month file of an instrument's candles and its size on disk.
+ */
+export type StoredMonthInfo = { 
+/**
+ * `YYYY-MM`.
+ */
+month: string, bytes: number, };
+
+/**
+ * What to delete: the candles of `instrument` for the months `from` to `to`, both included, or,
+ * with neither given, every month and a perpetual's funding file.
+ */
+export type DeleteRequest = { instrument: InstrumentId, 
+/**
+ * `YYYY-MM`; give both `from` and `to`, or neither.
+ */
+from?: string, 
+/**
+ * `YYYY-MM`, included.
+ */
+to?: string, };
+
+/**
+ * What a delete removed: data files, and temp files a crashed download left beside them.
+ */
+export type DeleteResult = { files: number, bytes: number, };
 
 /**
  * `GET /candles`: closed bars, oldest first.

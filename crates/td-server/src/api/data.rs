@@ -1,4 +1,4 @@
-//! Instruments, history downloads and store coverage.
+//! Instruments, history downloads, store coverage, and listing and deleting stored data.
 
 use std::sync::Arc;
 
@@ -224,6 +224,8 @@ pub struct MonthCoverageInfo {
     pub last: Millis,
     /// Missing minutes between `first` and `last`.
     pub gaps: Vec<GapInfo>,
+    /// The month file's size on disk.
+    pub bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
@@ -266,6 +268,7 @@ fn read_coverage(store: &Store, id: InstrumentId) -> Result<CoverageResponse, Ap
             first: m.first,
             last: m.last,
             gaps: m.gaps.iter().map(GapInfo::from).collect(),
+            bytes: m.bytes,
         })
         .collect();
     let funding = if id.kind == InstrumentKind::Perpetual {
@@ -283,6 +286,148 @@ fn read_coverage(store: &Store, id: InstrumentId) -> Result<CoverageResponse, Ap
         months,
         funding,
     })
+}
+
+/// One month file of an instrument's candles and its size on disk.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+pub struct StoredMonthInfo {
+    /// `YYYY-MM`.
+    pub month: String,
+    pub bytes: u64,
+}
+
+/// What the store holds for one instrument.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+pub struct StoredInstrumentInfo {
+    pub instrument: InstrumentId,
+    /// The month files, oldest first; empty when only a funding file is stored.
+    pub months: Vec<StoredMonthInfo>,
+    /// The funding file's size; `null` when there is none, which is always so for spot.
+    pub funding_bytes: Option<u64>,
+    /// The month files and the funding file together.
+    pub bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+pub struct StoredResponse {
+    /// Every instrument with at least one month file or a funding file, in instrument order.
+    pub instruments: Vec<StoredInstrumentInfo>,
+    /// Paths in the data folder, relative to it, that name no venue, kind, symbol or month the
+    /// store writes. They are neither counted nor deleted.
+    pub unrecognised: Vec<String>,
+}
+
+/// `GET /data/stored`: every instrument the store holds, with the size of each file.
+pub(super) async fn stored(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<StoredResponse>, ApiError> {
+    let store = state.store.clone();
+    let stored = tokio::task::spawn_blocking(move || store.stored())
+        .await
+        .map_err(|e| ApiError::internal(format!("the listing stopped: {e}")))??;
+    Ok(Json(StoredResponse {
+        instruments: stored
+            .instruments
+            .iter()
+            .map(|i| StoredInstrumentInfo {
+                instrument: i.id.clone(),
+                months: i
+                    .months
+                    .iter()
+                    .map(|m| StoredMonthInfo {
+                        month: m.month.to_string(),
+                        bytes: m.bytes,
+                    })
+                    .collect(),
+                funding_bytes: i.funding_bytes,
+                bytes: i.bytes(),
+            })
+            .collect(),
+        unrecognised: stored
+            .unrecognised
+            .iter()
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .collect(),
+    }))
+}
+
+/// What to delete: the candles of `instrument` for the months `from` to `to`, both included, or,
+/// with neither given, every month and a perpetual's funding file.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+pub struct DeleteRequest {
+    pub instrument: InstrumentId,
+    /// `YYYY-MM`; give both `from` and `to`, or neither.
+    #[serde(default)]
+    #[ts(optional)]
+    pub from: Option<String>,
+    /// `YYYY-MM`, included.
+    #[serde(default)]
+    #[ts(optional)]
+    pub to: Option<String>,
+}
+
+/// What a delete removed: data files, and temp files a crashed download left beside them.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+pub struct DeleteResult {
+    pub files: usize,
+    pub bytes: u64,
+}
+
+/// `POST /data/delete`: deletes stored data now and answers what it removed. Nothing stored is
+/// not an error. A queued or running download of the instrument in this server is a 409
+/// `conflict`: the delete would race the files it is writing.
+pub(super) async fn delete(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<DeleteRequest>, JsonRejection>,
+) -> Result<Json<DeleteResult>, ApiError> {
+    let Json(request) = body?;
+    let id = request.instrument;
+    let month = |text: &str| {
+        Month::parse(text).ok_or_else(|| {
+            ApiError::bad_request(format!(
+                "{text:?} is not a month: use YYYY-MM, like 2024-01"
+            ))
+        })
+    };
+    let range = match (request.from.as_deref(), request.to.as_deref()) {
+        (None, None) => None,
+        (Some(from), Some(to)) => {
+            let (from, to) = (month(from)?, month(to)?);
+            if from > to {
+                return Err(ApiError::bad_request("`to` must not be before `from`"));
+            }
+            Some((from, to))
+        }
+        _ => {
+            return Err(ApiError::bad_request(
+                "give both `from` and `to`, or neither to delete the whole instrument",
+            ));
+        }
+    };
+    // shortcut: checked once, before the delete, and only against this server's own jobs. A
+    // download started while the delete runs, or one running in another process on the same data
+    // folder (the `td-data` CLI; the app runs one engine), is not refused. Each file is safe, since
+    // both take its lock, but a month the download had already stored can be deleted under it and
+    // its report then names a month that is gone; a run on that range is refused as data missing.
+    // Hold the instrument across processes for a whole download and delete if that ever matters.
+    if let Some(job) = state.jobs.download_in_progress(&id) {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "conflict",
+            format!("{id} has a download in progress (job {job}); wait for it or cancel it"),
+        ));
+    }
+    let store = state.store.clone();
+    let report = tokio::task::spawn_blocking(move || match range {
+        Some((from, to)) => store.delete_months(&id, from, to),
+        None => store.delete_instrument(&id),
+    })
+    .await
+    .map_err(|e| ApiError::internal(format!("the delete stopped: {e}")))??;
+    Ok(Json(DeleteResult {
+        files: report.files,
+        bytes: report.bytes,
+    }))
 }
 
 /// Reads `venue:symbol:kind`, the form `InstrumentId` displays as.
