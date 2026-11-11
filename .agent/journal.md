@@ -168,3 +168,35 @@ The read path does not overlap #66 or the engine. Rounds, one hypothesis each:
 - **Final checksums, head `510af3d` (`baseline7.log`): dev `1bc2d4ff4b411ddc`, test `5ecd3911e0a8641c`.** Per workload: load_1h_24mo `3852b7945ccec859`, backtest_sma_1m_3mo `75ffe6edbb8ad741`, sweep_sma_1h_24mo `0a98024072a85554`, walkforward_donchian_1h_24mo `98212a17978b0b68`, lab_sma_1h_60mo `8cea35df3dbf82f9`; test: load_15m_18mo `334ea9e6970cea33`, backtest_donchian_5m_12mo `3f828b35d7f2aba6`, sweep_donchian_15m_12mo `917724d45265e03f`, walkforward_sma_4h_36mo `c0d922779bbc6a15`, lab_donchian_15m_48mo `64b19b670067da6d`. The timed work is the same as on `f89f7cf`; only what is hashed changed. Totals in that run (10.4 s dev) were taken with three other builds running and are not a baseline.
 - Proof that the app's default engine path is the release build: `cargo build --release -p td-server --bin td-server --manifest-path ../Cargo.toml` (the new `pnpm dev` build step) from `gui/`, then `pnpm vitest run app/src/main/engine.integration.test.ts`: 1 passed, not skipped, on `510af3d`.
 - The comment and README said "about nine times"; the final measurement is twelve, corrected.
+
+## PR 2 (`perf-read`): rounds 2 and 3, measured 2026-11-11 14:26 to 14:37 UTC
+
+Worker commits `b0abc6f` (round 2) and `ed844b4` (round 3), with the final bench merged in (`14585d1`). Three binaries, run one after another three times (`.agent/logs/round23.log`): the base (`510af3d`, the store as on main), round 2 alone (`ed844b4` reverted in the tree for the build), and rounds 2 and 3. Dev split, reps 5. The machine was under heavy load from other threads the whole time (the base took 9.7 to 14.3 s against 4.9 s on a quiet machine), so only the comparison inside each pass counts.
+
+| Pass | Base | Round 2 | Rounds 2 and 3 |
+|---|---|---|---|
+| 1 | 14,150.9 | 5,654.6 | 4,423.7 |
+| 2 | 14,306.8 | 7,144.4 | 3,333.9 |
+| 3 | 9,660.2 | 5,614.9 | 3,414.9 |
+| lowest | 9,660.2 | 5,614.9 | 3,333.9 |
+
+Checksum `1bc2d4ff4b411ddc` in all nine runs: no result changed.
+
+### Round 2: a month file is decoded once per process while it is unchanged (kept)
+
+- **Hypothesis (journaled above before the change):** coverage, check and load decode the same files seconds apart; keeping decoded months in the `Store` makes check and load nearly free.
+- **Change:** `Store` holds an `Arc<MonthCache>`: entries keyed by file path and column set, valid while the file's length and modified time are those of the decoded file, dropped on every write or delete through the store, least recently used evicted past 256 MB. A field of `Store`, not a static.
+- **Dev:** lowest 9,660.2 to 5,614.9 ms, 42% less; 60%, 50% and 42% less in the three passes. Far above the noise rule (10%).
+- **Phases of the Lab backtest:** check 1,025 to 2,877 ms became 100 to 131 ms; load 1,128 to 3,412 ms became 320 to 497 ms. Coverage and the reopen stayed cold, as predicted.
+- **Guardrails:** checksums identical. CI on the pushed head.
+
+### Round 3: a range's months are decoded in parallel (kept)
+
+- **Hypothesis:** the cold reads decode 24 to 60 files one after another on one core.
+- **Change:** `Store::read_months` decodes the months not in memory with rayon, in month order, one result per month so the first error is the one the old loop gave. Used by `coverage`, `load_candles`, `load_asks`, and the month loops of `read_data` and `check_run_data` in td-server.
+- **Dev:** lowest 5,614.9 to 3,333.9 ms, 41% less; 22%, 53% and 39% less in the three passes.
+- **Phases:** coverage 917 to 1,699 ms became 158 to 201 ms; the reopen 1,402 to 1,789 ms became 353 to 1,084 ms. The best Lab repetition was 935 ms against 9,781 ms for the base in the same pass.
+- **Guardrails:** checksums identical. The run check now holds a whole range in memory at once instead of one month at a time (marked `shortcut:`).
+- **Taught:** even with every core busy, parallel decoding still gained a third or more.
+
+Against the target (at most 2,436 ms, half of the quiet baseline 4,872.2 ms): load only adds time, so any run of rounds 2 and 3 at or under 2,436 ms meets it. Not yet seen under this load; more runs follow when the machine is quieter.
