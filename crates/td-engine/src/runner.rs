@@ -282,13 +282,14 @@ pub fn run(
     }
 
     let fills = session.fills().to_vec();
-    let mut trades = build_trades(&fills, &bars, session.bar_funding());
+    let mut trades = build_trades(&fills, &bars, &traded_asks, session.bar_funding());
     attach_stops(&mut trades, &bars, session.bar_stops());
     mark_forced_closes(&mut trades, &fills, session.orders());
     let series = EquitySeries::new(config.starting_cash, session.equity(), tf);
     let intrabar = risk::intrabar(
         config.starting_cash,
         &bars,
+        &traded_asks,
         session.equity(),
         &fills,
         session.bar_funding(),
@@ -618,8 +619,15 @@ fn hold(
         positions.push(portfolio.position());
     }
 
-    let trades = build_trades(&fills, bars, &bar_funding);
-    let intrabar = risk::intrabar(config.starting_cash, bars, &equity, &fills, &bar_funding);
+    let trades = build_trades(&fills, bars, asks, &bar_funding);
+    let intrabar = risk::intrabar(
+        config.starting_cash,
+        bars,
+        asks,
+        &equity,
+        &fills,
+        &bar_funding,
+    );
     Held {
         qty: fills.first().map_or(0.0, |f| f.qty),
         entry_price: price,

@@ -1122,7 +1122,7 @@ mod tests {
 
     /// The trades of a session with their stops attached.
     fn trades_of(s: &Session) -> Vec<crate::Trade> {
-        let mut t = crate::build_trades(s.fills(), s.bars(), s.bar_funding());
+        let mut t = crate::build_trades(s.fills(), s.bars(), &[], s.bar_funding());
         crate::attach_stops(&mut t, s.bars(), s.bar_stops());
         t
     }

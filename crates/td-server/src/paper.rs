@@ -888,7 +888,7 @@ impl PaperSession {
         let bars = session.bars();
         let live = &bars[bars.len().saturating_sub(session.bar_funding().len())..];
         let fills = session.fills();
-        build_trades_with_fills(fills, live, session.bar_funding())
+        build_trades_with_fills(fills, live, &[], session.bar_funding())
             .into_iter()
             .map(|(trade, range)| PaperTrade {
                 trade,

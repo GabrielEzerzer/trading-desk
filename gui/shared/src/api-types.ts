@@ -329,7 +329,8 @@ entry_time: number,
 exit_time: number, 
 /**
  * Still open at the end of the run; its exit is the remaining position marked at the last
- * close, with no exit fee.
+ * close it would exit at (the ask close for a short on a market with quotes), with no exit
+ * fee.
  */
 open: boolean, 
 /**
@@ -1603,7 +1604,8 @@ entry_time: number,
 exit_time: number, 
 /**
  * Still open at the end of the run; its exit is the remaining position marked at the last
- * close, with no exit fee.
+ * close it would exit at (the ask close for a short on a market with quotes), with no exit
+ * fee.
  */
 open: boolean, 
 /**

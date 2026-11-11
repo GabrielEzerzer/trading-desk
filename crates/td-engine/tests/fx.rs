@@ -569,22 +569,23 @@ fn a_per_unit_commission_is_charged_on_every_fill() {
         fees: Some(fees),
         ..fx_config()
     };
+    let quotes = [
+        DECIDE,
+        (
+            [150.000, 150.100, 149.900, 150.050],
+            [150.020, 150.120, 149.920, 150.070],
+        ),
+        (
+            [150.100, 150.200, 150.000, 150.150],
+            [150.120, 150.220, 150.020, 150.170],
+        ),
+    ];
     let s = run_fx_with(
         vec![
             (0, Send::Plain(market(Side::Buy, 1000.0))),
             (1, Send::Plain(market(Side::Sell, 1000.0))),
         ],
-        &[
-            DECIDE,
-            (
-                [150.000, 150.100, 149.900, 150.050],
-                [150.020, 150.120, 149.920, 150.070],
-            ),
-            (
-                [150.100, 150.200, 150.000, 150.150],
-                [150.120, 150.220, 150.020, 150.170],
-            ),
-        ],
+        &quotes,
         config,
     );
     assert_eq!(
@@ -596,7 +597,7 @@ fn a_per_unit_commission_is_charged_on_every_fill() {
     }
     approx(s.portfolio().fees_paid(), 4.0);
     approx(s.portfolio().cash(), 1_000_000.0 + 76.0);
-    let trades = td_engine::build_trades(s.fills(), s.bars(), s.bar_funding());
+    let trades = td_engine::build_trades(s.fills(), s.bars(), &asks_of(&quotes), s.bar_funding());
     assert_eq!(trades.len(), 1);
     approx(trades[0].fees, 4.0);
     approx(trades[0].net_pnl, 76.0);
@@ -978,4 +979,214 @@ fn the_built_in_strategies_short_on_fx() {
             config.strategy
         );
     }
+}
+
+/// The entry bar of the shorts below: the ask 0.020 above the bid at the open, low and close, and
+/// 0.100 above it at the high, where it spikes to 150.300.
+const SPIKE: ([f64; 4], [f64; 4]) = (
+    [150.000, 150.200, 149.900, 150.100],
+    [150.020, 150.300, 149.920, 150.120],
+);
+
+/// A bar that opens with the ask at 149.900, 0.050 above the bid, and rises through 150.400.
+const THROUGH: ([f64; 4], [f64; 4]) = (
+    [149.850, 150.450, 149.850, 150.400],
+    [149.900, 150.500, 149.900, 150.420],
+);
+
+/// A bar whose ask rises from its open of 150.100 to 150.400, then falls to 149.920.
+const DIP: ([f64; 4], [f64; 4]) = (
+    [150.050, 150.250, 149.900, 149.950],
+    [150.100, 150.400, 149.920, 149.970],
+);
+
+/// A bar that opens with the bid at its low of 149.800 and the ask 0.100 above it, an ask that
+/// comes down no further than 149.850.
+const WIDE: ([f64; 4], [f64; 4]) = (
+    [149.800, 150.000, 149.800, 149.900],
+    [149.900, 150.050, 149.850, 149.950],
+);
+
+/// The ask candle of each of `quotes`, by bar, as the measures take them.
+fn asks_of(quotes: &[([f64; 4], [f64; 4])]) -> Vec<Option<Candle>> {
+    quotes
+        .iter()
+        .enumerate()
+        .map(|(i, (_, ask))| Some(candle(i as i64, *ask)))
+        .collect()
+}
+
+/// A short of 1000 sold at bar 1's bid open, 150.000, with a buy stop at 150.400.
+fn stopped_short() -> Vec<(usize, Send)> {
+    vec![(0, Send::WithStop(market(Side::Sell, 1000.0), 150.400))]
+}
+
+/// A short of 1000 sold at bar 1's bid open, 150.000, and a buy limit at 149.950 sent at bar 1's
+/// close to close it.
+fn limited_short() -> Vec<(usize, Send)> {
+    vec![
+        (0, Send::Plain(market(Side::Sell, 1000.0))),
+        (1, Send::Plain(limit(Side::Buy, 1000.0, 149.950))),
+    ]
+}
+
+fn intrabar_of(s: &Session, quotes: &[([f64; 4], [f64; 4])]) -> td_engine::risk::Intrabar {
+    td_engine::risk::intrabar(
+        1_000_000.0,
+        s.bars(),
+        &asks_of(quotes),
+        s.equity(),
+        s.fills(),
+        s.bar_funding(),
+    )
+}
+
+/// The trades of a session, with their stops.
+fn trades_of(s: &Session, quotes: &[([f64; 4], [f64; 4])]) -> Vec<td_engine::Trade> {
+    let mut trades =
+        td_engine::build_trades(s.fills(), s.bars(), &asks_of(quotes), s.bar_funding());
+    td_engine::attach_stops(&mut trades, s.bars(), s.bar_stops());
+    trades
+}
+
+#[test]
+fn an_fx_shorts_equity_inside_each_bar_is_valued_on_the_ask() {
+    // The stopped short. Bar 1 closes with it marked at the ask close: 1 000 000 + 1000 *
+    // (150.000 - 150.120) = 999 880. Inside bar 1 the ask's high and low give 999 880 - 1000 *
+    // (150.300 - 150.120) = 999 700 and 999 880 + 1000 * (150.120 - 149.920) = 1 000 080; the
+    // bid's high would give 999 880 - 1000 * (150.200 - 150.100) = 999 780.
+    // Bar 2 opens at ask 149.900, 999 880 + 1000 * (150.120 - 149.900) = 1 000 100, and the stop
+    // fills at 150.400: 1 000 100 - 1000 * (150.400 - 149.900) = 999 600, flat after. Read from
+    // the bid close, the bid open would give 999 880 + 1000 * (150.100 - 149.850) = 1 000 130 and
+    // the stop 999 580, an equity the account never had.
+    let quotes = [DECIDE, SPIKE, THROUGH];
+    let s = run_fx(stopped_short(), &quotes);
+    assert_eq!(
+        fills(&s),
+        [(Side::Sell, 150.000, 1000.0), (Side::Buy, 150.400, 1000.0)]
+    );
+    approx(s.equity()[1].equity, 999_880.0);
+    approx(s.equity()[2].equity, 999_600.0);
+    let x = intrabar_of(&s, &quotes);
+    approx(x.ranges[1].low, 999_700.0);
+    approx(x.ranges[1].high, 1_000_080.0);
+    approx(x.ranges[2].low, 999_600.0);
+    approx(x.ranges[2].high, 1_000_100.0);
+    // The fall from the peak inside bars is 1 000 100 - 999 600 = 500, against 1 000 130 - 999 580
+    // = 550 on the bid, and the leverage peaks at the stop, 1000 * 150.400 / 999 600.
+    let drawdown = td_engine::risk::trailing_drawdown(1_000_000.0, &x.ranges).unwrap();
+    approx(drawdown.amount, 500.0);
+    approx(x.peak_leverage.unwrap(), 150_400.0 / 999_600.0);
+
+    // The limited short. The ask opens bar 2 at 150.100, 999 880 + 1000 * (150.120 - 150.100) =
+    // 999 900, and the limit fills at 149.950 as a maker, so after the ask's high of 150.400:
+    // 999 900 - 1000 * (150.400 - 150.100) = 999 600, then 1 000 050 flat. The bid's high of
+    // 150.250 would give 999 730.
+    let quotes = [DECIDE, SPIKE, DIP];
+    let s = run_fx(limited_short(), &quotes);
+    assert_eq!(
+        fills(&s),
+        [(Side::Sell, 150.000, 1000.0), (Side::Buy, 149.950, 1000.0)]
+    );
+    let x = intrabar_of(&s, &quotes);
+    approx(x.ranges[2].low, 999_600.0);
+    approx(x.ranges[2].high, 1_000_050.0);
+}
+
+#[test]
+fn an_fx_shorts_excursions_and_open_mark_are_on_the_ask() {
+    // The stopped short, still open after bar 1. Against its entry of 150.000, the ask's high of
+    // 150.300 puts it 1000 * 0.300 = 300 down and the ask's low of 149.920 80 up; the bid would
+    // say 200 and 100. Open at the end, it is marked at the ask close of 150.120: -120 yen, an R of
+    // -120 / (1000 * (150.400 - 150.000)) = -0.3, where the bid close would say -100 and -0.25.
+    let quotes = [DECIDE, SPIKE];
+    let trades = trades_of(&run_fx(stopped_short(), &quotes), &quotes);
+    let t = &trades[0];
+    assert!(t.open);
+    approx(t.mae.unwrap(), 300.0);
+    approx(t.mfe.unwrap(), 80.0);
+    approx(t.exit_price, 150.120);
+    approx(t.net_pnl, -120.0);
+    approx(t.stop.unwrap(), 150.400);
+    approx(t.r_multiple.unwrap(), -0.3);
+
+    // Stopped on bar 2, which opens at ask 149.900, 100 up (150 on the bid); the stop fills at
+    // 150.400, 400 down. A closed trade's R reads only its fills and its stop's trigger, the price
+    // the stop fills at on its own side: -400 / 400 = -1.
+    let quotes = [DECIDE, SPIKE, THROUGH];
+    let trades = trades_of(&run_fx(stopped_short(), &quotes), &quotes);
+    let t = &trades[0];
+    assert!(!t.open);
+    approx(t.mfe.unwrap(), 100.0);
+    approx(t.mae.unwrap(), 400.0);
+    approx(t.r_multiple.unwrap(), -1.0);
+
+    // Closed on bar 2 by the buy limit at 149.950: before a maker fill the ask reached its high of
+    // 150.400, 400 down, where the bid's high of 150.250 would say 250.
+    let quotes = [DECIDE, SPIKE, DIP];
+    let trades = trades_of(&run_fx(limited_short(), &quotes), &quotes);
+    let t = &trades[0];
+    assert!(!t.open);
+    approx(t.mae.unwrap(), 400.0);
+    approx(t.mfe.unwrap(), 80.0);
+
+    // Added to at bar 2's open by a sell of 1000 more at the bid open, 149.800. The 1000 short
+    // before the add counts at that price held to the ask's range, whose low is 149.850:
+    // 1000 * (150.000 - 149.850) = 150 up, where the bid's range would let it count 200. (The ask
+    // opened at 149.900, 100 up; see the shortcut on adds in `build_trades`.) After the add, short
+    // 2000 from 149.900, the ask's low is only 2000 * (149.900 - 149.850) = 100 up.
+    let quotes = [DECIDE, SPIKE, WIDE];
+    let plan = vec![
+        (0, Send::Plain(market(Side::Sell, 1000.0))),
+        (1, Send::Plain(market(Side::Sell, 1000.0))),
+    ];
+    let trades = trades_of(&run_fx(plan, &quotes), &quotes);
+    let t = &trades[0];
+    assert_eq!(t.qty, 2000.0);
+    approx(t.entry_price, 149.900);
+    approx(t.mfe.unwrap(), 150.0);
+}
+
+#[test]
+fn a_run_values_its_fx_shorts_on_the_ask() {
+    // Bids falling 0.010 a minute, with the ask 0.020 above the bid's open, low and close and
+    // 0.050 above its high. The moving average cross goes short and is still short at the end:
+    // the run's equity extremes are those its own record gives with the asks, not with the bid
+    // alone, and its open trade is marked at the last ask close.
+    let n = 12;
+    let bids: Vec<Candle> = (0..n)
+        .map(|i| {
+            let p = 150.0 - 0.01 * i as f64;
+            candle(i, [p, p + 0.005, p - 0.005, p + 0.002])
+        })
+        .collect();
+    let asks: Vec<Candle> = bids
+        .iter()
+        .map(|b| Candle {
+            open: b.open + 0.02,
+            high: b.high + 0.05,
+            low: b.low + 0.02,
+            close: b.close + 0.02,
+            ..*b
+        })
+        .collect();
+    let config = td_engine::BacktestConfig {
+        params: td_engine::Params::new()
+            .with("fast", td_engine::ParamValue::Int(2))
+            .with("slow", td_engine::ParamValue::Int(4))
+            .with("allow_short", td_engine::ParamValue::Bool(true)),
+        ..fx_backtest(n as usize)
+    };
+    let result = td_engine::run(&config, &bids, &asks, &[]).unwrap();
+    let extremes = |asks: &[Option<Candle>]| {
+        td_engine::risk::intrabar(1_000_000.0, &bids, asks, &result.equity, &result.fills, &[])
+            .ranges
+    };
+    let quoted: Vec<Option<Candle>> = asks.iter().copied().map(Some).collect();
+    assert_eq!(result.equity_extremes, extremes(&quoted));
+    assert_ne!(result.equity_extremes, extremes(&[]));
+    let last = result.trades.last().unwrap();
+    assert!(last.open);
+    assert_eq!(last.side, td_engine::TradeSide::Short);
+    approx(last.exit_price, asks[asks.len() - 1].close);
 }
