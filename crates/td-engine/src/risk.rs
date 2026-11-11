@@ -117,8 +117,11 @@ pub fn intrabar(
             pos = new;
         }
         let close = point.equity;
-        see(pos, bar.low, close + pos * (bar.low - bar.close));
-        see(pos, bar.high, close + pos * (bar.high - bar.close));
+        // The range is priced before the funding due later in the bar, which the session
+        // charges or credits at the close: a credit must not cover a loss taken before it.
+        let before = close + funding.get(k).map_or(0.0, |f| f.in_bar);
+        see(pos, bar.low, before + pos * (bar.low - bar.close));
+        see(pos, bar.high, before + pos * (bar.high - bar.close));
         see(pos, bar.close, close);
         ranges.push(EquityRange {
             low: low.max(0.0),
@@ -419,6 +422,28 @@ mod tests {
     //   after 0.5 of funding later in the bar, and flat the range adds nothing.
     //   Low 989.3, high 1011.3.
     // bar 2: flat all bar at 1010.7.
+    // Long 1 from 100 into a bar that dips to 90 and closes at 100, with 10 of funding credited
+    // later in the bar: the close is 1010, but the dip came before the credit, so the low is
+    // 1000 + 1 * (90 - 100) = 990, not 1010 - 10 = 1000.
+    #[test]
+    fn a_funding_credit_at_the_close_does_not_hide_an_earlier_dip() {
+        let bars = [
+            bar(0, 100.0, 100.0, 100.0, 100.0),
+            bar(1, 100.0, 100.0, 90.0, 100.0),
+        ];
+        let fills = [fill(0, Side::Buy, 1.0, 100.0, 0.0, Liquidity::Taker)];
+        let funding = [
+            BarFunding::default(),
+            BarFunding {
+                at_open: 0.0,
+                in_bar: -10.0,
+            },
+        ];
+        let x = intrabar(1000.0, &bars, &points(&[1000.0, 1010.0]), &fills, &funding);
+        approx(x.ranges[1].low, 990.0);
+        approx(x.ranges[1].high, 1010.0);
+    }
+
     #[test]
     fn extremes_follow_the_fill_models_path_through_each_bar() {
         let bars = [
