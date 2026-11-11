@@ -232,7 +232,8 @@ impl VerdictRule {
                 probability("limits.max_risk_of_ruin", limits.max_risk_of_ruin)?;
                 if !(limits.ruin_drawdown > 0.0 && limits.ruin_drawdown < 1.0) {
                     return Err(PlanError(format!(
-                        "limits.ruin_drawdown must be above 0 and below 1, got {}: ruin is a fall                          from the peak of less than the whole account",
+                        "limits.ruin_drawdown must be above 0 and below 1, got {}: ruin is a fall \
+                         from the peak of less than the whole account",
                         limits.ruin_drawdown
                     )));
                 }
@@ -583,7 +584,8 @@ pub fn evaluate_oos_integrity(x: &OosIntegrityInputs, max_leverage: f64) -> Vec<
         format!("Not measured: {what}. The sample is too small for a verdict either way.")
     };
     let inside_bars = if x.curve {
-        "Not measured: the out-of-sample curve has no equity ranges inside its bars, which this          check reads."
+        "Not measured: the out-of-sample curve has no equity ranges inside its bars, which this \
+         check reads."
             .to_string()
     } else {
         small("there is no out-of-sample curve")
@@ -1524,6 +1526,11 @@ mod tests {
                 "{bad}: {err}"
             );
         }
+        assert_eq!(
+            rule(1.0).validate().unwrap_err().0,
+            "limits.ruin_drawdown must be above 0 and below 1, got 1: ruin is a fall from the \
+             peak of less than the whole account"
+        );
     }
 
     #[test]
@@ -2104,8 +2111,12 @@ mod tests {
         let lines = evaluate_oos_integrity(&no_ranges, 1.0);
         for id in ["lowest_equity", "peak_leverage"] {
             let n = note(&lines, id);
-            assert!(n.contains("no equity ranges inside its bars"), "{id}: {n}");
-            assert!(!n.contains("too small"), "{id}: {n}");
+            assert_eq!(
+                n,
+                "Not measured: the out-of-sample curve has no equity ranges inside its bars, \
+                 which this check reads.",
+                "{id}"
+            );
         }
     }
 }
