@@ -824,6 +824,80 @@ fn a_lock_file_with_bytes_in_it_holds_up_no_write_or_delete() {
     assert!(store.months(&id).expect("lists").is_empty());
 }
 
+/// Makes `link` a link to the folder `target`: a junction on Windows, which needs no privilege,
+/// and a symlink elsewhere.
+fn link_dir(target: &std::path::Path, link: &std::path::Path) {
+    #[cfg(windows)]
+    {
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .stdout(std::process::Stdio::null())
+            .status()
+            .expect("cmd runs");
+        assert!(status.success(), "mklink /J {link:?} {target:?}: {status}");
+    }
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(target, link).expect("a symlink");
+}
+
+#[test]
+fn a_delete_does_not_follow_a_link_out_of_the_store() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let store = Store::new(dir.path().join("store"));
+    // Outside the store, a folder laid out as an instrument's folder is, holding a month file, and
+    // a funding file beside it.
+    let outside = dir.path().join("outside");
+    std::fs::create_dir_all(outside.join("1m")).expect("a folder");
+    std::fs::write(outside.join("1m/2024-01.parquet"), b"keep").expect("writes");
+    std::fs::write(outside.join("XRPUSDT.parquet"), b"keep").expect("writes");
+    let spot = InstrumentId {
+        venue: Venue::Binance,
+        symbol: "XRPUSDT".into(),
+        kind: InstrumentKind::Spot,
+    };
+    let perp = InstrumentId {
+        kind: InstrumentKind::Perpetual,
+        ..spot.clone()
+    };
+    let parent = |path: std::path::PathBuf| path.parent().expect("a folder").to_path_buf();
+    let month_dir = |id: &InstrumentId| parent(store.candle_path(id, month("2024-01")).unwrap());
+    // Links inside the store to it: the spot symbol folder, the perpetual's month folder, and the
+    // venue's funding folder.
+    for (link, target) in [
+        (parent(month_dir(&spot)), outside.clone()),
+        (month_dir(&perp), outside.join("1m")),
+        (parent(store.funding_path(&perp).unwrap()), outside.clone()),
+    ] {
+        std::fs::create_dir_all(parent(link.clone())).expect("a folder");
+        link_dir(&target, &link);
+    }
+
+    for id in [&spot, &perp] {
+        assert_eq!(
+            store.delete_instrument(id).expect("deletes nothing"),
+            DeleteReport::default(),
+            "{id}"
+        );
+        assert_eq!(
+            store
+                .delete_months(id, month("2024-01"), month("2024-01"))
+                .expect("deletes nothing"),
+            DeleteReport::default(),
+            "{id}"
+        );
+    }
+    assert_eq!(
+        tree(&outside),
+        ["1m", "1m/2024-01.parquet", "XRPUSDT.parquet"],
+        "nothing outside was removed or added"
+    );
+    for file in ["1m/2024-01.parquet", "XRPUSDT.parquet"] {
+        assert_eq!(std::fs::read(outside.join(file)).expect("reads"), b"keep");
+    }
+}
+
 #[test]
 fn a_hostile_symbol_cannot_make_a_delete_leave_the_store() {
     let dir = tempfile::tempdir().expect("a temp dir");

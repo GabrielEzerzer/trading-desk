@@ -16,7 +16,7 @@
 //! Deleting ([`Store::delete_months`], [`Store::delete_instrument`]) is the one way data leaves the
 //! store. A delete takes the same lock a writer takes, removes the data file and any temp files a
 //! crashed writer left beside it, and lets the lock go. It leaves the sidecar and the folders as
-//! they are.
+//! they are, and never follows a link (a symlink or a junction) out of the data folder.
 
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
@@ -591,7 +591,8 @@ impl Store {
     /// Deletes an instrument's candles for the months `from` to `to`, both included. Each month
     /// file is removed under the same lock a writer takes for it, with any temp files a crashed
     /// writer left beside it; its lock sidecar and the folders stay. Months not stored are skipped:
-    /// deleting nothing is not an error, and creates nothing. The funding file stays.
+    /// deleting nothing is not an error, and creates nothing. When a folder on the way to the
+    /// month files is missing or is a link, nothing is deleted. The funding file stays.
     pub fn delete_months(
         &self,
         id: &InstrumentId,
@@ -600,6 +601,9 @@ impl Store {
     ) -> Result<DeleteReport, DataError> {
         let dir = self.candle_dir(id)?;
         let mut report = DeleteReport::default();
+        if !self.real_dir(&dir)? {
+            return Ok(report);
+        }
         for name in dir_names(&dir, &mut Vec::new(), &self.root)? {
             if let Some((month, true)) = month_of_file(&name)
                 && (from..=to).contains(&month)
@@ -626,7 +630,11 @@ impl Store {
         let mut report = self.delete_months(id, every_month.0, every_month.1)?;
         if id.kind == InstrumentKind::Perpetual {
             let path = self.funding_path(id)?;
-            remove_locked(&path, &mut report)?;
+            if let Some(dir) = path.parent()
+                && self.real_dir(dir)?
+            {
+                remove_locked(&path, &mut report)?;
+            }
         }
         Ok(report)
     }
@@ -654,6 +662,30 @@ impl Store {
 
     fn relative(&self, path: &Path) -> PathBuf {
         relative_to(&self.root, path)
+    }
+
+    /// Whether `dir` and each folder between the store root and it are real folders, checked
+    /// without following links: `false` when one is missing, or is a file or a link (a symlink or
+    /// a junction), which could lead a delete out of the data folder. The root itself may be a
+    /// link.
+    // shortcut: checked once, before the delete lists anything, so a folder swapped for a link
+    // while the delete runs would be followed; only a program that can already write to the data
+    // folder can do that. Open each folder relative to its parent if that ever matters.
+    fn real_dir(&self, dir: &Path) -> Result<bool, DataError> {
+        let Ok(below_root) = dir.strip_prefix(&self.root) else {
+            return Ok(false);
+        };
+        let mut path = self.root.clone();
+        for part in below_root {
+            path.push(part);
+            match fs::symlink_metadata(&path) {
+                Ok(meta) if meta.is_dir() => {}
+                Ok(_) => return Ok(false),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+                Err(e) => return Err(DataError::io(&path)(e)),
+            }
+        }
+        Ok(true)
     }
 }
 
@@ -752,8 +784,8 @@ fn lock_across_processes(path: &Path) -> Result<File, DataError> {
 /// Removes the store file at `path` under its lock, taken as a writer takes it, with any temp files
 /// a crashed writer left beside it, and adds them to `report`; the lock sidecar stays as it is.
 /// While the lock is held no writer is part way through this file, in this process or another, so
-/// every temp file of it is a leftover. When there is no file at `path`, there is nothing to
-/// delete and no lock is taken.
+/// every temp file of it is a leftover. When `path` is not a regular file (nothing, or a link),
+/// there is nothing to delete and no lock is taken.
 fn remove_locked(path: &Path, report: &mut DeleteReport) -> Result<(), DataError> {
     if file_bytes(path)?.is_none() {
         return Ok(());
@@ -790,8 +822,9 @@ fn temp_files(path: &Path) -> Result<Vec<PathBuf>, DataError> {
         .collect())
 }
 
-/// The names of the files in `dir`, sorted; a missing `dir` has none. A subfolder, or a file whose
-/// name is not UTF-8, goes to `unrecognised`, as a path relative to `root`.
+/// The names of the regular files in `dir`, sorted; a missing `dir` has none. Anything else (a
+/// subfolder, a link, or a file whose name is not UTF-8) goes to `unrecognised`, as a path
+/// relative to `root`.
 fn dir_names(
     dir: &Path,
     unrecognised: &mut Vec<PathBuf>,
@@ -800,12 +833,12 @@ fn dir_names(
     let mut names = Vec::new();
     for entry in read_dir_or_empty(dir)? {
         let entry = entry.map_err(DataError::io(dir))?;
-        let is_dir = entry
+        let is_file = entry
             .file_type()
             .map_err(DataError::io(entry.path()))?
-            .is_dir();
+            .is_file();
         match entry.file_name().into_string() {
-            Ok(name) if !is_dir => names.push(name),
+            Ok(name) if is_file => names.push(name),
             _ => unrecognised.push(relative_to(root, &entry.path())),
         }
     }
@@ -828,10 +861,11 @@ fn relative_to(root: &Path, path: &Path) -> PathBuf {
     path.strip_prefix(root).unwrap_or(path).to_path_buf()
 }
 
-/// The size of the file at `path`, not following a link; `None` when there is none.
+/// The size of the regular file at `path`, not following a link; `None` when there is none, or a
+/// folder or a link is there instead.
 fn file_bytes(path: &Path) -> Result<Option<u64>, DataError> {
     match fs::symlink_metadata(path) {
-        Ok(meta) => Ok(Some(meta.len())),
+        Ok(meta) => Ok(meta.is_file().then_some(meta.len())),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(DataError::io(path)(e)),
     }
