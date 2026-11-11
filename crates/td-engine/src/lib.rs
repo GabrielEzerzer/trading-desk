@@ -1,6 +1,7 @@
 //! The trading engine: the `Strategy` trait, the event-driven simulation on candles, the fill
 //! model, the broker and the portfolio, the backtest runner with its metrics and saved results,
-//! and the strategy tester (sweeps, out-of-sample and walk-forward).
+//! the strategy tester (sweeps, out-of-sample, walk-forward and the luck test by bar permutation),
+//! and the seeded resampling statistics of the test battery ([`stats`]).
 //!
 //! The engine is push-driven. A [`Session`] is fed one closed bar at a time with
 //! [`Session::on_bar`]; a backtest ([`run_backtest`]) is a loop that feeds stored bars, and paper
@@ -23,13 +24,16 @@ mod error;
 mod fill;
 pub mod metrics;
 mod params;
+mod permute;
 mod plan;
 mod portfolio;
 mod registry;
 mod results;
 pub mod risk;
+mod rng;
 mod runner;
 mod session;
+pub mod stats;
 mod strategies;
 mod strategy;
 mod tester;
@@ -46,6 +50,7 @@ pub use error::{EngineError, OrderRejected};
 pub use fill::{CandleFillModel, FillCheck, FillModel};
 pub use metrics::MetricsReport;
 pub use params::{ParamKind, ParamSpec, ParamValue, Params};
+pub use permute::permute_bars;
 pub use plan::{
     BacktestSettings, EvidenceSettings, LuckTest, MIN_PERMUTATIONS, MIN_PROFITABLE_WINDOWS,
     MinSample, Period, PlanError, Plateau, SlippageOverride, SweepPlan, TestPlan, WalkForwardPlan,
@@ -69,9 +74,9 @@ pub use strategies::gotobi_calendar;
 pub use strategy::{Context, Strategy};
 pub use tester::{
     Direction, Headline, MAX_RUNS, Metric, Objective, OosResult, OosSpec, ParamAxis, ParamSpace,
-    Progress, Split, SweepMode, SweepResult, SweepRow, SweepSpec, TesterError, WalkForwardResult,
-    WalkForwardSpec, Window, WindowMode, WindowResult, WindowSpec, out_of_sample, stitch, sweep,
-    walk_forward,
+    PermutationResult, PermutationSpec, Progress, Split, SweepMode, SweepResult, SweepRow,
+    SweepSpec, TesterError, WalkForwardResult, WalkForwardSpec, Window, WindowMode, WindowResult,
+    WindowSpec, out_of_sample, permutation_test, stitch, sweep, walk_forward,
 };
 pub use trades::{
     BarFunding, BarStops, Trade, TradeSide, attach_stops, build_trades, build_trades_with_fills,
