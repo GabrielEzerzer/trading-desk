@@ -56,7 +56,11 @@ fn holidays() -> &'static HashSet<i64> {
                 let date = line.split(',').next().unwrap_or_default();
                 let mut parts = date.split('-').map(|p| p.parse::<i64>());
                 match (parts.next(), parts.next(), parts.next()) {
-                    (Some(Ok(y)), Some(Ok(m)), Some(Ok(d))) => {
+                    (Some(Ok(y)), Some(Ok(m)), Some(Ok(d)))
+                        if (HOLIDAY_TABLE_YEARS.0..=HOLIDAY_TABLE_YEARS.1).contains(&y)
+                            && civil_from_days(days_from_civil(y, m as u32, d as u32))
+                                == (y, m as u32, d as u32) =>
+                    {
                         days_from_civil(y, m as u32, d as u32)
                     }
                     _ => panic!("bad row in japan_holidays.csv: {line}"),
@@ -98,7 +102,8 @@ pub fn is_tokyo_business_day(days: i64) -> Result<bool, OutsideHolidayTable> {
 ///
 /// A nominal day after `to` can move back into the range, so this also looks at the days after
 /// `to` up to the next business day; any date it has to look at outside the holiday table is an
-/// error, including those days after `to`.
+/// error, including those days after `to`: a query ending after 2027-12-29 fails, because that
+/// scan reaches 2028.
 pub fn gotobi_days(from: i64, to: i64) -> Result<Vec<GotobiDay>, OutsideHolidayTable> {
     let mut out: Vec<GotobiDay> = Vec::new();
     if from > to {
@@ -283,7 +288,7 @@ mod tests {
             [(2019, 12, 30)]
         );
         assert_eq!(month(2020, 1)[0], (2020, 1, 10));
-        // A December query alone still sees January 5 2025 (a Sunday) moving into it.
+        // January 5 2025 (a Sunday) moves back onto December 30 2024, which is already one.
         assert_eq!(month(2024, 12).last(), Some(&(2024, 12, 30)));
         assert_eq!(month(2024, 12).len(), 6);
         // 2022-01-05 was a Wednesday and stays.
@@ -355,7 +360,9 @@ mod tests {
 
     #[test]
     fn the_published_span_has_a_pinned_count() {
-        // The published test reports 775 trades over this span, an independent rebuild 774.
+        // The published test reports 775 trades over this span, an independent rebuild 774. The
+        // rule as stated cannot exceed 769 here, so the gap is not one of this calendar's choices;
+        // #45 chases it when the reproduction runs.
         let all = gotobi_days(d(2016, 1, 1), d(2026, 10, 31)).unwrap();
         assert_eq!(all.len(), 765);
         assert!(
