@@ -88,6 +88,7 @@ impl InstrumentArgs {
 enum VenueArg {
     Binance,
     Bybit,
+    Dukascopy,
 }
 
 impl From<VenueArg> for Venue {
@@ -95,6 +96,7 @@ impl From<VenueArg> for Venue {
         match v {
             VenueArg::Binance => Venue::Binance,
             VenueArg::Bybit => Venue::Bybit,
+            VenueArg::Dukascopy => Venue::Dukascopy,
         }
     }
 }
@@ -363,4 +365,5 @@ mod tests {
         ];
         assert!(Cli::try_parse_from(bad).is_err());
     }
+
 }
