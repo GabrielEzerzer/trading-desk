@@ -168,12 +168,12 @@ slippage_bps: number,
  */
 fee_override: FeeSchedule | null, 
 /**
- * The largest perpetual position allowed, as its notional over equity: 1.0 means 1x, the
- * default. At 1x a long is liquidated only near a price of zero and a short only once the
- * price has about doubled (see [`Session::on_bar`]). Orders that would take the position
- * over it are rejected when submitted; orders that reduce the position are always allowed
- * (see [`crate::Context::submit`]). Spot ignores it. Left out of the saved result when it is
- * the default.
+ * The largest position allowed on a margined kind (perpetual, FX), as its notional over
+ * equity: 1.0 means 1x, the default. On a perpetual at 1x a long is liquidated only near a
+ * price of zero and a short only once the price has about doubled (see [`Session::on_bar`]).
+ * Orders that would take the position over it are rejected when submitted; orders that
+ * reduce the position are always allowed (see [`crate::Context::submit`]). A kind without
+ * margin, such as spot, ignores it. Left out of the saved result when it is the default.
  */
 max_leverage?: number, 
 /**
@@ -203,7 +203,7 @@ engine_version: string,
  */
 engine_revision: number, 
 /**
- * SHA-256 of the bars (warm-up bars first) and funding the run used; see
+ * SHA-256 of the bars (warm-up bars first), asks and funding the run used; see
  * [`data_fingerprint`].
  */
 data_fingerprint: string, 
@@ -223,8 +223,9 @@ orders: Array<Order>, fills: Array<Fill>, trades: Array<Trade>, metrics: Metrics
  */
 export type Benchmark = { 
 /**
- * Quantity bought at the first bar's open: all starting cash, after the taker fee, rounded
- * down to the lot size. In a walk-forward, the first test window's purchase.
+ * Quantity bought at the first bar's open: all starting cash, after the taker fee and any
+ * per-unit commission, rounded down to the lot size. In a walk-forward, the first test
+ * window's purchase.
  */
 qty: number, 
 /**
@@ -261,7 +262,9 @@ export type Order = { id: OrderId, request: OrderRequest,
  */
 submitted_at: number, 
 /**
- * Close of the bar the order was decided on: the last price before it was sent.
+ * Close of the bar the order was decided on: the last price before it was sent, on the
+ * order's side. For a market with an ask series that is the ask close for a buy and the bid
+ * close for a sell.
  */
 decision_close: number, 
 /**
@@ -1146,7 +1149,9 @@ export type PaperOrder = { source: OrderSource, id: OrderId, request: OrderReque
  */
 submitted_at: number, 
 /**
- * Close of the bar the order was decided on: the last price before it was sent.
+ * Close of the bar the order was decided on: the last price before it was sent, on the
+ * order's side. For a market with an ask series that is the ask close for a buy and the bid
+ * close for a sell.
  */
 decision_close: number, 
 /**
