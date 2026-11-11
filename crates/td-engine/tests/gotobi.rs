@@ -289,6 +289,41 @@ fn a_timeframe_without_bars_closing_at_the_fixing_fails_the_run() {
 }
 
 #[test]
+fn a_rejected_exit_fails_the_run_instead_of_holding_the_short_without_its_stop() {
+    let day = gotobi_tuesday();
+    let mut bars = morning(day);
+    // The bid falls to 148.000 by the exit decision, the close of the bar that opens at 01:25,
+    // far from the stop. The 625,000 units are worth 625,000 * 150.000 = 93,750,000 yen at the
+    // entry decision and 625,000 * 150.120 = 93,825,000 at the stop, but 92,500,000 at the exit
+    // decision, so a minimum notional of 93,000,000 yen passes the entry and its stop and rejects
+    // the exit: on FX a reduce-only order is not exempt from the minimum.
+    set(&mut bars, day, 1, 25, [150.0, 150.0, 148.0, 148.0]);
+    let mut inst = usdjpy();
+    inst.min_notional = 93_000_000.0;
+    let strategy = build_strategy("gotobi", &Params::new()).unwrap();
+    let mut s = Session::new(strategy, inst, Timeframe::M5, dollars()).unwrap();
+    let failed = bars.iter().find_map(|&b| {
+        s.on_bar_with_ask(candle(b), Some(candle(ask_of(b))), &[])
+            .err()
+            .map(|e| (b.0, e))
+    });
+    let (time, err) = failed.expect("the run fails");
+    assert_eq!(time, day + 85 * MIN, "on the exit decision");
+    let EngineError::StrategyFailed(reason) = &err else {
+        panic!("{err}");
+    };
+    assert!(reason.contains("exit at 01:30 UTC was rejected"), "{reason}");
+    assert!(reason.contains("is below the minimum 93000000"), "{reason}");
+    // The stop was cancelled for the exit, so the run stops with the short open and unprotected.
+    let orders = s.orders();
+    assert!(matches!(orders[1].status, OrderStatus::Cancelled(_)), "{orders:?}");
+    assert!(matches!(orders[2].status, OrderStatus::Rejected(_)), "{orders:?}");
+    assert!(orders[2].request.reduce_only);
+    assert!(s.open_orders().is_empty());
+    approx(s.portfolio().position(), -625_000.0);
+}
+
+#[test]
 fn the_registry_lists_gotobi_with_its_plan_on_a_dollar_account() {
     let entry = find_strategy("gotobi").unwrap();
     let params: Vec<(&str, ParamValue)> =

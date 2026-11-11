@@ -50,7 +50,8 @@ const EXIT_UTC: Millis = 90 * MINUTE;
 ///   the entry's day, which is a later bar when the data has a gap there, while the position is
 ///   open, the stop is cancelled and a reduce-only market buy for the whole position is sent. It
 ///   fills at the next bar's open, the bar that opens at 01:30 when there is no gap, on the ask. A
-///   stop that has already filled has ended the trade, and nothing happens at 01:30.
+///   stop that has already filled has ended the trade, and nothing happens at 01:30. If the buy
+///   is rejected, the run fails ([`Context::fail`]) rather than hold the position without a stop.
 /// - **Size.** `risk_pct` percent of the equity is lost if the stop is hit: the quantity is
 ///   `risk_pct / 100 * equity / to_account(stop distance)`, rounded down to the lot size by
 ///   [`Context::submit`]. On a dollar account the stop distance, in yen per unit, is converted to
@@ -198,7 +199,13 @@ impl Strategy for Gotobi {
                 } else {
                     Side::Buy
                 };
-                let _ = ctx.submit(order(ctx, side, position.abs(), OrderType::Market, true));
+                let exit = order(ctx, side, position.abs(), OrderType::Market, true);
+                if let Err(e) = ctx.submit(exit) {
+                    ctx.fail(format!(
+                        "gotobi's exit at 01:30 UTC was rejected after its stop was cancelled, \
+                         which would leave the position without a stop: {e}"
+                    ));
+                }
             }
             return;
         }
