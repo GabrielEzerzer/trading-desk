@@ -492,8 +492,10 @@ fn api_error(e: ApiError) -> String {
 
 fn job_error(e: JobError) -> String {
     match e {
-        JobError::Cancelled => "cancelled".into(),
-        JobError::Failed(body) => format!("{}: {}", body.code, body.message),
+        JobError::Cancelled | JobError::CancelledWith(_) => "cancelled".into(),
+        JobError::Failed(body) | JobError::FailedWith(body, _) => {
+            format!("{}: {}", body.code, body.message)
+        }
     }
 }
 
