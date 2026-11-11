@@ -14,6 +14,12 @@ const KEY_STATES = [
   'lab-result-trade',
   'lab-result-evidence',
   'lab-run-failed',
+  'lab-list-engine',
+  'lab-engine-past-result',
+  'lab-engine-null-metrics',
+  'lab-engine-no-data',
+  'lab-engine-downloading',
+  'lab-engine-too-many-runs',
   ...STATES.filter((s) => s.section === 'trading').map((s) => s.name),
 ]
 

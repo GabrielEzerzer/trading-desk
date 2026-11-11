@@ -5,1671 +5,10 @@
    "kind": "Trend following",
    "description": "Goes long when the fast moving average crosses above the slow one, and short or flat when it crosses below.",
    "last": {
-    "decision": "trade",
-    "instrument": {
-     "venue": "binance",
-     "symbol": "BTCUSDT",
-     "kind": "perpetual"
-    },
-    "period": {
-     "from": 1609459200000,
-     "to": 1751241600000
-    },
+    "id": "1794242520000-5a1c0e2b",
     "finishedAt": 1794242520000,
-    "criteria": [
-     {
-      "label": "Out-of-sample Sharpe",
-      "value": 1.2,
-      "limit": 1,
-      "rule": "at_least",
-      "format": "ratio",
-      "pass": true
-     },
-     {
-      "label": "Max drawdown",
-      "value": 0.2012,
-      "limit": 0.25,
-      "rule": "at_most",
-      "format": "percent",
-      "pass": true
-     },
-     {
-      "label": "Trades",
-      "value": 41,
-      "limit": 30,
-      "rule": "at_least",
-      "format": "count",
-      "pass": true
-     }
-    ],
-    "keyNumbers": [
-     {
-      "label": "Return",
-      "value": 2.4657,
-      "format": "percent",
-      "tone": "pnl"
-     },
-     {
-      "label": "CAGR",
-      "value": 0.3182,
-      "format": "percent",
-      "tone": "pnl"
-     },
-     {
-      "label": "Sharpe",
-      "value": 1.46,
-      "format": "ratio"
-     },
-     {
-      "label": "Max drawdown",
-      "value": 0.2012,
-      "format": "percent"
-     }
-    ],
-    "benchmarkLabel": "Buy and hold",
-    "equity": [
-     {
-      "t": 1609459200000,
-      "strategy": 1,
-      "benchmark": 1
-     },
-     {
-      "t": 1610064000000,
-      "strategy": 1.0297,
-      "benchmark": 1.0093
-     },
-     {
-      "t": 1610668800000,
-      "strategy": 1.0638,
-      "benchmark": 1.1798
-     },
-     {
-      "t": 1611273600000,
-      "strategy": 1.0872,
-      "benchmark": 1.2658
-     },
-     {
-      "t": 1611878400000,
-      "strategy": 1.1458,
-      "benchmark": 1.6048
-     },
-     {
-      "t": 1612483200000,
-      "strategy": 1.1426,
-      "benchmark": 1.4575
-     },
-     {
-      "t": 1613088000000,
-      "strategy": 1.1421,
-      "benchmark": 1.3427
-     },
-     {
-      "t": 1613692800000,
-      "strategy": 1.145,
-      "benchmark": 1.3751
-     },
-     {
-      "t": 1614297600000,
-      "strategy": 1.1348,
-      "benchmark": 1.3501
-     },
-     {
-      "t": 1614902400000,
-      "strategy": 1.1499,
-      "benchmark": 1.3276
-     },
-     {
-      "t": 1615507200000,
-      "strategy": 1.0791,
-      "benchmark": 1.2674
-     },
-     {
-      "t": 1616112000000,
-      "strategy": 1.1441,
-      "benchmark": 1.2973
-     },
-     {
-      "t": 1616716800000,
-      "strategy": 1.0999,
-      "benchmark": 1.231
-     },
-     {
-      "t": 1617321600000,
-      "strategy": 1.0705,
-      "benchmark": 1.0524
-     },
-     {
-      "t": 1617926400000,
-      "strategy": 1.0168,
-      "benchmark": 0.9144
-     },
-     {
-      "t": 1618531200000,
-      "strategy": 1.0086,
-      "benchmark": 0.8403
-     },
-     {
-      "t": 1619136000000,
-      "strategy": 1.0404,
-      "benchmark": 0.8744
-     },
-     {
-      "t": 1619740800000,
-      "strategy": 0.9995,
-      "benchmark": 0.7522
-     },
-     {
-      "t": 1620345600000,
-      "strategy": 0.9852,
-      "benchmark": 0.6599
-     },
-     {
-      "t": 1620950400000,
-      "strategy": 0.9815,
-      "benchmark": 0.6082
-     },
-     {
-      "t": 1621555200000,
-      "strategy": 0.9875,
-      "benchmark": 0.5757
-     },
-     {
-      "t": 1622160000000,
-      "strategy": 1.0127,
-      "benchmark": 0.6671
-     },
-     {
-      "t": 1622764800000,
-      "strategy": 1.016,
-      "benchmark": 0.5986
-     },
-     {
-      "t": 1623369600000,
-      "strategy": 1.0394,
-      "benchmark": 0.6107
-     },
-     {
-      "t": 1623974400000,
-      "strategy": 1.0397,
-      "benchmark": 0.5378
-     },
-     {
-      "t": 1624579200000,
-      "strategy": 1.1089,
-      "benchmark": 0.6428
-     },
-     {
-      "t": 1625184000000,
-      "strategy": 1.1291,
-      "benchmark": 0.5943
-     },
-     {
-      "t": 1625788800000,
-      "strategy": 1.1782,
-      "benchmark": 0.6753
-     },
-     {
-      "t": 1626393600000,
-      "strategy": 1.1596,
-      "benchmark": 0.6428
-     },
-     {
-      "t": 1626998400000,
-      "strategy": 1.1857,
-      "benchmark": 0.7837
-     },
-     {
-      "t": 1627603200000,
-      "strategy": 1.1985,
-      "benchmark": 0.7451
-     },
-     {
-      "t": 1628208000000,
-      "strategy": 1.213,
-      "benchmark": 0.7921
-     },
-     {
-      "t": 1628812800000,
-      "strategy": 1.229,
-      "benchmark": 0.7731
-     },
-     {
-      "t": 1629417600000,
-      "strategy": 1.1993,
-      "benchmark": 0.7251
-     },
-     {
-      "t": 1630022400000,
-      "strategy": 1.1849,
-      "benchmark": 0.7315
-     },
-     {
-      "t": 1630627200000,
-      "strategy": 1.1286,
-      "benchmark": 0.6303
-     },
-     {
-      "t": 1631232000000,
-      "strategy": 1.1384,
-      "benchmark": 0.5999
-     },
-     {
-      "t": 1631836800000,
-      "strategy": 1.1515,
-      "benchmark": 0.5882
-     },
-     {
-      "t": 1632441600000,
-      "strategy": 1.2192,
-      "benchmark": 0.651
-     },
-     {
-      "t": 1633046400000,
-      "strategy": 1.2242,
-      "benchmark": 0.6932
-     },
-     {
-      "t": 1633651200000,
-      "strategy": 1.2233,
-      "benchmark": 0.7418
-     },
-     {
-      "t": 1634256000000,
-      "strategy": 1.2158,
-      "benchmark": 0.698
-     },
-     {
-      "t": 1634860800000,
-      "strategy": 1.2751,
-      "benchmark": 0.8254
-     },
-     {
-      "t": 1635465600000,
-      "strategy": 1.2548,
-      "benchmark": 0.7284
-     },
-     {
-      "t": 1636070400000,
-      "strategy": 1.2475,
-      "benchmark": 0.6956
-     },
-     {
-      "t": 1636675200000,
-      "strategy": 1.3063,
-      "benchmark": 0.7397
-     },
-     {
-      "t": 1637280000000,
-      "strategy": 1.3026,
-      "benchmark": 0.7705
-     },
-     {
-      "t": 1637884800000,
-      "strategy": 1.3536,
-      "benchmark": 0.8777
-     },
-     {
-      "t": 1638489600000,
-      "strategy": 1.3238,
-      "benchmark": 0.8018
-     },
-     {
-      "t": 1639094400000,
-      "strategy": 1.3795,
-      "benchmark": 0.9564
-     },
-     {
-      "t": 1639699200000,
-      "strategy": 1.4461,
-      "benchmark": 0.9858
-     },
-     {
-      "t": 1640304000000,
-      "strategy": 1.3539,
-      "benchmark": 0.8359
-     },
-     {
-      "t": 1640908800000,
-      "strategy": 1.3576,
-      "benchmark": 0.7682
-     },
-     {
-      "t": 1641513600000,
-      "strategy": 1.3005,
-      "benchmark": 0.7001
-     },
-     {
-      "t": 1642118400000,
-      "strategy": 1.3229,
-      "benchmark": 0.7279
-     },
-     {
-      "t": 1642723200000,
-      "strategy": 1.2921,
-      "benchmark": 0.6964
-     },
-     {
-      "t": 1643328000000,
-      "strategy": 1.3596,
-      "benchmark": 0.8049
-     },
-     {
-      "t": 1643932800000,
-      "strategy": 1.3534,
-      "benchmark": 0.9138
-     },
-     {
-      "t": 1644537600000,
-      "strategy": 1.3474,
-      "benchmark": 0.7856
-     },
-     {
-      "t": 1645142400000,
-      "strategy": 1.3505,
-      "benchmark": 0.7477
-     },
-     {
-      "t": 1645747200000,
-      "strategy": 1.4142,
-      "benchmark": 0.7717
-     },
-     {
-      "t": 1646352000000,
-      "strategy": 1.4784,
-      "benchmark": 0.8276
-     },
-     {
-      "t": 1646956800000,
-      "strategy": 1.5525,
-      "benchmark": 0.9611
-     },
-     {
-      "t": 1647561600000,
-      "strategy": 1.6039,
-      "benchmark": 0.9818
-     },
-     {
-      "t": 1648166400000,
-      "strategy": 1.6061,
-      "benchmark": 1.0106
-     },
-     {
-      "t": 1648771200000,
-      "strategy": 1.6651,
-      "benchmark": 1.1832
-     },
-     {
-      "t": 1649376000000,
-      "strategy": 1.761,
-      "benchmark": 1.6443
-     },
-     {
-      "t": 1649980800000,
-      "strategy": 1.7364,
-      "benchmark": 1.6431
-     },
-     {
-      "t": 1650585600000,
-      "strategy": 1.7194,
-      "benchmark": 1.6561
-     },
-     {
-      "t": 1651190400000,
-      "strategy": 1.7831,
-      "benchmark": 1.8327
-     },
-     {
-      "t": 1651795200000,
-      "strategy": 1.8144,
-      "benchmark": 1.8285
-     },
-     {
-      "t": 1652400000000,
-      "strategy": 1.7965,
-      "benchmark": 1.8968
-     },
-     {
-      "t": 1653004800000,
-      "strategy": 1.8263,
-      "benchmark": 1.9971
-     },
-     {
-      "t": 1653609600000,
-      "strategy": 1.743,
-      "benchmark": 1.8792
-     },
-     {
-      "t": 1654214400000,
-      "strategy": 1.6423,
-      "benchmark": 1.6471
-     },
-     {
-      "t": 1654819200000,
-      "strategy": 1.6127,
-      "benchmark": 1.5955
-     },
-     {
-      "t": 1655424000000,
-      "strategy": 1.6313,
-      "benchmark": 1.7288
-     },
-     {
-      "t": 1656028800000,
-      "strategy": 1.7109,
-      "benchmark": 1.812
-     },
-     {
-      "t": 1656633600000,
-      "strategy": 1.7655,
-      "benchmark": 2.1298
-     },
-     {
-      "t": 1657238400000,
-      "strategy": 1.8269,
-      "benchmark": 2.2382
-     },
-     {
-      "t": 1657843200000,
-      "strategy": 1.8735,
-      "benchmark": 2.3847
-     },
-     {
-      "t": 1658448000000,
-      "strategy": 1.7747,
-      "benchmark": 2.2158
-     },
-     {
-      "t": 1659052800000,
-      "strategy": 1.808,
-      "benchmark": 2.3975
-     },
-     {
-      "t": 1659657600000,
-      "strategy": 1.7638,
-      "benchmark": 2.307
-     },
-     {
-      "t": 1660262400000,
-      "strategy": 1.7654,
-      "benchmark": 2.2483
-     },
-     {
-      "t": 1660867200000,
-      "strategy": 1.7468,
-      "benchmark": 2.0021
-     },
-     {
-      "t": 1661472000000,
-      "strategy": 1.8154,
-      "benchmark": 2.4999
-     },
-     {
-      "t": 1662076800000,
-      "strategy": 1.8014,
-      "benchmark": 2.2967
-     },
-     {
-      "t": 1662681600000,
-      "strategy": 1.7837,
-      "benchmark": 2.2357
-     },
-     {
-      "t": 1663286400000,
-      "strategy": 1.7976,
-      "benchmark": 2.3932
-     },
-     {
-      "t": 1663891200000,
-      "strategy": 1.7488,
-      "benchmark": 2.1772
-     },
-     {
-      "t": 1664496000000,
-      "strategy": 1.7378,
-      "benchmark": 2.387
-     },
-     {
-      "t": 1665100800000,
-      "strategy": 1.7084,
-      "benchmark": 2.3767
-     },
-     {
-      "t": 1665705600000,
-      "strategy": 1.727,
-      "benchmark": 2.2723
-     },
-     {
-      "t": 1666310400000,
-      "strategy": 1.7465,
-      "benchmark": 2.3139
-     },
-     {
-      "t": 1666915200000,
-      "strategy": 1.817,
-      "benchmark": 2.5283
-     },
-     {
-      "t": 1667520000000,
-      "strategy": 1.81,
-      "benchmark": 2.6125
-     },
-     {
-      "t": 1668124800000,
-      "strategy": 1.788,
-      "benchmark": 2.4029
-     },
-     {
-      "t": 1668729600000,
-      "strategy": 1.7412,
-      "benchmark": 2.4772
-     },
-     {
-      "t": 1669334400000,
-      "strategy": 1.7453,
-      "benchmark": 2.328
-     },
-     {
-      "t": 1669939200000,
-      "strategy": 1.7352,
-      "benchmark": 2.1975
-     },
-     {
-      "t": 1670544000000,
-      "strategy": 1.7174,
-      "benchmark": 2.0925
-     },
-     {
-      "t": 1671148800000,
-      "strategy": 1.7284,
-      "benchmark": 1.954
-     },
-     {
-      "t": 1671753600000,
-      "strategy": 1.7015,
-      "benchmark": 1.9018
-     },
-     {
-      "t": 1672358400000,
-      "strategy": 1.7223,
-      "benchmark": 2.1609
-     },
-     {
-      "t": 1672963200000,
-      "strategy": 1.8175,
-      "benchmark": 2.4462
-     },
-     {
-      "t": 1673568000000,
-      "strategy": 1.8814,
-      "benchmark": 2.5827
-     },
-     {
-      "t": 1674172800000,
-      "strategy": 1.8984,
-      "benchmark": 2.6834
-     },
-     {
-      "t": 1674777600000,
-      "strategy": 1.9672,
-      "benchmark": 3.0641
-     },
-     {
-      "t": 1675382400000,
-      "strategy": 2.0349,
-      "benchmark": 3.1215
-     },
-     {
-      "t": 1675987200000,
-      "strategy": 1.9667,
-      "benchmark": 2.2257
-     },
-     {
-      "t": 1676592000000,
-      "strategy": 2.029,
-      "benchmark": 2.2782
-     },
-     {
-      "t": 1677196800000,
-      "strategy": 2.1407,
-      "benchmark": 2.6168
-     },
-     {
-      "t": 1677801600000,
-      "strategy": 2.102,
-      "benchmark": 2.5932
-     },
-     {
-      "t": 1678406400000,
-      "strategy": 2.104,
-      "benchmark": 2.593
-     },
-     {
-      "t": 1679011200000,
-      "strategy": 2.1333,
-      "benchmark": 2.995
-     },
-     {
-      "t": 1679616000000,
-      "strategy": 2.0445,
-      "benchmark": 3.135
-     },
-     {
-      "t": 1680220800000,
-      "strategy": 2.0401,
-      "benchmark": 2.8166
-     },
-     {
-      "t": 1680825600000,
-      "strategy": 2.0065,
-      "benchmark": 2.6268
-     },
-     {
-      "t": 1681430400000,
-      "strategy": 2.0754,
-      "benchmark": 2.5105
-     },
-     {
-      "t": 1682035200000,
-      "strategy": 2.0507,
-      "benchmark": 2.3128
-     },
-     {
-      "t": 1682640000000,
-      "strategy": 2.1265,
-      "benchmark": 2.5095
-     },
-     {
-      "t": 1683244800000,
-      "strategy": 2.0798,
-      "benchmark": 2.2508
-     },
-     {
-      "t": 1683849600000,
-      "strategy": 2.1333,
-      "benchmark": 2.2365
-     },
-     {
-      "t": 1684454400000,
-      "strategy": 2.0648,
-      "benchmark": 1.99
-     },
-     {
-      "t": 1685059200000,
-      "strategy": 2.0505,
-      "benchmark": 1.7838
-     },
-     {
-      "t": 1685664000000,
-      "strategy": 1.9809,
-      "benchmark": 1.7091
-     },
-     {
-      "t": 1686268800000,
-      "strategy": 2.0144,
-      "benchmark": 1.5246
-     },
-     {
-      "t": 1686873600000,
-      "strategy": 1.961,
-      "benchmark": 1.3032
-     },
-     {
-      "t": 1687478400000,
-      "strategy": 2.017,
-      "benchmark": 1.3173
-     },
-     {
-      "t": 1688083200000,
-      "strategy": 1.9542,
-      "benchmark": 1.2178
-     },
-     {
-      "t": 1688688000000,
-      "strategy": 1.9417,
-      "benchmark": 1.3645
-     },
-     {
-      "t": 1689292800000,
-      "strategy": 1.8321,
-      "benchmark": 1.2362
-     },
-     {
-      "t": 1689897600000,
-      "strategy": 1.7735,
-      "benchmark": 1.1666
-     },
-     {
-      "t": 1690502400000,
-      "strategy": 1.7479,
-      "benchmark": 1.2827
-     },
-     {
-      "t": 1691107200000,
-      "strategy": 1.7794,
-      "benchmark": 1.3096
-     },
-     {
-      "t": 1691712000000,
-      "strategy": 1.8197,
-      "benchmark": 1.3651
-     },
-     {
-      "t": 1692316800000,
-      "strategy": 1.8694,
-      "benchmark": 1.537
-     },
-     {
-      "t": 1692921600000,
-      "strategy": 1.8284,
-      "benchmark": 1.4128
-     },
-     {
-      "t": 1693526400000,
-      "strategy": 1.8066,
-      "benchmark": 1.322
-     },
-     {
-      "t": 1694131200000,
-      "strategy": 1.7698,
-      "benchmark": 1.2813
-     },
-     {
-      "t": 1694736000000,
-      "strategy": 1.8407,
-      "benchmark": 1.3701
-     },
-     {
-      "t": 1695340800000,
-      "strategy": 1.9868,
-      "benchmark": 1.5021
-     },
-     {
-      "t": 1695945600000,
-      "strategy": 1.9791,
-      "benchmark": 1.5713
-     },
-     {
-      "t": 1696550400000,
-      "strategy": 1.9584,
-      "benchmark": 1.4547
-     },
-     {
-      "t": 1697155200000,
-      "strategy": 1.9971,
-      "benchmark": 1.563
-     },
-     {
-      "t": 1697760000000,
-      "strategy": 2.0479,
-      "benchmark": 1.5698
-     },
-     {
-      "t": 1698364800000,
-      "strategy": 2.1011,
-      "benchmark": 1.4681
-     },
-     {
-      "t": 1698969600000,
-      "strategy": 2.0537,
-      "benchmark": 1.3479
-     },
-     {
-      "t": 1699574400000,
-      "strategy": 2.0282,
-      "benchmark": 1.3351
-     },
-     {
-      "t": 1700179200000,
-      "strategy": 2.0362,
-      "benchmark": 1.2362
-     },
-     {
-      "t": 1700784000000,
-      "strategy": 2.112,
-      "benchmark": 1.2825
-     },
-     {
-      "t": 1701388800000,
-      "strategy": 2.0992,
-      "benchmark": 1.4055
-     },
-     {
-      "t": 1701993600000,
-      "strategy": 2.1805,
-      "benchmark": 1.3951
-     },
-     {
-      "t": 1702598400000,
-      "strategy": 2.1355,
-      "benchmark": 1.3155
-     },
-     {
-      "t": 1703203200000,
-      "strategy": 2.0797,
-      "benchmark": 1.2791
-     },
-     {
-      "t": 1703808000000,
-      "strategy": 2.1279,
-      "benchmark": 1.3464
-     },
-     {
-      "t": 1704412800000,
-      "strategy": 2.2043,
-      "benchmark": 1.4815
-     },
-     {
-      "t": 1705017600000,
-      "strategy": 2.2035,
-      "benchmark": 1.7137
-     },
-     {
-      "t": 1705622400000,
-      "strategy": 2.2396,
-      "benchmark": 1.7572
-     },
-     {
-      "t": 1706227200000,
-      "strategy": 2.2786,
-      "benchmark": 1.689
-     },
-     {
-      "t": 1706832000000,
-      "strategy": 2.2519,
-      "benchmark": 1.735
-     },
-     {
-      "t": 1707436800000,
-      "strategy": 2.3426,
-      "benchmark": 2.0756
-     },
-     {
-      "t": 1708041600000,
-      "strategy": 2.3562,
-      "benchmark": 2.1126
-     },
-     {
-      "t": 1708646400000,
-      "strategy": 2.4346,
-      "benchmark": 2.1285
-     },
-     {
-      "t": 1709251200000,
-      "strategy": 2.5722,
-      "benchmark": 2.3653
-     },
-     {
-      "t": 1709856000000,
-      "strategy": 2.6716,
-      "benchmark": 2.3905
-     },
-     {
-      "t": 1710460800000,
-      "strategy": 2.6222,
-      "benchmark": 2.2593
-     },
-     {
-      "t": 1711065600000,
-      "strategy": 2.657,
-      "benchmark": 2.4617
-     },
-     {
-      "t": 1711670400000,
-      "strategy": 2.6209,
-      "benchmark": 2.3122
-     },
-     {
-      "t": 1712275200000,
-      "strategy": 2.7229,
-      "benchmark": 2.5748
-     },
-     {
-      "t": 1712880000000,
-      "strategy": 2.8176,
-      "benchmark": 2.6181
-     },
-     {
-      "t": 1713484800000,
-      "strategy": 2.7569,
-      "benchmark": 2.5011
-     },
-     {
-      "t": 1714089600000,
-      "strategy": 2.8214,
-      "benchmark": 2.6498
-     },
-     {
-      "t": 1714694400000,
-      "strategy": 2.6998,
-      "benchmark": 2.5399
-     },
-     {
-      "t": 1715299200000,
-      "strategy": 2.7846,
-      "benchmark": 2.7809
-     },
-     {
-      "t": 1715904000000,
-      "strategy": 2.8297,
-      "benchmark": 2.56
-     },
-     {
-      "t": 1716508800000,
-      "strategy": 2.9074,
-      "benchmark": 2.4465
-     },
-     {
-      "t": 1717113600000,
-      "strategy": 2.9217,
-      "benchmark": 2.2718
-     },
-     {
-      "t": 1717718400000,
-      "strategy": 2.8501,
-      "benchmark": 2.278
-     },
-     {
-      "t": 1718323200000,
-      "strategy": 2.7501,
-      "benchmark": 1.9891
-     },
-     {
-      "t": 1718928000000,
-      "strategy": 2.6576,
-      "benchmark": 1.931
-     },
-     {
-      "t": 1719532800000,
-      "strategy": 2.6506,
-      "benchmark": 1.8117
-     },
-     {
-      "t": 1720137600000,
-      "strategy": 2.7305,
-      "benchmark": 1.8839
-     },
-     {
-      "t": 1720742400000,
-      "strategy": 2.8223,
-      "benchmark": 1.8563
-     },
-     {
-      "t": 1721347200000,
-      "strategy": 2.8659,
-      "benchmark": 1.7851
-     },
-     {
-      "t": 1721952000000,
-      "strategy": 2.9294,
-      "benchmark": 1.973
-     },
-     {
-      "t": 1722556800000,
-      "strategy": 2.8949,
-      "benchmark": 1.6981
-     },
-     {
-      "t": 1723161600000,
-      "strategy": 2.9447,
-      "benchmark": 1.6307
-     },
-     {
-      "t": 1723766400000,
-      "strategy": 2.7729,
-      "benchmark": 1.2933
-     },
-     {
-      "t": 1724371200000,
-      "strategy": 2.717,
-      "benchmark": 1.1914
-     },
-     {
-      "t": 1724976000000,
-      "strategy": 2.6456,
-      "benchmark": 1.0871
-     },
-     {
-      "t": 1725580800000,
-      "strategy": 2.7136,
-      "benchmark": 0.9404
-     },
-     {
-      "t": 1726185600000,
-      "strategy": 2.7505,
-      "benchmark": 1.0005
-     },
-     {
-      "t": 1726790400000,
-      "strategy": 2.737,
-      "benchmark": 1.1054
-     },
-     {
-      "t": 1727395200000,
-      "strategy": 2.8219,
-      "benchmark": 1.1488
-     },
-     {
-      "t": 1728000000000,
-      "strategy": 2.9019,
-      "benchmark": 1.3953
-     },
-     {
-      "t": 1728604800000,
-      "strategy": 2.7098,
-      "benchmark": 1.2049
-     },
-     {
-      "t": 1729209600000,
-      "strategy": 2.8234,
-      "benchmark": 1.2222
-     },
-     {
-      "t": 1729814400000,
-      "strategy": 2.8409,
-      "benchmark": 1.261
-     },
-     {
-      "t": 1730419200000,
-      "strategy": 2.8864,
-      "benchmark": 1.3776
-     },
-     {
-      "t": 1731024000000,
-      "strategy": 2.7665,
-      "benchmark": 1.2227
-     },
-     {
-      "t": 1731628800000,
-      "strategy": 2.7049,
-      "benchmark": 1.2951
-     },
-     {
-      "t": 1732233600000,
-      "strategy": 2.6706,
-      "benchmark": 1.2375
-     },
-     {
-      "t": 1732838400000,
-      "strategy": 2.6517,
-      "benchmark": 1.1276
-     },
-     {
-      "t": 1733443200000,
-      "strategy": 2.7147,
-      "benchmark": 1.3497
-     },
-     {
-      "t": 1734048000000,
-      "strategy": 2.6674,
-      "benchmark": 1.4161
-     },
-     {
-      "t": 1734652800000,
-      "strategy": 2.6075,
-      "benchmark": 1.3119
-     },
-     {
-      "t": 1735257600000,
-      "strategy": 2.7098,
-      "benchmark": 1.4243
-     },
-     {
-      "t": 1735862400000,
-      "strategy": 2.8034,
-      "benchmark": 1.5233
-     },
-     {
-      "t": 1736467200000,
-      "strategy": 2.8414,
-      "benchmark": 1.5468
-     },
-     {
-      "t": 1737072000000,
-      "strategy": 3.0157,
-      "benchmark": 1.7621
-     },
-     {
-      "t": 1737676800000,
-      "strategy": 3.0052,
-      "benchmark": 1.7635
-     },
-     {
-      "t": 1738281600000,
-      "strategy": 2.7055,
-      "benchmark": 1.3768
-     },
-     {
-      "t": 1738886400000,
-      "strategy": 2.7148,
-      "benchmark": 1.454
-     },
-     {
-      "t": 1739491200000,
-      "strategy": 2.7403,
-      "benchmark": 1.6007
-     },
-     {
-      "t": 1740096000000,
-      "strategy": 2.6653,
-      "benchmark": 1.5377
-     },
-     {
-      "t": 1740700800000,
-      "strategy": 2.6709,
-      "benchmark": 1.3386
-     },
-     {
-      "t": 1741305600000,
-      "strategy": 2.7343,
-      "benchmark": 1.3503
-     },
-     {
-      "t": 1741910400000,
-      "strategy": 2.7147,
-      "benchmark": 1.2949
-     },
-     {
-      "t": 1742515200000,
-      "strategy": 2.7428,
-      "benchmark": 1.2938
-     },
-     {
-      "t": 1743120000000,
-      "strategy": 2.8104,
-      "benchmark": 1.3379
-     },
-     {
-      "t": 1743724800000,
-      "strategy": 2.9104,
-      "benchmark": 1.3725
-     },
-     {
-      "t": 1744329600000,
-      "strategy": 2.948,
-      "benchmark": 1.4508
-     },
-     {
-      "t": 1744934400000,
-      "strategy": 2.9686,
-      "benchmark": 1.7109
-     },
-     {
-      "t": 1745539200000,
-      "strategy": 3.0574,
-      "benchmark": 1.8394
-     },
-     {
-      "t": 1746144000000,
-      "strategy": 3.0086,
-      "benchmark": 1.9386
-     },
-     {
-      "t": 1746748800000,
-      "strategy": 2.8845,
-      "benchmark": 1.8294
-     },
-     {
-      "t": 1747353600000,
-      "strategy": 2.953,
-      "benchmark": 1.7725
-     },
-     {
-      "t": 1747958400000,
-      "strategy": 3.0936,
-      "benchmark": 2.0092
-     },
-     {
-      "t": 1748563200000,
-      "strategy": 3.1245,
-      "benchmark": 2.0033
-     },
-     {
-      "t": 1749168000000,
-      "strategy": 3.3046,
-      "benchmark": 2.0621
-     },
-     {
-      "t": 1749772800000,
-      "strategy": 3.3586,
-      "benchmark": 1.9585
-     },
-     {
-      "t": 1750377600000,
-      "strategy": 3.362,
-      "benchmark": 1.909
-     },
-     {
-      "t": 1750982400000,
-      "strategy": 3.3224,
-      "benchmark": 1.6665
-     },
-     {
-      "t": 1751241600000,
-      "strategy": 3.4657,
-      "benchmark": 1.9048
-     }
-    ],
-    "metrics": [
-     {
-      "label": "Total return",
-      "strategy": 2.4657,
-      "benchmark": 0.9048,
-      "format": "percent"
-     },
-     {
-      "label": "CAGR",
-      "strategy": 0.3182,
-      "benchmark": 0.154,
-      "format": "percent"
-     },
-     {
-      "label": "Volatility",
-      "strategy": 0.2036,
-      "benchmark": 0.6656,
-      "format": "percent"
-     },
-     {
-      "label": "Sharpe",
-      "strategy": 1.46,
-      "benchmark": 0.55,
-      "format": "ratio"
-     },
-     {
-      "label": "Max drawdown",
-      "strategy": 0.2012,
-      "benchmark": 0.7175,
-      "format": "percent"
-     },
-     {
-      "label": "Win rate",
-      "strategy": 0.3171,
-      "benchmark": null,
-      "format": "percent"
-     },
-     {
-      "label": "Profit factor",
-      "strategy": 1.24,
-      "benchmark": null,
-      "format": "ratio"
-     },
-     {
-      "label": "Trades",
-      "strategy": 41,
-      "benchmark": null,
-      "format": "count"
-     }
-    ],
-    "trades": [
-     {
-      "id": 1,
-      "side": "long",
-      "entryTime": 1609977600000,
-      "exitTime": 1611100800000,
-      "entryPrice": 29742.52,
-      "exitPrice": 28424.11,
-      "returnPct": -4.43
-     },
-     {
-      "id": 2,
-      "side": "long",
-      "entryTime": 1613433600000,
-      "exitTime": 1613606400000,
-      "entryPrice": 38885.66,
-      "exitPrice": 37129.14,
-      "returnPct": -4.52
-     },
-     {
-      "id": 3,
-      "side": "long",
-      "entryTime": 1616803200000,
-      "exitTime": 1618617600000,
-      "entryPrice": 33734.58,
-      "exitPrice": 38203.31,
-      "returnPct": 13.25
-     },
-     {
-      "id": 4,
-      "side": "short",
-      "entryTime": 1619913600000,
-      "exitTime": 1620345600000,
-      "entryPrice": 20037.2,
-      "exitPrice": 18108.4,
-      "returnPct": 9.63
-     },
-     {
-      "id": 5,
-      "side": "long",
-      "entryTime": 1623801600000,
-      "exitTime": 1624147200000,
-      "entryPrice": 16145.41,
-      "exitPrice": 15440.28,
-      "returnPct": -4.37
-     },
-     {
-      "id": 6,
-      "side": "long",
-      "entryTime": 1627603200000,
-      "exitTime": 1629331200000,
-      "entryPrice": 21607.89,
-      "exitPrice": 20932.75,
-      "returnPct": -3.12
-     },
-     {
-      "id": 7,
-      "side": "short",
-      "entryTime": 1630454400000,
-      "exitTime": 1630627200000,
-      "entryPrice": 20095.94,
-      "exitPrice": 21360.54,
-      "returnPct": -6.29
-     },
-     {
-      "id": 8,
-      "side": "long",
-      "entryTime": 1633737600000,
-      "exitTime": 1635292800000,
-      "entryPrice": 20882.66,
-      "exitPrice": 23327.08,
-      "returnPct": 11.71
-     },
-     {
-      "id": 9,
-      "side": "short",
-      "entryTime": 1637971200000,
-      "exitTime": 1638316800000,
-      "entryPrice": 25979.86,
-      "exitPrice": 27418.47,
-      "returnPct": -5.54
-     },
-     {
-      "id": 10,
-      "side": "long",
-      "entryTime": 1640563200000,
-      "exitTime": 1640736000000,
-      "entryPrice": 23362.06,
-      "exitPrice": 22430.65,
-      "returnPct": -3.99
-     },
-     {
-      "id": 11,
-      "side": "long",
-      "entryTime": 1644278400000,
-      "exitTime": 1645401600000,
-      "entryPrice": 25010.05,
-      "exitPrice": 24503.17,
-      "returnPct": -2.03
-     },
-     {
-      "id": 12,
-      "side": "long",
-      "entryTime": 1647475200000,
-      "exitTime": 1648425600000,
-      "entryPrice": 28437.6,
-      "exitPrice": 26638.93,
-      "returnPct": -6.32
-     },
-     {
-      "id": 13,
-      "side": "long",
-      "entryTime": 1651363200000,
-      "exitTime": 1652140800000,
-      "entryPrice": 51241.07,
-      "exitPrice": 58456.31,
-      "returnPct": 14.08
-     },
-     {
-      "id": 14,
-      "side": "long",
-      "entryTime": 1655164800000,
-      "exitTime": 1655856000000,
-      "entryPrice": 45984.68,
-      "exitPrice": 44481.18,
-      "returnPct": -3.27
-     },
-     {
-      "id": 15,
-      "side": "short",
-      "entryTime": 1657929600000,
-      "exitTime": 1658188800000,
-      "entryPrice": 69235.64,
-      "exitPrice": 72415.95,
-      "returnPct": -4.59
-     },
-     {
-      "id": 16,
-      "side": "long",
-      "entryTime": 1661644800000,
-      "exitTime": 1662508800000,
-      "entryPrice": 67639.78,
-      "exitPrice": 63788.38,
-      "returnPct": -5.69
-     },
-     {
-      "id": 17,
-      "side": "short",
-      "entryTime": 1665100800000,
-      "exitTime": 1667088000000,
-      "entryPrice": 68925.62,
-      "exitPrice": 71467.13,
-      "returnPct": -3.69
-     },
-     {
-      "id": 18,
-      "side": "long",
-      "entryTime": 1668729600000,
-      "exitTime": 1668816000000,
-      "entryPrice": 71838.09,
-      "exitPrice": 69648.7,
-      "returnPct": -3.05
-     },
-     {
-      "id": 19,
-      "side": "long",
-      "entryTime": 1671753600000,
-      "exitTime": 1671926400000,
-      "entryPrice": 55151.66,
-      "exitPrice": 52827.74,
-      "returnPct": -4.21
-     },
-     {
-      "id": 20,
-      "side": "long",
-      "entryTime": 1675209600000,
-      "exitTime": 1676419200000,
-      "entryPrice": 86952.48,
-      "exitPrice": 81869.96,
-      "returnPct": -5.85
-     },
-     {
-      "id": 21,
-      "side": "short",
-      "entryTime": 1679184000000,
-      "exitTime": 1680480000000,
-      "entryPrice": 83505.76,
-      "exitPrice": 86794,
-      "returnPct": -3.94
-     },
-     {
-      "id": 22,
-      "side": "short",
-      "entryTime": 1682640000000,
-      "exitTime": 1684022400000,
-      "entryPrice": 72775.99,
-      "exitPrice": 76422.5,
-      "returnPct": -5.01
-     },
-     {
-      "id": 23,
-      "side": "long",
-      "entryTime": 1685577600000,
-      "exitTime": 1686960000000,
-      "entryPrice": 50028.77,
-      "exitPrice": 48403.49,
-      "returnPct": -3.25
-     },
-     {
-      "id": 24,
-      "side": "short",
-      "entryTime": 1689292800000,
-      "exitTime": 1690934400000,
-      "entryPrice": 35849.63,
-      "exitPrice": 36545.97,
-      "returnPct": -1.94
-     },
-     {
-      "id": 25,
-      "side": "long",
-      "entryTime": 1693008000000,
-      "exitTime": 1694044800000,
-      "entryPrice": 39747.63,
-      "exitPrice": 38681.97,
-      "returnPct": -2.68
-     },
-     {
-      "id": 26,
-      "side": "short",
-      "entryTime": 1696118400000,
-      "exitTime": 1696377600000,
-      "entryPrice": 44791.71,
-      "exitPrice": 46327.36,
-      "returnPct": -3.43
-     },
-     {
-      "id": 27,
-      "side": "long",
-      "entryTime": 1700092800000,
-      "exitTime": 1702080000000,
-      "entryPrice": 36556.17,
-      "exitPrice": 35962.43,
-      "returnPct": -1.62
-     },
-     {
-      "id": 28,
-      "side": "short",
-      "entryTime": 1703635200000,
-      "exitTime": 1704844800000,
-      "entryPrice": 38655.13,
-      "exitPrice": 40440.07,
-      "returnPct": -4.62
-     },
-     {
-      "id": 29,
-      "side": "short",
-      "entryTime": 1706659200000,
-      "exitTime": 1707696000000,
-      "entryPrice": 49854.39,
-      "exitPrice": 42347.85,
-      "returnPct": 15.06
-     },
-     {
-      "id": 30,
-      "side": "long",
-      "entryTime": 1709769600000,
-      "exitTime": 1711843200000,
-      "entryPrice": 70674.61,
-      "exitPrice": 67155.79,
-      "returnPct": -4.98
-     },
-     {
-      "id": 31,
-      "side": "long",
-      "entryTime": 1714089600000,
-      "exitTime": 1716163200000,
-      "entryPrice": 76844.42,
-      "exitPrice": 81933.99,
-      "returnPct": 6.62
-     },
-     {
-      "id": 32,
-      "side": "short",
-      "entryTime": 1716940800000,
-      "exitTime": 1717891200000,
-      "entryPrice": 65908.94,
-      "exitPrice": 67123.44,
-      "returnPct": -1.84
-     },
-     {
-      "id": 33,
-      "side": "long",
-      "entryTime": 1720483200000,
-      "exitTime": 1721088000000,
-      "entryPrice": 55670.66,
-      "exitPrice": 63455.74,
-      "returnPct": 13.98
-     },
-     {
-      "id": 34,
-      "side": "short",
-      "entryTime": 1723852800000,
-      "exitTime": 1725148800000,
-      "entryPrice": 37463.2,
-      "exitPrice": 30991.79,
-      "returnPct": 17.27
-     },
-     {
-      "id": 35,
-      "side": "long",
-      "entryTime": 1727395200000,
-      "exitTime": 1727913600000,
-      "entryPrice": 33315.45,
-      "exitPrice": 32275.12,
-      "returnPct": -3.12
-     },
-     {
-      "id": 36,
-      "side": "long",
-      "entryTime": 1731024000000,
-      "exitTime": 1731110400000,
-      "entryPrice": 35459.75,
-      "exitPrice": 37791.28,
-      "returnPct": 6.58
-     },
-     {
-      "id": 37,
-      "side": "long",
-      "entryTime": 1733961600000,
-      "exitTime": 1735689600000,
-      "entryPrice": 38938.57,
-      "exitPrice": 43900.69,
-      "returnPct": 12.74
-     },
-     {
-      "id": 38,
-      "side": "long",
-      "entryTime": 1738022400000,
-      "exitTime": 1739750400000,
-      "entryPrice": 48303.75,
-      "exitPrice": 50993.73,
-      "returnPct": 5.57
-     },
-     {
-      "id": 39,
-      "side": "long",
-      "entryTime": 1740960000000,
-      "exitTime": 1741219200000,
-      "entryPrice": 38948.2,
-      "exitPrice": 41161.15,
-      "returnPct": 5.68
-     },
-     {
-      "id": 40,
-      "side": "long",
-      "entryTime": 1744848000000,
-      "exitTime": 1746403200000,
-      "entryPrice": 45397.01,
-      "exitPrice": 43022.49,
-      "returnPct": -5.23
-     },
-     {
-      "id": 41,
-      "side": "short",
-      "entryTime": 1748044800000,
-      "exitTime": 1749686400000,
-      "entryPrice": 55998.56,
-      "exitPrice": 52023.98,
-      "returnPct": 7.1
-     }
-    ]
+    "totalReturn": 2.4657,
+    "decision": "trade"
    }
   },
   {
@@ -1677,2436 +16,10 @@
    "kind": "Mean reversion",
    "description": "Buys when RSI falls below its oversold level and sells when it recovers to the middle.",
    "last": {
-    "decision": "no_trade",
-    "instrument": {
-     "venue": "bybit",
-     "symbol": "ETHUSDT",
-     "kind": "spot"
-    },
-    "period": {
-     "from": 1609459200000,
-     "to": 1751241600000
-    },
+    "id": "1794132900000-c03d91f7",
     "finishedAt": 1794132900000,
-    "criteria": [
-     {
-      "label": "Out-of-sample Sharpe",
-      "value": 0.36,
-      "limit": 1,
-      "rule": "at_least",
-      "format": "ratio",
-      "pass": false
-     },
-     {
-      "label": "Max drawdown",
-      "value": 0.5247,
-      "limit": 0.25,
-      "rule": "at_most",
-      "format": "percent",
-      "pass": false
-     },
-     {
-      "label": "Trades",
-      "value": 126,
-      "limit": 30,
-      "rule": "at_least",
-      "format": "count",
-      "pass": true
-     }
-    ],
-    "keyNumbers": [
-     {
-      "label": "Return",
-      "value": 0.5523,
-      "format": "percent",
-      "tone": "pnl"
-     },
-     {
-      "label": "CAGR",
-      "value": 0.1027,
-      "format": "percent",
-      "tone": "pnl"
-     },
-     {
-      "label": "Sharpe",
-      "value": 0.44,
-      "format": "ratio"
-     },
-     {
-      "label": "Max drawdown",
-      "value": 0.5247,
-      "format": "percent"
-     }
-    ],
-    "benchmarkLabel": "Buy and hold",
-    "equity": [
-     {
-      "t": 1609459200000,
-      "strategy": 1,
-      "benchmark": 1
-     },
-     {
-      "t": 1610064000000,
-      "strategy": 0.9253,
-      "benchmark": 0.8685
-     },
-     {
-      "t": 1610668800000,
-      "strategy": 0.963,
-      "benchmark": 0.9349
-     },
-     {
-      "t": 1611273600000,
-      "strategy": 1.0785,
-      "benchmark": 1.152
-     },
-     {
-      "t": 1611878400000,
-      "strategy": 1.0291,
-      "benchmark": 1.0308
-     },
-     {
-      "t": 1612483200000,
-      "strategy": 1.0368,
-      "benchmark": 1.0924
-     },
-     {
-      "t": 1613088000000,
-      "strategy": 1.0291,
-      "benchmark": 1.0683
-     },
-     {
-      "t": 1613692800000,
-      "strategy": 1.1017,
-      "benchmark": 1.2379
-     },
-     {
-      "t": 1614297600000,
-      "strategy": 1.0639,
-      "benchmark": 1.2038
-     },
-     {
-      "t": 1614902400000,
-      "strategy": 1.1584,
-      "benchmark": 1.2818
-     },
-     {
-      "t": 1615507200000,
-      "strategy": 1.1568,
-      "benchmark": 1.3303
-     },
-     {
-      "t": 1616112000000,
-      "strategy": 1.1099,
-      "benchmark": 1.3205
-     },
-     {
-      "t": 1616716800000,
-      "strategy": 1.164,
-      "benchmark": 1.5729
-     },
-     {
-      "t": 1617321600000,
-      "strategy": 1.2626,
-      "benchmark": 1.7211
-     },
-     {
-      "t": 1617926400000,
-      "strategy": 1.2245,
-      "benchmark": 1.5756
-     },
-     {
-      "t": 1618531200000,
-      "strategy": 1.126,
-      "benchmark": 1.3981
-     },
-     {
-      "t": 1619136000000,
-      "strategy": 1.1108,
-      "benchmark": 1.429
-     },
-     {
-      "t": 1619740800000,
-      "strategy": 1.0854,
-      "benchmark": 1.4189
-     },
-     {
-      "t": 1620345600000,
-      "strategy": 1.1171,
-      "benchmark": 1.5667
-     },
-     {
-      "t": 1620950400000,
-      "strategy": 1.1165,
-      "benchmark": 1.5868
-     },
-     {
-      "t": 1621555200000,
-      "strategy": 1.0146,
-      "benchmark": 1.4068
-     },
-     {
-      "t": 1622160000000,
-      "strategy": 0.9872,
-      "benchmark": 1.2479
-     },
-     {
-      "t": 1622764800000,
-      "strategy": 0.9811,
-      "benchmark": 1.1693
-     },
-     {
-      "t": 1623369600000,
-      "strategy": 0.9899,
-      "benchmark": 1.2332
-     },
-     {
-      "t": 1623974400000,
-      "strategy": 0.9578,
-      "benchmark": 1.1485
-     },
-     {
-      "t": 1624579200000,
-      "strategy": 0.9265,
-      "benchmark": 1.0582
-     },
-     {
-      "t": 1625184000000,
-      "strategy": 0.9201,
-      "benchmark": 1.0326
-     },
-     {
-      "t": 1625788800000,
-      "strategy": 0.9303,
-      "benchmark": 1.0315
-     },
-     {
-      "t": 1626393600000,
-      "strategy": 0.9999,
-      "benchmark": 1.1549
-     },
-     {
-      "t": 1626998400000,
-      "strategy": 1.0222,
-      "benchmark": 1.1177
-     },
-     {
-      "t": 1627603200000,
-      "strategy": 1.0969,
-      "benchmark": 1.2945
-     },
-     {
-      "t": 1628208000000,
-      "strategy": 1.0443,
-      "benchmark": 1.1329
-     },
-     {
-      "t": 1628812800000,
-      "strategy": 1.023,
-      "benchmark": 1.207
-     },
-     {
-      "t": 1629417600000,
-      "strategy": 1.0361,
-      "benchmark": 1.1673
-     },
-     {
-      "t": 1630022400000,
-      "strategy": 1.1336,
-      "benchmark": 1.3584
-     },
-     {
-      "t": 1630627200000,
-      "strategy": 1.08,
-      "benchmark": 1.2659
-     },
-     {
-      "t": 1631232000000,
-      "strategy": 1.2361,
-      "benchmark": 1.5724
-     },
-     {
-      "t": 1631836800000,
-      "strategy": 1.3619,
-      "benchmark": 1.8415
-     },
-     {
-      "t": 1632441600000,
-      "strategy": 1.2564,
-      "benchmark": 1.707
-     },
-     {
-      "t": 1633046400000,
-      "strategy": 1.0723,
-      "benchmark": 1.2996
-     },
-     {
-      "t": 1633651200000,
-      "strategy": 1.0295,
-      "benchmark": 1.0715
-     },
-     {
-      "t": 1634256000000,
-      "strategy": 0.9995,
-      "benchmark": 0.9745
-     },
-     {
-      "t": 1634860800000,
-      "strategy": 1.0321,
-      "benchmark": 1.0958
-     },
-     {
-      "t": 1635465600000,
-      "strategy": 1.0271,
-      "benchmark": 1.278
-     },
-     {
-      "t": 1636070400000,
-      "strategy": 0.8891,
-      "benchmark": 0.92
-     },
-     {
-      "t": 1636675200000,
-      "strategy": 0.8589,
-      "benchmark": 0.8764
-     },
-     {
-      "t": 1637280000000,
-      "strategy": 0.9287,
-      "benchmark": 1.0707
-     },
-     {
-      "t": 1637884800000,
-      "strategy": 0.8724,
-      "benchmark": 0.9882
-     },
-     {
-      "t": 1638489600000,
-      "strategy": 0.894,
-      "benchmark": 1.0071
-     },
-     {
-      "t": 1639094400000,
-      "strategy": 0.9077,
-      "benchmark": 1.0955
-     },
-     {
-      "t": 1639699200000,
-      "strategy": 0.9138,
-      "benchmark": 1.2171
-     },
-     {
-      "t": 1640304000000,
-      "strategy": 0.8879,
-      "benchmark": 1.0657
-     },
-     {
-      "t": 1640908800000,
-      "strategy": 0.7755,
-      "benchmark": 0.8075
-     },
-     {
-      "t": 1641513600000,
-      "strategy": 0.8096,
-      "benchmark": 0.9324
-     },
-     {
-      "t": 1642118400000,
-      "strategy": 0.8121,
-      "benchmark": 0.8964
-     },
-     {
-      "t": 1642723200000,
-      "strategy": 0.8471,
-      "benchmark": 0.9268
-     },
-     {
-      "t": 1643328000000,
-      "strategy": 0.9185,
-      "benchmark": 1.0183
-     },
-     {
-      "t": 1643932800000,
-      "strategy": 0.8708,
-      "benchmark": 0.9719
-     },
-     {
-      "t": 1644537600000,
-      "strategy": 0.8253,
-      "benchmark": 0.9337
-     },
-     {
-      "t": 1645142400000,
-      "strategy": 0.861,
-      "benchmark": 1.0163
-     },
-     {
-      "t": 1645747200000,
-      "strategy": 0.8101,
-      "benchmark": 0.9738
-     },
-     {
-      "t": 1646352000000,
-      "strategy": 0.8708,
-      "benchmark": 1.0551
-     },
-     {
-      "t": 1646956800000,
-      "strategy": 0.809,
-      "benchmark": 0.9407
-     },
-     {
-      "t": 1647561600000,
-      "strategy": 0.8329,
-      "benchmark": 1.0051
-     },
-     {
-      "t": 1648166400000,
-      "strategy": 0.8972,
-      "benchmark": 1.1256
-     },
-     {
-      "t": 1648771200000,
-      "strategy": 0.9512,
-      "benchmark": 1.1826
-     },
-     {
-      "t": 1649376000000,
-      "strategy": 0.9716,
-      "benchmark": 1.2389
-     },
-     {
-      "t": 1649980800000,
-      "strategy": 0.884,
-      "benchmark": 1.0727
-     },
-     {
-      "t": 1650585600000,
-      "strategy": 0.9946,
-      "benchmark": 1.3463
-     },
-     {
-      "t": 1651190400000,
-      "strategy": 1.1519,
-      "benchmark": 1.498
-     },
-     {
-      "t": 1651795200000,
-      "strategy": 1.0395,
-      "benchmark": 1.3241
-     },
-     {
-      "t": 1652400000000,
-      "strategy": 1.0959,
-      "benchmark": 1.3625
-     },
-     {
-      "t": 1653004800000,
-      "strategy": 1.0962,
-      "benchmark": 1.2512
-     },
-     {
-      "t": 1653609600000,
-      "strategy": 1.0059,
-      "benchmark": 1.1188
-     },
-     {
-      "t": 1654214400000,
-      "strategy": 0.9266,
-      "benchmark": 0.9745
-     },
-     {
-      "t": 1654819200000,
-      "strategy": 0.8135,
-      "benchmark": 0.8544
-     },
-     {
-      "t": 1655424000000,
-      "strategy": 0.7923,
-      "benchmark": 0.7914
-     },
-     {
-      "t": 1656028800000,
-      "strategy": 0.8202,
-      "benchmark": 0.7629
-     },
-     {
-      "t": 1656633600000,
-      "strategy": 0.7916,
-      "benchmark": 0.7529
-     },
-     {
-      "t": 1657238400000,
-      "strategy": 0.7686,
-      "benchmark": 0.7377
-     },
-     {
-      "t": 1657843200000,
-      "strategy": 0.8366,
-      "benchmark": 0.8701
-     },
-     {
-      "t": 1658448000000,
-      "strategy": 0.8446,
-      "benchmark": 0.76
-     },
-     {
-      "t": 1659052800000,
-      "strategy": 0.8775,
-      "benchmark": 0.8569
-     },
-     {
-      "t": 1659657600000,
-      "strategy": 1.0131,
-      "benchmark": 1.1356
-     },
-     {
-      "t": 1660262400000,
-      "strategy": 0.9316,
-      "benchmark": 0.9676
-     },
-     {
-      "t": 1660867200000,
-      "strategy": 0.8852,
-      "benchmark": 0.9122
-     },
-     {
-      "t": 1661472000000,
-      "strategy": 0.8575,
-      "benchmark": 0.888
-     },
-     {
-      "t": 1662076800000,
-      "strategy": 0.8963,
-      "benchmark": 0.9591
-     },
-     {
-      "t": 1662681600000,
-      "strategy": 0.9629,
-      "benchmark": 1.0108
-     },
-     {
-      "t": 1663286400000,
-      "strategy": 0.9377,
-      "benchmark": 1.0579
-     },
-     {
-      "t": 1663891200000,
-      "strategy": 1.0219,
-      "benchmark": 1.2313
-     },
-     {
-      "t": 1664496000000,
-      "strategy": 1.071,
-      "benchmark": 1.3752
-     },
-     {
-      "t": 1665100800000,
-      "strategy": 1.0878,
-      "benchmark": 1.551
-     },
-     {
-      "t": 1665705600000,
-      "strategy": 1.1271,
-      "benchmark": 1.7701
-     },
-     {
-      "t": 1666310400000,
-      "strategy": 1.0591,
-      "benchmark": 1.7498
-     },
-     {
-      "t": 1666915200000,
-      "strategy": 1.0884,
-      "benchmark": 1.7368
-     },
-     {
-      "t": 1667520000000,
-      "strategy": 1.0744,
-      "benchmark": 1.7914
-     },
-     {
-      "t": 1668124800000,
-      "strategy": 1.0335,
-      "benchmark": 1.7116
-     },
-     {
-      "t": 1668729600000,
-      "strategy": 1.0094,
-      "benchmark": 1.6165
-     },
-     {
-      "t": 1669334400000,
-      "strategy": 1.0975,
-      "benchmark": 1.8714
-     },
-     {
-      "t": 1669939200000,
-      "strategy": 1.21,
-      "benchmark": 2.2387
-     },
-     {
-      "t": 1670544000000,
-      "strategy": 1.2213,
-      "benchmark": 2.3084
-     },
-     {
-      "t": 1671148800000,
-      "strategy": 1.2299,
-      "benchmark": 2.2588
-     },
-     {
-      "t": 1671753600000,
-      "strategy": 1.0655,
-      "benchmark": 1.7606
-     },
-     {
-      "t": 1672358400000,
-      "strategy": 1.1477,
-      "benchmark": 2.1759
-     },
-     {
-      "t": 1672963200000,
-      "strategy": 1.2312,
-      "benchmark": 2.6069
-     },
-     {
-      "t": 1673568000000,
-      "strategy": 1.2244,
-      "benchmark": 2.6769
-     },
-     {
-      "t": 1674172800000,
-      "strategy": 1.1907,
-      "benchmark": 2.5267
-     },
-     {
-      "t": 1674777600000,
-      "strategy": 1.2402,
-      "benchmark": 2.4946
-     },
-     {
-      "t": 1675382400000,
-      "strategy": 1.3592,
-      "benchmark": 2.7104
-     },
-     {
-      "t": 1675987200000,
-      "strategy": 1.301,
-      "benchmark": 2.6867
-     },
-     {
-      "t": 1676592000000,
-      "strategy": 1.3261,
-      "benchmark": 2.9256
-     },
-     {
-      "t": 1677196800000,
-      "strategy": 1.3652,
-      "benchmark": 2.8875
-     },
-     {
-      "t": 1677801600000,
-      "strategy": 1.2868,
-      "benchmark": 2.7794
-     },
-     {
-      "t": 1678406400000,
-      "strategy": 1.2512,
-      "benchmark": 2.8701
-     },
-     {
-      "t": 1679011200000,
-      "strategy": 1.1966,
-      "benchmark": 2.5971
-     },
-     {
-      "t": 1679616000000,
-      "strategy": 1.0886,
-      "benchmark": 2.2135
-     },
-     {
-      "t": 1680220800000,
-      "strategy": 1.1233,
-      "benchmark": 2.2937
-     },
-     {
-      "t": 1680825600000,
-      "strategy": 1.2832,
-      "benchmark": 2.7186
-     },
-     {
-      "t": 1681430400000,
-      "strategy": 1.1911,
-      "benchmark": 2.4467
-     },
-     {
-      "t": 1682035200000,
-      "strategy": 1.1147,
-      "benchmark": 2.2004
-     },
-     {
-      "t": 1682640000000,
-      "strategy": 1.1695,
-      "benchmark": 2.3063
-     },
-     {
-      "t": 1683244800000,
-      "strategy": 1.1013,
-      "benchmark": 2.2534
-     },
-     {
-      "t": 1683849600000,
-      "strategy": 1.0046,
-      "benchmark": 2.0058
-     },
-     {
-      "t": 1684454400000,
-      "strategy": 0.8905,
-      "benchmark": 1.6483
-     },
-     {
-      "t": 1685059200000,
-      "strategy": 0.9645,
-      "benchmark": 2.0363
-     },
-     {
-      "t": 1685664000000,
-      "strategy": 0.9173,
-      "benchmark": 2.0052
-     },
-     {
-      "t": 1686268800000,
-      "strategy": 0.9333,
-      "benchmark": 1.9994
-     },
-     {
-      "t": 1686873600000,
-      "strategy": 0.8489,
-      "benchmark": 1.7763
-     },
-     {
-      "t": 1687478400000,
-      "strategy": 0.8382,
-      "benchmark": 1.638
-     },
-     {
-      "t": 1688083200000,
-      "strategy": 0.8261,
-      "benchmark": 1.6015
-     },
-     {
-      "t": 1688688000000,
-      "strategy": 0.7808,
-      "benchmark": 1.3724
-     },
-     {
-      "t": 1689292800000,
-      "strategy": 0.7042,
-      "benchmark": 1.2283
-     },
-     {
-      "t": 1689897600000,
-      "strategy": 0.708,
-      "benchmark": 1.1834
-     },
-     {
-      "t": 1690502400000,
-      "strategy": 0.8136,
-      "benchmark": 1.4814
-     },
-     {
-      "t": 1691107200000,
-      "strategy": 0.8089,
-      "benchmark": 1.5249
-     },
-     {
-      "t": 1691712000000,
-      "strategy": 0.8115,
-      "benchmark": 1.7442
-     },
-     {
-      "t": 1692316800000,
-      "strategy": 0.8691,
-      "benchmark": 2.0967
-     },
-     {
-      "t": 1692921600000,
-      "strategy": 0.8499,
-      "benchmark": 1.9082
-     },
-     {
-      "t": 1693526400000,
-      "strategy": 0.9117,
-      "benchmark": 2.3076
-     },
-     {
-      "t": 1694131200000,
-      "strategy": 0.8806,
-      "benchmark": 2.1108
-     },
-     {
-      "t": 1694736000000,
-      "strategy": 0.8087,
-      "benchmark": 1.8812
-     },
-     {
-      "t": 1695340800000,
-      "strategy": 0.8105,
-      "benchmark": 1.8562
-     },
-     {
-      "t": 1695945600000,
-      "strategy": 0.6936,
-      "benchmark": 1.4979
-     },
-     {
-      "t": 1696550400000,
-      "strategy": 0.7367,
-      "benchmark": 1.5992
-     },
-     {
-      "t": 1697155200000,
-      "strategy": 0.8448,
-      "benchmark": 1.9615
-     },
-     {
-      "t": 1697760000000,
-      "strategy": 0.8813,
-      "benchmark": 2.4058
-     },
-     {
-      "t": 1698364800000,
-      "strategy": 0.8304,
-      "benchmark": 2.001
-     },
-     {
-      "t": 1698969600000,
-      "strategy": 0.8121,
-      "benchmark": 2.0535
-     },
-     {
-      "t": 1699574400000,
-      "strategy": 0.7585,
-      "benchmark": 1.8523
-     },
-     {
-      "t": 1700179200000,
-      "strategy": 0.8089,
-      "benchmark": 2.0604
-     },
-     {
-      "t": 1700784000000,
-      "strategy": 0.7733,
-      "benchmark": 1.7747
-     },
-     {
-      "t": 1701388800000,
-      "strategy": 0.8024,
-      "benchmark": 1.9249
-     },
-     {
-      "t": 1701993600000,
-      "strategy": 0.7309,
-      "benchmark": 1.6817
-     },
-     {
-      "t": 1702598400000,
-      "strategy": 0.7895,
-      "benchmark": 1.9173
-     },
-     {
-      "t": 1703203200000,
-      "strategy": 0.8192,
-      "benchmark": 2.0763
-     },
-     {
-      "t": 1703808000000,
-      "strategy": 0.8173,
-      "benchmark": 2.3974
-     },
-     {
-      "t": 1704412800000,
-      "strategy": 0.8514,
-      "benchmark": 2.5799
-     },
-     {
-      "t": 1705017600000,
-      "strategy": 0.8357,
-      "benchmark": 2.533
-     },
-     {
-      "t": 1705622400000,
-      "strategy": 0.789,
-      "benchmark": 2.4786
-     },
-     {
-      "t": 1706227200000,
-      "strategy": 0.7608,
-      "benchmark": 2.3448
-     },
-     {
-      "t": 1706832000000,
-      "strategy": 0.7363,
-      "benchmark": 2.4418
-     },
-     {
-      "t": 1707436800000,
-      "strategy": 0.732,
-      "benchmark": 2.3381
-     },
-     {
-      "t": 1708041600000,
-      "strategy": 0.7998,
-      "benchmark": 2.6685
-     },
-     {
-      "t": 1708646400000,
-      "strategy": 0.8121,
-      "benchmark": 2.7422
-     },
-     {
-      "t": 1709251200000,
-      "strategy": 0.8983,
-      "benchmark": 3.2331
-     },
-     {
-      "t": 1709856000000,
-      "strategy": 0.8715,
-      "benchmark": 3.0347
-     },
-     {
-      "t": 1710460800000,
-      "strategy": 0.9226,
-      "benchmark": 3.2243
-     },
-     {
-      "t": 1711065600000,
-      "strategy": 0.9218,
-      "benchmark": 2.988
-     },
-     {
-      "t": 1711670400000,
-      "strategy": 0.9624,
-      "benchmark": 2.9872
-     },
-     {
-      "t": 1712275200000,
-      "strategy": 1.0083,
-      "benchmark": 3.147
-     },
-     {
-      "t": 1712880000000,
-      "strategy": 0.9346,
-      "benchmark": 2.8291
-     },
-     {
-      "t": 1713484800000,
-      "strategy": 0.914,
-      "benchmark": 2.9518
-     },
-     {
-      "t": 1714089600000,
-      "strategy": 0.9938,
-      "benchmark": 3.3115
-     },
-     {
-      "t": 1714694400000,
-      "strategy": 0.9357,
-      "benchmark": 2.9954
-     },
-     {
-      "t": 1715299200000,
-      "strategy": 0.9651,
-      "benchmark": 3.3649
-     },
-     {
-      "t": 1715904000000,
-      "strategy": 1.0545,
-      "benchmark": 4.0836
-     },
-     {
-      "t": 1716508800000,
-      "strategy": 0.9943,
-      "benchmark": 3.6606
-     },
-     {
-      "t": 1717113600000,
-      "strategy": 0.9829,
-      "benchmark": 3.817
-     },
-     {
-      "t": 1717718400000,
-      "strategy": 0.9328,
-      "benchmark": 3.217
-     },
-     {
-      "t": 1718323200000,
-      "strategy": 1.0115,
-      "benchmark": 4.017
-     },
-     {
-      "t": 1718928000000,
-      "strategy": 1.047,
-      "benchmark": 4.0355
-     },
-     {
-      "t": 1719532800000,
-      "strategy": 1.0691,
-      "benchmark": 3.8768
-     },
-     {
-      "t": 1720137600000,
-      "strategy": 1.0829,
-      "benchmark": 3.6254
-     },
-     {
-      "t": 1720742400000,
-      "strategy": 1.114,
-      "benchmark": 3.8755
-     },
-     {
-      "t": 1721347200000,
-      "strategy": 1.1857,
-      "benchmark": 4.1907
-     },
-     {
-      "t": 1721952000000,
-      "strategy": 1.1411,
-      "benchmark": 4.0417
-     },
-     {
-      "t": 1722556800000,
-      "strategy": 1.3132,
-      "benchmark": 4.8366
-     },
-     {
-      "t": 1723161600000,
-      "strategy": 1.4064,
-      "benchmark": 4.8342
-     },
-     {
-      "t": 1723766400000,
-      "strategy": 1.5232,
-      "benchmark": 5.8622
-     },
-     {
-      "t": 1724371200000,
-      "strategy": 1.5786,
-      "benchmark": 6.0664
-     },
-     {
-      "t": 1724976000000,
-      "strategy": 1.5237,
-      "benchmark": 5.857
-     },
-     {
-      "t": 1725580800000,
-      "strategy": 1.5127,
-      "benchmark": 5.6611
-     },
-     {
-      "t": 1726185600000,
-      "strategy": 1.635,
-      "benchmark": 6.6465
-     },
-     {
-      "t": 1726790400000,
-      "strategy": 1.7101,
-      "benchmark": 7.1258
-     },
-     {
-      "t": 1727395200000,
-      "strategy": 1.7177,
-      "benchmark": 7.5755
-     },
-     {
-      "t": 1728000000000,
-      "strategy": 1.5187,
-      "benchmark": 6.0731
-     },
-     {
-      "t": 1728604800000,
-      "strategy": 1.5174,
-      "benchmark": 6.4125
-     },
-     {
-      "t": 1729209600000,
-      "strategy": 1.5272,
-      "benchmark": 6.1729
-     },
-     {
-      "t": 1729814400000,
-      "strategy": 1.4544,
-      "benchmark": 5.9042
-     },
-     {
-      "t": 1730419200000,
-      "strategy": 1.6821,
-      "benchmark": 7.0071
-     },
-     {
-      "t": 1731024000000,
-      "strategy": 1.83,
-      "benchmark": 7.469
-     },
-     {
-      "t": 1731628800000,
-      "strategy": 1.8496,
-      "benchmark": 8.5176
-     },
-     {
-      "t": 1732233600000,
-      "strategy": 1.7877,
-      "benchmark": 7.0432
-     },
-     {
-      "t": 1732838400000,
-      "strategy": 1.7111,
-      "benchmark": 7.5765
-     },
-     {
-      "t": 1733443200000,
-      "strategy": 1.4819,
-      "benchmark": 6.2064
-     },
-     {
-      "t": 1734048000000,
-      "strategy": 1.6416,
-      "benchmark": 7.5169
-     },
-     {
-      "t": 1734652800000,
-      "strategy": 1.5646,
-      "benchmark": 7.6129
-     },
-     {
-      "t": 1735257600000,
-      "strategy": 1.4178,
-      "benchmark": 6.2839
-     },
-     {
-      "t": 1735862400000,
-      "strategy": 1.4807,
-      "benchmark": 6.9677
-     },
-     {
-      "t": 1736467200000,
-      "strategy": 1.4541,
-      "benchmark": 6.9574
-     },
-     {
-      "t": 1737072000000,
-      "strategy": 1.5067,
-      "benchmark": 7.7883
-     },
-     {
-      "t": 1737676800000,
-      "strategy": 1.4459,
-      "benchmark": 7.5317
-     },
-     {
-      "t": 1738281600000,
-      "strategy": 1.4919,
-      "benchmark": 7.5107
-     },
-     {
-      "t": 1738886400000,
-      "strategy": 1.4326,
-      "benchmark": 7.0441
-     },
-     {
-      "t": 1739491200000,
-      "strategy": 1.4262,
-      "benchmark": 6.9928
-     },
-     {
-      "t": 1740096000000,
-      "strategy": 1.3458,
-      "benchmark": 6.3793
-     },
-     {
-      "t": 1740700800000,
-      "strategy": 1.3273,
-      "benchmark": 6.0546
-     },
-     {
-      "t": 1741305600000,
-      "strategy": 1.2206,
-      "benchmark": 5.1191
-     },
-     {
-      "t": 1741910400000,
-      "strategy": 1.2163,
-      "benchmark": 4.9947
-     },
-     {
-      "t": 1742515200000,
-      "strategy": 1.2747,
-      "benchmark": 5.7297
-     },
-     {
-      "t": 1743120000000,
-      "strategy": 1.358,
-      "benchmark": 5.8396
-     },
-     {
-      "t": 1743724800000,
-      "strategy": 1.2907,
-      "benchmark": 5.5923
-     },
-     {
-      "t": 1744329600000,
-      "strategy": 1.389,
-      "benchmark": 6.1477
-     },
-     {
-      "t": 1744934400000,
-      "strategy": 1.4192,
-      "benchmark": 6.2983
-     },
-     {
-      "t": 1745539200000,
-      "strategy": 1.3913,
-      "benchmark": 5.9536
-     },
-     {
-      "t": 1746144000000,
-      "strategy": 1.397,
-      "benchmark": 6.9346
-     },
-     {
-      "t": 1746748800000,
-      "strategy": 1.4072,
-      "benchmark": 6.2531
-     },
-     {
-      "t": 1747353600000,
-      "strategy": 1.3829,
-      "benchmark": 6.4099
-     },
-     {
-      "t": 1747958400000,
-      "strategy": 1.3449,
-      "benchmark": 6.2408
-     },
-     {
-      "t": 1748563200000,
-      "strategy": 1.3445,
-      "benchmark": 5.7236
-     },
-     {
-      "t": 1749168000000,
-      "strategy": 1.2723,
-      "benchmark": 5.9284
-     },
-     {
-      "t": 1749772800000,
-      "strategy": 1.3893,
-      "benchmark": 6.6688
-     },
-     {
-      "t": 1750377600000,
-      "strategy": 1.428,
-      "benchmark": 6.4328
-     },
-     {
-      "t": 1750982400000,
-      "strategy": 1.5069,
-      "benchmark": 7.5299
-     },
-     {
-      "t": 1751241600000,
-      "strategy": 1.5523,
-      "benchmark": 7.8308
-     }
-    ],
-    "metrics": [
-     {
-      "label": "Total return",
-      "strategy": 0.5523,
-      "benchmark": 6.8308,
-      "format": "percent"
-     },
-     {
-      "label": "CAGR",
-      "strategy": 0.1027,
-      "benchmark": 0.5801,
-      "format": "percent"
-     },
-     {
-      "label": "Volatility",
-      "strategy": 0.4804,
-      "benchmark": 0.852,
-      "format": "percent"
-     },
-     {
-      "label": "Sharpe",
-      "strategy": 0.44,
-      "benchmark": 0.96,
-      "format": "ratio"
-     },
-     {
-      "label": "Max drawdown",
-      "strategy": 0.5247,
-      "benchmark": 0.661,
-      "format": "percent"
-     },
-     {
-      "label": "Win rate",
-      "strategy": 0.5794,
-      "benchmark": null,
-      "format": "percent"
-     },
-     {
-      "label": "Profit factor",
-      "strategy": 1.09,
-      "benchmark": null,
-      "format": "ratio"
-     },
-     {
-      "label": "Trades",
-      "strategy": 126,
-      "benchmark": null,
-      "format": "count"
-     }
-    ],
-    "trades": [
-     {
-      "id": 1,
-      "side": "long",
-      "entryTime": 1609459200000,
-      "exitTime": 1609545600000,
-      "entryPrice": 730,
-      "exitPrice": 711.53,
-      "returnPct": -2.53
-     },
-     {
-      "id": 2,
-      "side": "long",
-      "entryTime": 1610668800000,
-      "exitTime": 1610841600000,
-      "entryPrice": 682.44,
-      "exitPrice": 708.79,
-      "returnPct": 3.86
-     },
-     {
-      "id": 3,
-      "side": "long",
-      "entryTime": 1611964800000,
-      "exitTime": 1612051200000,
-      "entryPrice": 767.43,
-      "exitPrice": 750.95,
-      "returnPct": -2.15
-     },
-     {
-      "id": 4,
-      "side": "long",
-      "entryTime": 1612828800000,
-      "exitTime": 1613520000000,
-      "entryPrice": 794.15,
-      "exitPrice": 768.81,
-      "returnPct": -3.19
-     },
-     {
-      "id": 5,
-      "side": "long",
-      "entryTime": 1614124800000,
-      "exitTime": 1614211200000,
-      "entryPrice": 959.37,
-      "exitPrice": 987.82,
-      "returnPct": 2.97
-     },
-     {
-      "id": 6,
-      "side": "long",
-      "entryTime": 1615334400000,
-      "exitTime": 1615507200000,
-      "entryPrice": 907.58,
-      "exitPrice": 887.32,
-      "returnPct": -2.23
-     },
-     {
-      "id": 7,
-      "side": "long",
-      "entryTime": 1616198400000,
-      "exitTime": 1616803200000,
-      "entryPrice": 1028.07,
-      "exitPrice": 1060.41,
-      "returnPct": 3.15
-     },
-     {
-      "id": 8,
-      "side": "long",
-      "entryTime": 1617408000000,
-      "exitTime": 1617753600000,
-      "entryPrice": 1254.35,
-      "exitPrice": 1199.79,
-      "returnPct": -4.35
-     },
-     {
-      "id": 9,
-      "side": "long",
-      "entryTime": 1618704000000,
-      "exitTime": 1619395200000,
-      "entryPrice": 978.66,
-      "exitPrice": 934.29,
-      "returnPct": -4.53
-     },
-     {
-      "id": 10,
-      "side": "long",
-      "entryTime": 1619740800000,
-      "exitTime": 1619913600000,
-      "entryPrice": 1035.81,
-      "exitPrice": 1062.25,
-      "returnPct": 2.55
-     },
-     {
-      "id": 11,
-      "side": "long",
-      "entryTime": 1620950400000,
-      "exitTime": 1621641600000,
-      "entryPrice": 1158.35,
-      "exitPrice": 1113.46,
-      "returnPct": -3.88
-     },
-     {
-      "id": 12,
-      "side": "long",
-      "entryTime": 1621900800000,
-      "exitTime": 1622592000000,
-      "entryPrice": 952.93,
-      "exitPrice": 973.73,
-      "returnPct": 2.18
-     },
-     {
-      "id": 13,
-      "side": "long",
-      "entryTime": 1623196800000,
-      "exitTime": 1623369600000,
-      "entryPrice": 916.24,
-      "exitPrice": 871.63,
-      "returnPct": -4.87
-     },
-     {
-      "id": 14,
-      "side": "long",
-      "entryTime": 1624320000000,
-      "exitTime": 1624406400000,
-      "entryPrice": 840.18,
-      "exitPrice": 811.45,
-      "returnPct": -3.42
-     },
-     {
-      "id": 15,
-      "side": "long",
-      "entryTime": 1625356800000,
-      "exitTime": 1625616000000,
-      "entryPrice": 762.79,
-      "exitPrice": 771.63,
-      "returnPct": 1.16
-     },
-     {
-      "id": 16,
-      "side": "long",
-      "entryTime": 1626307200000,
-      "exitTime": 1626480000000,
-      "entryPrice": 844.15,
-      "exitPrice": 830.16,
-      "returnPct": -1.66
-     },
-     {
-      "id": 17,
-      "side": "long",
-      "entryTime": 1627603200000,
-      "exitTime": 1628294400000,
-      "entryPrice": 944.98,
-      "exitPrice": 925.65,
-      "returnPct": -2.05
-     },
-     {
-      "id": 18,
-      "side": "long",
-      "entryTime": 1628553600000,
-      "exitTime": 1629072000000,
-      "entryPrice": 964.46,
-      "exitPrice": 982.99,
-      "returnPct": 1.92
-     },
-     {
-      "id": 19,
-      "side": "long",
-      "entryTime": 1629676800000,
-      "exitTime": 1630281600000,
-      "entryPrice": 914.31,
-      "exitPrice": 871.86,
-      "returnPct": -4.64
-     },
-     {
-      "id": 20,
-      "side": "long",
-      "entryTime": 1630972800000,
-      "exitTime": 1631059200000,
-      "entryPrice": 1020.83,
-      "exitPrice": 1051.34,
-      "returnPct": 2.99
-     },
-     {
-      "id": 21,
-      "side": "long",
-      "entryTime": 1632096000000,
-      "exitTime": 1632268800000,
-      "entryPrice": 1374.55,
-      "exitPrice": 1398.19,
-      "returnPct": 1.72
-     },
-     {
-      "id": 22,
-      "side": "long",
-      "entryTime": 1633046400000,
-      "exitTime": 1633478400000,
-      "entryPrice": 948.68,
-      "exitPrice": 935.3,
-      "returnPct": -1.41
-     },
-     {
-      "id": 23,
-      "side": "long",
-      "entryTime": 1634342400000,
-      "exitTime": 1634688000000,
-      "entryPrice": 743.44,
-      "exitPrice": 772.4,
-      "returnPct": 3.9
-     },
-     {
-      "id": 24,
-      "side": "long",
-      "entryTime": 1635465600000,
-      "exitTime": 1635984000000,
-      "entryPrice": 932.91,
-      "exitPrice": 891.3,
-      "returnPct": -4.46
-     },
-     {
-      "id": 25,
-      "side": "long",
-      "entryTime": 1636675200000,
-      "exitTime": 1636848000000,
-      "entryPrice": 639.75,
-      "exitPrice": 661.2,
-      "returnPct": 3.35
-     },
-     {
-      "id": 26,
-      "side": "long",
-      "entryTime": 1637712000000,
-      "exitTime": 1638144000000,
-      "entryPrice": 786.54,
-      "exitPrice": 754.18,
-      "returnPct": -4.11
-     },
-     {
-      "id": 27,
-      "side": "long",
-      "entryTime": 1638835200000,
-      "exitTime": 1639267200000,
-      "entryPrice": 788.41,
-      "exitPrice": 813.8,
-      "returnPct": 3.22
-     },
-     {
-      "id": 28,
-      "side": "long",
-      "entryTime": 1639785600000,
-      "exitTime": 1640476800000,
-      "entryPrice": 870.64,
-      "exitPrice": 856.09,
-      "returnPct": -1.67
-     },
-     {
-      "id": 29,
-      "side": "long",
-      "entryTime": 1640908800000,
-      "exitTime": 1641600000000,
-      "entryPrice": 589.46,
-      "exitPrice": 603.14,
-      "returnPct": 2.32
-     },
-     {
-      "id": 30,
-      "side": "long",
-      "entryTime": 1642032000000,
-      "exitTime": 1642291200000,
-      "entryPrice": 637.13,
-      "exitPrice": 659.39,
-      "returnPct": 3.49
-     },
-     {
-      "id": 31,
-      "side": "long",
-      "entryTime": 1643328000000,
-      "exitTime": 1643500800000,
-      "entryPrice": 743.38,
-      "exitPrice": 706.72,
-      "returnPct": -4.93
-     },
-     {
-      "id": 32,
-      "side": "long",
-      "entryTime": 1644278400000,
-      "exitTime": 1644451200000,
-      "entryPrice": 673.78,
-      "exitPrice": 682.18,
-      "returnPct": 1.25
-     },
-     {
-      "id": 33,
-      "side": "long",
-      "entryTime": 1645488000000,
-      "exitTime": 1645833600000,
-      "entryPrice": 718.42,
-      "exitPrice": 696.09,
-      "returnPct": -3.11
-     },
-     {
-      "id": 34,
-      "side": "long",
-      "entryTime": 1646524800000,
-      "exitTime": 1646611200000,
-      "entryPrice": 721.29,
-      "exitPrice": 699.99,
-      "returnPct": -2.95
-     },
-     {
-      "id": 35,
-      "side": "long",
-      "entryTime": 1647734400000,
-      "exitTime": 1648080000000,
-      "entryPrice": 759.6,
-      "exitPrice": 785.86,
-      "returnPct": 3.46
-     },
-     {
-      "id": 36,
-      "side": "long",
-      "entryTime": 1649030400000,
-      "exitTime": 1649203200000,
-      "entryPrice": 952.14,
-      "exitPrice": 919.22,
-      "returnPct": -3.46
-     },
-     {
-      "id": 37,
-      "side": "long",
-      "entryTime": 1649980800000,
-      "exitTime": 1650153600000,
-      "entryPrice": 783.05,
-      "exitPrice": 801.74,
-      "returnPct": 2.39
-     },
-     {
-      "id": 38,
-      "side": "long",
-      "entryTime": 1651190400000,
-      "exitTime": 1651363200000,
-      "entryPrice": 1093.5,
-      "exitPrice": 1109.39,
-      "returnPct": 1.45
-     },
-     {
-      "id": 39,
-      "side": "long",
-      "entryTime": 1652400000000,
-      "exitTime": 1652659200000,
-      "entryPrice": 994.61,
-      "exitPrice": 950.68,
-      "returnPct": -4.42
-     },
-     {
-      "id": 40,
-      "side": "long",
-      "entryTime": 1653436800000,
-      "exitTime": 1653523200000,
-      "entryPrice": 923.71,
-      "exitPrice": 880.87,
-      "returnPct": -4.64
-     },
-     {
-      "id": 41,
-      "side": "long",
-      "entryTime": 1654560000000,
-      "exitTime": 1655251200000,
-      "entryPrice": 655.01,
-      "exitPrice": 675.73,
-      "returnPct": 3.16
-     },
-     {
-      "id": 42,
-      "side": "long",
-      "entryTime": 1655510400000,
-      "exitTime": 1656115200000,
-      "entryPrice": 575.09,
-      "exitPrice": 560.44,
-      "returnPct": -2.55
-     },
-     {
-      "id": 43,
-      "side": "long",
-      "entryTime": 1656806400000,
-      "exitTime": 1657238400000,
-      "entryPrice": 548.71,
-      "exitPrice": 522.06,
-      "returnPct": -4.86
-     },
-     {
-      "id": 44,
-      "side": "long",
-      "entryTime": 1657843200000,
-      "exitTime": 1657929600000,
-      "entryPrice": 635.18,
-      "exitPrice": 657.63,
-      "returnPct": 3.53
-     },
-     {
-      "id": 45,
-      "side": "long",
-      "entryTime": 1659052800000,
-      "exitTime": 1659744000000,
-      "entryPrice": 625.51,
-      "exitPrice": 634.84,
-      "returnPct": 1.49
-     },
-     {
-      "id": 46,
-      "side": "long",
-      "entryTime": 1660262400000,
-      "exitTime": 1660521600000,
-      "entryPrice": 706.33,
-      "exitPrice": 717.52,
-      "returnPct": 1.58
-     },
-     {
-      "id": 47,
-      "side": "long",
-      "entryTime": 1661299200000,
-      "exitTime": 1661385600000,
-      "entryPrice": 635.27,
-      "exitPrice": 619.85,
-      "returnPct": -2.43
-     },
-     {
-      "id": 48,
-      "side": "long",
-      "entryTime": 1662508800000,
-      "exitTime": 1662854400000,
-      "entryPrice": 690.43,
-      "exitPrice": 702.16,
-      "returnPct": 1.7
-     },
-     {
-      "id": 49,
-      "side": "long",
-      "entryTime": 1663632000000,
-      "exitTime": 1664064000000,
-      "entryPrice": 879.87,
-      "exitPrice": 900.24,
-      "returnPct": 2.32
-     },
-     {
-      "id": 50,
-      "side": "long",
-      "entryTime": 1664582400000,
-      "exitTime": 1664841600000,
-      "entryPrice": 1056.59,
-      "exitPrice": 1092.95,
-      "returnPct": 3.44
-     },
-     {
-      "id": 51,
-      "side": "long",
-      "entryTime": 1665705600000,
-      "exitTime": 1666051200000,
-      "entryPrice": 1292.14,
-      "exitPrice": 1337.1,
-      "returnPct": 3.48
-     },
-     {
-      "id": 52,
-      "side": "long",
-      "entryTime": 1666828800000,
-      "exitTime": 1667088000000,
-      "entryPrice": 1315.14,
-      "exitPrice": 1285.79,
-      "returnPct": -2.23
-     },
-     {
-      "id": 53,
-      "side": "long",
-      "entryTime": 1668038400000,
-      "exitTime": 1668124800000,
-      "entryPrice": 1259.6,
-      "exitPrice": 1228.09,
-      "returnPct": -2.5
-     },
-     {
-      "id": 54,
-      "side": "long",
-      "entryTime": 1669248000000,
-      "exitTime": 1669420800000,
-      "entryPrice": 1413.5,
-      "exitPrice": 1428.03,
-      "returnPct": 1.03
-     },
-     {
-      "id": 55,
-      "side": "long",
-      "entryTime": 1670371200000,
-      "exitTime": 1670630400000,
-      "entryPrice": 1650.47,
-      "exitPrice": 1588.13,
-      "returnPct": -3.78
-     },
-     {
-      "id": 56,
-      "side": "long",
-      "entryTime": 1671494400000,
-      "exitTime": 1671667200000,
-      "entryPrice": 1328.38,
-      "exitPrice": 1289.47,
-      "returnPct": -2.93
-     },
-     {
-      "id": 57,
-      "side": "long",
-      "entryTime": 1672358400000,
-      "exitTime": 1672704000000,
-      "entryPrice": 1588.44,
-      "exitPrice": 1606.72,
-      "returnPct": 1.15
-     },
-     {
-      "id": 58,
-      "side": "long",
-      "entryTime": 1673481600000,
-      "exitTime": 1673654400000,
-      "entryPrice": 1965.91,
-      "exitPrice": 2031.56,
-      "returnPct": 3.34
-     },
-     {
-      "id": 59,
-      "side": "long",
-      "entryTime": 1674864000000,
-      "exitTime": 1675036800000,
-      "entryPrice": 1857.26,
-      "exitPrice": 1762.88,
-      "returnPct": -5.08
-     },
-     {
-      "id": 60,
-      "side": "long",
-      "entryTime": 1675814400000,
-      "exitTime": 1676160000000,
-      "entryPrice": 2107.53,
-      "exitPrice": 2014.05,
-      "returnPct": -4.44
-     },
-     {
-      "id": 61,
-      "side": "long",
-      "entryTime": 1677024000000,
-      "exitTime": 1677196800000,
-      "entryPrice": 2219.71,
-      "exitPrice": 2293.96,
-      "returnPct": 3.35
-     },
-     {
-      "id": 62,
-      "side": "long",
-      "entryTime": 1678147200000,
-      "exitTime": 1678579200000,
-      "entryPrice": 2172.15,
-      "exitPrice": 2226.07,
-      "returnPct": 2.48
-     },
-     {
-      "id": 63,
-      "side": "long",
-      "entryTime": 1679184000000,
-      "exitTime": 1679616000000,
-      "entryPrice": 1793.48,
-      "exitPrice": 1829.82,
-      "returnPct": 2.03
-     },
-     {
-      "id": 64,
-      "side": "long",
-      "entryTime": 1680393600000,
-      "exitTime": 1680825600000,
-      "entryPrice": 1687.8,
-      "exitPrice": 1749.72,
-      "returnPct": 3.67
-     },
-     {
-      "id": 65,
-      "side": "long",
-      "entryTime": 1681516800000,
-      "exitTime": 1682121600000,
-      "entryPrice": 1770.21,
-      "exitPrice": 1823.59,
-      "returnPct": 3.02
-     },
-     {
-      "id": 66,
-      "side": "long",
-      "entryTime": 1682553600000,
-      "exitTime": 1682812800000,
-      "entryPrice": 1563.33,
-      "exitPrice": 1579.74,
-      "returnPct": 1.05
-     },
-     {
-      "id": 67,
-      "side": "long",
-      "entryTime": 1683763200000,
-      "exitTime": 1684368000000,
-      "entryPrice": 1523.22,
-      "exitPrice": 1548.24,
-      "returnPct": 1.64
-     },
-     {
-      "id": 68,
-      "side": "long",
-      "entryTime": 1684886400000,
-      "exitTime": 1685232000000,
-      "entryPrice": 1378.28,
-      "exitPrice": 1404.8,
-      "returnPct": 1.92
-     },
-     {
-      "id": 69,
-      "side": "long",
-      "entryTime": 1685923200000,
-      "exitTime": 1686009600000,
-      "entryPrice": 1439.77,
-      "exitPrice": 1464.82,
-      "returnPct": 1.74
-     },
-     {
-      "id": 70,
-      "side": "long",
-      "entryTime": 1686960000000,
-      "exitTime": 1687651200000,
-      "entryPrice": 1200.22,
-      "exitPrice": 1177.31,
-      "returnPct": -1.91
-     },
-     {
-      "id": 71,
-      "side": "long",
-      "entryTime": 1688256000000,
-      "exitTime": 1688860800000,
-      "entryPrice": 1145.79,
-      "exitPrice": 1175.57,
-      "returnPct": 2.6
-     },
-     {
-      "id": 72,
-      "side": "long",
-      "entryTime": 1689379200000,
-      "exitTime": 1689638400000,
-      "entryPrice": 892.19,
-      "exitPrice": 869.05,
-      "returnPct": -2.59
-     },
-     {
-      "id": 73,
-      "side": "long",
-      "entryTime": 1690416000000,
-      "exitTime": 1690502400000,
-      "entryPrice": 1078.86,
-      "exitPrice": 1117.95,
-      "returnPct": 3.62
-     },
-     {
-      "id": 74,
-      "side": "long",
-      "entryTime": 1691625600000,
-      "exitTime": 1692057600000,
-      "entryPrice": 1250.13,
-      "exitPrice": 1296.72,
-      "returnPct": 3.73
-     },
-     {
-      "id": 75,
-      "side": "long",
-      "entryTime": 1692748800000,
-      "exitTime": 1693267200000,
-      "entryPrice": 1491.84,
-      "exitPrice": 1520.77,
-      "returnPct": 1.94
-     },
-     {
-      "id": 76,
-      "side": "long",
-      "entryTime": 1693699200000,
-      "exitTime": 1694044800000,
-      "entryPrice": 1696.58,
-      "exitPrice": 1735.39,
-      "returnPct": 2.29
-     },
-     {
-      "id": 77,
-      "side": "long",
-      "entryTime": 1694995200000,
-      "exitTime": 1695168000000,
-      "entryPrice": 1266.22,
-      "exitPrice": 1302.4,
-      "returnPct": 2.86
-     },
-     {
-      "id": 78,
-      "side": "long",
-      "entryTime": 1695945600000,
-      "exitTime": 1696464000000,
-      "entryPrice": 1093.48,
-      "exitPrice": 1127.23,
-      "returnPct": 3.09
-     },
-     {
-      "id": 79,
-      "side": "long",
-      "entryTime": 1697155200000,
-      "exitTime": 1697328000000,
-      "entryPrice": 1431.87,
-      "exitPrice": 1394.5,
-      "returnPct": -2.61
-     },
-     {
-      "id": 80,
-      "side": "long",
-      "entryTime": 1698278400000,
-      "exitTime": 1698969600000,
-      "entryPrice": 1554.81,
-      "exitPrice": 1582.54,
-      "returnPct": 1.78
-     },
-     {
-      "id": 81,
-      "side": "long",
-      "entryTime": 1699488000000,
-      "exitTime": 1700179200000,
-      "entryPrice": 1363.08,
-      "exitPrice": 1341.17,
-      "returnPct": -1.61
-     },
-     {
-      "id": 82,
-      "side": "long",
-      "entryTime": 1700697600000,
-      "exitTime": 1700784000000,
-      "entryPrice": 1283.9,
-      "exitPrice": 1313.13,
-      "returnPct": 2.28
-     },
-     {
-      "id": 83,
-      "side": "long",
-      "entryTime": 1701648000000,
-      "exitTime": 1701820800000,
-      "entryPrice": 1285.32,
-      "exitPrice": 1336.49,
-      "returnPct": 3.98
-     },
-     {
-      "id": 84,
-      "side": "long",
-      "entryTime": 1702857600000,
-      "exitTime": 1703376000000,
-      "entryPrice": 1432.29,
-      "exitPrice": 1359.27,
-      "returnPct": -5.1
-     },
-     {
-      "id": 85,
-      "side": "long",
-      "entryTime": 1703808000000,
-      "exitTime": 1704067200000,
-      "entryPrice": 1750.11,
-      "exitPrice": 1671.8,
-      "returnPct": -4.47
-     },
-     {
-      "id": 86,
-      "side": "long",
-      "entryTime": 1705017600000,
-      "exitTime": 1705363200000,
-      "entryPrice": 1849.09,
-      "exitPrice": 1798.52,
-      "returnPct": -2.73
-     },
-     {
-      "id": 87,
-      "side": "long",
-      "entryTime": 1706054400000,
-      "exitTime": 1706313600000,
-      "entryPrice": 1729.22,
-      "exitPrice": 1663.05,
-      "returnPct": -3.83
-     },
-     {
-      "id": 88,
-      "side": "long",
-      "entryTime": 1707436800000,
-      "exitTime": 1707782400000,
-      "entryPrice": 1706.78,
-      "exitPrice": 1745.95,
-      "returnPct": 2.29
-     },
-     {
-      "id": 89,
-      "side": "long",
-      "entryTime": 1708387200000,
-      "exitTime": 1708819200000,
-      "entryPrice": 1817.13,
-      "exitPrice": 1864.95,
-      "returnPct": 2.63
-     },
-     {
-      "id": 90,
-      "side": "long",
-      "entryTime": 1709683200000,
-      "exitTime": 1710201600000,
-      "entryPrice": 2313.06,
-      "exitPrice": 2385.32,
-      "returnPct": 3.12
-     },
-     {
-      "id": 91,
-      "side": "long",
-      "entryTime": 1710633600000,
-      "exitTime": 1711238400000,
-      "entryPrice": 2267.95,
-      "exitPrice": 2183.81,
-      "returnPct": -3.71
-     },
-     {
-      "id": 92,
-      "side": "long",
-      "entryTime": 1711756800000,
-      "exitTime": 1712188800000,
-      "entryPrice": 2231.57,
-      "exitPrice": 2294.29,
-      "returnPct": 2.81
-     },
-     {
-      "id": 93,
-      "side": "long",
-      "entryTime": 1713052800000,
-      "exitTime": 1713571200000,
-      "entryPrice": 1943.33,
-      "exitPrice": 1882.06,
-      "returnPct": -3.15
-     },
-     {
-      "id": 94,
-      "side": "long",
-      "entryTime": 1713916800000,
-      "exitTime": 1714176000000,
-      "entryPrice": 2244.23,
-      "exitPrice": 2278.99,
-      "returnPct": 1.55
-     },
-     {
-      "id": 95,
-      "side": "long",
-      "entryTime": 1715126400000,
-      "exitTime": 1715558400000,
-      "entryPrice": 2194.93,
-      "exitPrice": 2278.19,
-      "returnPct": 3.79
-     },
-     {
-      "id": 96,
-      "side": "long",
-      "entryTime": 1716422400000,
-      "exitTime": 1716768000000,
-      "entryPrice": 2886.51,
-      "exitPrice": 2949.31,
-      "returnPct": 2.18
-     },
-     {
-      "id": 97,
-      "side": "long",
-      "entryTime": 1717545600000,
-      "exitTime": 1717891200000,
-      "entryPrice": 2654.09,
-      "exitPrice": 2617.12,
-      "returnPct": -1.39
-     },
-     {
-      "id": 98,
-      "side": "long",
-      "entryTime": 1718668800000,
-      "exitTime": 1718841600000,
-      "entryPrice": 2930.53,
-      "exitPrice": 2988.6,
-      "returnPct": 1.98
-     },
-     {
-      "id": 99,
-      "side": "long",
-      "entryTime": 1719619200000,
-      "exitTime": 1719964800000,
-      "entryPrice": 2858.54,
-      "exitPrice": 2763.87,
-      "returnPct": -3.31
-     },
-     {
-      "id": 100,
-      "side": "long",
-      "entryTime": 1720915200000,
-      "exitTime": 1721260800000,
-      "entryPrice": 2724.31,
-      "exitPrice": 2808.34,
-      "returnPct": 3.08
-     },
-     {
-      "id": 101,
-      "side": "long",
-      "entryTime": 1722038400000,
-      "exitTime": 1722470400000,
-      "entryPrice": 3149.7,
-      "exitPrice": 3029.98,
-      "returnPct": -3.8
-     },
-     {
-      "id": 102,
-      "side": "long",
-      "entryTime": 1723161600000,
-      "exitTime": 1723852800000,
-      "entryPrice": 3528.95,
-      "exitPrice": 3664.29,
-      "returnPct": 3.83
-     },
-     {
-      "id": 103,
-      "side": "long",
-      "entryTime": 1724025600000,
-      "exitTime": 1724198400000,
-      "entryPrice": 4218.57,
-      "exitPrice": 4340.06,
-      "returnPct": 2.88
-     },
-     {
-      "id": 104,
-      "side": "long",
-      "entryTime": 1725148800000,
-      "exitTime": 1725494400000,
-      "entryPrice": 4042.07,
-      "exitPrice": 3847.71,
-      "returnPct": -4.81
-     },
-     {
-      "id": 105,
-      "side": "long",
-      "entryTime": 1726531200000,
-      "exitTime": 1726704000000,
-      "entryPrice": 4854.99,
-      "exitPrice": 4690.13,
-      "returnPct": -3.4
-     },
-     {
-      "id": 106,
-      "side": "long",
-      "entryTime": 1727568000000,
-      "exitTime": 1727740800000,
-      "entryPrice": 5523.63,
-      "exitPrice": 5402.84,
-      "returnPct": -2.19
-     },
-     {
-      "id": 107,
-      "side": "long",
-      "entryTime": 1728691200000,
-      "exitTime": 1729296000000,
-      "entryPrice": 4628.43,
-      "exitPrice": 4491.2,
-      "returnPct": -2.96
-     },
-     {
-      "id": 108,
-      "side": "long",
-      "entryTime": 1729900800000,
-      "exitTime": 1730419200000,
-      "entryPrice": 4463.6,
-      "exitPrice": 4621.37,
-      "returnPct": 3.53
-     },
-     {
-      "id": 109,
-      "side": "long",
-      "entryTime": 1730764800000,
-      "exitTime": 1731024000000,
-      "entryPrice": 5256.58,
-      "exitPrice": 5319.76,
-      "returnPct": 1.2
-     },
-     {
-      "id": 110,
-      "side": "long",
-      "entryTime": 1732147200000,
-      "exitTime": 1732320000000,
-      "entryPrice": 5587.54,
-      "exitPrice": 5806.27,
-      "returnPct": 3.91
-     },
-     {
-      "id": 111,
-      "side": "long",
-      "entryTime": 1733097600000,
-      "exitTime": 1733443200000,
-      "entryPrice": 5352.23,
-      "exitPrice": 5414.01,
-      "returnPct": 1.15
-     },
-     {
-      "id": 112,
-      "side": "long",
-      "entryTime": 1734393600000,
-      "exitTime": 1734566400000,
-      "entryPrice": 6064.94,
-      "exitPrice": 6297.47,
-      "returnPct": 3.83
-     },
-     {
-      "id": 113,
-      "side": "long",
-      "entryTime": 1735257600000,
-      "exitTime": 1735948800000,
-      "entryPrice": 4587.22,
-      "exitPrice": 4724.35,
-      "returnPct": 2.99
-     },
-     {
-      "id": 114,
-      "side": "long",
-      "entryTime": 1736467200000,
-      "exitTime": 1736640000000,
-      "entryPrice": 5078.9,
-      "exitPrice": 5278.81,
-      "returnPct": 3.94
-     },
-     {
-      "id": 115,
-      "side": "long",
-      "entryTime": 1737504000000,
-      "exitTime": 1737590400000,
-      "entryPrice": 5938.63,
-      "exitPrice": 6009.86,
-      "returnPct": 1.2
-     },
-     {
-      "id": 116,
-      "side": "long",
-      "entryTime": 1738800000000,
-      "exitTime": 1739318400000,
-      "entryPrice": 5139.03,
-      "exitPrice": 5054.72,
-      "returnPct": -1.64
-     },
-     {
-      "id": 117,
-      "side": "long",
-      "entryTime": 1740009600000,
-      "exitTime": 1740528000000,
-      "entryPrice": 4986.73,
-      "exitPrice": 5062.52,
-      "returnPct": 1.52
-     },
-     {
-      "id": 118,
-      "side": "long",
-      "entryTime": 1741132800000,
-      "exitTime": 1741392000000,
-      "entryPrice": 3745.85,
-      "exitPrice": 3578.66,
-      "returnPct": -4.46
-     },
-     {
-      "id": 119,
-      "side": "long",
-      "entryTime": 1742169600000,
-      "exitTime": 1742860800000,
-      "entryPrice": 3556.06,
-      "exitPrice": 3507.8,
-      "returnPct": -1.36
-     },
-     {
-      "id": 120,
-      "side": "long",
-      "entryTime": 1743206400000,
-      "exitTime": 1743724800000,
-      "entryPrice": 4284.12,
-      "exitPrice": 4415.9,
-      "returnPct": 3.08
-     },
-     {
-      "id": 121,
-      "side": "long",
-      "entryTime": 1744243200000,
-      "exitTime": 1744588800000,
-      "entryPrice": 4076.37,
-      "exitPrice": 4168.75,
-      "returnPct": 2.27
-     },
-     {
-      "id": 122,
-      "side": "long",
-      "entryTime": 1745625600000,
-      "exitTime": 1745712000000,
-      "entryPrice": 4511.45,
-      "exitPrice": 4687.01,
-      "returnPct": 3.89
-     },
-     {
-      "id": 123,
-      "side": "long",
-      "entryTime": 1746662400000,
-      "exitTime": 1747008000000,
-      "entryPrice": 4513.16,
-      "exitPrice": 4389.95,
-      "returnPct": -2.73
-     },
-     {
-      "id": 124,
-      "side": "long",
-      "entryTime": 1747785600000,
-      "exitTime": 1747872000000,
-      "entryPrice": 4213.07,
-      "exitPrice": 4306.12,
-      "returnPct": 2.21
-     },
-     {
-      "id": 125,
-      "side": "long",
-      "entryTime": 1748908800000,
-      "exitTime": 1748995200000,
-      "entryPrice": 3877.53,
-      "exitPrice": 3746.59,
-      "returnPct": -3.38
-     },
-     {
-      "id": 126,
-      "side": "long",
-      "entryTime": 1749945600000,
-      "exitTime": 1750377600000,
-      "entryPrice": 4536.44,
-      "exitPrice": 4594.43,
-      "returnPct": 1.28
-     }
-    ]
+    "totalReturn": 0.5523,
+    "decision": "no_trade"
    }
   },
   {
@@ -4120,6 +33,4291 @@
    "kind": "Carry",
    "description": "Holds the side of a perpetual that collects funding while the rate stays above its threshold.",
    "last": null
+  }
+ ],
+ "results": {
+  "1794242520000-5a1c0e2b": {
+   "decision": "trade",
+   "instrument": {
+    "venue": "binance",
+    "symbol": "BTCUSDT",
+    "kind": "perpetual"
+   },
+   "period": {
+    "from": 1609459200000,
+    "to": 1751241600000
+   },
+   "finishedAt": 1794242520000,
+   "criteria": [
+    {
+     "label": "Out-of-sample Sharpe",
+     "value": 1.2,
+     "limit": 1,
+     "rule": "at_least",
+     "format": "ratio",
+     "pass": true
+    },
+    {
+     "label": "Max drawdown",
+     "value": 0.2012,
+     "limit": 0.25,
+     "rule": "at_most",
+     "format": "percent",
+     "pass": true
+    },
+    {
+     "label": "Trades",
+     "value": 41,
+     "limit": 30,
+     "rule": "at_least",
+     "format": "count",
+     "pass": true
+    }
+   ],
+   "keyNumbers": [
+    {
+     "label": "Return",
+     "value": 2.4657,
+     "format": "percent",
+     "tone": "pnl"
+    },
+    {
+     "label": "CAGR",
+     "value": 0.3182,
+     "format": "percent",
+     "tone": "pnl"
+    },
+    {
+     "label": "Sharpe",
+     "value": 1.46,
+     "format": "ratio"
+    },
+    {
+     "label": "Max drawdown",
+     "value": 0.2012,
+     "format": "percent"
+    }
+   ],
+   "benchmarkLabel": "Buy and hold",
+   "equity": [
+    {
+     "t": 1609459200000,
+     "strategy": 1,
+     "benchmark": 1
+    },
+    {
+     "t": 1610064000000,
+     "strategy": 1.0297,
+     "benchmark": 1.0093
+    },
+    {
+     "t": 1610668800000,
+     "strategy": 1.0638,
+     "benchmark": 1.1798
+    },
+    {
+     "t": 1611273600000,
+     "strategy": 1.0872,
+     "benchmark": 1.2658
+    },
+    {
+     "t": 1611878400000,
+     "strategy": 1.1458,
+     "benchmark": 1.6048
+    },
+    {
+     "t": 1612483200000,
+     "strategy": 1.1426,
+     "benchmark": 1.4575
+    },
+    {
+     "t": 1613088000000,
+     "strategy": 1.1421,
+     "benchmark": 1.3427
+    },
+    {
+     "t": 1613692800000,
+     "strategy": 1.145,
+     "benchmark": 1.3751
+    },
+    {
+     "t": 1614297600000,
+     "strategy": 1.1348,
+     "benchmark": 1.3501
+    },
+    {
+     "t": 1614902400000,
+     "strategy": 1.1499,
+     "benchmark": 1.3276
+    },
+    {
+     "t": 1615507200000,
+     "strategy": 1.0791,
+     "benchmark": 1.2674
+    },
+    {
+     "t": 1616112000000,
+     "strategy": 1.1441,
+     "benchmark": 1.2973
+    },
+    {
+     "t": 1616716800000,
+     "strategy": 1.0999,
+     "benchmark": 1.231
+    },
+    {
+     "t": 1617321600000,
+     "strategy": 1.0705,
+     "benchmark": 1.0524
+    },
+    {
+     "t": 1617926400000,
+     "strategy": 1.0168,
+     "benchmark": 0.9144
+    },
+    {
+     "t": 1618531200000,
+     "strategy": 1.0086,
+     "benchmark": 0.8403
+    },
+    {
+     "t": 1619136000000,
+     "strategy": 1.0404,
+     "benchmark": 0.8744
+    },
+    {
+     "t": 1619740800000,
+     "strategy": 0.9995,
+     "benchmark": 0.7522
+    },
+    {
+     "t": 1620345600000,
+     "strategy": 0.9852,
+     "benchmark": 0.6599
+    },
+    {
+     "t": 1620950400000,
+     "strategy": 0.9815,
+     "benchmark": 0.6082
+    },
+    {
+     "t": 1621555200000,
+     "strategy": 0.9875,
+     "benchmark": 0.5757
+    },
+    {
+     "t": 1622160000000,
+     "strategy": 1.0127,
+     "benchmark": 0.6671
+    },
+    {
+     "t": 1622764800000,
+     "strategy": 1.016,
+     "benchmark": 0.5986
+    },
+    {
+     "t": 1623369600000,
+     "strategy": 1.0394,
+     "benchmark": 0.6107
+    },
+    {
+     "t": 1623974400000,
+     "strategy": 1.0397,
+     "benchmark": 0.5378
+    },
+    {
+     "t": 1624579200000,
+     "strategy": 1.1089,
+     "benchmark": 0.6428
+    },
+    {
+     "t": 1625184000000,
+     "strategy": 1.1291,
+     "benchmark": 0.5943
+    },
+    {
+     "t": 1625788800000,
+     "strategy": 1.1782,
+     "benchmark": 0.6753
+    },
+    {
+     "t": 1626393600000,
+     "strategy": 1.1596,
+     "benchmark": 0.6428
+    },
+    {
+     "t": 1626998400000,
+     "strategy": 1.1857,
+     "benchmark": 0.7837
+    },
+    {
+     "t": 1627603200000,
+     "strategy": 1.1985,
+     "benchmark": 0.7451
+    },
+    {
+     "t": 1628208000000,
+     "strategy": 1.213,
+     "benchmark": 0.7921
+    },
+    {
+     "t": 1628812800000,
+     "strategy": 1.229,
+     "benchmark": 0.7731
+    },
+    {
+     "t": 1629417600000,
+     "strategy": 1.1993,
+     "benchmark": 0.7251
+    },
+    {
+     "t": 1630022400000,
+     "strategy": 1.1849,
+     "benchmark": 0.7315
+    },
+    {
+     "t": 1630627200000,
+     "strategy": 1.1286,
+     "benchmark": 0.6303
+    },
+    {
+     "t": 1631232000000,
+     "strategy": 1.1384,
+     "benchmark": 0.5999
+    },
+    {
+     "t": 1631836800000,
+     "strategy": 1.1515,
+     "benchmark": 0.5882
+    },
+    {
+     "t": 1632441600000,
+     "strategy": 1.2192,
+     "benchmark": 0.651
+    },
+    {
+     "t": 1633046400000,
+     "strategy": 1.2242,
+     "benchmark": 0.6932
+    },
+    {
+     "t": 1633651200000,
+     "strategy": 1.2233,
+     "benchmark": 0.7418
+    },
+    {
+     "t": 1634256000000,
+     "strategy": 1.2158,
+     "benchmark": 0.698
+    },
+    {
+     "t": 1634860800000,
+     "strategy": 1.2751,
+     "benchmark": 0.8254
+    },
+    {
+     "t": 1635465600000,
+     "strategy": 1.2548,
+     "benchmark": 0.7284
+    },
+    {
+     "t": 1636070400000,
+     "strategy": 1.2475,
+     "benchmark": 0.6956
+    },
+    {
+     "t": 1636675200000,
+     "strategy": 1.3063,
+     "benchmark": 0.7397
+    },
+    {
+     "t": 1637280000000,
+     "strategy": 1.3026,
+     "benchmark": 0.7705
+    },
+    {
+     "t": 1637884800000,
+     "strategy": 1.3536,
+     "benchmark": 0.8777
+    },
+    {
+     "t": 1638489600000,
+     "strategy": 1.3238,
+     "benchmark": 0.8018
+    },
+    {
+     "t": 1639094400000,
+     "strategy": 1.3795,
+     "benchmark": 0.9564
+    },
+    {
+     "t": 1639699200000,
+     "strategy": 1.4461,
+     "benchmark": 0.9858
+    },
+    {
+     "t": 1640304000000,
+     "strategy": 1.3539,
+     "benchmark": 0.8359
+    },
+    {
+     "t": 1640908800000,
+     "strategy": 1.3576,
+     "benchmark": 0.7682
+    },
+    {
+     "t": 1641513600000,
+     "strategy": 1.3005,
+     "benchmark": 0.7001
+    },
+    {
+     "t": 1642118400000,
+     "strategy": 1.3229,
+     "benchmark": 0.7279
+    },
+    {
+     "t": 1642723200000,
+     "strategy": 1.2921,
+     "benchmark": 0.6964
+    },
+    {
+     "t": 1643328000000,
+     "strategy": 1.3596,
+     "benchmark": 0.8049
+    },
+    {
+     "t": 1643932800000,
+     "strategy": 1.3534,
+     "benchmark": 0.9138
+    },
+    {
+     "t": 1644537600000,
+     "strategy": 1.3474,
+     "benchmark": 0.7856
+    },
+    {
+     "t": 1645142400000,
+     "strategy": 1.3505,
+     "benchmark": 0.7477
+    },
+    {
+     "t": 1645747200000,
+     "strategy": 1.4142,
+     "benchmark": 0.7717
+    },
+    {
+     "t": 1646352000000,
+     "strategy": 1.4784,
+     "benchmark": 0.8276
+    },
+    {
+     "t": 1646956800000,
+     "strategy": 1.5525,
+     "benchmark": 0.9611
+    },
+    {
+     "t": 1647561600000,
+     "strategy": 1.6039,
+     "benchmark": 0.9818
+    },
+    {
+     "t": 1648166400000,
+     "strategy": 1.6061,
+     "benchmark": 1.0106
+    },
+    {
+     "t": 1648771200000,
+     "strategy": 1.6651,
+     "benchmark": 1.1832
+    },
+    {
+     "t": 1649376000000,
+     "strategy": 1.761,
+     "benchmark": 1.6443
+    },
+    {
+     "t": 1649980800000,
+     "strategy": 1.7364,
+     "benchmark": 1.6431
+    },
+    {
+     "t": 1650585600000,
+     "strategy": 1.7194,
+     "benchmark": 1.6561
+    },
+    {
+     "t": 1651190400000,
+     "strategy": 1.7831,
+     "benchmark": 1.8327
+    },
+    {
+     "t": 1651795200000,
+     "strategy": 1.8144,
+     "benchmark": 1.8285
+    },
+    {
+     "t": 1652400000000,
+     "strategy": 1.7965,
+     "benchmark": 1.8968
+    },
+    {
+     "t": 1653004800000,
+     "strategy": 1.8263,
+     "benchmark": 1.9971
+    },
+    {
+     "t": 1653609600000,
+     "strategy": 1.743,
+     "benchmark": 1.8792
+    },
+    {
+     "t": 1654214400000,
+     "strategy": 1.6423,
+     "benchmark": 1.6471
+    },
+    {
+     "t": 1654819200000,
+     "strategy": 1.6127,
+     "benchmark": 1.5955
+    },
+    {
+     "t": 1655424000000,
+     "strategy": 1.6313,
+     "benchmark": 1.7288
+    },
+    {
+     "t": 1656028800000,
+     "strategy": 1.7109,
+     "benchmark": 1.812
+    },
+    {
+     "t": 1656633600000,
+     "strategy": 1.7655,
+     "benchmark": 2.1298
+    },
+    {
+     "t": 1657238400000,
+     "strategy": 1.8269,
+     "benchmark": 2.2382
+    },
+    {
+     "t": 1657843200000,
+     "strategy": 1.8735,
+     "benchmark": 2.3847
+    },
+    {
+     "t": 1658448000000,
+     "strategy": 1.7747,
+     "benchmark": 2.2158
+    },
+    {
+     "t": 1659052800000,
+     "strategy": 1.808,
+     "benchmark": 2.3975
+    },
+    {
+     "t": 1659657600000,
+     "strategy": 1.7638,
+     "benchmark": 2.307
+    },
+    {
+     "t": 1660262400000,
+     "strategy": 1.7654,
+     "benchmark": 2.2483
+    },
+    {
+     "t": 1660867200000,
+     "strategy": 1.7468,
+     "benchmark": 2.0021
+    },
+    {
+     "t": 1661472000000,
+     "strategy": 1.8154,
+     "benchmark": 2.4999
+    },
+    {
+     "t": 1662076800000,
+     "strategy": 1.8014,
+     "benchmark": 2.2967
+    },
+    {
+     "t": 1662681600000,
+     "strategy": 1.7837,
+     "benchmark": 2.2357
+    },
+    {
+     "t": 1663286400000,
+     "strategy": 1.7976,
+     "benchmark": 2.3932
+    },
+    {
+     "t": 1663891200000,
+     "strategy": 1.7488,
+     "benchmark": 2.1772
+    },
+    {
+     "t": 1664496000000,
+     "strategy": 1.7378,
+     "benchmark": 2.387
+    },
+    {
+     "t": 1665100800000,
+     "strategy": 1.7084,
+     "benchmark": 2.3767
+    },
+    {
+     "t": 1665705600000,
+     "strategy": 1.727,
+     "benchmark": 2.2723
+    },
+    {
+     "t": 1666310400000,
+     "strategy": 1.7465,
+     "benchmark": 2.3139
+    },
+    {
+     "t": 1666915200000,
+     "strategy": 1.817,
+     "benchmark": 2.5283
+    },
+    {
+     "t": 1667520000000,
+     "strategy": 1.81,
+     "benchmark": 2.6125
+    },
+    {
+     "t": 1668124800000,
+     "strategy": 1.788,
+     "benchmark": 2.4029
+    },
+    {
+     "t": 1668729600000,
+     "strategy": 1.7412,
+     "benchmark": 2.4772
+    },
+    {
+     "t": 1669334400000,
+     "strategy": 1.7453,
+     "benchmark": 2.328
+    },
+    {
+     "t": 1669939200000,
+     "strategy": 1.7352,
+     "benchmark": 2.1975
+    },
+    {
+     "t": 1670544000000,
+     "strategy": 1.7174,
+     "benchmark": 2.0925
+    },
+    {
+     "t": 1671148800000,
+     "strategy": 1.7284,
+     "benchmark": 1.954
+    },
+    {
+     "t": 1671753600000,
+     "strategy": 1.7015,
+     "benchmark": 1.9018
+    },
+    {
+     "t": 1672358400000,
+     "strategy": 1.7223,
+     "benchmark": 2.1609
+    },
+    {
+     "t": 1672963200000,
+     "strategy": 1.8175,
+     "benchmark": 2.4462
+    },
+    {
+     "t": 1673568000000,
+     "strategy": 1.8814,
+     "benchmark": 2.5827
+    },
+    {
+     "t": 1674172800000,
+     "strategy": 1.8984,
+     "benchmark": 2.6834
+    },
+    {
+     "t": 1674777600000,
+     "strategy": 1.9672,
+     "benchmark": 3.0641
+    },
+    {
+     "t": 1675382400000,
+     "strategy": 2.0349,
+     "benchmark": 3.1215
+    },
+    {
+     "t": 1675987200000,
+     "strategy": 1.9667,
+     "benchmark": 2.2257
+    },
+    {
+     "t": 1676592000000,
+     "strategy": 2.029,
+     "benchmark": 2.2782
+    },
+    {
+     "t": 1677196800000,
+     "strategy": 2.1407,
+     "benchmark": 2.6168
+    },
+    {
+     "t": 1677801600000,
+     "strategy": 2.102,
+     "benchmark": 2.5932
+    },
+    {
+     "t": 1678406400000,
+     "strategy": 2.104,
+     "benchmark": 2.593
+    },
+    {
+     "t": 1679011200000,
+     "strategy": 2.1333,
+     "benchmark": 2.995
+    },
+    {
+     "t": 1679616000000,
+     "strategy": 2.0445,
+     "benchmark": 3.135
+    },
+    {
+     "t": 1680220800000,
+     "strategy": 2.0401,
+     "benchmark": 2.8166
+    },
+    {
+     "t": 1680825600000,
+     "strategy": 2.0065,
+     "benchmark": 2.6268
+    },
+    {
+     "t": 1681430400000,
+     "strategy": 2.0754,
+     "benchmark": 2.5105
+    },
+    {
+     "t": 1682035200000,
+     "strategy": 2.0507,
+     "benchmark": 2.3128
+    },
+    {
+     "t": 1682640000000,
+     "strategy": 2.1265,
+     "benchmark": 2.5095
+    },
+    {
+     "t": 1683244800000,
+     "strategy": 2.0798,
+     "benchmark": 2.2508
+    },
+    {
+     "t": 1683849600000,
+     "strategy": 2.1333,
+     "benchmark": 2.2365
+    },
+    {
+     "t": 1684454400000,
+     "strategy": 2.0648,
+     "benchmark": 1.99
+    },
+    {
+     "t": 1685059200000,
+     "strategy": 2.0505,
+     "benchmark": 1.7838
+    },
+    {
+     "t": 1685664000000,
+     "strategy": 1.9809,
+     "benchmark": 1.7091
+    },
+    {
+     "t": 1686268800000,
+     "strategy": 2.0144,
+     "benchmark": 1.5246
+    },
+    {
+     "t": 1686873600000,
+     "strategy": 1.961,
+     "benchmark": 1.3032
+    },
+    {
+     "t": 1687478400000,
+     "strategy": 2.017,
+     "benchmark": 1.3173
+    },
+    {
+     "t": 1688083200000,
+     "strategy": 1.9542,
+     "benchmark": 1.2178
+    },
+    {
+     "t": 1688688000000,
+     "strategy": 1.9417,
+     "benchmark": 1.3645
+    },
+    {
+     "t": 1689292800000,
+     "strategy": 1.8321,
+     "benchmark": 1.2362
+    },
+    {
+     "t": 1689897600000,
+     "strategy": 1.7735,
+     "benchmark": 1.1666
+    },
+    {
+     "t": 1690502400000,
+     "strategy": 1.7479,
+     "benchmark": 1.2827
+    },
+    {
+     "t": 1691107200000,
+     "strategy": 1.7794,
+     "benchmark": 1.3096
+    },
+    {
+     "t": 1691712000000,
+     "strategy": 1.8197,
+     "benchmark": 1.3651
+    },
+    {
+     "t": 1692316800000,
+     "strategy": 1.8694,
+     "benchmark": 1.537
+    },
+    {
+     "t": 1692921600000,
+     "strategy": 1.8284,
+     "benchmark": 1.4128
+    },
+    {
+     "t": 1693526400000,
+     "strategy": 1.8066,
+     "benchmark": 1.322
+    },
+    {
+     "t": 1694131200000,
+     "strategy": 1.7698,
+     "benchmark": 1.2813
+    },
+    {
+     "t": 1694736000000,
+     "strategy": 1.8407,
+     "benchmark": 1.3701
+    },
+    {
+     "t": 1695340800000,
+     "strategy": 1.9868,
+     "benchmark": 1.5021
+    },
+    {
+     "t": 1695945600000,
+     "strategy": 1.9791,
+     "benchmark": 1.5713
+    },
+    {
+     "t": 1696550400000,
+     "strategy": 1.9584,
+     "benchmark": 1.4547
+    },
+    {
+     "t": 1697155200000,
+     "strategy": 1.9971,
+     "benchmark": 1.563
+    },
+    {
+     "t": 1697760000000,
+     "strategy": 2.0479,
+     "benchmark": 1.5698
+    },
+    {
+     "t": 1698364800000,
+     "strategy": 2.1011,
+     "benchmark": 1.4681
+    },
+    {
+     "t": 1698969600000,
+     "strategy": 2.0537,
+     "benchmark": 1.3479
+    },
+    {
+     "t": 1699574400000,
+     "strategy": 2.0282,
+     "benchmark": 1.3351
+    },
+    {
+     "t": 1700179200000,
+     "strategy": 2.0362,
+     "benchmark": 1.2362
+    },
+    {
+     "t": 1700784000000,
+     "strategy": 2.112,
+     "benchmark": 1.2825
+    },
+    {
+     "t": 1701388800000,
+     "strategy": 2.0992,
+     "benchmark": 1.4055
+    },
+    {
+     "t": 1701993600000,
+     "strategy": 2.1805,
+     "benchmark": 1.3951
+    },
+    {
+     "t": 1702598400000,
+     "strategy": 2.1355,
+     "benchmark": 1.3155
+    },
+    {
+     "t": 1703203200000,
+     "strategy": 2.0797,
+     "benchmark": 1.2791
+    },
+    {
+     "t": 1703808000000,
+     "strategy": 2.1279,
+     "benchmark": 1.3464
+    },
+    {
+     "t": 1704412800000,
+     "strategy": 2.2043,
+     "benchmark": 1.4815
+    },
+    {
+     "t": 1705017600000,
+     "strategy": 2.2035,
+     "benchmark": 1.7137
+    },
+    {
+     "t": 1705622400000,
+     "strategy": 2.2396,
+     "benchmark": 1.7572
+    },
+    {
+     "t": 1706227200000,
+     "strategy": 2.2786,
+     "benchmark": 1.689
+    },
+    {
+     "t": 1706832000000,
+     "strategy": 2.2519,
+     "benchmark": 1.735
+    },
+    {
+     "t": 1707436800000,
+     "strategy": 2.3426,
+     "benchmark": 2.0756
+    },
+    {
+     "t": 1708041600000,
+     "strategy": 2.3562,
+     "benchmark": 2.1126
+    },
+    {
+     "t": 1708646400000,
+     "strategy": 2.4346,
+     "benchmark": 2.1285
+    },
+    {
+     "t": 1709251200000,
+     "strategy": 2.5722,
+     "benchmark": 2.3653
+    },
+    {
+     "t": 1709856000000,
+     "strategy": 2.6716,
+     "benchmark": 2.3905
+    },
+    {
+     "t": 1710460800000,
+     "strategy": 2.6222,
+     "benchmark": 2.2593
+    },
+    {
+     "t": 1711065600000,
+     "strategy": 2.657,
+     "benchmark": 2.4617
+    },
+    {
+     "t": 1711670400000,
+     "strategy": 2.6209,
+     "benchmark": 2.3122
+    },
+    {
+     "t": 1712275200000,
+     "strategy": 2.7229,
+     "benchmark": 2.5748
+    },
+    {
+     "t": 1712880000000,
+     "strategy": 2.8176,
+     "benchmark": 2.6181
+    },
+    {
+     "t": 1713484800000,
+     "strategy": 2.7569,
+     "benchmark": 2.5011
+    },
+    {
+     "t": 1714089600000,
+     "strategy": 2.8214,
+     "benchmark": 2.6498
+    },
+    {
+     "t": 1714694400000,
+     "strategy": 2.6998,
+     "benchmark": 2.5399
+    },
+    {
+     "t": 1715299200000,
+     "strategy": 2.7846,
+     "benchmark": 2.7809
+    },
+    {
+     "t": 1715904000000,
+     "strategy": 2.8297,
+     "benchmark": 2.56
+    },
+    {
+     "t": 1716508800000,
+     "strategy": 2.9074,
+     "benchmark": 2.4465
+    },
+    {
+     "t": 1717113600000,
+     "strategy": 2.9217,
+     "benchmark": 2.2718
+    },
+    {
+     "t": 1717718400000,
+     "strategy": 2.8501,
+     "benchmark": 2.278
+    },
+    {
+     "t": 1718323200000,
+     "strategy": 2.7501,
+     "benchmark": 1.9891
+    },
+    {
+     "t": 1718928000000,
+     "strategy": 2.6576,
+     "benchmark": 1.931
+    },
+    {
+     "t": 1719532800000,
+     "strategy": 2.6506,
+     "benchmark": 1.8117
+    },
+    {
+     "t": 1720137600000,
+     "strategy": 2.7305,
+     "benchmark": 1.8839
+    },
+    {
+     "t": 1720742400000,
+     "strategy": 2.8223,
+     "benchmark": 1.8563
+    },
+    {
+     "t": 1721347200000,
+     "strategy": 2.8659,
+     "benchmark": 1.7851
+    },
+    {
+     "t": 1721952000000,
+     "strategy": 2.9294,
+     "benchmark": 1.973
+    },
+    {
+     "t": 1722556800000,
+     "strategy": 2.8949,
+     "benchmark": 1.6981
+    },
+    {
+     "t": 1723161600000,
+     "strategy": 2.9447,
+     "benchmark": 1.6307
+    },
+    {
+     "t": 1723766400000,
+     "strategy": 2.7729,
+     "benchmark": 1.2933
+    },
+    {
+     "t": 1724371200000,
+     "strategy": 2.717,
+     "benchmark": 1.1914
+    },
+    {
+     "t": 1724976000000,
+     "strategy": 2.6456,
+     "benchmark": 1.0871
+    },
+    {
+     "t": 1725580800000,
+     "strategy": 2.7136,
+     "benchmark": 0.9404
+    },
+    {
+     "t": 1726185600000,
+     "strategy": 2.7505,
+     "benchmark": 1.0005
+    },
+    {
+     "t": 1726790400000,
+     "strategy": 2.737,
+     "benchmark": 1.1054
+    },
+    {
+     "t": 1727395200000,
+     "strategy": 2.8219,
+     "benchmark": 1.1488
+    },
+    {
+     "t": 1728000000000,
+     "strategy": 2.9019,
+     "benchmark": 1.3953
+    },
+    {
+     "t": 1728604800000,
+     "strategy": 2.7098,
+     "benchmark": 1.2049
+    },
+    {
+     "t": 1729209600000,
+     "strategy": 2.8234,
+     "benchmark": 1.2222
+    },
+    {
+     "t": 1729814400000,
+     "strategy": 2.8409,
+     "benchmark": 1.261
+    },
+    {
+     "t": 1730419200000,
+     "strategy": 2.8864,
+     "benchmark": 1.3776
+    },
+    {
+     "t": 1731024000000,
+     "strategy": 2.7665,
+     "benchmark": 1.2227
+    },
+    {
+     "t": 1731628800000,
+     "strategy": 2.7049,
+     "benchmark": 1.2951
+    },
+    {
+     "t": 1732233600000,
+     "strategy": 2.6706,
+     "benchmark": 1.2375
+    },
+    {
+     "t": 1732838400000,
+     "strategy": 2.6517,
+     "benchmark": 1.1276
+    },
+    {
+     "t": 1733443200000,
+     "strategy": 2.7147,
+     "benchmark": 1.3497
+    },
+    {
+     "t": 1734048000000,
+     "strategy": 2.6674,
+     "benchmark": 1.4161
+    },
+    {
+     "t": 1734652800000,
+     "strategy": 2.6075,
+     "benchmark": 1.3119
+    },
+    {
+     "t": 1735257600000,
+     "strategy": 2.7098,
+     "benchmark": 1.4243
+    },
+    {
+     "t": 1735862400000,
+     "strategy": 2.8034,
+     "benchmark": 1.5233
+    },
+    {
+     "t": 1736467200000,
+     "strategy": 2.8414,
+     "benchmark": 1.5468
+    },
+    {
+     "t": 1737072000000,
+     "strategy": 3.0157,
+     "benchmark": 1.7621
+    },
+    {
+     "t": 1737676800000,
+     "strategy": 3.0052,
+     "benchmark": 1.7635
+    },
+    {
+     "t": 1738281600000,
+     "strategy": 2.7055,
+     "benchmark": 1.3768
+    },
+    {
+     "t": 1738886400000,
+     "strategy": 2.7148,
+     "benchmark": 1.454
+    },
+    {
+     "t": 1739491200000,
+     "strategy": 2.7403,
+     "benchmark": 1.6007
+    },
+    {
+     "t": 1740096000000,
+     "strategy": 2.6653,
+     "benchmark": 1.5377
+    },
+    {
+     "t": 1740700800000,
+     "strategy": 2.6709,
+     "benchmark": 1.3386
+    },
+    {
+     "t": 1741305600000,
+     "strategy": 2.7343,
+     "benchmark": 1.3503
+    },
+    {
+     "t": 1741910400000,
+     "strategy": 2.7147,
+     "benchmark": 1.2949
+    },
+    {
+     "t": 1742515200000,
+     "strategy": 2.7428,
+     "benchmark": 1.2938
+    },
+    {
+     "t": 1743120000000,
+     "strategy": 2.8104,
+     "benchmark": 1.3379
+    },
+    {
+     "t": 1743724800000,
+     "strategy": 2.9104,
+     "benchmark": 1.3725
+    },
+    {
+     "t": 1744329600000,
+     "strategy": 2.948,
+     "benchmark": 1.4508
+    },
+    {
+     "t": 1744934400000,
+     "strategy": 2.9686,
+     "benchmark": 1.7109
+    },
+    {
+     "t": 1745539200000,
+     "strategy": 3.0574,
+     "benchmark": 1.8394
+    },
+    {
+     "t": 1746144000000,
+     "strategy": 3.0086,
+     "benchmark": 1.9386
+    },
+    {
+     "t": 1746748800000,
+     "strategy": 2.8845,
+     "benchmark": 1.8294
+    },
+    {
+     "t": 1747353600000,
+     "strategy": 2.953,
+     "benchmark": 1.7725
+    },
+    {
+     "t": 1747958400000,
+     "strategy": 3.0936,
+     "benchmark": 2.0092
+    },
+    {
+     "t": 1748563200000,
+     "strategy": 3.1245,
+     "benchmark": 2.0033
+    },
+    {
+     "t": 1749168000000,
+     "strategy": 3.3046,
+     "benchmark": 2.0621
+    },
+    {
+     "t": 1749772800000,
+     "strategy": 3.3586,
+     "benchmark": 1.9585
+    },
+    {
+     "t": 1750377600000,
+     "strategy": 3.362,
+     "benchmark": 1.909
+    },
+    {
+     "t": 1750982400000,
+     "strategy": 3.3224,
+     "benchmark": 1.6665
+    },
+    {
+     "t": 1751241600000,
+     "strategy": 3.4657,
+     "benchmark": 1.9048
+    }
+   ],
+   "metrics": [
+    {
+     "label": "Total return",
+     "strategy": 2.4657,
+     "benchmark": 0.9048,
+     "format": "percent"
+    },
+    {
+     "label": "CAGR",
+     "strategy": 0.3182,
+     "benchmark": 0.154,
+     "format": "percent"
+    },
+    {
+     "label": "Volatility",
+     "strategy": 0.2036,
+     "benchmark": 0.6656,
+     "format": "percent"
+    },
+    {
+     "label": "Sharpe",
+     "strategy": 1.46,
+     "benchmark": 0.55,
+     "format": "ratio"
+    },
+    {
+     "label": "Max drawdown",
+     "strategy": 0.2012,
+     "benchmark": 0.7175,
+     "format": "percent"
+    },
+    {
+     "label": "Win rate",
+     "strategy": 0.3171,
+     "benchmark": null,
+     "format": "percent"
+    },
+    {
+     "label": "Profit factor",
+     "strategy": 1.24,
+     "benchmark": null,
+     "format": "ratio"
+    },
+    {
+     "label": "Trades",
+     "strategy": 41,
+     "benchmark": null,
+     "format": "count"
+    }
+   ],
+   "trades": [
+    {
+     "id": 1,
+     "side": "long",
+     "entryTime": 1609977600000,
+     "exitTime": 1611100800000,
+     "entryPrice": 29742.52,
+     "exitPrice": 28424.11,
+     "returnPct": -4.43,
+     "open": false
+    },
+    {
+     "id": 2,
+     "side": "long",
+     "entryTime": 1613433600000,
+     "exitTime": 1613606400000,
+     "entryPrice": 38885.66,
+     "exitPrice": 37129.14,
+     "returnPct": -4.52,
+     "open": false
+    },
+    {
+     "id": 3,
+     "side": "long",
+     "entryTime": 1616803200000,
+     "exitTime": 1618617600000,
+     "entryPrice": 33734.58,
+     "exitPrice": 38203.31,
+     "returnPct": 13.25,
+     "open": false
+    },
+    {
+     "id": 4,
+     "side": "short",
+     "entryTime": 1619913600000,
+     "exitTime": 1620345600000,
+     "entryPrice": 20037.2,
+     "exitPrice": 18108.4,
+     "returnPct": 9.63,
+     "open": false
+    },
+    {
+     "id": 5,
+     "side": "long",
+     "entryTime": 1623801600000,
+     "exitTime": 1624147200000,
+     "entryPrice": 16145.41,
+     "exitPrice": 15440.28,
+     "returnPct": -4.37,
+     "open": false
+    },
+    {
+     "id": 6,
+     "side": "long",
+     "entryTime": 1627603200000,
+     "exitTime": 1629331200000,
+     "entryPrice": 21607.89,
+     "exitPrice": 20932.75,
+     "returnPct": -3.12,
+     "open": false
+    },
+    {
+     "id": 7,
+     "side": "short",
+     "entryTime": 1630454400000,
+     "exitTime": 1630627200000,
+     "entryPrice": 20095.94,
+     "exitPrice": 21360.54,
+     "returnPct": -6.29,
+     "open": false
+    },
+    {
+     "id": 8,
+     "side": "long",
+     "entryTime": 1633737600000,
+     "exitTime": 1635292800000,
+     "entryPrice": 20882.66,
+     "exitPrice": 23327.08,
+     "returnPct": 11.71,
+     "open": false
+    },
+    {
+     "id": 9,
+     "side": "short",
+     "entryTime": 1637971200000,
+     "exitTime": 1638316800000,
+     "entryPrice": 25979.86,
+     "exitPrice": 27418.47,
+     "returnPct": -5.54,
+     "open": false
+    },
+    {
+     "id": 10,
+     "side": "long",
+     "entryTime": 1640563200000,
+     "exitTime": 1640736000000,
+     "entryPrice": 23362.06,
+     "exitPrice": 22430.65,
+     "returnPct": -3.99,
+     "open": false
+    },
+    {
+     "id": 11,
+     "side": "long",
+     "entryTime": 1644278400000,
+     "exitTime": 1645401600000,
+     "entryPrice": 25010.05,
+     "exitPrice": 24503.17,
+     "returnPct": -2.03,
+     "open": false
+    },
+    {
+     "id": 12,
+     "side": "long",
+     "entryTime": 1647475200000,
+     "exitTime": 1648425600000,
+     "entryPrice": 28437.6,
+     "exitPrice": 26638.93,
+     "returnPct": -6.32,
+     "open": false
+    },
+    {
+     "id": 13,
+     "side": "long",
+     "entryTime": 1651363200000,
+     "exitTime": 1652140800000,
+     "entryPrice": 51241.07,
+     "exitPrice": 58456.31,
+     "returnPct": 14.08,
+     "open": false
+    },
+    {
+     "id": 14,
+     "side": "long",
+     "entryTime": 1655164800000,
+     "exitTime": 1655856000000,
+     "entryPrice": 45984.68,
+     "exitPrice": 44481.18,
+     "returnPct": -3.27,
+     "open": false
+    },
+    {
+     "id": 15,
+     "side": "short",
+     "entryTime": 1657929600000,
+     "exitTime": 1658188800000,
+     "entryPrice": 69235.64,
+     "exitPrice": 72415.95,
+     "returnPct": -4.59,
+     "open": false
+    },
+    {
+     "id": 16,
+     "side": "long",
+     "entryTime": 1661644800000,
+     "exitTime": 1662508800000,
+     "entryPrice": 67639.78,
+     "exitPrice": 63788.38,
+     "returnPct": -5.69,
+     "open": false
+    },
+    {
+     "id": 17,
+     "side": "short",
+     "entryTime": 1665100800000,
+     "exitTime": 1667088000000,
+     "entryPrice": 68925.62,
+     "exitPrice": 71467.13,
+     "returnPct": -3.69,
+     "open": false
+    },
+    {
+     "id": 18,
+     "side": "long",
+     "entryTime": 1668729600000,
+     "exitTime": 1668816000000,
+     "entryPrice": 71838.09,
+     "exitPrice": 69648.7,
+     "returnPct": -3.05,
+     "open": false
+    },
+    {
+     "id": 19,
+     "side": "long",
+     "entryTime": 1671753600000,
+     "exitTime": 1671926400000,
+     "entryPrice": 55151.66,
+     "exitPrice": 52827.74,
+     "returnPct": -4.21,
+     "open": false
+    },
+    {
+     "id": 20,
+     "side": "long",
+     "entryTime": 1675209600000,
+     "exitTime": 1676419200000,
+     "entryPrice": 86952.48,
+     "exitPrice": 81869.96,
+     "returnPct": -5.85,
+     "open": false
+    },
+    {
+     "id": 21,
+     "side": "short",
+     "entryTime": 1679184000000,
+     "exitTime": 1680480000000,
+     "entryPrice": 83505.76,
+     "exitPrice": 86794,
+     "returnPct": -3.94,
+     "open": false
+    },
+    {
+     "id": 22,
+     "side": "short",
+     "entryTime": 1682640000000,
+     "exitTime": 1684022400000,
+     "entryPrice": 72775.99,
+     "exitPrice": 76422.5,
+     "returnPct": -5.01,
+     "open": false
+    },
+    {
+     "id": 23,
+     "side": "long",
+     "entryTime": 1685577600000,
+     "exitTime": 1686960000000,
+     "entryPrice": 50028.77,
+     "exitPrice": 48403.49,
+     "returnPct": -3.25,
+     "open": false
+    },
+    {
+     "id": 24,
+     "side": "short",
+     "entryTime": 1689292800000,
+     "exitTime": 1690934400000,
+     "entryPrice": 35849.63,
+     "exitPrice": 36545.97,
+     "returnPct": -1.94,
+     "open": false
+    },
+    {
+     "id": 25,
+     "side": "long",
+     "entryTime": 1693008000000,
+     "exitTime": 1694044800000,
+     "entryPrice": 39747.63,
+     "exitPrice": 38681.97,
+     "returnPct": -2.68,
+     "open": false
+    },
+    {
+     "id": 26,
+     "side": "short",
+     "entryTime": 1696118400000,
+     "exitTime": 1696377600000,
+     "entryPrice": 44791.71,
+     "exitPrice": 46327.36,
+     "returnPct": -3.43,
+     "open": false
+    },
+    {
+     "id": 27,
+     "side": "long",
+     "entryTime": 1700092800000,
+     "exitTime": 1702080000000,
+     "entryPrice": 36556.17,
+     "exitPrice": 35962.43,
+     "returnPct": -1.62,
+     "open": false
+    },
+    {
+     "id": 28,
+     "side": "short",
+     "entryTime": 1703635200000,
+     "exitTime": 1704844800000,
+     "entryPrice": 38655.13,
+     "exitPrice": 40440.07,
+     "returnPct": -4.62,
+     "open": false
+    },
+    {
+     "id": 29,
+     "side": "short",
+     "entryTime": 1706659200000,
+     "exitTime": 1707696000000,
+     "entryPrice": 49854.39,
+     "exitPrice": 42347.85,
+     "returnPct": 15.06,
+     "open": false
+    },
+    {
+     "id": 30,
+     "side": "long",
+     "entryTime": 1709769600000,
+     "exitTime": 1711843200000,
+     "entryPrice": 70674.61,
+     "exitPrice": 67155.79,
+     "returnPct": -4.98,
+     "open": false
+    },
+    {
+     "id": 31,
+     "side": "long",
+     "entryTime": 1714089600000,
+     "exitTime": 1716163200000,
+     "entryPrice": 76844.42,
+     "exitPrice": 81933.99,
+     "returnPct": 6.62,
+     "open": false
+    },
+    {
+     "id": 32,
+     "side": "short",
+     "entryTime": 1716940800000,
+     "exitTime": 1717891200000,
+     "entryPrice": 65908.94,
+     "exitPrice": 67123.44,
+     "returnPct": -1.84,
+     "open": false
+    },
+    {
+     "id": 33,
+     "side": "long",
+     "entryTime": 1720483200000,
+     "exitTime": 1721088000000,
+     "entryPrice": 55670.66,
+     "exitPrice": 63455.74,
+     "returnPct": 13.98,
+     "open": false
+    },
+    {
+     "id": 34,
+     "side": "short",
+     "entryTime": 1723852800000,
+     "exitTime": 1725148800000,
+     "entryPrice": 37463.2,
+     "exitPrice": 30991.79,
+     "returnPct": 17.27,
+     "open": false
+    },
+    {
+     "id": 35,
+     "side": "long",
+     "entryTime": 1727395200000,
+     "exitTime": 1727913600000,
+     "entryPrice": 33315.45,
+     "exitPrice": 32275.12,
+     "returnPct": -3.12,
+     "open": false
+    },
+    {
+     "id": 36,
+     "side": "long",
+     "entryTime": 1731024000000,
+     "exitTime": 1731110400000,
+     "entryPrice": 35459.75,
+     "exitPrice": 37791.28,
+     "returnPct": 6.58,
+     "open": false
+    },
+    {
+     "id": 37,
+     "side": "long",
+     "entryTime": 1733961600000,
+     "exitTime": 1735689600000,
+     "entryPrice": 38938.57,
+     "exitPrice": 43900.69,
+     "returnPct": 12.74,
+     "open": false
+    },
+    {
+     "id": 38,
+     "side": "long",
+     "entryTime": 1738022400000,
+     "exitTime": 1739750400000,
+     "entryPrice": 48303.75,
+     "exitPrice": 50993.73,
+     "returnPct": 5.57,
+     "open": false
+    },
+    {
+     "id": 39,
+     "side": "long",
+     "entryTime": 1740960000000,
+     "exitTime": 1741219200000,
+     "entryPrice": 38948.2,
+     "exitPrice": 41161.15,
+     "returnPct": 5.68,
+     "open": false
+    },
+    {
+     "id": 40,
+     "side": "long",
+     "entryTime": 1744848000000,
+     "exitTime": 1746403200000,
+     "entryPrice": 45397.01,
+     "exitPrice": 43022.49,
+     "returnPct": -5.23,
+     "open": false
+    },
+    {
+     "id": 41,
+     "side": "short",
+     "entryTime": 1748044800000,
+     "exitTime": 1749686400000,
+     "entryPrice": 55998.56,
+     "exitPrice": 52023.98,
+     "returnPct": 7.1,
+     "open": false
+    }
+   ]
+  },
+  "1794132900000-c03d91f7": {
+   "decision": "no_trade",
+   "instrument": {
+    "venue": "bybit",
+    "symbol": "ETHUSDT",
+    "kind": "spot"
+   },
+   "period": {
+    "from": 1609459200000,
+    "to": 1751241600000
+   },
+   "finishedAt": 1794132900000,
+   "criteria": [
+    {
+     "label": "Out-of-sample Sharpe",
+     "value": 0.36,
+     "limit": 1,
+     "rule": "at_least",
+     "format": "ratio",
+     "pass": false
+    },
+    {
+     "label": "Max drawdown",
+     "value": 0.5247,
+     "limit": 0.25,
+     "rule": "at_most",
+     "format": "percent",
+     "pass": false
+    },
+    {
+     "label": "Trades",
+     "value": 126,
+     "limit": 30,
+     "rule": "at_least",
+     "format": "count",
+     "pass": true
+    }
+   ],
+   "keyNumbers": [
+    {
+     "label": "Return",
+     "value": 0.5523,
+     "format": "percent",
+     "tone": "pnl"
+    },
+    {
+     "label": "CAGR",
+     "value": 0.1027,
+     "format": "percent",
+     "tone": "pnl"
+    },
+    {
+     "label": "Sharpe",
+     "value": 0.44,
+     "format": "ratio"
+    },
+    {
+     "label": "Max drawdown",
+     "value": 0.5247,
+     "format": "percent"
+    }
+   ],
+   "benchmarkLabel": "Buy and hold",
+   "equity": [
+    {
+     "t": 1609459200000,
+     "strategy": 1,
+     "benchmark": 1
+    },
+    {
+     "t": 1610064000000,
+     "strategy": 0.9253,
+     "benchmark": 0.8685
+    },
+    {
+     "t": 1610668800000,
+     "strategy": 0.963,
+     "benchmark": 0.9349
+    },
+    {
+     "t": 1611273600000,
+     "strategy": 1.0785,
+     "benchmark": 1.152
+    },
+    {
+     "t": 1611878400000,
+     "strategy": 1.0291,
+     "benchmark": 1.0308
+    },
+    {
+     "t": 1612483200000,
+     "strategy": 1.0368,
+     "benchmark": 1.0924
+    },
+    {
+     "t": 1613088000000,
+     "strategy": 1.0291,
+     "benchmark": 1.0683
+    },
+    {
+     "t": 1613692800000,
+     "strategy": 1.1017,
+     "benchmark": 1.2379
+    },
+    {
+     "t": 1614297600000,
+     "strategy": 1.0639,
+     "benchmark": 1.2038
+    },
+    {
+     "t": 1614902400000,
+     "strategy": 1.1584,
+     "benchmark": 1.2818
+    },
+    {
+     "t": 1615507200000,
+     "strategy": 1.1568,
+     "benchmark": 1.3303
+    },
+    {
+     "t": 1616112000000,
+     "strategy": 1.1099,
+     "benchmark": 1.3205
+    },
+    {
+     "t": 1616716800000,
+     "strategy": 1.164,
+     "benchmark": 1.5729
+    },
+    {
+     "t": 1617321600000,
+     "strategy": 1.2626,
+     "benchmark": 1.7211
+    },
+    {
+     "t": 1617926400000,
+     "strategy": 1.2245,
+     "benchmark": 1.5756
+    },
+    {
+     "t": 1618531200000,
+     "strategy": 1.126,
+     "benchmark": 1.3981
+    },
+    {
+     "t": 1619136000000,
+     "strategy": 1.1108,
+     "benchmark": 1.429
+    },
+    {
+     "t": 1619740800000,
+     "strategy": 1.0854,
+     "benchmark": 1.4189
+    },
+    {
+     "t": 1620345600000,
+     "strategy": 1.1171,
+     "benchmark": 1.5667
+    },
+    {
+     "t": 1620950400000,
+     "strategy": 1.1165,
+     "benchmark": 1.5868
+    },
+    {
+     "t": 1621555200000,
+     "strategy": 1.0146,
+     "benchmark": 1.4068
+    },
+    {
+     "t": 1622160000000,
+     "strategy": 0.9872,
+     "benchmark": 1.2479
+    },
+    {
+     "t": 1622764800000,
+     "strategy": 0.9811,
+     "benchmark": 1.1693
+    },
+    {
+     "t": 1623369600000,
+     "strategy": 0.9899,
+     "benchmark": 1.2332
+    },
+    {
+     "t": 1623974400000,
+     "strategy": 0.9578,
+     "benchmark": 1.1485
+    },
+    {
+     "t": 1624579200000,
+     "strategy": 0.9265,
+     "benchmark": 1.0582
+    },
+    {
+     "t": 1625184000000,
+     "strategy": 0.9201,
+     "benchmark": 1.0326
+    },
+    {
+     "t": 1625788800000,
+     "strategy": 0.9303,
+     "benchmark": 1.0315
+    },
+    {
+     "t": 1626393600000,
+     "strategy": 0.9999,
+     "benchmark": 1.1549
+    },
+    {
+     "t": 1626998400000,
+     "strategy": 1.0222,
+     "benchmark": 1.1177
+    },
+    {
+     "t": 1627603200000,
+     "strategy": 1.0969,
+     "benchmark": 1.2945
+    },
+    {
+     "t": 1628208000000,
+     "strategy": 1.0443,
+     "benchmark": 1.1329
+    },
+    {
+     "t": 1628812800000,
+     "strategy": 1.023,
+     "benchmark": 1.207
+    },
+    {
+     "t": 1629417600000,
+     "strategy": 1.0361,
+     "benchmark": 1.1673
+    },
+    {
+     "t": 1630022400000,
+     "strategy": 1.1336,
+     "benchmark": 1.3584
+    },
+    {
+     "t": 1630627200000,
+     "strategy": 1.08,
+     "benchmark": 1.2659
+    },
+    {
+     "t": 1631232000000,
+     "strategy": 1.2361,
+     "benchmark": 1.5724
+    },
+    {
+     "t": 1631836800000,
+     "strategy": 1.3619,
+     "benchmark": 1.8415
+    },
+    {
+     "t": 1632441600000,
+     "strategy": 1.2564,
+     "benchmark": 1.707
+    },
+    {
+     "t": 1633046400000,
+     "strategy": 1.0723,
+     "benchmark": 1.2996
+    },
+    {
+     "t": 1633651200000,
+     "strategy": 1.0295,
+     "benchmark": 1.0715
+    },
+    {
+     "t": 1634256000000,
+     "strategy": 0.9995,
+     "benchmark": 0.9745
+    },
+    {
+     "t": 1634860800000,
+     "strategy": 1.0321,
+     "benchmark": 1.0958
+    },
+    {
+     "t": 1635465600000,
+     "strategy": 1.0271,
+     "benchmark": 1.278
+    },
+    {
+     "t": 1636070400000,
+     "strategy": 0.8891,
+     "benchmark": 0.92
+    },
+    {
+     "t": 1636675200000,
+     "strategy": 0.8589,
+     "benchmark": 0.8764
+    },
+    {
+     "t": 1637280000000,
+     "strategy": 0.9287,
+     "benchmark": 1.0707
+    },
+    {
+     "t": 1637884800000,
+     "strategy": 0.8724,
+     "benchmark": 0.9882
+    },
+    {
+     "t": 1638489600000,
+     "strategy": 0.894,
+     "benchmark": 1.0071
+    },
+    {
+     "t": 1639094400000,
+     "strategy": 0.9077,
+     "benchmark": 1.0955
+    },
+    {
+     "t": 1639699200000,
+     "strategy": 0.9138,
+     "benchmark": 1.2171
+    },
+    {
+     "t": 1640304000000,
+     "strategy": 0.8879,
+     "benchmark": 1.0657
+    },
+    {
+     "t": 1640908800000,
+     "strategy": 0.7755,
+     "benchmark": 0.8075
+    },
+    {
+     "t": 1641513600000,
+     "strategy": 0.8096,
+     "benchmark": 0.9324
+    },
+    {
+     "t": 1642118400000,
+     "strategy": 0.8121,
+     "benchmark": 0.8964
+    },
+    {
+     "t": 1642723200000,
+     "strategy": 0.8471,
+     "benchmark": 0.9268
+    },
+    {
+     "t": 1643328000000,
+     "strategy": 0.9185,
+     "benchmark": 1.0183
+    },
+    {
+     "t": 1643932800000,
+     "strategy": 0.8708,
+     "benchmark": 0.9719
+    },
+    {
+     "t": 1644537600000,
+     "strategy": 0.8253,
+     "benchmark": 0.9337
+    },
+    {
+     "t": 1645142400000,
+     "strategy": 0.861,
+     "benchmark": 1.0163
+    },
+    {
+     "t": 1645747200000,
+     "strategy": 0.8101,
+     "benchmark": 0.9738
+    },
+    {
+     "t": 1646352000000,
+     "strategy": 0.8708,
+     "benchmark": 1.0551
+    },
+    {
+     "t": 1646956800000,
+     "strategy": 0.809,
+     "benchmark": 0.9407
+    },
+    {
+     "t": 1647561600000,
+     "strategy": 0.8329,
+     "benchmark": 1.0051
+    },
+    {
+     "t": 1648166400000,
+     "strategy": 0.8972,
+     "benchmark": 1.1256
+    },
+    {
+     "t": 1648771200000,
+     "strategy": 0.9512,
+     "benchmark": 1.1826
+    },
+    {
+     "t": 1649376000000,
+     "strategy": 0.9716,
+     "benchmark": 1.2389
+    },
+    {
+     "t": 1649980800000,
+     "strategy": 0.884,
+     "benchmark": 1.0727
+    },
+    {
+     "t": 1650585600000,
+     "strategy": 0.9946,
+     "benchmark": 1.3463
+    },
+    {
+     "t": 1651190400000,
+     "strategy": 1.1519,
+     "benchmark": 1.498
+    },
+    {
+     "t": 1651795200000,
+     "strategy": 1.0395,
+     "benchmark": 1.3241
+    },
+    {
+     "t": 1652400000000,
+     "strategy": 1.0959,
+     "benchmark": 1.3625
+    },
+    {
+     "t": 1653004800000,
+     "strategy": 1.0962,
+     "benchmark": 1.2512
+    },
+    {
+     "t": 1653609600000,
+     "strategy": 1.0059,
+     "benchmark": 1.1188
+    },
+    {
+     "t": 1654214400000,
+     "strategy": 0.9266,
+     "benchmark": 0.9745
+    },
+    {
+     "t": 1654819200000,
+     "strategy": 0.8135,
+     "benchmark": 0.8544
+    },
+    {
+     "t": 1655424000000,
+     "strategy": 0.7923,
+     "benchmark": 0.7914
+    },
+    {
+     "t": 1656028800000,
+     "strategy": 0.8202,
+     "benchmark": 0.7629
+    },
+    {
+     "t": 1656633600000,
+     "strategy": 0.7916,
+     "benchmark": 0.7529
+    },
+    {
+     "t": 1657238400000,
+     "strategy": 0.7686,
+     "benchmark": 0.7377
+    },
+    {
+     "t": 1657843200000,
+     "strategy": 0.8366,
+     "benchmark": 0.8701
+    },
+    {
+     "t": 1658448000000,
+     "strategy": 0.8446,
+     "benchmark": 0.76
+    },
+    {
+     "t": 1659052800000,
+     "strategy": 0.8775,
+     "benchmark": 0.8569
+    },
+    {
+     "t": 1659657600000,
+     "strategy": 1.0131,
+     "benchmark": 1.1356
+    },
+    {
+     "t": 1660262400000,
+     "strategy": 0.9316,
+     "benchmark": 0.9676
+    },
+    {
+     "t": 1660867200000,
+     "strategy": 0.8852,
+     "benchmark": 0.9122
+    },
+    {
+     "t": 1661472000000,
+     "strategy": 0.8575,
+     "benchmark": 0.888
+    },
+    {
+     "t": 1662076800000,
+     "strategy": 0.8963,
+     "benchmark": 0.9591
+    },
+    {
+     "t": 1662681600000,
+     "strategy": 0.9629,
+     "benchmark": 1.0108
+    },
+    {
+     "t": 1663286400000,
+     "strategy": 0.9377,
+     "benchmark": 1.0579
+    },
+    {
+     "t": 1663891200000,
+     "strategy": 1.0219,
+     "benchmark": 1.2313
+    },
+    {
+     "t": 1664496000000,
+     "strategy": 1.071,
+     "benchmark": 1.3752
+    },
+    {
+     "t": 1665100800000,
+     "strategy": 1.0878,
+     "benchmark": 1.551
+    },
+    {
+     "t": 1665705600000,
+     "strategy": 1.1271,
+     "benchmark": 1.7701
+    },
+    {
+     "t": 1666310400000,
+     "strategy": 1.0591,
+     "benchmark": 1.7498
+    },
+    {
+     "t": 1666915200000,
+     "strategy": 1.0884,
+     "benchmark": 1.7368
+    },
+    {
+     "t": 1667520000000,
+     "strategy": 1.0744,
+     "benchmark": 1.7914
+    },
+    {
+     "t": 1668124800000,
+     "strategy": 1.0335,
+     "benchmark": 1.7116
+    },
+    {
+     "t": 1668729600000,
+     "strategy": 1.0094,
+     "benchmark": 1.6165
+    },
+    {
+     "t": 1669334400000,
+     "strategy": 1.0975,
+     "benchmark": 1.8714
+    },
+    {
+     "t": 1669939200000,
+     "strategy": 1.21,
+     "benchmark": 2.2387
+    },
+    {
+     "t": 1670544000000,
+     "strategy": 1.2213,
+     "benchmark": 2.3084
+    },
+    {
+     "t": 1671148800000,
+     "strategy": 1.2299,
+     "benchmark": 2.2588
+    },
+    {
+     "t": 1671753600000,
+     "strategy": 1.0655,
+     "benchmark": 1.7606
+    },
+    {
+     "t": 1672358400000,
+     "strategy": 1.1477,
+     "benchmark": 2.1759
+    },
+    {
+     "t": 1672963200000,
+     "strategy": 1.2312,
+     "benchmark": 2.6069
+    },
+    {
+     "t": 1673568000000,
+     "strategy": 1.2244,
+     "benchmark": 2.6769
+    },
+    {
+     "t": 1674172800000,
+     "strategy": 1.1907,
+     "benchmark": 2.5267
+    },
+    {
+     "t": 1674777600000,
+     "strategy": 1.2402,
+     "benchmark": 2.4946
+    },
+    {
+     "t": 1675382400000,
+     "strategy": 1.3592,
+     "benchmark": 2.7104
+    },
+    {
+     "t": 1675987200000,
+     "strategy": 1.301,
+     "benchmark": 2.6867
+    },
+    {
+     "t": 1676592000000,
+     "strategy": 1.3261,
+     "benchmark": 2.9256
+    },
+    {
+     "t": 1677196800000,
+     "strategy": 1.3652,
+     "benchmark": 2.8875
+    },
+    {
+     "t": 1677801600000,
+     "strategy": 1.2868,
+     "benchmark": 2.7794
+    },
+    {
+     "t": 1678406400000,
+     "strategy": 1.2512,
+     "benchmark": 2.8701
+    },
+    {
+     "t": 1679011200000,
+     "strategy": 1.1966,
+     "benchmark": 2.5971
+    },
+    {
+     "t": 1679616000000,
+     "strategy": 1.0886,
+     "benchmark": 2.2135
+    },
+    {
+     "t": 1680220800000,
+     "strategy": 1.1233,
+     "benchmark": 2.2937
+    },
+    {
+     "t": 1680825600000,
+     "strategy": 1.2832,
+     "benchmark": 2.7186
+    },
+    {
+     "t": 1681430400000,
+     "strategy": 1.1911,
+     "benchmark": 2.4467
+    },
+    {
+     "t": 1682035200000,
+     "strategy": 1.1147,
+     "benchmark": 2.2004
+    },
+    {
+     "t": 1682640000000,
+     "strategy": 1.1695,
+     "benchmark": 2.3063
+    },
+    {
+     "t": 1683244800000,
+     "strategy": 1.1013,
+     "benchmark": 2.2534
+    },
+    {
+     "t": 1683849600000,
+     "strategy": 1.0046,
+     "benchmark": 2.0058
+    },
+    {
+     "t": 1684454400000,
+     "strategy": 0.8905,
+     "benchmark": 1.6483
+    },
+    {
+     "t": 1685059200000,
+     "strategy": 0.9645,
+     "benchmark": 2.0363
+    },
+    {
+     "t": 1685664000000,
+     "strategy": 0.9173,
+     "benchmark": 2.0052
+    },
+    {
+     "t": 1686268800000,
+     "strategy": 0.9333,
+     "benchmark": 1.9994
+    },
+    {
+     "t": 1686873600000,
+     "strategy": 0.8489,
+     "benchmark": 1.7763
+    },
+    {
+     "t": 1687478400000,
+     "strategy": 0.8382,
+     "benchmark": 1.638
+    },
+    {
+     "t": 1688083200000,
+     "strategy": 0.8261,
+     "benchmark": 1.6015
+    },
+    {
+     "t": 1688688000000,
+     "strategy": 0.7808,
+     "benchmark": 1.3724
+    },
+    {
+     "t": 1689292800000,
+     "strategy": 0.7042,
+     "benchmark": 1.2283
+    },
+    {
+     "t": 1689897600000,
+     "strategy": 0.708,
+     "benchmark": 1.1834
+    },
+    {
+     "t": 1690502400000,
+     "strategy": 0.8136,
+     "benchmark": 1.4814
+    },
+    {
+     "t": 1691107200000,
+     "strategy": 0.8089,
+     "benchmark": 1.5249
+    },
+    {
+     "t": 1691712000000,
+     "strategy": 0.8115,
+     "benchmark": 1.7442
+    },
+    {
+     "t": 1692316800000,
+     "strategy": 0.8691,
+     "benchmark": 2.0967
+    },
+    {
+     "t": 1692921600000,
+     "strategy": 0.8499,
+     "benchmark": 1.9082
+    },
+    {
+     "t": 1693526400000,
+     "strategy": 0.9117,
+     "benchmark": 2.3076
+    },
+    {
+     "t": 1694131200000,
+     "strategy": 0.8806,
+     "benchmark": 2.1108
+    },
+    {
+     "t": 1694736000000,
+     "strategy": 0.8087,
+     "benchmark": 1.8812
+    },
+    {
+     "t": 1695340800000,
+     "strategy": 0.8105,
+     "benchmark": 1.8562
+    },
+    {
+     "t": 1695945600000,
+     "strategy": 0.6936,
+     "benchmark": 1.4979
+    },
+    {
+     "t": 1696550400000,
+     "strategy": 0.7367,
+     "benchmark": 1.5992
+    },
+    {
+     "t": 1697155200000,
+     "strategy": 0.8448,
+     "benchmark": 1.9615
+    },
+    {
+     "t": 1697760000000,
+     "strategy": 0.8813,
+     "benchmark": 2.4058
+    },
+    {
+     "t": 1698364800000,
+     "strategy": 0.8304,
+     "benchmark": 2.001
+    },
+    {
+     "t": 1698969600000,
+     "strategy": 0.8121,
+     "benchmark": 2.0535
+    },
+    {
+     "t": 1699574400000,
+     "strategy": 0.7585,
+     "benchmark": 1.8523
+    },
+    {
+     "t": 1700179200000,
+     "strategy": 0.8089,
+     "benchmark": 2.0604
+    },
+    {
+     "t": 1700784000000,
+     "strategy": 0.7733,
+     "benchmark": 1.7747
+    },
+    {
+     "t": 1701388800000,
+     "strategy": 0.8024,
+     "benchmark": 1.9249
+    },
+    {
+     "t": 1701993600000,
+     "strategy": 0.7309,
+     "benchmark": 1.6817
+    },
+    {
+     "t": 1702598400000,
+     "strategy": 0.7895,
+     "benchmark": 1.9173
+    },
+    {
+     "t": 1703203200000,
+     "strategy": 0.8192,
+     "benchmark": 2.0763
+    },
+    {
+     "t": 1703808000000,
+     "strategy": 0.8173,
+     "benchmark": 2.3974
+    },
+    {
+     "t": 1704412800000,
+     "strategy": 0.8514,
+     "benchmark": 2.5799
+    },
+    {
+     "t": 1705017600000,
+     "strategy": 0.8357,
+     "benchmark": 2.533
+    },
+    {
+     "t": 1705622400000,
+     "strategy": 0.789,
+     "benchmark": 2.4786
+    },
+    {
+     "t": 1706227200000,
+     "strategy": 0.7608,
+     "benchmark": 2.3448
+    },
+    {
+     "t": 1706832000000,
+     "strategy": 0.7363,
+     "benchmark": 2.4418
+    },
+    {
+     "t": 1707436800000,
+     "strategy": 0.732,
+     "benchmark": 2.3381
+    },
+    {
+     "t": 1708041600000,
+     "strategy": 0.7998,
+     "benchmark": 2.6685
+    },
+    {
+     "t": 1708646400000,
+     "strategy": 0.8121,
+     "benchmark": 2.7422
+    },
+    {
+     "t": 1709251200000,
+     "strategy": 0.8983,
+     "benchmark": 3.2331
+    },
+    {
+     "t": 1709856000000,
+     "strategy": 0.8715,
+     "benchmark": 3.0347
+    },
+    {
+     "t": 1710460800000,
+     "strategy": 0.9226,
+     "benchmark": 3.2243
+    },
+    {
+     "t": 1711065600000,
+     "strategy": 0.9218,
+     "benchmark": 2.988
+    },
+    {
+     "t": 1711670400000,
+     "strategy": 0.9624,
+     "benchmark": 2.9872
+    },
+    {
+     "t": 1712275200000,
+     "strategy": 1.0083,
+     "benchmark": 3.147
+    },
+    {
+     "t": 1712880000000,
+     "strategy": 0.9346,
+     "benchmark": 2.8291
+    },
+    {
+     "t": 1713484800000,
+     "strategy": 0.914,
+     "benchmark": 2.9518
+    },
+    {
+     "t": 1714089600000,
+     "strategy": 0.9938,
+     "benchmark": 3.3115
+    },
+    {
+     "t": 1714694400000,
+     "strategy": 0.9357,
+     "benchmark": 2.9954
+    },
+    {
+     "t": 1715299200000,
+     "strategy": 0.9651,
+     "benchmark": 3.3649
+    },
+    {
+     "t": 1715904000000,
+     "strategy": 1.0545,
+     "benchmark": 4.0836
+    },
+    {
+     "t": 1716508800000,
+     "strategy": 0.9943,
+     "benchmark": 3.6606
+    },
+    {
+     "t": 1717113600000,
+     "strategy": 0.9829,
+     "benchmark": 3.817
+    },
+    {
+     "t": 1717718400000,
+     "strategy": 0.9328,
+     "benchmark": 3.217
+    },
+    {
+     "t": 1718323200000,
+     "strategy": 1.0115,
+     "benchmark": 4.017
+    },
+    {
+     "t": 1718928000000,
+     "strategy": 1.047,
+     "benchmark": 4.0355
+    },
+    {
+     "t": 1719532800000,
+     "strategy": 1.0691,
+     "benchmark": 3.8768
+    },
+    {
+     "t": 1720137600000,
+     "strategy": 1.0829,
+     "benchmark": 3.6254
+    },
+    {
+     "t": 1720742400000,
+     "strategy": 1.114,
+     "benchmark": 3.8755
+    },
+    {
+     "t": 1721347200000,
+     "strategy": 1.1857,
+     "benchmark": 4.1907
+    },
+    {
+     "t": 1721952000000,
+     "strategy": 1.1411,
+     "benchmark": 4.0417
+    },
+    {
+     "t": 1722556800000,
+     "strategy": 1.3132,
+     "benchmark": 4.8366
+    },
+    {
+     "t": 1723161600000,
+     "strategy": 1.4064,
+     "benchmark": 4.8342
+    },
+    {
+     "t": 1723766400000,
+     "strategy": 1.5232,
+     "benchmark": 5.8622
+    },
+    {
+     "t": 1724371200000,
+     "strategy": 1.5786,
+     "benchmark": 6.0664
+    },
+    {
+     "t": 1724976000000,
+     "strategy": 1.5237,
+     "benchmark": 5.857
+    },
+    {
+     "t": 1725580800000,
+     "strategy": 1.5127,
+     "benchmark": 5.6611
+    },
+    {
+     "t": 1726185600000,
+     "strategy": 1.635,
+     "benchmark": 6.6465
+    },
+    {
+     "t": 1726790400000,
+     "strategy": 1.7101,
+     "benchmark": 7.1258
+    },
+    {
+     "t": 1727395200000,
+     "strategy": 1.7177,
+     "benchmark": 7.5755
+    },
+    {
+     "t": 1728000000000,
+     "strategy": 1.5187,
+     "benchmark": 6.0731
+    },
+    {
+     "t": 1728604800000,
+     "strategy": 1.5174,
+     "benchmark": 6.4125
+    },
+    {
+     "t": 1729209600000,
+     "strategy": 1.5272,
+     "benchmark": 6.1729
+    },
+    {
+     "t": 1729814400000,
+     "strategy": 1.4544,
+     "benchmark": 5.9042
+    },
+    {
+     "t": 1730419200000,
+     "strategy": 1.6821,
+     "benchmark": 7.0071
+    },
+    {
+     "t": 1731024000000,
+     "strategy": 1.83,
+     "benchmark": 7.469
+    },
+    {
+     "t": 1731628800000,
+     "strategy": 1.8496,
+     "benchmark": 8.5176
+    },
+    {
+     "t": 1732233600000,
+     "strategy": 1.7877,
+     "benchmark": 7.0432
+    },
+    {
+     "t": 1732838400000,
+     "strategy": 1.7111,
+     "benchmark": 7.5765
+    },
+    {
+     "t": 1733443200000,
+     "strategy": 1.4819,
+     "benchmark": 6.2064
+    },
+    {
+     "t": 1734048000000,
+     "strategy": 1.6416,
+     "benchmark": 7.5169
+    },
+    {
+     "t": 1734652800000,
+     "strategy": 1.5646,
+     "benchmark": 7.6129
+    },
+    {
+     "t": 1735257600000,
+     "strategy": 1.4178,
+     "benchmark": 6.2839
+    },
+    {
+     "t": 1735862400000,
+     "strategy": 1.4807,
+     "benchmark": 6.9677
+    },
+    {
+     "t": 1736467200000,
+     "strategy": 1.4541,
+     "benchmark": 6.9574
+    },
+    {
+     "t": 1737072000000,
+     "strategy": 1.5067,
+     "benchmark": 7.7883
+    },
+    {
+     "t": 1737676800000,
+     "strategy": 1.4459,
+     "benchmark": 7.5317
+    },
+    {
+     "t": 1738281600000,
+     "strategy": 1.4919,
+     "benchmark": 7.5107
+    },
+    {
+     "t": 1738886400000,
+     "strategy": 1.4326,
+     "benchmark": 7.0441
+    },
+    {
+     "t": 1739491200000,
+     "strategy": 1.4262,
+     "benchmark": 6.9928
+    },
+    {
+     "t": 1740096000000,
+     "strategy": 1.3458,
+     "benchmark": 6.3793
+    },
+    {
+     "t": 1740700800000,
+     "strategy": 1.3273,
+     "benchmark": 6.0546
+    },
+    {
+     "t": 1741305600000,
+     "strategy": 1.2206,
+     "benchmark": 5.1191
+    },
+    {
+     "t": 1741910400000,
+     "strategy": 1.2163,
+     "benchmark": 4.9947
+    },
+    {
+     "t": 1742515200000,
+     "strategy": 1.2747,
+     "benchmark": 5.7297
+    },
+    {
+     "t": 1743120000000,
+     "strategy": 1.358,
+     "benchmark": 5.8396
+    },
+    {
+     "t": 1743724800000,
+     "strategy": 1.2907,
+     "benchmark": 5.5923
+    },
+    {
+     "t": 1744329600000,
+     "strategy": 1.389,
+     "benchmark": 6.1477
+    },
+    {
+     "t": 1744934400000,
+     "strategy": 1.4192,
+     "benchmark": 6.2983
+    },
+    {
+     "t": 1745539200000,
+     "strategy": 1.3913,
+     "benchmark": 5.9536
+    },
+    {
+     "t": 1746144000000,
+     "strategy": 1.397,
+     "benchmark": 6.9346
+    },
+    {
+     "t": 1746748800000,
+     "strategy": 1.4072,
+     "benchmark": 6.2531
+    },
+    {
+     "t": 1747353600000,
+     "strategy": 1.3829,
+     "benchmark": 6.4099
+    },
+    {
+     "t": 1747958400000,
+     "strategy": 1.3449,
+     "benchmark": 6.2408
+    },
+    {
+     "t": 1748563200000,
+     "strategy": 1.3445,
+     "benchmark": 5.7236
+    },
+    {
+     "t": 1749168000000,
+     "strategy": 1.2723,
+     "benchmark": 5.9284
+    },
+    {
+     "t": 1749772800000,
+     "strategy": 1.3893,
+     "benchmark": 6.6688
+    },
+    {
+     "t": 1750377600000,
+     "strategy": 1.428,
+     "benchmark": 6.4328
+    },
+    {
+     "t": 1750982400000,
+     "strategy": 1.5069,
+     "benchmark": 7.5299
+    },
+    {
+     "t": 1751241600000,
+     "strategy": 1.5523,
+     "benchmark": 7.8308
+    }
+   ],
+   "metrics": [
+    {
+     "label": "Total return",
+     "strategy": 0.5523,
+     "benchmark": 6.8308,
+     "format": "percent"
+    },
+    {
+     "label": "CAGR",
+     "strategy": 0.1027,
+     "benchmark": 0.5801,
+     "format": "percent"
+    },
+    {
+     "label": "Volatility",
+     "strategy": 0.4804,
+     "benchmark": 0.852,
+     "format": "percent"
+    },
+    {
+     "label": "Sharpe",
+     "strategy": 0.44,
+     "benchmark": 0.96,
+     "format": "ratio"
+    },
+    {
+     "label": "Max drawdown",
+     "strategy": 0.5247,
+     "benchmark": 0.661,
+     "format": "percent"
+    },
+    {
+     "label": "Win rate",
+     "strategy": 0.5794,
+     "benchmark": null,
+     "format": "percent"
+    },
+    {
+     "label": "Profit factor",
+     "strategy": 1.09,
+     "benchmark": null,
+     "format": "ratio"
+    },
+    {
+     "label": "Trades",
+     "strategy": 126,
+     "benchmark": null,
+     "format": "count"
+    }
+   ],
+   "trades": [
+    {
+     "id": 1,
+     "side": "long",
+     "entryTime": 1609459200000,
+     "exitTime": 1609545600000,
+     "entryPrice": 730,
+     "exitPrice": 711.53,
+     "returnPct": -2.53,
+     "open": false
+    },
+    {
+     "id": 2,
+     "side": "long",
+     "entryTime": 1610668800000,
+     "exitTime": 1610841600000,
+     "entryPrice": 682.44,
+     "exitPrice": 708.79,
+     "returnPct": 3.86,
+     "open": false
+    },
+    {
+     "id": 3,
+     "side": "long",
+     "entryTime": 1611964800000,
+     "exitTime": 1612051200000,
+     "entryPrice": 767.43,
+     "exitPrice": 750.95,
+     "returnPct": -2.15,
+     "open": false
+    },
+    {
+     "id": 4,
+     "side": "long",
+     "entryTime": 1612828800000,
+     "exitTime": 1613520000000,
+     "entryPrice": 794.15,
+     "exitPrice": 768.81,
+     "returnPct": -3.19,
+     "open": false
+    },
+    {
+     "id": 5,
+     "side": "long",
+     "entryTime": 1614124800000,
+     "exitTime": 1614211200000,
+     "entryPrice": 959.37,
+     "exitPrice": 987.82,
+     "returnPct": 2.97,
+     "open": false
+    },
+    {
+     "id": 6,
+     "side": "long",
+     "entryTime": 1615334400000,
+     "exitTime": 1615507200000,
+     "entryPrice": 907.58,
+     "exitPrice": 887.32,
+     "returnPct": -2.23,
+     "open": false
+    },
+    {
+     "id": 7,
+     "side": "long",
+     "entryTime": 1616198400000,
+     "exitTime": 1616803200000,
+     "entryPrice": 1028.07,
+     "exitPrice": 1060.41,
+     "returnPct": 3.15,
+     "open": false
+    },
+    {
+     "id": 8,
+     "side": "long",
+     "entryTime": 1617408000000,
+     "exitTime": 1617753600000,
+     "entryPrice": 1254.35,
+     "exitPrice": 1199.79,
+     "returnPct": -4.35,
+     "open": false
+    },
+    {
+     "id": 9,
+     "side": "long",
+     "entryTime": 1618704000000,
+     "exitTime": 1619395200000,
+     "entryPrice": 978.66,
+     "exitPrice": 934.29,
+     "returnPct": -4.53,
+     "open": false
+    },
+    {
+     "id": 10,
+     "side": "long",
+     "entryTime": 1619740800000,
+     "exitTime": 1619913600000,
+     "entryPrice": 1035.81,
+     "exitPrice": 1062.25,
+     "returnPct": 2.55,
+     "open": false
+    },
+    {
+     "id": 11,
+     "side": "long",
+     "entryTime": 1620950400000,
+     "exitTime": 1621641600000,
+     "entryPrice": 1158.35,
+     "exitPrice": 1113.46,
+     "returnPct": -3.88,
+     "open": false
+    },
+    {
+     "id": 12,
+     "side": "long",
+     "entryTime": 1621900800000,
+     "exitTime": 1622592000000,
+     "entryPrice": 952.93,
+     "exitPrice": 973.73,
+     "returnPct": 2.18,
+     "open": false
+    },
+    {
+     "id": 13,
+     "side": "long",
+     "entryTime": 1623196800000,
+     "exitTime": 1623369600000,
+     "entryPrice": 916.24,
+     "exitPrice": 871.63,
+     "returnPct": -4.87,
+     "open": false
+    },
+    {
+     "id": 14,
+     "side": "long",
+     "entryTime": 1624320000000,
+     "exitTime": 1624406400000,
+     "entryPrice": 840.18,
+     "exitPrice": 811.45,
+     "returnPct": -3.42,
+     "open": false
+    },
+    {
+     "id": 15,
+     "side": "long",
+     "entryTime": 1625356800000,
+     "exitTime": 1625616000000,
+     "entryPrice": 762.79,
+     "exitPrice": 771.63,
+     "returnPct": 1.16,
+     "open": false
+    },
+    {
+     "id": 16,
+     "side": "long",
+     "entryTime": 1626307200000,
+     "exitTime": 1626480000000,
+     "entryPrice": 844.15,
+     "exitPrice": 830.16,
+     "returnPct": -1.66,
+     "open": false
+    },
+    {
+     "id": 17,
+     "side": "long",
+     "entryTime": 1627603200000,
+     "exitTime": 1628294400000,
+     "entryPrice": 944.98,
+     "exitPrice": 925.65,
+     "returnPct": -2.05,
+     "open": false
+    },
+    {
+     "id": 18,
+     "side": "long",
+     "entryTime": 1628553600000,
+     "exitTime": 1629072000000,
+     "entryPrice": 964.46,
+     "exitPrice": 982.99,
+     "returnPct": 1.92,
+     "open": false
+    },
+    {
+     "id": 19,
+     "side": "long",
+     "entryTime": 1629676800000,
+     "exitTime": 1630281600000,
+     "entryPrice": 914.31,
+     "exitPrice": 871.86,
+     "returnPct": -4.64,
+     "open": false
+    },
+    {
+     "id": 20,
+     "side": "long",
+     "entryTime": 1630972800000,
+     "exitTime": 1631059200000,
+     "entryPrice": 1020.83,
+     "exitPrice": 1051.34,
+     "returnPct": 2.99,
+     "open": false
+    },
+    {
+     "id": 21,
+     "side": "long",
+     "entryTime": 1632096000000,
+     "exitTime": 1632268800000,
+     "entryPrice": 1374.55,
+     "exitPrice": 1398.19,
+     "returnPct": 1.72,
+     "open": false
+    },
+    {
+     "id": 22,
+     "side": "long",
+     "entryTime": 1633046400000,
+     "exitTime": 1633478400000,
+     "entryPrice": 948.68,
+     "exitPrice": 935.3,
+     "returnPct": -1.41,
+     "open": false
+    },
+    {
+     "id": 23,
+     "side": "long",
+     "entryTime": 1634342400000,
+     "exitTime": 1634688000000,
+     "entryPrice": 743.44,
+     "exitPrice": 772.4,
+     "returnPct": 3.9,
+     "open": false
+    },
+    {
+     "id": 24,
+     "side": "long",
+     "entryTime": 1635465600000,
+     "exitTime": 1635984000000,
+     "entryPrice": 932.91,
+     "exitPrice": 891.3,
+     "returnPct": -4.46,
+     "open": false
+    },
+    {
+     "id": 25,
+     "side": "long",
+     "entryTime": 1636675200000,
+     "exitTime": 1636848000000,
+     "entryPrice": 639.75,
+     "exitPrice": 661.2,
+     "returnPct": 3.35,
+     "open": false
+    },
+    {
+     "id": 26,
+     "side": "long",
+     "entryTime": 1637712000000,
+     "exitTime": 1638144000000,
+     "entryPrice": 786.54,
+     "exitPrice": 754.18,
+     "returnPct": -4.11,
+     "open": false
+    },
+    {
+     "id": 27,
+     "side": "long",
+     "entryTime": 1638835200000,
+     "exitTime": 1639267200000,
+     "entryPrice": 788.41,
+     "exitPrice": 813.8,
+     "returnPct": 3.22,
+     "open": false
+    },
+    {
+     "id": 28,
+     "side": "long",
+     "entryTime": 1639785600000,
+     "exitTime": 1640476800000,
+     "entryPrice": 870.64,
+     "exitPrice": 856.09,
+     "returnPct": -1.67,
+     "open": false
+    },
+    {
+     "id": 29,
+     "side": "long",
+     "entryTime": 1640908800000,
+     "exitTime": 1641600000000,
+     "entryPrice": 589.46,
+     "exitPrice": 603.14,
+     "returnPct": 2.32,
+     "open": false
+    },
+    {
+     "id": 30,
+     "side": "long",
+     "entryTime": 1642032000000,
+     "exitTime": 1642291200000,
+     "entryPrice": 637.13,
+     "exitPrice": 659.39,
+     "returnPct": 3.49,
+     "open": false
+    },
+    {
+     "id": 31,
+     "side": "long",
+     "entryTime": 1643328000000,
+     "exitTime": 1643500800000,
+     "entryPrice": 743.38,
+     "exitPrice": 706.72,
+     "returnPct": -4.93,
+     "open": false
+    },
+    {
+     "id": 32,
+     "side": "long",
+     "entryTime": 1644278400000,
+     "exitTime": 1644451200000,
+     "entryPrice": 673.78,
+     "exitPrice": 682.18,
+     "returnPct": 1.25,
+     "open": false
+    },
+    {
+     "id": 33,
+     "side": "long",
+     "entryTime": 1645488000000,
+     "exitTime": 1645833600000,
+     "entryPrice": 718.42,
+     "exitPrice": 696.09,
+     "returnPct": -3.11,
+     "open": false
+    },
+    {
+     "id": 34,
+     "side": "long",
+     "entryTime": 1646524800000,
+     "exitTime": 1646611200000,
+     "entryPrice": 721.29,
+     "exitPrice": 699.99,
+     "returnPct": -2.95,
+     "open": false
+    },
+    {
+     "id": 35,
+     "side": "long",
+     "entryTime": 1647734400000,
+     "exitTime": 1648080000000,
+     "entryPrice": 759.6,
+     "exitPrice": 785.86,
+     "returnPct": 3.46,
+     "open": false
+    },
+    {
+     "id": 36,
+     "side": "long",
+     "entryTime": 1649030400000,
+     "exitTime": 1649203200000,
+     "entryPrice": 952.14,
+     "exitPrice": 919.22,
+     "returnPct": -3.46,
+     "open": false
+    },
+    {
+     "id": 37,
+     "side": "long",
+     "entryTime": 1649980800000,
+     "exitTime": 1650153600000,
+     "entryPrice": 783.05,
+     "exitPrice": 801.74,
+     "returnPct": 2.39,
+     "open": false
+    },
+    {
+     "id": 38,
+     "side": "long",
+     "entryTime": 1651190400000,
+     "exitTime": 1651363200000,
+     "entryPrice": 1093.5,
+     "exitPrice": 1109.39,
+     "returnPct": 1.45,
+     "open": false
+    },
+    {
+     "id": 39,
+     "side": "long",
+     "entryTime": 1652400000000,
+     "exitTime": 1652659200000,
+     "entryPrice": 994.61,
+     "exitPrice": 950.68,
+     "returnPct": -4.42,
+     "open": false
+    },
+    {
+     "id": 40,
+     "side": "long",
+     "entryTime": 1653436800000,
+     "exitTime": 1653523200000,
+     "entryPrice": 923.71,
+     "exitPrice": 880.87,
+     "returnPct": -4.64,
+     "open": false
+    },
+    {
+     "id": 41,
+     "side": "long",
+     "entryTime": 1654560000000,
+     "exitTime": 1655251200000,
+     "entryPrice": 655.01,
+     "exitPrice": 675.73,
+     "returnPct": 3.16,
+     "open": false
+    },
+    {
+     "id": 42,
+     "side": "long",
+     "entryTime": 1655510400000,
+     "exitTime": 1656115200000,
+     "entryPrice": 575.09,
+     "exitPrice": 560.44,
+     "returnPct": -2.55,
+     "open": false
+    },
+    {
+     "id": 43,
+     "side": "long",
+     "entryTime": 1656806400000,
+     "exitTime": 1657238400000,
+     "entryPrice": 548.71,
+     "exitPrice": 522.06,
+     "returnPct": -4.86,
+     "open": false
+    },
+    {
+     "id": 44,
+     "side": "long",
+     "entryTime": 1657843200000,
+     "exitTime": 1657929600000,
+     "entryPrice": 635.18,
+     "exitPrice": 657.63,
+     "returnPct": 3.53,
+     "open": false
+    },
+    {
+     "id": 45,
+     "side": "long",
+     "entryTime": 1659052800000,
+     "exitTime": 1659744000000,
+     "entryPrice": 625.51,
+     "exitPrice": 634.84,
+     "returnPct": 1.49,
+     "open": false
+    },
+    {
+     "id": 46,
+     "side": "long",
+     "entryTime": 1660262400000,
+     "exitTime": 1660521600000,
+     "entryPrice": 706.33,
+     "exitPrice": 717.52,
+     "returnPct": 1.58,
+     "open": false
+    },
+    {
+     "id": 47,
+     "side": "long",
+     "entryTime": 1661299200000,
+     "exitTime": 1661385600000,
+     "entryPrice": 635.27,
+     "exitPrice": 619.85,
+     "returnPct": -2.43,
+     "open": false
+    },
+    {
+     "id": 48,
+     "side": "long",
+     "entryTime": 1662508800000,
+     "exitTime": 1662854400000,
+     "entryPrice": 690.43,
+     "exitPrice": 702.16,
+     "returnPct": 1.7,
+     "open": false
+    },
+    {
+     "id": 49,
+     "side": "long",
+     "entryTime": 1663632000000,
+     "exitTime": 1664064000000,
+     "entryPrice": 879.87,
+     "exitPrice": 900.24,
+     "returnPct": 2.32,
+     "open": false
+    },
+    {
+     "id": 50,
+     "side": "long",
+     "entryTime": 1664582400000,
+     "exitTime": 1664841600000,
+     "entryPrice": 1056.59,
+     "exitPrice": 1092.95,
+     "returnPct": 3.44,
+     "open": false
+    },
+    {
+     "id": 51,
+     "side": "long",
+     "entryTime": 1665705600000,
+     "exitTime": 1666051200000,
+     "entryPrice": 1292.14,
+     "exitPrice": 1337.1,
+     "returnPct": 3.48,
+     "open": false
+    },
+    {
+     "id": 52,
+     "side": "long",
+     "entryTime": 1666828800000,
+     "exitTime": 1667088000000,
+     "entryPrice": 1315.14,
+     "exitPrice": 1285.79,
+     "returnPct": -2.23,
+     "open": false
+    },
+    {
+     "id": 53,
+     "side": "long",
+     "entryTime": 1668038400000,
+     "exitTime": 1668124800000,
+     "entryPrice": 1259.6,
+     "exitPrice": 1228.09,
+     "returnPct": -2.5,
+     "open": false
+    },
+    {
+     "id": 54,
+     "side": "long",
+     "entryTime": 1669248000000,
+     "exitTime": 1669420800000,
+     "entryPrice": 1413.5,
+     "exitPrice": 1428.03,
+     "returnPct": 1.03,
+     "open": false
+    },
+    {
+     "id": 55,
+     "side": "long",
+     "entryTime": 1670371200000,
+     "exitTime": 1670630400000,
+     "entryPrice": 1650.47,
+     "exitPrice": 1588.13,
+     "returnPct": -3.78,
+     "open": false
+    },
+    {
+     "id": 56,
+     "side": "long",
+     "entryTime": 1671494400000,
+     "exitTime": 1671667200000,
+     "entryPrice": 1328.38,
+     "exitPrice": 1289.47,
+     "returnPct": -2.93,
+     "open": false
+    },
+    {
+     "id": 57,
+     "side": "long",
+     "entryTime": 1672358400000,
+     "exitTime": 1672704000000,
+     "entryPrice": 1588.44,
+     "exitPrice": 1606.72,
+     "returnPct": 1.15,
+     "open": false
+    },
+    {
+     "id": 58,
+     "side": "long",
+     "entryTime": 1673481600000,
+     "exitTime": 1673654400000,
+     "entryPrice": 1965.91,
+     "exitPrice": 2031.56,
+     "returnPct": 3.34,
+     "open": false
+    },
+    {
+     "id": 59,
+     "side": "long",
+     "entryTime": 1674864000000,
+     "exitTime": 1675036800000,
+     "entryPrice": 1857.26,
+     "exitPrice": 1762.88,
+     "returnPct": -5.08,
+     "open": false
+    },
+    {
+     "id": 60,
+     "side": "long",
+     "entryTime": 1675814400000,
+     "exitTime": 1676160000000,
+     "entryPrice": 2107.53,
+     "exitPrice": 2014.05,
+     "returnPct": -4.44,
+     "open": false
+    },
+    {
+     "id": 61,
+     "side": "long",
+     "entryTime": 1677024000000,
+     "exitTime": 1677196800000,
+     "entryPrice": 2219.71,
+     "exitPrice": 2293.96,
+     "returnPct": 3.35,
+     "open": false
+    },
+    {
+     "id": 62,
+     "side": "long",
+     "entryTime": 1678147200000,
+     "exitTime": 1678579200000,
+     "entryPrice": 2172.15,
+     "exitPrice": 2226.07,
+     "returnPct": 2.48,
+     "open": false
+    },
+    {
+     "id": 63,
+     "side": "long",
+     "entryTime": 1679184000000,
+     "exitTime": 1679616000000,
+     "entryPrice": 1793.48,
+     "exitPrice": 1829.82,
+     "returnPct": 2.03,
+     "open": false
+    },
+    {
+     "id": 64,
+     "side": "long",
+     "entryTime": 1680393600000,
+     "exitTime": 1680825600000,
+     "entryPrice": 1687.8,
+     "exitPrice": 1749.72,
+     "returnPct": 3.67,
+     "open": false
+    },
+    {
+     "id": 65,
+     "side": "long",
+     "entryTime": 1681516800000,
+     "exitTime": 1682121600000,
+     "entryPrice": 1770.21,
+     "exitPrice": 1823.59,
+     "returnPct": 3.02,
+     "open": false
+    },
+    {
+     "id": 66,
+     "side": "long",
+     "entryTime": 1682553600000,
+     "exitTime": 1682812800000,
+     "entryPrice": 1563.33,
+     "exitPrice": 1579.74,
+     "returnPct": 1.05,
+     "open": false
+    },
+    {
+     "id": 67,
+     "side": "long",
+     "entryTime": 1683763200000,
+     "exitTime": 1684368000000,
+     "entryPrice": 1523.22,
+     "exitPrice": 1548.24,
+     "returnPct": 1.64,
+     "open": false
+    },
+    {
+     "id": 68,
+     "side": "long",
+     "entryTime": 1684886400000,
+     "exitTime": 1685232000000,
+     "entryPrice": 1378.28,
+     "exitPrice": 1404.8,
+     "returnPct": 1.92,
+     "open": false
+    },
+    {
+     "id": 69,
+     "side": "long",
+     "entryTime": 1685923200000,
+     "exitTime": 1686009600000,
+     "entryPrice": 1439.77,
+     "exitPrice": 1464.82,
+     "returnPct": 1.74,
+     "open": false
+    },
+    {
+     "id": 70,
+     "side": "long",
+     "entryTime": 1686960000000,
+     "exitTime": 1687651200000,
+     "entryPrice": 1200.22,
+     "exitPrice": 1177.31,
+     "returnPct": -1.91,
+     "open": false
+    },
+    {
+     "id": 71,
+     "side": "long",
+     "entryTime": 1688256000000,
+     "exitTime": 1688860800000,
+     "entryPrice": 1145.79,
+     "exitPrice": 1175.57,
+     "returnPct": 2.6,
+     "open": false
+    },
+    {
+     "id": 72,
+     "side": "long",
+     "entryTime": 1689379200000,
+     "exitTime": 1689638400000,
+     "entryPrice": 892.19,
+     "exitPrice": 869.05,
+     "returnPct": -2.59,
+     "open": false
+    },
+    {
+     "id": 73,
+     "side": "long",
+     "entryTime": 1690416000000,
+     "exitTime": 1690502400000,
+     "entryPrice": 1078.86,
+     "exitPrice": 1117.95,
+     "returnPct": 3.62,
+     "open": false
+    },
+    {
+     "id": 74,
+     "side": "long",
+     "entryTime": 1691625600000,
+     "exitTime": 1692057600000,
+     "entryPrice": 1250.13,
+     "exitPrice": 1296.72,
+     "returnPct": 3.73,
+     "open": false
+    },
+    {
+     "id": 75,
+     "side": "long",
+     "entryTime": 1692748800000,
+     "exitTime": 1693267200000,
+     "entryPrice": 1491.84,
+     "exitPrice": 1520.77,
+     "returnPct": 1.94,
+     "open": false
+    },
+    {
+     "id": 76,
+     "side": "long",
+     "entryTime": 1693699200000,
+     "exitTime": 1694044800000,
+     "entryPrice": 1696.58,
+     "exitPrice": 1735.39,
+     "returnPct": 2.29,
+     "open": false
+    },
+    {
+     "id": 77,
+     "side": "long",
+     "entryTime": 1694995200000,
+     "exitTime": 1695168000000,
+     "entryPrice": 1266.22,
+     "exitPrice": 1302.4,
+     "returnPct": 2.86,
+     "open": false
+    },
+    {
+     "id": 78,
+     "side": "long",
+     "entryTime": 1695945600000,
+     "exitTime": 1696464000000,
+     "entryPrice": 1093.48,
+     "exitPrice": 1127.23,
+     "returnPct": 3.09,
+     "open": false
+    },
+    {
+     "id": 79,
+     "side": "long",
+     "entryTime": 1697155200000,
+     "exitTime": 1697328000000,
+     "entryPrice": 1431.87,
+     "exitPrice": 1394.5,
+     "returnPct": -2.61,
+     "open": false
+    },
+    {
+     "id": 80,
+     "side": "long",
+     "entryTime": 1698278400000,
+     "exitTime": 1698969600000,
+     "entryPrice": 1554.81,
+     "exitPrice": 1582.54,
+     "returnPct": 1.78,
+     "open": false
+    },
+    {
+     "id": 81,
+     "side": "long",
+     "entryTime": 1699488000000,
+     "exitTime": 1700179200000,
+     "entryPrice": 1363.08,
+     "exitPrice": 1341.17,
+     "returnPct": -1.61,
+     "open": false
+    },
+    {
+     "id": 82,
+     "side": "long",
+     "entryTime": 1700697600000,
+     "exitTime": 1700784000000,
+     "entryPrice": 1283.9,
+     "exitPrice": 1313.13,
+     "returnPct": 2.28,
+     "open": false
+    },
+    {
+     "id": 83,
+     "side": "long",
+     "entryTime": 1701648000000,
+     "exitTime": 1701820800000,
+     "entryPrice": 1285.32,
+     "exitPrice": 1336.49,
+     "returnPct": 3.98,
+     "open": false
+    },
+    {
+     "id": 84,
+     "side": "long",
+     "entryTime": 1702857600000,
+     "exitTime": 1703376000000,
+     "entryPrice": 1432.29,
+     "exitPrice": 1359.27,
+     "returnPct": -5.1,
+     "open": false
+    },
+    {
+     "id": 85,
+     "side": "long",
+     "entryTime": 1703808000000,
+     "exitTime": 1704067200000,
+     "entryPrice": 1750.11,
+     "exitPrice": 1671.8,
+     "returnPct": -4.47,
+     "open": false
+    },
+    {
+     "id": 86,
+     "side": "long",
+     "entryTime": 1705017600000,
+     "exitTime": 1705363200000,
+     "entryPrice": 1849.09,
+     "exitPrice": 1798.52,
+     "returnPct": -2.73,
+     "open": false
+    },
+    {
+     "id": 87,
+     "side": "long",
+     "entryTime": 1706054400000,
+     "exitTime": 1706313600000,
+     "entryPrice": 1729.22,
+     "exitPrice": 1663.05,
+     "returnPct": -3.83,
+     "open": false
+    },
+    {
+     "id": 88,
+     "side": "long",
+     "entryTime": 1707436800000,
+     "exitTime": 1707782400000,
+     "entryPrice": 1706.78,
+     "exitPrice": 1745.95,
+     "returnPct": 2.29,
+     "open": false
+    },
+    {
+     "id": 89,
+     "side": "long",
+     "entryTime": 1708387200000,
+     "exitTime": 1708819200000,
+     "entryPrice": 1817.13,
+     "exitPrice": 1864.95,
+     "returnPct": 2.63,
+     "open": false
+    },
+    {
+     "id": 90,
+     "side": "long",
+     "entryTime": 1709683200000,
+     "exitTime": 1710201600000,
+     "entryPrice": 2313.06,
+     "exitPrice": 2385.32,
+     "returnPct": 3.12,
+     "open": false
+    },
+    {
+     "id": 91,
+     "side": "long",
+     "entryTime": 1710633600000,
+     "exitTime": 1711238400000,
+     "entryPrice": 2267.95,
+     "exitPrice": 2183.81,
+     "returnPct": -3.71,
+     "open": false
+    },
+    {
+     "id": 92,
+     "side": "long",
+     "entryTime": 1711756800000,
+     "exitTime": 1712188800000,
+     "entryPrice": 2231.57,
+     "exitPrice": 2294.29,
+     "returnPct": 2.81,
+     "open": false
+    },
+    {
+     "id": 93,
+     "side": "long",
+     "entryTime": 1713052800000,
+     "exitTime": 1713571200000,
+     "entryPrice": 1943.33,
+     "exitPrice": 1882.06,
+     "returnPct": -3.15,
+     "open": false
+    },
+    {
+     "id": 94,
+     "side": "long",
+     "entryTime": 1713916800000,
+     "exitTime": 1714176000000,
+     "entryPrice": 2244.23,
+     "exitPrice": 2278.99,
+     "returnPct": 1.55,
+     "open": false
+    },
+    {
+     "id": 95,
+     "side": "long",
+     "entryTime": 1715126400000,
+     "exitTime": 1715558400000,
+     "entryPrice": 2194.93,
+     "exitPrice": 2278.19,
+     "returnPct": 3.79,
+     "open": false
+    },
+    {
+     "id": 96,
+     "side": "long",
+     "entryTime": 1716422400000,
+     "exitTime": 1716768000000,
+     "entryPrice": 2886.51,
+     "exitPrice": 2949.31,
+     "returnPct": 2.18,
+     "open": false
+    },
+    {
+     "id": 97,
+     "side": "long",
+     "entryTime": 1717545600000,
+     "exitTime": 1717891200000,
+     "entryPrice": 2654.09,
+     "exitPrice": 2617.12,
+     "returnPct": -1.39,
+     "open": false
+    },
+    {
+     "id": 98,
+     "side": "long",
+     "entryTime": 1718668800000,
+     "exitTime": 1718841600000,
+     "entryPrice": 2930.53,
+     "exitPrice": 2988.6,
+     "returnPct": 1.98,
+     "open": false
+    },
+    {
+     "id": 99,
+     "side": "long",
+     "entryTime": 1719619200000,
+     "exitTime": 1719964800000,
+     "entryPrice": 2858.54,
+     "exitPrice": 2763.87,
+     "returnPct": -3.31,
+     "open": false
+    },
+    {
+     "id": 100,
+     "side": "long",
+     "entryTime": 1720915200000,
+     "exitTime": 1721260800000,
+     "entryPrice": 2724.31,
+     "exitPrice": 2808.34,
+     "returnPct": 3.08,
+     "open": false
+    },
+    {
+     "id": 101,
+     "side": "long",
+     "entryTime": 1722038400000,
+     "exitTime": 1722470400000,
+     "entryPrice": 3149.7,
+     "exitPrice": 3029.98,
+     "returnPct": -3.8,
+     "open": false
+    },
+    {
+     "id": 102,
+     "side": "long",
+     "entryTime": 1723161600000,
+     "exitTime": 1723852800000,
+     "entryPrice": 3528.95,
+     "exitPrice": 3664.29,
+     "returnPct": 3.83,
+     "open": false
+    },
+    {
+     "id": 103,
+     "side": "long",
+     "entryTime": 1724025600000,
+     "exitTime": 1724198400000,
+     "entryPrice": 4218.57,
+     "exitPrice": 4340.06,
+     "returnPct": 2.88,
+     "open": false
+    },
+    {
+     "id": 104,
+     "side": "long",
+     "entryTime": 1725148800000,
+     "exitTime": 1725494400000,
+     "entryPrice": 4042.07,
+     "exitPrice": 3847.71,
+     "returnPct": -4.81,
+     "open": false
+    },
+    {
+     "id": 105,
+     "side": "long",
+     "entryTime": 1726531200000,
+     "exitTime": 1726704000000,
+     "entryPrice": 4854.99,
+     "exitPrice": 4690.13,
+     "returnPct": -3.4,
+     "open": false
+    },
+    {
+     "id": 106,
+     "side": "long",
+     "entryTime": 1727568000000,
+     "exitTime": 1727740800000,
+     "entryPrice": 5523.63,
+     "exitPrice": 5402.84,
+     "returnPct": -2.19,
+     "open": false
+    },
+    {
+     "id": 107,
+     "side": "long",
+     "entryTime": 1728691200000,
+     "exitTime": 1729296000000,
+     "entryPrice": 4628.43,
+     "exitPrice": 4491.2,
+     "returnPct": -2.96,
+     "open": false
+    },
+    {
+     "id": 108,
+     "side": "long",
+     "entryTime": 1729900800000,
+     "exitTime": 1730419200000,
+     "entryPrice": 4463.6,
+     "exitPrice": 4621.37,
+     "returnPct": 3.53,
+     "open": false
+    },
+    {
+     "id": 109,
+     "side": "long",
+     "entryTime": 1730764800000,
+     "exitTime": 1731024000000,
+     "entryPrice": 5256.58,
+     "exitPrice": 5319.76,
+     "returnPct": 1.2,
+     "open": false
+    },
+    {
+     "id": 110,
+     "side": "long",
+     "entryTime": 1732147200000,
+     "exitTime": 1732320000000,
+     "entryPrice": 5587.54,
+     "exitPrice": 5806.27,
+     "returnPct": 3.91,
+     "open": false
+    },
+    {
+     "id": 111,
+     "side": "long",
+     "entryTime": 1733097600000,
+     "exitTime": 1733443200000,
+     "entryPrice": 5352.23,
+     "exitPrice": 5414.01,
+     "returnPct": 1.15,
+     "open": false
+    },
+    {
+     "id": 112,
+     "side": "long",
+     "entryTime": 1734393600000,
+     "exitTime": 1734566400000,
+     "entryPrice": 6064.94,
+     "exitPrice": 6297.47,
+     "returnPct": 3.83,
+     "open": false
+    },
+    {
+     "id": 113,
+     "side": "long",
+     "entryTime": 1735257600000,
+     "exitTime": 1735948800000,
+     "entryPrice": 4587.22,
+     "exitPrice": 4724.35,
+     "returnPct": 2.99,
+     "open": false
+    },
+    {
+     "id": 114,
+     "side": "long",
+     "entryTime": 1736467200000,
+     "exitTime": 1736640000000,
+     "entryPrice": 5078.9,
+     "exitPrice": 5278.81,
+     "returnPct": 3.94,
+     "open": false
+    },
+    {
+     "id": 115,
+     "side": "long",
+     "entryTime": 1737504000000,
+     "exitTime": 1737590400000,
+     "entryPrice": 5938.63,
+     "exitPrice": 6009.86,
+     "returnPct": 1.2,
+     "open": false
+    },
+    {
+     "id": 116,
+     "side": "long",
+     "entryTime": 1738800000000,
+     "exitTime": 1739318400000,
+     "entryPrice": 5139.03,
+     "exitPrice": 5054.72,
+     "returnPct": -1.64,
+     "open": false
+    },
+    {
+     "id": 117,
+     "side": "long",
+     "entryTime": 1740009600000,
+     "exitTime": 1740528000000,
+     "entryPrice": 4986.73,
+     "exitPrice": 5062.52,
+     "returnPct": 1.52,
+     "open": false
+    },
+    {
+     "id": 118,
+     "side": "long",
+     "entryTime": 1741132800000,
+     "exitTime": 1741392000000,
+     "entryPrice": 3745.85,
+     "exitPrice": 3578.66,
+     "returnPct": -4.46,
+     "open": false
+    },
+    {
+     "id": 119,
+     "side": "long",
+     "entryTime": 1742169600000,
+     "exitTime": 1742860800000,
+     "entryPrice": 3556.06,
+     "exitPrice": 3507.8,
+     "returnPct": -1.36,
+     "open": false
+    },
+    {
+     "id": 120,
+     "side": "long",
+     "entryTime": 1743206400000,
+     "exitTime": 1743724800000,
+     "entryPrice": 4284.12,
+     "exitPrice": 4415.9,
+     "returnPct": 3.08,
+     "open": false
+    },
+    {
+     "id": 121,
+     "side": "long",
+     "entryTime": 1744243200000,
+     "exitTime": 1744588800000,
+     "entryPrice": 4076.37,
+     "exitPrice": 4168.75,
+     "returnPct": 2.27,
+     "open": false
+    },
+    {
+     "id": 122,
+     "side": "long",
+     "entryTime": 1745625600000,
+     "exitTime": 1745712000000,
+     "entryPrice": 4511.45,
+     "exitPrice": 4687.01,
+     "returnPct": 3.89,
+     "open": false
+    },
+    {
+     "id": 123,
+     "side": "long",
+     "entryTime": 1746662400000,
+     "exitTime": 1747008000000,
+     "entryPrice": 4513.16,
+     "exitPrice": 4389.95,
+     "returnPct": -2.73,
+     "open": false
+    },
+    {
+     "id": 124,
+     "side": "long",
+     "entryTime": 1747785600000,
+     "exitTime": 1747872000000,
+     "entryPrice": 4213.07,
+     "exitPrice": 4306.12,
+     "returnPct": 2.21,
+     "open": false
+    },
+    {
+     "id": 125,
+     "side": "long",
+     "entryTime": 1748908800000,
+     "exitTime": 1748995200000,
+     "entryPrice": 3877.53,
+     "exitPrice": 3746.59,
+     "returnPct": -3.38,
+     "open": false
+    },
+    {
+     "id": 126,
+     "side": "long",
+     "entryTime": 1749945600000,
+     "exitTime": 1750377600000,
+     "entryPrice": 4536.44,
+     "exitPrice": 4594.43,
+     "returnPct": 1.28,
+     "open": false
+    }
+   ]
+  }
+ },
+ "datasets": [
+  {
+   "venue": "binance",
+   "symbol": "BTCUSDT",
+   "kind": "perpetual"
+  },
+  {
+   "venue": "bybit",
+   "symbol": "ETHUSDT",
+   "kind": "spot"
+  },
+  {
+   "venue": "bybit",
+   "symbol": "SOLUSDT",
+   "kind": "perpetual"
   }
  ],
  "runs": {
@@ -5474,7 +5672,8 @@
       "exitTime": 1610236800000,
       "entryPrice": 1.5,
       "exitPrice": 1.61,
-      "returnPct": -7.29
+      "returnPct": -7.29,
+      "open": false
      },
      {
       "id": 2,
@@ -5483,7 +5682,8 @@
       "exitTime": 1612656000000,
       "entryPrice": 1.67,
       "exitPrice": 1.79,
-      "returnPct": -7.18
+      "returnPct": -7.18,
+      "open": false
      },
      {
       "id": 3,
@@ -5492,7 +5692,8 @@
       "exitTime": 1616025600000,
       "entryPrice": 1.39,
       "exitPrice": 1.36,
-      "returnPct": -2.28
+      "returnPct": -2.28,
+      "open": false
      },
      {
       "id": 4,
@@ -5501,7 +5702,8 @@
       "exitTime": 1617926400000,
       "entryPrice": 2.1,
       "exitPrice": 2.55,
-      "returnPct": 21.62
+      "returnPct": 21.62,
+      "open": false
      },
      {
       "id": 5,
@@ -5510,7 +5712,8 @@
       "exitTime": 1619568000000,
       "entryPrice": 2,
       "exitPrice": 1.91,
-      "returnPct": -4.81
+      "returnPct": -4.81,
+      "open": false
      },
      {
       "id": 6,
@@ -5519,7 +5722,8 @@
       "exitTime": 1622678400000,
       "entryPrice": 2.26,
       "exitPrice": 1.68,
-      "returnPct": 25.53
+      "returnPct": 25.53,
+      "open": false
      },
      {
       "id": 7,
@@ -5528,7 +5732,8 @@
       "exitTime": 1624320000000,
       "entryPrice": 2.12,
       "exitPrice": 2.17,
-      "returnPct": -2.25
+      "returnPct": -2.25,
+      "open": false
      },
      {
       "id": 8,
@@ -5537,7 +5742,8 @@
       "exitTime": 1627603200000,
       "entryPrice": 2.19,
       "exitPrice": 2.33,
-      "returnPct": -6.48
+      "returnPct": -6.48,
+      "open": false
      },
      {
       "id": 9,
@@ -5546,7 +5752,8 @@
       "exitTime": 1630368000000,
       "entryPrice": 2.95,
       "exitPrice": 2.44,
-      "returnPct": 17.29
+      "returnPct": 17.29,
+      "open": false
      },
      {
       "id": 10,
@@ -5555,7 +5762,8 @@
       "exitTime": 1632441600000,
       "entryPrice": 3.48,
       "exitPrice": 2.62,
-      "returnPct": 24.63
+      "returnPct": 24.63,
+      "open": false
      },
      {
       "id": 11,
@@ -5564,7 +5772,8 @@
       "exitTime": 1635033600000,
       "entryPrice": 3.35,
       "exitPrice": 3,
-      "returnPct": 10.5
+      "returnPct": 10.5,
+      "open": false
      },
      {
       "id": 12,
@@ -5573,7 +5782,8 @@
       "exitTime": 1637452800000,
       "entryPrice": 3.1,
       "exitPrice": 2.8,
-      "returnPct": 9.48
+      "returnPct": 9.48,
+      "open": false
      },
      {
       "id": 13,
@@ -5582,7 +5792,8 @@
       "exitTime": 1640390400000,
       "entryPrice": 2.61,
       "exitPrice": 3.26,
-      "returnPct": 24.85
+      "returnPct": 24.85,
+      "open": false
      },
      {
       "id": 14,
@@ -5591,7 +5802,8 @@
       "exitTime": 1642636800000,
       "entryPrice": 4.32,
       "exitPrice": 3.53,
-      "returnPct": 18.36
+      "returnPct": 18.36,
+      "open": false
      },
      {
       "id": 15,
@@ -5600,7 +5812,8 @@
       "exitTime": 1643932800000,
       "entryPrice": 4.42,
       "exitPrice": 4.73,
-      "returnPct": -7.09
+      "returnPct": -7.09,
+      "open": false
      },
      {
       "id": 16,
@@ -5609,7 +5822,8 @@
       "exitTime": 1646524800000,
       "entryPrice": 4.99,
       "exitPrice": 4.72,
-      "returnPct": -5.52
+      "returnPct": -5.52,
+      "open": false
      },
      {
       "id": 17,
@@ -5618,7 +5832,8 @@
       "exitTime": 1650153600000,
       "entryPrice": 6.57,
       "exitPrice": 7.06,
-      "returnPct": 7.51
+      "returnPct": 7.51,
+      "open": false
      },
      {
       "id": 18,
@@ -5627,7 +5842,8 @@
       "exitTime": 1651622400000,
       "entryPrice": 7.04,
       "exitPrice": 8.49,
-      "returnPct": 20.56
+      "returnPct": 20.56,
+      "open": false
      },
      {
       "id": 19,
@@ -5636,7 +5852,8 @@
       "exitTime": 1654905600000,
       "entryPrice": 7.39,
       "exitPrice": 7.05,
-      "returnPct": -4.56
+      "returnPct": -4.56,
+      "open": false
      },
      {
       "id": 20,
@@ -5645,7 +5862,8 @@
       "exitTime": 1656374400000,
       "entryPrice": 3.52,
       "exitPrice": 2.79,
-      "returnPct": 20.74
+      "returnPct": 20.74,
+      "open": false
      },
      {
       "id": 21,
@@ -5654,7 +5872,8 @@
       "exitTime": 1659052800000,
       "entryPrice": 3.6,
       "exitPrice": 3.81,
-      "returnPct": -5.86
+      "returnPct": -5.86,
+      "open": false
      },
      {
       "id": 22,
@@ -5663,7 +5882,8 @@
       "exitTime": 1662336000000,
       "entryPrice": 5.26,
       "exitPrice": 5.05,
-      "returnPct": -3.86
+      "returnPct": -3.86,
+      "open": false
      },
      {
       "id": 23,
@@ -5672,7 +5892,8 @@
       "exitTime": 1664409600000,
       "entryPrice": 5.55,
       "exitPrice": 5.7,
-      "returnPct": -2.7
+      "returnPct": -2.7,
+      "open": false
      },
      {
       "id": 24,
@@ -5681,7 +5902,8 @@
       "exitTime": 1665619200000,
       "entryPrice": 4.73,
       "exitPrice": 5.34,
-      "returnPct": 13.03
+      "returnPct": 13.03,
+      "open": false
      },
      {
       "id": 25,
@@ -5690,7 +5912,8 @@
       "exitTime": 1668729600000,
       "entryPrice": 4.49,
       "exitPrice": 4.63,
-      "returnPct": -3.18
+      "returnPct": -3.18,
+      "open": false
      },
      {
       "id": 26,
@@ -5699,7 +5922,8 @@
       "exitTime": 1670976000000,
       "entryPrice": 3.91,
       "exitPrice": 4.15,
-      "returnPct": -6.2
+      "returnPct": -6.2,
+      "open": false
      },
      {
       "id": 27,
@@ -5708,7 +5932,8 @@
       "exitTime": 1673913600000,
       "entryPrice": 2.79,
       "exitPrice": 3.23,
-      "returnPct": 15.7
+      "returnPct": 15.7,
+      "open": false
      },
      {
       "id": 28,
@@ -5717,7 +5942,8 @@
       "exitTime": 1675814400000,
       "entryPrice": 4.25,
       "exitPrice": 4.11,
-      "returnPct": -3.33
+      "returnPct": -3.33,
+      "open": false
      },
      {
       "id": 29,
@@ -5726,7 +5952,8 @@
       "exitTime": 1677974400000,
       "entryPrice": 6.46,
       "exitPrice": 7.75,
-      "returnPct": 19.91
+      "returnPct": 19.91,
+      "open": false
      },
      {
       "id": 30,
@@ -5735,7 +5962,8 @@
       "exitTime": 1680998400000,
       "entryPrice": 9.04,
       "exitPrice": 9.52,
-      "returnPct": -5.25
+      "returnPct": -5.25,
+      "open": false
      },
      {
       "id": 31,
@@ -5744,7 +5972,8 @@
       "exitTime": 1682640000000,
       "entryPrice": 15.88,
       "exitPrice": 18.97,
-      "returnPct": 19.51
+      "returnPct": 19.51,
+      "open": false
      },
      {
       "id": 32,
@@ -5753,7 +5982,8 @@
       "exitTime": 1686268800000,
       "entryPrice": 20.79,
       "exitPrice": 21.28,
-      "returnPct": -2.38
+      "returnPct": -2.38,
+      "open": false
      },
      {
       "id": 33,
@@ -5762,7 +5992,8 @@
       "exitTime": 1687996800000,
       "entryPrice": 33.15,
       "exitPrice": 25.55,
-      "returnPct": 22.92
+      "returnPct": 22.92,
+      "open": false
      },
      {
       "id": 34,
@@ -5771,7 +6002,8 @@
       "exitTime": 1690761600000,
       "entryPrice": 33.78,
       "exitPrice": 31.82,
-      "returnPct": -5.79
+      "returnPct": -5.79,
+      "open": false
      },
      {
       "id": 35,
@@ -5780,7 +6012,8 @@
       "exitTime": 1692576000000,
       "entryPrice": 24.54,
       "exitPrice": 19.67,
-      "returnPct": 19.84
+      "returnPct": 19.84,
+      "open": false
      },
      {
       "id": 36,
@@ -5789,7 +6022,8 @@
       "exitTime": 1695254400000,
       "entryPrice": 24.58,
       "exitPrice": 19.27,
-      "returnPct": 21.62
+      "returnPct": 21.62,
+      "open": false
      },
      {
       "id": 37,
@@ -5798,7 +6032,8 @@
       "exitTime": 1698278400000,
       "entryPrice": 30.43,
       "exitPrice": 31.54,
-      "returnPct": -3.66
+      "returnPct": -3.66,
+      "open": false
      },
      {
       "id": 38,
@@ -5807,7 +6042,8 @@
       "exitTime": 1700611200000,
       "entryPrice": 25.46,
       "exitPrice": 20.46,
-      "returnPct": 19.66
+      "returnPct": 19.66,
+      "open": false
      },
      {
       "id": 39,
@@ -5816,7 +6052,8 @@
       "exitTime": 1702944000000,
       "entryPrice": 18.4,
       "exitPrice": 18.79,
-      "returnPct": -2.15
+      "returnPct": -2.15,
+      "open": false
      },
      {
       "id": 40,
@@ -5825,7 +6062,8 @@
       "exitTime": 1705017600000,
       "entryPrice": 18.74,
       "exitPrice": 20.44,
-      "returnPct": 9.1
+      "returnPct": 9.1,
+      "open": false
      },
      {
       "id": 41,
@@ -5834,7 +6072,8 @@
       "exitTime": 1707523200000,
       "entryPrice": 20.41,
       "exitPrice": 19.36,
-      "returnPct": -5.16
+      "returnPct": -5.16,
+      "open": false
      },
      {
       "id": 42,
@@ -5843,7 +6082,8 @@
       "exitTime": 1709078400000,
       "entryPrice": 29.24,
       "exitPrice": 27.55,
-      "returnPct": -5.78
+      "returnPct": -5.78,
+      "open": false
      },
      {
       "id": 43,
@@ -5852,7 +6092,8 @@
       "exitTime": 1712966400000,
       "entryPrice": 32.94,
       "exitPrice": 36.77,
-      "returnPct": 11.63
+      "returnPct": 11.63,
+      "open": false
      },
      {
       "id": 44,
@@ -5861,7 +6102,8 @@
       "exitTime": 1714003200000,
       "entryPrice": 22.07,
       "exitPrice": 24.87,
-      "returnPct": 12.69
+      "returnPct": 12.69,
+      "open": false
      },
      {
       "id": 45,
@@ -5870,7 +6112,8 @@
       "exitTime": 1717372800000,
       "entryPrice": 16.34,
       "exitPrice": 17.57,
-      "returnPct": -7.5
+      "returnPct": -7.5,
+      "open": false
      },
      {
       "id": 46,
@@ -5879,7 +6122,8 @@
       "exitTime": 1719532800000,
       "entryPrice": 15.96,
       "exitPrice": 12.08,
-      "returnPct": 24.31
+      "returnPct": 24.31,
+      "open": false
      },
      {
       "id": 47,
@@ -5888,7 +6132,8 @@
       "exitTime": 1722038400000,
       "entryPrice": 19.44,
       "exitPrice": 16.02,
-      "returnPct": 17.6
+      "returnPct": 17.6,
+      "open": false
      },
      {
       "id": 48,
@@ -5897,7 +6142,8 @@
       "exitTime": 1724025600000,
       "entryPrice": 12.54,
       "exitPrice": 13.48,
-      "returnPct": 7.48
+      "returnPct": 7.48,
+      "open": false
      },
      {
       "id": 49,
@@ -5906,7 +6152,8 @@
       "exitTime": 1726531200000,
       "entryPrice": 12.93,
       "exitPrice": 12.58,
-      "returnPct": -2.69
+      "returnPct": -2.69,
+      "open": false
      },
      {
       "id": 50,
@@ -5915,7 +6162,8 @@
       "exitTime": 1728691200000,
       "entryPrice": 16.47,
       "exitPrice": 14.64,
-      "returnPct": 11.16
+      "returnPct": 11.16,
+      "open": false
      },
      {
       "id": 51,
@@ -5924,7 +6172,8 @@
       "exitTime": 1731801600000,
       "entryPrice": 14.5,
       "exitPrice": 12.32,
-      "returnPct": 15.03
+      "returnPct": 15.03,
+      "open": false
      },
      {
       "id": 52,
@@ -5933,7 +6182,8 @@
       "exitTime": 1734048000000,
       "entryPrice": 16.81,
       "exitPrice": 16.33,
-      "returnPct": -2.84
+      "returnPct": -2.84,
+      "open": false
      },
      {
       "id": 53,
@@ -5942,7 +6192,8 @@
       "exitTime": 1736035200000,
       "entryPrice": 17.9,
       "exitPrice": 16.75,
-      "returnPct": -6.42
+      "returnPct": -6.42,
+      "open": false
      },
      {
       "id": 54,
@@ -5951,7 +6202,8 @@
       "exitTime": 1738281600000,
       "entryPrice": 15.1,
       "exitPrice": 14.01,
-      "returnPct": -7.24
+      "returnPct": -7.24,
+      "open": false
      },
      {
       "id": 55,
@@ -5960,7 +6212,8 @@
       "exitTime": 1740441600000,
       "entryPrice": 19.39,
       "exitPrice": 16.73,
-      "returnPct": 13.74
+      "returnPct": 13.74,
+      "open": false
      },
      {
       "id": 56,
@@ -5969,7 +6222,8 @@
       "exitTime": 1743465600000,
       "entryPrice": 26.41,
       "exitPrice": 24.35,
-      "returnPct": -7.82
+      "returnPct": -7.82,
+      "open": false
      },
      {
       "id": 57,
@@ -5978,7 +6232,8 @@
       "exitTime": 1745971200000,
       "entryPrice": 30.35,
       "exitPrice": 36.34,
-      "returnPct": 19.77
+      "returnPct": 19.77,
+      "open": false
      }
     ]
    }
