@@ -263,6 +263,9 @@ fn bench(
         _ => Some(load_run_data(store, &config).map_err(api_error)?),
     };
     for rep in 0..reps {
+        // A store of its own for each repetition, as after an app start: whatever a store comes
+        // to keep in memory is not carried from one repetition to the next.
+        let store = &Store::new(store.root());
         let (ms, json) = match (&w.mode, &data) {
             (Mode::LabBacktest, _) => {
                 let (phases, json) = lab_backtest(&lab_config(&config)?, store, rep)?;

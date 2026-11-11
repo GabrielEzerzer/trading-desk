@@ -92,3 +92,25 @@ Verified and accepted:
 ## Baselines on the merged head `73bfe86` (main with #65 and #67), eight workloads
 
 #65 and #67 added metrics to every result, so checksums changed (dev `232c001b45c95b12`, test `6eecea8b74475979`) and runs got heavier. Debug dev 14,921.4 and 21,303.9 ms; debug test 17,133.8 ms. Release dev 3,448.2 and 2,988.9 ms; release test 2,039.7 ms. The spread between two unchanged runs was 15% (release) and 43% (debug) while two other agents were compiling. These are replaced by the baseline on the ten-workload set.
+
+## Final baseline: ten workloads, head `682a9aa` (2026-11-11 12:44 to 12:55 UTC, machine quieter)
+
+The eight original workloads print the same checksums as before the two Lab workloads were added. Checksums: dev `30170cbf866f6c97`, test `5d549e7dc7c03cb8`, the same in debug and release.
+
+| Build | Split | total_ms | load | backtest | sweep | walk-forward | Lab backtest |
+|---|---|---|---|---|---|---|---|
+| A debug, reps 3 | dev | 37,738.7 | 4,342.8 | 840.2 | 2,645.5 | 5,404.7 | 24,505.5 |
+| A debug, reps 3 | test | 49,958.1 | 6,381.7 | 1,144.5 | 5,968.2 | 1,560.7 | 34,903.1 |
+| B release, reps 5 | dev, run 1 | 4,226.1 | 655.8 | 98.7 | 243.3 | 454.6 | 2,773.7 |
+| B release, reps 5 | dev, run 2 | 4,407.1 | 975.5 | 106.4 | 273.4 | 457.3 | 2,594.6 |
+| B release, reps 5 | test | 3,354.0 | 491.6 | 69.3 | 342.2 | 86.1 | 2,364.9 |
+
+Phases of the dev Lab backtest (five years of 1-minute candles, 1h bars), fastest repetition, release: check 664 ms, load 920 ms, run 34 ms, save 63 ms, result read 83 ms, reopen 1,009 ms. In debug: 6,363, 6,877, 314, 1,203, 1,213, 8,536 ms. The strategy run is about 1% of what the user waits for; reading the 1-minute data three times is about 93%.
+
+Noise floor on a quiet machine: 4% between two unchanged release runs. The keep rule stays at more than 10% on the lower of two runs, because other agents start compiling without notice.
+
+Round 1 restated on this set: dev 37,738.7 ms to 4,226.1 ms (8.9 times), test 49,958.1 ms to 3,354.0 ms (14.9 times). Target was 5 times. Kept.
+
+**Baseline B for PR 2 is 4,226.1 ms on dev. Target: at most 2,113 ms with identical checksums.**
+
+One more change to the bench before the freeze: each repetition of the load and Lab workloads opens its own `Store`, so anything a store later keeps in memory is not carried between repetitions. A repetition then stands for the first run after an app start. Checksums unchanged.
