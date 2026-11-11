@@ -257,7 +257,7 @@ pub(super) async fn coverage(
     Ok(Json(response))
 }
 
-fn read_coverage(store: &Store, id: InstrumentId) -> Result<CoverageResponse, ApiError> {
+pub fn read_coverage(store: &Store, id: InstrumentId) -> Result<CoverageResponse, ApiError> {
     let months = store
         .coverage(&id)?
         .iter()

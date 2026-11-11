@@ -4,8 +4,9 @@
 //! synthetic 1-minute candles (and a perpetual's funding) through the real [`Store`] into a fresh
 //! temporary directory, removed when the run ends, then times each workload `--reps` times: for
 //! `load`, the data check and load a run makes; for `lab_backtest`, the whole of a Strategy Lab
-//! backtest as the server does it (check, load, run, save, the job-result read and the saved-run
-//! read); for the others, only the engine call, on data loaded beforehand. Prints one `WORKLOAD`
+//! backtest as the server does it (the coverage read the Lab asks for first, check, load, run,
+//! save, the job-result read, and the saved-run read as a later session makes it); for the
+//! others, only the engine call, on data loaded beforehand. Prints one `WORKLOAD`
 //! line per workload, a `PHASES` line per `lab_backtest` workload, and one `BENCH` line to stdout;
 //! progress goes to stderr. A workload whose result differs between repetitions stops the run
 //! with a non-zero exit.
@@ -28,6 +29,7 @@ use td_engine::{
     BacktestConfig, BacktestResult, EngineError, Objective, ParamAxis, Params, SavedRun, SweepMode,
     SweepResult, SweepSpec, TesterError, WalkForwardResult, WalkForwardSpec, WindowSpec,
 };
+use td_server::api::data::read_coverage;
 use td_server::api::error::ApiError;
 use td_server::api::jobs::JobError;
 use td_server::api::runs::{
@@ -123,6 +125,9 @@ struct SweepSettings {
 #[derive(Debug, Clone, PartialEq)]
 struct Measured {
     min_ms: f64,
+    /// The first repetition's time. Far above `min_ms`, it says later repetitions reused
+    /// something the first one had to make.
+    first_ms: f64,
     median_ms: f64,
     /// SHA-256 of the result's JSON, in hex; the same on every repetition.
     checksum: String,
@@ -133,12 +138,19 @@ struct Measured {
 /// The phases of a `lab_backtest` repetition, in milliseconds, in the order they run.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 struct Phases {
+    coverage: f64,
     check: f64,
     load: f64,
     run: f64,
     save: f64,
     result: f64,
     open: f64,
+}
+
+impl Phases {
+    fn total(&self) -> f64 {
+        self.coverage + self.check + self.load + self.run + self.save + self.result + self.open
+    }
 }
 
 fn main() -> ExitCode {
@@ -209,10 +221,12 @@ fn bench_all(args: &Args) -> Result<(), String> {
 
 fn workload_line(w: &Workload, reps: usize, m: &Measured) -> String {
     format!(
-        "WORKLOAD name={} split={} reps={reps} min_ms={:.1} median_ms={:.1} checksum={}",
+        "WORKLOAD name={} split={} reps={reps} min_ms={:.1} first_ms={:.1} median_ms={:.1} \
+         checksum={}",
         w.name,
         w.split,
         m.min_ms,
+        m.first_ms,
         m.median_ms,
         &m.checksum[..16]
     )
@@ -220,9 +234,9 @@ fn workload_line(w: &Workload, reps: usize, m: &Measured) -> String {
 
 fn phases_line(w: &Workload, p: &Phases) -> String {
     format!(
-        "PHASES name={} check_ms={:.1} load_ms={:.1} run_ms={:.1} save_ms={:.1} result_ms={:.1} \
-         open_ms={:.1}",
-        w.name, p.check, p.load, p.run, p.save, p.result, p.open
+        "PHASES name={} coverage_ms={:.1} check_ms={:.1} load_ms={:.1} run_ms={:.1} save_ms={:.1} \
+         result_ms={:.1} open_ms={:.1}",
+        w.name, p.coverage, p.check, p.load, p.run, p.save, p.result, p.open
     )
 }
 
@@ -269,12 +283,7 @@ fn bench(
         let (ms, json) = match (&w.mode, &data) {
             (Mode::LabBacktest, _) => {
                 let (phases, json) = lab_backtest(&lab_config(&config)?, store, rep)?;
-                let ms = phases.check
-                    + phases.load
-                    + phases.run
-                    + phases.save
-                    + phases.result
-                    + phases.open;
+                let ms = phases.total();
                 if fastest.is_none_or(|(best, _)| ms < best) {
                     fastest = Some((ms, phases));
                 }
@@ -365,6 +374,7 @@ fn bench(
         }
         times.push(ms);
     }
+    let first_ms = times.first().copied().unwrap_or_default();
     times.sort_by(f64::total_cmp);
     let n = times.len();
     let median_ms = if n % 2 == 1 {
@@ -374,6 +384,7 @@ fn bench(
     };
     Ok(Measured {
         min_ms: times[0],
+        first_ms,
         median_ms,
         checksum: checksum.unwrap_or_default(),
         phases: fastest.map(|(_, p)| p),
@@ -395,11 +406,13 @@ fn lab_config(base: &BacktestConfig) -> Result<BacktestConfig, String> {
     })
 }
 
-/// One Lab backtest, timed phase by phase as the server runs it: `start`'s data check, the job
-/// (`execute`: load, run, save), the Lab's `GET /jobs/{id}/result`, then opening the saved run
-/// with `GET /runs/{id}`. Saves into an empty runs directory made and removed outside the timed
-/// phases. Returns the phases and the JSON to checksum: the saved backtest as read back and the
-/// run's check, without the run id, which carries the save time.
+/// One Lab backtest, timed phase by phase as the server runs it: the `GET /data/coverage` the Lab
+/// asks for before every run, `start`'s data check, the job (`execute`: load, run, save), the
+/// Lab's `GET /jobs/{id}/result`, then opening the saved run with `GET /runs/{id}`. The Lab opens
+/// a saved run only in a later session, so that phase reads through a store of its own and shares
+/// nothing the earlier phases kept in memory. Saves into an empty runs directory made and removed
+/// outside the timed phases. Returns the phases and the JSON to checksum: the coverage, the saved
+/// backtest as read back and the run's check, without the run id, which carries the save time.
 fn lab_backtest(
     config: &BacktestConfig,
     store: &Store,
@@ -409,6 +422,7 @@ fn lab_backtest(
         .prefix("td-bench-runs-")
         .tempdir()
         .map_err(|e| format!("cannot make the runs directory: {e}"))?;
+    let later_session = Store::new(store.root());
     let mut p = Phases::default();
     let mut lap = Instant::now();
     let mut split = |phase: &mut f64| {
@@ -416,6 +430,9 @@ fn lab_backtest(
         lap = Instant::now();
     };
 
+    let coverage = read_coverage(store, config.instrument.id.clone()).map_err(api_error)?;
+    to_json(&coverage)?;
+    split(&mut p.coverage);
     check_run_data(store, config).map_err(api_error)?;
     split(&mut p.check);
     let data = load_run_data(store, config).map_err(api_error)?;
@@ -435,12 +452,12 @@ fn lab_backtest(
     to_json(&detail)?;
     split(&mut p.result);
     let mut opened = read_run(runs.path(), done.run_id.as_str()).map_err(api_error)?;
-    opened.check = Some(check_run(store, &opened.run));
+    opened.check = Some(check_run(&later_session, &opened.run));
     to_json(&opened)?;
     split(&mut p.open);
 
     eprintln!("  rep {rep}: {trades} trades, check {:?}", opened.check);
-    Ok((p, to_json(&(&opened.run, &opened.check))?))
+    Ok((p, to_json(&(&coverage, &opened.run, &opened.check))?))
 }
 
 fn elapsed_ms(start: Instant) -> f64 {
@@ -799,8 +816,7 @@ mod tests {
         };
         let m = bench_twice(&w);
         let p = m.phases.expect("a lab backtest times its phases");
-        let total = p.check + p.load + p.run + p.save + p.result + p.open;
-        assert!((total - m.min_ms).abs() < 1e-9);
+        assert!((p.total() - m.min_ms).abs() < 1e-9);
         let line = phases_line(&w, &p);
         let f = fields(&line, "PHASES");
         let keys: Vec<&str> = f.iter().map(|(k, _)| k.as_str()).collect();
@@ -808,6 +824,7 @@ mod tests {
             keys,
             [
                 "name",
+                "coverage_ms",
                 "check_ms",
                 "load_ms",
                 "run_ms",
@@ -831,9 +848,17 @@ mod tests {
         let keys: Vec<&str> = f.iter().map(|(k, _)| k.as_str()).collect();
         assert_eq!(
             keys,
-            ["name", "split", "reps", "min_ms", "median_ms", "checksum"]
+            [
+                "name",
+                "split",
+                "reps",
+                "min_ms",
+                "first_ms",
+                "median_ms",
+                "checksum"
+            ]
         );
-        assert_eq!(f[5].1, first.checksum[..16]);
+        assert_eq!(f[6].1, first.checksum[..16]);
         f[3].1.parse::<f64>().unwrap();
 
         let summary = bench_line("dev", 1, first.min_ms, &first.checksum);
