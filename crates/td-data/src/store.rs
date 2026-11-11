@@ -64,9 +64,32 @@ impl Gap {
     }
 }
 
-/// The missing minutes in `[from, to)` among `candles`, which are sorted by open time.
-pub fn missing_minutes(candles: &[Candle], from: Millis, to: Millis) -> Vec<Gap> {
+/// The missing minutes in `[from, to)` among `candles`, which are sorted by open time, for a market
+/// of `kind`. Its closed hours ([`InstrumentKind::closed_spans`]) are never missing: they are cut
+/// out of each gap, so an FX week with its weekend absent has no gap, and a gap that runs into the
+/// weekend ends at the close. For a market that never closes every absent minute is missing.
+pub fn missing_minutes(
+    kind: InstrumentKind,
+    candles: &[Candle],
+    from: Millis,
+    to: Millis,
+) -> Vec<Gap> {
     let mut gaps = Vec::new();
+    let mut push = |from: Millis, to: Millis| {
+        let mut start = from;
+        for closed in kind.closed_spans(from, to) {
+            if start < closed.start {
+                gaps.push(Gap {
+                    from: start,
+                    to: closed.start,
+                });
+            }
+            start = closed.end;
+        }
+        if start < to {
+            gaps.push(Gap { from: start, to });
+        }
+    };
     let mut expected = from;
     for c in candles {
         if c.open_time < expected {
@@ -76,15 +99,12 @@ pub fn missing_minutes(candles: &[Candle], from: Millis, to: Millis) -> Vec<Gap>
             break;
         }
         if c.open_time > expected {
-            gaps.push(Gap {
-                from: expected,
-                to: c.open_time,
-            });
+            push(expected, c.open_time);
         }
         expected = c.open_time + MINUTE;
     }
     if expected < to {
-        gaps.push(Gap { from: expected, to });
+        push(expected, to);
     }
     gaps
 }
@@ -97,7 +117,8 @@ pub struct WriteReport {
     /// Candles given that replaced a stored candle or an earlier one in the same batch with the
     /// same open time.
     pub duplicates: usize,
-    /// Missing minutes between the first and last candle given, after the write.
+    /// Missing minutes between the first and last candle given, after the write, by the
+    /// instrument's trading hours ([`missing_minutes`]).
     pub gaps: Vec<Gap>,
 }
 
@@ -109,7 +130,7 @@ pub struct MonthCoverage {
     pub minutes: usize,
     pub first: Millis,
     pub last: Millis,
-    /// Missing minutes between `first` and `last`.
+    /// Missing minutes between `first` and `last`, by the instrument's trading hours.
     pub gaps: Vec<Gap>,
     /// The month file's size on disk.
     pub bytes: u64,
@@ -291,7 +312,7 @@ impl Store {
                     .filter(|c| (first..=last).contains(&c.open_time)),
             );
         }
-        report.gaps = missing_minutes(&merged_span, first, last + MINUTE);
+        report.gaps = missing_minutes(id.kind, &merged_span, first, last + MINUTE);
         Ok(report)
     }
 
@@ -355,7 +376,8 @@ impl Store {
         Ok(months)
     }
 
-    /// Which months and minutes are stored for an instrument.
+    /// Which months and minutes are stored for an instrument, with gaps by its kind's trading hours
+    /// ([`missing_minutes`]).
     pub fn coverage(&self, id: &InstrumentId) -> Result<Vec<MonthCoverage>, DataError> {
         let mut coverage = Vec::new();
         for month in self.months(id)? {
@@ -368,7 +390,7 @@ impl Store {
                 minutes: candles.len(),
                 first: first.open_time,
                 last: last.open_time,
-                gaps: missing_minutes(&candles, first.open_time, last.open_time + MINUTE),
+                gaps: missing_minutes(id.kind, &candles, first.open_time, last.open_time + MINUTE),
                 bytes: file_bytes(&self.candle_path(id, month)?)?.unwrap_or(0),
             });
         }
@@ -376,7 +398,7 @@ impl Store {
     }
 
     /// Bars of `timeframe` resampled from the stored 1-minute candles with open times in
-    /// `[from, to)`, by the rules of [`resample`].
+    /// `[from, to)`, by the rules of [`resample`] for the instrument's kind.
     ///
     /// Minutes outside the range are not read, so a bucket that `from` or `to` falls inside is
     /// missing minutes, and it is dropped or kept by the same rule as a bucket with minutes missing
@@ -397,7 +419,7 @@ impl Store {
                     .filter(|c| (from..to).contains(&c.open_time)),
             );
         }
-        Ok(resample(&minutes, timeframe, include_incomplete))
+        Ok(resample(id.kind, &minutes, timeframe, include_incomplete))
     }
 
     /// Merges funding rates `(funding time, rate)` into a perpetual's funding file, replacing any

@@ -259,8 +259,8 @@ fn read_data(store: &Store, config: &BacktestConfig) -> Result<StoreData, ApiErr
                 .filter(|c| (from..to).contains(&c.open_time)),
         );
     }
-    let gaps = missing_minutes(&minutes, from, to);
-    let loaded = resample(&minutes, config.timeframe, false);
+    let gaps = missing_minutes(id.kind, &minutes, from, to);
+    let loaded = resample(id.kind, &minutes, config.timeframe, false);
     let funding = if id.kind.rules().funding {
         store.load_funding(id, from, to)?
     } else {
@@ -294,7 +294,7 @@ pub fn check_run_data(store: &Store, config: &BacktestConfig) -> Result<(), ApiE
             .into_iter()
             .filter(|c| (start..end).contains(&c.open_time))
             .collect();
-        for gap in missing_minutes(&minutes, start, end) {
+        for gap in missing_minutes(id.kind, &minutes, start, end) {
             match open.as_mut() {
                 Some(o) if o.to == gap.from => o.to = gap.to,
                 _ => long.extend(open.replace(gap).filter(is_long)),
@@ -308,13 +308,16 @@ pub fn check_run_data(store: &Store, config: &BacktestConfig) -> Result<(), ApiE
         // resample judges each bucket on its own minutes.
         let cut = timeframe.floor(end);
         let split = pending.partition_point(|c| c.open_time < cut);
-        any_bar = !resample(&pending[..split], timeframe, false)
+        any_bar = !resample(id.kind, &pending[..split], timeframe, false)
             .candles
             .is_empty();
         pending.drain(..split);
     }
     long.extend(open.filter(is_long));
-    any_bar = any_bar || !resample(&pending, timeframe, false).candles.is_empty();
+    any_bar = any_bar
+        || !resample(id.kind, &pending, timeframe, false)
+            .candles
+            .is_empty();
     let funding = if id.kind.rules().funding {
         store.load_funding(id, from, to)?
     } else {
