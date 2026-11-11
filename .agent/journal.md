@@ -74,5 +74,5 @@ Baseline A for the target is the lower debug run, 19,966.2 ms. Baseline B is the
 
 - PR 1 (`perf-bench`): push, CI, review gate, merge.
 - PR 2 (`perf-engine`): waits for #66. Rounds planned: load caching, shared sweep preparation, incremental indicators.
-- PR 3 (`live-chart`): worker running in `D:\code\.worktrees	rading-desk-live-chart`.
+- PR 3 (`live-chart`): worker running in `D:/code/.worktrees/trading-desk-live-chart`.
 - The bench worker did not check that checksums match between Windows and Linux; CI does not run the bench, so this only matters if someone compares across machines.
