@@ -18,7 +18,7 @@ use td_data::{DataError, DownloadReport, InstrumentList, Store};
 use td_engine::{
     BacktestSettings, Direction, ENGINE_REVISION, EvidenceSettings, LuckTest, Metric, Objective,
     ParamAxis, ParamSpace, Params, Period, PortfolioBenchmark, PortfolioLimits, RunId, SavedRun,
-    StrategyEntry, SweepPlan, TestPlan, VerdictRule, WalkForwardPlan,
+    SlippageOverride, StrategyEntry, SweepPlan, TestPlan, VerdictRule, WalkForwardPlan,
 };
 use td_server::api::auth::Token;
 use td_server::api::jobs::{JobInfo, JobResult, JobStatus};
@@ -911,9 +911,40 @@ async fn the_verdict_list_flags_a_changed_plan_and_prefers_a_complete_battery() 
     assert!(r.plan_matches && r.complete, "{r:?}");
 
     // The plans and rules are compiled in: a server built with other ones sees the saved verdict
-    // as stale. The same entry still matches.
+    // as stale. The same entry still matches, and so does one that changes only what the spot
+    // battery does not read: the other instruments and their slippage.
     let same = t.restarted(vec![entry(49)]).await;
     assert!(row(same.verdicts("").await).plan_matches);
+    let eth = InstrumentId {
+        symbol: "ETHUSDT".into(),
+        ..id(InstrumentKind::Spot)
+    };
+    let slippage = |kind: InstrumentKind, bps: f64| SlippageOverride {
+        instrument: id(kind),
+        bps,
+    };
+    let mut another_instrument = entry(49);
+    another_instrument.plan.instruments.push(eth.clone());
+    let mut reordered = entry(49);
+    reordered.plan.instruments.reverse();
+    let mut other_slippage = entry(49);
+    other_slippage.plan.backtest.slippage = vec![slippage(InstrumentKind::Perpetual, 7.5)];
+    let mut everything_else = entry(49);
+    everything_else.plan.instruments = vec![eth, id(InstrumentKind::Spot)];
+    everything_else.plan.backtest.slippage = vec![SlippageOverride {
+        instrument: everything_else.plan.instruments[0].clone(),
+        bps: 3.0,
+    }];
+    for current in [
+        another_instrument,
+        reordered,
+        other_slippage,
+        everything_else,
+    ] {
+        let changed = t.restarted(vec![current.clone()]).await;
+        let r = row(changed.verdicts("").await);
+        assert!(r.plan_matches, "{:?}: {r:?}", current.plan);
+    }
     let mut other_rule = entry(49);
     other_rule.rule = VerdictRule::Portfolio {
         benchmark: PortfolioBenchmark::Cash,
@@ -924,10 +955,13 @@ async fn the_verdict_list_flags_a_changed_plan_and_prefers_a_complete_battery() 
     };
     let mut without_spot = entry(49);
     without_spot.plan.instruments = vec![id(InstrumentKind::Perpetual)];
+    let mut spot_slippage = entry(49);
+    spot_slippage.plan.backtest.slippage = vec![slippage(InstrumentKind::Spot, 7.5)];
     let stale = [
         vec![entry(50)],
         vec![other_rule],
         vec![without_spot],
+        vec![spot_slippage],
         Vec::new(),
     ];
     for entries in stale {
@@ -957,6 +991,27 @@ async fn the_verdict_list_flags_a_changed_plan_and_prefers_a_complete_battery() 
     let r = row(t.verdicts("").await);
     assert_eq!((r.run_id.clone(), r.runs), (first.clone(), 1));
     assert!(r.plan_matches && r.complete, "{r:?}");
+    std::fs::write(&record, &intact).unwrap();
+
+    // A record whose plan no longer reads as this build's plan type (it has a field since removed
+    // or renamed) still shows, as stale, whether it is read from the record or from the result.
+    rewrite_record(&runs_dir, &first, |v| v["plan"]["retired"] = json!(1));
+    let r = row(t.verdicts("").await);
+    assert_eq!((r.run_id.clone(), r.runs), (first.clone(), 1));
+    assert!(!r.plan_matches && r.complete, "{r:?}");
+    std::fs::write(&record, &intact).unwrap();
+    let result = runs_dir.join(first.as_str()).join("result.json");
+    let intact_result = std::fs::read(&result).unwrap();
+    let mut saved: Value = serde_json::from_slice(&intact_result).unwrap();
+    saved["result"]["plan"]["retired"] = json!(1);
+    std::fs::write(&result, serde_json::to_vec(&saved).unwrap()).unwrap();
+    rewrite_record(&runs_dir, &first, |v| {
+        v.as_object_mut().unwrap().remove("complete");
+    });
+    let r = row(t.verdicts("").await);
+    assert_eq!((r.run_id.clone(), r.runs), (first.clone(), 1));
+    assert!(!r.plan_matches && r.complete, "{r:?}");
+    std::fs::write(&result, &intact_result).unwrap();
     std::fs::write(&record, &intact).unwrap();
 
     // A newer battery whose luck test a cancel stopped is counted but does not replace the

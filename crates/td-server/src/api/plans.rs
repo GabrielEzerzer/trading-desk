@@ -43,11 +43,12 @@ use axum::extract::rejection::{JsonRejection, QueryRejection};
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use td_core::{Instrument, InstrumentId, Millis};
 use td_data::Store;
 use td_engine::{
-    BatterySpec, ENGINE_REVISION, PlanRun, RunId, SavedRun, StrategyEntry, TestPlan, TesterError,
-    Verdict, VerdictRule,
+    BatterySpec, ENGINE_REVISION, PlanRun, RunId, RunKind, SavedRun, StrategyEntry, TesterError,
+    Verdict,
 };
 use ts_rs::TS;
 
@@ -107,10 +108,12 @@ pub struct VerdictRecord {
     pub seed: u64,
     pub engine_revision: u32,
     pub verdict: Verdict,
-    /// The plan and the rule the battery ran under. Both are compiled in, and editing one does not
-    /// change [`ENGINE_REVISION`], so the verdict list compares them with the registered ones.
-    pub plan: TestPlan,
-    pub rule: VerdictRule,
+    /// The plan ([`td_engine::TestPlan`]) and the rule ([`td_engine::VerdictRule`]) the battery
+    /// ran under. Both are compiled in, and editing one does not change [`ENGINE_REVISION`], so the
+    /// verdict list compares them with the registered ones. They are kept as JSON so that a record
+    /// written before a field of either was added, renamed or removed still reads, as stale.
+    pub plan: Value,
+    pub rule: Value,
     /// False when a cancel stopped the luck test (R3), so the verdict lacks it.
     pub complete: bool,
 }
@@ -406,8 +409,8 @@ fn save_plan_run(
         seed: battery.seed,
         engine_revision: ENGINE_REVISION,
         verdict: battery.verdict.clone(),
-        plan: entry.plan.clone(),
-        rule: entry.rule,
+        plan: to_json(&entry.plan)?,
+        rule: to_json(&entry.rule)?,
         complete,
     };
     let run = PlanRun::new(
@@ -437,12 +440,51 @@ fn save_plan_run(
     })
 }
 
+fn to_json<T: Serialize>(value: &T) -> Result<Value, JobError> {
+    serde_json::to_value(value)
+        .map_err(|e| ApiError::internal(format!("cannot write the verdict record: {e}")).into())
+}
+
 /// A plan run's `config.json`, enough to tell it from the other kinds' without reading the result.
 #[derive(Deserialize)]
 #[allow(dead_code)] // read only to check that the fields are there
 struct PlanConfigHead {
     plan: serde::de::IgnoredAny,
-    rule: VerdictRule,
+    rule: serde::de::IgnoredAny,
+}
+
+/// The beginning of a plan run's `result.json` (a [`SavedRun::Plan`]): the fields of a
+/// [`VerdictRecord`], with the plan and the rule as JSON for the same reason as there.
+#[derive(Deserialize)]
+struct PlanResultHead {
+    kind: RunKind,
+    result: PlanResultFields,
+}
+
+#[derive(Deserialize)]
+struct PlanResultFields {
+    strategy: String,
+    config: ConfigHead,
+    plan: Value,
+    rule: Value,
+    engine_revision: u32,
+    battery: BatteryHead,
+}
+
+#[derive(Deserialize)]
+struct ConfigHead {
+    instrument: InstrumentHead,
+}
+
+#[derive(Deserialize)]
+struct InstrumentHead {
+    id: InstrumentId,
+}
+
+#[derive(Deserialize)]
+struct BatteryHead {
+    verdict: Verdict,
+    seed: u64,
 }
 
 /// The verdict record of the run in `dir`, if it is a plan run. A run saved without a
@@ -461,21 +503,60 @@ fn read_record(dir: &Path) -> Option<VerdictRecord> {
     }
     let config = fs::read(dir.join("config.json")).ok()?;
     serde_json::from_slice::<PlanConfigHead>(&config).ok()?;
-    let runs_dir = dir.parent()?;
-    let id = dir.file_name()?.to_str()?;
-    match td_engine::load(runs_dir, id).ok()? {
-        SavedRun::Plan(run) => Some(VerdictRecord {
-            strategy: run.strategy,
-            instrument: run.config.instrument.id,
-            seed: run.battery.seed,
-            engine_revision: run.engine_revision,
-            verdict: run.battery.verdict,
-            plan: run.plan,
-            rule: run.rule,
-            complete: true,
-        }),
-        _ => None,
+    let result = fs::read(dir.join("result.json")).ok()?;
+    let head: PlanResultHead = serde_json::from_slice(&result).ok()?;
+    if head.kind != RunKind::Plan {
+        return None;
     }
+    let run = head.result;
+    Some(VerdictRecord {
+        strategy: run.strategy,
+        instrument: run.config.instrument.id,
+        seed: run.battery.seed,
+        engine_revision: run.engine_revision,
+        verdict: run.battery.verdict,
+        plan: run.plan,
+        rule: run.rule,
+        complete: true,
+    })
+}
+
+/// The part of a plan, as JSON, that the battery on `instrument` reads: the plan with its
+/// per-instrument fields, `instruments` and `backtest.slippage`, cut down to `instrument`'s
+/// entry. A battery reads no other instrument's entry, and the seed is the strategy's and the
+/// instrument's, so adding, removing or reordering another instrument, or changing another
+/// instrument's slippage, leaves this instrument's verdict current. A field that is missing or not
+/// shaped as expected is left as it is, so the plan compares unequal to the registered one.
+fn instrument_view(mut plan: Value, instrument: &Value) -> Value {
+    if let Some(fields) = plan.as_object_mut() {
+        if let Some(instruments) = fields.get_mut("instruments") {
+            *instruments = Value::Array(vec![instrument.clone()]);
+        }
+        if let Some(Value::Array(slippage)) = fields
+            .get_mut("backtest")
+            .and_then(|b| b.get_mut("slippage"))
+        {
+            slippage.retain(|o| o.get("instrument") == Some(instrument));
+        }
+    }
+    plan
+}
+
+/// Whether the battery saved in `record` ran under `entry`'s current plan and rule, as far as
+/// they concern the record's instrument, and the plan still tests it. JSON numbers compare exactly:
+/// serde_json's `float_roundtrip` reads each saved float back to the value it was written from.
+fn ran_under(entry: &StrategyEntry, record: &VerdictRecord, saved_view: &Value) -> bool {
+    if entry.name != record.strategy || !entry.plan.instruments.contains(&record.instrument) {
+        return false;
+    }
+    let (Ok(plan), Ok(rule), Ok(id)) = (
+        serde_json::to_value(&entry.plan),
+        serde_json::to_value(entry.rule),
+        serde_json::to_value(&record.instrument),
+    ) else {
+        return false;
+    };
+    rule == record.rule && &instrument_view(plan, &id) == saved_view
 }
 
 /// The latest verdict per strategy and instrument (the newest complete one, or the newest when none
@@ -505,7 +586,7 @@ pub fn latest_verdicts(
         else {
             continue;
         };
-        let Some(record) = read_record(&entry.path()) else {
+        let Some(mut record) = read_record(&entry.path()) else {
             continue;
         };
         if strategy.is_some_and(|s| s != record.strategy) {
@@ -513,12 +594,11 @@ pub fn latest_verdicts(
         }
         let key = (record.strategy.clone(), record.instrument.to_string());
         let runs = latest.get(&key).map_or(0, |s| s.runs) + 1;
-        let plan_matches = strategies.iter().any(|e| {
-            e.name == record.strategy
-                && e.plan == record.plan
-                && e.rule == record.rule
-                && e.plan.instruments.contains(&record.instrument)
-        });
+        let saved_view = serde_json::to_value(&record.instrument)
+            .ok()
+            .map(|id| instrument_view(record.plan.take(), &id));
+        let plan_matches =
+            saved_view.is_some_and(|view| strategies.iter().any(|e| ran_under(e, &record, &view)));
         let row = VerdictSummary {
             strategy: record.strategy,
             instrument: record.instrument,
