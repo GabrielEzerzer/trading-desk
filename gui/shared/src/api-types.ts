@@ -4,7 +4,7 @@
 /**
  * An exchange the desk reads data from and simulates orders against.
  */
-export type Venue = "binance" | "bybit";
+export type Venue = "binance" | "bybit" | "dukascopy";
 
 export type InstrumentKind = "spot" | "perpetual" | "fx";
 

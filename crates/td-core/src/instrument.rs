@@ -11,6 +11,8 @@ use crate::{CoreError, OrderRequest, OrderType};
 pub enum Venue {
     Binance,
     Bybit,
+    /// Dukascopy's free historical data feed: FX bid and ask candles, no trading.
+    Dukascopy,
 }
 
 impl fmt::Display for Venue {
@@ -18,6 +20,7 @@ impl fmt::Display for Venue {
         f.write_str(match self {
             Venue::Binance => "binance",
             Venue::Bybit => "bybit",
+            Venue::Dukascopy => "dukascopy",
         })
     }
 }

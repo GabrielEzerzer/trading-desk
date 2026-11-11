@@ -88,6 +88,7 @@ impl InstrumentArgs {
 enum VenueArg {
     Binance,
     Bybit,
+    Dukascopy,
 }
 
 impl From<VenueArg> for Venue {
@@ -95,6 +96,7 @@ impl From<VenueArg> for Venue {
         match v {
             VenueArg::Binance => Venue::Binance,
             VenueArg::Bybit => Venue::Bybit,
+            VenueArg::Dukascopy => Venue::Dukascopy,
         }
     }
 }
@@ -362,5 +364,28 @@ mod tests {
             "forex",
         ];
         assert!(Cli::try_parse_from(bad).is_err());
+    }
+
+    #[test]
+    fn a_download_names_dukascopy_by_its_venue_name() {
+        let cli = Cli::try_parse_from([
+            "td-data",
+            "download",
+            "--venue",
+            "dukascopy",
+            "--kind",
+            "fx",
+            "--symbol",
+            "USDJPY",
+            "--from",
+            "2024-01-08",
+            "--to",
+            "2024-01-15",
+        ])
+        .expect("parses");
+        let Command::Download { instrument, .. } = cli.command else {
+            panic!("not the download command");
+        };
+        assert_eq!(instrument.id().to_string(), "dukascopy:USDJPY:fx");
     }
 }

@@ -8,6 +8,7 @@
 pub mod binance;
 pub mod bybit;
 mod download;
+pub mod dukascopy;
 mod error;
 mod http;
 pub mod instruments;

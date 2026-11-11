@@ -9,6 +9,7 @@ publish.workspace = true
 arrow.workspace = true
 clap.workspace = true
 futures-util.workspace = true
+lzma-rs.workspace = true
 parquet.workspace = true
 reqwest.workspace = true
 rustls.workspace = true

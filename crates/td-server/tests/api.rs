@@ -442,6 +442,10 @@ async fn instruments_come_from_the_source_once_per_list_and_then_from_memory() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["instruments"][0]["id"]["kind"], "perpetual");
     assert_eq!(t.source.instrument_calls.load(Ordering::SeqCst), 2);
+    let (status, body) = t.get("/instruments?venue=dukascopy&kind=fx").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["instruments"][0]["id"]["venue"], "dukascopy");
+    assert_eq!(body["instruments"][0]["id"]["kind"], "fx");
 
     for bad in [
         "/instruments?venue=kraken&kind=spot",
@@ -569,6 +573,9 @@ async fn a_download_job_reaches_done_on_the_jobs_topic_and_shows_in_coverage() {
         .await;
     assert_eq!(empty["months"], json!([]));
     assert_eq!(empty["funding"], Value::Null);
+    let (status, fx) = t.get("/data/coverage?instrument=dukascopy:USDJPY:fx").await;
+    assert_eq!(status, StatusCode::OK, "{fx}");
+    assert_eq!(fx["months"], json!([]));
 }
 
 #[tokio::test(flavor = "multi_thread")]
