@@ -335,9 +335,11 @@ fn plan() -> TestPlan {
 /// bound on it. The rule passes when, out of sample and after the spread:
 ///
 /// - the mean net P&L per trade is above zero, and so is the bootstrap's lower bound on it, which
-///   is the margin of error. Every trade risks the same share of the account, so the mean in
-///   dollars has the sign of the mean in pips, and its lower bound above zero is the claim that
-///   the pips per trade are above zero by more than the sampling error;
+///   is the margin of error. Every trade risks the same share of the account as it stands then,
+///   so the mean in dollars weights a trade by the account's size at the time: it follows the
+///   mean in pips, but an edge that fades over the years reads weaker in dollars than in pips,
+///   and two trades of nearly equal and opposite pips can differ in sign. The figure in pips is
+///   the report's `avg_trade_pips`;
 /// - the default profit factor of 1.3, risk of ruin at most 5% of a 50% drawdown, and a positive
 ///   return without the single best trade, so one lucky day cannot carry the result.
 ///
@@ -350,7 +352,10 @@ fn plan() -> TestPlan {
 /// publishes no profit factor to check it against. A real but smaller effect therefore ends as
 /// not passing, on purpose, because the published edge also has to pay a commission that this
 /// plan does not charge. The published numbers (775 trades, +2.35 pips, t = 5.5, 58% winners) are
-/// what a run is read against, not pass marks.
+/// what a run is read against, not pass marks. The run to read against them is the plain backtest
+/// over the whole period at the default 12 pip stop, by its `avg_trade_pips`; the calendar allows
+/// at most 765 trades there. The walk-forward's out-of-sample curve covers about 8.5 of the years
+/// and picks a stop per window, so its trade count and its mean are not comparable.
 fn rule() -> VerdictRule {
     VerdictRule::HighRisk {
         limits: HighRiskLimits {
