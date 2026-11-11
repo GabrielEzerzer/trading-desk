@@ -1404,7 +1404,7 @@ p_mean_not_positive: number | null,
  */
 trades: number, 
 /**
- * Mean net P&L per closed trade, in the quote asset.
+ * Mean net P&L per closed trade, in the run's account currency.
  */
 expectancy: number | null, 
 /**
