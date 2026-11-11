@@ -1253,6 +1253,64 @@ async fn fx_sweeps_out_of_sample_and_walk_forward_runs_trade_on_the_asks() {
 
 /// Sets the ask high of the minute at `open_time` in its stored month file to `high`, past the
 /// store's checks.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_fx_run_goes_over_a_holiday_but_three_days_missing_or_a_spot_day_is_refused() {
+    // FX_DAYS days of FX minutes from Monday 8 January 2024. EURUSD lacks 25 hours of open time
+    // from Tuesday 22:00 UTC, as OANDA's minutes lack a holiday such as 25 to 26 December 2016;
+    // GBPUSD lacks three days from Tuesday 00:00 UTC.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = Store::new(dir.path());
+    let (from, to) = (fx_t0(), fx_t0() + FX_DAYS * DAY);
+    let holiday = from + DAY + 22 * HOUR..from + 2 * DAY + 23 * HOUR;
+    let three_days = from + DAY..from + 4 * DAY;
+    let without = |hole: std::ops::Range<Millis>| -> Vec<Millis> {
+        let open = open_minutes(from, to).into_iter();
+        open.filter(|t| !hole.contains(t)).collect()
+    };
+    write_fx(&store, "EURUSD", &without(holiday.clone()), SPREAD);
+    write_fx(&store, "GBPUSD", &without(three_days), SPREAD);
+    // Three days of spot minutes from 1 March 2024, the second day missing.
+    let spot = config(InstrumentKind::Spot, 3);
+    store
+        .write_candles(&spot.instrument.id, &minutes(3, t0() + DAY..t0() + 2 * DAY))
+        .expect("seeds");
+    let t = TestServer::on(dir, store).await;
+
+    // The holiday is run through, and listed in the run's data report with its hours.
+    let (detail, _) = fx_backtest(&t, &fx_config("EURUSD", Timeframe::H1)).await;
+    let data = detail.data.expect("a data report");
+    let gap = GapInfo {
+        from: holiday.start,
+        to: holiday.end,
+        minutes: 25 * 60,
+    };
+    assert_eq!(data.gaps, [gap]);
+    assert_eq!(data.dropped.len(), 25);
+
+    // Three days missing for FX, and a day for spot, are refused as before: only the EURUSD run
+    // started a job.
+    let refused = [
+        (
+            serde_json::to_value(fx_config("GBPUSD", Timeframe::H1)).unwrap(),
+            "the store has no binance:GBPUSD:fx candles from 2024-01-09 00:00 to 2024-01-12 \
+             00:00 UTC; download them first",
+        ),
+        (
+            serde_json::to_value(&spot).unwrap(),
+            "the store has no binance:BTCUSDT:spot candles from 2024-03-02 00:00 to 2024-03-03 \
+             00:00 UTC; download them first",
+        ),
+    ];
+    for (body, message) in refused {
+        let (status, body) = t.post("/runs/backtest", &body).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["error"]["code"], "data_missing");
+        assert_eq!(body["error"]["message"], message);
+    }
+    let (_, jobs) = t.get("/jobs").await;
+    assert_eq!(jobs.as_array().map(Vec::len), Some(1));
+}
+
 fn plant_ask_high(store: &Store, id: &InstrumentId, open_time: Millis, high: f64) {
     use arrow::array::{Array, ArrayRef, Float64Array, Int64Array};
     use arrow::record_batch::RecordBatch;
