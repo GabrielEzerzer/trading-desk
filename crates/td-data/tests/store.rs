@@ -651,12 +651,15 @@ fn deleting_a_month_range_leaves_the_other_months_readable() {
     for m in ["2024-01", "2024-03"] {
         assert_eq!(store.read_month(&id, month(m)).expect("reads").len(), 60);
     }
-    let files = tree(dir.path());
-    assert!(
-        !files.iter().any(|f| f.contains("2024-02")),
-        "the February file, its sidecar and the temp file are gone: {files:?}"
+    let february: Vec<String> = tree(dir.path())
+        .into_iter()
+        .filter(|f| f.contains("2024-02"))
+        .collect();
+    assert_eq!(
+        february,
+        ["candles/binance/perpetual/BTCUSDT/1m/2024-02.parquet.lock"],
+        "the February file and the temp file are gone, and its lock file stays"
     );
-    assert!(files.iter().any(|f| f.ends_with("2024-01.parquet.lock")));
     assert_eq!(
         store
             .load_funding(&id, i64::MIN, i64::MAX)
@@ -697,7 +700,7 @@ fn deleting_a_month_range_leaves_the_other_months_readable() {
 }
 
 #[test]
-fn deleting_a_whole_perpetual_removes_its_candles_funding_and_emptied_folders() {
+fn deleting_a_whole_perpetual_removes_its_candles_and_funding_and_leaves_its_lock_files() {
     let dir = tempfile::tempdir().expect("a temp dir");
     let store = Store::new(dir.path());
     let perp = btc(InstrumentKind::Perpetual);
@@ -728,33 +731,97 @@ fn deleting_a_whole_perpetual_removes_its_candles_funding_and_emptied_folders() 
             .expect("loads")
             .is_empty()
     );
-    let ids: Vec<InstrumentId> = store
-        .stored()
-        .expect("lists")
-        .instruments
-        .into_iter()
-        .map(|i| i.id)
-        .collect();
+    let stored = store.stored().expect("lists");
+    let ids: Vec<InstrumentId> = stored.instruments.into_iter().map(|i| i.id).collect();
     assert_eq!(ids, std::slice::from_ref(&spot));
-    let files = tree(dir.path());
-    assert!(
-        !files
-            .iter()
-            .any(|f| f.contains("perpetual") || f.starts_with("funding")),
-        "the perpetual folders and the emptied funding folders are gone: {files:?}"
+    assert_eq!(stored.unrecognised, Vec::<std::path::PathBuf>::new());
+    // Of the perpetual, only its lock files are left, empty, as writers leave them.
+    let perp_files: Vec<String> = tree(dir.path())
+        .into_iter()
+        .filter(|f| f.contains("perpetual") || f.starts_with("funding"))
+        .filter(|f| dir.path().join(f).is_file())
+        .collect();
+    assert_eq!(
+        perp_files,
+        [
+            "candles/binance/perpetual/BTCUSDT/1m/2024-01.parquet.lock",
+            "candles/binance/perpetual/BTCUSDT/1m/2024-02.parquet.lock",
+            "candles/binance/perpetual/BTCUSDT/1m/2024-03.parquet.lock",
+            "funding/binance/BTCUSDT.parquet.lock",
+        ]
     );
+    for file in &perp_files {
+        assert_eq!(file_size(dir.path().join(file)), 0, "{file}");
+    }
 
-    store.delete_instrument(&spot).expect("deletes");
+    // Deleting what is not stored removes nothing and creates nothing, not even a folder or a
+    // lock file.
+    let before = tree(dir.path());
+    let eth = InstrumentId {
+        symbol: "ETHUSDT".into(),
+        ..perp.clone()
+    };
+    for id in [&perp, &eth] {
+        assert_eq!(
+            store.delete_instrument(id).expect("deletes nothing"),
+            DeleteReport::default()
+        );
+        assert_eq!(
+            store
+                .delete_months(id, month("2020-01"), month("2030-12"))
+                .expect("deletes nothing"),
+            DeleteReport::default()
+        );
+    }
+    assert_eq!(tree(dir.path()), before);
+
+    // The deleted month and funding can be written and read again.
+    store
+        .write_candles(&perp, &flat_minutes(month("2024-02").start(), 0..5))
+        .expect("writes");
     assert_eq!(
-        tree(dir.path()),
-        Vec::<String>::new(),
-        "everything below the root is gone"
+        store
+            .read_month(&perp, month("2024-02"))
+            .expect("reads")
+            .len(),
+        5
     );
-    assert!(dir.path().exists(), "the root itself stays");
+    let t = day("2024-02-01");
+    store.write_funding(&perp, &[(t, 0.0003)]).expect("writes");
     assert_eq!(
-        store.delete_instrument(&spot).expect("deletes nothing"),
-        DeleteReport::default()
+        store
+            .load_funding(&perp, i64::MIN, i64::MAX)
+            .expect("loads"),
+        [(t, 0.0003)]
     );
+}
+
+#[test]
+fn a_lock_file_with_bytes_in_it_holds_up_no_write_or_delete() {
+    // The store never writes into a lock file, and what one holds does not matter: writes and
+    // deletes lock it as it is, and a delete leaves it as it was.
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let store = Store::new(dir.path());
+    let id = btc(InstrumentKind::Spot);
+    let jan = month("2024-01");
+    store
+        .write_candles(&id, &flat_minutes(jan.start(), 0..5))
+        .expect("writes");
+    let lock_file = store
+        .candle_path(&id, jan)
+        .unwrap()
+        .with_extension("parquet.lock");
+    std::fs::write(&lock_file, b"x").expect("writes");
+    store
+        .write_candles(&id, &flat_minutes(jan.start(), 5..10))
+        .expect("writes");
+    assert_eq!(store.read_month(&id, jan).expect("reads").len(), 10);
+    assert_eq!(
+        store.delete_months(&id, jan, jan).expect("deletes").files,
+        1
+    );
+    assert_eq!(std::fs::read(&lock_file).expect("stays"), b"x");
+    assert!(store.months(&id).expect("lists").is_empty());
 }
 
 #[test]

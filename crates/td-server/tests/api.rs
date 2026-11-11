@@ -1005,6 +1005,11 @@ async fn stored_data_lists_with_sizes_and_deletes_by_month_range_or_whole_instru
         .map(|i| i["instrument"]["symbol"].as_str().unwrap())
         .collect();
     assert_eq!(left, ["ETHUSDT"], "the other instrument is untouched");
+    assert_eq!(
+        stored["unrecognised"],
+        json!([]),
+        "lock files are not strays"
+    );
     // Deleting what is not there is not an error.
     let (status, removed) = t.post("/data/delete", &body.to_string()).await;
     assert_eq!(status, StatusCode::OK);

@@ -9,17 +9,16 @@
 //! same folder, then renamed over the old one. Each read-merge-write of a file holds a lock for
 //! that path, in this process and across processes, so two writers (two download jobs, or the two
 //! apps' servers sharing one data folder) never lose each other's rows. The cross-process lock is
-//! an OS lock on a sidecar file beside the data file, `<name>.parquet.lock`, which stays on disk
-//! while the data file does. Readers take no lock: the rename means they see the old file or the
-//! new one, never half of one. Missing minutes are reported, never filled.
+//! an OS lock on a sidecar file beside the data file, `<name>.parquet.lock`, which stays on disk.
+//! Readers take no lock: the rename means they see the old file or the new one, never half of one.
+//! Missing minutes are reported, never filled.
 //!
 //! Deleting ([`Store::delete_months`], [`Store::delete_instrument`]) is the one way data leaves the
-//! store. A delete takes the same lock a writer takes, removes the data file, then retires the
-//! sidecar (writes one byte into it, so it is no longer empty) and removes it; a writer that was
-//! waiting on the retired sidecar sees it is not empty once it gets the lock and starts over on a
-//! fresh one (see [`lock_across_processes`]). Folders a delete empties are removed.
+//! store. A delete takes the same lock a writer takes, removes the data file and any temp files a
+//! crashed writer left beside it, and lets the lock go. It leaves the sidecar and the folders as
+//! they are.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io;
@@ -150,8 +149,7 @@ pub struct StoredData {
     pub unrecognised: Vec<PathBuf>,
 }
 
-/// What a delete removed: data files, and temp files a crashed writer left beside them. The lock
-/// sidecars it removes are empty and not counted.
+/// What a delete removed: data files, and temp files a crashed writer left beside them.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DeleteReport {
     pub files: usize,
@@ -590,10 +588,10 @@ impl Store {
         })
     }
 
-    /// Deletes an instrument's candles for the months `from` to `to`, both included, and removes
-    /// the folders that leaves empty. Each month file is removed under the same lock a writer
-    /// takes for it, with its lock sidecar and any temp files a crashed writer left beside it.
-    /// Months not stored are skipped: deleting nothing is not an error. The funding file stays.
+    /// Deletes an instrument's candles for the months `from` to `to`, both included. Each month
+    /// file is removed under the same lock a writer takes for it, with any temp files a crashed
+    /// writer left beside it; its lock sidecar and the folders stay. Months not stored are skipped:
+    /// deleting nothing is not an error, and creates nothing. The funding file stays.
     pub fn delete_months(
         &self,
         id: &InstrumentId,
@@ -602,18 +600,13 @@ impl Store {
     ) -> Result<DeleteReport, DataError> {
         let dir = self.candle_dir(id)?;
         let mut report = DeleteReport::default();
-        let mut months = BTreeSet::new();
         for name in dir_names(&dir, &mut Vec::new(), &self.root)? {
-            months.extend(
-                month_of_file(&name)
-                    .map(|(month, _)| month)
-                    .filter(|m| (from..=to).contains(m)),
-            );
+            if let Some((month, true)) = month_of_file(&name)
+                && (from..=to).contains(&month)
+            {
+                remove_locked(&dir.join(name), &mut report)?;
+            }
         }
-        for month in months {
-            remove_locked(&self.candle_path(id, month)?, &mut report)?;
-        }
-        self.remove_empty_dirs(&dir);
         Ok(report)
     }
 
@@ -634,9 +627,6 @@ impl Store {
         if id.kind == InstrumentKind::Perpetual {
             let path = self.funding_path(id)?;
             remove_locked(&path, &mut report)?;
-            if let Some(dir) = path.parent() {
-                self.remove_empty_dirs(dir);
-            }
         }
         Ok(report)
     }
@@ -664,20 +654,6 @@ impl Store {
 
     fn relative(&self, path: &Path) -> PathBuf {
         relative_to(&self.root, path)
-    }
-
-    /// Removes `dir`, then each folder above it up to but not including the store root, for as
-    /// long as they are empty. `fs::remove_dir` removes only an empty folder, so one a writer has
-    /// just put a file in stays; a writer that had just created a folder this removes creates it
-    /// again (see [`lock_across_processes`]).
-    fn remove_empty_dirs(&self, dir: &Path) {
-        let mut dir = dir;
-        while dir != self.root && dir.starts_with(&self.root) && fs::remove_dir(dir).is_ok() {
-            match dir.parent() {
-                Some(parent) => dir = parent,
-                None => break,
-            }
-        }
     }
 }
 
@@ -747,98 +723,44 @@ fn file_lock(path: &Path) -> Arc<Mutex<()>> {
     locks.entry(path.to_path_buf()).or_default().clone()
 }
 
-/// How many times [`lock_across_processes`] opens a lock sidecar before it gives up: about 1.5 s.
-const LOCK_TRIES: u32 = 20;
-
 /// Takes the exclusive OS lock that serialises read-merge-write of the store file at `path` across
 /// processes, waiting for any other holder, and returns the open lock file; the lock lasts until it
 /// is dropped. Callers take it after [`file_lock`] and hold it from the read through the rename.
 ///
 /// The lock is on a sidecar file, `<file name>.lock` beside `path`, not on the data file: on Windows
-/// a lock or open handle on the data file would make the rename over it fail. It is an OS lock
-/// (`flock` on Unix, `LockFileEx` on Windows) bound to the open handle, so the OS releases it when
-/// the holder exits or is killed: a crash cannot leave a file locked, as a create-exclusive marker
-/// file would.
-///
-/// A sidecar is empty while it is in use. A delete removes it, but a writer may already have it
-/// open and be waiting for its lock; if that writer went on, it would hold a lock on a file no
-/// longer at the path while a newcomer locked a fresh sidecar there, and both would write. So the
-/// delete first retires the sidecar by writing a byte into it ([`retire_lock`]), and a writer that
-/// gets the lock on a sidecar that is not empty lets it go and opens the path again. Making the
-/// folder and opening the sidecar are also retried when a delete has just removed the folder (not
-/// found) and, on Windows, while a removed folder's or sidecar's name lingers until every handle
-/// on it is closed (access denied, or already exists from `create_dir_all`, which cannot tell
-/// that such a folder is there).
+/// a lock or open handle on the data file would make the rename over it fail. The sidecar is never
+/// deleted, since a writer could otherwise lock a file another writer is about to remove and both
+/// would proceed. It is an OS lock (`flock` on Unix, `LockFileEx` on Windows) bound to the open
+/// handle, so the OS releases it when the holder exits or is killed: a crash cannot leave a file
+/// locked, as a create-exclusive marker file would.
 fn lock_across_processes(path: &Path) -> Result<File, DataError> {
     let dir = path.parent().unwrap_or(Path::new("."));
-    let lock_path = lock_path_of(path);
-    let mut wait = Duration::from_millis(1);
-    let mut last_error = None;
-    for _ in 0..LOCK_TRIES {
-        let opened = fs::create_dir_all(dir).and_then(|()| {
-            File::options()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .open(&lock_path)
-        });
-        match opened {
-            Ok(file) => {
-                file.lock().map_err(DataError::io(&lock_path))?;
-                let len = file.metadata().map_err(DataError::io(&lock_path))?.len();
-                if len == 0 {
-                    return Ok(file);
-                }
-                last_error = None; // retired by a delete: open the path again
-            }
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    io::ErrorKind::NotFound
-                        | io::ErrorKind::PermissionDenied
-                        | io::ErrorKind::AlreadyExists
-                ) =>
-            {
-                last_error = Some(e);
-            }
-            Err(e) => return Err(DataError::io(&lock_path)(e)),
-        }
-        sleep(wait);
-        wait = (wait * 2).min(Duration::from_millis(100));
-    }
-    Err(match last_error {
-        Some(e) => DataError::io(&lock_path)(e),
-        None => bad_file(
-            &lock_path,
-            "is a retired lock file that was never removed, so a delete stopped part way; remove \
-             the file if no delete is running",
-        ),
-    })
-}
-
-/// The lock sidecar of the store file at `path`: `<file name>.lock` beside it.
-fn lock_path_of(path: &Path) -> PathBuf {
+    fs::create_dir_all(dir).map_err(DataError::io(dir))?;
     let mut name = path.file_name().unwrap_or_default().to_owned();
     name.push(".lock");
-    path.with_file_name(name)
+    let lock_path = dir.join(name);
+    let file = File::options()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(DataError::io(&lock_path))?;
+    file.lock().map_err(DataError::io(&lock_path))?;
+    Ok(file)
 }
 
 /// Removes the store file at `path` under its lock, taken as a writer takes it, with any temp files
-/// a crashed writer left beside it, then retires and removes its lock sidecar. Nothing there is
-/// not an error. While the lock is held no writer is part way through this file, in this process
-/// or another, so every temp file of it is a leftover.
+/// a crashed writer left beside it, and adds them to `report`; the lock sidecar stays as it is.
+/// While the lock is held no writer is part way through this file, in this process or another, so
+/// every temp file of it is a leftover. When there is no file at `path`, there is nothing to
+/// delete and no lock is taken.
 fn remove_locked(path: &Path, report: &mut DeleteReport) -> Result<(), DataError> {
-    let lock_path = lock_path_of(path);
-    if file_bytes(path)?.is_none()
-        && file_bytes(&lock_path)?.is_none()
-        && temp_files(path)?.is_empty()
-    {
+    if file_bytes(path)?.is_none() {
         return Ok(());
     }
     let lock = file_lock(path);
     let _held = hold(&lock);
-    let locked = lock_across_processes(path)?;
+    let _locked = lock_across_processes(path)?;
     for file in std::iter::once(path.to_path_buf()).chain(temp_files(path)?) {
         let Some(bytes) = file_bytes(&file)? else {
             continue;
@@ -851,21 +773,6 @@ fn remove_locked(path: &Path, report: &mut DeleteReport) -> Result<(), DataError
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(DataError::io(&file)(e)),
         }
-    }
-    retire_lock(&locked, &lock_path)
-}
-
-/// Retires the lock sidecar `locked`, open and locked at `lock_path`, and removes it (see
-/// [`lock_across_processes`]). If it cannot be removed it is emptied again, back to a sidecar in
-/// use, so writers carry on with it.
-fn retire_lock(locked: &File, lock_path: &Path) -> Result<(), DataError> {
-    locked.set_len(1).map_err(DataError::io(lock_path))?;
-    if let Err(e) = retry_denied(|| fs::remove_file(lock_path)) {
-        locked.set_len(0).map_err(DataError::io(lock_path))?;
-        eprintln!(
-            "warning: {}: left in place, since it could not be removed: {e}",
-            lock_path.display()
-        );
     }
     Ok(())
 }
@@ -1375,61 +1282,8 @@ mod tests {
             assert_eq!(report.files, 1);
         });
         assert!(!path.exists());
-        assert!(!lock_path_of(&path).exists(), "the sidecar went with it");
-    }
-
-    #[test]
-    fn a_writer_waiting_on_a_sidecar_a_delete_retired_starts_over_on_a_fresh_one() {
-        let dir = tempfile::tempdir().expect("a temp dir");
-        let store = Store::new(dir.path());
-        let id = spot_id();
-        let jan = Month::containing(1_704_067_200_000); // 2024-01-01
-        store
-            .write_candles(&id, &[flat_candle(jan.start())])
-            .expect("writes");
-        let path = store.candle_path(&id, jan).expect("a path");
-        // A writer in another process that opened the sidecar before the delete and is waiting for
-        // its lock.
-        let waiting = File::options()
-            .read(true)
-            .write(true)
-            .open(lock_path_of(&path))
-            .expect("opens");
-        store.delete_months(&id, jan, jan).expect("deletes");
-        waiting
-            .lock()
-            .expect("gets the lock once the delete lets go");
-        assert_eq!(
-            waiting.metadata().expect("metadata").len(),
-            1,
-            "the sidecar it holds is marked retired, so it must not write under it"
-        );
-        drop(waiting);
-        // Starting over, it gets a fresh, empty sidecar at the path.
-        let fresh = lock_across_processes(&path).expect("locks");
-        assert_eq!(fresh.metadata().expect("metadata").len(), 0);
-        assert!(lock_path_of(&path).exists());
-    }
-
-    #[test]
-    fn a_writer_never_writes_under_a_retired_sidecar() {
-        let dir = tempfile::tempdir().expect("a temp dir");
-        let store = Store::new(dir.path());
-        let id = spot_id();
-        let jan = Month::containing(1_704_067_200_000); // 2024-01-01
-        store
-            .write_candles(&id, &[flat_candle(jan.start())])
-            .expect("writes");
-        let path = store.candle_path(&id, jan).expect("a path");
-        // A delete that stopped after retiring the sidecar and before removing it.
-        fs::write(lock_path_of(&path), b"x").expect("writes");
-        assert!(lock_across_processes(&path).is_err());
-        assert!(
-            store
-                .write_candles(&id, &[flat_candle(jan.start() + MINUTE)])
-                .is_err()
-        );
-        assert_eq!(store.read_month(&id, jan).expect("reads").len(), 1);
+        let sidecar = fs::metadata(path.with_extension("parquet.lock")).expect("the sidecar stays");
+        assert_eq!(sidecar.len(), 0, "and the delete wrote nothing into it");
     }
 
     #[test]
