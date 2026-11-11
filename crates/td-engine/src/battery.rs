@@ -180,8 +180,10 @@ pub struct Breakdown {
     pub short: SideResult,
     /// Net funding paid on the stitched curve; negative when it was received.
     pub funding_paid: f64,
-    /// Windows where buy and hold rose over the test window, and the strategy's return in them,
-    /// compounded.
+    /// Windows where the instrument's price rose over the test window, and the strategy's return
+    /// in them, compounded. The price is the quote currency per unit of the base, so a long
+    /// position gained in those windows in either currency: on a dollar account trading USD/JPY,
+    /// a rising window is one where the dollar strengthened against the yen.
     pub rising: RegimeResult,
     /// Windows where it fell or stayed flat.
     pub falling: RegimeResult,
@@ -195,7 +197,7 @@ pub struct Breakdown {
 pub struct SideResult {
     /// Closed trades.
     pub trades: usize,
-    /// Their net P&L, in the quote asset.
+    /// Their net P&L, in the account currency.
     pub net_pnl: f64,
 }
 
