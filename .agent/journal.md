@@ -221,3 +221,13 @@ The machine was quieter for a few minutes. Rounds 2 and 3 (`ed844b4` with the fi
   1. A merge read the month through the cache. The entry is valid by length and modified time only, so a rewrite by another process that the stamp cannot tell apart would be merged from stale rows and written back over the other process's rows. Fixed: `merge_months` forgets the path under the cross-process lock before it reads, so a merge always decodes the file. A write decodes its month as it did before the cache existed.
   2. No test failed without `forget` or without the generation guard. Added three: a same-length rewrite through the store with the modified time set back is read as the new rows; a merge after another store's same-looking rewrite keeps that store's rows; rows decoded before a `forget` are not cached after it.
   3. The 256 MB cap is under BTCUSDT's full history (about 111 months, 272 MB), and a range over the cap gets no hits on a repeated pass. Raised to 512 MB and the limit is written beside the constant. The laptop has 31.7 GB. Listed for Gabriel as a memory-against-speed choice.
+- Each new test fails without its guard: three mutants on `53d664c` (no `forget` after the write, no `forget` before the merge's read, no generation check) each failed the test written for it. With the real code `cargo test -p td-data --lib` 57 passed, `cargo test -p td-server --test runs` 10 passed, clippy clean on both crates.
+- Scores on the fixed head `53d664c` (`.agent/logs/r4.log`, reps 5): dev 2,024.2 ms, checksum `1bc2d4ff4b411ddc`; test 1,991.8 and 2,192.5 ms against the base's 4,091.3 ms in the same minutes, checksum `5ecd3911e0a8641c`. The extra decode per write is outside the timed work, as expected.
+- reviewer round 2 on `53d664c`: APPROVE, all three resolved, no new finding.
+- Sol round 1 on `53d664c` (gpt-6.1-sol, high): APPROVE, no findings; it confirmed the diff edits no workload, scorer or split.
+- CI: `ci` on `53a0d8d` failed only in `api_forming.rs` (the forming-bar websocket test from #70 is flaky; PR #74 from another thread fixes it). `gui` fails on every branch of the repo since about 14:10 UTC in "Install Chromium": the GitHub runner cannot resolve the Ubuntu package mirrors.
+
+## What is open (15:00 UTC)
+
+1. #75: `gui` on `123ea7d` needs one green run once the runner outage ends (`gh run rerun 43037103483 --failed`), then the merge gate and the merge.
+2. `perf-read`: after #75 merges, `git merge origin/main`, delete `.agent/`, push, open the PR (body drafted in the session scratchpad; the numbers are all in this file), CI green on that head, merge. The Gotobi thread's `m4-server-asks` edits the same two loops in `runs.rs`; whoever merges second resolves a few lines.
