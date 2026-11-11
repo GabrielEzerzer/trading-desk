@@ -2,7 +2,46 @@
 
 use std::ops::Range;
 
+use serde::{Deserialize, Serialize};
+
 use crate::{InstrumentKind, Millis, days_from_civil};
+
+/// The currency an account holds and reports money in, against the instrument it trades.
+///
+/// - `Quote`: the instrument's quote currency, as a USDT account trading BTC/USDT. Every amount
+///   the engine computes from prices is already in it, so nothing is converted.
+/// - `Base`: the instrument's base currency, as a dollar account trading USD/JPY. Profit, loss and
+///   commission arise in the quote currency (yen) and are converted at the pair's own price: an
+///   amount in the quote currency divided by the price is the amount in the base currency.
+///
+/// shortcut: only the account's currency on either side of the pair it trades. A cross pair on a
+/// third-currency account (EUR/JPY on a dollar account) needs a second price series to convert
+/// at; add a conversion series when the desk trades crosses.
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AccountCurrency {
+    #[default]
+    Quote,
+    Base,
+}
+
+impl AccountCurrency {
+    /// True for the default, `Quote`, which saved JSON leaves out.
+    pub fn is_quote(&self) -> bool {
+        *self == AccountCurrency::Quote
+    }
+
+    /// `amount`, in the quote currency, in the account currency at `price`: the amount itself on
+    /// `Quote`, with no arithmetic, so a quote account's numbers are exactly what they were before
+    /// accounts had a currency; `amount / price` on `Base`.
+    pub fn from_quote(self, amount: f64, price: f64) -> f64 {
+        match self {
+            AccountCurrency::Quote => amount,
+            AccountCurrency::Base => amount / price,
+        }
+    }
+}
 
 /// The rules of one market type. Code that differs by market asks [`InstrumentKind::rules`]
 /// instead of naming kinds.
@@ -155,6 +194,19 @@ mod tests {
     /// `hour:minute` UTC on a date.
     fn utc(year: i64, month: u32, day: u32, hour: i64, minute: i64) -> Millis {
         days_from_civil(year, month, day) * DAY + hour * HOUR + minute * MINUTE
+    }
+
+    #[test]
+    fn account_currency_converts_only_on_base() {
+        assert_eq!(AccountCurrency::default(), AccountCurrency::Quote);
+        // 1,500 yen at 150.00 yen a dollar is 10 dollars; a quote account keeps the yen.
+        assert_eq!(AccountCurrency::Quote.from_quote(1500.0, 150.0), 1500.0);
+        assert_eq!(AccountCurrency::Base.from_quote(1500.0, 150.0), 10.0);
+        assert_eq!(serde_json::to_string(&AccountCurrency::Base).unwrap(), "\"base\"");
+        assert_eq!(
+            serde_json::from_str::<AccountCurrency>("\"quote\"").unwrap(),
+            AccountCurrency::Quote
+        );
     }
 
     #[test]
