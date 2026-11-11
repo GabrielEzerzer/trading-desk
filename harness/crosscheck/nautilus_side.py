@@ -15,6 +15,10 @@ Configuration, per issue #29:
   stamp inside the bar on the position after the bar's fills, at the close. Nautilus 1.231 has no
   funding settlement of its own for perpetuals in a backtest.
 
+The round trips come from Nautilus's own positions (the positions report's rows: the open and closed
+positions in the cache plus the snapshots a NETTING account takes of each closed position before it
+reuses its ID); see `round_trips`.
+
 The strategies are written again here from their Rust source, decision for decision, including
 the lot rounding and the order checks our engine applies when an order is submitted.
 """
@@ -166,8 +170,10 @@ class CrosscheckStrategy(Strategy):
         self._next_stamp = 0
         self._first_open: int | None = None
         # The position held going into the next bar: after this bar's fills, before the orders
-        # decided at its close fill (which Nautilus fills at that close).
+        # decided at its close fill (which Nautilus fills at that close). `_carried_opened` is the
+        # opening time of Nautilus's position then, which names the round trip funding belongs to.
         self._carried = 0.0
+        self._carried_opened: int | None = None
         self._bar_open = 0
         self.sent = False
 
@@ -181,6 +187,12 @@ class CrosscheckStrategy(Strategy):
         positions = self.cache.positions_open(instrument_id=self.instrument_id)
         return sum(p.signed_qty for p in positions)
 
+    def position_opened(self) -> int | None:
+        """The opening time (ms) of the open position, which identifies its round trip: a NETTING
+        account reuses the position ID, but each fill opens at most one position."""
+        positions = self.cache.positions_open(instrument_id=self.instrument_id)
+        return positions[0].ts_opened // MS if positions else None
+
     def account_equity(self, close: float) -> float:
         account = self.portfolio.account(self.instrument_id.venue)
         cash = account.balance_total(USDT).as_double()
@@ -192,13 +204,18 @@ class CrosscheckStrategy(Strategy):
             upnl += p.unrealized_pnl(Price(close, self.instrument.price_precision)).as_double()
         return cash + upnl
 
-    def charge(self, bar_open: int, stamp: int, rate: float, position: float, price: float, at: str):
+    def charge(
+        self, bar_open: int, stamp: int, rate: float, position: float, price: float, at: str,
+        opened: int | None,
+    ):
+        """Charges one stamp's funding. `opened` names the Nautilus position it was charged on
+        (its opening time), so `round_trips` can give each round trip its funding."""
         payment = position * price * rate
         if payment != 0.0:
             self.module.exchange.adjust_account(Money(-payment, USDT))
         self.funding.append(
             {"bar": bar_open, "stamp": stamp, "rate": rate, "position": position,
-             "price": price, "payment": payment, "at": at}
+             "price": price, "payment": payment, "at": at, "trade": opened if position else None}
         )
 
     def submit(self, side: OrderSide, qty: float, close: float) -> None:
@@ -237,15 +254,17 @@ class CrosscheckStrategy(Strategy):
         # Due at the open or in a gap before it: on the position going into the bar, at the open.
         while self._next_stamp < len(funding) and funding[self._next_stamp][0] <= bar_open:
             stamp, rate = funding[self._next_stamp]
-            self.charge(bar_open, stamp, rate, self._carried, o, "open")
+            self.charge(bar_open, stamp, rate, self._carried, o, "open", self._carried_opened)
             self._next_stamp += 1
         # Due later in the bar: on the position after the bar's fills, at the close.
         now = self.position()
+        now_opened = self.position_opened()
         while self._next_stamp < len(funding) and funding[self._next_stamp][0] < close_time:
             stamp, rate = funding[self._next_stamp]
-            self.charge(bar_open, stamp, rate, now, c, "in_bar")
+            self.charge(bar_open, stamp, rate, now, c, "in_bar", now_opened)
             self._next_stamp += 1
         self._carried = now
+        self._carried_opened = now_opened
         equity = self.account_equity(c)
         self.equity.append({"time": bar_open, "equity": equity})
         self.closes.append(c)
@@ -319,6 +338,75 @@ class CrosscheckStrategy(Strategy):
 # -------------------------------------------------------------------------------------------------
 # Building and running the backtest
 # -------------------------------------------------------------------------------------------------
+
+
+def round_trips(positions: list, last_bar: dict, funding: list[dict]) -> list[dict]:
+    """Nautilus's round trips, from its own positions, in our engine's trade fields.
+
+    On a NETTING account a fill that takes the position through zero is split by Nautilus's
+    execution engine (`_flip_position`): the quantity of the open position closes it, the rest opens
+    the next one, and the commission is shared in proportion to those quantities. Our engine splits
+    a flip the same way (`td_engine::trades`), so both sides give one closed trade and one new trade
+    per flip, the new one entered at the flip fill.
+
+    - `gross_pnl` is the position's realized P&L (net of its commissions in Nautilus) plus those
+      commissions, so `gross_pnl - fees` is Nautilus's own number, as it is ours.
+    - A position still open after the last bar is reported the way our engine reports its open
+      trade: exit at the last bar's open time and close, `gross_pnl - fees` its realized P&L (minus
+      the entry commission) plus its unrealized P&L at that close.
+    - `funding` is not Nautilus's, which has none: it is the harness's charges (`charge`) made while
+      this position was the one held, as the strategy recorded them. `funding_gross` is the sum of
+      their sizes, the scale the comparison measures a funding difference against.
+    """
+    paid: dict[int, float] = {}
+    gross: dict[int, float] = {}
+    for f in funding:
+        if f["trade"] is None and f["payment"] != 0.0:
+            raise ValueError(f"funding at {f['stamp']} was charged with no position to give it to")
+        if f["trade"] is not None:
+            paid[f["trade"]] = paid.get(f["trade"], 0.0) + f["payment"]
+            gross[f["trade"]] = gross.get(f["trade"], 0.0) + abs(f["payment"])
+    out = []
+    for p in sorted(positions, key=lambda p: p.ts_opened):
+        commissions = p.commissions()
+        if any(m.currency != USDT for m in commissions):
+            raise ValueError(f"position {p.id} has a commission not in USDT: {commissions}")
+        fees = sum(m.as_double() for m in commissions)
+        realized = p.realized_pnl.as_double() if p.realized_pnl is not None else 0.0
+        opened = p.ts_opened // MS
+        if p.is_open:
+            close = last_bar["close"]
+            pnl = realized + p.unrealized_pnl(Price(close, p.price_precision)).as_double()
+            exit_time, exit_price = last_bar["open_time"], close
+        else:
+            pnl = realized
+            exit_time, exit_price = p.ts_closed // MS, p.avg_px_close
+        paid_here = paid.get(opened, 0.0)
+        out.append(
+            {
+                "side": "long" if p.entry == OrderSide.BUY else "short",
+                "entry_time": opened,
+                "exit_time": exit_time,
+                "open": bool(p.is_open),
+                "qty": p.peak_qty.as_double(),
+                "entry_price": p.avg_px_open,
+                "exit_price": exit_price,
+                "gross_pnl": pnl + fees,
+                "fees": fees,
+                "funding": paid_here,
+                "funding_gross": gross.get(opened, 0.0),
+                "net_pnl": pnl - paid_here,
+                "fills": p.event_count,
+                "fee_precision": USDT.precision,
+            }
+        )
+    times = [t["entry_time"] for t in out]
+    if len(set(times)) != len(times):
+        raise ValueError("two Nautilus positions opened at the same time")
+    unclaimed = set(paid) - set(times)
+    if unclaimed:
+        raise ValueError(f"funding charged on positions not in the report: {sorted(unclaimed)}")
+    return out
 
 
 def read_bars(path: Path) -> list[dict]:
@@ -451,12 +539,16 @@ def run_case(case: dict, harness: Path, series: str) -> dict:
     engine.run()
 
     account = engine.trader.generate_account_report(venue)
+    # The positions report's rows: the cache's positions and the NETTING snapshots of closed ones.
+    positions = engine.cache.positions(instrument_id=instrument.id)
+    positions += engine.cache.position_snapshots()
     result = {
         "engine": "nautilus_trader",
         "case": case["name"],
         "series": series,
         "bars": len(bars),
         "fills": strategy.fills,
+        "trades": round_trips(positions, bars[-1], strategy.funding),
         "rejected_orders": strategy.rejections,
         "equity": strategy.equity,
         "funding": strategy.funding,

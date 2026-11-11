@@ -96,9 +96,11 @@ def run_case(exe: Path, case_path: Path, refetch: bool) -> bool:
     g, r = results["gapless"][0].numbers, results["real"][0].numbers
     print(
         f"{name}: {'PASS' if ok else 'FAIL'}  gapless: {g['fills_compared']} fills, max price diff "
-        f"{g['max_price_diff']:.6g}, final equity rel {g['final_equity_rel']:.2e}  real: "
+        f"{g['max_price_diff']:.6g}, final equity rel {g['final_equity_rel']:.2e}, "
+        f"{g['trades_compared']} trades, max P&L diff {g['max_trade_pnl_abs']:.2e}  real: "
         f"{r['fills_compared']} fills, equity diff {r['final_equity_diff']:.4f} vs bound "
-        f"{r['bound_sum']:.4f}",
+        f"{r['bound_sum']:.4f}, {r['trades_compared']} trades, max P&L diff "
+        f"{r['max_trade_pnl_diff']:.4f} ({r['max_trade_bound_ratio']:.6g} of its bound)",
         flush=True,
     )
     return ok
@@ -169,7 +171,12 @@ def report(case: dict, meta: dict, inst: dict, results: dict, ok: bool) -> str:
         "## Gapless bars",
         "",
         "Every open set to the previous close, so a market order filled at the next open (ours) and "
-        "one filled at the decision bar's close (Nautilus) get the same price. Everything must match.",
+        "one filled at the decision bar's close (Nautilus) get the same price. Everything must match. "
+        "Round-trip trades pair by the decision bar of their entry fill and their side, and must "
+        "close on the same decision bar or both be open at the end; then the same quantity, entry "
+        "and exit prices within one tick, fees within 1e-9 relative, P&L net of fees and before "
+        "funding within 1e-6 relative, and funding within 1e-9 of the size of its charges. Fees and "
+        "P&L may also differ by up to four units of the 8th decimal, Nautilus's rounding of money.",
         "",
         checks_table(gap_cmp),
         "",
@@ -184,7 +191,10 @@ def report(case: dict, meta: dict, inst: dict, results: dict, ok: bool) -> str:
         "must stay within `|open[N+1] - close[N]|`, and the final equity difference within the sum "
         "of bound 1, `qty * |open[N+1] - close[N]| * (1 + taker)` over the fills (the taker factor "
         "is the fee on that price difference). Cases 1 to 4 have no stops or limits, so bounds 2 "
-        "and 3 are zero.",
+        "and 3 are zero. Trades must pair one to one as on the gapless bars, and each trade's P&L "
+        "(net of fees, before funding) must stay within the bound 1 of its entry and exit fills at "
+        "our quantity, after Nautilus's P&L is scaled to our quantity to remove the sizing "
+        "difference.",
         "",
         checks_table(real_cmp),
         "",
@@ -206,9 +216,18 @@ def report(case: dict, meta: dict, inst: dict, results: dict, ok: bool) -> str:
         f"- Gapless: {g['fills_compared']} fills compared, max price difference "
         f"{g['max_price_diff']:.6g}, final equity {g['final_equity_ours']:.8f} (ours) vs "
         f"{g['final_equity_nautilus']:.8f} (Nautilus), relative {g['final_equity_rel']:.2e}.",
+        f"- Gapless trades: {g['trades_compared']} compared ({g['trades_open']} open at the end), "
+        f"max entry or exit price difference {g['max_trade_price_diff']:.6g}, max fee difference "
+        f"{g['max_trade_fee_abs']:.2e}, max P&L difference {g['max_trade_pnl_abs']:.2e} (relative "
+        f"{g['max_trade_pnl_rel']:.2e}), max funding difference {g['max_trade_funding_rel']:.2e} "
+        "of its charges' size.",
         f"- Real: {r['fills_compared']} fills compared, max price difference "
         f"{r['max_price_diff']:.6g}, final equity difference {r['final_equity_diff']:.6f} against a "
         f"bound of {r['bound_sum']:.6f}.",
+        f"- Real trades: {r['trades_compared']} compared ({r['trades_open']} open at the end), max "
+        f"P&L difference {r['max_trade_pnl_diff']:.6f} with Nautilus scaled to our quantity, at "
+        f"most {r['max_trade_bound_ratio']:.8g} of its bound; quantities differ by up to "
+        f"{r['max_trade_qty_rel']:.2e} relative.",
         "",
     ]
     return "\n".join(parts)
@@ -248,6 +267,23 @@ def differences(case: dict, results: dict) -> list[str]:
             f"{r['max_qty_rel']:.2e} relative, because each engine sizes from its own equity, which "
             "already differs by the earlier fill price differences; where a size lands near a lot "
             "boundary the rounding down to the lot moves it by a whole lot."
+        )
+    if r["trades_compared"] and r["max_trade_qty_rel"] > 0:
+        out.append(
+            "- Real bars, trades: paired trades differ in quantity by up to "
+            f"{r['max_trade_qty_rel']:.2e} relative, for the sizing reason above, so their P&L also "
+            "differs by the quantity difference times the price move. Nautilus's P&L is scaled to "
+            "our quantity before it is held to the bound 1 of the trade's fills; scaled, the "
+            f"largest difference is {r['max_trade_pnl_diff']:.6f}."
+        )
+    if r["trades_compared"] and r["max_trade_bound_ratio"] > 0:
+        out.append(
+            "- Real bars, trade P&L: the largest difference reaches "
+            f"{r['max_trade_bound_ratio']:.8g} of its trade's bound. Each fill's price differs by "
+            "the whole `|open[N+1] - close[N]|` (a fill at the open against one at the close), so "
+            "a trade whose entry and exit differences both move its P&L the same way meets its "
+            "bound exactly; anything above 1 is within four units of the 8th decimal, Nautilus's "
+            "rounding of money."
         )
     if compare.rel(r["funding_total_ours"], r["funding_total_nautilus"]) > compare.FUNDING_REL:
         out.append(
