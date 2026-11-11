@@ -403,7 +403,6 @@ PRICE_DERIVED = {
     "final equity",
     "each price difference within its bound",
     "trades: each P&L difference within its fills' bounds",
-    "ambiguous trades: our P&L at most Nautilus's",
     "final equity difference within the sum of the bounds",
 }
 WALK = "stop-limit fills on the same bar in both engines"
