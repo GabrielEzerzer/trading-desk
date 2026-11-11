@@ -11,9 +11,9 @@ use std::sync::Mutex;
 use td_core::{Candle, Instrument, Millis, Timeframe};
 use td_engine::{
     BatteryResult, BatterySpec, Direction, DrawdownMode, EvidenceSettings, FirmLimits,
-    HighRiskLimits, Layer, Metric, Objective, Outcome, ParamAxis, ParamSpace, ParamValue, Params,
-    Period, PortfolioBenchmark, PortfolioLimits, PropFirmLimits, SweepPlan, TestPlan, TesterError,
-    VerdictRule, VerdictState, WalkForwardPlan, run_battery,
+    HighRiskLimits, Layer, MAX_RUNS, Metric, Objective, Outcome, ParamAxis, ParamSpace, ParamValue,
+    Params, Period, PortfolioBenchmark, PortfolioLimits, PropFirmLimits, SweepPlan, TestPlan,
+    TesterError, VerdictRule, VerdictState, WalkForwardPlan, risk, run_battery,
 };
 
 const HOUR: Millis = 3_600_000;
@@ -42,13 +42,18 @@ impl Noise {
 
 /// Four-hour bars from a list of closes, each opening at the previous close.
 fn bars_from(closes: &[f64]) -> Vec<Candle> {
+    bars_every(BAR, closes)
+}
+
+/// Bars `step` apart from a list of closes, each opening at the previous close.
+fn bars_every(step: Millis, closes: &[f64]) -> Vec<Candle> {
     closes
         .iter()
         .enumerate()
         .map(|(i, &close)| {
             let open = if i == 0 { close } else { closes[i - 1] };
             Candle {
-                open_time: T0 + i as i64 * BAR,
+                open_time: T0 + i as i64 * step,
                 open,
                 high: open.max(close) * 1.001,
                 low: open.min(close) * 0.999,
@@ -73,11 +78,14 @@ fn tri(x: f64) -> f64 {
 /// A planted edge: up and down legs of 30 bars (five days), a triangle wave, with a little noise.
 /// A moving-average cross that goes short rides both legs; shuffled, the legs are gone.
 fn edge_bars(days: i64) -> Vec<Candle> {
+    bars_from(&edge_closes(bar_count(days)))
+}
+
+fn edge_closes(bars: usize) -> Vec<f64> {
     let mut noise = Noise(0x5EED_1234);
-    let closes: Vec<f64> = (0..bar_count(days))
+    (0..bars)
         .map(|i| 100.0 + 10.0 * tri(i as f64 / 60.0) + 0.6 * noise.next())
-        .collect();
-    bars_from(&closes)
+        .collect()
 }
 
 /// Pure noise: a random walk of independent moves of up to 1%.
@@ -307,7 +315,30 @@ fn the_other_kinds_get_their_inputs_from_the_same_runs() {
     assert_eq!(line(&high, "trades").value, Some(wf.metrics.trades as f64));
     assert!(high.prop_firm_odds.is_none());
 
+    // Alpha against buy and hold is the stitched benchmark's.
+    let held = VerdictRule::Portfolio {
+        benchmark: PortfolioBenchmark::BuyAndHold,
+        limits: PortfolioLimits::default(),
+    };
+    let held = battery(&plan, &held, &bars, 7, None).unwrap();
+    let wf = held.walk_forward.as_ref().unwrap();
+    let alpha = wf.benchmark.as_ref().unwrap().alpha;
+    assert!(alpha.is_some());
+    assert_ne!(alpha, wf.metrics.cagr);
+    assert_eq!(held.kind.alpha, alpha);
+    assert_eq!(line(&held, "alpha").value, alpha);
+
     let prop = battery(&plan, &prop_firm_rule(), &bars, 7, None).unwrap();
+    let cash = plan.backtest.starting_cash;
+    let trailing =
+        risk::trailing_drawdown(cash, &prop.walk_forward.as_ref().unwrap().equity_extremes)
+            .unwrap()
+            .amount
+            / cash;
+    assert!(trailing > 0.0);
+    assert_eq!(prop.kind.intrabar_drawdown_trailing, Some(trailing));
+    // The firm in this rule trails, so its drawdown line reads the trailing value.
+    assert_eq!(line(&prop, "max_drawdown").value, Some(trailing));
     let odds = prop.prop_firm_odds.unwrap();
     assert_eq!(prop.kind.pass_probability, Some(odds.pass));
     assert_eq!(prop.kind.breach_probability, Some(odds.breach));
@@ -509,4 +540,58 @@ fn progress_counts_every_run_once_against_one_total() {
     assert_eq!(done, (1..=r.runs).collect::<Vec<_>>());
     let windows: usize = r.start_offsets.iter().map(|o| o.windows).sum();
     assert_eq!(windows, offset_windows);
+}
+
+/// R6 on test windows shorter than `start_offsets + 1` bars: seven daily bars against eight
+/// offsets. Each offset still moves the windows by a different, non-zero number of bars, so R6
+/// runs instead of indexing past the end of the bars.
+#[test]
+fn start_offsets_run_on_test_windows_shorter_than_the_offset_count() {
+    // 120-day train windows hold four legs of the wave; 400 days hold 40 test windows.
+    let days = 400;
+    let mut plan = plan(days);
+    plan.timeframe = Timeframe::D1;
+    plan.walk_forward = WalkForwardPlan {
+        train_days: 120,
+        test_days: 7,
+    };
+    let bars = bars_every(DAY, &edge_closes(days as usize));
+    let r = battery(&plan, &cash_rule(), &bars, 7, None).unwrap();
+    // The lines before R6 left it something to decide, so it ran.
+    assert!(r.cost_stress.is_some(), "{:#?}", r.verdict.criteria);
+    let shifts: Vec<usize> = r.start_offsets.iter().map(|o| o.shift_bars).collect();
+    assert_eq!(shifts, (1..=8).collect::<Vec<_>>());
+    assert!(r.start_offsets.iter().all(|o| o.windows > 0));
+    assert!(
+        r.start_offsets.iter().all(|o| o.error.is_none()),
+        "{:#?}",
+        r.start_offsets
+    );
+}
+
+/// A luck test over the run limit is refused before the first run, not after every other step:
+/// a 25 x 25 grid at 199 permutations is 125,000 runs.
+#[test]
+fn a_luck_test_over_the_run_limit_is_refused_before_anything_runs() {
+    let mut plan = plan(DAYS);
+    let axis = |name: &str, from: i64| ParamAxis {
+        name: name.into(),
+        space: ints(&(from..from + 25).collect::<Vec<_>>()),
+    };
+    plan.sweep.axes = vec![axis("fast", 1), axis("slow", 30)];
+    plan.evidence.luck.permutations = 199;
+    let calls = Mutex::new(0usize);
+    let progress = |_: usize, _: usize| {
+        *calls.lock().unwrap() += 1;
+        ControlFlow::Continue(())
+    };
+    let r = battery(&plan, &cash_rule(), &edge_bars(DAYS), 7, Some(&progress));
+    assert_eq!(
+        r,
+        Err(TesterError::TooManyRuns {
+            runs: 125_000,
+            limit: MAX_RUNS,
+        })
+    );
+    assert_eq!(calls.into_inner().unwrap(), 0);
 }

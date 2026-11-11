@@ -62,8 +62,8 @@ use crate::verdict::{
 };
 use crate::{
     BacktestConfig, BacktestResult, Criterion, Direction, DrawdownMode, EquityPoint,
-    EvidenceInputs, KindInputs, Order, Outcome, PermutationResult, PermutationSpec,
-    PortfolioBenchmark, Progress, SweepResult, SweepRow, SweepSpec, TestPlan, TesterError,
+    EvidenceInputs, KindInputs, MAX_RUNS, Order, Outcome, PermutationResult, PermutationSpec,
+    PortfolioBenchmark, Progress, SweepResult, SweepRow, SweepSpec, TestPlan, TesterError, Trade,
     TradeSide, Verdict, VerdictRule, WalkForwardResult, WalkForwardSpec, combine, evaluate,
     evaluate_evidence, permutation_test, run, sweep, walk_forward,
 };
@@ -269,7 +269,8 @@ pub struct BatterySpec<'a> {
 /// a test from running a smaller battery. A period that holds too little data gives
 /// `not_enough_evidence`.
 ///
-/// Errors: a refused rule or spec, a data or engine error, or a cancel before R3.
+/// Errors: a refused rule or spec, a luck test over [`MAX_RUNS`] (refused before anything runs),
+/// a data or engine error, or a cancel before R3.
 pub fn run_battery(
     spec: &BatterySpec,
     bars: &[Candle],
@@ -461,6 +462,7 @@ pub fn run_battery(
                 .map(|r| r.low)
                 .reduce(f64::min)
                 .map(|low| low / cash),
+            curve: true,
         };
 
         kind = KindInputs {
@@ -484,7 +486,8 @@ pub fn run_battery(
             profit_factor: m.profit_factor,
             risk_of_ruin: match rule {
                 VerdictRule::HighRisk { limits } => {
-                    ruin(wf, cash, limits.ruin_drawdown, derive_seed(seed, SEED_RUIN))
+                    let seed = derive_seed(seed, SEED_RUIN);
+                    ruin(&wf.trades, &wf.equity, cash, limits.ruin_drawdown, seed)
                 }
                 _ => None,
             },
@@ -505,6 +508,9 @@ pub fn run_battery(
                     DrawdownMode::Static => stats::DrawdownMode::Static,
                     DrawdownMode::Trailing => stats::DrawdownMode::Trailing,
                 },
+                // The pass odds use the breach horizon too, so they are the chance of passing
+                // within `breach_horizon_days`: a product decision, since the firm rule sets no
+                // time limit of its own (see `FirmLimits`).
                 horizon_days: limits.breach_horizon_days as usize,
                 paths: DEFAULT_RESAMPLES,
                 mean_block: stats::default_block_len(daily.len()),
@@ -565,9 +571,17 @@ pub fn run_battery(
                 oos_return: None,
                 error: None,
             };
-            if planned > 0 {
+            // The range ends at the open of the first bar left out. Every shift is at least 1,
+            // and a shift as long as the range leaves no window, so this bar exists whenever a
+            // window fits.
+            let end = traded
+                .len()
+                .checked_sub(shift)
+                .filter(|_| shift > 0)
+                .and_then(|i| traded.get(i));
+            if let (true, Some(end)) = (planned > 0, end) {
                 let mut spec: WalkForwardSpec = wf_spec.clone();
-                spec.sweep.base.to = traded[traded.len() - shift].open_time;
+                spec.sweep.base.to = end.open_time;
                 match walk_forward(&spec, bars, funding, Some(&meter.step())) {
                     Ok(r) => offset.oos_return = r.metrics.total_return,
                     Err(
@@ -700,14 +714,20 @@ fn layout(
     let per_sweep = sweep_spec.runs()?;
     let window_count = |bars: usize| wf_spec.windows.windows(bars).map_or(0, |w| w.len());
     let windows = window_count(traded);
-    let offsets: Vec<usize> = (1..=ev.start_offsets as usize)
-        .map(|k| k * wf_spec.windows.test_bars / (ev.start_offsets as usize + 1))
-        .collect();
+    let offsets = start_offset_shifts(wf_spec.windows.test_bars, ev.start_offsets as usize);
     let offset_windows: Vec<usize> = offsets
         .iter()
         .map(|&s| window_count(traded.saturating_sub(s)))
         .collect();
     let permutations = ev.luck.permutations as usize;
+    // R3 runs last but is refused up front, before the hours of runs ahead of it.
+    let luck_runs = per_sweep as u128 * (permutations as u128 + 1);
+    if luck_runs > MAX_RUNS as u128 {
+        return Err(TesterError::TooManyRuns {
+            runs: luck_runs,
+            limit: MAX_RUNS,
+        });
+    }
     let total = 3
         + per_sweep
         + windows * per_sweep
@@ -752,6 +772,14 @@ fn later_lines_cannot_change(
         }
     }
     states.windows(2).all(|w| w[0] == w[1])
+}
+
+/// R6's `n` shifts, in bars left out at the end of the period: the k-th is `k / (n + 1)` of a
+/// test window, so the window boundaries move to `n` evenly spaced points inside a test window,
+/// and at least `k` bars, so test windows shorter than `n + 1` bars still give `n` different,
+/// non-zero shifts.
+fn start_offset_shifts(test_bars: usize, n: usize) -> Vec<usize> {
+    (1..=n).map(|k| (k * test_bars / (n + 1)).max(k)).collect()
 }
 
 /// -1, 0 or 1.
@@ -915,36 +943,43 @@ fn worst_daily_loss(
         .reduce(f64::max)
 }
 
-/// `high_risk`'s risk of ruin from the closed trades: each trade's net P&L over the stitched
-/// equity before its entry, drawn in blocks over as many trades as the sample has.
-///
-/// shortcut: `stats::risk_of_ruin` measures ruin as a fall from the starting equity, while
-/// `HighRiskLimits::ruin_drawdown` names a drawdown from the peak; a fall from the peak is
-/// reached more often, so this can report a lower risk than the rule means. Measure from the
-/// running peak in `stats` (and repin its tests) before a high-risk strategy trades on the
-/// verdict.
-fn ruin(wf: &WalkForwardResult, cash: f64, ruin_drawdown: f64, seed: u64) -> Option<f64> {
-    let equity_before = |t: Millis| {
-        let i = wf.equity.partition_point(|p: &EquityPoint| p.time < t);
-        i.checked_sub(1).map_or(cash, |i| wf.equity[i].equity)
-    };
-    let returns: Vec<f64> = wf
-        .trades
-        .iter()
-        .filter(|t| !t.open)
-        .filter_map(|t| {
-            let e = equity_before(t.entry_time);
-            (e > 0.0).then(|| t.net_pnl / e)
-        })
-        .collect();
+/// `high_risk`'s risk of ruin from the closed trades of the stitched curve: each trade's net P&L
+/// over the stitched equity before its entry, drawn in blocks over as many trades as the sample
+/// has. Ruin is a fall of the rule's `ruin_drawdown` from a path's running peak, as the rule
+/// means it.
+fn ruin(
+    trades: &[Trade],
+    equity: &[EquityPoint],
+    cash: f64,
+    ruin_drawdown: f64,
+    seed: u64,
+) -> Option<f64> {
+    let returns = trade_returns(trades, equity, cash);
     let spec = RuinSpec {
-        ruin_level: 1.0 - ruin_drawdown,
+        ruin_drawdown,
         horizon: returns.len(),
         paths: DEFAULT_RESAMPLES,
         mean_block: stats::default_block_len(returns.len()),
         seed,
     };
     stats::risk_of_ruin(&returns, &spec).ok()
+}
+
+/// Each closed trade's net P&L over the equity at the close of the last bar before its entry
+/// (the starting cash before the first bar), skipping trades entered with no equity left.
+fn trade_returns(trades: &[Trade], equity: &[EquityPoint], cash: f64) -> Vec<f64> {
+    let equity_before = |t: Millis| {
+        let i = equity.partition_point(|p: &EquityPoint| p.time < t);
+        i.checked_sub(1).map_or(cash, |i| equity[i].equity)
+    };
+    trades
+        .iter()
+        .filter(|t| !t.open)
+        .filter_map(|t| {
+            let e = equity_before(t.entry_time);
+            (e > 0.0).then(|| t.net_pnl / e)
+        })
+        .collect()
 }
 
 /// R8 on the stitched walk-forward.
@@ -1057,9 +1092,8 @@ mod tests {
         assert_eq!(prefix_differences(&full[..1], &prefix, 3), 1);
     }
 
-    #[test]
-    fn a_repeat_must_match_in_fills_and_equity() {
-        let instrument = Instrument {
+    fn test_instrument() -> Instrument {
+        Instrument {
             id: InstrumentId {
                 venue: Venue::Binance,
                 symbol: "TESTUSDT".into(),
@@ -1075,13 +1109,37 @@ mod tests {
                 maker: 0.001,
                 taker: 0.002,
             },
-        };
-        let hour = 3_600_000;
+        }
+    }
+
+    const HOUR: Millis = 3_600_000;
+
+    fn test_config() -> BacktestConfig {
+        BacktestConfig {
+            strategy: "sma_cross".into(),
+            params: crate::Params::new()
+                .with("fast", crate::ParamValue::Int(3))
+                .with("slow", crate::ParamValue::Int(8)),
+            instrument: test_instrument(),
+            timeframe: td_core::Timeframe::H1,
+            from: 0,
+            to: 200 * HOUR,
+            starting_cash: 10_000.0,
+            slippage_bps: 2.0,
+            fee_override: None,
+            max_leverage: 1.0,
+            warmup_from: None,
+            close_at_end: false,
+        }
+    }
+
+    #[test]
+    fn a_repeat_must_match_in_fills_and_equity() {
         let bars: Vec<Candle> = (0..200)
             .map(|i| {
                 let close = 100.0 + 10.0 * ((i as f64) / 15.0).sin();
                 Candle {
-                    open_time: i * hour,
+                    open_time: i * HOUR,
                     open: close,
                     high: close * 1.001,
                     low: close * 0.999,
@@ -1091,22 +1149,7 @@ mod tests {
                 }
             })
             .collect();
-        let config = BacktestConfig {
-            strategy: "sma_cross".into(),
-            params: crate::Params::new()
-                .with("fast", crate::ParamValue::Int(3))
-                .with("slow", crate::ParamValue::Int(8)),
-            instrument,
-            timeframe: td_core::Timeframe::H1,
-            from: 0,
-            to: 200 * hour,
-            starting_cash: 10_000.0,
-            slippage_bps: 2.0,
-            fee_override: None,
-            max_leverage: 1.0,
-            warmup_from: None,
-            close_at_end: false,
-        };
+        let config = test_config();
         let a = run(&config, &bars, &[]).unwrap();
         assert!(!a.fills.is_empty());
         assert_eq!(repeat_differences(&a, &a.clone()), 0);
@@ -1119,4 +1162,182 @@ mod tests {
         fills.fills[0].price += 0.01;
         assert_eq!(repeat_differences(&a, &fills), 1);
     }
+
+    /// A row of a hand-built 3 x 3 sweep: its grid coordinates, its objective (Sharpe or max
+    /// drawdown, as the test reads it) and its total return.
+    fn row(coords: [u64; 2], objective: Option<f64>, total_return: f64) -> SweepRow {
+        let headline = crate::Headline {
+            total_return: Some(total_return),
+            cagr: None,
+            sharpe: objective,
+            sortino: None,
+            calmar: None,
+            profit_factor: None,
+            win_rate: None,
+            max_drawdown: objective,
+            trades: 10,
+        };
+        SweepRow {
+            index: coords[0] * 3 + coords[1],
+            coords: coords.to_vec(),
+            params: crate::Params::new(),
+            qualified: objective.is_some(),
+            metrics: Some(headline),
+            error: None,
+        }
+    }
+
+    /// Rows best first, as a sweep returns them.
+    fn swept(rows: Vec<SweepRow>) -> SweepResult {
+        SweepResult {
+            spec: crate::SweepSpec {
+                base: test_config(),
+                axes: Vec::new(),
+                mode: crate::SweepMode::Grid,
+                objective: crate::Objective {
+                    metric: crate::Metric::Sharpe,
+                    direction: Direction::Maximize,
+                },
+                min_trades: 0,
+            },
+            engine_version: String::new(),
+            data_fingerprint: String::new(),
+            rows,
+            best: None,
+        }
+    }
+
+    #[test]
+    fn the_plateau_reads_the_best_sets_neighbours_on_the_grid() {
+        use crate::Metric::{MaxDrawdown, Sharpe};
+        // The best set in the corner (0, 0) has three neighbours: (0, 1), (1, 0) and (1, 1).
+        // (1, 0)'s objective is undefined and counts as the worst; (0, 2) is refused and (2, 2),
+        // better than every neighbour, is two steps away; neither counts.
+        let mut refused = row([0, 2], None, 0.0);
+        refused.metrics = None;
+        refused.error = Some("slow must be more than fast".into());
+        let rows = |best: f64| {
+            vec![
+                row([0, 0], Some(best), 0.4),
+                row([2, 2], Some(1.9), 0.3),
+                row([1, 1], Some(1.5), 0.2),
+                row([0, 1], Some(1.0), 0.1),
+                row([1, 2], Some(0.5), 0.05),
+                row([1, 0], None, -0.05),
+                refused.clone(),
+            ]
+        };
+        let p = plateau(&swept(rows(2.0)), Sharpe, Direction::Maximize).unwrap();
+        assert_eq!(p.best, vec![0, 0]);
+        assert_eq!(p.best_objective, 2.0);
+        assert_eq!(
+            p.neighbours,
+            vec![
+                (vec![1, 1], Some(1.5)),
+                (vec![0, 1], Some(1.0)),
+                (vec![1, 0], None),
+            ]
+        );
+        // Sorted [-inf, 1.0, 1.5]: the median is 1.0, half the best. Two of three neighbours
+        // made money.
+        assert_eq!(p.median_ratio, Some(0.5));
+        assert_eq!(p.positive_share, Some(2.0 / 3.0));
+
+        // With the best at or below zero a ratio would read backwards, so there is none; the
+        // share still counts.
+        for best in [0.0, -0.5] {
+            let p = plateau(&swept(rows(best)), Sharpe, Direction::Maximize).unwrap();
+            assert_eq!(p.median_ratio, None, "best {best}");
+            assert_eq!(p.positive_share, Some(2.0 / 3.0));
+        }
+
+        // Two undefined neighbours of three put the median at the worst value: no finite ratio.
+        let mut two_undefined = rows(2.0);
+        two_undefined[3] = row([0, 1], None, 0.1);
+        let p = plateau(&swept(two_undefined), Sharpe, Direction::Maximize).unwrap();
+        assert_eq!(p.median_ratio, None);
+
+        // Minimize, on max drawdown: the best is the smallest, an undefined neighbour counts as
+        // the largest, and the ratio is the best over the median, so below 1 is worse here too.
+        // Sorted [0.2, 0.3, inf]: the median is 0.3.
+        let min_rows = vec![
+            row([0, 0], Some(0.1), 0.4),
+            row([0, 1], Some(0.2), 0.1),
+            row([1, 1], Some(0.3), 0.2),
+            row([2, 2], Some(0.4), 0.3),
+            row([1, 0], None, -0.05),
+        ];
+        let p = plateau(&swept(min_rows), MaxDrawdown, Direction::Minimize).unwrap();
+        assert_eq!(p.median_ratio, Some(0.1 / 0.3));
+        assert_eq!(p.positive_share, Some(2.0 / 3.0));
+
+        // No qualified best: no plateau.
+        let none = vec![row([0, 0], None, 0.1), row([0, 1], None, 0.1)];
+        assert_eq!(plateau(&swept(none), Sharpe, Direction::Maximize), None);
+    }
+
+    #[test]
+    fn start_offsets_are_distinct_and_never_zero_even_on_short_test_windows() {
+        // 270 bars of test window, 8 offsets: k * 30 bars.
+        assert_eq!(
+            start_offset_shifts(270, 8),
+            (1..=8).map(|k| 30 * k).collect::<Vec<_>>()
+        );
+        // 7 bars, 8 offsets: k * 7 / 9 is 0 for k = 1; at least k bars instead.
+        assert_eq!(start_offset_shifts(7, 8), (1..=8).collect::<Vec<_>>());
+        // 9 bars sit on the edge: k bars exactly.
+        assert_eq!(start_offset_shifts(9, 8), (1..=8).collect::<Vec<_>>());
+        assert_eq!(start_offset_shifts(20, 8), vec![2, 4, 6, 8, 11, 13, 15, 17]);
+    }
+
+    fn trade(entry_time: Millis, net_pnl: f64, open: bool) -> Trade {
+        Trade {
+            side: TradeSide::Long,
+            entry_time,
+            exit_time: entry_time + 1,
+            open,
+            qty: 1.0,
+            entry_price: 100.0,
+            exit_price: 100.0,
+            gross_pnl: net_pnl,
+            fees: 0.0,
+            funding: 0.0,
+            net_pnl,
+            return_on_notional: 0.0,
+            bars_held: 1,
+            stop: None,
+            r_multiple: None,
+            mae: None,
+            mfe: None,
+            force_closed: false,
+        }
+    }
+
+    #[test]
+    fn risk_of_ruin_is_pinned_on_a_hand_made_trade_list() {
+        let cash = 10_000.0;
+        let point = |time, equity| EquityPoint { time, equity };
+        let equity = [point(0, 10_000.0), point(2, 11_000.0), point(4, 5_500.0)];
+        // +1,000 on the 10,000 before it (+10%), -5,500 on the 11,000 before it (-50%); the open
+        // trade is left out. A trade entered before the first bar is measured on the cash.
+        let trades = [
+            trade(1, 1_000.0, false),
+            trade(3, -5_500.0, false),
+            trade(4, 50.0, true),
+        ];
+        assert_eq!(trade_returns(&trades, &equity, cash), vec![0.1, -0.5]);
+        assert_eq!(
+            trade_returns(&[trade(0, 500.0, false)], &equity, cash),
+            vec![0.05]
+        );
+        // Two trades a path, drawn singly: every path but +10% twice is ruined at a drawdown of
+        // half from the peak, since 1.1 then -50% is exactly half the 1.1 high. From the start
+        // that path would end at 0.55 and survive, so the risk would be about 1/2, not 3/4.
+        let risk = ruin(&trades, &equity, cash, 0.5, 3).unwrap();
+        assert!((risk - 0.75).abs() < 0.035, "{risk}");
+        assert_eq!(risk, PINNED_HAND_RUIN);
+    }
+
+    /// 1,482 of 2,000 paths, seed 3.
+    const PINNED_HAND_RUIN: f64 = 0.741;
 }

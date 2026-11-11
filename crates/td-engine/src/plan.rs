@@ -18,7 +18,7 @@ use td_core::{FeeSchedule, Instrument, InstrumentId, Millis, Timeframe, days_fro
 
 use crate::metrics::DAY_MS;
 use crate::{
-    BacktestConfig, Objective, OosSpec, ParamAxis, Params, Split, SweepMode, SweepSpec,
+    BacktestConfig, MAX_RUNS, Objective, OosSpec, ParamAxis, Params, Split, SweepMode, SweepSpec,
     WalkForwardSpec, WindowMode, WindowSpec, default_slippage_bps,
 };
 
@@ -437,6 +437,16 @@ impl TestPlan {
             oos.check().map_err(|e| PlanError(e.to_string()))?;
         }
         self.evidence.validate()?;
+        // The luck test repeats the sweep once per permutation; the battery refuses it past the
+        // tester's run limit, so a plan that would reach it is refused here.
+        let per_sweep = wf.sweep.runs().map_err(|e| PlanError(e.to_string()))?;
+        let luck_runs = per_sweep as u128 * (u128::from(self.evidence.luck.permutations) + 1);
+        if luck_runs > MAX_RUNS as u128 {
+            return refuse(format!(
+                "the luck test would run {luck_runs} backtests ({per_sweep} parameter sets times                  {} sweeps), above the limit of {MAX_RUNS}: shrink the grid or run fewer                  permutations",
+                self.evidence.luck.permutations + 1
+            ));
+        }
         // The windows as the tester lays them, on data with no gaps: the bars of the period's
         // open hours, so an FX pair, closed at weekends, has fewer than a crypto pair.
         let ws = &wf.windows;
@@ -742,6 +752,30 @@ mod tests {
             example_plan().validate("nope").is_err(),
             "an unknown strategy"
         );
+    }
+
+    /// The luck test repeats the sweep once per permutation, and a plan whose luck test would
+    /// pass the tester's run limit is refused before the battery spends hours on the steps
+    /// before it: a 25 x 25 grid at 199 permutations is 625 x 200 = 125,000 runs.
+    #[test]
+    fn a_luck_test_over_the_run_limit_is_refused() {
+        let mut plan = example_plan();
+        let axis = |name: &str, from: f64| ParamAxis {
+            name: name.into(),
+            space: ParamSpace::Range {
+                from,
+                to: from + 24.0,
+                step: 1.0,
+            },
+        };
+        plan.sweep.axes = vec![axis("fast", 1.0), axis("slow", 30.0)];
+        plan.evidence.luck.permutations = 199;
+        let err = plan.validate("sma_cross").unwrap_err();
+        assert!(err.0.contains("125000 backtests"), "{err}");
+        // 159 permutations are 625 x 160 = 100,000 runs, exactly the limit.
+        assert_eq!(625 * 160, MAX_RUNS);
+        plan.evidence.luck.permutations = 159;
+        assert_eq!(plan.validate("sma_cross"), Ok(()));
     }
 
     /// An FX pair is a valid instrument, and its weekends count against the minimum sample: a

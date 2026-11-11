@@ -1064,7 +1064,7 @@ min_profit_factor: number,
  */
 max_risk_of_ruin: number, 
 /**
- * The drawdown from the peak that counts as ruin.
+ * The drawdown from the running peak of equity that counts as ruin, above 0 and below 1.
  */
 ruin_drawdown: number, 
 /**
@@ -1337,7 +1337,7 @@ expectancy: number | null,
  */
 expectancy_lower_bound: number | null, profit_factor: number | null, 
 /**
- * The chance of a drawdown of the rule's `ruin_drawdown`.
+ * The chance of a drawdown of the rule's `ruin_drawdown` from the running peak.
  */
 risk_of_ruin: number | null, 
 /**
@@ -1382,7 +1382,13 @@ peak_leverage: number | null,
  * I5: the lowest equity inside any bar, over the starting cash. Zero is a bankrupt account:
  * a liquidation leaves the account at exactly zero.
  */
-lowest_equity: number | null, };
+lowest_equity: number | null, 
+/**
+ * Whether the stitched out-of-sample curve exists. A curve can exist without the equity
+ * ranges inside its bars that I5 reads (a test run that kept none), and the lines then say
+ * so instead of blaming the sample.
+ */
+curve: boolean, };
 
 /**
  * R5: the best parameter set and its neighbours on the grid.
