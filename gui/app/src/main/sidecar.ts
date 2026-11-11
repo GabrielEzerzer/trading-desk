@@ -33,7 +33,7 @@ const STOP_GRACE_MS = 11_000
 const STDERR_TAIL = 10
 
 /** Where the engine binary is: `TD_SERVER_BIN`, else the release build in the repo's target dir. The
- * debug build runs the same code about nine times slower (td-bench), so the app never starts it. */
+ * debug build runs the same code about twelve times slower (td-bench), so the app never starts it. */
 export function sidecarBin(env: NodeJS.ProcessEnv, appPath: string, isPackaged: boolean): string {
   if (env.TD_SERVER_BIN) return env.TD_SERVER_BIN
   const exe = process.platform === 'win32' ? 'td-server.exe' : 'td-server'

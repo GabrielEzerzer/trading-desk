@@ -126,3 +126,45 @@ Both findings verified against the app and accepted. Neither touches the workloa
 3. Nit, taken: the `WORKLOAD` line prints `first_ms` beside `min_ms`, so a cache that outlives a repetition shows as a gap between them. Rule for PR 2: a cache is a field of `Store`, never a static.
 
 What one Lab repetition now stands for: the first backtest after the app starts (coverage, check, load, run, save, result read on one store), then the reopen of that run in a later session (a cold store).
+
+## Baseline with the coverage phase and the later-session reopen
+
+Head `f89f7cf`, 2026-11-11 13:17 to 13:32 UTC (`.agent/logs/baseline4.log`). Checksums equal in debug and release.
+
+| Build | Split | total_ms | load | backtest | sweep | walk-forward | Lab backtest |
+|---|---|---|---|---|---|---|---|
+| A debug, reps 3 | dev | 58,713.2 | 5,583.9 | 1,082.1 | 3,262.5 | 7,964.8 | 40,819.9 |
+| A debug, reps 3 | test | 52,179.5 | 6,392.2 | 1,006.0 | 4,070.9 | 1,361.0 | 39,349.4 |
+| B release, reps 5 | dev, run 1 | 4,872.2 | 789.2 | 109.0 | 292.1 | 504.5 | 3,177.5 |
+| B release, reps 5 | dev, run 2 | 7,647.7 | 993.7 | 136.5 | 483.7 | 608.5 | 5,425.4 |
+| B release, reps 5 | test | 4,581.2 | 808.5 | 111.2 | 535.2 | 137.4 | 2,988.8 |
+
+Phases of the dev Lab backtest, fastest repetition: release coverage 674, check 656, load 813, run 23, save 50, result read 65, reopen 897 ms; debug 8,025, 8,627, 8,930, 363, 1,360, 1,222, 12,294 ms. Four reads of the 1-minute data are 96% of a Lab backtest; the strategy run is under 1%.
+
+**Round 1 on the final metric: dev 58,713.2 ms to 4,872.2 ms (12.0 times), test 52,179.5 ms to 4,581.2 ms (11.4 times). Target was 5 times. Kept.** A five-year Lab backtest goes from 40.8 s to 3.2 s.
+
+Noise: run 2 was 57% above run 1 while other threads ran `cargo test --workspace`; CPU load was 100%. A single run cannot decide a round. PR 2 measures base and candidate interleaved, several runs each, and compares the lowest of each.
+
+## After #66 (main `99a7743`) and review round 3
+
+- #66 added an `asks` argument to the engine entry points; the bench passes none, as the server does for crypto. Release re-run on `0e352dd` (`baseline5.log`): every checksum equal to `f89f7cf`'s (dev `0ee29ceab903b31a`, test `2fa9814ee9eeb6b6`), so #66 changed no crypto result. Totals 7,011 to 9,408 ms dev under full load: not a baseline.
+- Reviewer round 3 (head `0e352dd`): round 2's two findings fixed as the app behaves. One new should, accepted: the Lab checksum hashed each month file's size on disk, so a store change that keeps every candle would have looked like a changed result. Fixed: sizes are zeroed before hashing (still serialized in the timed phase). The nit (parse `first_ms` in the test) taken.
+- Final checksums on `64f11b5` (`baseline6.log`): dev `18c3f65986696a8c`, test `4e8892bfdc155145`; the eight non-Lab workloads unchanged, `lab_sma_1h_60mo` `360b189bdc2fdcb4`, `lab_donchian_15m_48mo` `bfa8c14a6243bd0a`. Release totals on this head with a worker compiling: dev 5,009.9 and 5,531.7 ms, test 5,180.7 ms.
+
+**Baseline B for PR 2: 4,872.2 ms on dev (the quietest run of the same timed code). Target: at most 2,436 ms with these checksums.**
+
+## PR 2 plan (`perf-read`, worktree `trading-desk-perf-read`, branched from `64f11b5`)
+
+The read path does not overlap #66 or the engine. Rounds, one hypothesis each:
+
+- Round 2, hypothesis: coverage, check and load run seconds apart in one server process and each decode the same month files; keeping decoded months in the `Store` (validated by file length and time, bounded at 256 MB) makes check and load nearly free. Expect check 656 to under 100 ms, load 813 to about 300 ms, the `load` workload about 40% faster; the reopen and coverage stay cold. About 25 to 30% off the dev total.
+- Round 3, hypothesis: the cold reads (coverage, the reopen, the first read of the `load` workload) decode 24 to 60 files one after another on one core; decoding a range's months in parallel cuts them several times on a free machine. About another 20 to 25%.
+- Then, if time remains: shared preparation across a sweep's parameter sets, and incremental indicators.
+
+## PR 1 review gate closed (2026-11-11 14:15 UTC)
+
+- reviewer round 4 on `2491236`: APPROVE, no findings.
+- Sol round 1: one should, accepted. The Lab checksum left out the data report (`RunDetail.data`, `data_error`) of both reads, so a read path that lost or skipped the report would have kept the checksum. Fixed in `510af3d`: the checksum covers the coverage (without file sizes), and the run, report and report error of both the job-result read and the reopen, and the reopen's check. A test asserts both reports are in the hashed JSON. Sol round 2: APPROVE, S1 resolved.
+- **Final checksums, head `510af3d` (`baseline7.log`): dev `1bc2d4ff4b411ddc`, test `5ecd3911e0a8641c`.** Per workload: load_1h_24mo `3852b7945ccec859`, backtest_sma_1m_3mo `75ffe6edbb8ad741`, sweep_sma_1h_24mo `0a98024072a85554`, walkforward_donchian_1h_24mo `98212a17978b0b68`, lab_sma_1h_60mo `8cea35df3dbf82f9`; test: load_15m_18mo `334ea9e6970cea33`, backtest_donchian_5m_12mo `3f828b35d7f2aba6`, sweep_donchian_15m_12mo `917724d45265e03f`, walkforward_sma_4h_36mo `c0d922779bbc6a15`, lab_donchian_15m_48mo `64b19b670067da6d`. The timed work is the same as on `f89f7cf`; only what is hashed changed. Totals in that run (10.4 s dev) were taken with three other builds running and are not a baseline.
+- Proof that the app's default engine path is the release build: `cargo build --release -p td-server --bin td-server --manifest-path ../Cargo.toml` (the new `pnpm dev` build step) from `gui/`, then `pnpm vitest run app/src/main/engine.integration.test.ts`: 1 passed, not skipped, on `510af3d`.
+- The comment and README said "about nine times"; the final measurement is twelve, corrected.
