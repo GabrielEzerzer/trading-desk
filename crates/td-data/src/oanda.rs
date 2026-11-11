@@ -195,11 +195,12 @@ pub(crate) struct Counts {
 /// connection, a 429 or a 5xx is tried again after each of `delays`, and any other failure fails
 /// the whole call, so a month never comes back short of a page OANDA failed to serve.
 ///
-/// A page is refused whole when it names another instrument or granularity, or holds a time or a
-/// price that does not read, a candle that is not valid, or a time that is not after the one
-/// before it. Then, by [`fill`]: a candle still forming, in closed hours or with the ask crossed
-/// below the bid is left out and counted, and an open minute without a candle is filled, but
-/// never at or after the candle still forming, even when the local clock is ahead of OANDA's.
+/// A page is refused whole when it names another instrument or granularity, starts before the time
+/// asked, or holds a time or a price that does not read, a candle that is not valid, or a time
+/// that is not after the one before it. Then, by [`fill`]: a candle still forming, in closed
+/// hours or with the ask crossed below the bid is left out and counted, and an open minute
+/// without a candle is filled, but never at or after the candle still forming, even when the
+/// local clock is ahead of OANDA's.
 pub(crate) fn history(
     id: &InstrumentId,
     from: Millis,
@@ -232,7 +233,19 @@ pub(crate) fn history(
             answer(&url, status, body, &token)
         })?;
         let page = parse_page(&url, &body, &name, &id.symbol)?;
-        let Some(last) = page.last() else { break };
+        let (Some(first), Some(last)) = (page.first(), page.last()) else {
+            break;
+        };
+        if first.bid.open_time < cursor {
+            return Err(DataError::parse(
+                &url,
+                format!(
+                    "it starts at {} UTC, before the {} UTC asked for",
+                    format_minute(first.bid.open_time),
+                    format_minute(cursor)
+                ),
+            ));
+        }
         let last_time = last.bid.open_time;
         let forming = page.iter().find(|q| !q.complete).map(|q| q.bid.open_time);
         for q in page {
@@ -865,6 +878,23 @@ mod tests {
         let mut c = good.clone();
         c.swap(1, 2);
         refused(c, "not after the one before");
+        // A page that starts before the time asked, as from a server that ignores `from`.
+        let early = open_minutes(monday - 2 * MINUTE, monday + 3 * MINUTE, &[]);
+        let mut ignores_from = |_: &Token, _| Ok((200, page(&early)));
+        let result = history(
+            &usdjpy(),
+            monday,
+            monday + 3 * MINUTE,
+            far_future(),
+            env,
+            &NO_WAIT,
+            &mut ignores_from,
+        );
+        let says = "it starts at 2024-01-08 08:58 UTC, before the 2024-01-08 09:00 UTC asked for";
+        assert!(
+            matches!(&result, Err(e) if e.to_string().contains(says)),
+            "{result:?}"
+        );
 
         let mut wrong = |_: &Token, _| {
             Ok((
