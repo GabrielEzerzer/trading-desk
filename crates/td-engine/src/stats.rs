@@ -600,6 +600,8 @@ mod tests {
         // Losing 10% a trade: 0.9^6 = 0.531 is above 0.5 and 0.9^7 = 0.478 is below.
         assert_eq!(risk_of_ruin(&[-0.1], &ruin_spec(6)), Ok(0.0));
         assert_eq!(risk_of_ruin(&[-0.1], &ruin_spec(7)), Ok(1.0));
+        // Landing exactly on the level is ruin: 1 * (1 - 0.5) is 0.5, exact in binary.
+        assert_eq!(risk_of_ruin(&[-0.5], &ruin_spec(1)), Ok(1.0));
     }
 
     #[test]
@@ -655,14 +657,21 @@ mod tests {
             max_drawdown: f64::INFINITY,
             ..challenge(10)
         };
-        // Daily loss: from 1.1, -4% loses 0.044 and -5% loses 0.055, measured against a limit of
-        // 0.05 of the starting balance, not of the day's opening equity.
+        // Daily loss: from 1.1, -4% loses 0.044 and -4.8% loses 0.0528, measured against a limit
+        // of 0.05 of the starting balance. Against the day's opening equity, -4.8% would be under
+        // a 5% limit and hold.
         let daily = PropFirmSpec {
             daily_loss_limit: 0.05,
             ..off
         };
         assert_eq!(walk(&daily, &[0.1, -0.04]).breach_day, None);
-        assert_eq!(walk(&daily, &[0.1, -0.05]).breach_day, Some(2));
+        assert_eq!(walk(&daily, &[0.1, -0.048]).breach_day, Some(2));
+        // A loss of exactly the limit breaches: 1 - 0.875 is 0.125, all exact in binary.
+        let eighth = PropFirmSpec {
+            daily_loss_limit: 0.125,
+            ..off
+        };
+        assert_eq!(walk(&eighth, &[-0.125]).breach_day, Some(1));
         // 1.1 then -8%: 1.012. Static floor 0.9 holds; trailing floor 1.1 - 0.1 = 1.0 holds.
         // 1.1 then -10%: 0.99. Static holds; trailing breaches.
         let fixed = PropFirmSpec {
@@ -679,6 +688,16 @@ mod tests {
         assert_eq!(walk(&trailing, &[0.1, -0.1]).breach_day, Some(2));
         // Static: three days of -4% reach 0.8847, below 0.9, on day 3.
         assert_eq!(walk(&fixed, &[-0.04, -0.04, -0.04]).breach_day, Some(3));
+        // Landing exactly on the static floor breaches: 1 - 0.25 is 0.75, exact in binary.
+        let quarter = PropFirmSpec {
+            max_drawdown: 0.25,
+            ..off
+        };
+        assert_eq!(walk(&quarter, &[-0.25]).breach_day, Some(1));
+        // The trailing floor sits max_drawdown of the starting balance below the peak, not a
+        // fraction of the peak: from a peak of 1.2, -9% is 1.092, under 1.2 - 0.1 = 1.1 but
+        // above 1.2 * 0.9 = 1.08.
+        assert_eq!(walk(&trailing, &[0.2, -0.09]).breach_day, Some(2));
         // The path trades on after the target: day 1 reaches 1.1, day 2 breaches the trailing
         // floor. That is a pass, because the target came first, and a breach.
         let o = walk(&trailing, &[0.1, -0.1]);

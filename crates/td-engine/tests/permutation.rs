@@ -140,7 +140,8 @@ fn a_planted_edge_beats_every_shuffled_copy_and_noise_does_not() {
     let edge = permutation_test(&spec(19, 7), &trending_bars(), &[], None).unwrap();
     assert_eq!(edge.permuted_best.len(), 19);
     assert!(edge.real_best > 0.0, "{edge:?}");
-    // No copy comes close: p is the smallest 19 copies allow.
+    // Every copy qualifies and none comes close: p is the smallest 19 copies allow.
+    assert_eq!(edge.qualified_copies, 19, "{edge:?}");
     assert_eq!(edge.at_least_as_good, 0, "{edge:?}");
     assert_eq!(edge.p_value, 0.05);
 
@@ -156,14 +157,16 @@ const PINNED_NOISE_COUNT: usize = 6;
 #[test]
 fn the_p_value_counts_copies_at_least_as_good_as_the_real_best() {
     let r = permutation_test(&spec(9, 3), &noise_bars(42), &[], None).unwrap();
+    let qualified = r.permuted_best.iter().flatten().count();
     let count = r
         .permuted_best
         .iter()
         .flatten()
         .filter(|&&x| x >= r.real_best)
         .count();
+    assert_eq!(r.qualified_copies, qualified);
     assert_eq!(r.at_least_as_good, count);
-    assert_eq!(r.p_value, (1 + count) as f64 / 10.0);
+    assert_eq!(r.p_value, (1 + count) as f64 / (1 + qualified) as f64);
     // The real best is the plain sweep's best.
     let swept = td_engine::sweep(&r.spec.sweep, &noise_bars(42), &[], None).unwrap();
     let top = swept.rows[0].metrics.unwrap().total_return.unwrap();

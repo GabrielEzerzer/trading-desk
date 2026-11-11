@@ -665,7 +665,8 @@ fn refuse_base_warmup(spec: &SweepSpec) -> Result<(), TesterError> {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PermutationSpec {
     pub sweep: SweepSpec,
-    /// Shuffled copies to sweep; #35 uses 199, so the smallest possible p-value is 0.005.
+    /// Shuffled copies to sweep; #35 uses 199, so the smallest possible p-value is 0.005 when
+    /// every copy has a qualifying run.
     pub permutations: usize,
     /// Copy k is shuffled with a seed derived from this one and k, so the same seed shuffles the
     /// same copies.
@@ -684,13 +685,22 @@ pub struct PermutationResult {
     /// The best objective value of each shuffled copy's sweep, in copy order; `None` when no run
     /// on that copy qualified.
     pub permuted_best: Vec<Option<f64>>,
-    /// Copies whose best is at least as good as the real best: at or above it when maximising,
-    /// at or below it when minimising. A copy with no qualifying run found nothing, and does not
-    /// count.
+    /// Copies with a qualifying run: the entries of `permuted_best` that are not `None`.
+    pub qualified_copies: usize,
+    /// Qualifying copies whose best is at least as good as the real best: at or above it when
+    /// maximising, at or below it when minimising, ties included.
     pub at_least_as_good: usize,
-    /// `(1 + at_least_as_good) / (1 + permutations)`: the chance of a best this good if the bars'
-    /// order carried no information. Counting the real sweep as one of the draws keeps it above
-    /// zero and makes it a valid p-value (Phipson and Smyth, 2010).
+    /// `(1 + at_least_as_good) / (1 + qualified_copies)`: the chance of a best this good if the
+    /// bars' order carried no information, given that the real sweep qualified. The test runs
+    /// only when it did, so the real bars are compared with the copies that qualified too; if
+    /// the order carried nothing, the real best is then equally likely to rank anywhere among
+    /// those `1 + qualified_copies` bests, which makes this the exact permutation p-value
+    /// (counting the real sweep as one of the draws keeps it above zero; Phipson and Smyth,
+    /// 2010). Dividing by all the copies instead would count the ones with no qualifying run as
+    /// worse than the real best and bias the p-value low.
+    ///
+    /// The smallest it can be is `1 / (1 + qualified_copies)`. When that is above a pass
+    /// threshold, the test cannot pass however good the real best is: too few copies qualified.
     pub p_value: f64,
 }
 
@@ -769,23 +779,41 @@ pub fn permutation_test(
         permuted_best.push(best_of(k + 1, &copy)?);
     }
 
-    let at_least_as_good = permuted_best
-        .iter()
-        .flatten()
-        .filter(|&&x| match objective.direction {
-            Direction::Maximize => x >= real_best,
-            Direction::Minimize => x <= real_best,
-        })
-        .count();
+    let (qualified_copies, at_least_as_good, p_value) =
+        permutation_p_value(real_best, &permuted_best, objective.direction);
     Ok(PermutationResult {
         spec: spec.clone(),
         engine_version: env!("CARGO_PKG_VERSION").to_string(),
         data_fingerprint,
         real_best,
         permuted_best,
+        qualified_copies,
         at_least_as_good,
-        p_value: (1 + at_least_as_good) as f64 / (1 + copies) as f64,
+        p_value,
     })
+}
+
+/// The qualifying copies, those of them at least as good as the real best, and the p-value; see
+/// [`PermutationResult::p_value`].
+fn permutation_p_value(
+    real_best: f64,
+    permuted_best: &[Option<f64>],
+    direction: Direction,
+) -> (usize, usize, f64) {
+    let qualified = permuted_best.iter().flatten();
+    let at_least_as_good = qualified
+        .clone()
+        .filter(|&&x| match direction {
+            Direction::Maximize => x >= real_best,
+            Direction::Minimize => x <= real_best,
+        })
+        .count();
+    let q = qualified.count();
+    (
+        q,
+        at_least_as_good,
+        (1 + at_least_as_good) as f64 / (1 + q) as f64,
+    )
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1689,6 +1717,46 @@ mod tests {
             assert_eq!(r.permuted_best[k], best(&copy), "copy {k}");
             assert_ne!(copy, bars[..220]);
         }
+    }
+
+    #[test]
+    fn the_p_value_divides_by_the_copies_that_qualified_not_all_of_them() {
+        // Ten copies, four with no qualifying run; one of the six beats the real best of 0.5.
+        let copies = [
+            Some(0.1),
+            None,
+            Some(0.7),
+            None,
+            Some(0.2),
+            Some(0.3),
+            None,
+            Some(0.4),
+            None,
+            Some(0.0),
+        ];
+        let (q, b, p) = permutation_p_value(0.5, &copies, Direction::Maximize);
+        assert_eq!((q, b), (6, 1));
+        assert_eq!(p, 2.0 / 7.0);
+        // No copy qualified: nothing to compare with, so p is 1.
+        assert_eq!(
+            permutation_p_value(0.5, &[None, None], Direction::Maximize),
+            (0, 0, 1.0)
+        );
+    }
+
+    #[test]
+    fn a_copy_that_ties_the_real_best_counts_as_at_least_as_good() {
+        let copies = [Some(0.25), Some(0.5), Some(1.0), None];
+        // Maximising: 0.5 ties and 1.0 beats; 0.25 does not.
+        assert_eq!(
+            permutation_p_value(0.5, &copies, Direction::Maximize),
+            (3, 2, 0.75)
+        );
+        // Minimising: 0.5 ties and 0.25 beats; 1.0 does not.
+        assert_eq!(
+            permutation_p_value(0.5, &copies, Direction::Minimize),
+            (3, 2, 0.75)
+        );
     }
 
     fn point(time: Millis, equity: f64) -> EquityPoint {
