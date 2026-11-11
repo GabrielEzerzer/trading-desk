@@ -1448,8 +1448,8 @@ fn a_walk_forward_on_weekly_bars_needs_30_bars_in_every_train_window() {
     assert_eq!(s.check(), Ok(()));
     assert_eq!(
         refused_before_running(&s, &bars),
-        "a Sharpe objective needs at least 30 bars as well as 30 daily returns in every train \
-         window, and train window 0 is 25 bars over 175 days"
+        "a Sharpe objective needs at least 30 daily returns on days with a bar close in every \
+         train window, and train window 0 (25 bars over 175 days) has 25"
     );
     // Thirty weekly bars are enough: the train window has a Sharpe ratio.
     let (s, bars) = weekly_wf_spec(35, rolling(30));
@@ -1502,6 +1502,56 @@ fn an_out_of_sample_test_whose_in_sample_segment_is_too_short_for_its_objective_
     let (r, calls) = oos(70, Metric::Sharpe);
     assert!(r.unwrap().in_sample.best.unwrap().metrics.sharpe.is_some());
     assert_eq!(calls, 6);
+}
+
+/// Hourly [`rising_bars`] over the first `n` hours, without those `keep` rejects.
+fn gappy_bars(n: i64, keep: impl Fn(i64) -> bool) -> Vec<Candle> {
+    rising_bars(n)
+        .into_iter()
+        .filter(|b| keep((b.open_time - T0) / HOUR))
+        .collect()
+}
+
+#[test]
+fn a_segment_whose_daily_returns_are_mostly_carried_across_a_gap_is_refused_before_running() {
+    // In sample, 30 hourly bars, 15 on day 0 and 15 on day 29: 30 daily returns and 30 bars, but
+    // only two days hold a bar close. Then 50 bars out of sample.
+    let split = 29 * 24 + 15;
+    let bars = gappy_bars(split + 50, |h| !(15..29 * 24).contains(&h));
+    let mut sweep = rising_spec();
+    sweep.base.to = T0 + (split + 50) * HOUR;
+    sweep.objective.metric = Metric::Sharpe;
+    let s = OosSpec {
+        sweep,
+        split: Split::At(T0 + split * HOUR),
+    };
+    let calls = Mutex::new(0usize);
+    let progress = |_: usize, _: usize| {
+        *calls.lock().unwrap() += 1;
+        ControlFlow::Continue(())
+    };
+    let r = out_of_sample(&s, &bars, &[], Some(&progress));
+    assert_eq!(calls.into_inner().unwrap(), 0, "ran before refusing");
+    assert_eq!(
+        r.unwrap_err(),
+        TesterError::InvalidSpec(
+            "a Sharpe objective needs at least 30 daily returns on days with a bar close in the \
+             in-sample segment, and it (30 bars over 29 days 15 hours) has 2"
+                .into()
+        )
+    );
+
+    // A train window of 696 hourly bars passes the spec check. Without day 14 they run over 30
+    // days, so 30 daily returns, but close on 29 of them.
+    let (mut s, _) = train_floor_spec(Metric::Sharpe, 696);
+    s.sweep.base.to = T0 + 770 * HOUR;
+    let bars = gappy_bars(770, |h| h / 24 != 14);
+    assert_eq!(s.check(), Ok(()));
+    assert_eq!(
+        refused_before_running(&s, &bars),
+        "a Sharpe objective needs at least 30 daily returns on days with a bar close in every \
+         train window, and train window 0 (696 bars over 30 days) has 29"
+    );
 }
 
 #[test]

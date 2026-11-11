@@ -111,10 +111,10 @@ pub enum SweepMode {
 /// A metrics report field a sweep can rank by.
 ///
 /// `Sharpe` and `Sortino` are undefined on a range with fewer than
-/// [`metrics::MIN_DAILY_RETURNS`] daily returns or bars, and `Cagr` and `Calmar` on a range
-/// shorter than [`metrics::MIN_CAGR_DAYS`] days; a run whose objective is undefined does not
-/// qualify (see [`SweepRow::qualified`]). In a walk-forward that applies to each train window's
-/// length, and in an out-of-sample test to the in-sample segment's.
+/// [`metrics::MIN_DAILY_RETURNS`] daily returns on days with a bar close, and `Cagr` and `Calmar`
+/// on a range shorter than [`metrics::MIN_CAGR_DAYS`] days; a run whose objective is undefined
+/// does not qualify (see [`SweepRow::qualified`]). In a walk-forward that applies to each train
+/// window's length, and in an out-of-sample test to the in-sample segment's.
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -715,10 +715,10 @@ pub struct OosResult {
     ///
     /// With `TotalReturn`, `Cagr` or `Calmar` it is therefore `None` when either segment is
     /// shorter than [`metrics::MIN_CAGR_DAYS`] days, and with `Sharpe` or `Sortino` when either
-    /// has fewer than [`metrics::MIN_DAILY_RETURNS`] daily returns or bars (the in-sample segment
-    /// is refused up front then, so this is the out-of-sample one). It does not fall back to the
-    /// ratio of total returns, which would compare segments of different lengths; compare the
-    /// two runs' metrics directly then.
+    /// has fewer than [`metrics::MIN_DAILY_RETURNS`] daily returns on days with a bar close (the
+    /// in-sample segment is refused up front then, so this is the out-of-sample one). It does not
+    /// fall back to the ratio of total returns, which would compare segments of different
+    /// lengths; compare the two runs' metrics directly then.
     pub degradation: Option<f64>,
 }
 
@@ -1112,10 +1112,11 @@ fn floored_metric_name(metric: Metric) -> Option<&'static str> {
 
 /// Refuses, without data, a walk-forward whose objective is undefined on its first train window
 /// whatever the data: a Sharpe or Sortino objective when that window cannot hold
-/// [`metrics::MIN_DAILY_RETURNS`] daily returns and as many bars, or a CAGR or Calmar objective
-/// when it cannot span [`metrics::MIN_CAGR_DAYS`] days. The first train window is the shortest:
-/// `train_bars` long when rolling, and when anchored up to `step_bars - 1` bars longer, since it
-/// starts at the first bar and so also takes the bars left over before the first test.
+/// [`metrics::MIN_DAILY_RETURNS`] daily returns on days with a bar close (without gaps, at most
+/// one per day it spans and one per bar), or a CAGR or Calmar objective when it cannot span
+/// [`metrics::MIN_CAGR_DAYS`] days. The first train window is the shortest: `train_bars` long when
+/// rolling, and when anchored up to `step_bars - 1` bars longer, since it starts at the first bar
+/// and so also takes the bars left over before the first test.
 ///
 /// Bars without gaps span their count times the timeframe, and hold the most daily returns when
 /// they start on the last bar of a UTC day. A data gap would stretch a window over more days, but
@@ -1214,7 +1215,8 @@ enum FloorRange {
 }
 
 /// Refuses a Sharpe or Sortino objective on a segment with fewer than
-/// [`metrics::MIN_DAILY_RETURNS`] daily returns or bars, or a CAGR or Calmar objective on one
+/// [`metrics::MIN_DAILY_RETURNS`] daily returns, or as many on days with a bar close (see
+/// [`metrics::observed_daily_returns`]), or a CAGR or Calmar objective on one
 /// shorter than [`metrics::MIN_CAGR_DAYS`] days: the metric is undefined on it whatever the
 /// parameters. The daily returns and length are counted from the bars as the run's metrics count
 /// them, from the first bar's open to the last bar's close.
@@ -1253,15 +1255,17 @@ fn refuse_short_segment(
     let refusal = match metric {
         Metric::Sharpe | Metric::Sortino => {
             let returns = metrics::daily_equity(&times, &vec![1.0; times.len()]).len() - 1;
+            // Counted as the report counts them: only days that hold a bar close.
+            let observed = metrics::observed_daily_returns(&times);
             if returns < min {
                 format!(
                     "a {name} objective needs at least {min} daily returns in {every}, and {this} \
                      ({length}) has {returns}"
                 )
-            } else if segment.len() < min {
+            } else if observed < min {
                 format!(
-                    "a {name} objective needs at least {min} bars as well as {min} daily returns \
-                     in {every}, and {this} is {length}"
+                    "a {name} objective needs at least {min} daily returns on days with a bar \
+                     close in {every}, and {this} ({length}) has {observed}"
                 )
             } else {
                 return Ok(());

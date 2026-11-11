@@ -347,7 +347,8 @@ total_return: number | null,
 cagr: number | null, 
 /**
  * Annualised volatility of daily returns; see [`volatility`] and [`daily_equity`]. `None`
- * with fewer than [`MIN_DAILY_RETURNS`] daily returns or bars, as are Sharpe and Sortino.
+ * with fewer than [`MIN_DAILY_RETURNS`] daily returns on days with a bar close, as are
+ * Sharpe and Sortino.
  */
 volatility: number | null, 
 /**
@@ -428,10 +429,10 @@ export type SweepMode = "grid" | { "random": { samples: number, seed: number, } 
  * A metrics report field a sweep can rank by.
  *
  * `Sharpe` and `Sortino` are undefined on a range with fewer than
- * [`metrics::MIN_DAILY_RETURNS`] daily returns or bars, and `Cagr` and `Calmar` on a range
- * shorter than [`metrics::MIN_CAGR_DAYS`] days; a run whose objective is undefined does not
- * qualify (see [`SweepRow::qualified`]). In a walk-forward that applies to each train window's
- * length, and in an out-of-sample test to the in-sample segment's.
+ * [`metrics::MIN_DAILY_RETURNS`] daily returns on days with a bar close, and `Cagr` and `Calmar`
+ * on a range shorter than [`metrics::MIN_CAGR_DAYS`] days; a run whose objective is undefined
+ * does not qualify (see [`SweepRow::qualified`]). In a walk-forward that applies to each train
+ * window's length, and in an out-of-sample test to the in-sample segment's.
  */
 export type Metric = "total_return" | "cagr" | "sharpe" | "sortino" | "calmar" | "profit_factor" | "win_rate" | "max_drawdown";
 
@@ -559,10 +560,10 @@ out_of_sample: BacktestResult,
  *
  * With `TotalReturn`, `Cagr` or `Calmar` it is therefore `None` when either segment is
  * shorter than [`metrics::MIN_CAGR_DAYS`] days, and with `Sharpe` or `Sortino` when either
- * has fewer than [`metrics::MIN_DAILY_RETURNS`] daily returns or bars (the in-sample segment
- * is refused up front then, so this is the out-of-sample one). It does not fall back to the
- * ratio of total returns, which would compare segments of different lengths; compare the
- * two runs' metrics directly then.
+ * has fewer than [`metrics::MIN_DAILY_RETURNS`] daily returns on days with a bar close (the
+ * in-sample segment is refused up front then, so this is the out-of-sample one). It does not
+ * fall back to the ratio of total returns, which would compare segments of different
+ * lengths; compare the two runs' metrics directly then.
  */
 degradation: number | null, };
 

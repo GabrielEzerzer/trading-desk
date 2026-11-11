@@ -16,8 +16,8 @@
 //! time; the maximum drawdown and its duration use the full per-bar series.
 //!
 //! The report leaves the annualised figures out of short runs, where they mean nothing: volatility,
-//! Sharpe and Sortino need [`MIN_DAILY_RETURNS`] daily returns and as many bars, and CAGR and
-//! Calmar need a run of [`MIN_CAGR_DAYS`] days. The functions below compute their formula on
+//! Sharpe and Sortino need [`MIN_DAILY_RETURNS`] daily returns on days with a bar close, and CAGR
+//! and Calmar need a run of [`MIN_CAGR_DAYS`] days. The functions below compute their formula on
 //! whatever they are given; the floors are applied by [`report`].
 //!
 //! Every value that can be undefined is an `Option`: `None` means there is not enough data, the
@@ -42,14 +42,15 @@ const MS_PER_YEAR: f64 = DAYS_PER_YEAR * DAY_MS as f64;
 /// gave a Sharpe of 12.5). Thirty, about a month of daily returns, is a common rule-of-thumb
 /// minimum for a sample standard deviation.
 ///
-/// The floor counts the UTC calendar days the equity curve spans (see [`daily_equity`]), not days
-/// with bars: a day inside a data gap, or between two walk-forward test windows in a stitched
-/// curve, counts as a daily return of zero. Zero returns lower the mean daily return more than
-/// its standard deviation, so they pull Sharpe and Sortino toward zero rather than inflate them
-/// (and volatility usually comes out lower), but a gappy curve reaches the floor with fewer real
-/// returns. The run also needs this many bars, since on bars longer than a day most daily returns
-/// are such zeros (five weekly bars span 35 days); bars of a day or shorter without gaps have a
-/// bar for every day, so for them only the daily count binds.
+/// The daily returns are taken on the UTC calendar days the equity curve spans (see
+/// [`daily_equity`]): a day inside a data gap, between two walk-forward test windows in a stitched
+/// curve, or inside a bar longer than a day counts as a daily return of zero. The floor counts
+/// only the daily returns on days that hold a bar close ([`observed_daily_returns`]), so a curve
+/// cannot reach it on carried-forward zeros: 30 hourly bars on two days a month apart, or five
+/// weekly bars spanning 35 days, have no ratios. That also means at least this many bars. Bars of
+/// a day or shorter without gaps close on every day they span, so for them the two counts agree.
+/// The zeros still count in the values themselves, where they pull Sharpe and Sortino toward zero
+/// (and usually lower volatility) rather than inflate them.
 pub const MIN_DAILY_RETURNS: usize = 30;
 
 /// The shortest run, from the first bar's open to the last bar's close, the report computes CAGR
@@ -70,7 +71,8 @@ pub struct MetricsReport {
     /// See [`cagr`]. `None` for a run shorter than [`MIN_CAGR_DAYS`].
     pub cagr: Option<f64>,
     /// Annualised volatility of daily returns; see [`volatility`] and [`daily_equity`]. `None`
-    /// with fewer than [`MIN_DAILY_RETURNS`] daily returns or bars, as are Sharpe and Sortino.
+    /// with fewer than [`MIN_DAILY_RETURNS`] daily returns on days with a bar close, as are
+    /// Sharpe and Sortino.
     pub volatility: Option<f64>,
     /// Annualised Sharpe ratio of daily returns; see [`sharpe`].
     pub sharpe: Option<f64>,
@@ -146,9 +148,10 @@ pub fn report(
         (Some(a), Some(b)) => b - a,
         _ => 0,
     };
-    // One value per bar after the starting value: `values.len() - 1` per-bar returns.
+    // The observed days are among the calendar days and each holds a bar close, so this floor also
+    // means at least as many daily returns and bars.
     let returns = per_bar_returns(&daily_equity(&series.times, values))
-        .filter(|r| r.len() >= MIN_DAILY_RETURNS && values.len() > MIN_DAILY_RETURNS);
+        .filter(|_| observed_daily_returns(&series.times) >= MIN_DAILY_RETURNS);
     let returns = returns.as_deref();
     let growth = if elapsed >= MIN_CAGR_DAYS * DAY_MS {
         cagr(values, elapsed)
@@ -220,6 +223,28 @@ pub fn daily_equity(times: &[Millis], values: &[f64]) -> Vec<f64> {
         day_end += DAY_MS;
     }
     daily
+}
+
+/// How many of the daily returns [`daily_equity`] forms over `times` fall on a UTC day that holds
+/// one of the times after the first (a bar close): the days whose value is observed rather than
+/// carried forward. A time stamped exactly 00:00 belongs to the day before, as in
+/// [`daily_equity`]. `times` must be ascending.
+pub fn observed_daily_returns(times: &[Millis]) -> usize {
+    let mut days = times
+        .get(1..)
+        .unwrap_or(&[])
+        .iter()
+        .map(|t| (t - 1).div_euclid(DAY_MS));
+    let Some(mut day) = days.next() else {
+        return 0;
+    };
+    let mut count = 1;
+    for d in days {
+        if d != day {
+            (day, count) = (d, count + 1);
+        }
+    }
+    count
 }
 
 /// `r_i = v_i / v_{i-1} - 1` for each consecutive pair. `None` with fewer than two values, if
@@ -693,6 +718,35 @@ mod tests {
     }
 
     #[test]
+    fn the_floor_counts_daily_returns_on_days_with_a_bar_close() {
+        let risk = |r: &MetricsReport| (r.volatility, r.sharpe, r.sortino);
+        // 30 hourly bars, 15 on day 0 and 15 on day 29: 30 daily returns and 30 bars, but only
+        // two days hold a bar close; the other 28 returns are carried-forward zeros.
+        let hours: Vec<i64> = (0..15).chain(29 * 24..29 * 24 + 15).collect();
+        let r = hourly_report(&hours);
+        assert_eq!(risk(&r), (None, None, None));
+        let mut times = vec![0];
+        times.extend(hours.iter().map(|h| (h + 1) * HOUR));
+        assert_eq!(daily_equity(&times, &vec![1.0; times.len()]).len() - 1, 30);
+        assert_eq!(observed_daily_returns(&times), 2);
+        // Without gaps, 697 hourly bars from midnight close on 30 days, and 696 on 29.
+        assert!(
+            risk(&hourly_report(&(0..697).collect::<Vec<_>>()))
+                .1
+                .is_some()
+        );
+        assert_eq!(
+            risk(&hourly_report(&(0..696).collect::<Vec<_>>())),
+            (None, None, None)
+        );
+        // The multi-day series closes on days 0, 1 and 3 of its four daily returns.
+        let s = multi_day_series();
+        assert_eq!(observed_daily_returns(&s.times), 3);
+        assert_eq!(observed_daily_returns(&[HOUR]), 0);
+        assert_eq!(observed_daily_returns(&[]), 0);
+    }
+
+    #[test]
     fn a_return_across_a_data_gap_is_not_a_one_bar_return() {
         // 31 hourly bars, one a day with 23-hour gaps between, against the same bars back to back.
         let contiguous = hourly_report(&(0..31).collect::<Vec<_>>());
@@ -755,21 +809,31 @@ mod tests {
 
     #[test]
     fn report_risk_metrics_are_annualised_daily_returns() {
-        // The multi-day series, then one value at noon on each of days 4 to 29, alternately up 1%
-        // and down 0.5%: 30 daily returns in all.
+        // The multi-day series, then one value at noon on each of days 4 to 30, alternately up 1%
+        // and down 0.5%: 31 daily returns in all, 30 of them on days with a value (day 2 has
+        // none). The carried day stays in the returns as a zero.
         let mut s = multi_day_series();
         let mut daily = vec![100.0, 110.0, 99.0, 99.0, 108.9];
         let mut e = 108.9;
-        for d in 4..30 {
+        for d in 4..31 {
             e *= if d % 2 == 0 { 1.01 } else { 0.995 };
             s.times.push(d * DAY + 12 * HOUR);
             s.values.push(e);
             daily.push(e);
         }
         assert_eq!(daily_equity(&s.times, &s.values), daily);
+        assert_eq!(observed_daily_returns(&s.times), 30);
         let r = report(&s, &[], &[], &[], 0.0);
         let returns = per_bar_returns(&daily).unwrap();
-        assert_eq!(returns.len(), 30);
+        assert_eq!(returns.len(), 31);
+        assert_eq!(returns[2], 0.0);
+        // A day less: 30 daily returns, but 29 on days with a value, so below the floor.
+        let short = EquitySeries {
+            times: s.times[..s.times.len() - 1].to_vec(),
+            values: s.values[..s.values.len() - 1].to_vec(),
+        };
+        let rs = report(&short, &[], &[], &[], 0.0);
+        assert_eq!((rs.volatility, rs.sharpe, rs.sortino), (None, None, None));
         assert_eq!(r.volatility, volatility(&returns, 365.0));
         assert_eq!(r.sharpe, sharpe(&returns, 365.0));
         assert_eq!(r.sortino, sortino(&returns, 365.0));
