@@ -7,7 +7,7 @@
 //! - `GET /instruments?venue=&kind=`: the instruments a venue lists, cached per server run.
 //! - `POST /data/download` `{instrument, from, to}`: starts a download job, answers `{job_id}`.
 //!   `from` may not be before 2017-01-01 UTC for binance and bybit ([`data::EARLIEST_FROM`]), or
-//!   before 2003-01-01 UTC for dukascopy ([`data::DUKASCOPY_EARLIEST_FROM`]); an instrument that
+//!   before 2005-01-01 UTC for oanda ([`data::OANDA_EARLIEST_FROM`]); an instrument that
 //!   already has an unfinished download in this server is a 409 `conflict` (a duplicate from
 //!   another server on the same data folder is safe, since the store locks across processes, just
 //!   redundant).
@@ -24,7 +24,9 @@
 //!   come from the store, resampled from its minutes; the slots it does not cover are fetched from
 //!   the venue's REST API, as a paper session's warm-up does, and are not stored, so an instrument
 //!   with no stored data works too. A bar still open is never returned. `to` defaults to now and
-//!   `from` to 2017-01-01; either one between bar boundaries is rounded up to the next. `limit` defaults to and is capped at [`candles::MAX_CANDLES`]; a range
+//!   `from` to the venue's earliest download date (2017-01-01, or 2005-01-01 for oanda), which
+//!   is also the earliest bar served; either one between bar boundaries is rounded up to the
+//!   next. `limit` defaults to and is capped at [`candles::MAX_CANDLES`]; a range
 //!   holding more bar slots than `limit` is cut to the latest `limit` slots ending at `to`, so the
 //!   chart gets the latest history (`truncated` says so when `from` was given). The response
 //!   names the spans served by the venue (`from_venue`) and the slots neither had (`missing`). A

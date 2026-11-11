@@ -1,7 +1,6 @@
 //! Downloads from the real venues and data feeds. Ignored by default; run with
-//! `cargo test -p td-data --test network -- --ignored`. The Dukascopy test reads a requester-pays
-//! S3 bucket: it needs AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY, and the transfer is billed to
-//! that account.
+//! `cargo test -p td-data --test network -- --ignored`. The OANDA test needs the token of an
+//! OANDA practice account in OANDA_API_TOKEN.
 
 use td_core::{InstrumentId, InstrumentKind, Timeframe, Venue};
 use td_data::time::{DAY, Month, format_minute, parse_date};
@@ -49,15 +48,15 @@ fn one_day_of_btcusdt_from_each_source() {
 }
 
 #[test]
-#[ignore = "downloads from Dukascopy's requester-pays S3 bucket, billed to the AWS credentials"]
-fn one_day_of_usdjpy_from_dukascopy_has_bids_and_asks_on_the_same_minutes() {
+#[ignore = "downloads from OANDA's practice API, with the token in OANDA_API_TOKEN"]
+fn one_day_of_usdjpy_from_oanda_has_bids_and_asks_on_the_same_minutes() {
     let dir = tempfile::tempdir().expect("a temp dir");
     let store = Store::new(dir.path());
     let http = Http::new().expect("an HTTP client");
-    // A Wednesday, open all day, well inside the bucket's history.
-    let from = parse_date("2024-11-06").expect("a date");
+    // A Wednesday, open all day, in the first year the desk's FX history needs.
+    let from = parse_date("2016-01-06").expect("a date");
     let id = InstrumentId {
-        venue: Venue::Dukascopy,
+        venue: Venue::Oanda,
         symbol: "USDJPY".into(),
         kind: InstrumentKind::Fx,
     };
@@ -72,8 +71,8 @@ fn one_day_of_usdjpy_from_dukascopy_has_bids_and_asks_on_the_same_minutes() {
         "{:?}",
         report.missing_files
     );
-    // Every minute of an open day: a quiet one is filled at the last price, and only the minutes
-    // before the day's first tick can be missing.
+    // Every minute of an open day: a quiet one is filled at the last close, and only the minutes
+    // before the day's first candle can be missing.
     assert!(bids.len() > 1_400, "{} minutes", bids.len());
     assert_eq!(asks.len(), bids.len());
     for (bid, ask) in bids.iter().zip(&asks) {

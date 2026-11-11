@@ -71,7 +71,7 @@ impl From<QueryRejection> for ApiError {
     }
 }
 
-/// Data errors caused by what the client asked for, or by AWS credentials that are missing or
+/// Data errors caused by what the client asked for, or by an OANDA token that is missing or
 /// refused, are 400s; the venue failing, or a source giving quotes the store refuses during a
 /// download, is a 502; a stored month of a quoted market without its asks is a 422
 /// `data_missing`; the rest (disk, corrupt files, no data directory) are 500s.
@@ -99,8 +99,8 @@ impl From<DataError> for ApiError {
             | DataError::NoFunding(_)
             | DataError::NoLiveStream(_)
             | DataError::InvalidInstrument { .. }
-            | DataError::MissingAwsCredentials { .. }
-            | DataError::AwsRefused { .. } => ApiError::bad_request(message),
+            | DataError::MissingOandaToken
+            | DataError::OandaRefused { .. } => ApiError::bad_request(message),
             DataError::Http { .. } | DataError::Status { .. } | DataError::Api { .. } => {
                 ApiError::new(StatusCode::BAD_GATEWAY, "venue", message)
             }

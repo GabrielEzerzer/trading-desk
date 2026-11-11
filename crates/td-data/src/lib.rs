@@ -1,6 +1,6 @@
 //! Market data: instrument metadata, history download, the local Parquet candle store,
 //! resampling to higher timeframes, and live candle feeds ([`live`]). What differs between data
-//! sources (Binance, Bybit) sits behind [`DataSource`]; [`source()`] maps a venue to its source.
+//! sources (Binance, Bybit, OANDA) sits behind [`DataSource`]; [`source()`] maps a venue to its source.
 //!
 //! The engine reads candles as [`LoadedCandles`] (the bars, and the buckets dropped as incomplete
 //! or built with a few minutes missing) and funding as `Vec<(Millis, f64)>` from [`Store`].
@@ -8,13 +8,12 @@
 pub mod binance;
 pub mod bybit;
 mod download;
-pub mod dukascopy;
 mod error;
 mod http;
 pub mod instruments;
 pub mod live;
+pub mod oanda;
 mod resample;
-mod sigv4;
 mod source;
 mod store;
 pub mod time;

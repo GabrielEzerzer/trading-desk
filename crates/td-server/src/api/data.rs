@@ -80,24 +80,23 @@ pub(super) async fn instrument_list(
 /// that do not exist.
 pub const EARLIEST_FROM: Millis = 1_483_228_800_000;
 
-/// The earliest `from` a Dukascopy download accepts: 2003-01-01 00:00 UTC. Dukascopy's "Data
-/// export" page (<https://wiki.dukascopy.com/en/development/data-export/>, read on 2026-11-11)
-/// names no earliest date, so this is a floor chosen early enough for the FX history the desk
-/// needs, from 2016; it is not taken from any pair's first file.
-pub const DUKASCOPY_EARLIEST_FROM: Millis = 1_041_379_200_000;
+/// The earliest `from` an OANDA download accepts: 2005-01-01 00:00 UTC. OANDA's practice API
+/// returned full pages of USDJPY minutes from 2005 when it was tried on 2026-11-11; the desk's FX
+/// history starts in 2016.
+pub const OANDA_EARLIEST_FROM: Millis = 1_104_537_600_000;
 
-/// The earliest `from` a download of `venue`'s data accepts, and the message refusing an earlier
-/// one.
-fn earliest_from(venue: Venue) -> (Millis, &'static str) {
+/// The earliest time anything of `venue`'s is downloaded or charted from, and the message refusing
+/// a download from earlier.
+pub(super) fn earliest_from(venue: Venue) -> (Millis, &'static str) {
     match venue {
         Venue::Binance | Venue::Bybit => (
             EARLIEST_FROM,
             "`from` must not be before 2017-01-01 00:00 UTC (1483228800000), before either \
              venue's earliest data",
         ),
-        Venue::Dukascopy => (
-            DUKASCOPY_EARLIEST_FROM,
-            "`from` must not be before 2003-01-01 00:00 UTC (1041379200000) for dukascopy",
+        Venue::Oanda => (
+            OANDA_EARLIEST_FROM,
+            "`from` must not be before 2005-01-01 00:00 UTC (1104537600000) for oanda",
         ),
     }
 }
@@ -108,7 +107,7 @@ fn earliest_from(venue: Venue) -> (Millis, &'static str) {
 pub struct DownloadRequest {
     pub instrument: InstrumentId,
     /// Not before 2017-01-01 00:00 UTC (1483228800000) for binance and bybit, or before
-    /// 2003-01-01 00:00 UTC (1041379200000) for dukascopy; earlier is a 400.
+    /// 2005-01-01 00:00 UTC (1104537600000) for oanda; earlier is a 400.
     pub from: Millis,
     pub to: Millis,
 }
@@ -486,7 +485,7 @@ mod tests {
 
     #[test]
     fn instruments_parse_from_their_display_form() {
-        for text in ["bybit:ETHUSDT:perpetual", "dukascopy:USDJPY:fx"] {
+        for text in ["bybit:ETHUSDT:perpetual", "oanda:USDJPY:fx"] {
             let id = parse_instrument(text).expect("parses");
             assert_eq!(id.to_string(), text);
         }
