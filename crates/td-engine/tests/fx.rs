@@ -507,3 +507,144 @@ fn a_per_unit_commission_is_charged_on_every_fill() {
     };
     approx(both.fee(150.020, 1000.0, both.taker), 15.002 + 2.0);
 }
+
+/// An FX backtest of the SMA cross over `bars` one-minute bars, all traded.
+fn fx_backtest(bars: usize) -> td_engine::BacktestConfig {
+    td_engine::BacktestConfig {
+        strategy: "sma_cross".into(),
+        params: td_engine::Params::new()
+            .with("fast", td_engine::ParamValue::Int(2))
+            .with("slow", td_engine::ParamValue::Int(4)),
+        instrument: usdjpy(),
+        timeframe: Timeframe::M1,
+        from: 0,
+        to: bars as Millis * MIN,
+        starting_cash: 1_000_000.0,
+        slippage_bps: 0.0,
+        fee_override: Some(FeeSchedule {
+            maker: 0.0,
+            taker: 0.0,
+            per_unit: 0.002,
+        }),
+        max_leverage: 1.0,
+        warmup_from: None,
+        close_at_end: false,
+    }
+}
+
+/// Bid bars drifting up by 0.010 a minute from 150, and asks 0.020 above them.
+fn quotes(n: usize) -> (Vec<Candle>, Vec<Candle>) {
+    let bids: Vec<Candle> = (0..n)
+        .map(|i| {
+            let p = 150.0 + 0.01 * i as f64;
+            candle(i as i64, [p, p + 0.005, p - 0.005, p + 0.002])
+        })
+        .collect();
+    let asks = bids
+        .iter()
+        .map(|b| Candle {
+            open: b.open + 0.02,
+            high: b.high + 0.02,
+            low: b.low + 0.02,
+            close: b.close + 0.02,
+            ..*b
+        })
+        .collect();
+    (bids, asks)
+}
+
+#[test]
+fn an_fx_run_needs_matching_asks_and_a_spot_run_refuses_them() {
+    let (bids, asks) = quotes(8);
+    let config = fx_backtest(8);
+    assert!(td_engine::run(&config, &bids, &asks, &[]).is_ok());
+    // Without asks.
+    assert_eq!(
+        td_engine::run(&config, &bids, &[], &[]).unwrap_err(),
+        EngineError::MissingAsk {
+            time: 0,
+            kind: InstrumentKind::Fx
+        }
+    );
+    // One ask missing, for the bar at minute 3.
+    let mut gap = asks.clone();
+    gap.remove(3);
+    assert_eq!(
+        td_engine::run(&config, &bids, &gap, &[]).unwrap_err(),
+        EngineError::MissingAsk {
+            time: 3 * MIN,
+            kind: InstrumentKind::Fx
+        }
+    );
+    // An ask at a time with no bar: minute 3's ask moved 30 seconds on.
+    let mut moved = asks.clone();
+    moved[3].open_time += 30_000;
+    assert_eq!(
+        td_engine::run(&config, &bids, &moved, &[]).unwrap_err(),
+        EngineError::UnmatchedAsk {
+            time: 3 * MIN + 30_000
+        }
+    );
+    // Asks on a spot run.
+    let spot_config = td_engine::BacktestConfig {
+        instrument: spot(),
+        fee_override: None,
+        ..config
+    };
+    assert_eq!(
+        td_engine::run(&spot_config, &bids, &asks, &[]).unwrap_err(),
+        EngineError::AsksWithoutQuotes {
+            kind: InstrumentKind::Spot
+        }
+    );
+}
+
+#[test]
+fn the_fx_benchmark_buys_at_the_first_ask_open_and_pays_the_per_unit_commission() {
+    // All of a million yen at the first ask open, 150.020, with 0.002 a unit:
+    // floor(1 000 000 / (150.020 + 0.002)) = floor(6665.69...) = 6665 units, fee 6665 * 0.002
+    // = 13.33 yen.
+    let (bids, asks) = quotes(8);
+    let result = td_engine::run(&fx_backtest(8), &bids, &asks, &[]).unwrap();
+    let bench = &result.benchmark;
+    assert_eq!(bench.entry_price, 150.020);
+    assert_eq!(bench.qty, 6665.0);
+    // Marked at the last bid close, 150.072: 1 000 000 - 13.33 + 6665 * (150.072 - 150.020).
+    let last = bench.equity.last().unwrap().equity;
+    approx(last, 1_000_000.0 - 13.33 + 6665.0 * (150.072 - 150.020));
+}
+
+#[test]
+fn the_fingerprint_covers_the_asks_and_is_unchanged_without_them() {
+    let (bids, asks) = quotes(8);
+    let config = fx_backtest(8);
+    let base = td_engine::config_fingerprint(&config, &bids, &asks, &[]).unwrap();
+    assert_eq!(
+        td_engine::run(&config, &bids, &asks, &[])
+            .unwrap()
+            .data_fingerprint,
+        base
+    );
+    // One ask's high moved by one tick.
+    let mut changed = asks.clone();
+    changed[5].high += 0.001;
+    assert_ne!(
+        td_engine::config_fingerprint(&config, &bids, &changed, &[]).unwrap(),
+        base
+    );
+    assert_ne!(
+        td_engine::data_fingerprint(&bids, &asks, &[]),
+        td_engine::data_fingerprint(&bids, &changed, &[])
+    );
+
+    // Crypto passes no asks, and its fingerprint is the one main computed before asks existed for
+    // these two bars and one funding event.
+    let bars = [
+        bar(0, 100.0, 101.0, 99.0, 100.5),
+        bar(1, 100.5, 102.0, 100.0, 101.0),
+    ];
+    assert_eq!(
+        td_engine::data_fingerprint(&bars, &[], &[(30_000, 0.0001)]),
+        "7e1973b2e1f7195998b82e84290884c5953883179b654faa6d8472066c3a60cf"
+    );
+}

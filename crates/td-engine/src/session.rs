@@ -7,6 +7,7 @@ use td_core::{
 };
 
 use crate::broker::ENTRY_CANCELLED;
+use crate::runner::match_asks;
 use crate::{
     BarFunding, Broker, BrokerEvent, CandleFillModel, Context, EngineError, Order, OrderStatus,
     Portfolio, SimBroker, Strategy,
@@ -626,22 +627,26 @@ fn liquidation_trigger(
 
 /// Runs a strategy over stored bars by feeding them to a new [`Session`] one at a time.
 ///
-/// `funding` is a series of `(time, rate)`, in any order; each event is charged on the bar whose
-/// time window contains it, an event in a gap between bars at the next bar's open, and events
-/// before the first bar or from the last bar's end on are not charged.
+/// `asks` is the ask series beside `bars`, matched by open time as [`crate::run`] matches it:
+/// empty for a kind without quotes, one for every bar for a kind with them. `funding` is a series
+/// of `(time, rate)`, in any order; each event is charged on the bar whose time window contains
+/// it, an event in a gap between bars at the next bar's open, and events before the first bar or
+/// from the last bar's end on are not charged.
 pub fn run_backtest(
     strategy: Box<dyn Strategy>,
     instrument: Instrument,
     timeframe: Timeframe,
     bars: &[Candle],
+    asks: &[Candle],
     funding: &[(Millis, f64)],
     config: SessionConfig,
 ) -> Result<Session, EngineError> {
+    let bar_asks = match_asks(instrument.id.kind, bars, asks, bars)?;
     let funding = sorted_funding(funding);
     let ranges = funding_ranges(timeframe, bars, &funding);
     let mut session = Session::new(strategy, instrument, timeframe, config)?;
-    for (bar, range) in bars.iter().zip(ranges) {
-        session.on_bar(*bar, &funding[range])?;
+    for ((bar, ask), range) in bars.iter().zip(bar_asks).zip(ranges) {
+        session.on_bar_with_ask(*bar, ask, &funding[range])?;
     }
     Ok(session)
 }
