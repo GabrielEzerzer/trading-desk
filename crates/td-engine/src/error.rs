@@ -34,6 +34,9 @@ pub enum EngineError {
     #[error("the ask at {time} matches no bar")]
     UnmatchedAsk { time: Millis },
 
+    #[error("more than one ask opens at {time}")]
+    DuplicateAsk { time: Millis },
+
     /// An ask whose open, high, low or close is below the bid's: real quotes never cross, so the
     /// series are wrong, for example swapped. Equal is a zero spread and allowed.
     #[error("the ask for the bar at {time} is below the bid")]

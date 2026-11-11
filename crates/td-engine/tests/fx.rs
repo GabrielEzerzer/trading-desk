@@ -772,6 +772,29 @@ fn a_zero_spread_is_accepted() {
 }
 
 #[test]
+fn a_second_ask_at_one_time_is_refused() {
+    // Two asks at minute 3, the second with its high a tick higher: an error, as two bars at one
+    // time are, rather than the later one kept. The fingerprint, which the tester takes before it
+    // runs anything, refuses them the same way.
+    let (bids, mut asks) = quotes(8);
+    let second = Candle {
+        high: asks[3].high + 0.001,
+        ..asks[3]
+    };
+    asks.insert(4, second);
+    let config = fx_backtest(8);
+    let duplicate = EngineError::DuplicateAsk { time: 3 * MIN };
+    assert_eq!(
+        td_engine::run(&config, &bids, &asks, &[]).unwrap_err(),
+        duplicate
+    );
+    assert_eq!(
+        td_engine::config_fingerprint(&config, &bids, &asks, &[]).unwrap_err(),
+        duplicate
+    );
+}
+
+#[test]
 fn the_fx_benchmark_buys_at_the_first_ask_open_and_pays_the_per_unit_commission() {
     // All of a million yen at the first ask open, 150.020, with 0.002 a unit:
     // floor(1 000 000 / (150.020 + 0.002)) = floor(6665.69...) = 6665 units, fee 6665 * 0.002

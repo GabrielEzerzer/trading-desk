@@ -144,9 +144,10 @@ pub struct Rerun {
 /// bars inside `warmup_from..from` warm the strategy up first. `asks` is the ask series beside
 /// `bars`, which then hold the bid, matched to them by open time: empty for a kind whose rules have
 /// no quotes, and for a kind with quotes one for every bar used (warm-up bars too), never filled in
-/// from the bid. An ask that matches no bar in `bars` is an error. `funding` is `(time, rate)` in
-/// any order. An event in a gap between traded bars is charged at the next bar's open, like one due at
-/// that open; events before the first traded bar or from the last traded bar's end on are ignored.
+/// from the bid. An ask that matches no bar in `bars`, or a second ask at one time, is an error.
+/// `funding` is `(time, rate)` in any order. An event in a gap between traded bars is charged at
+/// the next bar's open, like one due at that open; events before the first traded bar or from the
+/// last traded bar's end on are ignored.
 ///
 /// The strategy is built through the registry and run on a [`Session`], then the trade list,
 /// metrics and buy-and-hold benchmark are derived from the session's record.
@@ -232,8 +233,8 @@ pub fn run(
 
 /// The ask of each of `used`, from `asks` matched by open time, or `None` for every bar when the
 /// kind has no quotes. `all` is every bar given to the run, which every ask must match. Errors for
-/// asks given on a kind without quotes, an ask that matches no bar in `all`, and a bar in `used`
-/// without an ask on a kind with quotes.
+/// asks given on a kind without quotes, an ask that matches no bar in `all`, two asks with one open
+/// time, and a bar in `used` without an ask on a kind with quotes.
 pub(crate) fn match_asks(
     kind: InstrumentKind,
     all: &[Candle],
@@ -252,7 +253,14 @@ pub(crate) fn match_asks(
             time: ask.open_time,
         });
     }
-    let by_time: HashMap<Millis, Candle> = asks.iter().map(|a| (a.open_time, *a)).collect();
+    let mut by_time = HashMap::with_capacity(asks.len());
+    for ask in asks {
+        if by_time.insert(ask.open_time, *ask).is_some() {
+            return Err(EngineError::DuplicateAsk {
+                time: ask.open_time,
+            });
+        }
+    }
     used.iter()
         .map(|bar| match by_time.get(&bar.open_time) {
             Some(ask) => Ok(Some(*ask)),
