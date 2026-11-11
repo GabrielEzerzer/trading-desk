@@ -6,6 +6,7 @@
 //! `gotobi_calendar` is a calendar for strategies to use, not a strategy.
 
 pub mod donchian;
+pub mod gotobi;
 pub mod gotobi_calendar;
 pub mod sma_cross;
 
