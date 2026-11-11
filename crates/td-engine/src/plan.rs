@@ -19,7 +19,7 @@ use td_core::{FeeSchedule, Instrument, InstrumentId, Millis, Timeframe, days_fro
 use crate::metrics::DAY_MS;
 use crate::{
     BacktestConfig, Objective, OosSpec, ParamAxis, Params, Split, SweepMode, SweepSpec,
-    WalkForwardSpec, WindowMode, WindowSpec,
+    WalkForwardSpec, WindowMode, WindowSpec, default_slippage_bps,
 };
 
 /// The fewest permutations the luck test (R3) may run. With 49 the smallest p it can report is
@@ -302,22 +302,13 @@ impl WalkForwardPlan {
 
 impl TestPlan {
     /// The backtest of `strategy` on `instrument` over the plan's period, with the sweep's fixed
-    /// parameters. `default_slippage_bps` is the backtest config's default slippage for
-    /// `instrument`, used when the plan sets none for it.
-    ///
-    /// shortcut: the caller passes the default because it lives with the backtest config, which
-    /// #35 part 1 adds (`runner::default_slippage_bps`) on its own branch; once that merges, call
-    /// it here and drop the argument.
-    pub fn backtest_config(
-        &self,
-        strategy: &str,
-        instrument: Instrument,
-        default_slippage_bps: f64,
-    ) -> BacktestConfig {
+    /// parameters. The slippage is the plan's for `instrument`, or [`default_slippage_bps`] for it
+    /// when the plan sets none.
+    pub fn backtest_config(&self, strategy: &str, instrument: Instrument) -> BacktestConfig {
         let slippage_bps = self
             .backtest
             .slippage_bps(&instrument.id)
-            .unwrap_or(default_slippage_bps);
+            .unwrap_or_else(|| default_slippage_bps(&instrument));
         BacktestConfig {
             strategy: strategy.to_string(),
             params: self.sweep.fixed.clone(),
@@ -334,16 +325,11 @@ impl TestPlan {
         }
     }
 
-    /// The plan's grid sweep over the whole period. `default_slippage_bps` as in
+    /// The plan's grid sweep over the whole period, with the slippage of
     /// [`TestPlan::backtest_config`].
-    pub fn sweep_spec(
-        &self,
-        strategy: &str,
-        instrument: Instrument,
-        default_slippage_bps: f64,
-    ) -> SweepSpec {
+    pub fn sweep_spec(&self, strategy: &str, instrument: Instrument) -> SweepSpec {
         SweepSpec {
-            base: self.backtest_config(strategy, instrument, default_slippage_bps),
+            base: self.backtest_config(strategy, instrument),
             axes: self.sweep.axes.clone(),
             mode: SweepMode::Grid,
             objective: self.sweep.objective,
@@ -351,26 +337,16 @@ impl TestPlan {
         }
     }
 
-    pub fn walk_forward_spec(
-        &self,
-        strategy: &str,
-        instrument: Instrument,
-        default_slippage_bps: f64,
-    ) -> WalkForwardSpec {
+    pub fn walk_forward_spec(&self, strategy: &str, instrument: Instrument) -> WalkForwardSpec {
         WalkForwardSpec {
-            sweep: self.sweep_spec(strategy, instrument, default_slippage_bps),
+            sweep: self.sweep_spec(strategy, instrument),
             windows: self.walk_forward.window_spec(self.timeframe),
         }
     }
 
-    pub fn oos_spec(
-        &self,
-        strategy: &str,
-        instrument: Instrument,
-        default_slippage_bps: f64,
-    ) -> Option<OosSpec> {
+    pub fn oos_spec(&self, strategy: &str, instrument: Instrument) -> Option<OosSpec> {
         self.out_of_sample.map(|split| OosSpec {
-            sweep: self.sweep_spec(strategy, instrument, default_slippage_bps),
+            sweep: self.sweep_spec(strategy, instrument),
             split,
         })
     }
@@ -445,10 +421,9 @@ impl TestPlan {
                 taker: 0.0,
             },
         };
-        // The slippage does not change these checks, so a stand-in 0 serves.
-        let wf = self.walk_forward_spec(strategy, stand_in.clone(), 0.0);
+        let wf = self.walk_forward_spec(strategy, stand_in.clone());
         wf.check().map_err(|e| PlanError(e.to_string()))?;
-        if let Some(oos) = self.oos_spec(strategy, stand_in, 0.0) {
+        if let Some(oos) = self.oos_spec(strategy, stand_in) {
             if let Split::Fraction(f) = oos.split
                 && !(f > 0.0 && f < 1.0)
             {
@@ -631,14 +606,14 @@ mod tests {
                 taker: 0.001,
             },
         };
-        let wf = plan.walk_forward_spec("sma_cross", inst.clone(), 2.0);
+        let wf = plan.walk_forward_spec("sma_cross", inst.clone());
         assert_eq!(wf.sweep.mode, SweepMode::Grid);
         assert_eq!(wf.sweep.base.from, plan.period.from);
         assert_eq!(wf.sweep.base.starting_cash, 10_000.0);
         assert_eq!(wf.sweep.base.instrument, inst);
         assert_eq!(wf.check(), Ok(()));
         assert_eq!(
-            plan.oos_spec("sma_cross", inst, 2.0).unwrap().split,
+            plan.oos_spec("sma_cross", inst).unwrap().split,
             Split::Fraction(0.7)
         );
     }
@@ -651,7 +626,7 @@ mod tests {
         assert!(plan.backtest.slippage.is_empty());
         let instrument = |id: &InstrumentId| Instrument {
             id: id.clone(),
-            base: String::new(),
+            base: id.symbol.trim_end_matches("USDT").into(),
             quote: "USDT".into(),
             tick_size: 0.01,
             lot_size: 0.00001,
@@ -664,7 +639,7 @@ mod tests {
         };
         let (btc, eth) = (plan.instruments[0].clone(), plan.instruments[1].clone());
         let slip = |plan: &TestPlan, id: &InstrumentId| {
-            plan.backtest_config("sma_cross", instrument(id), 2.0)
+            plan.backtest_config("sma_cross", instrument(id))
                 .slippage_bps
         };
         assert_eq!((slip(&plan, &btc), slip(&plan, &eth)), (2.0, 2.0));
@@ -676,7 +651,7 @@ mod tests {
         assert_eq!(plan.backtest.slippage_bps(&btc), None);
         assert_eq!(plan.backtest.slippage_bps(&eth), Some(7.5));
         assert_eq!((slip(&plan, &btc), slip(&plan, &eth)), (2.0, 7.5));
-        let wf = plan.walk_forward_spec("sma_cross", instrument(&eth), 2.0);
+        let wf = plan.walk_forward_spec("sma_cross", instrument(&eth));
         assert_eq!(wf.sweep.base.slippage_bps, 7.5);
 
         let json = serde_json::to_value(&plan).unwrap();
