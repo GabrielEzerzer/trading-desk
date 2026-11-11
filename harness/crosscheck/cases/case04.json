@@ -1,7 +1,8 @@
 {
   "name": "case04",
   "title": "Short and hold, Bybit perpetual BTCUSDT, 4h, April to June 2021 around the May 2021 crash, with funding",
-  "exercises": "Funding sign and timing, short P&L",
+  "about": "Funding sign and timing, short P&L",
+  "exercises": ["funding_paid", "funding_received", "funding_at_open", "short_trades"],
   "strategy": "crosscheck_short_and_hold",
   "params": { "fraction": 0.99 },
   "venue": "bybit",

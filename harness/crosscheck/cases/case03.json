@@ -1,7 +1,8 @@
 {
   "name": "case03",
   "title": "sma_cross long/short, Binance perpetual BTCUSDT, 1h, the trending half-year October 2023 to March 2024, with funding",
-  "exercises": "Flips, funding in both directions",
+  "about": "Flips, funding in both directions",
+  "exercises": ["flips", "funding_paid", "funding_received"],
   "strategy": "sma_cross",
   "params": { "fast": 10, "slow": 30, "allow_short": true, "equity_fraction": 0.95 },
   "venue": "binance",

@@ -1,7 +1,8 @@
 {
   "name": "case01",
   "title": "Buy and hold, Binance spot BTCUSDT, 1d, the trending year 2023",
-  "exercises": "Market fill, fee, marking, the benchmark",
+  "about": "Market fill, fee, marking, the benchmark",
+  "exercises": ["market_fills", "fees", "marking", "benchmark"],
   "strategy": "crosscheck_buy_and_hold",
   "params": { "fraction": 0.99 },
   "venue": "binance",

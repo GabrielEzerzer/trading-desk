@@ -1,7 +1,8 @@
 {
   "name": "case09",
   "title": "crosscheck_stop_limit_breakout, a stop-limit breakout entry and a market exit after 16 bars, Bybit perpetual BTCUSDT, 15m, the trending month of February 2024",
-  "exercises": "Stop-limit triggers, fills at the trigger, entries cancelled after 8 bars, funding",
+  "about": "Stop-limit triggers, fills at the trigger, entries cancelled after 8 bars, funding",
+  "exercises": ["stop_limit_triggers", "stop_limit_rested"],
   "strategy": "crosscheck_stop_limit_breakout",
   "params": { "channel": 20, "trend": 50, "trigger_gap": 0.001, "limit_offset": 0.002, "cancel_after": 8, "hold": 16, "qty": 0.05 },
   "venue": "bybit",

@@ -1,7 +1,8 @@
 {
   "name": "case02",
   "title": "sma_cross long only, Binance spot ETHUSDT, 1h, the ranging half-year April to September 2023",
-  "exercises": "Many round trips, cash, lot rounding",
+  "about": "Many round trips, cash, lot rounding",
+  "exercises": ["round_trips", "cash", "lot_rounding"],
   "strategy": "sma_cross",
   "params": { "fast": 10, "slow": 30, "allow_short": false, "equity_fraction": 0.95 },
   "venue": "binance",

@@ -1,7 +1,8 @@
 {
   "name": "case06",
   "title": "donchian_breakout long only, Bybit spot BTCUSDT, 4h, the trending year 2023",
-  "exercises": "Reduce-only exits on spot, risk sizing against the cash, attached stops on a cash account",
+  "about": "Reduce-only exits on spot, risk sizing against the cash, attached stops on a cash account",
+  "exercises": ["reduce_only_exits", "risk_sizing"],
   "strategy": "donchian_breakout",
   "params": { "entry": 20, "exit": 10, "atr_period": 14, "atr_stop": 2.0, "risk": 0.01, "allow_short": false },
   "venue": "bybit",

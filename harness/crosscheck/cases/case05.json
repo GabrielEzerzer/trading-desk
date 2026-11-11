@@ -1,7 +1,9 @@
 {
   "name": "case05",
   "title": "donchian_breakout long/short with its attached stop, Binance perpetual BTCUSDT, 15m, the FTX crash week of 7 to 13 November 2022",
-  "exercises": "Attached stops filling inside the bar and through gaps, reduce-only exits, risk sizing, funding",
+  "about": "Attached stops filling inside the bar and through gaps, reduce-only exits, risk sizing, funding",
+  "exercises": ["stop_through_gap", "stop_through_dropped_bucket", "stop_on_entry_bar", "ambiguous_bars"],
+  "exercise_note": "No period was searched for the missing ones: a search was started and stopped unfinished, nothing from it is used, and the case keeps its row's week. Two of them cannot come from another period of this case as it stands. Binance perpetual BTCUSDT, the row's instrument, had no dropped bucket at 15m in the months the stopped search downloaded (January 2020 to October 2025), so a stop through dropped buckets needs another instrument or venue. And donchian_breakout enters at the market and holds one resting order, its stop, so no bar can have two of its orders reachable: an ambiguous bar needs a resting entry with its attached stop, a change to the strategy rather than to the period.",
   "strategy": "donchian_breakout",
   "params": { "entry": 20, "exit": 10, "atr_period": 14, "atr_stop": 2.0, "risk": 0.01, "allow_short": true },
   "venue": "binance",

@@ -502,8 +502,12 @@ def test_a_stop_and_a_target_both_inside_the_range_make_the_bar_ambiguous():
     stop = order(2, "sell", 1.0, "stop", trigger=108.5)
     found = amb(resting(3, target, stop))
     assert list(found) == [3]
-    # Bound 2: the larger order's qty times the spread of the levels, plus both fees on the higher.
-    assert abs(found[3]["bound"] - (2.0 * 2.5 + 2.0 * 111.0 * (MAKER + TAKER))) < 1e-12
+    # Bound 2: the larger order's qty times the spread of the levels, plus the larger fee on the
+    # higher: two fees of the same sign differ by at most the larger one.
+    assert abs(found[3]["bound"] - (2.0 * 2.5 + 2.0 * 111.0 * TAKER)) < 1e-12
+    # A maker rebate against a taker charge can differ by both.
+    rebate = compare.ambiguous_bars([resting(3, target, stop)], bars(), -MAKER, TAKER)
+    assert abs(rebate[3]["bound"] - (2.0 * 2.5 + 2.0 * 111.0 * (MAKER + TAKER))) < 1e-12
     # One of them alone is not ambiguous, nor is a target the bar opens at (it fills first).
     assert amb(resting(3, target)) == {}
     assert amb(resting(3, order(1, "sell", 2.0, "limit", price=109.0), stop)) == {}
@@ -621,6 +625,38 @@ def test_an_ambiguous_entry_leaves_the_bars_to_its_exit_out_of_the_curve():
     assert by_name(cmp)["equity curve, every bar"].ok, by_name(cmp)["equity curve, every bar"]
 
 
+AMBIGUOUS_PRICE = "ambiguous fills: ours at the worse listed level for the side"
+
+
+def test_our_fill_on_an_ambiguous_bar_must_be_at_the_worse_level():
+    # Our broker takes the stop (108.5) before the target (111.0) for the long's sell exit.
+    ours, theirs = bracket_pair(108.5, 111.0)
+    for cmp in (compare_gapless(ours, theirs, bars(), TICK, maker=MAKER, taker=TAKER),
+                compare_real(ours, theirs, bars(), TAKER, maker=MAKER, tick=TICK)):
+        assert by_name(cmp)[AMBIGUOUS_PRICE].ok, by_name(cmp)[AMBIGUOUS_PRICE]
+    # Our fill at a price no listed order has (here 110.0, between them) fails in both series, as
+    # does our fill at the better level, which our broker never takes first.
+    for price in (110.0, 111.0):
+        ours, theirs = bracket_pair(price, 111.0)
+        for cmp in (compare_gapless(ours, theirs, bars(), TICK, maker=MAKER, taker=TAKER),
+                    compare_real(ours, theirs, bars(), TAKER, maker=MAKER, tick=TICK)):
+            assert not by_name(cmp)[AMBIGUOUS_PRICE].ok and not cmp.ok
+
+
+def test_the_worse_level_of_a_buy_is_the_highest():
+    # A short's buy exit: stop above at 111.5, target below at 108.5, both inside bar 3. The worse
+    # for a buy is the stop.
+    b = bars()
+    snaps = [resting(3, order(2, "buy", 1.0, "stop", trigger=111.5),
+                     order(3, "buy", 1.0, "limit", price=108.5))]
+    ambiguous = compare.ambiguous_bars(snaps, b, MAKER, TAKER)
+    ok_pair = {"bar": 3, "class": compare.AMBIGUOUS, "ours": fill(3 * H, "buy", 1.0, 111.5, 0.0),
+               "theirs": fill(4 * H, "buy", 1.0, 108.5, 0.0)}
+    assert compare.ambiguous_price_check([ok_pair], ambiguous, TICK).ok
+    bad_pair = dict(ok_pair, ours=fill(3 * H, "buy", 1.0, 108.5, 0.0))
+    assert not compare.ambiguous_price_check([bad_pair], ambiguous, TICK).ok
+
+
 def test_ambiguous_trades_on_real_bars_add_bound_two():
     ours, theirs = bracket_pair(108.5, 111.0)
     cmp = compare_real(ours, theirs, bars(), TAKER, maker=MAKER, tick=TICK)
@@ -628,6 +664,37 @@ def test_ambiguous_trades_on_real_bars_add_bound_two():
     assert cmp.numbers["bound2"] > 2.5
     ours["resting"] = []
     assert not compare_real(ours, theirs, bars(), TAKER, maker=MAKER, tick=TICK).ok
+
+
+def test_a_trade_takes_only_its_own_fills_when_the_next_entry_shares_its_exit_bar():
+    # A long closed by its stop inside the ambiguous bar 3 and a short opened by a market sell
+    # decided on the same bar: both fills are sells of bar 3. The short's entry is not on an
+    # ambiguous bar, and the long's exit is the stop alone.
+    stop = {"type": "stop", "trigger": 108.5}
+    ours_fills = [
+        fill(2 * H, "buy", 1.0, 106.0, 0.0),
+        fill(3 * H, "sell", 1.0, 108.5, 0.0, at_decision=False, order_type=stop),
+        fill(4 * H, "sell", 1.0, 112.0, 0.0),
+    ]
+    theirs_fills = [fill(2 * H, "buy", 1.0, 106.0, 0.0), fill(4 * H, "sell", 1.0, 111.0, 0.0),
+                    fill(4 * H, "sell", 1.0, 111.0, 0.0)]
+    ours_trades = [trade(2 * H, 3 * H, "long", 1.0, 106.0, 108.5, 0.0),
+                   trade(4 * H, 5 * H, "short", 1.0, 112.0, 115.0, 0.0, open_=True)]
+    theirs_trades = [trade(2 * H, 4 * H, "long", 1.0, 106.0, 111.0, 0.0),
+                     trade(4 * H, 5 * H, "short", 1.0, 111.0, 115.0, 0.0, open_=True)]
+    ambiguous = amb(resting(3, order(2, "sell", 1.0, "stop", trigger=108.5),
+                            order(3, "sell", 1.0, "limit", price=111.0)))
+    fill_pairs, problems = pair_fills(ours_fills, theirs_fills, bars())
+    assert problems == []
+    compare.classify(fill_pairs, bars(), ambiguous)
+    trade_pairs, problems = compare.pair_trades(ours_trades, theirs_trades, bars(), ours_fills)
+    assert problems == []
+    compare.trade_fills(trade_pairs, fill_pairs)
+    long_, short = trade_pairs
+    assert [(role, p["ours"]["time"]) for role, p, _ in long_["fills"]] == [
+        ("entry", 2 * H), ("exit", 3 * H)]
+    assert [(role, p["ours"]["time"]) for role, p, _ in short["fills"]] == [("entry", 4 * H)]
+    assert long_["ambiguous"] and not short["ambiguous"]
 
 
 def stop_limit_pair(limit: float = 110.5, their_fee=None) -> tuple[dict, dict]:
@@ -835,6 +902,61 @@ def test_a_stop_limit_the_walk_fills_on_a_later_bar_is_named():
     assert moved == ["our sell stop-limit fill of bar 3 at 108.5: Nautilus's walk fills it on bar 4 "
                      "at 108.5"]
     assert compare.walked_elsewhere(ours["fills"], bars(), compare.open_orders(ours["resting"])) == []
+
+
+def move_our_walked_fill(ours: dict, price: float, fee: float) -> None:
+    """walked_sell_pair with our stop-limit sell filled at `price` for `fee` instead, and our
+    trade and equity following it."""
+    fee_x = 115.0 * TAKER
+    ours["fills"][0].update(price=price, fee=fee)
+    marks = [price - 111.0 - fee, price - 114.0 - fee, price - 115.0 - fee - fee_x]
+    for k, m in zip(range(3, 6), marks):
+        ours["equity"][k]["equity"] = 10_000.0 + m
+    ours["trades"][0].update(entry_price=price, gross_pnl=price - 115.0, fees=fee + fee_x)
+
+
+def test_our_stop_limit_off_our_own_model_is_not_explained_by_the_walk():
+    # Our sell stop-limit filled at 110.0, 1.5 above its trigger 108.5, where our model fills it
+    # (a taker at the trigger). Nautilus's walk explains Nautilus's fill, not ours: the pair is
+    # compared as exact and fails, though trade and equity follow our wrong price consistently.
+    ours, theirs = walked_sell_pair(108.5)
+    move_our_walked_fill(ours, 110.0, 110.0 * TAKER)
+    g = compare_gapless(ours, theirs, bars(), TICK, maker=MAKER, taker=TAKER)
+    r = compare_real(ours, theirs, bars(), TAKER, maker=MAKER, tick=TICK)
+    assert g.numbers["stop_limit_maker_fills"] == 0 and r.numbers["stop_limit_maker_fills"] == 0
+    assert not by_name(g)["prices within one tick"].ok
+    assert "off our own fill model" in by_name(g)["prices within one tick"].note
+    assert not by_name(r)["each price difference within its bound"].ok
+    assert not g.ok and not r.ok
+
+
+def test_our_stop_limit_fee_off_our_own_model_is_not_explained_by_the_walk():
+    # At the trigger, but charged at neither rate. The walk explains a maker fee against our
+    # taker fee, not a fee off both.
+    ours, theirs = walked_sell_pair(108.5)
+    move_our_walked_fill(ours, 108.5, 108.5 * 0.0003)
+    g = compare_gapless(ours, theirs, bars(), TICK, maker=MAKER, taker=TAKER)
+    assert g.numbers["stop_limit_maker_fills"] == 0
+    assert not by_name(g)["fees"].ok and not g.ok
+
+
+def test_the_walk_bound_on_real_bars_is_the_walks_part_only():
+    # Nautilus fills at 108.3 (its walk), our model at the trigger 108.5; ours at 108.55, within
+    # the tick of our rounding but 0.05 off the model. The walk adds 0.2 (Nautilus's price against
+    # our model's) and the fee at the other rate on the dearer price, not our own 0.05 on top.
+    rows = [dict(r) for r in bars().bars]
+    rows[3]["close"] = 108.3
+    b = Bars(rows, H)
+    ours, theirs = walked_sell_pair(108.3)
+    move_our_walked_fill(ours, 108.55, 108.55 * TAKER)
+    real = compare_real(ours, theirs, b, TAKER, maker=MAKER, tick=TICK)
+    assert real.numbers["stop_limit_maker_fills"] == 1
+    walk = (108.5 - 108.3) + 108.5 * (TAKER - MAKER)
+    assert abs(real.numbers["stop_limit_fee"] - walk) < 1e-12, real.numbers["stop_limit_fee"]
+    # On the gapless bars our 0.05 off the model is left in the comparison, so it fails there.
+    g = compare_gapless(ours, theirs, b, TICK, maker=MAKER, taker=TAKER)
+    assert g.numbers["stop_limit_maker_fills"] == 1
+    assert not by_name(g)["trades: P&L net of fees, before funding"].ok
 
 
 def rounding_pair(side: str, ours: float, theirs: float, cls: str = compare.EXACT) -> dict:
