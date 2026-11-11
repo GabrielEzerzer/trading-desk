@@ -4,7 +4,7 @@
 //
 //   node scripts/quit-check.mjs            from gui/
 //
-// Needs target/debug/td-server(.exe), or TD_SERVER_BIN.
+// Needs target/release/td-server(.exe), or TD_SERVER_BIN.
 
 import { existsSync, mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -15,9 +15,9 @@ import { killAll, processTree, waitGone } from './procs.mjs'
 
 const gui = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const exe = process.platform === 'win32' ? 'td-server.exe' : 'td-server'
-const bin = process.env.TD_SERVER_BIN ?? join(gui, '..', 'target', 'debug', exe)
+const bin = process.env.TD_SERVER_BIN ?? join(gui, '..', 'target', 'release', exe)
 if (!existsSync(bin)) {
-  console.error(`quit-check: no engine binary at ${bin}; run cargo build -p td-server`)
+  console.error(`quit-check: no engine binary at ${bin}; run cargo build --release -p td-server --bin td-server`)
   process.exit(2)
 }
 const QUIT_WITHIN_MS = 5_000
