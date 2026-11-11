@@ -19,8 +19,8 @@ use td_core::{Candle, Fill, Millis, Side, Timeframe};
 
 use crate::metrics::{self, EquitySeries, MetricsReport};
 use crate::permute::permute_bars;
-use crate::rng::{SplitMix64, derive_seed};
 use crate::risk::{EquityRange, Intrabar};
+use crate::rng::{SplitMix64, derive_seed};
 use crate::runner::{compare, config_fingerprint, hold_over, select_bars};
 use crate::{
     BacktestConfig, BacktestResult, Benchmark, EngineError, EquityPoint, ParamKind, ParamSpec,
