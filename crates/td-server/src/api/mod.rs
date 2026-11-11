@@ -63,7 +63,8 @@
 //!     reduce_only?}`: places a manual order (a `ManualOrder`), on a strategy session too. It goes
 //!     through the same rounding, checks (lot, tick and minimums, the spot cash and holding, the
 //!     leverage cap) and broker as a strategy's order, checked at the close of the last bar fed.
-//!     It takes effect from the first bar that opens at or after the moment it is accepted, so it
+//!     It takes effect from the first bar that opens at or after the moment it is accepted (by
+//!     the local clock, assumed in step with the venue), so it
 //!     never fills on a price from before then: a market order fills at that bar's open, and a
 //!     limit is first checked against that bar. The bar in progress when it is placed cannot fill
 //!     it, nor can the bars a backfill feeds after it; one placed exactly as a bar closes takes

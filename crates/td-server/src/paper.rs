@@ -18,7 +18,7 @@
 //! the file again where possible, so a refused order does not come back on a resume.
 //!
 //! A manual order takes effect from the first bar that opens at or after the moment it was
-//! accepted (see [`Session::submit`]): it never fills on a price from before then, neither on the
+//! accepted by the local clock (see [`Session::submit`]): it never fills on a price from before then, neither on the
 //! bar in progress when it was placed nor on bars a backfill feeds after it.
 //!
 //! A session runs a registered strategy, or none: strategy [`MANUAL_STRATEGY`] (`none`) makes a

@@ -359,9 +359,13 @@ impl Sessions {
                     format!("paper session {id:?} is already running"),
                 ));
             }
-            // Taken under the session's lock after the run is seen to be over, so a manual order
-            // being written as it ended is in the log before it is read (see `Sessions::manual`).
-            Some(entry) => lock(&entry.session).check_resumable()?,
+            Some(entry) => {
+                // The barrier: the old session's lock, taken after the run is seen to be over, so
+                // a manual order being written as it ended is in the log before it is read (see
+                // `Sessions::manual`). Keep this lock even if the check below moves.
+                let barrier = lock(&entry.session);
+                barrier.check_resumable()?;
+            }
         }
         let (dir, name) = (self.data_dir.clone(), id.to_string());
         let paper = tokio::task::spawn_blocking(move || PaperSession::open(&dir, &name))
@@ -430,6 +434,10 @@ impl Sessions {
     /// Places a manual order on a running session, accepted at the time the session's live
     /// source gives as the order is applied.
     pub(crate) fn place(&self, id: &str, order: &ManualOrder) -> Result<PaperOrder, ApiError> {
+        // shortcut: the acceptance time is the local clock, assumed in step with the venue's.
+        // A clock behind the venue by s seconds lets an order placed within s seconds after a bar
+        // opened fill at that bar's open. Taking the newest in-progress kline time from the
+        // stream as a floor would close it.
         let rest = self.streams.live().rest();
         self.manual(id, |paper| paper.place(order, rest.now()))
     }
