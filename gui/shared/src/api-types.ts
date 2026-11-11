@@ -717,6 +717,291 @@ export type SavedRun = { "kind": "backtest", "result": BacktestResult } | { "kin
 export type RunSummary = { id: RunId, created_at: number, kind: RunKind, strategy: string, instrument: InstrumentId, timeframe: Timeframe, from: number, to: number, total_return: number | null, cagr: number | null, sharpe: number | null, max_drawdown: number | null, trades: number, };
 
 /**
+ * Everything the battery needs to test a strategy, with no data.
+ */
+export type TestPlan = { 
+/**
+ * Each instrument is tested on its own and gets its own verdict.
+ */
+instruments: Array<InstrumentId>, timeframe: Timeframe, period: Period, backtest: BacktestSettings, sweep: SweepPlan, walk_forward: WalkForwardPlan, 
+/**
+ * A single in-sample / out-of-sample split, reported only. `None` leaves it out.
+ */
+out_of_sample: Split | null, evidence: EvidenceSettings, };
+
+/**
+ * Bars that open at or after `from` and before `to`. Both must be bar boundaries.
+ */
+export type Period = { from: number, to: number, };
+
+/**
+ * What every run of the plan shares.
+ */
+export type BacktestSettings = { 
+/**
+ * Starting balance in the quote asset.
+ */
+starting_cash: number, 
+/**
+ * The perpetual leverage cap, as in [`BacktestConfig::max_leverage`]; 1.0 is 1x.
+ */
+max_leverage: number, 
+/**
+ * Slippage set for some of the plan's instruments. An instrument not listed here uses the
+ * backtest config's default slippage for that instrument (#35: 2 bps on BTC and ETH, 5 bps
+ * on other large caps); an empty list uses the default everywhere.
+ */
+slippage: Array<SlippageOverride>, };
+
+/**
+ * One instrument's slippage, overriding the backtest config's default for it.
+ */
+export type SlippageOverride = { 
+/**
+ * One of the plan's instruments.
+ */
+instrument: InstrumentId, 
+/**
+ * Slippage on market and stop fills, in basis points of price.
+ */
+bps: number, };
+
+/**
+ * The parameter grid. It always runs as a full grid, because the plateau test (R5) reads each
+ * set's neighbours on it.
+ */
+export type SweepPlan = { 
+/**
+ * Parameters the sweep does not vary; the rest take the strategy's defaults.
+ */
+fixed: Params, axes: Array<ParamAxis>, objective: Objective, 
+/**
+ * See [`SweepSpec::min_trades`].
+ */
+min_trades: number, };
+
+/**
+ * Rolling walk-forward windows, in days of bars: a day is 24 hours of bars of the plan's
+ * timeframe, so on an FX pair, closed at weekends, a window spans more calendar days. Each test
+ * segment starts where the previous one ended, so the stitched out-of-sample curve has no holes.
+ * Both lengths must be whole bars of the timeframe.
+ */
+export type WalkForwardPlan = { train_days: number, test_days: number, };
+
+/**
+ * The common evidence layer (#35, R2 to R6). Every field is a number: there is no way to switch a
+ * test off. The defaults are #35's.
+ */
+export type EvidenceSettings = { min_sample: MinSample, luck: LuckTest, 
+/**
+ * R4: fees and slippage are multiplied by this, and the strategy must stay profitable.
+ */
+cost_stress: number, plateau: Plateau, 
+/**
+ * R6: how many different start offsets must all give a result of the same sign.
+ */
+start_offsets: number, };
+
+/**
+ * R2: below any of these, the verdict is `not_enough_evidence`.
+ *
+ * A day here is a day of bars, as in [`WalkForwardPlan`]: 24 hours of the market's open bars,
+ * so the days a market is closed (an FX pair's weekends) do not count. It is the unit the
+ * walk-forward windows are laid in, so a run's out-of-sample days are its windows times
+ * `test_days`.
+ */
+export type MinSample = { 
+/**
+ * Closed out-of-sample trades.
+ */
+trades: number, 
+/**
+ * Days of bars covered by the stitched out-of-sample curve, as defined above.
+ */
+days: number, 
+/**
+ * Walk-forward windows.
+ */
+windows: number, };
+
+/**
+ * R3: the same sweep repeated on bar permutations.
+ */
+export type LuckTest = { permutations: number, 
+/**
+ * p at or below this passes.
+ */
+pass_p: number, 
+/**
+ * p above `pass_p` and at or below this gives `not_enough_evidence`; above it fails.
+ */
+inconclusive_p: number, };
+
+/**
+ * R5: how the best parameter set's neighbours on the grid must do.
+ */
+export type Plateau = { 
+/**
+ * The neighbours' median objective over the best set's must be at least this.
+ */
+min_median_ratio: number, 
+/**
+ * At least this share of the neighbours must be profitable.
+ */
+min_positive_share: number, };
+
+export type RuleKind = "prop_firm" | "portfolio" | "high_risk";
+
+/**
+ * What counts as tradable for one strategy: a kind with that strategy's limits. Each kind's
+ * limits default to #35's; a strategy overrides a field by naming it.
+ */
+export type VerdictRule = { "kind": "prop_firm", firm: FirmLimits, limits: PropFirmLimits, } | { "kind": "portfolio", benchmark: PortfolioBenchmark, limits: PortfolioLimits, } | { "kind": "high_risk", limits: HighRiskLimits, };
+
+/**
+ * A prop firm's own rules. Losses and drawdowns are fractions of the starting balance.
+ *
+ * shortcut: no time limit on the challenge; add one if a firm the desk trades on has it.
+ */
+export type FirmLimits = { 
+/**
+ * The largest loss allowed within one day.
+ */
+daily_loss: number, 
+/**
+ * The largest drawdown allowed, measured as `drawdown` says.
+ */
+max_drawdown: number, drawdown: DrawdownMode, 
+/**
+ * The profit that passes the challenge.
+ */
+profit_target: number, };
+
+export type DrawdownMode = "static" | "trailing";
+
+export type PropFirmLimits = { 
+/**
+ * The worst daily loss and the max drawdown, measured inside bars, must stay within this
+ * share of the firm's limits.
+ */
+share_of_firm_limits: number, 
+/**
+ * The chance of reaching the profit target before breaching a limit must be at least this.
+ */
+min_pass_probability: number, 
+/**
+ * The chance of breaching a limit within `breach_horizon_days` must be at most this.
+ */
+max_breach_probability: number, breach_horizon_days: number, };
+
+export type PortfolioBenchmark = "buy_and_hold" | "cash";
+
+export type PortfolioLimits = { 
+/**
+ * Out-of-sample Sharpe at least this.
+ */
+min_sharpe: number, 
+/**
+ * Max drawdown, as a fraction of its peak, at most this.
+ */
+max_drawdown: number, 
+/**
+ * Max drawdown at most this share of the benchmark's. Not judged against `cash`, which has
+ * none.
+ */
+max_drawdown_vs_benchmark: number, 
+/**
+ * Annualised alpha against the benchmark strictly above this.
+ */
+min_alpha: number, 
+/**
+ * The bootstrap chance that the mean daily return is zero or less, at most this.
+ */
+max_p_mean_not_positive: number, };
+
+export type HighRiskLimits = { 
+/**
+ * Closed out-of-sample trades, at least this many.
+ */
+min_trades: number, 
+/**
+ * Mean net P&L per closed trade strictly above this, in the quote asset.
+ */
+min_expectancy: number, 
+/**
+ * The bootstrap's lower bound on that mean strictly above this.
+ */
+min_expectancy_lower_bound: number, 
+/**
+ * Profit factor at least this.
+ */
+min_profit_factor: number, 
+/**
+ * The chance of losing `ruin_drawdown` of the account, at most this.
+ */
+max_risk_of_ruin: number, 
+/**
+ * The drawdown from the peak that counts as ruin.
+ */
+ruin_drawdown: number, 
+/**
+ * The out-of-sample return with the single best trade removed, strictly above this.
+ */
+min_return_without_best_trade: number, };
+
+export type Layer = "integrity" | "evidence" | "kind";
+
+/**
+ * How a value is held against its limit.
+ */
+export type Comparison = "at_least" | "above" | "at_most";
+
+/**
+ * How the GUI writes a value and its limit.
+ */
+export type Unit = "percent" | "ratio" | "count" | "days" | "quote";
+
+export type Outcome = "pass" | "warn" | "fail" | "inconclusive";
+
+/**
+ * One criterion of a verdict.
+ */
+export type Criterion = { layer: Layer, 
+/**
+ * A stable key, such as `max_drawdown`.
+ */
+id: string, 
+/**
+ * What the GUI shows, such as "Max drawdown".
+ */
+name: string, 
+/**
+ * `None` when the battery could not compute it; the criterion then does not pass.
+ */
+value: number | null, comparison: Comparison, 
+/**
+ * `None` when there is no limit to hold the value against, such as a drawdown against a
+ * benchmark whose drawdown is missing; the line is then inconclusive and `note` says why.
+ */
+limit: number | null, unit: Unit, outcome: Outcome, 
+/**
+ * Why the line warns or is inconclusive, in words the GUI shows. `None` when the value and
+ * the limit say it all.
+ */
+note: string | null, };
+
+export type VerdictState = "trade" | "no_trade" | "not_enough_evidence" | "invalid";
+
+/**
+ * One instrument's verdict.
+ */
+export type Verdict = { instrument: InstrumentId, state: VerdictState, 
+/**
+ * Every line of every layer that was judged, integrity first.
+ */
+criteria: Array<Criterion>, };
+
+/**
  * The line the binary prints to stdout once it listens, for the app that started it.
  */
 export type Handshake = { port: number, token: string, };
@@ -910,9 +1195,14 @@ missing: Array<BarSpan>, };
 export type BarSpan = { from: number, to: number, bars: number, };
 
 /**
- * A strategy the apps can run, with the parameters it takes.
+ * A strategy the apps can run, with the parameters it takes, the plan the battery tests it on
+ * and the rule its verdict is judged by.
  */
-export type StrategyInfo = { name: string, description: string, params: Array<ParamSpec>, };
+export type StrategyInfo = { name: string, description: string, params: Array<ParamSpec>, 
+/**
+ * The rule's kind, for the Lab's picker; the same as `rule.kind`.
+ */
+kind: RuleKind, plan: TestPlan, rule: VerdictRule, };
 
 /**
  * Returned when a job is accepted.
