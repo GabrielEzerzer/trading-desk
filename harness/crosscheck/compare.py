@@ -148,6 +148,7 @@ def fee_check(pairs: list[dict]) -> Check:
     worst_abs = 0.0
     unexplained = 0
     rounded = 0
+    precisions: set[int] = set()
     for p in pairs:
         fo, ft = p["ours"]["fee"], p["theirs"]["fee"]
         r = rel(fo, ft)
@@ -155,22 +156,38 @@ def fee_check(pairs: list[dict]) -> Check:
         worst_abs = max(worst_abs, abs(fo - ft))
         if r <= FEE_REL:
             continue
-        half_unit = 0.5 * 10.0 ** -p["theirs"].get("fee_precision", 8)
+        precision = p["theirs"].get("fee_precision", 8)
+        half_unit = 0.5 * 10.0 ** -precision
         if abs(fo - ft) <= half_unit * (1.0 + SLACK_REL):
             rounded += 1
+            precisions.add(precision)
         else:
             unexplained += 1
     note = ""
     if rounded:
+        decimals = ", ".join(str(d) for d in sorted(precisions))
         note = (
             f"{rounded} fee(s) beyond 1e-9 relative differ by less than half a unit of the "
-            "8 decimals Nautilus rounds a commission to (its Money type): explained"
+            f"{decimals} decimals Nautilus rounds a commission to (its Money type): explained"
         )
     return Check(
         "fees",
         unexplained == 0,
         f"max rel {worst:.2e}, max abs {worst_abs:.2e}",
         f"rel {FEE_REL:.0e}",
+        note,
+    )
+
+
+def pairing_check(pairs: list[dict], problems: list[str], n_ours: int, n_theirs: int) -> Check:
+    """Every fill has a partner, and there is at least one pair: a case where neither engine
+    fills anything compares nothing and must not pass."""
+    note = "; ".join(problems[:5]) or ("" if pairs else "no fills paired, so nothing was compared")
+    return Check(
+        "fills pair one to one (same decision bar and side)",
+        bool(pairs) and not problems,
+        f"{len(pairs)} paired of {n_ours} ours / {n_theirs} Nautilus",
+        "all",
         note,
     )
 
@@ -188,22 +205,18 @@ def compare_gapless(
     bars: Bars,
     tick: float,
     ambiguous_bars: frozenset[int] = frozenset(),
+    perpetual: bool = False,
 ) -> Comparison:
-    """The exact comparison on the gapless bars, outside `ambiguous_bars` (decision bar indices)."""
+    """The exact comparison on the gapless bars, outside `ambiguous_bars` (decision bar indices).
+
+    With `perpetual`, both engines must charge funding on at least one bar, so a case meant to
+    exercise funding cannot pass on an empty funding series."""
     cmp = Comparison("gapless")
     of = [f for f in ours["fills"] if bars.decided_at_next_open(f["time"]) not in ambiguous_bars]
     tf = [f for f in theirs["fills"] if bars.decided_at_close(f["time"]) not in ambiguous_bars]
     pairs, problems = pair_fills(of, tf, bars)
     cmp.pairs = pairs
-    cmp.checks.append(
-        Check(
-            "fills pair one to one (same decision bar and side)",
-            not problems,
-            f"{len(pairs)} paired of {len(of)} ours / {len(tf)} Nautilus",
-            "all",
-            "; ".join(problems[:5]),
-        )
-    )
+    cmp.checks.append(pairing_check(pairs, problems, len(of), len(tf)))
     qty_bad = [p for p in pairs if rel(p["ours"]["qty"], p["theirs"]["qty"]) > QTY_REL]
     cmp.checks.append(
         Check(
@@ -234,12 +247,16 @@ def compare_gapless(
     for r in rows:
         worst_f = max(worst_f, rel(r["ours_open"], r["theirs_open"]), rel(r["ours_in"], r["theirs_in"]))
     total_o, total_t = ours["funding_paid"], theirs["funding_paid"]
+    charged = any(r["ours_open"] or r["ours_in"] for r in rows) and any(
+        r["theirs_open"] or r["theirs_in"] for r in rows
+    )
     cmp.checks.append(
         Check(
             "funding per bar",
-            worst_f <= FUNDING_REL,
+            worst_f <= FUNDING_REL and (charged or not perpetual),
             f"{len(rows)} bars, max rel {worst_f:.2e}; total {total_o:.10g} vs {total_t:.10g}",
             f"rel {FUNDING_REL:.0e}",
+            "" if charged or not perpetual else "no funding charged on a perpetual case",
         )
     )
     eq_o, eq_t = ours["equity"], theirs["equity"]
@@ -294,15 +311,7 @@ def compare_real(
     cmp = Comparison("real")
     pairs, problems = pair_fills(ours["fills"], theirs["fills"], bars)
     cmp.pairs = pairs
-    cmp.checks.append(
-        Check(
-            "fills pair one to one (same decision bar and side)",
-            not problems,
-            f"{len(pairs)} paired of {len(ours['fills'])} ours / {len(theirs['fills'])} Nautilus",
-            "all",
-            "; ".join(problems[:5]),
-        )
-    )
+    cmp.checks.append(pairing_check(pairs, problems, len(ours["fills"]), len(theirs["fills"])))
     cmp.checks.append(rejections_check(ours, theirs))
     over = []
     bound1 = 0.0

@@ -194,3 +194,43 @@ def test_a_rejection_only_one_engine_makes_fails():
     ours, theirs = real_pair()
     theirs["rejected_orders"] = [{"bar": 0, "reason": "below the minimum notional"}]
     assert not by_name(compare_real(ours, theirs, bars(), taker=0.001))["rejected orders"].ok
+
+
+def test_a_six_decimal_commission_is_named_in_the_fee_note():
+    ours, theirs = gapless_pair()
+    ours["fills"][0]["fee"] = 0.1234564
+    theirs["fills"][0]["fee"] = 0.123456
+    theirs["fills"][0]["fee_precision"] = 6
+    check = by_name(compare_gapless(ours, theirs, bars(), TICK))["fees"]
+    assert check.ok and "the 6 decimals" in check.note
+
+
+def no_fills() -> tuple[dict, dict]:
+    """Neither engine fills anything (both rejected the only order): a flat, identical result."""
+    ours = result([], [10.0] * 6)
+    ours["rejected_orders"] = [{"bar": 0, "reason": "below the minimum notional"}]
+    return ours, copy.deepcopy(ours)
+
+
+def test_no_fills_on_either_side_fails_on_gapless_bars():
+    ours, theirs = no_fills()
+    cmp = compare_gapless(ours, theirs, bars(), TICK)
+    assert not cmp.ok
+    assert not by_name(cmp)["fills pair one to one"].ok
+
+
+def test_no_fills_on_either_side_fails_on_real_bars():
+    ours, theirs = no_fills()
+    cmp = compare_real(ours, theirs, bars(), taker=0.001)
+    assert not cmp.ok
+    assert not by_name(cmp)["fills pair one to one"].ok
+
+
+def test_a_perpetual_case_with_no_funding_charged_fails():
+    ours, theirs = gapless_pair()
+    # An empty funding series agrees bar by bar, but a perpetual case must have charged something.
+    assert by_name(compare_gapless(ours, theirs, bars(), TICK))["funding per bar"].ok
+    assert not by_name(compare_gapless(ours, theirs, bars(), TICK, perpetual=True))["funding per bar"].ok
+    ours["funding"] = [{"bar": 3 * H, "at_open": 0.0159, "in_bar": 0.0}]
+    theirs["funding"] = [{"bar": 3 * H, "at": "open", "payment": 0.0159}]
+    assert by_name(compare_gapless(ours, theirs, bars(), TICK, perpetual=True))["funding per bar"].ok

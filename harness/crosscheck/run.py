@@ -81,7 +81,9 @@ def run_case(exe: Path, case_path: Path, refetch: bool) -> bool:
         (out / f"nautilus_{series}.json").write_text(json.dumps(theirs, indent=1))
         bars = compare.Bars(nautilus_side.read_bars(data / f"bars_{series}.csv"), tf_ms)
         if series == "gapless":
-            cmp = compare.compare_gapless(mine, theirs, bars, inst["tick_size"])
+            cmp = compare.compare_gapless(
+                mine, theirs, bars, inst["tick_size"], perpetual=case["kind"] == "perpetual"
+            )
         else:
             cmp = compare.compare_real(mine, theirs, bars, case["fees"]["taker"])
         m_ours = metrics(exe, mine, case, out / f"metrics_ours_{series}.json")
