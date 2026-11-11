@@ -1,0 +1,168 @@
+{
+  "workloads": [
+    {
+      "name": "load_1h_24mo",
+      "split": "dev",
+      "seed": 1,
+      "kind": "perpetual",
+      "months": 24,
+      "timeframe": "1h",
+      "strategy": "sma_cross",
+      "params": {},
+      "starting_cash": 10000,
+      "slippage_bps": 1,
+      "mode": "load"
+    },
+    {
+      "name": "backtest_sma_1m_3mo",
+      "split": "dev",
+      "seed": 1,
+      "kind": "spot",
+      "months": 3,
+      "timeframe": "1m",
+      "strategy": "sma_cross",
+      "params": { "fast": 20, "slow": 100 },
+      "starting_cash": 10000,
+      "slippage_bps": 1,
+      "mode": "backtest"
+    },
+    {
+      "name": "sweep_sma_1h_24mo",
+      "split": "dev",
+      "seed": 1,
+      "kind": "perpetual",
+      "months": 24,
+      "timeframe": "1h",
+      "strategy": "sma_cross",
+      "params": { "allow_short": true },
+      "starting_cash": 10000,
+      "slippage_bps": 1,
+      "mode": "sweep",
+      "sweep": {
+        "axes": [
+          { "name": "fast", "space": { "kind": "range", "from": 5, "to": 50, "step": 5 } },
+          { "name": "slow", "space": { "kind": "range", "from": 60, "to": 240, "step": 20 } }
+        ],
+        "objective": { "metric": "sharpe", "direction": "maximize" },
+        "min_trades": 1
+      }
+    },
+    {
+      "name": "walkforward_donchian_1h_24mo",
+      "split": "dev",
+      "seed": 1,
+      "kind": "perpetual",
+      "months": 24,
+      "timeframe": "1h",
+      "strategy": "donchian_breakout",
+      "params": { "allow_short": true },
+      "starting_cash": 10000,
+      "slippage_bps": 1,
+      "mode": "walk_forward",
+      "sweep": {
+        "axes": [
+          { "name": "entry", "space": { "kind": "range", "from": 10, "to": 60, "step": 10 } },
+          { "name": "exit", "space": { "kind": "range", "from": 5, "to": 20, "step": 5 } }
+        ],
+        "objective": { "metric": "sharpe", "direction": "maximize" },
+        "min_trades": 1
+      },
+      "windows": { "train_bars": 4320, "test_bars": 720, "step_bars": 720, "mode": "rolling" }
+    },
+    {
+      "name": "load_15m_18mo",
+      "split": "test",
+      "seed": 2,
+      "kind": "spot",
+      "months": 18,
+      "timeframe": "15m",
+      "strategy": "sma_cross",
+      "params": {},
+      "starting_cash": 10000,
+      "slippage_bps": 1,
+      "mode": "load"
+    },
+    {
+      "name": "backtest_donchian_5m_12mo",
+      "split": "test",
+      "seed": 2,
+      "kind": "perpetual",
+      "months": 12,
+      "timeframe": "5m",
+      "strategy": "donchian_breakout",
+      "params": {},
+      "starting_cash": 10000,
+      "slippage_bps": 1,
+      "mode": "backtest"
+    },
+    {
+      "name": "sweep_donchian_15m_12mo",
+      "split": "test",
+      "seed": 2,
+      "kind": "perpetual",
+      "months": 12,
+      "timeframe": "15m",
+      "strategy": "donchian_breakout",
+      "params": { "allow_short": true },
+      "starting_cash": 10000,
+      "slippage_bps": 1,
+      "mode": "sweep",
+      "sweep": {
+        "axes": [
+          { "name": "entry", "space": { "kind": "range", "from": 10, "to": 100, "step": 10 } },
+          { "name": "exit", "space": { "kind": "range", "from": 5, "to": 30, "step": 5 } }
+        ],
+        "objective": { "metric": "sharpe", "direction": "maximize" },
+        "min_trades": 1
+      }
+    },
+    {
+      "name": "walkforward_sma_4h_36mo",
+      "split": "test",
+      "seed": 2,
+      "kind": "spot",
+      "months": 36,
+      "timeframe": "4h",
+      "strategy": "sma_cross",
+      "params": {},
+      "starting_cash": 10000,
+      "slippage_bps": 1,
+      "mode": "walk_forward",
+      "sweep": {
+        "axes": [
+          { "name": "fast", "space": { "kind": "range", "from": 5, "to": 20, "step": 5 } },
+          { "name": "slow", "space": { "kind": "range", "from": 30, "to": 110, "step": 20 } }
+        ],
+        "objective": { "metric": "sharpe", "direction": "maximize" },
+        "min_trades": 1
+      },
+      "windows": { "train_bars": 2190, "test_bars": 540, "step_bars": 540, "mode": "rolling" }
+    },
+    {
+      "name": "lab_sma_1h_60mo",
+      "split": "dev",
+      "seed": 1,
+      "kind": "spot",
+      "months": 60,
+      "timeframe": "1h",
+      "strategy": "sma_cross",
+      "params": {},
+      "starting_cash": 10000,
+      "slippage_bps": 2,
+      "mode": "lab_backtest"
+    },
+    {
+      "name": "lab_donchian_15m_48mo",
+      "split": "test",
+      "seed": 2,
+      "kind": "perpetual",
+      "months": 48,
+      "timeframe": "15m",
+      "strategy": "donchian_breakout",
+      "params": {},
+      "starting_cash": 10000,
+      "slippage_bps": 2,
+      "mode": "lab_backtest"
+    }
+  ]
+}

@@ -601,7 +601,7 @@ fn report_progress(ctx: &JobCtx, done: usize, total: usize) -> ControlFlow<()> {
 }
 
 /// Saves a run with its data report, both in one atomic save.
-fn save_run(saved: &SavedRun, report: &DataReport, runs_dir: &Path) -> Result<RunId, JobError> {
+pub fn save_run(saved: &SavedRun, report: &DataReport, runs_dir: &Path) -> Result<RunId, JobError> {
     let json = serde_json::to_vec_pretty(report)
         .map_err(|e| ApiError::internal(format!("cannot write the data report: {e}")))?;
     let files = [(DATA_REPORT_FILE, json.as_slice())];
@@ -619,7 +619,7 @@ fn save_run(saved: &SavedRun, report: &DataReport, runs_dir: &Path) -> Result<Ru
 }
 
 /// Reads a saved run and its data report.
-fn read_run(runs_dir: &Path, id: &str) -> Result<RunDetail, ApiError> {
+pub fn read_run(runs_dir: &Path, id: &str) -> Result<RunDetail, ApiError> {
     let run = td_engine::load(runs_dir, id).map_err(|e| match e {
         StoreError::InvalidRunId(_) => ApiError::not_found(format!("no run {id}")),
         StoreError::Io { source, .. } if source.kind() == std::io::ErrorKind::NotFound => {
@@ -647,7 +647,7 @@ fn read_run(runs_dir: &Path, id: &str) -> Result<RunDetail, ApiError> {
 }
 
 /// Compares a saved run with what the store and engine would give now.
-fn check_run(store: &Store, run: &SavedRun) -> RunCheck {
+pub fn check_run(store: &Store, run: &SavedRun) -> RunCheck {
     let base = run.base_config();
     let data_matches = read_data(store, base)
         .ok()
