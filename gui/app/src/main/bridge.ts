@@ -23,6 +23,11 @@ const ROUTES: readonly Route[] = [
   { method: 'GET', path: /^\/jobs$/ },
   { method: 'GET', path: /^\/jobs\/\d{1,15}$/ },
   { method: 'POST', path: /^\/jobs\/\d{1,15}\/cancel$/ },
+  { method: 'GET', path: /^\/jobs\/\d{1,15}\/result$/ },
+  { method: 'POST', path: /^\/runs\/backtest$/, body: true },
+  { method: 'GET', path: /^\/runs$/ },
+  // A run id: the save time as 13 digits, `-`, then 8 lowercase hex digits (td_engine::RunId).
+  { method: 'GET', path: /^\/runs\/\d{13}-[0-9a-f]{8}$/ },
   { method: 'GET', path: /^\/sessions$/ },
   { method: 'POST', path: /^\/sessions$/, body: true },
   { method: 'GET', path: /^\/sessions\/[A-Za-z0-9_-]{1,64}$/ },
