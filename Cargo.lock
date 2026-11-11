@@ -2317,6 +2317,7 @@ dependencies = [
  "flate2",
  "futures-util",
  "parquet",
+ "rayon",
  "reqwest",
  "rustls",
  "serde",

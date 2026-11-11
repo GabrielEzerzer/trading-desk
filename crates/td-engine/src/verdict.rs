@@ -152,7 +152,8 @@ impl Default for PortfolioLimits {
 pub struct HighRiskLimits {
     /// Closed out-of-sample trades, at least this many.
     pub min_trades: u32,
-    /// Mean net P&L per closed trade strictly above this, in the quote asset.
+    /// Mean net P&L per closed trade strictly above this, in the run's account currency (the
+    /// quote asset on a plan's runs).
     pub min_expectancy: f64,
     /// The bootstrap's lower bound on that mean strictly above this.
     pub min_expectancy_lower_bound: f64,
@@ -334,7 +335,8 @@ pub enum Unit {
     Ratio,
     Count,
     Days,
-    /// An amount in the instrument's quote asset.
+    /// An amount of money in the run's account currency: the instrument's quote asset unless the
+    /// run is on a base-currency account. The name is kept so saved verdicts still load.
     Quote,
 }
 
@@ -662,7 +664,7 @@ pub struct KindInputs {
     // high_risk
     /// Closed trades.
     pub trades: usize,
-    /// Mean net P&L per closed trade, in the quote asset.
+    /// Mean net P&L per closed trade, in the run's account currency.
     pub expectancy: Option<f64>,
     /// The bootstrap's lower bound on the expectancy.
     pub expectancy_lower_bound: Option<f64>,

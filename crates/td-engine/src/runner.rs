@@ -5,7 +5,8 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 
 use td_core::{
-    Candle, FeeSchedule, Fill, Instrument, InstrumentKind, Millis, OrderId, Side, Timeframe,
+    AccountCurrency, Candle, FeeSchedule, Fill, Instrument, InstrumentKind, Millis, OrderId, Side,
+    Timeframe,
 };
 
 use crate::metrics::{self, DAY_MS, DAYS_PER_YEAR, EquitySeries, MetricsReport};
@@ -62,7 +63,7 @@ pub struct BacktestConfig {
     /// Bars that open at or after `from` and before `to` are used.
     pub from: Millis,
     pub to: Millis,
-    /// Starting balance in the quote asset.
+    /// Starting balance in the account currency (`account_currency`).
     pub starting_cash: f64,
     /// Slippage on market and stop fills, in basis points of price. Left out when loading, it is
     /// the instrument's default ([`default_slippage_bps`]); a value given, zero included, is
@@ -96,6 +97,11 @@ pub struct BacktestConfig {
     /// close. The strategy tester sets it on out-of-sample runs.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub close_at_end: bool,
+    /// The currency the account holds and the result reports every amount in: the instrument's
+    /// quote currency, the default, or its base currency, as a dollar account trading USD/JPY
+    /// (FX only; see [`Session::new`]). Left out of the saved result when it is the default.
+    #[serde(default, skip_serializing_if = "AccountCurrency::is_quote")]
+    pub account_currency: AccountCurrency,
 }
 
 impl<'de> Deserialize<'de> for BacktestConfig {
@@ -121,6 +127,8 @@ impl<'de> Deserialize<'de> for BacktestConfig {
             warmup_from: Option<Millis>,
             #[serde(default)]
             close_at_end: bool,
+            #[serde(default)]
+            account_currency: AccountCurrency,
         }
         let g = Given::deserialize(deserializer)?;
         Ok(BacktestConfig {
@@ -138,6 +146,7 @@ impl<'de> Deserialize<'de> for BacktestConfig {
             max_leverage: g.max_leverage,
             warmup_from: g.warmup_from,
             close_at_end: g.close_at_end,
+            account_currency: g.account_currency,
         })
     }
 }
@@ -266,6 +275,7 @@ pub fn run(
         slippage_bps: config.slippage_bps,
         fees: config.fee_override,
         max_leverage: config.max_leverage,
+        account_currency: config.account_currency,
     };
     let mut session = Session::new(strategy, config.instrument.clone(), tf, session_config)?;
     for bar in &warmup {
@@ -286,8 +296,17 @@ pub fn run(
     }
 
     let fills = session.fills().to_vec();
-    let mut trades = build_trades(&fills, &bars, &traded_asks, session.bar_funding());
-    attach_stops(&mut trades, &bars, session.bar_stops());
+    let account = config.account_currency;
+    let pip = config.instrument.pip_size();
+    let mut trades = build_trades(
+        &fills,
+        &bars,
+        &traded_asks,
+        session.bar_funding(),
+        account,
+        pip,
+    );
+    attach_stops(&mut trades, &bars, session.bar_stops(), account);
     mark_forced_closes(&mut trades, &fills, session.orders());
     let series = EquitySeries::new(config.starting_cash, session.equity(), tf);
     let intrabar = risk::intrabar(
@@ -297,6 +316,7 @@ pub fn run(
         session.equity(),
         &fills,
         session.bar_funding(),
+        account,
     );
     let report = metrics::report_with(
         &series,
@@ -305,6 +325,7 @@ pub fn run(
         &trades,
         &fills,
         session.portfolio().funding_paid(),
+        account,
     );
     let benchmark = benchmark(
         config,
@@ -531,6 +552,7 @@ fn benchmark(
         &held.trades,
         &held.fills,
         held.funding_paid,
+        config.account_currency,
     );
     compare(
         held.qty,
@@ -583,7 +605,9 @@ pub(crate) fn compare(
 /// funding due at a bar's open or in the gap before it on the position held going into the bar,
 /// at the open price, so none at the first open, and funding due later in the bar at the close.
 /// With an ask series the purchase is at the first ask open, and the long is marked at the bid
-/// closes, as the session marks a long. `asks` holds each bar's ask, `None` without quotes.
+/// closes, as the session marks a long. `asks` holds each bar's ask, `None` without quotes. On a
+/// base account the cash is in the base currency, so the purchase's cost and fee are converted at
+/// its price, and the account is valued as the session values it.
 fn hold(
     config: &BacktestConfig,
     bars: &[Candle],
@@ -599,8 +623,10 @@ fn hold(
     let first = bars[0];
     let entry = asks.first().copied().flatten().unwrap_or(first);
     let price = model.slip(entry.open, Side::Buy, inst);
-    let qty = inst.round_qty(config.starting_cash / (price * (1.0 + fees.taker) + fees.per_unit));
-    let mut portfolio = Portfolio::new(inst.id.kind, config.starting_cash);
+    let account = config.account_currency;
+    let unit_cost = account.from_quote(price * (1.0 + fees.taker) + fees.per_unit, price);
+    let qty = inst.round_qty(config.starting_cash / unit_cost);
+    let mut portfolio = Portfolio::new_in(inst.id.kind, config.starting_cash, account);
     let mut fills = Vec::new();
     let mut equity = Vec::with_capacity(bars.len());
     let mut positions = Vec::with_capacity(bars.len());
@@ -619,7 +645,7 @@ fn hold(
                 time: first.open_time,
                 price,
                 qty,
-                fee: fees.fee(price, qty, fees.taker),
+                fee: account.from_quote(fees.fee(price, qty, fees.taker), price),
                 liquidity: td_core::Liquidity::Taker,
             };
             portfolio.apply_fill(fill.side, fill.qty, fill.price, fill.fee);
@@ -637,7 +663,7 @@ fn hold(
         positions.push(portfolio.position());
     }
 
-    let trades = build_trades(&fills, bars, asks, &bar_funding);
+    let trades = build_trades(&fills, bars, asks, &bar_funding, account, inst.pip_size());
     let intrabar = risk::intrabar(
         config.starting_cash,
         bars,
@@ -645,6 +671,7 @@ fn hold(
         &equity,
         &fills,
         &bar_funding,
+        account,
     );
     Held {
         qty: fills.first().map_or(0.0, |f| f.qty),

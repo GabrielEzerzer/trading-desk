@@ -125,6 +125,19 @@ pub struct Instrument {
 }
 
 impl Instrument {
+    /// The size of one pip in price, for a kind quoted as a bid and an ask: 0.01 when the quote
+    /// currency is JPY and 0.0001 otherwise. `None` for a kind without quotes, which has no pips.
+    ///
+    /// shortcut: the two standard FX pip sizes only; metals (XAU/USD at 0.01) and other pairs with
+    /// a non-standard pip get the wrong one. Carry the pip on the instrument when the desk trades
+    /// them.
+    pub fn pip_size(&self) -> Option<f64> {
+        if !self.id.kind.rules().quotes {
+            return None;
+        }
+        Some(if self.quote == "JPY" { 0.01 } else { 0.0001 })
+    }
+
     /// Rounds a price to a multiple of the tick size in the given direction.
     pub fn round_price(&self, price: f64, rounding: Rounding) -> f64 {
         round_to_step(price, self.tick_size, rounding)
@@ -284,6 +297,23 @@ mod tests {
             reduce_only: false,
             client_tag: None,
         }
+    }
+
+    #[test]
+    fn pip_size_by_quote_currency_and_kind() {
+        let fx = |base: &str, quote: &str| Instrument {
+            id: InstrumentId {
+                venue: Venue::Binance,
+                symbol: format!("{base}{quote}"),
+                kind: InstrumentKind::Fx,
+            },
+            base: base.into(),
+            quote: quote.into(),
+            ..btc_perp()
+        };
+        assert_eq!(fx("USD", "JPY").pip_size(), Some(0.01));
+        assert_eq!(fx("EUR", "USD").pip_size(), Some(0.0001));
+        assert_eq!(btc_perp().pip_size(), None);
     }
 
     #[test]

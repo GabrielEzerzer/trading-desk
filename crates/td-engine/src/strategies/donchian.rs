@@ -164,7 +164,8 @@ impl Strategy for DonchianBreakout {
             }
             // Flat here, so the cash is the whole equity.
             let affordable = affordable_qty(ctx, ctx.cash(), bar.close);
-            let qty = (self.risk * ctx.equity() / distance).min(affordable);
+            // The stop distance is a price, in the quote currency; the risk is in the account's.
+            let qty = (self.risk * ctx.equity() / ctx.to_account(distance)).min(affordable);
             let entry = order(ctx, side, qty, OrderType::Market, false);
             if let Ok((_, stop)) = ctx.submit_with_stop(entry, trigger) {
                 self.stop = Some(stop);

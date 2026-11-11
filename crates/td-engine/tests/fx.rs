@@ -40,6 +40,7 @@ fn fx_config() -> SessionConfig {
         slippage_bps: 0.0,
         fees: None,
         max_leverage: 1.0,
+        account_currency: td_core::AccountCurrency::Quote,
     }
 }
 
@@ -727,7 +728,14 @@ fn a_per_unit_commission_is_charged_on_every_fill() {
     }
     approx(s.portfolio().fees_paid(), 4.0);
     approx(s.portfolio().cash(), 1_000_000.0 + 76.0);
-    let trades = td_engine::build_trades(s.fills(), s.bars(), &asks_of(&quotes), s.bar_funding());
+    let trades = td_engine::build_trades(
+        s.fills(),
+        s.bars(),
+        &asks_of(&quotes),
+        s.bar_funding(),
+        td_core::AccountCurrency::Quote,
+        None,
+    );
     assert_eq!(trades.len(), 1);
     approx(trades[0].fees, 4.0);
     approx(trades[0].net_pnl, 76.0);
@@ -762,6 +770,7 @@ fn fx_backtest(bars: usize) -> td_engine::BacktestConfig {
         max_leverage: 1.0,
         warmup_from: None,
         close_at_end: false,
+        account_currency: td_core::AccountCurrency::Quote,
     }
 }
 
@@ -1221,14 +1230,26 @@ fn intrabar_of(s: &Session, quotes: &[([f64; 4], [f64; 4])]) -> td_engine::risk:
         s.equity(),
         s.fills(),
         s.bar_funding(),
+        td_core::AccountCurrency::Quote,
     )
 }
 
 /// The trades of a session, with their stops.
 fn trades_of(s: &Session, quotes: &[([f64; 4], [f64; 4])]) -> Vec<td_engine::Trade> {
-    let mut trades =
-        td_engine::build_trades(s.fills(), s.bars(), &asks_of(quotes), s.bar_funding());
-    td_engine::attach_stops(&mut trades, s.bars(), s.bar_stops());
+    let mut trades = td_engine::build_trades(
+        s.fills(),
+        s.bars(),
+        &asks_of(quotes),
+        s.bar_funding(),
+        td_core::AccountCurrency::Quote,
+        None,
+    );
+    td_engine::attach_stops(
+        &mut trades,
+        s.bars(),
+        s.bar_stops(),
+        td_core::AccountCurrency::Quote,
+    );
     trades
 }
 
@@ -1362,8 +1383,16 @@ fn a_run_values_its_fx_shorts_on_the_ask() {
     };
     let result = td_engine::run(&config, &bids, &asks, &[]).unwrap();
     let extremes = |asks: &[Option<Candle>]| {
-        td_engine::risk::intrabar(1_000_000.0, &bids, asks, &result.equity, &result.fills, &[])
-            .ranges
+        td_engine::risk::intrabar(
+            1_000_000.0,
+            &bids,
+            asks,
+            &result.equity,
+            &result.fills,
+            &[],
+            td_core::AccountCurrency::Quote,
+        )
+        .ranges
     };
     let quoted: Vec<Option<Candle>> = asks.iter().copied().map(Some).collect();
     assert_eq!(result.equity_extremes, extremes(&quoted));

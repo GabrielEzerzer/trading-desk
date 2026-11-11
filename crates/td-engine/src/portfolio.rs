@@ -1,7 +1,12 @@
 use serde::Serialize;
-use td_core::{InstrumentKind, Side};
+use td_core::{AccountCurrency, InstrumentKind, Side};
 
-/// Cash, position and P&L for the session's one instrument, in the quote asset.
+/// Cash, position and P&L for the session's one instrument, in the account currency: the quote
+/// asset on a [`AccountCurrency::Quote`] account, and the base currency on a
+/// [`AccountCurrency::Base`] one, where every amount in the quote currency (a fill's P&L, its fee,
+/// the open position's value) is converted at the price it arose at; see
+/// [`Portfolio::apply_fill`] and [`Portfolio::unrealised_pnl`]. Prices and the average entry stay
+/// in the quote currency, as prices.
 ///
 /// What `cash` means depends on the instrument:
 /// - Spot: the quote balance. A buy pays `qty * price` plus the fee out of it, a sell adds the
@@ -17,6 +22,8 @@ use td_core::{InstrumentKind, Side};
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Portfolio {
     kind: InstrumentKind,
+    #[serde(skip_serializing_if = "AccountCurrency::is_quote")]
+    account: AccountCurrency,
     cash: f64,
     position: f64,
     avg_entry: f64,
@@ -28,9 +35,21 @@ pub struct Portfolio {
 }
 
 impl Portfolio {
+    /// A quote-currency account.
     pub fn new(kind: InstrumentKind, starting_cash: f64) -> Self {
+        Portfolio::new_in(kind, starting_cash, AccountCurrency::Quote)
+    }
+
+    /// An account in `account`, holding `starting_cash` of it. [`crate::Session::new`] checks
+    /// that the kind allows the account currency.
+    pub(crate) fn new_in(
+        kind: InstrumentKind,
+        starting_cash: f64,
+        account: AccountCurrency,
+    ) -> Self {
         Portfolio {
             kind,
+            account,
             cash: starting_cash,
             position: 0.0,
             avg_entry: 0.0,
@@ -40,6 +59,11 @@ impl Portfolio {
             mark_price: 0.0,
             shortfall_written_off: 0.0,
         }
+    }
+
+    /// The currency every amount here is in.
+    pub fn account(&self) -> AccountCurrency {
+        self.account
     }
 
     pub fn cash(&self) -> f64 {
@@ -56,14 +80,21 @@ impl Portfolio {
         self.avg_entry
     }
 
-    /// P&L of closed quantity against the average entry price, before fees and funding.
+    /// P&L of closed quantity against the average entry price, before fees and funding. On a base
+    /// account each closing fill's P&L is converted at that fill's price.
     pub fn realised_pnl(&self) -> f64 {
         self.realised_pnl
     }
 
-    /// P&L of the open position at the last mark price.
+    /// P&L of the open position at the last mark price. On a base account it is converted at the
+    /// mark: closing the position there would realise the quote amount at that price.
     pub fn unrealised_pnl(&self) -> f64 {
-        self.position * (self.mark_price - self.avg_entry)
+        let pnl = self.position * (self.mark_price - self.avg_entry);
+        // Flat before the first mark has a mark of zero to divide by.
+        if self.position == 0.0 {
+            return pnl;
+        }
+        self.account.from_quote(pnl, self.mark_price)
     }
 
     pub fn fees_paid(&self) -> f64 {
@@ -97,6 +128,12 @@ impl Portfolio {
         }
     }
 
+    /// Applies a fill of `qty` at `price`, paying `fee`, which is in the account currency (a
+    /// broker converts it at the fill's price, see [`crate::SimBroker`]). The P&L of the quantity
+    /// it closes arises in the quote currency and is converted at `price`.
+    ///
+    /// shortcut: a spot account is always in the quote currency ([`crate::Session::new`] refuses
+    /// a base account there), so the spot cash movement `qty * price` is not converted.
     pub(crate) fn apply_fill(&mut self, side: Side, qty: f64, price: f64, fee: f64) {
         let dq = side.sign() * qty;
         let pos = self.position;
@@ -108,7 +145,9 @@ impl Portfolio {
         }
         if pos != 0.0 && pos.signum() != dq.signum() {
             let closed = qty.min(pos.abs());
-            let pnl = closed * (price - self.avg_entry) * pos.signum();
+            let pnl = self
+                .account
+                .from_quote(closed * (price - self.avg_entry) * pos.signum(), price);
             self.realised_pnl += pnl;
             if margin {
                 self.cash += pnl;
@@ -134,6 +173,9 @@ impl Portfolio {
 
     /// Charges one funding payment of `position * price * rate`: longs pay a positive rate and
     /// shorts receive it. Returns the amount paid.
+    ///
+    /// Not converted: funding is charged only on a kind whose rules have it (perpetuals), and
+    /// [`crate::Session::new`] refuses a base account on those, so it is always a quote account.
     pub(crate) fn charge_funding(&mut self, rate: f64, price: f64) -> f64 {
         let payment = self.position * price * rate;
         self.cash -= payment;
