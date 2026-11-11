@@ -9,14 +9,18 @@
 //!   `meta.json` of what the data layer dropped or moved.
 //! - `run <case.json> <harness dir> <real|gapless> <out.json>`: runs the case's backtest on the
 //!   exported bars through the engine's public API (`run`, or `run_strategy` for the harness's own
-//!   strategies) with zero slippage and the case's fees, and writes the fills, trades, equity
-//!   curve, funding per bar and metrics as JSON.
+//!   strategies) with zero slippage and the case's fees, and writes the fills (each with its
+//!   order), every order, the orders resting before each bar, the trades, equity curve, funding
+//!   per bar and metrics as JSON.
 //! - `metrics <curve.json> <out.json>`: our metrics report for any equity curve, so both engines'
 //!   curves are measured with the same formulas.
 //!
-//! Strategies: registered names (such as `sma_cross`) are built by the registry. The two strategies
-//! only the cross-check needs, `crosscheck_buy_and_hold` and `crosscheck_short_and_hold`, live in
-//! this file and run through `run_strategy`, so they never appear in the apps' strategy list.
+//! Strategies: registered names (such as `sma_cross`) are built by the registry. The strategies
+//! only the cross-check needs live in this file and run through `run_strategy`, so they never
+//! appear in the apps' strategy list: `crosscheck_buy_and_hold` and `crosscheck_short_and_hold`
+//! (cases 1 to 4), `crosscheck_limit_revert` (case 7), `crosscheck_bracket` (case 8),
+//! `crosscheck_stop_limit_breakout` (case 9) and `crosscheck_sma_limit` (case 10). Each has a
+//! twin in `nautilus_side.py`.
 //!
 //! Run it with `cargo run -p td-engine --example crosscheck -- <command> ...`; the harness's
 //! `run.py` does that for every case.
@@ -30,13 +34,13 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use td_core::{
-    Candle, FeeSchedule, Instrument, InstrumentId, InstrumentKind, Millis, OrderRequest, OrderType,
-    Side, TimeInForce, Timeframe, Venue,
+    Candle, FeeSchedule, Instrument, InstrumentId, InstrumentKind, Liquidity, Millis, OrderId,
+    OrderRequest, OrderType, Side, TimeInForce, Timeframe, Venue,
 };
 use td_data::{Http, Store, download_candles, download_funding, fetch_instruments};
 use td_engine::metrics::{self, EquitySeries};
 use td_engine::{
-    BacktestConfig, Context, EquityPoint, Params, SessionConfig, Strategy, run, run_backtest,
+    BacktestConfig, Context, EquityPoint, Params, Session, SessionConfig, Strategy, run,
     run_strategy,
 };
 
@@ -268,6 +272,32 @@ fn read_bars(path: &Path) -> Res<Vec<Candle>> {
     Ok(bars)
 }
 
+/// For each bar, the range of `funding` (sorted by time) the session charges with it, as
+/// `run_backtest` splits it: the stamps inside the bar's window and, from the second bar on, those
+/// in the gap since the previous bar's end. Stamps before the first bar are not charged.
+fn funding_ranges(
+    timeframe: Timeframe,
+    bars: &[Candle],
+    funding: &[(Millis, f64)],
+) -> Vec<std::ops::Range<usize>> {
+    let mut next = 0;
+    if let Some(first) = bars.first() {
+        while next < funding.len() && funding[next].0 < first.open_time {
+            next += 1;
+        }
+    }
+    bars.iter()
+        .map(|bar| {
+            let end = bar.open_time + timeframe.duration_ms();
+            let start = next;
+            while next < funding.len() && funding[next].0 < end {
+                next += 1;
+            }
+            start..next
+        })
+        .collect()
+}
+
 fn read_funding(path: &Path) -> Res<Vec<(Millis, f64)>> {
     let text = fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let mut rates = Vec::new();
@@ -319,18 +349,359 @@ impl Strategy for Hold {
     }
 }
 
+fn request(
+    ctx: &Context,
+    side: Side,
+    qty: f64,
+    order_type: OrderType,
+    reduce_only: bool,
+) -> OrderRequest {
+    OrderRequest {
+        instrument: ctx.instrument().id.clone(),
+        side,
+        qty,
+        order_type,
+        tif: TimeInForce::Gtc,
+        reduce_only,
+        client_tag: None,
+    }
+}
+
+/// The mean of the last `n` closes, summed oldest first.
+fn sma(bars: &[Candle], n: usize) -> f64 {
+    bars[bars.len() - n..].iter().map(|b| b.close).sum::<f64>() / n as f64
+}
+
+/// The simple mean of the true range over the last `n` bars, as `donchian_breakout` computes it;
+/// needs `n + 1` bars.
+fn atr(bars: &[Candle], n: usize) -> f64 {
+    let tail = &bars[bars.len() - n - 1..];
+    let sum: f64 = tail
+        .windows(2)
+        .map(|w| {
+            let (prev, b) = (w[0].close, &w[1]);
+            (b.high - b.low)
+                .max((b.high - prev).abs())
+                .max((b.low - prev).abs())
+        })
+        .sum();
+    sum / n as f64
+}
+
+/// Whether the order `id` is still open.
+fn is_open(ctx: &Context, id: OrderId) -> bool {
+    ctx.open_orders().iter().any(|o| o.id == id)
+}
+
+/// What became of an order a strategy keeps track of.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Tracked {
+    /// Still open, and younger than its time limit: kept.
+    Resting,
+    /// Still open after `cancel_after` bars: cancelled.
+    Expired,
+    /// No order tracked, or it filled or was cancelled.
+    Gone,
+}
+
+/// Checks the order in `slot`, sent on the bar where `ctx.bars()` had `sent` bars, at a decision
+/// with `n` bars: cancels it once it has rested `cancel_after` bars, and empties the slot unless
+/// it is still resting.
+fn track(
+    ctx: &mut Context,
+    slot: &mut Option<(OrderId, usize)>,
+    n: usize,
+    cancel_after: usize,
+) -> Tracked {
+    let Some((id, sent)) = slot.take() else {
+        return Tracked::Gone;
+    };
+    if !is_open(ctx, id) {
+        return Tracked::Gone;
+    }
+    if n - sent < cancel_after {
+        *slot = Some((id, sent));
+        return Tracked::Resting;
+    }
+    ctx.cancel(id);
+    Tracked::Expired
+}
+
+/// Cancels every open order. The strategies below call it when flat, so an exit left over from
+/// the trade just closed (a take-profit after its stop filled, or the stop after its take-profit)
+/// never rests on: Nautilus cancels such reduce-only orders itself once the position is flat.
+fn cancel_all(ctx: &mut Context) {
+    let ids: Vec<OrderId> = ctx.open_orders().iter().map(|o| o.id).collect();
+    for id in ids {
+        ctx.cancel(id);
+    }
+}
+
+/// Case 7: a limit entry and a limit exit, each cancelled and sent again at the latest close once
+/// it has rested `cancel_after` bars unfilled. Flat, it rests a buy `offset` below the close for
+/// `fraction` of the cash (net of the taker fee, as the cash check values it); long, a reduce-only
+/// sell `offset` above the close for the whole position.
+#[derive(Debug, Clone)]
+struct LimitRevert {
+    offset: f64,
+    cancel_after: usize,
+    fraction: f64,
+    order: Option<(OrderId, usize)>,
+}
+
+impl Strategy for LimitRevert {
+    fn on_bar(&mut self, ctx: &mut Context, bar: &Candle) {
+        if ctx.is_warming_up() {
+            return;
+        }
+        let n = ctx.bars().len();
+        if track(ctx, &mut self.order, n, self.cancel_after) == Tracked::Resting {
+            return;
+        }
+        let position = ctx.position();
+        let req = if position == 0.0 {
+            let price = bar.close * (1.0 - self.offset);
+            let qty = ctx.cash() * self.fraction / (price * (1.0 + ctx.fees().taker));
+            request(ctx, Side::Buy, qty, OrderType::Limit { price }, false)
+        } else {
+            let price = bar.close * (1.0 + self.offset);
+            request(ctx, Side::Sell, position, OrderType::Limit { price }, true)
+        };
+        if let Ok(id) = ctx.submit(req) {
+            self.order = Some((id, n));
+        }
+    }
+}
+
+/// Case 8: flat, it enters at market in the direction of the `fast`/`slow` moving averages with a
+/// protective stop `stop_atr` ATRs from the close attached, and rests a reduce-only take-profit
+/// limit `target_atr` ATRs from the close on the other side; then it waits for one of them. The
+/// quantity is fixed, so a trade closed differently by the two engines (on a bar where both exits
+/// are reachable, #29's difference 2) does not change the size of any later order.
+#[derive(Debug, Clone)]
+struct Bracket {
+    fast: usize,
+    slow: usize,
+    atr_period: usize,
+    stop_atr: f64,
+    target_atr: f64,
+    qty: f64,
+}
+
+impl Strategy for Bracket {
+    fn on_bar(&mut self, ctx: &mut Context, bar: &Candle) {
+        let bars = ctx.bars();
+        if ctx.is_warming_up() || bars.len() < self.slow.max(self.atr_period + 1) {
+            return;
+        }
+        if ctx.position() != 0.0 {
+            return;
+        }
+        let (fast, slow) = (sma(bars, self.fast), sma(bars, self.slow));
+        let atr = atr(bars, self.atr_period);
+        cancel_all(ctx);
+        if fast == slow || atr <= 0.0 {
+            return;
+        }
+        let (side, exit_side, sign) = if fast > slow {
+            (Side::Buy, Side::Sell, 1.0)
+        } else {
+            (Side::Sell, Side::Buy, -1.0)
+        };
+        let stop = bar.close - sign * self.stop_atr * atr;
+        let target = bar.close + sign * self.target_atr * atr;
+        let entry = request(ctx, side, self.qty, OrderType::Market, false);
+        if ctx.submit_with_stop(entry, stop).is_ok() {
+            let exit = request(
+                ctx,
+                exit_side,
+                self.qty,
+                OrderType::Limit { price: target },
+                true,
+            );
+            let _ = ctx.submit(exit);
+        }
+    }
+}
+
+/// Case 9: flat, it rests a stop-limit breakout entry for a fixed quantity: above the highest high
+/// of the last `channel` bars while the close is above its `trend` moving average (a buy), below
+/// the lowest low while it is under it (a sell). The trigger sits `trigger_gap` beyond that high
+/// or low, so it is never in the market when sent, and the limit `limit_offset` beyond the trigger.
+/// An entry still resting after `cancel_after` bars is cancelled and placed again. In a position,
+/// it exits at market `hold` bars after the bar its entry filled on.
+#[derive(Debug, Clone)]
+struct StopLimitBreakout {
+    channel: usize,
+    trend: usize,
+    trigger_gap: f64,
+    limit_offset: f64,
+    cancel_after: usize,
+    hold: usize,
+    qty: f64,
+    entry: Option<(OrderId, usize)>,
+    held: usize,
+}
+
+impl Strategy for StopLimitBreakout {
+    fn on_bar(&mut self, ctx: &mut Context, bar: &Candle) {
+        let bars = ctx.bars();
+        let n = bars.len();
+        if ctx.is_warming_up() || n < self.channel.max(self.trend) {
+            return;
+        }
+        let channel = &bars[n - self.channel..];
+        let high = channel.iter().map(|b| b.high).fold(f64::MIN, f64::max);
+        let low = channel.iter().map(|b| b.low).fold(f64::MAX, f64::min);
+        let above_trend = bar.close > sma(bars, self.trend);
+        let position = ctx.position();
+        if position != 0.0 {
+            self.entry = None;
+            self.held += 1;
+            if self.held >= self.hold {
+                let side = if position > 0.0 {
+                    Side::Sell
+                } else {
+                    Side::Buy
+                };
+                let exit = request(ctx, side, position.abs(), OrderType::Market, true);
+                let _ = ctx.submit(exit);
+            }
+            return;
+        }
+        self.held = 0;
+        if track(ctx, &mut self.entry, n, self.cancel_after) == Tracked::Resting {
+            return;
+        }
+        let (side, trigger, sign) = if above_trend {
+            (Side::Buy, high * (1.0 + self.trigger_gap), 1.0)
+        } else {
+            (Side::Sell, low * (1.0 - self.trigger_gap), -1.0)
+        };
+        let price = trigger * (1.0 + sign * self.limit_offset);
+        let entry = request(
+            ctx,
+            side,
+            self.qty,
+            OrderType::StopLimit { trigger, price },
+            false,
+        );
+        if let Ok(id) = ctx.submit(entry) {
+            self.entry = Some((id, n));
+        }
+    }
+}
+
+/// Case 10: `sma_cross`'s position (long above, short below, sized as `sma_cross` sizes it), but
+/// reached with a resting limit `offset` beyond the close instead of a market order: below it for
+/// a buy, above it for a sell. A limit still resting after `cancel_after` bars is cancelled, and
+/// the next decision sends a new one at the latest close.
+#[derive(Debug, Clone)]
+struct SmaLimit {
+    fast: usize,
+    slow: usize,
+    equity_fraction: f64,
+    offset: f64,
+    cancel_after: usize,
+    order: Option<(OrderId, usize)>,
+}
+
+impl Strategy for SmaLimit {
+    fn on_bar(&mut self, ctx: &mut Context, bar: &Candle) {
+        let bars = ctx.bars();
+        let n = bars.len();
+        if ctx.is_warming_up() || n < self.slow {
+            return;
+        }
+        let (fast, slow) = (sma(bars, self.fast), sma(bars, self.slow));
+        if track(ctx, &mut self.order, n, self.cancel_after) != Tracked::Gone {
+            return;
+        }
+        let can_short = ctx.instrument().id.kind.rules().can_short;
+        let want = if fast > slow {
+            1.0
+        } else if fast < slow && can_short {
+            -1.0
+        } else {
+            0.0
+        };
+        let position = ctx.position();
+        let held = if position > 0.0 {
+            1.0
+        } else if position < 0.0 {
+            -1.0
+        } else {
+            0.0
+        };
+        if held == want {
+            return;
+        }
+        let equity = ctx.equity();
+        let costs = 1.0 + ctx.fees().taker + ctx.slippage_bps() / 10_000.0;
+        // `affordable_qty` of the reference strategies, with their 0.5% headroom.
+        let affordable = equity * (1.0 - 0.005) / (bar.close * costs);
+        let size = (equity * self.equity_fraction / bar.close).min(affordable);
+        let delta = want * size - position;
+        let (side, price) = if delta > 0.0 {
+            (Side::Buy, bar.close * (1.0 - self.offset))
+        } else {
+            (Side::Sell, bar.close * (1.0 + self.offset))
+        };
+        let req = request(ctx, side, delta.abs(), OrderType::Limit { price }, false);
+        if let Ok(id) = ctx.submit(req) {
+            self.order = Some((id, n));
+        }
+    }
+}
+
 /// The harness's own strategy for `name`, or `None` for a registered one.
-fn harness_strategy(name: &str, params: &Params) -> Res<Option<Box<dyn Strategy>>> {
-    let side = match name {
-        "crosscheck_buy_and_hold" => Side::Buy,
-        "crosscheck_short_and_hold" => Side::Sell,
+fn harness_strategy(name: &str, p: &Params) -> Res<Option<Box<dyn Strategy>>> {
+    let strategy: Box<dyn Strategy> = match name {
+        "crosscheck_buy_and_hold" | "crosscheck_short_and_hold" => Box::new(Hold {
+            side: if name == "crosscheck_buy_and_hold" {
+                Side::Buy
+            } else {
+                Side::Sell
+            },
+            fraction: p.float("fraction")?,
+            sent: false,
+        }),
+        "crosscheck_limit_revert" => Box::new(LimitRevert {
+            offset: p.float("offset")?,
+            cancel_after: p.len("cancel_after")?,
+            fraction: p.float("fraction")?,
+            order: None,
+        }),
+        "crosscheck_bracket" => Box::new(Bracket {
+            fast: p.len("fast")?,
+            slow: p.len("slow")?,
+            atr_period: p.len("atr_period")?,
+            stop_atr: p.float("stop_atr")?,
+            target_atr: p.float("target_atr")?,
+            qty: p.float("qty")?,
+        }),
+        "crosscheck_stop_limit_breakout" => Box::new(StopLimitBreakout {
+            channel: p.len("channel")?,
+            trend: p.len("trend")?,
+            trigger_gap: p.float("trigger_gap")?,
+            limit_offset: p.float("limit_offset")?,
+            cancel_after: p.len("cancel_after")?,
+            hold: p.len("hold")?,
+            qty: p.float("qty")?,
+            entry: None,
+            held: 0,
+        }),
+        "crosscheck_sma_limit" => Box::new(SmaLimit {
+            fast: p.len("fast")?,
+            slow: p.len("slow")?,
+            equity_fraction: p.float("equity_fraction")?,
+            offset: p.float("offset")?,
+            cancel_after: p.len("cancel_after")?,
+            order: None,
+        }),
         _ => return Ok(None),
     };
-    Ok(Some(Box::new(Hold {
-        side,
-        fraction: params.float("fraction")?,
-        sent: false,
-    })))
+    Ok(Some(strategy))
 }
 
 fn build(case: &Case) -> Res<Box<dyn Strategy>> {
@@ -379,20 +750,20 @@ fn run_case(case_path: &Path, dir: &Path, series: &str, out: &Path) -> Res<()> {
         None => run(&config, &bars, &[], &funding)?,
     };
 
-    // The result has the run's funding total; the funding of each bar comes from the same session
-    // fed the same traded bars, checked to have made the same fills.
+    // The result has the run's funding total; the funding of each bar, and the orders resting
+    // before each bar, come from the same session fed the same traded bars one at a time, as
+    // `run_backtest` feeds them, checked to have made the same fills and paid the same funding.
     let traded: Vec<Candle> = bars
         .iter()
         .filter(|b| (from..to).contains(&b.open_time))
         .copied()
         .collect();
-    let session = run_backtest(
+    let mut funding_sorted = funding.clone();
+    funding_sorted.sort_by_key(|&(time, _)| time);
+    let mut session = Session::new(
         build(&case)?,
         instrument,
         case.timeframe,
-        &traded,
-        &[],
-        &funding,
         SessionConfig {
             starting_cash: case.starting_cash,
             slippage_bps: 0.0,
@@ -400,9 +771,35 @@ fn run_case(case_path: &Path, dir: &Path, series: &str, out: &Path) -> Res<()> {
             max_leverage: case.max_leverage,
         },
     )?;
+    let mut resting = Vec::new();
+    for (bar, range) in traded
+        .iter()
+        .zip(funding_ranges(case.timeframe, &traded, &funding_sorted))
+    {
+        let open = session.open_orders();
+        if !open.is_empty() {
+            resting.push(json!({ "bar": bar.open_time, "orders": open }));
+        }
+        session.on_bar(*bar, &funding_sorted[range])?;
+    }
     if session.fills() != result.fills.as_slice() {
         return Err("the session's fills differ from the backtest's".into());
     }
+    let session_funding: f64 = session
+        .bar_funding()
+        .iter()
+        .map(|f| f.at_open + f.in_bar)
+        .sum();
+    if (session_funding - result.metrics.funding_paid).abs()
+        > 1e-9 * (1.0 + result.metrics.funding_paid.abs())
+    {
+        return Err(format!(
+            "the session's funding {session_funding} differs from the backtest's {}",
+            result.metrics.funding_paid
+        )
+        .into());
+    }
+    let orders = session.orders();
     let funding_by_bar: Vec<Value> = traded
         .iter()
         .zip(session.bar_funding())
@@ -420,14 +817,31 @@ fn run_case(case_path: &Path, dir: &Path, series: &str, out: &Path) -> Res<()> {
         "case": case.name,
         "series": series,
         "bars": traded.len(),
-        "fills": result.fills.iter().map(|f| json!({
-            "time": f.time,
-            "side": f.side,
-            "qty": f.qty,
-            "price": f.price,
-            "fee": f.fee,
-            "liquidity": f.liquidity,
-        })).collect::<Vec<_>>(),
+        "fills": result.fills.iter().map(|f| {
+            let order = &orders[f.order_id.0 as usize - 1];
+            // Filled at the price the decision met: a market order, or a limit already marketable
+            // at its decision close, which fills as a taker on its first bar. Every other fill
+            // comes from an order resting on the bar it fills on.
+            let at_decision = match order.request.order_type {
+                OrderType::Market => true,
+                OrderType::Limit { .. } => f.liquidity == Liquidity::Taker,
+                _ => false,
+            };
+            json!({
+                "time": f.time,
+                "side": f.side,
+                "qty": f.qty,
+                "price": f.price,
+                "fee": f.fee,
+                "liquidity": f.liquidity,
+                "order_id": f.order_id,
+                "order_type": order.request.order_type,
+                "reduce_only": order.request.reduce_only,
+                "at_decision": at_decision,
+            })
+        }).collect::<Vec<_>>(),
+        "orders": orders,
+        "resting": resting,
         "rejected_orders": rejected,
         "trades": result.trades,
         "equity": result.equity,
