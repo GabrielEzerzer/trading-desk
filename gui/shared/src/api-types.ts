@@ -2037,7 +2037,8 @@ bars: number,
 /**
  * Every stretch of minutes in the range (warm-up included) the store has no candle for,
  * oldest first, including any at the start or the end of the range, in the instrument's open
- * hours. Each is shorter than a day, or three days for FX; a longer one refuses the run.
+ * hours. Together with any next to it that only closed hours part it from, each holds less
+ * than a day of open time, or two days for FX; more refuses the run.
  */
 gaps: Array<GapInfo>, 
 /**
