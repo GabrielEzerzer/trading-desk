@@ -710,5 +710,11 @@ fn on_a_market_with_quotes_the_asks_reach_every_run() {
     assert!(r.permutation.is_none());
     let luck = line(&r, "luck_p");
     assert_eq!(luck.outcome, Outcome::Inconclusive);
-    assert!(luck.note.as_deref().unwrap().contains("quotes"));
+    assert_eq!(
+        luck.note.as_deref(),
+        Some(
+            "The luck test does not run on a market with quotes yet: it shuffles the bars and \
+             cannot shuffle the asks with them."
+        )
+    );
 }

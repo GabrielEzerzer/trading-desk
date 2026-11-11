@@ -660,7 +660,8 @@ pub fn run_battery(
         match luck {
             Err(None) => {
                 result.luck_note = Some(
-                    "The luck test does not run on a market with quotes yet: it shuffles the bars                      and cannot shuffle the asks with them."
+                    "The luck test does not run on a market with quotes yet: it shuffles the bars \
+                     and cannot shuffle the asks with them."
                         .into(),
                 );
             }
