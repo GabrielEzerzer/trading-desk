@@ -422,6 +422,11 @@ async fn a_candles_topic_sends_the_bar_forming_then_the_closed_bar_that_replaces
         .map(|(_, m)| m)
         .filter(|m| matches!(m, ServerMessage::Candle { topic, .. } | ServerMessage::CandleForming { topic, .. } if *topic == m1))
         .collect();
+    assert_eq!(
+        one.len(),
+        24,
+        "three messages for each of minutes 2 to 9: {one:?}"
+    );
     for (k, i) in (2..10).enumerate() {
         assert_eq!(
             one[3 * k..3 * k + 3],
