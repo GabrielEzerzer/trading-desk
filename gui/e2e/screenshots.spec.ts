@@ -1,6 +1,7 @@
-// Visual baselines for the key Lab states at each window size. Font rendering differs between
-// operating systems, so the baselines are made and compared on CI's Linux runner only; elsewhere
-// this spec skips (README, "UI gates").
+// Visual baselines for the key Lab states and every Trading state at each window size. Trading's
+// states run on a held clock (harness.mjs), so the live chart shows the same bars on every run.
+// Font rendering differs between operating systems, so the baselines are made and compared on CI's
+// Linux runner only; elsewhere this spec skips (README, "UI gates").
 import { SIZES, STATES, settle } from '../app/shots/harness.mjs'
 import { expect, test } from './fixtures'
 
@@ -13,6 +14,7 @@ const KEY_STATES = [
   'lab-result-trade',
   'lab-result-evidence',
   'lab-run-failed',
+  ...STATES.filter((s) => s.section === 'trading').map((s) => s.name),
 ]
 
 test.skip(process.platform !== 'linux', "Baselines are made and compared on CI's Linux runner")

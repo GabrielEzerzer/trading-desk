@@ -6,7 +6,7 @@
  */
 export type Venue = "binance" | "bybit";
 
-export type InstrumentKind = "spot" | "perpetual";
+export type InstrumentKind = "spot" | "perpetual" | "fx";
 
 /**
  * Identifies an instrument across venues. The same symbol can exist as spot and as a perpetual on
