@@ -6,7 +6,7 @@
 //! Missing minutes are counted in the instrument's open hours only ([`missing_minutes`]), so the FX
 //! weekend is not a gap, and a market with bid and ask prices whose stored month lacks its asks is
 //! refused the same way. The
-//! check streams the range a month at a time and keeps nothing: a queued job holds only its
+//! check reads the range and keeps nothing: a queued job holds only its
 //! request, and loads its candles and funding once it has a run slot. If the store changed in
 //! between so that the run would now be refused, the job fails with that refusal. The job runs on
 //! a blocking thread (a tester run spreads its backtests over a rayon pool of its own), reports
@@ -266,14 +266,15 @@ fn read_data(store: &Store, config: &BacktestConfig) -> Result<StoreData, ApiErr
     let (from, to) = data_range(config)?;
     let in_range = |c: &Candle| (from..to).contains(&c.open_time);
     let (mut minutes, mut ask_minutes) = (Vec::new(), Vec::new());
-    for month in Month::range(from, to) {
-        let stored = store.read_month(id, month)?;
+    let months = Month::range(from, to);
+    for (&month, stored) in months.iter().zip(store.read_months(id, &months)) {
+        let stored = stored?;
         ask_minutes.extend(
             month_asks(store, id, month, &stored)?
                 .into_iter()
                 .filter(in_range),
         );
-        minutes.extend(stored.into_iter().filter(in_range));
+        minutes.extend(stored.iter().copied().filter(in_range));
     }
     let gaps = missing_minutes(id.kind, &minutes, from, to);
     let loaded = resample(id.kind, &minutes, config.timeframe, false);
@@ -294,9 +295,10 @@ fn read_data(store: &Store, config: &BacktestConfig) -> Result<StoreData, ApiErr
 }
 
 /// Checks that the store holds a configuration's range well enough to run it, by the rules of
-/// [`load_run_data`], without keeping the data: the 1-minute candles are read a month at a time,
-/// and only the long gaps and whether any bar can be built are kept. A 400 for a bad range, a 422
-/// `data_missing` where `load_run_data` would refuse.
+/// [`load_run_data`], without keeping the data: the months' 1-minute candles are read together
+/// ([`Store::read_months`]) and gone through a month at a time, and only the long gaps and whether
+/// any bar can be built are kept. A 400 for a bad range, a 422 `data_missing` where
+/// `load_run_data` would refuse.
 pub fn check_run_data(store: &Store, config: &BacktestConfig) -> Result<(), ApiError> {
     let id = &config.instrument.id;
     let (from, to) = data_range(config)?;
@@ -307,14 +309,16 @@ pub fn check_run_data(store: &Store, config: &BacktestConfig) -> Result<(), ApiE
     let mut any_bar = false;
     // Minutes of a bucket that a month's end cuts, kept for the next month.
     let mut pending: Vec<Candle> = Vec::new();
-    for month in Month::range(from, to) {
+    let months = Month::range(from, to);
+    for (&month, stored) in months.iter().zip(store.read_months(id, &months)) {
         let (start, end) = (month.start().max(from), month.end().min(to));
-        let stored = store.read_month(id, month)?;
+        let stored = stored?;
         // Read only to check the month has them; the load reads them again with the bids.
         month_asks(store, id, month, &stored)?;
         let minutes: Vec<Candle> = stored
-            .into_iter()
+            .iter()
             .filter(|c| (start..end).contains(&c.open_time))
+            .copied()
             .collect();
         for gap in missing_minutes(id.kind, &minutes, start, end) {
             match open.as_mut() {
@@ -601,7 +605,7 @@ fn report_progress(ctx: &JobCtx, done: usize, total: usize) -> ControlFlow<()> {
 }
 
 /// Saves a run with its data report and any `extra` files, all in one atomic save.
-pub(super) fn save_run(
+pub fn save_run(
     saved: &SavedRun,
     report: &DataReport,
     extra: &[(&str, &[u8])],
@@ -625,7 +629,7 @@ pub(super) fn save_run(
 }
 
 /// Reads a saved run and its data report.
-fn read_run(runs_dir: &Path, id: &str) -> Result<RunDetail, ApiError> {
+pub fn read_run(runs_dir: &Path, id: &str) -> Result<RunDetail, ApiError> {
     let run = td_engine::load(runs_dir, id).map_err(|e| match e {
         StoreError::InvalidRunId(_) => ApiError::not_found(format!("no run {id}")),
         StoreError::Io { source, .. } if source.kind() == std::io::ErrorKind::NotFound => {
@@ -653,7 +657,7 @@ fn read_run(runs_dir: &Path, id: &str) -> Result<RunDetail, ApiError> {
 }
 
 /// Compares a saved run with what the store and engine would give now.
-fn check_run(store: &Store, run: &SavedRun) -> RunCheck {
+pub fn check_run(store: &Store, run: &SavedRun) -> RunCheck {
     let base = run.base_config();
     let data_matches = read_data(store, base)
         .ok()
