@@ -483,21 +483,7 @@ impl Session {
             Some(ask) if ask.open_time != bar.open_time => Err(EngineError::UnmatchedAsk {
                 time: ask.open_time,
             }),
-            Some(ask) => {
-                ask.validate()?;
-                // The ask is at or above the bid at every instant, so also at the open and the
-                // close, at the highest bid and at the lowest ask.
-                if ask.open < bar.open
-                    || ask.high < bar.high
-                    || ask.low < bar.low
-                    || ask.close < bar.close
-                {
-                    return Err(EngineError::CrossedQuote {
-                        time: bar.open_time,
-                    });
-                }
-                Ok(())
-            }
+            Some(ask) => check_quote(bar, &ask),
         }
     }
 
@@ -639,6 +625,21 @@ impl Session {
     pub fn portfolio(&self) -> &Portfolio {
         &self.portfolio
     }
+}
+
+/// Checks that `ask`, whose open time matches, can be the ask candle of the bid candle `bar`: a
+/// valid candle with each of its open, high, low and close at or above the bid's (see
+/// [`EngineError::CrossedQuote`]).
+pub(crate) fn check_quote(bar: &Candle, ask: &Candle) -> Result<(), EngineError> {
+    ask.validate()?;
+    // The ask is at or above the bid at every instant, so also at the open and the close, at the
+    // highest bid and at the lowest ask.
+    if ask.open < bar.open || ask.high < bar.high || ask.low < bar.low || ask.close < bar.close {
+        return Err(EngineError::CrossedQuote {
+            time: bar.open_time,
+        });
+    }
+    Ok(())
 }
 
 /// Counts `order` in `stops` if it is a reduce-only stop or stop-limit.

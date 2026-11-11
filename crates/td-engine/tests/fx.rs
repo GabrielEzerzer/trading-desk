@@ -926,6 +926,59 @@ fn a_second_ask_at_one_time_is_refused() {
 }
 
 #[test]
+fn bad_asks_are_refused_on_warm_up_bars_and_by_the_fingerprint() {
+    // Eight bars: the first three warm the strategy up and the other five trade. The bid at minute
+    // 1, a warm-up bar, is 150.010 / 150.015 / 150.005 / 150.012 and its ask 0.020 above. Warm-up
+    // bars reach the session without their asks, so the run checks those asks itself, as the
+    // session checks a traded bar's. The fingerprint runs no session, so it checks every ask.
+    let (bids, asks) = quotes(8);
+    let config = td_engine::BacktestConfig {
+        from: 3 * MIN,
+        warmup_from: Some(0),
+        ..fx_backtest(8)
+    };
+    assert!(td_engine::run(&config, &bids, &asks, &[]).is_ok());
+    assert!(td_engine::config_fingerprint(&config, &bids, &asks, &[]).is_ok());
+    // Each case replaces one ask, and the run and the fingerprint must both refuse it.
+    let refuse = |at: usize, ask: Candle, refused: EngineError| {
+        let mut asks = asks.clone();
+        asks[at] = ask;
+        assert_eq!(
+            td_engine::run(&config, &bids, &asks, &[]).unwrap_err(),
+            refused
+        );
+        assert_eq!(
+            td_engine::config_fingerprint(&config, &bids, &asks, &[]).unwrap_err(),
+            refused
+        );
+    };
+    // An ask low of 149.995 at minute 1, under the bid low of 150.005: crossed.
+    let crossed = Candle {
+        low: 149.995,
+        ..asks[1]
+    };
+    refuse(1, crossed, EngineError::CrossedQuote { time: MIN });
+    // An ask high of 150.020 at minute 1, under the ask's own low of 150.025 and its open of
+    // 150.030: not a valid candle.
+    let invalid = Candle {
+        high: 150.020,
+        ..asks[1]
+    };
+    let not_a_candle = td_core::CoreError::InvalidCandle {
+        open_time: MIN,
+        reason: "high is below open or close",
+    };
+    refuse(1, invalid, EngineError::Core(not_a_candle));
+    // A traded bar's ask, at minute 5, with its low of 150.035 under the bid low of 150.045: the
+    // session refuses it during the run, and the fingerprint refuses it the same way.
+    let crossed = Candle {
+        low: 150.035,
+        ..asks[5]
+    };
+    refuse(5, crossed, EngineError::CrossedQuote { time: 5 * MIN });
+}
+
+#[test]
 fn the_fx_benchmark_buys_at_the_first_ask_open_and_pays_the_per_unit_commission() {
     // All of a million yen at the first ask open, 150.020, with 0.002 a unit:
     // floor(1 000 000 / (150.020 + 0.002)) = floor(6665.69...) = 6665 units, fee 6665 * 0.002

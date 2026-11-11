@@ -10,7 +10,7 @@ use td_core::{
 
 use crate::metrics::{self, DAY_MS, DAYS_PER_YEAR, EquitySeries, MetricsReport};
 use crate::risk::{self, EquityRange, Intrabar};
-use crate::session::{funding_ranges, sorted_funding};
+use crate::session::{check_quote, funding_ranges, sorted_funding};
 use crate::{
     BarFunding, CLOSE_OUT_TAG, CandleFillModel, EngineError, EquityPoint, Order, Params, Portfolio,
     Session, SessionConfig, Trade, attach_stops, build_strategy, build_trades,
@@ -231,7 +231,9 @@ pub struct Rerun {
 /// bars inside `warmup_from..from` warm the strategy up first. `asks` is the ask series beside
 /// `bars`, which then hold the bid, matched to them by open time: empty for a kind whose rules have
 /// no quotes, and for a kind with quotes one for every bar used (warm-up bars too), never filled in
-/// from the bid. An ask that matches no bar in `bars`, or a second ask at one time, is an error.
+/// from the bid. An ask that matches no bar in `bars`, or a second ask at one time, is an error, and
+/// so is one that is not a valid candle or is below its bid (see [`EngineError::CrossedQuote`]), on
+/// a warm-up bar as on a traded one.
 /// `funding` is `(time, rate)` in any order. An event in a gap between traded bars is charged at
 /// the next bar's open, like one due at that open; events before the first traded bar or from the
 /// last traded bar's end on are ignored.
@@ -250,6 +252,8 @@ pub fn run(
     let (warmup, traded) = select_bars(config, bars)?;
     let mut used_asks = match_asks(config.instrument.id.kind, bars, asks, &warmup)?;
     let traded_asks = match_asks(config.instrument.id.kind, bars, asks, &traded)?;
+    // The session checks each traded bar's ask as it is fed, but warm-up bars are fed without one.
+    check_quotes(&warmup, &used_asks)?;
     used_asks.extend_from_slice(&traded_asks);
     let bars = traded;
     let tf = config.timeframe;
@@ -391,6 +395,17 @@ pub(crate) fn match_asks(
         .collect()
 }
 
+/// Checks the ask that [`match_asks`] matched to each of `bars`, where there is one, as the session
+/// checks a bar's ask (see [`check_quote`]).
+fn check_quotes(bars: &[Candle], asks: &[Option<Candle>]) -> Result<(), EngineError> {
+    for (bar, ask) in bars.iter().zip(asks) {
+        if let Some(ask) = ask {
+            check_quote(bar, ask)?;
+        }
+    }
+    Ok(())
+}
+
 /// The warm-up bars (`warmup_from..from`) and the traded bars (`from..to`) of `bars`, after
 /// checking the range.
 pub(crate) fn select_bars(
@@ -424,7 +439,8 @@ pub(crate) fn select_bars(
 
 /// The fingerprint [`run`] would record for `config` on this data, without running it. A tester
 /// result's `data_fingerprint` is this over its base configuration, so comparing it with a saved
-/// run's tells whether the data changed since, as [`rerun`] does for a backtest.
+/// run's tells whether the data changed since, as [`rerun`] does for a backtest. It refuses the
+/// asks [`run`] refuses, on warm-up and traded bars alike.
 pub fn config_fingerprint(
     config: &BacktestConfig,
     bars: &[Candle],
@@ -434,13 +450,15 @@ pub fn config_fingerprint(
     let (mut used, traded) = select_bars(config, bars)?;
     let mut used_asks = match_asks(config.instrument.id.kind, bars, asks, &used)?;
     used_asks.extend(match_asks(config.instrument.id.kind, bars, asks, &traded)?);
+    used.extend_from_slice(&traded);
+    // No session runs here to check the traded bars' asks, so every ask is checked.
+    check_quotes(&used, &used_asks)?;
     let used_asks: Vec<Candle> = used_asks.into_iter().flatten().collect();
     let funding = sorted_funding(funding);
     let used_funding: Vec<(Millis, f64)> = funding_ranges(config.timeframe, &traded, &funding)
         .into_iter()
         .flat_map(|r| funding[r].iter().copied())
         .collect();
-    used.extend_from_slice(&traded);
     Ok(data_fingerprint(&used, &used_asks, &used_funding))
 }
 
