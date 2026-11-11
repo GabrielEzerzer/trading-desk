@@ -59,7 +59,7 @@ Nautilus fills a market order at the close of the bar it was decided on, our eng
 |---|---|---|---|---|
 | fills pair one to one (same bar and side) | agree | 185 paired of 185 ours / 185 Nautilus | all |  |
 | rejected orders | agree | 0 ours, 0 Nautilus | equal |  |
-| each price difference within its bound | agree | max diff 5 | per fill: |open[N+1] - close[N]| at the decision price; one tick plus bound 3 per unit for a resting order |  |
+| each price difference within its bound | agree | max diff 5 | per fill: |open[N+1] - close[N]| at the decision price; one tick plus bound 3 per unit for a resting order; one tick from Nautilus's walk for a stop-limit it rests |  |
 | trades pair one to one (same entry and exit bar, side, open at the end) | agree | 185 paired of 185 ours / 185 Nautilus | all |  |
 | trades: each P&L difference within its fills' bounds | agree | max diff 0.68034 (Nautilus scaled to our quantity), max 1 of its bound | per trade |  |
 | final equity difference within the sum of the bounds | agree | 9504.75030399 vs 9505.21771074, diff 0.467407 | 7.308853 |  |
