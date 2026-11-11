@@ -2338,6 +2338,7 @@ name = "td-data"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "aws-lc-rs",
  "clap",
  "flate2",
  "futures-util",

@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use reqwest::StatusCode;
 use reqwest::blocking::Client;
+use reqwest::header::HeaderMap;
 
 use crate::DataError;
 
@@ -73,6 +74,23 @@ impl Http {
             source,
         })?;
         Ok(Some(bytes.to_vec()))
+    }
+
+    /// GETs `url` with `headers` and returns the status and the body, whatever the status. Mark a
+    /// header that carries a secret as sensitive, so no debug output shows it.
+    pub(crate) fn get_with_headers(
+        &self,
+        url: &str,
+        headers: HeaderMap,
+    ) -> Result<(u16, Vec<u8>), DataError> {
+        let http = |source| DataError::Http {
+            url: url.to_string(),
+            source,
+        };
+        let response = self.client.get(url).headers(headers).send().map_err(http)?;
+        let status = response.status().as_u16();
+        let body = response.bytes().map_err(http)?;
+        Ok((status, body.to_vec()))
     }
 
     fn send(

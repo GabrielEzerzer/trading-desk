@@ -125,6 +125,23 @@ pub enum DataError {
 
     #[error("no data directory: set TD_DATA_DIR")]
     NoDataDir,
+
+    /// Names the variables that are not set, never a value.
+    #[error(
+        "dukascopy's history is read from a requester-pays S3 bucket, which needs AWS \
+         credentials: {} not set (set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY, and \
+         AWS_SESSION_TOKEN with temporary credentials)",
+        .missing.join(" and ")
+    )]
+    MissingAwsCredentials { missing: Vec<&'static str> },
+
+    /// S3 answered 403. `code` is S3's error code alone: the rest of its answer can echo the
+    /// access key and the signature, so it is never kept.
+    #[error(
+        "{url} was refused (403 {code}): the AWS credentials in AWS_ACCESS_KEY_ID and \
+         AWS_SECRET_ACCESS_KEY are not valid, or may not read this requester-pays bucket"
+    )]
+    AwsRefused { url: String, code: String },
 }
 
 impl DataError {

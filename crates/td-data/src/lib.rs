@@ -14,6 +14,7 @@ mod http;
 pub mod instruments;
 pub mod live;
 mod resample;
+mod sigv4;
 mod source;
 mod store;
 pub mod time;
