@@ -49,6 +49,7 @@ use parquet::arrow::ArrowWriter;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::WriterProperties;
+use rayon::prelude::*;
 use td_core::{Candle, InstrumentId, InstrumentKind, Millis, Timeframe, Venue};
 
 use crate::DataError;
@@ -429,6 +430,23 @@ impl Store {
         self.month_rows(id, month).map(Arc::unwrap_or_clone)
     }
 
+    /// What [`Store::read_month`] returns for each of `months`, in their order, shared with the
+    /// store's memory instead of copied. The months not in memory are decoded in parallel, so a
+    /// caller that stops at the first error gets the error a month-by-month loop would.
+    // shortcut: every month asked for is held at once, beside what the cache keeps, so a range far
+    // longer than the cache's cap costs its whole size in memory while it is read; read it in
+    // chunks of months if ranges that long are ever loaded.
+    pub fn read_months(
+        &self,
+        id: &InstrumentId,
+        months: &[Month],
+    ) -> Vec<Result<Arc<Vec<Candle>>, DataError>> {
+        months
+            .par_iter()
+            .map(|&month| self.month_rows(id, month))
+            .collect()
+    }
+
     /// [`Store::read_month`], shared with the cache instead of copied.
     fn month_rows(&self, id: &InstrumentId, month: Month) -> Result<Arc<Vec<Candle>>, DataError> {
         self.read_rows(id, month, &CANDLE_COLUMNS, |_| Ok(()))
@@ -539,8 +557,9 @@ impl Store {
     /// ([`missing_minutes`]).
     pub fn coverage(&self, id: &InstrumentId) -> Result<Vec<MonthCoverage>, DataError> {
         let mut coverage = Vec::new();
-        for month in self.months(id)? {
-            let candles = self.month_rows(id, month)?;
+        let months = self.months(id)?;
+        for (&month, candles) in months.iter().zip(self.read_months(id, &months)) {
+            let candles = candles?;
             let (Some(first), Some(last)) = (candles.first(), candles.last()) else {
                 continue;
             };
@@ -571,12 +590,8 @@ impl Store {
         include_incomplete: bool,
     ) -> Result<LoadedCandles, DataError> {
         let mut minutes = Vec::new();
-        for month in Month::range(from, to) {
-            minutes.extend(
-                self.month_rows(id, month)?
-                    .iter()
-                    .filter(|c| (from..to).contains(&c.open_time)),
-            );
+        for stored in self.read_months(id, &Month::range(from, to)) {
+            minutes.extend(stored?.iter().filter(|c| (from..to).contains(&c.open_time)));
         }
         Ok(resample(id.kind, &minutes, timeframe, include_incomplete))
     }
@@ -593,13 +608,13 @@ impl Store {
         to: Millis,
         include_incomplete: bool,
     ) -> Result<LoadedCandles, DataError> {
+        let asks: Vec<_> = Month::range(from, to)
+            .into_par_iter()
+            .map(|month| self.month_ask_rows(id, month))
+            .collect();
         let mut minutes = Vec::new();
-        for month in Month::range(from, to) {
-            minutes.extend(
-                self.month_ask_rows(id, month)?
-                    .iter()
-                    .filter(|c| (from..to).contains(&c.open_time)),
-            );
+        for stored in asks {
+            minutes.extend(stored?.iter().filter(|c| (from..to).contains(&c.open_time)));
         }
         Ok(resample(id.kind, &minutes, timeframe, include_incomplete))
     }
@@ -2200,5 +2215,65 @@ mod tests {
         store.read_month(&id, months[0]).expect("reads");
         assert_eq!(decodes(&store), 4);
         assert_eq!(cached(&store), (2, 2 * month_bytes));
+    }
+
+    #[test]
+    fn months_read_together_are_what_reading_them_one_by_one_gives() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let store = Store::new(dir.path());
+        let id = spot_id();
+        let jan = Month::containing(JAN_2024);
+        let months: Vec<Month> = std::iter::successors(Some(jan), |m| Some(m.next()))
+            .take(6)
+            .collect();
+        // January and June stored, February missing, March and May out of order, April whole.
+        for &month in [months[0], months[3], months[5]].iter() {
+            store
+                .write_candles(&id, &minutes_of(month, 5))
+                .expect("writes");
+        }
+        for month in [months[2], months[4]] {
+            let mut rows = minutes_of(month, 3);
+            rows.swap(0, 2);
+            let path = store.candle_path(&id, month).expect("a path");
+            write_atomic(&path, &candle_batch(&rows).expect("a batch")).expect("writes");
+        }
+        let one_by_one: Vec<Result<Vec<Candle>, String>> = months
+            .iter()
+            .map(|&m| {
+                Store::new(dir.path())
+                    .read_month(&id, m)
+                    .map_err(|e| e.to_string())
+            })
+            .collect();
+        let together: Vec<Result<Vec<Candle>, String>> = store
+            .read_months(&id, &months)
+            .into_iter()
+            .map(|r| r.map(Arc::unwrap_or_clone).map_err(|e| e.to_string()))
+            .collect();
+        assert_eq!(together, one_by_one);
+        assert_eq!(together[1], Ok(Vec::new()), "a missing month is empty");
+        // Read again, from memory where cached, and stopped at the first error: March's.
+        let first_error = store
+            .read_months(&id, &months)
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .expect_err("March is out of order")
+            .to_string();
+        assert_eq!(Err(first_error), one_by_one[2]);
+        assert!(
+            one_by_one[2] != one_by_one[4],
+            "March's error names March's file"
+        );
+        let stored = store
+            .load_candles(
+                &id,
+                Timeframe::M1,
+                months[0].start(),
+                months[1].end(),
+                false,
+            )
+            .expect("January and February load");
+        assert_eq!(stored.candles, minutes_of(months[0], 5));
     }
 }
