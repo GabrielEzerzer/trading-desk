@@ -493,20 +493,21 @@ fn keep_going(_done: usize, _total: usize) -> ControlFlow<()> {
 }
 
 // The engine calls, one function each, so a change to their signatures is a few-line edit here.
+// The workloads are crypto, which has no stored asks, so each passes none, as the server does.
 
 fn engine_run(config: &BacktestConfig, data: &RunData) -> Result<BacktestResult, EngineError> {
-    td_engine::run(config, &data.bars, &data.funding)
+    td_engine::run(config, &data.bars, &[], &data.funding)
 }
 
 fn engine_sweep(spec: &SweepSpec, data: &RunData) -> Result<SweepResult, TesterError> {
-    td_engine::sweep(spec, &data.bars, &data.funding, Some(&keep_going))
+    td_engine::sweep(spec, &data.bars, &[], &data.funding, Some(&keep_going))
 }
 
 fn engine_walk_forward(
     spec: &WalkForwardSpec,
     data: &RunData,
 ) -> Result<WalkForwardResult, TesterError> {
-    td_engine::walk_forward(spec, &data.bars, &data.funding, Some(&keep_going))
+    td_engine::walk_forward(spec, &data.bars, &[], &data.funding, Some(&keep_going))
 }
 
 fn base_config(w: &Workload, from: Millis, to: Millis) -> BacktestConfig {
