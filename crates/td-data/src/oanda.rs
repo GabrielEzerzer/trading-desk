@@ -397,11 +397,17 @@ fn get_page(
     http.get_with_headers(&page_url(base, instrument, from), headers)
 }
 
-/// Reads OANDA's answer for the page at `url`: its body, or an error that keeps only the status and
-/// OANDA's `errorMessage`, with any copy of the token taken out.
-fn answer(url: &str, status: u16, body: Vec<u8>, token: &Token) -> Result<Vec<u8>, DataError> {
+/// Reads OANDA's answer for the page at `url`: its body as text, or an error that keeps only the
+/// status and OANDA's `errorMessage`. Either way any copy of the token is taken out first, so no
+/// error built from the answer can show it.
+///
+/// shortcut: a copy of the token in a 2xx body written with JSON escapes (`t...`) is not
+/// found; scrub the decoded strings instead if a server ever sends one back that way.
+fn answer(url: &str, status: u16, body: Vec<u8>, token: &Token) -> Result<String, DataError> {
     if (200..300).contains(&status) {
-        return Ok(body);
+        let text = String::from_utf8(body)
+            .map_err(|_| DataError::parse(url, "the answer is not UTF-8 text"))?;
+        return Ok(token.scrub(&text));
     }
     #[derive(Deserialize)]
     struct ErrorBody {
@@ -475,8 +481,8 @@ struct RawPrices {
 
 /// The minutes of one page from `url`, in its order. `name` is the instrument as OANDA names it
 /// and `symbol` as the desk does, for errors.
-fn parse_page(url: &str, body: &[u8], name: &str, symbol: &str) -> Result<Vec<Quote>, DataError> {
-    let page: Page = serde_json::from_slice(body).map_err(|e| DataError::parse(url, e))?;
+fn parse_page(url: &str, body: &str, name: &str, symbol: &str) -> Result<Vec<Quote>, DataError> {
+    let page: Page = serde_json::from_str(body).map_err(|e| DataError::parse(url, e))?;
     if page.instrument != name || page.granularity != "M1" {
         return Err(DataError::parse(
             url,
@@ -880,6 +886,57 @@ mod tests {
         assert!(result.is_err_and(|e| e.to_string().contains("EUR_USD M1 candles, not USD_JPY")),);
     }
 
+    /// Every error built from a page's text (serde's, the instrument or granularity, a time, a
+    /// price) shows `[token]` where the page held the token.
+    #[test]
+    fn a_page_that_does_not_read_never_shows_the_token() {
+        let monday = parse_date("2024-01-08").expect("a date") + 9 * HOUR;
+        let good = open_minutes(monday, monday + 3 * MINUTE, &[]);
+        let candles_with = |field: &str, side: Option<&str>| {
+            let mut c = good.clone();
+            match side {
+                Some(side) => c[1][side][field] = json!(TOKEN),
+                None => c[1][field] = json!(TOKEN),
+            }
+            c
+        };
+        let good_page = json!({ "instrument": "USD_JPY", "granularity": "M1", "candles": good });
+        let with = |key: &str, value: Value| {
+            let mut p = good_page.clone();
+            p[key] = value;
+            p
+        };
+        let bodies = [
+            with("instrument", json!(format!("USD_JPY {TOKEN}"))),
+            with("granularity", json!(TOKEN)),
+            with("candles", json!(candles_with("time", None))),
+            with("candles", json!(candles_with("o", Some("bid")))),
+            // A string where serde wants a number, which serde's own error quotes.
+            with("candles", json!(candles_with("volume", None))),
+        ];
+        for body in bodies {
+            let body = body.to_string().into_bytes();
+            let mut get = |_: &Token, _| Ok((200, body.clone()));
+            let error = history(
+                &usdjpy(),
+                monday,
+                monday + 3 * MINUTE,
+                far_future(),
+                env,
+                &NO_WAIT,
+                &mut get,
+            )
+            .expect_err("refused");
+            let shown = format!("{error} {error:?}");
+            assert!(!shown.contains(TOKEN), "{shown}");
+            assert!(shown.contains("[token]"), "{shown}");
+        }
+        // A body that is not UTF-8 is not JSON, and is refused before it is read.
+        let token = Token(TOKEN.into());
+        let error = answer("u", 200, vec![b'{', 0xff, b'}'], &token).expect_err("refused");
+        assert!(error.to_string().contains("not UTF-8"), "{error}");
+    }
+
     #[test]
     fn times_and_prices_read_only_in_oandas_forms() {
         assert_eq!(parse_time("1452055800.000000000"), Some(1_452_055_800_000));
@@ -1028,9 +1085,9 @@ mod tests {
         let result = with_retries(&NO_WAIT, || {
             calls += 1;
             let status = if calls < 3 { 429 } else { 200 };
-            answer("u", status, vec![1], &token)
+            answer("u", status, b"[]".to_vec(), &token)
         });
-        assert_eq!((result.ok(), calls), (Some(vec![1]), 3));
+        assert_eq!((result.ok(), calls), (Some("[]".to_string()), 3));
     }
 
     /// The request [`get_page`] sends, read back by a local one-shot server: the path and query,
