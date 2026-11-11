@@ -835,3 +835,35 @@ def test_a_stop_limit_the_walk_fills_on_a_later_bar_is_named():
     assert moved == ["our sell stop-limit fill of bar 3 at 108.5: Nautilus's walk fills it on bar 4 "
                      "at 108.5"]
     assert compare.walked_elsewhere(ours["fills"], bars(), compare.open_orders(ours["resting"])) == []
+
+
+def rounding_pair(side: str, ours: float, theirs: float, cls: str = compare.EXACT) -> dict:
+    return {"class": cls, "ours": fill(0, side, 1.0, ours, 0.0), "theirs": fill(0, side, 1.0, theirs, 0.0)}
+
+
+def test_tick_rounding_names_fills_rounded_against_the_order():
+    pairs = [
+        rounding_pair("buy", 17126.1, 17126.05),   # rounded up for a buy
+        rounding_pair("sell", 22794.6, 22794.67),  # rounded down for a sell
+        rounding_pair("buy", 100.0, 100.0),        # same price: not counted
+        rounding_pair("buy", 101.0, 100.95, compare.AMBIGUOUS),  # not an exact pair: left out
+    ]
+    assert compare.tick_rounding(pairs, TICK) == (2, 0)
+
+
+def test_tick_rounding_counts_any_other_difference_as_other():
+    # Rounded the wrong way for the side, off by a whole tick, and a difference where Nautilus's
+    # price is already on the tick: none of them is the rounding.
+    pairs = [
+        rounding_pair("buy", 17126.0, 17126.05),
+        rounding_pair("sell", 22794.7, 22794.67),
+        rounding_pair("buy", 100.1, 100.0),
+    ]
+    assert compare.tick_rounding(pairs, TICK) == (0, 3)
+
+
+def test_compare_gapless_reports_the_tick_rounding():
+    ours = result([fill(1 * H, "buy", 1.0, 103.1, 0.0)], [10_000.0] * 6)
+    theirs = result([fill(1 * H, "buy", 1.0, 103.05, 0.0)], [10_000.0] * 6)
+    numbers = compare_gapless(ours, theirs, bars(), TICK).numbers
+    assert (numbers["tick_rounded_fills"], numbers["other_price_diffs"]) == (1, 0)

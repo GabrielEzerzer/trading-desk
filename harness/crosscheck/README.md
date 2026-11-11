@@ -56,7 +56,7 @@ Each report starts with the verdict, PASS or FAIL, then the setup (data, dropped
 
 A case with fills but no paired trades fails, as a case with no paired fills does.
 
-Both sections end with the metrics computed with our formulas from each engine's equity curve. "Differences and their reasons" lists every difference the report found with its explanation; anything listed there as unexplained fails the case.
+Both sections end with the metrics computed with our formulas from each engine's equity curve. "Differences and their reasons" lists every difference the report found with its explanation; anything listed there as unexplained fails the case. A failure whose cause is known still fails, and the list names the cause and the checks that fail from it. Two causes are named so far: a stop-limit that Nautilus's bar walk fills on a later bar than ours (case 9), and fills our broker rounds to the instrument's current tick where the bars carry prices off it, found when every differing gapless price is Nautilus's rounded to the tick against the order (case 6).
 
 ## How the two engines are lined up
 

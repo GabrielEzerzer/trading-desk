@@ -325,12 +325,31 @@ def differences(case: dict, results: dict) -> list[str]:
             "sizes above (same stamps, rates and prices)."
         )
     walk = "stop-limit fills on the same bar in both engines"
+    # Every differing gapless price is ours at Nautilus's price rounded to the tick against the
+    # order: our broker's rounding of off-tick bar prices, so the failures below follow from it.
+    rounding = g.get("tick_rounded_fills", 0) > 0 and g.get("other_price_diffs", 0) == 0
+    failing = any(not c.ok for cmp in (gap_cmp, real_cmp) for c in cmp.checks)
+    if rounding and failing:
+        out.append(
+            f"- **Fails, cause known, our engine:** on the gapless bars {g['tick_rounded_fills']} "
+            "fill(s) differ in price, and every one is Nautilus's price rounded to the instrument's "
+            "current tick against the order, up for a buy and down for a "
+            "sell. The bars carry prices off the current tick (the venue's tick was finer then). "
+            "Our broker rounds every fill price to the current tick, slippage 0 included "
+            "(`slip()` in `crates/td-engine/src/fill.rs`), where Nautilus fills at the bar's "
+            "price. Each such fill is up to a tick worse in ours; quantities, which each engine "
+            "sizes from its own equity, then differ, and fees, trade P&L and equity follow. Not "
+            "fixed in this branch."
+        )
     for cmp in (gap_cmp, real_cmp):
         moved = any(c.name == walk and not c.ok for c in cmp.checks)
         for c in cmp.checks:
             if c.ok:
                 continue
-            if c.name == walk:
+            if rounding and c.name != walk:
+                out.append(f"- **Fails, following from our engine's tick rounding, {cmp.series} "
+                           f"bars, {c.name}:** {c.value} (limit {c.limit}). {c.note}")
+            elif c.name == walk:
                 out.append(
                     f"- **Fails, cause known, {cmp.series} bars:** {c.value}. Nautilus 1.231 walks "
                     "a bar through its open, high, low and close only, so it triggers a stop-limit "

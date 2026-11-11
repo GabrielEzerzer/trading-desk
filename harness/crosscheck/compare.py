@@ -57,6 +57,7 @@ Nautilus computes itself; funding is compared on its own, per trade, on the gapl
 from __future__ import annotations
 
 import bisect
+import math
 from dataclasses import dataclass, field
 
 PRICE_TICKS = 1.0
@@ -409,6 +410,31 @@ def value_shift(p: dict) -> float:
     o, t = p["ours"], p["theirs"]
     sign = 1.0 if o["side"] == "buy" else -1.0
     return sign * o["qty"] * (t["price"] - o["price"]) + (t["fee"] - o["fee"])
+
+
+def tick_rounding(pairs: list[dict], tick: float) -> tuple[int, int]:
+    """Of the exact fill pairs whose prices differ, how many have ours at Nautilus's price rounded
+    to the tick against the order (up for a buy, down for a sell), and how many differ otherwise.
+
+    Our broker rounds every fill price to the instrument's tick, slippage 0 included; Nautilus
+    fills at the bar's price as it is. Where the bars carry prices off the current tick (a venue
+    that has since widened its tick), all differing pairs land in the first count."""
+    rounded = other = 0
+    for p in pairs:
+        if p.get("class") != EXACT:
+            continue
+        o, t = p["ours"]["price"], p["theirs"]["price"]
+        if abs(o - t) <= tick * 1e-6:
+            continue
+        # Rounded first so a price on the tick is not pushed to the next one by float noise; it
+        # then rounds to itself, and a difference from it counts as other.
+        steps = round(t / tick, 6)
+        want = (math.ceil(steps) if p["ours"]["side"] == "buy" else math.floor(steps)) * tick
+        if abs(o - want) <= tick * 1e-6:
+            rounded += 1
+        else:
+            other += 1
+    return rounded, other
 
 
 def expected_fee(p: dict, maker: float) -> float:
@@ -847,6 +873,7 @@ def compare_gapless(
         for p in exact
     ]
     max_price = max(price_diffs, default=0.0)
+    rounded, other_diffs = tick_rounding(exact, tick)
     cmp.checks.append(
         Check(
             "prices within one tick",
@@ -963,6 +990,8 @@ def compare_gapless(
         "ambiguous_bars": len(amb),
         "ambiguous_fills": n_amb_fills,
         "stop_limit_maker_fills": sum(1 for p in pairs if p["class"] == STOP_LIMIT_MAKER),
+        "tick_rounded_fills": rounded,
+        "other_price_diffs": other_diffs,
         **trade_numbers,
         **amb_numbers,
     }
