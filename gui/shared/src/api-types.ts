@@ -277,7 +277,10 @@ export type EquityRange = { low: number, high: number, };
  */
 export type Order = { id: OrderId, request: OrderRequest, 
 /**
- * Open time of the bar the order was decided on. It can first fill on a later bar.
+ * Open time of the bar the order was decided on. It can first fill on a later bar. For a
+ * strategy's order that is the bar at whose close it was sent; for one placed between bars
+ * from outside the strategy, such as a manual order, it is the bar in progress when it was
+ * accepted, so it never fills on a price from before then.
  */
 submitted_at: number, 
 /**
@@ -1098,10 +1101,15 @@ funding_rates: number, };
 export type ToleratedBucket = { open_time: number, missing_minutes: number, };
 
 /**
- * What a paper session runs: a registered strategy with its parameters, on one instrument and
- * timeframe, with the same money settings as a backtest.
+ * What a paper session runs: a registered strategy with its parameters, or none for a manual
+ * session, on one instrument and timeframe, with the same money settings as a backtest.
  */
-export type PaperConfig = { strategy: string, params: Params, 
+export type PaperConfig = { 
+/**
+ * A registered strategy, or `none` ([`MANUAL_STRATEGY`]) for a manual session, which takes no
+ * parameters.
+ */
+strategy: string, params: Params, 
 /**
  * The instrument with the trading rules it had when the session was made. Fixed for the
  * session's life, so a resume replays against the same rules.
@@ -1142,7 +1150,8 @@ export type Status = { "status": "warming_up" } | { "status": "live" } | { "stat
  */
 export type StartSessionRequest = { 
 /**
- * A registered strategy, as `GET /strategies` lists it.
+ * A registered strategy, as `GET /strategies` lists it, or `none` for a manual session, where
+ * only manual orders trade; it takes no parameters.
  */
 strategy: string, params: Params, instrument: InstrumentId, timeframe: Timeframe, starting_cash: number, slippage_bps: number, 
 /**
@@ -1173,6 +1182,163 @@ qty: number, avg_entry: number, mark_price: number, unrealised_pnl: number, real
 funding_paid: number, };
 
 /**
+ * Who placed an order, and so whose its fills are.
+ */
+export type OrderSource = "strategy" | "manual" | "liquidation";
+
+/**
+ * An order with who placed it.
+ */
+export type PaperOrder = { source: OrderSource, id: OrderId, request: OrderRequest, 
+/**
+ * Open time of the bar the order was decided on. It can first fill on a later bar. For a
+ * strategy's order that is the bar at whose close it was sent; for one placed between bars
+ * from outside the strategy, such as a manual order, it is the bar in progress when it was
+ * accepted, so it never fills on a price from before then.
+ */
+submitted_at: number, 
+/**
+ * Close of the bar the order was decided on: the last price before it was sent.
+ */
+decision_close: number, 
+/**
+ * The protective stop to place when this order fills, if one was attached.
+ */
+attached_stop: AttachedStop | null, status: OrderStatus, };
+
+/**
+ * A fill with who placed its order.
+ */
+export type PaperFill = { source: OrderSource, order_id: OrderId, instrument: InstrumentId, side: Side, time: number, price: number, qty: number, 
+/**
+ * The fee paid, in the quote asset. Negative for a rebate.
+ */
+fee: number, liquidity: Liquidity, };
+
+/**
+ * Whose fills make up a trade. A liquidation's fill does not count: it only closes a trade that
+ * the strategy or a person opened.
+ */
+export type TradeSource = "strategy" | "manual" | "mixed";
+
+/**
+ * A round trip with whose fills it is made of.
+ */
+export type PaperTrade = { source: TradeSource, side: TradeSide, 
+/**
+ * Open time of the bar of the first fill.
+ */
+entry_time: number, 
+/**
+ * Open time of the bar of the fill that closed the trade, or of the last bar for an open
+ * trade.
+ */
+exit_time: number, 
+/**
+ * Still open at the end of the run; its exit is the remaining position marked at the last
+ * close, with no exit fee.
+ */
+open: boolean, 
+/**
+ * The largest absolute position during the trade.
+ */
+qty: number, 
+/**
+ * Volume-weighted price of the fills that opened or added to the position.
+ */
+entry_price: number, 
+/**
+ * Volume-weighted price of the fills that reduced or closed it (and the mark, if open).
+ */
+exit_price: number, 
+/**
+ * `sign * exit_qty * (exit_price - entry_price)`, before fees and funding. Over a closed
+ * round trip this is the exit notional minus the entry notional (reversed for a short),
+ * which is what the portfolio's average-cost realised P&L adds up to.
+ */
+gross_pnl: number, 
+/**
+ * Fees of the trade's fills. A fill that flips the position splits its fee between the two
+ * trades in proportion to the quantity that closed and that opened.
+ */
+fees: number, 
+/**
+ * Funding charged on the trade's position: at a bar's open (including funding due in a gap
+ * before the bar) while it was held going into the bar, and later in a bar while it was held
+ * after the bar's fills.
+ */
+funding: number, 
+/**
+ * `gross_pnl - fees - funding`.
+ */
+net_pnl: number, 
+/**
+ * `net_pnl / (entry_price * qty)`: net P&L over the largest entry notional.
+ */
+return_on_notional: number, 
+/**
+ * Bars from the entry fill's bar to the exit fill's bar; for an open trade, to the end of the
+ * last bar. It counts bars fed, not time: missing bars in a gap are not counted, so across a
+ * gap it understates how long the position was held. For a closed trade, the time between
+ * the entry and exit fills' bars is `exit_time - entry_time`.
+ */
+bars_held: number, 
+/**
+ * The protective stop in force when the trade opened, if any: see [`attach_stops`]. `None`
+ * without one, and in a result saved before trades kept their stop.
+ */
+stop: number | null, 
+/**
+ * `net_pnl` over the initial risk, `qty * |entry_price - stop|`: the trade's result in
+ * multiples of what it risked at its stop; see [`attach_stops`]. `None` without a stop, with
+ * a stop at or beyond the entry price (no risk), or when not finite.
+ */
+r_multiple: number | null, 
+/**
+ * Maximum adverse excursion: the largest unrealised loss of the open position at any price
+ * it met, in the quote asset, before fees and funding; 0 if it never went against the
+ * entry. See [`build_trades`] for the prices counted. `None` in a result saved before
+ * trades had it.
+ */
+mae: number | null, 
+/**
+ * Maximum favourable excursion: the largest unrealised gain, measured like `mae`.
+ */
+mfe: number | null, 
+/**
+ * Closed by the end-of-run close-out (see [`crate::BacktestConfig::close_at_end`]) rather
+ * than by the strategy: in a walk-forward, at the end of its test window.
+ */
+force_closed: boolean, };
+
+/**
+ * `POST /sessions/{id}/orders`: an order placed by hand. It goes through the same rounding,
+ * checks and broker as a strategy's order, checked at the close of the last bar fed, and takes
+ * effect from the first bar that opens at or after the moment it is accepted.
+ */
+export type ManualOrder = { side: Side, 
+/**
+ * In the base asset; rounded down to the lot size.
+ */
+qty: number, type: ManualOrderType, 
+/**
+ * Required for a limit order and refused on a market one. Rounded to the tick in the order's
+ * favour: a buy down, a sell up.
+ */
+limit_price?: number, 
+/**
+ * Only reduce the open position; false when left out.
+ */
+reduce_only?: boolean, };
+
+/**
+ * A manual order's type. A market order fills at the open of the first bar that opens at or after
+ * it is accepted; a limit order rests, good till cancelled, until a bar from then on reaches its
+ * price.
+ */
+export type ManualOrderType = "market" | "limit";
+
+/**
  * Everything about one session: `GET /sessions/{id}`, and the first message of a `session:`
  * subscription.
  */
@@ -1184,11 +1350,11 @@ equity: number, position: PositionInfo,
 /**
  * Equity at each live bar's close.
  */
-equity_curve: Array<EquityPoint>, open_orders: Array<Order>, fills: Array<Fill>, 
+equity_curve: Array<EquityPoint>, open_orders: Array<PaperOrder>, fills: Array<PaperFill>, 
 /**
  * Round trips so far; one still open is marked at the last close.
  */
-trades: Array<Trade>, 
+trades: Array<PaperTrade>, 
 /**
  * Funding rates charged.
  */
@@ -1213,7 +1379,7 @@ warnings: Array<string>, };
  * subscriber never sees a bar that a resume would fetch and report again. Replaying the log
  * reports nothing.
  */
-export type SessionEvent = { "event": "funding", funding: Funding, } | { "event": "fill", fill: Fill, } | { "event": "order", order: Order, } | { "event": "bar", bar: Candle, warm_up: boolean, equity: number | null, } | { "event": "status", status: Status, } | { "event": "dropped", open_time: number, } | { "event": "warning", message: string, };
+export type SessionEvent = { "event": "funding", funding: Funding, } | { "event": "fill", fill: PaperFill, } | { "event": "order", order: PaperOrder, } | { "event": "bar", bar: Candle, warm_up: boolean, equity: number | null, } | { "event": "status", status: Status, } | { "event": "dropped", open_time: number, } | { "event": "warning", message: string, };
 
 /**
  * A message from the client.
