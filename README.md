@@ -10,7 +10,7 @@ FX pairs (`--venue oanda --kind fx`) download bid and ask minutes from OANDA's R
 hush run -- cargo run --release -p td-data -- download --venue oanda --kind fx --symbol USDJPY --from 2016-01-01 --to 2026-11-01
 ```
 
-A request returns at most 5,000 minutes, so a month of one pair takes six or seven requests. Minutes with no price are filled at the last close, and nothing is stored for the weekend, when the market is closed.
+A request returns at most 5,000 minutes, so a month of one pair takes six or seven requests. A minute with no price is filled at the last close. A run of an hour or more with no price, such as a market holiday, is left missing and shows as a gap, and nothing is stored for the weekend, when the market is closed.
 
 ## Writing a strategy
 

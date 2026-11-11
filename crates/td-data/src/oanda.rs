@@ -30,6 +30,11 @@ const HOST: &str = "https://api-fxpractice.oanda.com";
 const TOKEN_VAR: &str = "OANDA_API_TOKEN";
 /// The most candles one request returns.
 const PAGE: usize = 5_000;
+/// The shortest run of open minutes without a candle that is taken for a closure or an outage
+/// rather than a quiet market, and so left missing instead of filled. Quiet stretches in an open FX
+/// market are minutes long: the gaps inside the week in OANDA's USD/JPY minutes are 1 to 5 minutes.
+/// A market holiday the weekend rule does not know, such as 25 December, is a whole day.
+const CLOSURE_MINUTES: i64 = 60;
 /// The pauses before each retry of a page after a failed connection, a 429 or a 5xx: five tries
 /// over about 40 seconds.
 const RETRY_DELAYS: [Duration; 4] = [
@@ -199,8 +204,8 @@ pub(crate) struct Counts {
 /// asked, or holds a time or a price that does not read, a candle that is not valid, or a time
 /// that is not after the one before it. Then, by [`fill`]: a candle still forming, in closed
 /// hours or with the ask crossed below the bid is left out and counted, and an open minute
-/// without a candle is filled, but never at or after the candle still forming, even when the
-/// local clock is ahead of OANDA's.
+/// without a candle is filled, but never in a run of an hour or more without one, and never at or
+/// after the candle still forming, even when the local clock is ahead of OANDA's.
 pub(crate) fn history(
     id: &InstrumentId,
     from: Millis,
@@ -306,7 +311,11 @@ struct Quote {
 /// - an open minute with no candle is filled with a flat candle on each side at that side's last
 ///   close, with no volume, and counted. Before the first candle there is nothing to fill at, and
 ///   closed hours clear the last close, so the minutes after a weekend's open stay missing until
-///   its first candle: a fill never reaches across closed hours.
+///   its first candle: a fill never reaches across closed hours;
+/// - a run of [`CLOSURE_MINUTES`] or more open minutes with no candle, up to the next candle or
+///   closed hours, is a closure or an outage, such as a market holiday: it is left missing whole,
+///   so it shows in the download's gaps and in coverage, and nothing is filled again until the
+///   next candle that is kept. A crossed candle still ends such a run, as OANDA was quoting then.
 ///
 /// The minutes are open by [`InstrumentKind::is_open`], which agrees with the closed spans the
 /// store's coverage counts open minutes by.
@@ -315,8 +324,9 @@ struct Quote {
 /// starts with nothing to fill at; carry the last close in from the month before if those gaps
 /// matter.
 ///
-/// shortcut: a long quiet stretch in open hours is filled at a stale price; cap the fill if a
-/// holiday ever shows up as a flat day.
+/// shortcut: a run is measured only up to the end of the read (the month's end or the present), so
+/// a closure that starts less than an hour before that is filled up to it; read on past the end if
+/// a closure ever starts in a month's last hour or a download runs in a closure's first hour.
 fn fill(
     kind: InstrumentKind,
     to: Millis,
@@ -355,6 +365,17 @@ fn fill(
             Some(q) if !crossed(&q.bid, &q.ask) => (q.bid, q.ask),
             quote => {
                 counts.crossed += usize::from(quote.is_some());
+                // A run that stays open with no candle for `CLOSURE_MINUTES` is a closure: clearing
+                // the last close at its first minute leaves all of it unfilled.
+                let next = quotes.peek().map_or(end, |q| q.bid.open_time);
+                if quote.is_none()
+                    && last.is_some()
+                    && (0..CLOSURE_MINUTES)
+                        .map(|i| minute + i * MINUTE)
+                        .all(|m| m < next && kind.is_open(m))
+                {
+                    last = None;
+                }
                 let Some((bid, ask)) = last else { continue };
                 counts.filled_minutes += 1;
                 (flat(minute, bid), flat(minute, ask))
@@ -806,6 +827,87 @@ mod tests {
             Counts {
                 closed_minutes: 1,
                 filled_minutes: 2,
+                ..Counts::default()
+            }
+        );
+    }
+
+    #[test]
+    fn a_quiet_hour_is_left_missing_whole_and_filling_starts_again_at_the_next_candle() {
+        // Monday 8 January 2024 from 09:00 UTC: 59 quiet minutes, a candle at 10:00, 60 quiet
+        // minutes, a candle at 11:01, then 2 quiet minutes.
+        let nine = parse_date("2024-01-08").expect("a date") + 9 * HOUR;
+        let minutes = |from: Millis, n: i64| (0..n).map(move |i| from + i * MINUTE);
+        let (short, long, resumed) = (nine + MINUTE, nine + HOUR + MINUTE, nine + 122 * MINUTE);
+        let quiet: Vec<Millis> = minutes(short, 59)
+            .chain(minutes(long, 60))
+            .chain(minutes(resumed, 2))
+            .collect();
+        let to = nine + 3 * HOUR;
+        let served = open_minutes(nine, to, &quiet);
+        let asked = RefCell::new(Vec::new());
+        let (history, counts) = history(
+            &usdjpy(),
+            nine,
+            to,
+            far_future(),
+            env,
+            &NO_WAIT,
+            serve(&served, &asked),
+        )
+        .expect("reads");
+
+        // The hour is left out whole; the 59 minutes before it and the 2 after it are filled.
+        let expected: Vec<Millis> = minutes(nine, 180)
+            .filter(|t| !(long..long + HOUR).contains(t))
+            .collect();
+        assert_eq!(times(&history.candles), expected);
+        assert_eq!(times(&history.asks), expected);
+        assert_eq!(
+            counts,
+            Counts {
+                filled_minutes: 61,
+                ..Counts::default()
+            }
+        );
+        // Each filled minute is flat at the close of the candle before its stretch.
+        let at = |t: Millis| {
+            let i = history.candles.iter().position(|c| c.open_time == t);
+            &history.candles[i.expect("stored")]
+        };
+        for (stretch, n, before) in [(short, 59, nine), (resumed, 2, long + HOUR)] {
+            let close = at(before).close;
+            for t in minutes(stretch, n) {
+                assert_eq!((at(t).open, at(t).low, at(t).volume), (close, close, 0.0));
+            }
+        }
+    }
+
+    #[test]
+    fn a_crossed_candle_ends_a_quiet_run() {
+        // A candle at 09:00, a crossed one at 09:01, 59 quiet minutes, then a candle at 10:01:
+        // OANDA was quoting at 09:01, so the run without a candle is 59 minutes and is filled.
+        let nine = parse_date("2024-01-08").expect("a date") + 9 * HOUR;
+        let quiet: Vec<Millis> = (2..61).map(|i| nine + i * MINUTE).collect();
+        let mut served = open_minutes(nine, nine + 2 * HOUR, &quiet);
+        served[1]["ask"]["l"] = json!("118.000");
+        let asked = RefCell::new(Vec::new());
+        let (history, counts) = history(
+            &usdjpy(),
+            nine,
+            nine + 2 * HOUR,
+            far_future(),
+            env,
+            &NO_WAIT,
+            serve(&served, &asked),
+        )
+        .expect("reads");
+        assert_eq!(history.candles.len(), 120);
+        assert_eq!(
+            counts,
+            Counts {
+                crossed: 1,
+                filled_minutes: 60,
                 ..Counts::default()
             }
         );
