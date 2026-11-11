@@ -27,8 +27,23 @@ fn with_private(private: Vec<StrategyEntry>) -> Vec<StrategyEntry> {
     all
 }
 
+/// The registered strategy called `name`. In the crate's own tests it also finds the strategies
+/// in `strategies::test_only`, which are broken on purpose and never listed.
 pub fn find_strategy(name: &str) -> Option<StrategyEntry> {
-    strategies().into_iter().find(|e| e.name == name)
+    strategies()
+        .into_iter()
+        .chain(test_only())
+        .find(|e| e.name == name)
+}
+
+#[cfg(test)]
+fn test_only() -> Vec<StrategyEntry> {
+    crate::strategies::test_only::entries()
+}
+
+#[cfg(not(test))]
+fn test_only() -> Vec<StrategyEntry> {
+    Vec::new()
 }
 
 /// Resolves `params` against the strategy's specs and builds it.
