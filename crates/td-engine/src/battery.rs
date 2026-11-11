@@ -124,6 +124,10 @@ pub struct BatteryResult {
     /// (`luck_note` says which).
     pub permutation: Option<PermutationResult>,
     pub luck_note: Option<String>,
+    /// True when a cancel stopped R3, so the luck line lacks its p-value. False when R3 finished,
+    /// was skipped or did not run; a result saved before this field existed reads as false.
+    #[serde(default)]
+    pub luck_cancelled: bool,
 }
 
 /// The counts behind I1 to I3.
@@ -365,6 +369,7 @@ pub fn run_battery(
         start_offsets: Vec::new(),
         permutation: None,
         luck_note: None,
+        luck_cancelled: false,
     };
     if criteria.iter().any(|c| c.outcome == Outcome::Fail) {
         meter.finish();
@@ -670,6 +675,7 @@ pub fn run_battery(
                 result.permutation = Some(p);
             }
             Err(Some(TesterError::Cancelled)) => {
+                result.luck_cancelled = true;
                 result.luck_note = Some(
                     "The luck test was cancelled, so it gave no p-value; run the battery again \
                      to complete it."

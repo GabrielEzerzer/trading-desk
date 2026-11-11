@@ -36,7 +36,6 @@ use std::fs;
 use std::io;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use axum::Json;
 use axum::extract::rejection::{JsonRejection, QueryRejection};
@@ -316,13 +315,8 @@ fn execute(
         let spec = battery_spec(entry, instrument);
         let id = &instrument.id;
         let step = (grand / 200).max(1);
-        // Set when the cancel is seen during the luck test, the one step a cancel lets end early.
-        let stopped_in_luck = AtomicBool::new(false);
         let progress = |count: usize, total: usize| {
             if ctx.is_cancelled() {
-                if count > runs.luck_from {
-                    stopped_in_luck.store(true, Ordering::SeqCst);
-                }
                 return std::ops::ControlFlow::Break(());
             }
             if count.is_multiple_of(step) || count == total {
@@ -352,9 +346,7 @@ fn execute(
             }
             Err(e) => return Err(failed(done, e)),
         };
-        // A luck test that ran to the end gave a p-value; one the cancel stopped gave none.
-        let complete = battery.permutation.is_some() || !stopped_in_luck.load(Ordering::SeqCst);
-        match save_plan_run(entry, instrument, battery, complete, data, runs_dir) {
+        match save_plan_run(entry, instrument, battery, data, runs_dir) {
             Ok(saved) => done.instruments.push(saved),
             Err(e) => return Err(failed(done, e)),
         }
@@ -402,7 +394,6 @@ fn save_plan_run(
     entry: &StrategyEntry,
     instrument: &Instrument,
     battery: td_engine::BatteryResult,
-    complete: bool,
     data: &RunData,
     runs_dir: &Path,
 ) -> Result<PlanInstrumentDone, JobError> {
@@ -414,7 +405,9 @@ fn save_plan_run(
         verdict: battery.verdict.clone(),
         plan: to_json(&entry.plan)?,
         rule: to_json(&entry.rule)?,
-        complete,
+        // Only a cancel during the luck test leaves a battery incomplete; a luck test skipped on a
+        // market with quotes is not one.
+        complete: !battery.luck_cancelled,
     };
     let run = PlanRun::new(
         &battery_spec(entry, instrument),
@@ -486,12 +479,16 @@ struct InstrumentHead {
 struct BatteryHead {
     verdict: Verdict,
     seed: u64,
+    #[serde(default)]
+    luck_cancelled: bool,
 }
 
 /// The verdict record of the run in `dir`, if it is a plan run. A run saved without a
 /// `verdict.json` (by another tool), or whose `verdict.json` does not parse (damaged, or written
-/// before a field existed), is read from its `result.json` and counted as complete. `None` for
-/// other kinds and for a run that cannot be read, so one damaged run does not hide the rest.
+/// before a field existed), is read from its `result.json`, complete unless its battery says a
+/// cancel stopped the luck test (a result saved before that flag existed reads as complete).
+/// `None` for other kinds and for a run that cannot be read, so one damaged run does not hide the
+/// rest.
 fn read_record(dir: &Path) -> Option<VerdictRecord> {
     match fs::read(dir.join(VERDICT_FILE)) {
         Ok(bytes) => {
@@ -518,7 +515,7 @@ fn read_record(dir: &Path) -> Option<VerdictRecord> {
         verdict: run.battery.verdict,
         plan: run.plan,
         rule: run.rule,
-        complete: true,
+        complete: !run.battery.luck_cancelled,
     })
 }
 

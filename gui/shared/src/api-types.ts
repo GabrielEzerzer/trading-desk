@@ -1222,7 +1222,12 @@ start_offsets: Array<StartOffset>,
  * R3. `None` when it did not run, was cancelled or had no qualifying real sweep
  * (`luck_note` says which).
  */
-permutation: PermutationResult | null, luck_note: string | null, };
+permutation: PermutationResult | null, luck_note: string | null, 
+/**
+ * True when a cancel stopped R3, so the luck line lacks its p-value. False when R3 finished,
+ * was skipped or did not run; a result saved before this field existed reads as false.
+ */
+luck_cancelled: boolean, };
 
 /**
  * The counts behind I1 to I3.
