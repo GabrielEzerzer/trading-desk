@@ -443,6 +443,7 @@ impl TestPlan {
             fees: FeeSchedule {
                 maker: 0.0,
                 taker: 0.0,
+                per_unit: 0.0,
             },
         };
         // The slippage does not change these checks, so a stand-in 0 serves.
@@ -629,6 +630,7 @@ mod tests {
             fees: FeeSchedule {
                 maker: 0.001,
                 taker: 0.001,
+                per_unit: 0.0,
             },
         };
         let wf = plan.walk_forward_spec("sma_cross", inst.clone(), 2.0);
@@ -660,6 +662,7 @@ mod tests {
             fees: FeeSchedule {
                 maker: 0.001,
                 taker: 0.001,
+                per_unit: 0.0,
             },
         };
         let (btc, eth) = (plan.instruments[0].clone(), plan.instruments[1].clone());

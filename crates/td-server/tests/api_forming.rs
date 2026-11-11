@@ -48,6 +48,7 @@ fn instrument() -> Instrument {
         fees: FeeSchedule {
             maker: 0.001,
             taker: 0.002,
+            per_unit: 0.0,
         },
     }
 }

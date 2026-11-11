@@ -18,7 +18,16 @@ fn run(
     bars: &[Candle],
     strategy: Box<dyn Strategy>,
 ) -> Session {
-    run_backtest(strategy, inst, Timeframe::M1, bars, &[], config(slippage)).unwrap()
+    run_backtest(
+        strategy,
+        inst,
+        Timeframe::M1,
+        bars,
+        &[],
+        &[],
+        config(slippage),
+    )
+    .unwrap()
 }
 
 /// Calls the closure with the context and the bar's index at each bar's close.
@@ -539,7 +548,7 @@ fn funding_session(side: Side) -> Session {
         (-5, 0.01),
     ];
     let (script, _) = Script::new(vec![(0, req(&i, side, 2.0, OrderType::Market))]);
-    run_backtest(script, i, Timeframe::H1, &bars, &funding, config(0.0)).unwrap()
+    run_backtest(script, i, Timeframe::H1, &bars, &[], &funding, config(0.0)).unwrap()
 }
 
 #[test]
@@ -582,7 +591,7 @@ fn funding_due_at_the_open_is_charged_on_a_long_stopped_out_inside_the_bar() {
         ),
     ]);
     let funding = [(2 * MIN, 0.001)];
-    let s = run_backtest(script, i, Timeframe::M1, &bars, &funding, config(0.0)).unwrap();
+    let s = run_backtest(script, i, Timeframe::M1, &bars, &[], &funding, config(0.0)).unwrap();
     // The long of 2 bought at 100 on bar 1 (fee 0.4) is still held at bar 2's open, when the
     // funding is due: 2 * 100 * 0.001 = 0.2. The stop sells it later in the bar, at 95: fee 0.38,
     // realised -10.
@@ -606,7 +615,7 @@ fn an_entry_inside_the_bar_does_not_pay_the_funding_due_at_its_open() {
         req(&i, Side::Buy, 2.0, OrderType::Limit { price: 99.0 }),
     )]);
     let funding = [(MIN, 0.001)];
-    let s = run_backtest(script, i, Timeframe::M1, &bars, &funding, config(0.0)).unwrap();
+    let s = run_backtest(script, i, Timeframe::M1, &bars, &[], &funding, config(0.0)).unwrap();
     // Flat at bar 1's open, when the funding is due, so nothing is paid. The limit then buys 2 at
     // 99 inside the bar, as a maker: fee 0.198.
     let p = s.portfolio();
@@ -644,7 +653,7 @@ fn a_daily_bar_charges_funding_at_its_open_and_inside_it_on_different_positions(
         (2 * D + H8, 0.0002),
         (2 * D + 2 * H8, 0.0003),
     ];
-    let s = run_backtest(script, i, Timeframe::D1, &bars, &funding, config(0.0)).unwrap();
+    let s = run_backtest(script, i, Timeframe::D1, &bars, &[], &funding, config(0.0)).unwrap();
     // Day 1: flat at 00:00, so nothing is due then. The market buy fills at the open at 100, fee
     // 0.2, and 08:00 and 16:00 are charged on that long of 1 at the close: 1 * 100 * 0.0001 = 0.01
     // each. Equity: 10000 - 0.2 - 0.02 = 9999.78.
@@ -691,7 +700,7 @@ fn funding_due_in_a_gap_is_charged_at_the_next_bar_open() {
     let (script, _) = Script::new(vec![(0, req(&i, Side::Buy, 2.0, OrderType::Market))]);
     // 08:00 falls in the gap; 05:00 is before the first bar and is not charged.
     let funding = [(8 * H, 0.0001), (5 * H, 0.01)];
-    let s = run_backtest(script, i, Timeframe::H1, &bars, &funding, config(0.0)).unwrap();
+    let s = run_backtest(script, i, Timeframe::H1, &bars, &[], &funding, config(0.0)).unwrap();
     // The long of 2 bought at 07:00's open at 100 (fee 0.4) is held across the gap. The 08:00
     // funding is charged at the 09:00 bar's open on that long, at the open price: 2 * 104 * 0.0001
     // = 0.0208.
@@ -1451,7 +1460,16 @@ fn a_strategy_never_sees_a_future_bar() {
         .collect();
     let seen = Arc::new(Mutex::new(Vec::new()));
     let strategy = Box::new(Recorder(seen.clone()));
-    run_backtest(strategy, spot(), Timeframe::M1, &bars, &[], config(0.0)).unwrap();
+    run_backtest(
+        strategy,
+        spot(),
+        Timeframe::M1,
+        &bars,
+        &[],
+        &[],
+        config(0.0),
+    )
+    .unwrap();
     let seen = seen.lock().unwrap();
     // on_start on the first bar, then on_bar for every bar with history ending at that bar.
     assert_eq!(seen[0], (1, 0, -1));
@@ -1548,6 +1566,7 @@ fn sma_cross_goes_long_on_the_rise_and_flat_on_the_fall() {
         Timeframe::M1,
         &up_then_down(),
         &[],
+        &[],
         config(5.0),
     )
     .unwrap();
@@ -1573,6 +1592,7 @@ fn donchian_enters_on_a_breakout_places_a_stop_and_exits() {
         perp(),
         Timeframe::M1,
         &up_then_down(),
+        &[],
         &[],
         config(0.0),
     )
@@ -1631,6 +1651,7 @@ fn donchian_skips_an_entry_whose_stop_would_be_at_or_below_zero() {
         Timeframe::M1,
         &up_then_down(),
         &[],
+        &[],
         config(0.0),
     )
     .unwrap();
@@ -1685,7 +1706,16 @@ fn reference_strategies_size_full_spot_entries_to_pass_the_cash_check() {
     for (name, params, qty) in cases {
         let strategy = build_strategy(name, &params).unwrap();
         let bars = up_then_down();
-        let s = run_backtest(strategy, spot(), Timeframe::M1, &bars, &[], config(5.0)).unwrap();
+        let s = run_backtest(
+            strategy,
+            spot(),
+            Timeframe::M1,
+            &bars,
+            &[],
+            &[],
+            config(5.0),
+        )
+        .unwrap();
         assert!(
             s.orders()
                 .iter()

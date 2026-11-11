@@ -59,11 +59,13 @@ const MICROS_FROM: i64 = 100_000_000_000_000;
 pub const BINANCE_SPOT_FEES: FeeSchedule = FeeSchedule {
     maker: 0.001,
     taker: 0.001,
+    per_unit: 0.0,
 };
 /// Binance USD-M futures: 0.02% maker, 0.05% taker.
 pub const BINANCE_USDM_FEES: FeeSchedule = FeeSchedule {
     maker: 0.0002,
     taker: 0.0005,
+    per_unit: 0.0,
 };
 
 /// Binance spot and USD-M perpetuals.
