@@ -27,7 +27,8 @@ enum Command {
         #[arg(long)]
         kind: KindArg,
     },
-    /// Download 1-minute candles (and funding rates, for a perpetual) into the store.
+    /// Download 1-minute candles (and funding rates, for a perpetual) into the store. Dukascopy
+    /// needs AWS credentials in AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY.
     Download {
         #[command(flatten)]
         instrument: InstrumentArgs,

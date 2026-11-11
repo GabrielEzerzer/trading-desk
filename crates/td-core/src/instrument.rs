@@ -11,7 +11,8 @@ use crate::{CoreError, OrderRequest, OrderType};
 pub enum Venue {
     Binance,
     Bybit,
-    /// Dukascopy's free historical data feed: FX bid and ask candles, no trading.
+    /// Dukascopy's historical tick data, read from its requester-pays S3 export: FX bid and ask
+    /// candles, no trading.
     Dukascopy,
 }
 
