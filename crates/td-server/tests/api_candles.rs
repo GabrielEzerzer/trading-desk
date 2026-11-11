@@ -125,7 +125,7 @@ impl Rest for FakeRest {
         let bars = if timeframe == Timeframe::M1 {
             self.minutes.clone()
         } else {
-            resample(&self.minutes, timeframe, true).candles
+            resample(InstrumentKind::Spot, &self.minutes, timeframe, true).candles
         };
         Ok(bars.into_iter().filter(|c| c.open_time >= from).collect())
     }
@@ -272,7 +272,10 @@ async fn higher_timeframes_aggregate_the_stored_minutes_as_the_store_does() {
             .expect("loads")
             .candles;
         assert_eq!(got.candles, from_store, "{name}");
-        assert_eq!(got.candles, resample(&minutes, timeframe, false).candles);
+        assert_eq!(
+            got.candles,
+            resample(InstrumentKind::Spot, &minutes, timeframe, false).candles
+        );
         assert_eq!(got.candles.len() as i64, 4 * HOUR / timeframe.duration_ms());
         // An aggregated bar is not a copy of its first minute.
         assert_eq!(
@@ -297,7 +300,7 @@ async fn daily_and_weekly_bars_over_months_match_the_store() {
             .await;
         assert_eq!(
             got.candles,
-            resample(&minutes, timeframe, false).candles,
+            resample(InstrumentKind::Spot, &minutes, timeframe, false).candles,
             "{name}"
         );
         assert_eq!(got.candles.len(), bars, "{name}");
@@ -323,7 +326,7 @@ async fn from_and_to_between_bar_boundaries_round_up_to_the_next() {
             T0 + 3 * HOUR + 5 * MIN
         ))
         .await;
-    let hours = resample(&minutes, Timeframe::H1, false).candles;
+    let hours = resample(InstrumentKind::Spot, &minutes, Timeframe::H1, false).candles;
     assert_eq!(got.candles, hours[1..4]);
     assert_eq!((got.from, got.to), (T0 + HOUR, T0 + 4 * HOUR));
     // From Wednesday 3 January: the weeks opening on Monday 8 and Monday 15 January.
@@ -334,7 +337,7 @@ async fn from_and_to_between_bar_boundaries_round_up_to_the_next() {
             T0 + 21 * DAY
         ))
         .await;
-    let weeks = resample(&minutes, Timeframe::W1, false).candles;
+    let weeks = resample(InstrumentKind::Spot, &minutes, Timeframe::W1, false).candles;
     assert_eq!(got.candles, weeks[1..3]);
     assert_eq!((got.from, got.to), (T0 + 7 * DAY, T0 + 21 * DAY));
     assert!(got.missing.is_empty() && got.from_venue.is_empty());
@@ -387,8 +390,8 @@ async fn an_hour_the_store_holds_only_part_of_comes_from_the_venue() {
         .candles(&format!("&timeframe=1h&from={T0}&to={}", T0 + 4 * HOUR))
         .await;
     let tf = Timeframe::H1;
-    let from_store = resample(&store_minutes, tf, false).candles;
-    let from_venue = resample(&venue, tf, false).candles;
+    let from_store = resample(InstrumentKind::Spot, &store_minutes, tf, false).candles;
+    let from_venue = resample(InstrumentKind::Spot, &venue, tf, false).candles;
     assert_eq!(
         got.candles,
         [from_store[0], from_venue[1], from_store[1], from_store[2]]
@@ -407,7 +410,10 @@ async fn a_watched_instrument_with_nothing_stored_comes_from_the_venue() {
     let api = Api::start(&[], FakeRest::new(venue.clone(), now)).await;
     let got = api.candles("&timeframe=1h").await;
     let tf = Timeframe::H1;
-    assert_eq!(got.candles, resample(&venue, tf, false).candles);
+    assert_eq!(
+        got.candles,
+        resample(InstrumentKind::Spot, &venue, tf, false).candles
+    );
     assert_eq!(got.candles.len(), 10, "the forming hour is left out");
     assert_eq!(got.to, T0 + 10 * HOUR);
     // No `from`: the latest MAX_CANDLES hour slots, most of them before the venue's first bar.
@@ -463,7 +469,7 @@ async fn the_bar_still_open_is_never_returned() {
     let got = api.candles("&timeframe=1h&limit=2").await;
     assert_eq!(
         got.candles,
-        resample(&stored(0..60), Timeframe::H1, false).candles
+        resample(InstrumentKind::Spot, &stored(0..60), Timeframe::H1, false).candles
     );
     assert_eq!(got.missing, [span(T0 - HOUR, T0, Timeframe::H1)]);
     api.shutdown().await;

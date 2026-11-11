@@ -1307,14 +1307,15 @@ export type DataReport = {
 bars: number, 
 /**
  * Every stretch of minutes in the range (warm-up included) the store has no candle for,
- * oldest first, including any at the start or the end of the range. Each is shorter than a
- * day; a longer one refuses the run.
+ * oldest first, including any at the start or the end of the range, in the instrument's open
+ * hours. Each is shorter than a day; a longer one refuses the run.
  */
 gaps: Array<GapInfo>, 
 /**
  * Open times of every bucket in the range the run has no bar for: buckets with no minutes at
  * all, and buckets left out because too many of their minutes are missing (td-data's rule: a
- * bucket needs its first and last minute and at most 1% missing).
+ * bucket needs its first and last open minute and at most 1% of its open minutes missing). A
+ * bucket wholly inside the market's closed hours is not listed.
  */
 dropped: Array<number>, 
 /**

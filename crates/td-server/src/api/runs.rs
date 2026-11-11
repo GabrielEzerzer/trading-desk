@@ -2,7 +2,10 @@
 //! saved on disk.
 //!
 //! A run request is checked against the store before the job is created, so a range the store
-//! does not cover is a 422 `data_missing` naming the missing spans, not a job that fails later. The
+//! does not cover is a 422 `data_missing` naming the missing spans, not a job that fails later.
+//! Missing minutes are counted in the instrument's open hours only ([`missing_minutes`]), so the FX
+//! weekend is not a gap, and a market with bid and ask prices whose stored month lacks its asks is
+//! refused the same way. The
 //! check streams the range a month at a time and keeps nothing: a queued job holds only its
 //! request, and loads its candles and funding once it has a run slot. If the store changed in
 //! between so that the run would now be refused, the job fails with that refusal. The job runs on
@@ -23,9 +26,9 @@ use axum::extract::rejection::{JsonRejection, PathRejection};
 use axum::extract::{Path as UrlPath, State};
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
-use td_core::{Candle, InstrumentKind, Millis};
+use td_core::{Candle, InstrumentId, InstrumentKind, Millis};
 use td_data::time::{DAY, Month, format_minute};
-use td_data::{Gap, LoadedCandles, Store, missing_minutes, resample};
+use td_data::{DataError, Gap, LoadedCandles, Store, missing_minutes, resample};
 use td_engine::{
     BacktestConfig, ENGINE_REVISION, EngineError, RunId, RunSummary, SavedRun, StoreError,
     TesterError, config_fingerprint,
@@ -48,6 +51,10 @@ const DATA_REPORT_FILE: &str = "data.json";
 /// they and their buckets are listed in the result's [`DataReport`].
 // shortcut: one fixed limit for every timeframe and venue; make it relative to the timeframe if
 // daily or weekly runs over long outages get refused when they should not.
+// shortcut: gaps are cut at the market's closed hours and each piece is judged on its own, so
+// missing open time either side of the FX weekend counts as two shorter gaps, and a market holiday
+// the hours do not know (FX on 25 December or 1 January) is a whole day missing and refuses the
+// run. Join pieces across closed hours and add the holidays when real FX data shows either.
 pub const MAX_GAP: Millis = DAY;
 
 /// A bucket built although a few of its minutes are missing, within td-data's tolerance.
@@ -65,12 +72,13 @@ pub struct DataReport {
     /// Bars from the start of the range (warm-up included) to its end.
     pub bars: usize,
     /// Every stretch of minutes in the range (warm-up included) the store has no candle for,
-    /// oldest first, including any at the start or the end of the range. Each is shorter than a
-    /// day; a longer one refuses the run.
+    /// oldest first, including any at the start or the end of the range, in the instrument's open
+    /// hours. Each is shorter than a day; a longer one refuses the run.
     pub gaps: Vec<GapInfo>,
     /// Open times of every bucket in the range the run has no bar for: buckets with no minutes at
     /// all, and buckets left out because too many of their minutes are missing (td-data's rule: a
-    /// bucket needs its first and last minute and at most 1% missing).
+    /// bucket needs its first and last open minute and at most 1% of its open minutes missing). A
+    /// bucket wholly inside the market's closed hours is not listed.
     pub dropped: Vec<Millis>,
     /// Buckets built with a tolerated number of minutes missing.
     pub tolerated: Vec<ToleratedBucket>,
@@ -252,15 +260,16 @@ fn read_data(store: &Store, config: &BacktestConfig) -> Result<StoreData, ApiErr
     let (from, to) = data_range(config)?;
     let mut minutes = Vec::new();
     for month in Month::range(from, to) {
+        let stored = store.read_month(id, month)?;
+        check_asks(store, id, month, &stored)?;
         minutes.extend(
-            store
-                .read_month(id, month)?
+            stored
                 .into_iter()
                 .filter(|c| (from..to).contains(&c.open_time)),
         );
     }
-    let gaps = missing_minutes(&minutes, from, to);
-    let loaded = resample(&minutes, config.timeframe, false);
+    let gaps = missing_minutes(id.kind, &minutes, from, to);
+    let loaded = resample(id.kind, &minutes, config.timeframe, false);
     let funding = if id.kind.rules().funding {
         store.load_funding(id, from, to)?
     } else {
@@ -289,12 +298,13 @@ pub fn check_run_data(store: &Store, config: &BacktestConfig) -> Result<(), ApiE
     let mut pending: Vec<Candle> = Vec::new();
     for month in Month::range(from, to) {
         let (start, end) = (month.start().max(from), month.end().min(to));
-        let minutes: Vec<Candle> = store
-            .read_month(id, month)?
+        let stored = store.read_month(id, month)?;
+        check_asks(store, id, month, &stored)?;
+        let minutes: Vec<Candle> = stored
             .into_iter()
             .filter(|c| (start..end).contains(&c.open_time))
             .collect();
-        for gap in missing_minutes(&minutes, start, end) {
+        for gap in missing_minutes(id.kind, &minutes, start, end) {
             match open.as_mut() {
                 Some(o) if o.to == gap.from => o.to = gap.to,
                 _ => long.extend(open.replace(gap).filter(is_long)),
@@ -308,13 +318,16 @@ pub fn check_run_data(store: &Store, config: &BacktestConfig) -> Result<(), ApiE
         // resample judges each bucket on its own minutes.
         let cut = timeframe.floor(end);
         let split = pending.partition_point(|c| c.open_time < cut);
-        any_bar = !resample(&pending[..split], timeframe, false)
+        any_bar = !resample(id.kind, &pending[..split], timeframe, false)
             .candles
             .is_empty();
         pending.drain(..split);
     }
     long.extend(open.filter(is_long));
-    any_bar = any_bar || !resample(&pending, timeframe, false).candles.is_empty();
+    any_bar = any_bar
+        || !resample(id.kind, &pending, timeframe, false)
+            .candles
+            .is_empty();
     let funding = if id.kind.rules().funding {
         store.load_funding(id, from, to)?
     } else {
@@ -323,6 +336,28 @@ pub fn check_run_data(store: &Store, config: &BacktestConfig) -> Result<(), ApiE
     match refusal(config, &long, any_bar, &funding) {
         Some(e) => Err(e),
         None => Ok(()),
+    }
+}
+
+/// Refuses with 422 `data_missing` a stored month of a kind whose rules require quotes when its
+/// file has no ask prices: a run on its bids alone would trade at no spread. `stored` is the
+/// month's bids; a month with none needs no asks.
+fn check_asks(
+    store: &Store,
+    id: &InstrumentId,
+    month: Month,
+    stored: &[Candle],
+) -> Result<(), ApiError> {
+    if !id.kind.rules().quotes || stored.is_empty() {
+        return Ok(());
+    }
+    match store.read_month_asks(id, month) {
+        Ok(_) => Ok(()),
+        Err(DataError::NoAskColumns { .. }) => Err(data_missing(format!(
+            "the store's {id} candles for {month} have no ask prices; delete the month and \
+             download it again"
+        ))),
+        Err(e) => Err(e.into()),
     }
 }
 
@@ -391,12 +426,14 @@ pub fn load_run_data(store: &Store, config: &BacktestConfig) -> Result<RunData, 
     }
     // Every bucket in the range with no bar: td-data's `dropped` lists only the incomplete ones,
     // not those with no minute at all. Bars are sorted and inside the range, which starts and
-    // ends on bar boundaries.
+    // ends on bar boundaries. A bucket wholly in closed hours has no bar to miss.
     let step = config.timeframe.duration_ms();
+    let kind = config.instrument.id.kind;
     let mut bar_times = loaded.candles.iter().map(|c| c.open_time).peekable();
     let dropped: Vec<Millis> = (0..(to - from) / step)
         .map(|i| from + i * step)
         .filter(|&t| bar_times.next_if_eq(&t).is_none())
+        .filter(|&t| kind.closed_spans(t, t + step).first() != Some(&(t..t + step)))
         .collect();
     let report = DataReport {
         bars: loaded.candles.len(),
