@@ -1,6 +1,15 @@
 import type { Candle } from '@td/shared'
 import { describe, expect, it } from 'vitest'
-import { EMPTY_SERIES, addCandle, bucketOf, mergeCandles, withClosed, withForming, withHistory } from './candles'
+import {
+  EMPTY_SERIES,
+  addCandle,
+  bucketOf,
+  mergeCandles,
+  onlyLastChanged,
+  withClosed,
+  withForming,
+  withHistory,
+} from './candles'
 
 const bar = (open_time: number, close = 100): Candle => ({
   open_time,
@@ -112,5 +121,28 @@ describe('the live series', () => {
   it('changes nothing for an empty history', () => {
     const s = withClosed(EMPTY_SERIES, bar(60))
     expect(withHistory(s, [])).toBe(s)
+  })
+})
+
+describe('onlyLastChanged', () => {
+  const drawn = withForming(withClosed(EMPTY_SERIES, bar(1)), bar(2, 101))
+
+  it('holds for a forming bar that moves and for one appended bar', () => {
+    const moved = withForming(drawn, bar(2, 102))
+    expect(onlyLastChanged(drawn.candles, moved.candles)).toBe(true)
+    expect(onlyLastChanged(moved.candles, withForming(withClosed(moved, bar(2, 103)), bar(2, 103)).candles)).toBe(true)
+    expect(onlyLastChanged([], [bar(1)])).toBe(true)
+  })
+
+  it('fails when a bar closes and the next starts forming before one render', () => {
+    const next = withForming(withClosed(drawn, bar(2, 103)), bar(3, 104))
+    expect(next.revision).toBe(drawn.revision)
+    expect(onlyLastChanged(drawn.candles, next.candles)).toBe(false)
+  })
+
+  it('fails when two bars arrive before one render', () => {
+    const next = withClosed(withClosed(drawn, bar(3)), bar(4))
+    expect(onlyLastChanged(drawn.candles, next.candles)).toBe(false)
+    expect(onlyLastChanged([], [bar(1), bar(2)])).toBe(false)
   })
 })

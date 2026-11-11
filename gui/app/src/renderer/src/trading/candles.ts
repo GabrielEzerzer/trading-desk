@@ -37,6 +37,18 @@ export function addCandle(list: readonly Candle[], candle: Candle): { list: Cand
   return { list: mergeCandles(list, [candle]), change: 'reset' }
 }
 
+/**
+ * Whether `next` differs from the drawn `prev` only at its end (the last bar replaced, or one bar
+ * appended), so the chart can draw that one bar in place. Two changes in one render, such as a bar
+ * closing and the next one starting to form, change the bar before the last too. Untouched bars
+ * keep their identity through `addCandle`, so the bar before the last tells.
+ */
+export function onlyLastChanged(prev: readonly Candle[], next: readonly Candle[]): boolean {
+  const grew = next.length - prev.length
+  if (grew !== 0 && grew !== 1) return false
+  return next.length < 2 || next.at(-2) === prev.at(grew === 1 ? -1 : -2)
+}
+
 /** The bars a chart draws. Only the last one can still be forming. */
 export interface CandleSeries {
   candles: Candle[]
