@@ -63,7 +63,7 @@ impl DataSource for Bybit {
         let mut cursor = String::new();
         loop {
             let mut query = vec![
-                ("category", category(kind).to_string()),
+                ("category", category(kind)?.to_string()),
                 ("limit", "1000".to_string()),
             ];
             if !cursor.is_empty() {
@@ -80,10 +80,11 @@ impl DataSource for Bybit {
         }
     }
 
-    fn default_fees(&self, kind: InstrumentKind) -> FeeSchedule {
+    fn default_fees(&self, kind: InstrumentKind) -> Result<FeeSchedule, DataError> {
         match kind {
-            InstrumentKind::Spot => BYBIT_SPOT_FEES,
-            InstrumentKind::Perpetual => BYBIT_LINEAR_FEES,
+            InstrumentKind::Spot => Ok(BYBIT_SPOT_FEES),
+            InstrumentKind::Perpetual => Ok(BYBIT_LINEAR_FEES),
+            InstrumentKind::Fx => Err(not_listed(kind)),
         }
     }
 
@@ -119,7 +120,11 @@ impl DataSource for Bybit {
 
 impl LiveStream for Bybit {
     fn url(&self, id: &InstrumentId) -> String {
-        format!("wss://stream.bybit.com/v5/public/{}", category(id.kind))
+        // An empty URL for a kind the source does not list, which is never connected to: such a
+        // stream refuses to open (see `SharedStream::open_on`).
+        category(id.kind)
+            .map(|category| format!("wss://stream.bybit.com/v5/public/{category}"))
+            .unwrap_or_default()
     }
 
     /// A subscription to the symbol's 1-minute klines, and a ping every 20 s.
@@ -150,10 +155,18 @@ impl LiveStream for Bybit {
 }
 
 /// Bybit's name for the market an instrument kind trades in.
-fn category(kind: InstrumentKind) -> &'static str {
+fn category(kind: InstrumentKind) -> Result<&'static str, DataError> {
     match kind {
-        InstrumentKind::Spot => "spot",
-        InstrumentKind::Perpetual => "linear",
+        InstrumentKind::Spot => Ok("spot"),
+        InstrumentKind::Perpetual => Ok("linear"),
+        InstrumentKind::Fx => Err(not_listed(kind)),
+    }
+}
+
+fn not_listed(kind: InstrumentKind) -> DataError {
+    DataError::KindNotListed {
+        venue: Venue::Bybit,
+        kind,
     }
 }
 
@@ -220,11 +233,12 @@ pub fn fetch_klines(
     from: Millis,
     to: Millis,
 ) -> Result<Vec<Candle>, DataError> {
+    let category = category(id.kind)?;
     let end = to.min(timeframe.floor(now_ms())) - 1;
     let open_time = |c: &Candle| c.open_time;
     page_backwards(from, end, KLINE_LIMIT, open_time, |page_end| {
         let query = [
-            ("category", category(id.kind).to_string()),
+            ("category", category.to_string()),
             ("symbol", id.symbol.clone()),
             ("interval", interval(timeframe).to_string()),
             ("start", from.to_string()),
@@ -444,6 +458,7 @@ fn add_bybit(list: &mut InstrumentList, kind: InstrumentKind, page: Vec<BybitIns
             && match kind {
                 InstrumentKind::Spot => true,
                 InstrumentKind::Perpetual => s.contract_type.as_deref() == Some("LinearPerpetual"),
+                InstrumentKind::Fx => false,
             };
         if listed {
             list.push(&s.symbol, bybit_instrument(&s, kind));
@@ -456,6 +471,7 @@ fn bybit_instrument(s: &BybitInstrument, kind: InstrumentKind) -> Result<Instrum
     let (step, min_value) = match kind {
         InstrumentKind::Spot => (&lot.base_precision, &lot.min_order_amt),
         InstrumentKind::Perpetual => (&lot.qty_step, &lot.min_notional_value),
+        InstrumentKind::Fx => return Err(not_listed(kind).to_string()),
     };
     let required = |name: &str, value: &Option<String>| -> Result<f64, String> {
         number(name, value.as_deref().ok_or_else(|| format!("no {name}"))?)
@@ -472,7 +488,7 @@ fn bybit_instrument(s: &BybitInstrument, kind: InstrumentKind) -> Result<Instrum
         lot_size: required("quantity step", step)?,
         min_qty: number("minOrderQty", &lot.min_order_qty)?,
         min_notional: required("minimum order value", min_value)?,
-        fees: Bybit.default_fees(kind),
+        fees: Bybit.default_fees(kind).map_err(|e| e.to_string())?,
     })
 }
 

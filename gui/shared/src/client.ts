@@ -10,6 +10,9 @@ import type {
   InstrumentsResponse,
   JobCreated,
   JobInfo,
+  SessionState,
+  SessionSummary,
+  StartSessionRequest,
   StrategyInfo,
   Venue,
 } from './api-types'
@@ -58,6 +61,17 @@ export function createClient(send: Send) {
     jobs: () => call<JobInfo[]>({ method: 'GET', path: '/jobs' }),
     job: (id: number) => call<JobInfo>({ method: 'GET', path: `/jobs/${id}` }),
     cancelJob: (id: number) => call<JobInfo>({ method: 'POST', path: `/jobs/${id}/cancel` }),
+    /** Every paper session, oldest first. */
+    sessions: () => call<SessionSummary[]>({ method: 'GET', path: '/sessions' }),
+    session: (id: string) => call<SessionState>({ method: 'GET', path: `/sessions/${encodeURIComponent(id)}` }),
+    /** Creates a paper session and starts it. */
+    startSession: (request: StartSessionRequest) =>
+      call<SessionSummary>({ method: 'POST', path: '/sessions', body: request }),
+    stopSession: (id: string) =>
+      call<SessionSummary>({ method: 'POST', path: `/sessions/${encodeURIComponent(id)}/stop` }),
+    /** Replays a stopped session and starts it again. */
+    resumeSession: (id: string) =>
+      call<SessionSummary>({ method: 'POST', path: `/sessions/${encodeURIComponent(id)}/resume` }),
   }
 }
 

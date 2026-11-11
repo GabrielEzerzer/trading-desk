@@ -52,11 +52,89 @@ describe('validateRequest', () => {
   })
 })
 
-describe('validateTopic', () => {
-  it('passes the jobs topic and refuses anything else', () => {
-    expect(validateTopic('jobs')).toBe('jobs')
-    for (const topic of ['candles:binance:BTCUSDT:spot:1m', 'jobs ', '', 7, null]) {
-      expect(() => validateTopic(topic)).toThrow(RefusedRequest)
+describe('paper session routes', () => {
+  const start = {
+    strategy: 'sma_cross',
+    params: {},
+    instrument: { venue: 'binance', symbol: 'BTCUSDT', kind: 'spot' },
+    timeframe: '1h',
+    starting_cash: 10_000,
+    slippage_bps: 2,
+  }
+
+  it('passes the session routes', () => {
+    expect(validateRequest({ method: 'GET', path: '/sessions' })).toEqual({ method: 'GET', path: '/sessions' })
+    expect(validateRequest({ method: 'POST', path: '/sessions', body: start })).toEqual({
+      method: 'POST',
+      path: '/sessions',
+      body: start,
+    })
+    for (const path of ['/sessions/1762790400000-0a1b2c3d', '/sessions/my_session']) {
+      expect(validateRequest({ method: 'GET', path })).toEqual({ method: 'GET', path })
     }
+    expect(validateRequest({ method: 'POST', path: '/sessions/1762790400000-0a1b2c3d/stop' })).toEqual({
+      method: 'POST',
+      path: '/sessions/1762790400000-0a1b2c3d/stop',
+    })
+    expect(validateRequest({ method: 'POST', path: '/sessions/abc/resume' })).toEqual({
+      method: 'POST',
+      path: '/sessions/abc/resume',
+    })
+  })
+
+  it.each([
+    ['a session id with a dot', { method: 'GET', path: '/sessions/a.b' }],
+    ['a session id that climbs out', { method: 'GET', path: '/sessions/../health' }],
+    ['an encoded slash in the id', { method: 'GET', path: '/sessions/a%2Fb' }],
+    ['a session id over 64 characters', { method: 'GET', path: `/sessions/${'a'.repeat(65)}` }],
+    ['an empty session id', { method: 'GET', path: '/sessions/' }],
+    ['an unknown session action', { method: 'POST', path: '/sessions/abc/delete' }],
+    ['GET on stop', { method: 'GET', path: '/sessions/abc/stop' }],
+    ['a body on stop', { method: 'POST', path: '/sessions/abc/stop', body: {} }],
+    ['a body on resume', { method: 'POST', path: '/sessions/abc/resume', body: { force: true } }],
+    ['a start without a body', { method: 'POST', path: '/sessions' }],
+    ['a start with an array body', { method: 'POST', path: '/sessions', body: [start] }],
+    ['a query on the session list', { method: 'GET', path: '/sessions', query: { status: 'live' } }],
+    ['manual orders, which do not exist yet (#36)', { method: 'POST', path: '/sessions/abc/orders', body: {} }],
+    ['candle history, which does not exist yet (#36)', { method: 'GET', path: '/candles' }],
+  ])('refuses %s', (_name, input) => {
+    expect(() => validateRequest(input)).toThrow(RefusedRequest)
+  })
+})
+
+describe('validateTopic', () => {
+  it('passes the jobs, candles and session topics', () => {
+    for (const topic of [
+      'jobs',
+      'candles:binance:BTCUSDT:spot:1m',
+      'candles:bybit:1000PEPEUSDT:perpetual:4h',
+      'candles:binance:ETHUSDT:spot:1w',
+      'session:1762790400000-0a1b2c3d',
+      'session:my_session',
+    ]) {
+      expect(validateTopic(topic)).toBe(topic)
+    }
+  })
+
+  it.each([
+    ['jobs with a space', 'jobs '],
+    ['an empty topic', ''],
+    ['a number', 7],
+    ['null', null],
+    ['an unknown venue', 'candles:kraken:BTCUSDT:spot:1m'],
+    ['a lowercase symbol', 'candles:binance:btcusdt:spot:1m'],
+    ['a symbol with a path in it', 'candles:binance:../x:spot:1m'],
+    ['a symbol with a colon', 'candles:binance:BTC:USDT:spot:1m'],
+    ['an unknown kind', 'candles:binance:BTCUSDT:future:1m'],
+    ['an unknown timeframe', 'candles:binance:BTCUSDT:spot:2m'],
+    ['a missing timeframe', 'candles:binance:BTCUSDT:spot'],
+    ['a symbol over 32 characters', `candles:binance:${'A'.repeat(33)}:spot:1m`],
+    ['a trailing newline', 'candles:binance:BTCUSDT:spot:1m\n'],
+    ['an empty session id', 'session:'],
+    ['a session id with a colon', 'session:a:b'],
+    ['a session id over 64 characters', `session:${'a'.repeat(65)}`],
+    ['an unknown topic', 'sessions'],
+  ])('refuses %s', (_name, topic) => {
+    expect(() => validateTopic(topic)).toThrow(RefusedRequest)
   })
 })

@@ -1,17 +1,15 @@
-// Per window size and per Lab state: layout invariants, hit areas and axe (WCAG 2.2 AA, contrast
-// included). The Trading section is left to its own work.
+// Per window size and per state, the Strategy Lab's and Trading's: layout invariants, hit areas and
+// axe (WCAG 2.2 AA, contrast included).
 import AxeBuilder from '@axe-core/playwright'
 import { SIZES, STATES, realTimers, settle } from '../app/shots/harness.mjs'
 import { hitAudit, layoutAudit } from './audit'
 import { expect, test } from './fixtures'
 
-const LAB_STATES = STATES.filter((s) => !s.section)
-
 for (const size of SIZES) {
   test.describe(`${size.name}`, () => {
     test.use({ viewport: { width: size.width, height: size.height } })
 
-    for (const state of LAB_STATES) {
+    for (const state of STATES) {
       test(`${state.name}: layout, hit areas, axe`, async ({ page, open }) => {
         await open(state.config, { clock: state.clock })
         await state.steps(page)

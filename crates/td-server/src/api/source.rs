@@ -89,3 +89,35 @@ impl LiveSource for VenueLive {
         td_data::live::stream_url(id)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::data::parse_instrument;
+    use crate::api::error::ApiError;
+
+    /// A request names an FX instrument on Binance or Bybit: the text parses, and the venue
+    /// refuses it with a clear 400 rather than a panic or a venue error.
+    #[test]
+    fn an_fx_instrument_on_a_crypto_venue_is_a_bad_request() {
+        for venue in [Venue::Binance, Venue::Bybit] {
+            let id = parse_instrument(&format!("{venue}:USDJPY:fx")).expect("fx parses");
+            assert_eq!(id.kind, InstrumentKind::Fx);
+            let message = format!("{venue} does not list fx instruments");
+
+            let listed = VenueSource.instruments(venue, id.kind);
+            let Err(e @ DataError::KindNotListed { .. }) = listed else {
+                panic!("{venue}: {listed:?}");
+            };
+            assert_eq!(ApiError::from(e), ApiError::bad_request(&message));
+
+            let klines = VenueLive
+                .rest()
+                .klines(&id, td_core::Timeframe::M1, 0, 60_000);
+            let Err(e @ DataError::KindNotListed { .. }) = klines else {
+                panic!("{venue}: {klines:?}");
+            };
+            assert_eq!(e.to_string(), message);
+        }
+    }
+}
