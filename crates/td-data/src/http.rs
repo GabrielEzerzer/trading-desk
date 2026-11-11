@@ -12,7 +12,8 @@ use crate::DataError;
 const USER_AGENT: &str = "trading-desk";
 
 /// A blocking HTTP client for the venues' public endpoints. Cheap to clone; the connection pool is
-/// shared.
+/// shared. Every request sends `Accept-Encoding: gzip` and a gzipped body is decoded before it is
+/// read: Binance's spot exchangeInfo is about 52 KB that way instead of 2.5 MB.
 #[derive(Debug, Clone)]
 pub struct Http {
     client: Client,
@@ -87,5 +88,87 @@ impl Http {
                 url: url.to_string(),
                 source,
             })
+    }
+}
+
+/// A one-shot HTTP server on 127.0.0.1 for tests: it answers one request with a fixed response and
+/// hands back the request it received.
+#[cfg(test)]
+pub(crate) mod stub {
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+    use std::thread::JoinHandle;
+
+    /// Serves one request at the returned base URL (`http://127.0.0.1:<port>`) with `headers` and
+    /// `body`, then closes. Joining the handle gives the request line and headers, lower-cased.
+    pub(crate) fn serve_once(
+        headers: &[(&str, &str)],
+        body: Vec<u8>,
+    ) -> (String, JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let base = format!("http://{}", listener.local_addr().expect("an address"));
+        let mut head = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n",
+            body.len()
+        );
+        for (name, value) in headers {
+            head.push_str(&format!("{name}: {value}\r\n"));
+        }
+        head.push_str("\r\n");
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("a connection");
+            let mut reader = BufReader::new(stream.try_clone().expect("a clone"));
+            let mut request = String::new();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).expect("reads");
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+                request.push_str(&line.to_lowercase());
+            }
+            stream.write_all(head.as_bytes()).expect("writes");
+            stream.write_all(&body).expect("writes");
+            request
+        });
+        (base, handle)
+    }
+
+    /// `text` gzipped.
+    pub(crate) fn gzip(text: &str) -> Vec<u8> {
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(text.as_bytes()).expect("compresses");
+        encoder.finish().expect("compresses")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_request_asks_for_gzip_and_a_gzipped_body_is_decoded() {
+        let text = r#"{"symbols":[]}"#;
+        let (base, server) = stub::serve_once(
+            &[
+                ("Content-Type", "application/json"),
+                ("Content-Encoding", "gzip"),
+            ],
+            stub::gzip(text),
+        );
+        let http = Http::new().expect("an HTTP client");
+        let body = http.get_text(&format!("{base}/info"), &[]).expect("a body");
+        assert_eq!(body, text);
+        let request = server.join().expect("the server");
+        let accepts = request
+            .lines()
+            .find_map(|l| l.strip_prefix("accept-encoding:"))
+            .unwrap_or_default();
+        assert!(accepts.contains("gzip"), "{request}");
+        // Nothing identifying: the user agent stays plain.
+        assert!(
+            request.lines().any(|l| l == "user-agent: trading-desk"),
+            "{request}"
+        );
     }
 }

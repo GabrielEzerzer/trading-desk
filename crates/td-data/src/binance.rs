@@ -81,7 +81,8 @@ impl DataSource for Binance {
 
     fn instruments(&self, http: &Http, kind: InstrumentKind) -> Result<InstrumentList, DataError> {
         match kind {
-            InstrumentKind::Spot => parse_binance_spot(&http.get_text(SPOT_INFO_URL, &[])?),
+            InstrumentKind::Spot => fetch_spot_instruments(http, SPOT_INFO_URL),
+            // `/fapi/v1/exchangeInfo` takes no filters; gzip alone shrinks it.
             InstrumentKind::Perpetual => parse_binance_usdm(&http.get_text(USDM_INFO_URL, &[])?),
         }
     }
@@ -163,6 +164,18 @@ impl LiveStream for Binance {
     ) -> Result<Vec<Candle>, DataError> {
         fetch_klines(http, id, timeframe, from, to)
     }
+}
+
+/// The spot symbols open for trading, from the exchangeInfo at `url`. Binance is asked for those
+/// symbols only and without their permission sets, which td-data does not read: 2.5 MB instead of
+/// 17.8 MB before gzip. [`parse_binance_spot`] keeps only `TRADING` symbols either way, so the
+/// list is the same as from the full response.
+fn fetch_spot_instruments(http: &Http, url: &str) -> Result<InstrumentList, DataError> {
+    let query = [
+        ("symbolStatus", "TRADING".to_string()),
+        ("showPermissionSets", "false".to_string()),
+    ];
+    parse_binance_spot(&http.get_text(url, &query)?)
 }
 
 /// The span one archive file covers.
@@ -691,6 +704,42 @@ pub fn parse_stream_frame(text: &str) -> Result<Option<KlineUpdate>, DataError> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::http::stub;
+
+    /// The spot list is asked for with the filters, and a gzipped, filtered response reads the same
+    /// as the full response did.
+    #[test]
+    fn spot_instruments_are_asked_for_filtered_and_read_the_same_as_the_full_list() {
+        let full = include_str!("../tests/fixtures/binance_spot_exchange_info.json");
+        // What Binance sends for the filtered request: the same document without the symbols that
+        // are not trading.
+        let mut filtered: serde_json::Value = serde_json::from_str(full).expect("JSON");
+        let symbols = filtered["symbols"].as_array_mut().expect("symbols");
+        let before = symbols.len();
+        symbols.retain(|s| s["status"] == "TRADING");
+        assert!(
+            symbols.len() < before,
+            "the fixture has a symbol that is not trading"
+        );
+        let (base, server) = stub::serve_once(
+            &[
+                ("Content-Type", "application/json"),
+                ("Content-Encoding", "gzip"),
+            ],
+            stub::gzip(&filtered.to_string()),
+        );
+        let http = Http::new().expect("an HTTP client");
+        let url = format!("{base}/api/v3/exchangeInfo");
+        let list = fetch_spot_instruments(&http, &url).expect("lists");
+        assert_eq!(list, parse_binance_spot(full).expect("parses"));
+        let request = server.join().expect("the server");
+        let line = request.lines().next().unwrap_or_default();
+        assert_eq!(
+            line, "get /api/v3/exchangeinfo?symbolstatus=trading&showpermissionsets=false http/1.1",
+            "{request}"
+        );
+        assert!(request.contains("accept-encoding: gzip"), "{request}");
+    }
 
     /// Reads `month` through [`archive_month`] from an archive that holds the files `has` says it
     /// holds, each with one candle at the start of its period. Returns the open times read, the
