@@ -114,3 +114,15 @@ Round 1 restated on this set: dev 37,738.7 ms to 4,226.1 ms (8.9 times), test 49
 **Baseline B for PR 2 is 4,226.1 ms on dev. Target: at most 2,113 ms with identical checksums.**
 
 One more change to the bench before the freeze: each repetition of the load and Lab workloads opens its own `Store`, so anything a store later keeps in memory is not carried between repetitions. A repetition then stands for the first run after an app start. Checksums unchanged.
+
+## Review of the measurement, round 2 (reviewer, head `919ab51`): CHANGES REQUESTED
+
+CI on `919ab51` (main with #70 merged in): `ci` and `gui` green.
+
+Both findings verified against the app and accepted. Neither touches the workload file, whose hash test still passes; both change what a Lab repetition times, so the Lab baseline is taken again. No engine or store change has been scored yet.
+
+1. **The reopen ran on the store the same repetition had just read.** The Lab opens a saved run only when its result is not already on screen (`StrategyLab.tsx`, the effect on `last`), which means a later session with a new server process. A cache inside `Store` would have made the bench's reopen free while the user's reopen stayed as slow. Fixed: the open phase reads through a `Store` of its own.
+2. **The Lab reads the coverage of every stored month before each backtest (`engine-source.ts`, `api.coverage` in `run`), and the bench did not time it.** That is a fourth full read of the 1-minute data. Fixed: a `coverage` phase first, through the server's `read_coverage` (now `pub`), on the same store as check and load, as in the app; its output is part of the Lab checksum.
+3. Nit, taken: the `WORKLOAD` line prints `first_ms` beside `min_ms`, so a cache that outlives a repetition shows as a gap between them. Rule for PR 2: a cache is a field of `Store`, never a static.
+
+What one Lab repetition now stands for: the first backtest after the app starts (coverage, check, load, run, save, result read on one store), then the reopen of that run in a later session (a cold store).
