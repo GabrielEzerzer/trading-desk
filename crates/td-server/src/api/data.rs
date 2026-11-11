@@ -404,9 +404,12 @@ pub(super) async fn delete(
             ));
         }
     };
-    // shortcut: checked once, before the delete; a download started while the delete runs is not
-    // refused. That is safe, since both take each file's lock, and the download stores again the
-    // months it fetches. Hold downloads of the instrument off for the delete if that ever matters.
+    // shortcut: checked once, before the delete, and only against this server's own jobs. A
+    // download started while the delete runs, or one running in another process on the same data
+    // folder (the `td-data` CLI; the app runs one engine), is not refused. Each file is safe, since
+    // both take its lock, but a month the download had already stored can be deleted under it and
+    // its report then names a month that is gone; a run on that range is refused as data missing.
+    // Hold the instrument across processes for a whole download and delete if that ever matters.
     if let Some(job) = state.jobs.download_in_progress(&id) {
         return Err(ApiError::new(
             StatusCode::CONFLICT,
