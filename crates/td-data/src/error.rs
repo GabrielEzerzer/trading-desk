@@ -1,7 +1,7 @@
 use std::io;
 use std::path::PathBuf;
 
-use td_core::{CoreError, InstrumentKind, Venue};
+use td_core::{CoreError, InstrumentKind, Millis, Venue};
 
 /// Errors from downloading, parsing and storing market data.
 #[derive(Debug, thiserror::Error)]
@@ -68,6 +68,45 @@ pub enum DataError {
 
     #[error("{0} is not a perpetual, so it has no funding")]
     NotPerpetual(String),
+
+    #[error("{0} has bid and ask prices, so its candles are written with their asks")]
+    QuotesRequired(String),
+
+    #[error("{0} has no ask prices, so it takes no asks")]
+    NoQuotes(String),
+
+    #[error("{instrument}: the bids and asks do not cover the same minutes: {reason}")]
+    QuoteMinutes { instrument: String, reason: String },
+
+    #[error(
+        "{instrument} at {} UTC: the ask {field} {ask} is below the bid {field} {bid}",
+        crate::time::format_minute(*.open_time)
+    )]
+    CrossedQuote {
+        instrument: String,
+        open_time: Millis,
+        field: &'static str,
+        bid: f64,
+        ask: f64,
+    },
+
+    #[error(
+        "{instrument} at {} UTC: the market is closed then, so no candle may open there",
+        crate::time::format_minute(*.open_time)
+    )]
+    ClosedMinute {
+        instrument: String,
+        open_time: Millis,
+    },
+
+    #[error(
+        "{}: the month has no ask prices; delete it and download it again",
+        .path.display()
+    )]
+    NoAskColumns { path: PathBuf },
+
+    #[error("{instrument} {month}: the source returned bids without asks")]
+    NoAsks { instrument: String, month: String },
 
     #[error("{venue} does not list {kind} instruments")]
     KindNotListed { venue: Venue, kind: InstrumentKind },
