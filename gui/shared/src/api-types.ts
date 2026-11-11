@@ -1534,8 +1534,10 @@ export type Breakdown = { long: SideResult, short: SideResult,
  */
 funding_paid: number, 
 /**
- * Windows where buy and hold rose over the test window, and the strategy's return in them,
- * compounded.
+ * Windows where the instrument's price rose over the test window, and the strategy's return
+ * in them, compounded. The price is the quote currency per unit of the base, so a long
+ * position gained in those windows in either currency: on a dollar account trading USD/JPY,
+ * a rising window is one where the dollar strengthened against the yen.
  */
 rising: RegimeResult, 
 /**
@@ -1557,7 +1559,7 @@ export type SideResult = {
  */
 trades: number, 
 /**
- * Their net P&L, in the quote asset.
+ * Their net P&L, in the account currency.
  */
 net_pnl: number, };
 
