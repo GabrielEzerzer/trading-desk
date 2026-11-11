@@ -53,6 +53,23 @@
 //! - `GET /runs`: the saved runs, newest first, one summary row each. `GET /runs/{id}`: one saved
 //!   run with its data report (`data_error` says why when that report is damaged) and a check of
 //!   whether its data and engine still match.
+//! - `POST /runs/plan` `{strategy, instruments?}` (a `PlanRequest`): runs the strategy's test
+//!   battery on each instrument of its plan, or on the given ones, as one job of kind `plan`, and
+//!   answers `{job_id}` (see [`plans`]). 400 `invalid_config` for an unknown strategy or an
+//!   instrument the venue does not list, `invalid_plan` for a plan or rule that fails its checks,
+//!   `instrument_not_in_plan` for an instrument the plan does not test, `invalid_request` for an
+//!   empty or repeated list; 422 `data_missing`, naming the instrument and the span, when the store
+//!   lacks part of the plan's period (nothing is downloaded); 429 `too_many_runs` as for the other
+//!   runs. The job's result (`PlanDone`) holds one verdict and saved run id per instrument; a
+//!   cancelled plan job keeps the instruments it finished, and the one it stopped during the luck
+//!   test, in its result; a failed one keeps those it saved before the error. Each instrument's run
+//!   (kind `plan`, a `PlanRun`) is at `GET /runs/{id}`.
+//! - `GET /verdicts?strategy=`: the latest verdict of each strategy on each instrument
+//!   (`VerdictSummary`; the newest complete one, so a luck test stopped by a cancel does not
+//!   replace a finished battery), with how many batteries that pair has saved, the run id, its time
+//!   and the engine revision, whether that revision is this engine's (`engine_matches`), whether
+//!   the strategy's plan and rule are still the ones it ran under (`plan_matches`) and whether its
+//!   luck test finished (`complete`). Only the given strategy's with `strategy`.
 //! - Paper sessions (see [`sessions`]):
 //!   - `POST /sessions` `{strategy, params, instrument, timeframe, starting_cash, slippage_bps,
 //!     fees?}`: creates a session and starts it, 201 with its summary. `instrument` is an
@@ -106,6 +123,7 @@ pub mod data;
 pub mod error;
 pub mod jobs;
 mod live;
+pub mod plans;
 pub mod runs;
 pub mod sessions;
 pub mod source;
@@ -168,6 +186,8 @@ pub(crate) struct AppState {
     sessions: Arc<Sessions>,
     streams: Arc<Streams>,
     instruments: Mutex<InstrumentCache>,
+    /// The strategies `GET /strategies` lists and `POST /runs/plan` runs plans of.
+    strategies: Arc<Vec<StrategyEntry>>,
     /// Turns true when the server is stopping; WebSocket connections close on it.
     shutdown: watch::Receiver<bool>,
 }
@@ -197,8 +217,18 @@ pub struct Server {
 
 impl Server {
     /// Binds 127.0.0.1 on the configured port, loads the saved paper sessions (stopped), and
-    /// starts serving in the background.
+    /// starts serving in the background, with every registered strategy.
     pub async fn start(config: ApiConfig) -> io::Result<Server> {
+        Self::start_with_strategies(config, td_engine::strategies()).await
+    }
+
+    /// [`Server::start`] with `strategies` in place of the registered ones, for tests that run a
+    /// plan smaller than a registered strategy's. Each entry's name must still be a registered
+    /// strategy: the engine builds strategies by name.
+    pub async fn start_with_strategies(
+        config: ApiConfig,
+        strategies: Vec<StrategyEntry>,
+    ) -> io::Result<Server> {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, config.port)).await?;
         let addr = listener.local_addr()?;
         let (shutdown, shutdown_rx) = watch::channel(false);
@@ -218,6 +248,7 @@ impl Server {
             sessions: sessions.clone(),
             streams,
             instruments: Mutex::new(HashMap::new()),
+            strategies: Arc::new(strategies),
             shutdown: shutdown_rx.clone(),
         });
         let app = router(state).into_make_service_with_connect_info::<SocketAddr>();
@@ -301,6 +332,8 @@ pub(crate) fn router(state: Arc<AppState>) -> Router {
         .route("/runs/sweep", post(runs::sweep))
         .route("/runs/out-of-sample", post(runs::out_of_sample))
         .route("/runs/walk-forward", post(runs::walk_forward))
+        .route("/runs/plan", post(plans::start))
+        .route("/verdicts", get(plans::verdicts))
         .route("/runs/{id}", get(runs::get))
         .route("/sessions", get(sessions::list).post(sessions::start))
         .route("/sessions/{id}", get(sessions::get))
@@ -342,8 +375,8 @@ pub struct StrategyInfo {
     pub rule: VerdictRule,
 }
 
-async fn strategies() -> Json<Vec<StrategyInfo>> {
-    Json(strategy_infos(td_engine::strategies()))
+async fn strategies(State(state): State<Arc<AppState>>) -> Json<Vec<StrategyInfo>> {
+    Json(strategy_infos(state.strategies.as_ref().clone()))
 }
 
 fn strategy_infos(entries: Vec<StrategyEntry>) -> Vec<StrategyInfo> {
@@ -452,6 +485,7 @@ mod tests {
             sessions: Arc::new(Sessions::load(&unused, streams.clone())),
             streams,
             instruments: Mutex::new(HashMap::new()),
+            strategies: Arc::new(td_engine::strategies()),
             shutdown: watch::channel(false).1,
         });
         let app = router(state).layer(MockConnectInfo(peer));
