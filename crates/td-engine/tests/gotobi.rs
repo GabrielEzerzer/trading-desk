@@ -243,7 +243,11 @@ fn the_size_risks_the_percentage_and_rounds_down_to_the_lot() {
 #[test]
 fn a_risk_below_a_hundredth_of_a_percent_is_refused() {
     let build = |pct: f64| {
-        build_strategy("gotobi", &Params::new().with("risk_pct", ParamValue::Float(pct))).err()
+        build_strategy(
+            "gotobi",
+            &Params::new().with("risk_pct", ParamValue::Float(pct)),
+        )
+        .err()
     };
     for pct in [0.0, 0.005, 100.5] {
         assert!(
@@ -328,12 +332,21 @@ fn a_rejected_exit_fails_the_run_instead_of_holding_the_short_without_its_stop()
     let EngineError::StrategyFailed(reason) = &err else {
         panic!("{err}");
     };
-    assert!(reason.contains("exit at 01:30 UTC was rejected"), "{reason}");
+    assert!(
+        reason.contains("exit at 01:30 UTC was rejected"),
+        "{reason}"
+    );
     assert!(reason.contains("is below the minimum 93000000"), "{reason}");
     // The stop was cancelled for the exit, so the run stops with the short open and unprotected.
     let orders = s.orders();
-    assert!(matches!(orders[1].status, OrderStatus::Cancelled(_)), "{orders:?}");
-    assert!(matches!(orders[2].status, OrderStatus::Rejected(_)), "{orders:?}");
+    assert!(
+        matches!(orders[1].status, OrderStatus::Cancelled(_)),
+        "{orders:?}"
+    );
+    assert!(
+        matches!(orders[2].status, OrderStatus::Rejected(_)),
+        "{orders:?}"
+    );
     assert!(orders[2].request.reduce_only);
     assert!(s.open_orders().is_empty());
     approx(s.portfolio().position(), -625_000.0);
