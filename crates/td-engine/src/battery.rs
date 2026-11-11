@@ -70,9 +70,9 @@ use crate::verdict::{
 use crate::{
     BacktestConfig, BacktestResult, Criterion, Direction, DrawdownMode, EquityPoint,
     EvidenceInputs, KindInputs, MAX_RUNS, Order, Outcome, Params, PermutationResult,
-    PermutationSpec, PortfolioBenchmark, Progress, SweepResult, SweepRow, TestPlan, TesterError,
-    Trade, TradeSide, Verdict, VerdictRule, WalkForwardResult, WalkForwardSpec, combine, evaluate,
-    evaluate_evidence, permutation_test, run, sweep, walk_forward,
+    PermutationSpec, PortfolioBenchmark, Progress, SweepResult, SweepRow, SweepSpec, TestPlan,
+    TesterError, Trade, TradeSide, Verdict, VerdictRule, WalkForwardResult, WalkForwardSpec,
+    combine, evaluate, evaluate_evidence, permutation_test, run, sweep, walk_forward,
 };
 
 /// The seed streams of the battery's seeded steps, derived from its seed.
@@ -87,6 +87,7 @@ const LATER_LINES: [&str; 3] = ["luck_p", "stressed_return", "start_offsets"];
 
 /// Everything one battery produced: the verdict, and the runs and numbers behind it for saving
 /// and showing.
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BatteryResult {
     pub verdict: Verdict,
@@ -123,9 +124,14 @@ pub struct BatteryResult {
     /// (`luck_note` says which).
     pub permutation: Option<PermutationResult>,
     pub luck_note: Option<String>,
+    /// True when a cancel stopped R3, so the luck line lacks its p-value. False when R3 finished,
+    /// was skipped or did not run; a result saved before this field existed reads as false.
+    #[serde(default)]
+    pub luck_cancelled: bool,
 }
 
 /// The counts behind I1 to I3.
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct IntegrityReport {
     /// Buckets of the period's open hours: those not wholly inside the market's closed hours.
@@ -138,6 +144,7 @@ pub struct IntegrityReport {
 }
 
 /// R5: the best parameter set and its neighbours on the grid.
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PlateauReport {
     /// The best row's grid coordinates.
@@ -151,6 +158,7 @@ pub struct PlateauReport {
 }
 
 /// R4: each test window's chosen parameters run again at higher costs.
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CostStress {
     pub multiplier: f64,
@@ -161,6 +169,7 @@ pub struct CostStress {
 }
 
 /// R6: one walk-forward with its windows moved.
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StartOffset {
     /// How many of the period's last bars this run leaves out, which moves every window boundary
@@ -174,6 +183,7 @@ pub struct StartOffset {
 }
 
 /// R8: where the out-of-sample profit came from. Reported only.
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Breakdown {
     pub long: SideResult,
@@ -191,6 +201,7 @@ pub struct Breakdown {
     pub return_without_best_trade: Option<f64>,
 }
 
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct SideResult {
     /// Closed trades.
@@ -199,6 +210,7 @@ pub struct SideResult {
     pub net_pnl: f64,
 }
 
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct RegimeResult {
     pub windows: usize,
@@ -306,30 +318,14 @@ pub fn run_battery(
     let (_, traded) = select_bars(&base, bars)?;
 
     // The total before anything runs.
-    let per_sweep = sweep_spec.runs()?;
-    let window_count = |bars: usize| wf_spec.windows.windows(bars).map_or(0, |w| w.len());
-    let windows = window_count(traded.len());
-    let offsets = start_offset_shifts(wf_spec.windows.test_bars, ev.start_offsets as usize);
-    let offset_windows: Vec<usize> = offsets
-        .iter()
-        .map(|&s| window_count(traded.len().saturating_sub(s)))
-        .collect();
-    let permutations = ev.luck.permutations as usize;
-    // R3 runs last but is refused up front, before the hours of runs ahead of it.
-    let luck_runs = per_sweep as u128 * (permutations as u128 + 1);
-    if luck_runs > MAX_RUNS as u128 {
-        return Err(TesterError::TooManyRuns {
-            runs: luck_runs,
-            limit: MAX_RUNS,
-        });
-    }
-    let total = 3
-        + per_sweep
-        + windows * per_sweep
-        + 3 * windows
-        + windows
-        + offset_windows.iter().sum::<usize>() * per_sweep
-        + per_sweep * (permutations + 1);
+    let Layout {
+        per_sweep,
+        windows,
+        offsets,
+        offset_windows,
+        permutations,
+        total,
+    } = layout(&sweep_spec, &wf_spec, plan, traded.len())?;
     let mut meter = Meter {
         progress,
         total,
@@ -373,6 +369,7 @@ pub fn run_battery(
         start_offsets: Vec::new(),
         permutation: None,
         luck_note: None,
+        luck_cancelled: false,
     };
     if criteria.iter().any(|c| c.outcome == Outcome::Fail) {
         meter.finish();
@@ -678,6 +675,7 @@ pub fn run_battery(
                 result.permutation = Some(p);
             }
             Err(Some(TesterError::Cancelled)) => {
+                result.luck_cancelled = true;
                 result.luck_note = Some(
                     "The luck test was cancelled, so it gave no p-value; run the battery again \
                      to complete it."
@@ -720,6 +718,84 @@ pub fn run_battery(
     result.oos_integrity = oos_integrity;
     result.plateau = plateau;
     Ok(result)
+}
+
+/// The runs a battery counts, known before it runs, for a caller that reports one progress total
+/// over several batteries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BatteryRuns {
+    /// The total [`run_battery`] reports progress against.
+    pub total: usize,
+    /// The count after which the luck test (R3), the last step, runs: the counts above it are
+    /// R3's, and a cancel there keeps the verdict with the luck line inconclusive.
+    pub luck_from: usize,
+}
+
+/// The progress total of [`run_battery`] for `spec` on `bars`, without running anything. Errors
+/// as `run_battery` would on a refused spec or a period with no bars.
+pub fn battery_runs(spec: &BatterySpec, bars: &[Candle]) -> Result<BatteryRuns, TesterError> {
+    let instrument = spec.instrument.clone();
+    let base = spec.plan.backtest_config(spec.strategy, instrument.clone());
+    let sweep_spec = spec.plan.sweep_spec(spec.strategy, instrument.clone());
+    let wf_spec = spec.plan.walk_forward_spec(spec.strategy, instrument);
+    wf_spec.check()?;
+    let (_, traded) = select_bars(&base, bars)?;
+    let l = layout(&sweep_spec, &wf_spec, spec.plan, traded.len())?;
+    Ok(BatteryRuns {
+        total: l.total,
+        luck_from: l.total - l.per_sweep * (l.permutations + 1),
+    })
+}
+
+/// How a battery's runs are laid out: the counts its progress total is made of.
+struct Layout {
+    per_sweep: usize,
+    windows: usize,
+    offsets: Vec<usize>,
+    offset_windows: Vec<usize>,
+    permutations: usize,
+    total: usize,
+}
+
+fn layout(
+    sweep_spec: &SweepSpec,
+    wf_spec: &WalkForwardSpec,
+    plan: &TestPlan,
+    traded: usize,
+) -> Result<Layout, TesterError> {
+    let ev = &plan.evidence;
+    let per_sweep = sweep_spec.runs()?;
+    let window_count = |bars: usize| wf_spec.windows.windows(bars).map_or(0, |w| w.len());
+    let windows = window_count(traded);
+    let offsets = start_offset_shifts(wf_spec.windows.test_bars, ev.start_offsets as usize);
+    let offset_windows: Vec<usize> = offsets
+        .iter()
+        .map(|&s| window_count(traded.saturating_sub(s)))
+        .collect();
+    let permutations = ev.luck.permutations as usize;
+    // R3 runs last but is refused up front, before the hours of runs ahead of it.
+    let luck_runs = per_sweep as u128 * (permutations as u128 + 1);
+    if luck_runs > MAX_RUNS as u128 {
+        return Err(TesterError::TooManyRuns {
+            runs: luck_runs,
+            limit: MAX_RUNS,
+        });
+    }
+    let total = 3
+        + per_sweep
+        + windows * per_sweep
+        + 3 * windows
+        + windows
+        + offset_windows.iter().sum::<usize>() * per_sweep
+        + per_sweep * (permutations + 1);
+    Ok(Layout {
+        per_sweep,
+        windows,
+        offsets,
+        offset_windows,
+        permutations,
+        total,
+    })
 }
 
 /// Whether R3, R4 and R6 can no longer change the verdict: the state comes out the same whatever
