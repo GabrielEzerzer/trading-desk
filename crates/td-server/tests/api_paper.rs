@@ -1334,7 +1334,8 @@ async fn a_manual_order_on_a_strategy_session_is_marked_manual() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_manual_order_takes_effect_from_the_first_bar_that_opens_after_it_is_placed() {
+async fn a_manual_order_is_refused_while_catching_up_and_takes_effect_from_the_first_bar_after_it()
+{
     let dir = tempfile::tempdir().expect("temp dir");
     let venue = Exchange::start().await;
     let api = Api::start(&dir, &venue).await;
@@ -1349,16 +1350,42 @@ async fn a_manual_order_takes_effect_from_the_first_bar_that_opens_after_it_is_p
     venue.send(&minutes(0..5));
     api.until_bar(&id, T0 + 4 * MIN).await;
 
-    // Placed at 00:12:30 while the feed has only reached 00:05, as during a backfill: the bars up
-    // to 00:12 that it feeds next are from before the order and cannot fill it.
+    // At 00:12:30 the last closed bar is 00:11. With the feed at 00:04, as during a backfill, the
+    // session is catching up: an order would be counted by the checks on bars from before it, so
+    // it is refused and leaves nothing behind. Still refused at 00:09, two bars behind.
     venue.now.store(T0 + 12 * MIN + 30_000, Ordering::SeqCst);
     let order = json!({ "side": "buy", "qty": 1.0, "type": "market" });
-    let (status, placed) = api
-        .post(&format!("/sessions/{id}/orders"), &order.to_string())
-        .await;
+    let orders = format!("/sessions/{id}/orders");
+    let log = td_server::paper_dir(dir.path(), &id).join("events.jsonl");
+    let manual_lines = || {
+        std::fs::read_to_string(&log)
+            .expect("reads")
+            .lines()
+            .filter(|l| l.contains("manual_order"))
+            .count()
+    };
+    for (bars, last) in [(5..5, 4), (5..10, 9)] {
+        venue.send(&minutes(bars));
+        api.until_bar(&id, T0 + last * MIN).await;
+        let (status, refused) = api.post(&orders, &order.to_string()).await;
+        assert_eq!(status, StatusCode::CONFLICT, "00:{last:02}: {refused}");
+        assert_eq!(refused["error"]["code"], "catching_up");
+        let message = refused["error"]["message"].as_str().expect("a message");
+        assert!(message.contains("replaying bars it missed"), "{message}");
+    }
+    assert_eq!(manual_lines(), 0, "a refused order is not in the log");
+
+    // At 00:10 it is one bar behind, which is allowed: accepted, as the first order. The 00:11
+    // bar, closed before it was placed but fed after it, and the 00:12 bar in progress when it
+    // was placed cannot fill it.
+    venue.send(&minutes(10..11));
+    api.until_bar(&id, T0 + 10 * MIN).await;
+    let (status, placed) = api.post(&orders, &order.to_string()).await;
     assert_eq!(status, StatusCode::CREATED, "{placed}");
+    assert_eq!(placed["id"], 1, "a refused order takes no id");
     assert_eq!(placed["submitted_at"], T0 + 12 * MIN);
-    venue.send(&minutes(5..20));
+    assert_eq!(manual_lines(), 1);
+    venue.send(&minutes(11..20));
     let state = api.until_bar(&id, T0 + 19 * MIN).await;
     let fills = state["fills"].as_array().expect("fills");
     assert_eq!(fills.len(), 1, "{fills:?}");

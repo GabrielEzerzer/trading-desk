@@ -73,11 +73,17 @@
 //!     cancelled before it takes effect. 201 with the order (a `PaperOrder`,
 //!     `source: "manual"`). 400 `invalid_order` with the engine's reason when it is refused, 4xx
 //!     `bad_request` for a body that does not read, 409 `not_running` on a session that is not
-//!     running, 409 `not_live` before its first live bar. Its fills and trades are marked manual
-//!     too, and the order is in the session's log, so a resume replays it.
+//!     running, 409 `not_live` before its first live bar, 409 `catching_up` while the session is
+//!     still replaying bars it missed: its last bar fed opens more than one bar before the last
+//!     bar closed by the same clock, as during a resume's backfill or behind a lagging feed. The
+//!     strategy's checks at each bar's close count pending orders, so this keeps an order from
+//!     changing its decisions on bars from before the order, apart from at most one bar that
+//!     closed before it but was delivered after it. Its fills and trades are marked manual too,
+//!     and the order is in the session's log, so a resume replays it.
 //!   - `POST /sessions/{id}/orders/{order_id}/cancel`: cancels an open manual order, 200 with the
-//!     order. 404 for an unknown order, 409 `not_manual` for one the strategy placed, 409
-//!     `order_done` for one already filled or cancelled, 409 `not_running` as above.
+//!     order, while catching up too. 404 for an unknown order, 409 `not_manual` for one the
+//!     strategy placed, 409 `order_done` for one already filled or cancelled, 409 `not_running`
+//!     as above.
 //!
 //!   An unknown session id is a 404.
 //! - `GET /ws`: topic subscriptions: `jobs`, `candles:...` and `session:<id>` (see [`ws`]).

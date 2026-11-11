@@ -18,8 +18,12 @@
 //! the file again where possible, so a refused order does not come back on a resume.
 //!
 //! A manual order takes effect from the first bar that opens at or after the moment it was
-//! accepted by the local clock (see [`Session::submit`]): it never fills on a price from before then, neither on the
-//! bar in progress when it was placed nor on bars a backfill feeds after it.
+//! accepted by the local clock (see [`Session::submit`]): it never fills on a price from before
+//! then, neither on the bar in progress when it was placed nor on a bar fed after it that closed
+//! before it. Orders are refused while the session is catching up, more than one bar behind the
+//! last closed bar (see [`PaperSession::place`]), so the strategy's checks (cash, holding,
+//! leverage) count a pending manual order only at closes after it was accepted, and at the close
+//! of at most one bar that closed before it but that a delayed feed delivered after it.
 //!
 //! A session runs a registered strategy, or none: strategy [`MANUAL_STRATEGY`] (`none`) makes a
 //! manual session, where only manual orders trade. Manual orders are also allowed on a strategy
@@ -577,16 +581,26 @@ impl PaperSession {
     /// fills on a price from before it was placed. An accepted order is appended to the log with
     /// `accepted_at` and synced, then reported and returned. A rejected one changes nothing.
     ///
-    /// Refused before the first live bar. On a log error the order has been placed but is not
-    /// saved, and the session takes no more bars or orders: stop it.
+    /// Refused before the first live bar, and while the session is catching up: when the last
+    /// bar fed opens more than one bar before the last bar closed at `accepted_at`, as during a
+    /// resume's backfill or behind a lagging feed. The strategy's checks at the close of each bar
+    /// fed count a pending order, so an order accepted then would change its decisions on the bars
+    /// still to be fed from before the order. One bar of delay is allowed for a feed that has not
+    /// delivered the bar that just closed yet; that bar is the only one from before the order
+    /// whose checks can see it. On a log error the order has been placed but is not saved, and
+    /// the session takes no more bars or orders: stop it.
     pub fn place(
         &mut self,
         order: &ManualOrder,
         accepted_at: Millis,
     ) -> Result<PaperOrder, ManualError> {
         self.check_log()?;
-        if self.live_from.is_none() {
+        let Some(last) = self.last_bar().filter(|_| self.live_from.is_some()) else {
             return Err(ManualError::NotLive);
+        };
+        let timeframe = self.config.timeframe;
+        if last.open_time < timeframe.floor(accepted_at) - 2 * timeframe.duration_ms() {
+            return Err(ManualError::CatchingUp);
         }
         let request = order
             .request(&self.config.instrument.id)

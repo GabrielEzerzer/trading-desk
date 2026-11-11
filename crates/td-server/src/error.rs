@@ -51,6 +51,13 @@ pub enum ManualError {
     #[error("the session has not fed its first live bar yet; orders can be placed once it has")]
     NotLive,
 
+    /// The last bar fed is more than one bar behind the last closed bar (see
+    /// [`crate::PaperSession::place`]).
+    #[error(
+        "the session is still replaying bars it missed; orders can be placed once it has caught up"
+    )]
+    CatchingUp,
+
     /// The engine's reason, or a request it cannot take.
     #[error("{0}")]
     Rejected(String),

@@ -1146,6 +1146,60 @@ fn a_refused_manual_order_records_nothing_and_says_why() {
 }
 
 #[test]
+fn a_manual_order_is_refused_while_the_session_is_more_than_one_bar_behind() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let mut paper = PaperSession::create(
+        dir.path(),
+        "behind",
+        manual_config(InstrumentKind::Perpetual),
+    )
+    .expect("creates");
+    for i in 0..=10 {
+        paper.feed(minute(i), Vec::new(), false).expect("live bar");
+    }
+    let log = paper_dir(dir.path(), "behind").join("events.jsonl");
+    let lines = || fs::read_to_string(&log).expect("reads").lines().count();
+    let order = market(Side::Buy, 1.0);
+
+    // The last bar fed, 00:10, is the last closed bar from 00:11, and one bar behind it from
+    // 00:12: both are accepted.
+    for (at, id) in [
+        (close_of(10), 1),
+        (T0 + 12 * MIN, 2),
+        (T0 + 13 * MIN - 1, 3),
+    ] {
+        let placed = paper.place(&order, at).expect("accepted");
+        assert_eq!(placed.order.id, OrderId(id), "{at}");
+    }
+    assert_eq!(lines(), 14);
+
+    // From 00:13 it is two bars behind, catching up: refused, and nothing changes.
+    for at in [T0 + 13 * MIN, T0 + 13 * MIN + 30_000, T0 + 60 * MIN] {
+        let refused = paper.place(&order, at);
+        assert!(
+            matches!(refused, Err(ManualError::CatchingUp)),
+            "{at}: {refused:?}"
+        );
+    }
+    assert_eq!(paper.orders().len(), 3);
+    assert_eq!(lines(), 14, "a refused order is not in the log");
+
+    // Cancels are still taken.
+    let cancelled = paper.cancel(OrderId(3)).expect("cancels");
+    assert_eq!(
+        cancelled.order.status,
+        OrderStatus::Cancelled("cancelled manually".into())
+    );
+
+    // Fed up to 00:12, it takes orders again at 00:13.
+    for i in 11..=12 {
+        paper.feed(minute(i), Vec::new(), false).expect("live bar");
+    }
+    let placed = paper.place(&order, T0 + 13 * MIN).expect("accepted");
+    assert_eq!(placed.order.id, OrderId(4));
+}
+
+#[test]
 fn manual_orders_on_a_strategy_session_are_marked_manual_and_only_they_can_be_cancelled() {
     let dir = tempfile::tempdir().expect("temp dir");
     let cfg = config(InstrumentKind::Perpetual, Timeframe::M1);
@@ -1350,16 +1404,17 @@ fn hour(i: i64, open: f64, low: f64) -> Candle {
 
 /// What the hourly manual test does, after the hour each step is paired with, at the time given.
 /// After 00:00, at 01:50 while the 01:00 bar is in progress: a market buy, and a limit buy at 95,
-/// which the 01:00 bar dips to. After 02:00, at 06:30 while the feed is behind, as during a
-/// backfill: a market sell, and a marketable limit buy that is cancelled before it takes effect.
+/// which the 01:00 bar dips to. After 04:00, at 06:30 while the feed is one bar behind, the most
+/// an order is accepted at (the 05:00 bar closed but is not fed yet): a market sell, and a
+/// marketable limit buy that is cancelled before it takes effect.
 fn hourly_script() -> Vec<(i64, Millis, Hand)> {
     let at = |h: i64, m: i64| T0 + h * HOUR + m * MIN;
     vec![
         (0, at(1, 50), Hand::Place(market(Side::Buy, 1.0))),
         (0, at(1, 50), Hand::Place(limit(Side::Buy, 1.0, 95.0))),
-        (2, at(6, 30), Hand::Place(market(Side::Sell, 1.0))),
-        (2, at(6, 30), Hand::Place(limit(Side::Buy, 1.0, 200.0))),
-        (2, at(6, 30), Hand::Cancel(4)),
+        (4, at(6, 30), Hand::Place(market(Side::Sell, 1.0))),
+        (4, at(6, 30), Hand::Place(limit(Side::Buy, 1.0, 200.0))),
+        (4, at(6, 30), Hand::Cancel(4)),
     ]
 }
 
@@ -1397,7 +1452,7 @@ fn a_manual_order_never_fills_on_a_bar_from_before_it_was_placed_and_replays_so(
         .collect();
     // The buy placed at 01:50 fills at the 02:00 open, not the 01:00 one; the limit at 95, which
     // only the 01:00 bar reached, never fills; the sell placed at 06:30 fills at the 07:00 open,
-    // not on the bars from 03:00 to 06:00 fed after it.
+    // not on the 05:00 and 06:00 bars fed after it.
     assert_eq!(fills, [(1, T0 + 2 * HOUR), (3, T0 + 7 * HOUR)]);
     let open = whole.fills()[0].price;
     assert!(
@@ -1415,14 +1470,14 @@ fn a_manual_order_never_fills_on_a_bar_from_before_it_was_placed_and_replays_so(
         OrderStatus::Cancelled("cancelled manually".into())
     );
 
-    // Stopped after 02:00, with both orders placed at 06:30 not yet in effect, and reopened: the
+    // Stopped after 04:00, with both orders placed at 06:30 not yet in effect, and reopened: the
     // replay places them as they were, and the rest goes as in the session that ran through.
     let mut first = PaperSession::create(dir.path(), "split", cfg).expect("creates");
-    feed_hours(&mut first, 0..3);
+    feed_hours(&mut first, 0..5);
     let mut reopened = PaperSession::open(dir.path(), "split").expect("opens");
     assert_same_marked_state(&first, &reopened);
     drop(first);
-    feed_hours(&mut reopened, 3..10);
+    feed_hours(&mut reopened, 5..10);
     assert_same_marked_state(&whole, &reopened);
     drop(reopened);
     let again = PaperSession::open(dir.path(), "split").expect("opens");

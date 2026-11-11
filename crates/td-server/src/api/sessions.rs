@@ -438,6 +438,12 @@ impl Sessions {
         // A clock behind the venue by s seconds lets an order placed within s seconds after a bar
         // opened fill at that bar's open. Taking the newest in-progress kline time from the
         // stream as a floor would close it.
+        // The same clock decides whether the session has caught up (see `PaperSession::place`):
+        // an order is refused while the feed is more than one bar behind it. Within that bound
+        // the strategy can still see a pending manual order at the close of one bar that closed
+        // before the order was accepted but was delivered after it, a feed delayed by up to one
+        // bar; its checks on that bar (cash, holding, leverage) count the order. It cannot fill
+        // there.
         let rest = self.streams.live().rest();
         self.manual(id, |paper| paper.place(order, rest.now()))
     }
@@ -556,6 +562,7 @@ impl From<ManualError> for ApiError {
         let message = e.to_string();
         match e {
             ManualError::NotLive => ApiError::new(StatusCode::CONFLICT, "not_live", message),
+            ManualError::CatchingUp => ApiError::new(StatusCode::CONFLICT, "catching_up", message),
             ManualError::Rejected(_) => {
                 ApiError::new(StatusCode::BAD_REQUEST, "invalid_order", message)
             }
