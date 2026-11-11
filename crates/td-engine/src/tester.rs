@@ -178,6 +178,12 @@ impl SweepSpec {
     pub fn check(&self) -> Result<(), TesterError> {
         Plan::new(self).map(|_| ())
     }
+
+    /// The backtests one sweep of this spec runs and reports progress for, after the checks of
+    /// [`SweepSpec::check`].
+    pub(crate) fn runs(&self) -> Result<usize, TesterError> {
+        Plan::new(self).map(|p| p.indices.len())
+    }
 }
 
 impl OosSpec {

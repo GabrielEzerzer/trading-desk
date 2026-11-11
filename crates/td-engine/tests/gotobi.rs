@@ -374,7 +374,7 @@ fn the_registry_lists_gotobi_with_its_plan_on_a_dollar_account() {
         (date(2016, 1, 1), date(2026, 10, 31))
     );
     assert_eq!(plan.backtest.account_currency, AccountCurrency::Base);
-    let config = plan.backtest_config("gotobi", usdjpy(), 5.0);
+    let config = plan.backtest_config("gotobi", usdjpy());
     assert_eq!(config.account_currency, AccountCurrency::Base);
     assert_eq!(config.slippage_bps, 0.0);
     assert_eq!(config.max_leverage, 30.0);
@@ -398,7 +398,7 @@ fn the_registry_lists_gotobi_with_its_plan_on_a_dollar_account() {
         );
         let mut inst = usdjpy();
         inst.id = plan.instruments[0].clone();
-        let config = plan.backtest_config(name, inst, 2.0);
+        let config = plan.backtest_config(name, inst);
         assert_eq!(config.account_currency, AccountCurrency::Quote, "{name}");
         let json = serde_json::to_value(&plan).unwrap();
         assert!(json["backtest"].get("account_currency").is_none(), "{name}");

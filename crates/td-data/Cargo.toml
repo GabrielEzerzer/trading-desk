@@ -12,6 +12,7 @@ clap.workspace = true
 futures-util.workspace = true
 lzma-rs.workspace = true
 parquet.workspace = true
+rayon.workspace = true
 reqwest.workspace = true
 rustls.workspace = true
 serde.workspace = true

@@ -2344,6 +2344,7 @@ dependencies = [
  "futures-util",
  "lzma-rs",
  "parquet",
+ "rayon",
  "reqwest",
  "rustls",
  "serde",
