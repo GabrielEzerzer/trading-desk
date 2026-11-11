@@ -11,8 +11,9 @@ use super::HealthResponse;
 use super::StrategyInfo;
 use super::candles::{BarSpan, CandlesResponse};
 use super::data::{
-    CoverageResponse, DownloadRequest, DownloadResult, FundingCoverage, GapInfo,
-    InstrumentsResponse, MonthCount, MonthCoverageInfo, RejectedInstrument,
+    CoverageResponse, DeleteRequest, DeleteResult, DownloadRequest, DownloadResult,
+    FundingCoverage, GapInfo, InstrumentsResponse, MonthCount, MonthCoverageInfo,
+    RejectedInstrument, StoredInstrumentInfo, StoredMonthInfo, StoredResponse,
 };
 use super::error::{ErrorBody, ErrorResponse};
 use super::jobs::{JobCreated, JobInfo, JobKind, JobRequest, JobResult, JobStatus};
@@ -120,6 +121,11 @@ pub fn render() -> String {
         CoverageResponse,
         MonthCoverageInfo,
         FundingCoverage,
+        StoredResponse,
+        StoredInstrumentInfo,
+        StoredMonthInfo,
+        DeleteRequest,
+        DeleteResult,
         CandlesResponse,
         BarSpan,
         StrategyInfo,

@@ -344,7 +344,14 @@ async fn health_answers_the_version_with_the_token() {
 async fn requests_without_the_token_or_with_a_wrong_one_are_401() {
     let t = TestServer::start(FakeSource::default()).await;
     let wrong = format!("Bearer {}", Token::generate().unwrap().as_str());
-    for path in ["/health", "/jobs", "/strategies", "/no-such-route", "/ws"] {
+    for path in [
+        "/health",
+        "/jobs",
+        "/strategies",
+        "/data/stored",
+        "/no-such-route",
+        "/ws",
+    ] {
         let (status, body) = t.send(t.client.get(t.url(path))).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED, "{path} without a token");
         assert_eq!(body["error"]["code"], "unauthorized");
@@ -356,10 +363,10 @@ async fn requests_without_the_token_or_with_a_wrong_one_are_401() {
             "{path} with a wrong token"
         );
     }
-    let (status, _) = t
-        .send(t.client.post(t.url("/data/download")).body("{}"))
-        .await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    for path in ["/data/download", "/data/delete"] {
+        let (status, _) = t.send(t.client.post(t.url(path)).body("{}")).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{path} without a token");
+    }
 
     // A WebSocket upgrade with a wrong subprotocol token, and with none, is refused.
     for protocol in [Some(format!("td-token.{}", "0".repeat(64))), None] {
@@ -905,4 +912,191 @@ fn the_committed_typescript_types_are_up_to_date() {
         committed == ts::render(),
         "gui/shared/src/api-types.ts is stale: run `cargo run -p td-server --bin gen-api-types`"
     );
+}
+
+/// Downloads January and February 2024 of a Bybit perpetual through the fake: an hour of candles
+/// per month and three funding rates.
+async fn download_two_months(t: &TestServer, symbol: &str) {
+    let body = json!({
+        "instrument": { "venue": "bybit", "symbol": symbol, "kind": "perpetual" },
+        "from": day("2024-01-01"),
+        "to": day("2024-02-10"),
+    });
+    let (status, created) = t.post("/data/download", &body.to_string()).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{created}");
+    t.until_status(created["job_id"].as_u64().unwrap(), "done")
+        .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stored_data_lists_with_sizes_and_deletes_by_month_range_or_whole_instrument() {
+    let t = TestServer::start(FakeSource::default()).await;
+    let (status, empty) = t.get("/data/stored").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(empty, json!({ "instruments": [], "unrecognised": [] }));
+    download_two_months(&t, "BTCUSDT").await;
+    download_two_months(&t, "ETHUSDT").await;
+
+    let (status, stored) = t.get("/data/stored").await;
+    assert_eq!(status, StatusCode::OK);
+    let btc = &stored["instruments"][0];
+    assert_eq!(
+        btc["instrument"],
+        json!({ "venue": "bybit", "symbol": "BTCUSDT", "kind": "perpetual" })
+    );
+    assert_eq!(stored["instruments"][1]["instrument"]["symbol"], "ETHUSDT");
+    let months: Vec<&str> = btc["months"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["month"].as_str().unwrap())
+        .collect();
+    assert_eq!(months, ["2024-01", "2024-02"]);
+    let month_bytes: Vec<u64> = btc["months"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["bytes"].as_u64().unwrap())
+        .collect();
+    let funding_bytes = btc["funding_bytes"].as_u64().expect("a funding file");
+    assert!(month_bytes.iter().all(|b| *b > 0) && funding_bytes > 0);
+    assert_eq!(
+        btc["bytes"].as_u64(),
+        Some(month_bytes.iter().sum::<u64>() + funding_bytes)
+    );
+    // Coverage reports the same bytes per month.
+    let (_, coverage) = t
+        .get("/data/coverage?instrument=bybit:BTCUSDT:perpetual")
+        .await;
+    let covered: Vec<u64> = coverage["months"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["bytes"].as_u64().unwrap())
+        .collect();
+    assert_eq!(covered, month_bytes);
+
+    // A month range removes those months only; the funding file stays.
+    let instrument = json!({ "venue": "bybit", "symbol": "BTCUSDT", "kind": "perpetual" });
+    let body = json!({ "instrument": instrument, "from": "2023-11", "to": "2024-01" });
+    let (status, removed) = t.post("/data/delete", &body.to_string()).await;
+    assert_eq!(status, StatusCode::OK, "{removed}");
+    assert_eq!(removed, json!({ "files": 1, "bytes": month_bytes[0] }));
+    let (_, coverage) = t
+        .get("/data/coverage?instrument=bybit:BTCUSDT:perpetual")
+        .await;
+    assert_eq!(coverage["months"].as_array().map(Vec::len), Some(1));
+    assert_eq!(coverage["months"][0]["month"], "2024-02");
+    assert_eq!(coverage["funding"]["rates"], 3);
+
+    // With no range, the rest of the instrument goes, funding included.
+    let body = json!({ "instrument": instrument });
+    let (status, removed) = t.post("/data/delete", &body.to_string()).await;
+    assert_eq!(status, StatusCode::OK, "{removed}");
+    assert_eq!(
+        removed,
+        json!({ "files": 2, "bytes": month_bytes[1] + funding_bytes })
+    );
+    let (_, stored) = t.get("/data/stored").await;
+    let left: Vec<&str> = stored["instruments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["instrument"]["symbol"].as_str().unwrap())
+        .collect();
+    assert_eq!(left, ["ETHUSDT"], "the other instrument is untouched");
+    assert_eq!(
+        stored["unrecognised"],
+        json!([]),
+        "lock files are not strays"
+    );
+    // Deleting what is not there is not an error.
+    let (status, removed) = t.post("/data/delete", &body.to_string()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(removed, json!({ "files": 0, "bytes": 0 }));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn bad_delete_requests_are_400_and_delete_nothing() {
+    let t = TestServer::start(FakeSource::default()).await;
+    download_two_months(&t, "BTCUSDT").await;
+    let (_, before) = t.get("/data/stored").await;
+    let delete = |symbol: &str, range: Value| {
+        let mut body = json!({
+            "instrument": { "venue": "bybit", "symbol": symbol, "kind": "perpetual" },
+        });
+        body.as_object_mut()
+            .unwrap()
+            .extend(range.as_object().unwrap().clone());
+        body.to_string()
+    };
+    let cases = [
+        delete("BTCUSDT", json!({ "from": "2024-01" })),
+        delete("BTCUSDT", json!({ "to": "2024-01" })),
+        delete("BTCUSDT", json!({ "from": "2024-02", "to": "2024-01" })),
+        delete("BTCUSDT", json!({ "from": "2024-1", "to": "2024-02" })),
+        delete("BTCUSDT", json!({ "from": "2024-01-01", "to": "2024-02" })),
+        delete("BTCUSDT", json!({ "from": "2024-13", "to": "2024-13" })),
+        delete("../BTCUSDT", json!({})),
+        delete("..", json!({ "from": "2024-01", "to": "2024-02" })),
+        delete("btcusdt", json!({})),
+        "{not json".to_string(),
+    ];
+    for body in cases {
+        let (status, answer) = t.post("/data/delete", &body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}: {answer}");
+        assert!(answer["error"]["message"].is_string(), "{answer}");
+    }
+    let (status, _) = t.post("/data/delete", r#"{"from": "2024-01"}"#).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(t.get("/data/stored").await.1, before, "nothing was deleted");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_delete_while_the_instrument_downloads_is_409() {
+    let t = TestServer::start(FakeSource::gated()).await;
+    let body = json!({
+        "instrument": { "venue": "binance", "symbol": "BTCUSDT", "kind": "spot" },
+        "from": day("2024-01-01"),
+        "to": day("2024-03-01"),
+    });
+    let (status, created) = t.post("/data/download", &body.to_string()).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let job = created["job_id"].as_u64().unwrap();
+    t.source.release(1);
+    // January is stored and the job waits on February.
+    let deadline = Instant::now() + WAIT;
+    while t.get("/data/stored").await.1["instruments"] == json!([]) {
+        assert!(Instant::now() < deadline, "January was never stored");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(t.get(&format!("/jobs/{job}")).await.1["status"], "running");
+
+    let delete = |symbol: &str| {
+        json!({ "instrument": { "venue": "binance", "symbol": symbol, "kind": "spot" } })
+            .to_string()
+    };
+    let (status, answer) = t.post("/data/delete", &delete("BTCUSDT")).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{answer}");
+    assert_eq!(answer["error"]["code"], "conflict");
+    let range = json!({
+        "instrument": { "venue": "binance", "symbol": "BTCUSDT", "kind": "spot" },
+        "from": "2024-01",
+        "to": "2024-01",
+    });
+    let (status, _) = t.post("/data/delete", &range.to_string()).await;
+    assert_eq!(status, StatusCode::CONFLICT, "a month range too");
+    let (_, coverage) = t
+        .get("/data/coverage?instrument=binance:BTCUSDT:spot")
+        .await;
+    assert_eq!(coverage["months"][0]["month"], "2024-01", "nothing deleted");
+    // Another instrument is not held up.
+    let (status, _) = t.post("/data/delete", &delete("ETHUSDT")).await;
+    assert_eq!(status, StatusCode::OK);
+
+    t.source.release(1);
+    t.until_status(job, "done").await;
+    let (status, removed) = t.post("/data/delete", &delete("BTCUSDT")).await;
+    assert_eq!(status, StatusCode::OK, "{removed}");
+    assert_eq!(removed["files"], 2);
 }
