@@ -99,7 +99,9 @@ pub struct Trade {
     pub pips: Option<f64>,
     /// `net_pnl` in pips: `net_pnl` over the value of one pip on the quantity the trade closed (its
     /// whole size for one entry and one exit), in the account currency, converted at `exit_price`
-    /// on a base account. After commission, so `pips - net_pips` is the commission in pips.
+    /// on a base account. It is after commission. On a quote account, or when the trade exits at
+    /// one price, `pips - net_pips` is the commission in pips; on a base account with exits at
+    /// different prices it is not, since each exit's P&L is converted at its own price.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub net_pips: Option<f64>,
 }

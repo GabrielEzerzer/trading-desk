@@ -117,7 +117,8 @@ export type Liquidity = "maker" | "taker";
  */
 export type Fill = { order_id: OrderId, instrument: InstrumentId, side: Side, time: number, price: number, qty: number, 
 /**
- * The fee paid, in the quote asset. Negative for a rebate.
+ * The fee paid, in the account currency: the quote asset, or the base currency on a
+ * base-currency account. Negative for a rebate.
  */
 fee: number, liquidity: Liquidity, };
 
@@ -442,7 +443,9 @@ pips?: number | null,
 /**
  * `net_pnl` in pips: `net_pnl` over the value of one pip on the quantity the trade closed (its
  * whole size for one entry and one exit), in the account currency, converted at `exit_price`
- * on a base account. After commission, so `pips - net_pips` is the commission in pips.
+ * on a base account. It is after commission. On a quote account, or when the trade exits at
+ * one price, `pips - net_pips` is the commission in pips; on a base account with exits at
+ * different prices it is not, since each exit's P&L is converted at its own price.
  */
 net_pips?: number | null, };
 
@@ -1632,7 +1635,8 @@ attached_stop: AttachedStop | null, status: OrderStatus, };
  */
 export type PaperFill = { source: OrderSource, order_id: OrderId, instrument: InstrumentId, side: Side, time: number, price: number, qty: number, 
 /**
- * The fee paid, in the quote asset. Negative for a rebate.
+ * The fee paid, in the account currency: the quote asset, or the base currency on a
+ * base-currency account. Negative for a rebate.
  */
 fee: number, liquidity: Liquidity, };
 
@@ -1746,7 +1750,9 @@ pips?: number | null,
 /**
  * `net_pnl` in pips: `net_pnl` over the value of one pip on the quantity the trade closed (its
  * whole size for one entry and one exit), in the account currency, converted at `exit_price`
- * on a base account. After commission, so `pips - net_pips` is the commission in pips.
+ * on a base account. It is after commission. On a quote account, or when the trade exits at
+ * one price, `pips - net_pips` is the commission in pips; on a base account with exits at
+ * different prices it is not, since each exit's P&L is converted at its own price.
  */
 net_pips?: number | null, };
 
