@@ -106,7 +106,8 @@ impl Context<'_> {
     /// (buys down, sells up) so an order never trades worse than asked; triggers round to the
     /// nearest tick. On spot, a sell must fit in the holding less the open sells, and a buy must
     /// fit in the cash together with the open buys: each buy is valued at its limit price, its
-    /// trigger, or this bar's close for a market order, plus the taker fee. A spot buy is checked
+    /// trigger, or this bar's close for a market order, plus the taker fee and any per-unit
+    /// commission. A spot buy is checked
     /// again when it fills and cut to the cash then (see [`crate::SimBroker`]).
     ///
     /// On a perpetual, an order that is not reduce-only is rejected if the position it could
@@ -326,6 +327,7 @@ impl Context<'_> {
             let close = self.bar().close;
             let cost = |r: &OrderRequest| {
                 r.qty * reference_price(r.order_type, close) * (1.0 + self.fees.taker)
+                    + r.qty * self.fees.per_unit
             };
             let pending: f64 = self
                 .open_orders()

@@ -84,8 +84,8 @@ fn is_default_max_leverage(max_leverage: &f64) -> bool {
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Benchmark {
-    /// Quantity bought at the first bar's open: all starting cash, after the taker fee, rounded
-    /// down to the lot size. In a walk-forward, the first test window's purchase.
+    /// Quantity bought at the first bar's open: all starting cash, after the taker fee and any
+    /// per-unit commission, rounded down to the lot size. In a walk-forward, the first test window's purchase.
     pub qty: f64,
     /// The first bar's open with slippage, rounded up to the tick. In a walk-forward, the first
     /// test window's.
@@ -372,7 +372,7 @@ fn hold(
     };
     let first = bars[0];
     let price = model.slip(first.open, Side::Buy, inst);
-    let qty = inst.round_qty(config.starting_cash / (price * (1.0 + fees.taker)));
+    let qty = inst.round_qty(config.starting_cash / (price * (1.0 + fees.taker) + fees.per_unit));
     let mut portfolio = Portfolio::new(inst.id.kind, config.starting_cash);
     let mut fills = Vec::new();
     let mut equity = Vec::with_capacity(bars.len());
@@ -392,7 +392,7 @@ fn hold(
                 time: first.open_time,
                 price,
                 qty,
-                fee: price * qty * fees.taker,
+                fee: fees.fee(price, qty, fees.taker),
                 liquidity: td_core::Liquidity::Taker,
             };
             portfolio.apply_fill(fill.side, fill.qty, fill.price, fill.fee);

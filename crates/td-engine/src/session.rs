@@ -97,7 +97,7 @@ impl Session {
             ));
         }
         let fees = config.fees.unwrap_or(instrument.fees);
-        if !(fees.maker.is_finite() && fees.taker.is_finite()) {
+        if !(fees.maker.is_finite() && fees.taker.is_finite() && fees.per_unit.is_finite()) {
             return Err(EngineError::InvalidConfig("fees must be finite numbers"));
         }
         let model = CandleFillModel {
@@ -420,7 +420,7 @@ impl Session {
         });
         // The taker fee, then a liquidation fee of whatever equity is left after it: the venue
         // keeps the rest of the margin. None is left when the bar gapped through the price.
-        let taker = price * qty * self.fees.taker;
+        let taker = self.fees.fee(price, qty, self.fees.taker);
         let left = self.portfolio.cash() + q * (price - self.portfolio.avg_entry()) - taker;
         let fee = taker + left.max(0.0);
         self.portfolio.apply_fill(side, qty, price, fee);

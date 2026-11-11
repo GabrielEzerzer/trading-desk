@@ -445,3 +445,59 @@ fn asks_are_required_for_fx_must_match_the_bar_and_are_refused_elsewhere() {
     // Nothing was fed by any of them.
     assert!(s.bars().is_empty());
 }
+
+#[test]
+fn a_per_unit_commission_is_charged_on_every_fill() {
+    // 0.002 yen per unit, no rate. Buy 1000 at bar 0's close, sell 1000 at bar 1's close.
+    // Entry: bar 1's ask open 150.020, fee 1000 * 0.002 = 2 yen.
+    // Exit: bar 2's bid open 150.100, fee 2 yen.
+    // Net: 1000 * (150.100 - 150.020) - 2 - 2 = 80 - 4 = 76 yen.
+    let fees = FeeSchedule {
+        maker: 0.0,
+        taker: 0.0,
+        per_unit: 0.002,
+    };
+    let config = SessionConfig {
+        fees: Some(fees),
+        ..fx_config()
+    };
+    let s = run_fx_with(
+        vec![
+            (0, Send::Plain(market(Side::Buy, 1000.0))),
+            (1, Send::Plain(market(Side::Sell, 1000.0))),
+        ],
+        &[
+            DECIDE,
+            (
+                [150.000, 150.100, 149.900, 150.050],
+                [150.020, 150.120, 149.920, 150.070],
+            ),
+            (
+                [150.100, 150.200, 150.000, 150.150],
+                [150.120, 150.220, 150.020, 150.170],
+            ),
+        ],
+        config,
+    );
+    assert_eq!(
+        fills(&s),
+        [(Side::Buy, 150.020, 1000.0), (Side::Sell, 150.100, 1000.0)]
+    );
+    for fill in s.fills() {
+        approx(fill.fee, 2.0);
+    }
+    approx(s.portfolio().fees_paid(), 4.0);
+    approx(s.portfolio().cash(), 1_000_000.0 + 76.0);
+    let trades = td_engine::build_trades(s.fills(), s.bars(), s.bar_funding());
+    assert_eq!(trades.len(), 1);
+    approx(trades[0].fees, 4.0);
+    approx(trades[0].net_pnl, 76.0);
+
+    // With a rate as well, the per-unit term adds to it: 0.0001 of 150 020 notional is 15.002,
+    // plus 2 per-unit, 17.002 on the entry.
+    let both = FeeSchedule {
+        taker: 0.0001,
+        ..fees
+    };
+    approx(both.fee(150.020, 1000.0, both.taker), 15.002 + 2.0);
+}

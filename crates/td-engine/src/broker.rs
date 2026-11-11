@@ -229,7 +229,7 @@ impl<M: FillModel> SimBroker<M> {
             Liquidity::Taker => self.fees.taker,
         };
         if inst.id.kind == InstrumentKind::Spot && req.side == Side::Buy {
-            let unit_cost = price * (1.0 + rate);
+            let unit_cost = price * (1.0 + rate) + self.fees.per_unit;
             let cash = book.cash();
             if qty * unit_cost > cash {
                 qty = inst.round_qty(cash.max(0.0) / unit_cost);
@@ -250,7 +250,8 @@ impl<M: FillModel> SimBroker<M> {
                 }
             }
         }
-        book.apply_fill(req.side, qty, price, price * qty * rate);
+        let fee = self.fees.fee(price, qty, rate);
+        book.apply_fill(req.side, qty, price, fee);
         Ok(Fill {
             order_id: order.id,
             instrument: req.instrument.clone(),
@@ -259,7 +260,7 @@ impl<M: FillModel> SimBroker<M> {
             time: bar.open_time,
             price,
             qty,
-            fee: price * qty * rate,
+            fee,
             liquidity,
         })
     }
