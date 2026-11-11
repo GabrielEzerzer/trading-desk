@@ -319,8 +319,8 @@ impl Store {
     ///
     /// The batch is refused, and nothing is written, when the kind takes no quotes, when a candle
     /// is not valid or not on a minute, when the `i`-th ask does not have the `i`-th bid's open
-    /// time, when an ask's open or close is below its bid's (a crossed quote), or when a minute is
-    /// in the kind's closed hours.
+    /// time, when an ask's open, high, low or close is below its bid's (a crossed quote), or when a
+    /// minute is in the kind's closed hours.
     pub fn write_quotes(
         &self,
         id: &InstrumentId,
@@ -901,8 +901,8 @@ fn check_candle(id: &InstrumentId, c: &Candle) -> Result<(), DataError> {
     Ok(())
 }
 
-/// A minute of bid and ask: each candle valid and on a minute, the same open time, the ask's open
-/// and close not below the bid's, and the market open.
+/// A minute of bid and ask: each candle valid and on a minute, the same open time, the ask's open,
+/// high, low and close not below the bid's, and the market open.
 fn check_quote(id: &InstrumentId, bid: &Candle, ask: &Candle) -> Result<(), DataError> {
     check_candle(id, bid)?;
     check_candle(id, ask)?;
@@ -917,8 +917,12 @@ fn check_quote(id: &InstrumentId, bid: &Candle, ask: &Candle) -> Result<(), Data
             ),
         });
     }
+    // The ask is at or above the bid at every instant, so on each of open, high, low and close:
+    // the engine refuses a bar crossed on any of them, so the store does too.
     for (field, b, a) in [
         ("open", bid.open, ask.open),
+        ("high", bid.high, ask.high),
+        ("low", bid.low, ask.low),
         ("close", bid.close, ask.close),
     ] {
         if a < b {

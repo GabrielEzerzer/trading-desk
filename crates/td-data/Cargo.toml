@@ -7,8 +7,10 @@ publish.workspace = true
 
 [dependencies]
 arrow.workspace = true
+aws-lc-rs.workspace = true
 clap.workspace = true
 futures-util.workspace = true
+lzma-rs.workspace = true
 parquet.workspace = true
 reqwest.workspace = true
 rustls.workspace = true

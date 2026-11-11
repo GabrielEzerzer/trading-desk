@@ -8,11 +8,13 @@
 pub mod binance;
 pub mod bybit;
 mod download;
+pub mod dukascopy;
 mod error;
 mod http;
 pub mod instruments;
 pub mod live;
 mod resample;
+mod sigv4;
 mod source;
 mod store;
 pub mod time;

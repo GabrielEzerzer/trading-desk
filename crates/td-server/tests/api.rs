@@ -16,6 +16,7 @@ use td_data::time::{MINUTE, Month, now_ms, parse_date};
 use td_data::{DataError, DownloadReport, InstrumentList, Store};
 use td_server::api::auth::Token;
 use td_server::api::data::EARLIEST_FROM;
+use td_server::api::error::ApiError;
 use td_server::api::jobs::{JobInfo, JobResult, JobStatus};
 use td_server::api::source::{LiveSource, MarketSource};
 use td_server::api::ws::ServerMessage;
@@ -93,6 +94,12 @@ impl MarketSource for FakeSource {
         from: Millis,
         to: Millis,
     ) -> Result<DownloadReport, DataError> {
+        // Fails as the real source does when the server has no AWS credentials.
+        if id.venue == Venue::Dukascopy {
+            return Err(DataError::MissingAwsCredentials {
+                missing: vec!["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"],
+            });
+        }
         if self.gated {
             let mut permits = self.permits.lock().unwrap();
             while *permits == 0 {
@@ -442,6 +449,10 @@ async fn instruments_come_from_the_source_once_per_list_and_then_from_memory() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["instruments"][0]["id"]["kind"], "perpetual");
     assert_eq!(t.source.instrument_calls.load(Ordering::SeqCst), 2);
+    let (status, body) = t.get("/instruments?venue=dukascopy&kind=fx").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["instruments"][0]["id"]["venue"], "dukascopy");
+    assert_eq!(body["instruments"][0]["id"]["kind"], "fx");
 
     for bad in [
         "/instruments?venue=kraken&kind=spot",
@@ -569,6 +580,63 @@ async fn a_download_job_reaches_done_on_the_jobs_topic_and_shows_in_coverage() {
         .await;
     assert_eq!(empty["months"], json!([]));
     assert_eq!(empty["funding"], Value::Null);
+    let (status, fx) = t.get("/data/coverage?instrument=dukascopy:USDJPY:fx").await;
+    assert_eq!(status, StatusCode::OK, "{fx}");
+    assert_eq!(fx["months"], json!([]));
+}
+
+/// Missing or refused AWS credentials are the client's to fix, not the venue failing: a 400 with
+/// the `bad_request` code, as a failed download job carries it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dukascopy_download_without_aws_credentials_fails_as_a_bad_request() {
+    let missing = DataError::MissingAwsCredentials {
+        missing: vec!["AWS_SECRET_ACCESS_KEY"],
+    };
+    let refused = DataError::AwsRefused {
+        url: "s3://bucket/key".into(),
+        code: "InvalidAccessKeyId".into(),
+    };
+    for error in [missing, refused] {
+        let api = ApiError::from(error);
+        assert_eq!(
+            (api.status.as_u16(), api.body.code.as_str()),
+            (400, "bad_request")
+        );
+        assert!(
+            api.body.message.contains("AWS_SECRET_ACCESS_KEY"),
+            "{api:?}"
+        );
+    }
+
+    let t = TestServer::start(FakeSource::default()).await;
+    let mut ws = t.websocket().await;
+    ws.send(json!({ "type": "subscribe", "topic": "jobs" }))
+        .await;
+    assert!(matches!(
+        ws.next().await,
+        Some(ServerMessage::Subscribed { .. })
+    ));
+    let body = json!({
+        "instrument": { "venue": "dukascopy", "symbol": "USDJPY", "kind": "fx" },
+        "from": day("2024-01-08"),
+        "to": day("2024-01-15"),
+    });
+    let (status, created) = t.post("/data/download", &body.to_string()).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{created}");
+    let id = created["job_id"].as_u64().expect("a job id");
+    let job = ws.until_job(id, JobStatus::Failed).await;
+    let error = job.error.expect("an error");
+    assert_eq!(error.code, "bad_request");
+    assert!(
+        error
+            .message
+            .contains("AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY not set"),
+        "{}",
+        error.message
+    );
+    let (_, fetched) = t.get(&format!("/jobs/{id}")).await;
+    assert_eq!(fetched["status"], "failed");
+    assert_eq!(fetched["error"]["code"], "bad_request");
 }
 
 #[tokio::test(flavor = "multi_thread")]

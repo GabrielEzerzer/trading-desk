@@ -462,8 +462,10 @@ mod tests {
 
     #[test]
     fn instruments_parse_from_their_display_form() {
-        let id = parse_instrument("bybit:ETHUSDT:perpetual").expect("parses");
-        assert_eq!(id.to_string(), "bybit:ETHUSDT:perpetual");
+        for text in ["bybit:ETHUSDT:perpetual", "dukascopy:USDJPY:fx"] {
+            let id = parse_instrument(text).expect("parses");
+            assert_eq!(id.to_string(), text);
+        }
         for bad in [
             "",
             "binance:BTCUSDT",

@@ -71,8 +71,9 @@ impl From<QueryRejection> for ApiError {
     }
 }
 
-/// Data errors caused by what the client asked for are 400s; the venue failing is a 502; the rest
-/// (disk, corrupt files, no data directory) are 500s.
+/// Data errors caused by what the client asked for, or by AWS credentials that are missing or
+/// refused, are 400s; the venue failing is a 502; the rest (disk, corrupt files, no data
+/// directory) are 500s.
 impl From<DataError> for ApiError {
     fn from(e: DataError) -> Self {
         let message = e.to_string();
@@ -84,7 +85,9 @@ impl From<DataError> for ApiError {
             | DataError::KindNotListed { .. }
             | DataError::NoFunding(_)
             | DataError::NoLiveStream(_)
-            | DataError::InvalidInstrument { .. } => ApiError::bad_request(message),
+            | DataError::InvalidInstrument { .. }
+            | DataError::MissingAwsCredentials { .. }
+            | DataError::AwsRefused { .. } => ApiError::bad_request(message),
             DataError::Http { .. } | DataError::Status { .. } | DataError::Api { .. } => {
                 ApiError::new(StatusCode::BAD_GATEWAY, "venue", message)
             }
