@@ -160,7 +160,7 @@ pub struct HighRiskLimits {
     pub min_profit_factor: f64,
     /// The chance of losing `ruin_drawdown` of the account, at most this.
     pub max_risk_of_ruin: f64,
-    /// The drawdown from the peak that counts as ruin.
+    /// The drawdown from the running peak of equity that counts as ruin, above 0 and below 1.
     pub ruin_drawdown: f64,
     /// The out-of-sample return with the single best trade removed, strictly above this.
     pub min_return_without_best_trade: f64,
@@ -230,7 +230,12 @@ impl VerdictRule {
                 )?;
                 finite("limits.min_profit_factor", limits.min_profit_factor)?;
                 probability("limits.max_risk_of_ruin", limits.max_risk_of_ruin)?;
-                share("limits.ruin_drawdown", limits.ruin_drawdown)?;
+                if !(limits.ruin_drawdown > 0.0 && limits.ruin_drawdown < 1.0) {
+                    return Err(PlanError(format!(
+                        "limits.ruin_drawdown must be above 0 and below 1, got {}: ruin is a fall                          from the peak of less than the whole account",
+                        limits.ruin_drawdown
+                    )));
+                }
                 finite(
                     "limits.min_return_without_best_trade",
                     limits.min_return_without_best_trade,
@@ -500,6 +505,11 @@ pub struct OosIntegrityInputs {
     /// I5: the lowest equity inside any bar, over the starting cash. Zero is a bankrupt account:
     /// a liquidation leaves the account at exactly zero.
     pub lowest_equity: Option<f64>,
+    /// Whether the stitched out-of-sample curve exists. A curve can exist without the equity
+    /// ranges inside its bars that I5 reads (a test run that kept none), and the lines then say
+    /// so instead of blaming the sample.
+    #[serde(default)]
+    pub curve: bool,
 }
 
 /// Judges I1 to I3: one line each, and any line that fails makes the verdict `invalid`.
@@ -551,24 +561,31 @@ pub fn evaluate_integrity(x: &IntegrityInputs) -> Vec<Criterion> {
 ///   from the price moving against a position after its entry (a short in a rally), not from a
 ///   broken run.
 ///
-/// A value that could not be measured (no out-of-sample curve, or one too short for a Sharpe
-/// ratio) warns with a note instead of failing: the sample lines of the evidence layer already
-/// make that verdict `not_enough_evidence`, and the data behind it passed I1 to I3.
+/// A value that could not be measured warns with a note instead of failing. With no
+/// out-of-sample curve, or one too short for a Sharpe ratio, the sample lines of the evidence
+/// layer already make that verdict `not_enough_evidence`, and the data behind it passed I1 to
+/// I3. A curve without equity ranges inside its bars leaves I5 unchecked, and its lines say that.
 pub fn evaluate_oos_integrity(x: &OosIntegrityInputs, max_leverage: f64) -> Vec<Criterion> {
-    let unmeasured = |c: Criterion, what: &str| {
+    let unmeasured = |c: Criterion, note: &str| {
         if c.value.is_none() {
             Criterion {
                 outcome: Outcome::Warn,
                 ..c
             }
-            .with_note(format!(
-                "Not measured: {what}. The sample is too small for a verdict either way."
-            ))
+            .with_note(note.to_string())
         } else {
             c
         }
     };
-    let no_curve = "there is no out-of-sample curve";
+    let small = |what: &str| {
+        format!("Not measured: {what}. The sample is too small for a verdict either way.")
+    };
+    let inside_bars = if x.curve {
+        "Not measured: the out-of-sample curve has no equity ranges inside its bars, which this          check reads."
+            .to_string()
+    } else {
+        small("there is no out-of-sample curve")
+    };
     vec![
         unmeasured(
             Criterion::new(
@@ -581,7 +598,7 @@ pub fn evaluate_oos_integrity(x: &OosIntegrityInputs, max_leverage: f64) -> Vec<
                 Unit::Ratio,
             )
             .warning_on_fail(),
-            "the out-of-sample curve is missing or too short for a Sharpe ratio",
+            &small("the out-of-sample curve is missing or too short for a Sharpe ratio"),
         )
         .with_warning_note("Check the strategy before trusting a Sharpe this high."),
         unmeasured(
@@ -594,7 +611,7 @@ pub fn evaluate_oos_integrity(x: &OosIntegrityInputs, max_leverage: f64) -> Vec<
                 0.0,
                 Unit::Percent,
             ),
-            no_curve,
+            &inside_bars,
         ),
         unmeasured(
             Criterion::new(
@@ -607,7 +624,7 @@ pub fn evaluate_oos_integrity(x: &OosIntegrityInputs, max_leverage: f64) -> Vec<
                 Unit::Ratio,
             )
             .warning_on_fail(),
-            no_curve,
+            &inside_bars,
         )
         .with_warning_note(
             "Leverage rose above the plan's cap inside a bar, from the price moving against an \
@@ -645,7 +662,7 @@ pub struct KindInputs {
     /// The bootstrap's lower bound on the expectancy.
     pub expectancy_lower_bound: Option<f64>,
     pub profit_factor: Option<f64>,
-    /// The chance of a drawdown of the rule's `ruin_drawdown`.
+    /// The chance of a drawdown of the rule's `ruin_drawdown` from the running peak.
     pub risk_of_ruin: Option<f64>,
     /// The total return with the single best trade removed.
     pub return_without_best_trade: Option<f64>,
@@ -1484,6 +1501,27 @@ mod tests {
         }
     }
 
+    /// Ruin is a fall from the peak of less than the whole account: a drawdown of 1 can never be
+    /// simulated, so it would leave the risk-of-ruin line unmeasured and failing.
+    #[test]
+    fn a_ruin_drawdown_of_the_whole_account_is_refused() {
+        let rule = |ruin_drawdown| VerdictRule::HighRisk {
+            limits: HighRiskLimits {
+                ruin_drawdown,
+                ..HighRiskLimits::default()
+            },
+        };
+        assert_eq!(rule(0.5).validate(), Ok(()));
+        assert_eq!(rule(0.99).validate(), Ok(()));
+        for bad in [1.0, 1.5, 0.0, f64::NAN] {
+            let err = rule(bad).validate().unwrap_err();
+            assert!(
+                err.0.contains("ruin_drawdown must be above 0 and below 1"),
+                "{bad}: {err}"
+            );
+        }
+    }
+
     #[test]
     fn rules_serialize_with_their_kind() {
         let rule = portfolio(PortfolioBenchmark::BuyAndHold);
@@ -2014,6 +2052,7 @@ mod tests {
             sharpe: Some(2.0),
             peak_leverage: Some(1.0),
             lowest_equity: Some(0.8),
+            curve: true,
         };
         assert!(not_passing(&evaluate_oos_integrity(&calm, 1.0)).is_empty());
         // A Sharpe above the limit and leverage above the cap warn; a bankrupt curve fails.
@@ -2021,6 +2060,7 @@ mod tests {
             sharpe: Some(TOO_GOOD_SHARPE + 0.1),
             peak_leverage: Some(1.2),
             lowest_equity: Some(0.0),
+            curve: true,
         };
         let lines = evaluate_oos_integrity(&wild, 1.0);
         assert_eq!(
@@ -2044,5 +2084,24 @@ mod tests {
                 .iter()
                 .all(|l| l.outcome == Outcome::Warn && l.note.is_some())
         );
+        let note = |lines: &[Criterion], id: &str| {
+            let l = lines.iter().find(|l| l.id == id).unwrap();
+            assert_eq!(l.outcome, Outcome::Warn, "{id}");
+            l.note.clone().unwrap()
+        };
+        assert!(note(&lines, "lowest_equity").contains("no out-of-sample curve"));
+        // A curve with no ranges inside its bars: the lines read on those ranges say so, not
+        // that the sample is too small.
+        let no_ranges = OosIntegrityInputs {
+            sharpe: Some(1.0),
+            curve: true,
+            ..OosIntegrityInputs::default()
+        };
+        let lines = evaluate_oos_integrity(&no_ranges, 1.0);
+        for id in ["lowest_equity", "peak_leverage"] {
+            let n = note(&lines, id);
+            assert!(n.contains("no equity ranges inside its bars"), "{id}: {n}");
+            assert!(!n.contains("too small"), "{id}: {n}");
+        }
     }
 }
