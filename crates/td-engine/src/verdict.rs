@@ -2,11 +2,15 @@
 //!
 //! A verdict is read in three layers, and a later layer only counts when the earlier ones pass:
 //!
-//! 1. **Integrity**: any line that does not pass makes the verdict `invalid`.
+//! 1. **Integrity**: any line that neither passes nor warns makes the verdict `invalid`. A
+//!    warning (I4, too good to be true) stays on the verdict for the user to acknowledge.
 //! 2. **Evidence**, the same for every strategy ([`evaluate_evidence`]): a sample below the
-//!    minimum, or a luck-test p between the pass and inconclusive thresholds, gives
-//!    `not_enough_evidence`; any other failure gives `no_trade`.
+//!    minimum gives `not_enough_evidence`, any failure `no_trade`, and a luck-test p between the
+//!    pass and inconclusive thresholds `not_enough_evidence`, in that order.
 //! 3. **Kind**, the strategy's own [`VerdictRule`] ([`evaluate`]): any failure gives `no_trade`.
+//!
+//! A sample too small to judge outranks every failure, in either layer; [`combine`] gives the
+//! exact order.
 //!
 //! Every criterion is one [`Criterion`] line with its value, its limit and its outcome, so the GUI
 //! can write "Max drawdown 4.1% against a 6% limit". The battery computes the inputs
@@ -333,9 +337,13 @@ pub enum Unit {
 #[serde(rename_all = "snake_case")]
 pub enum Outcome {
     Pass,
+    /// Passes, with a warning the user must acknowledge before trusting the verdict, such as I4's
+    /// "too good to be true". It never changes the verdict's state; the line stays on the verdict,
+    /// with its `note`, for the GUI to show.
+    Warn,
     Fail,
-    /// Not enough evidence to judge: a sample below the minimum, or a luck-test p between the
-    /// thresholds or not computed.
+    /// Not enough evidence to judge: a sample below the minimum, a luck-test p between the
+    /// thresholds or not computed, or a line with no limit to judge against.
     Inconclusive,
 }
 
@@ -351,9 +359,14 @@ pub struct Criterion {
     /// `None` when the battery could not compute it; the criterion then does not pass.
     pub value: Option<f64>,
     pub comparison: Comparison,
-    pub limit: f64,
+    /// `None` when there is no limit to hold the value against, such as a drawdown against a
+    /// benchmark whose drawdown is missing; the line is then inconclusive and `note` says why.
+    pub limit: Option<f64>,
     pub unit: Unit,
     pub outcome: Outcome,
+    /// Why the line warns or is inconclusive, in words the GUI shows. `None` when the value and
+    /// the limit say it all.
+    pub note: Option<String>,
 }
 
 impl Criterion {
@@ -378,20 +391,69 @@ impl Criterion {
             name: name.into(),
             value,
             comparison,
-            limit,
+            limit: Some(limit),
             unit,
             outcome,
+            note: None,
         }
     }
 
+    /// A line with no limit to hold `value` against: inconclusive, with `note` saying why.
+    pub fn without_limit(
+        layer: Layer,
+        id: &str,
+        name: impl Into<String>,
+        value: Option<f64>,
+        comparison: Comparison,
+        unit: Unit,
+        note: impl Into<String>,
+    ) -> Criterion {
+        Criterion {
+            layer,
+            id: id.to_string(),
+            name: name.into(),
+            value,
+            comparison,
+            limit: None,
+            unit,
+            outcome: Outcome::Inconclusive,
+            note: Some(note.into()),
+        }
+    }
+
+    /// The same line with `note`.
+    pub fn with_note(mut self, note: impl Into<String>) -> Criterion {
+        self.note = Some(note.into());
+        self
+    }
+
     /// The same line, inconclusive instead of failed.
-    fn inconclusive_on_fail(mut self) -> Criterion {
+    pub fn inconclusive_on_fail(mut self) -> Criterion {
         if self.outcome == Outcome::Fail {
             self.outcome = Outcome::Inconclusive;
         }
         self
     }
+
+    /// The same line, a warning instead of failed: for an integrity check the user acknowledges
+    /// rather than one that makes the verdict `invalid`, such as I4.
+    pub fn warning_on_fail(mut self) -> Criterion {
+        if self.outcome == Outcome::Fail {
+            self.outcome = Outcome::Warn;
+        }
+        self
+    }
 }
+
+/// The lines that measure the sample's size, by layer and id: R2's three, and a kind's own
+/// minimum trade count. Below its minimum such a line is inconclusive, and [`combine`] reads it
+/// before any failure.
+const SAMPLE_LINES: [(Layer, &str); 4] = [
+    (Layer::Evidence, "oos_trades"),
+    (Layer::Evidence, "oos_days"),
+    (Layer::Evidence, "windows"),
+    (Layer::Kind, "trades"),
+];
 
 // ---------------------------------------------------------------------------------------------
 // Kind rules
@@ -510,21 +572,32 @@ pub fn evaluate(rule: &VerdictRule, x: &KindInputs) -> Vec<Criterion> {
                 ),
             ];
             if *benchmark == PortfolioBenchmark::BuyAndHold {
-                // The limit is the benchmark's drawdown scaled by the share, so the line reads as
-                // a drawdown against a drawdown. Without the benchmark's drawdown the line cannot
-                // be judged: no value, so it fails, and a limit of 0 since it has none.
-                let (value, limit) = match x.benchmark_max_drawdown {
-                    Some(d) => (x.max_drawdown, limits.max_drawdown_vs_benchmark * d),
-                    None => (None, 0.0),
-                };
-                lines.push(line(
+                let (id, name) = (
                     "drawdown_vs_benchmark",
                     "Max drawdown against the benchmark's",
-                    value,
-                    AtMost,
-                    limit,
-                    Unit::Percent,
-                ));
+                );
+                lines.push(match x.benchmark_max_drawdown {
+                    // The limit is the benchmark's drawdown scaled by the share, so the line
+                    // reads as a drawdown against a drawdown.
+                    Some(d) => line(
+                        id,
+                        name,
+                        x.max_drawdown,
+                        AtMost,
+                        limits.max_drawdown_vs_benchmark * d,
+                        Unit::Percent,
+                    ),
+                    None => Criterion::without_limit(
+                        Layer::Kind,
+                        id,
+                        name,
+                        x.max_drawdown,
+                        AtMost,
+                        Unit::Percent,
+                        "The benchmark's drawdown could not be computed, so there is no limit to \
+                         hold the drawdown against.",
+                    ),
+                });
             }
             lines.push(line(
                 "alpha",
@@ -545,6 +618,8 @@ pub fn evaluate(rule: &VerdictRule, x: &KindInputs) -> Vec<Criterion> {
             lines
         }
         VerdictRule::HighRisk { limits } => vec![
+            // A trade count is the sample's size: too few trades is not enough evidence, not a
+            // failure.
             line(
                 "trades",
                 "Trades",
@@ -552,7 +627,8 @@ pub fn evaluate(rule: &VerdictRule, x: &KindInputs) -> Vec<Criterion> {
                 AtLeast,
                 f64::from(limits.min_trades),
                 Unit::Count,
-            ),
+            )
+            .inconclusive_on_fail(),
             line(
                 "expectancy",
                 "Expectancy per trade",
@@ -610,7 +686,9 @@ pub struct EvidenceInputs {
     pub profitable_windows: Option<f64>,
     /// R2: closed out-of-sample trades.
     pub oos_trades: usize,
-    /// R2: days covered by the stitched out-of-sample curve.
+    /// R2: days of bars covered by the stitched out-of-sample curve, as in
+    /// [`MinSample`](crate::MinSample): 24 hours of the market's open bars, so the days it is
+    /// closed do not count. On data with no gaps this is the windows times `test_days`.
     pub oos_days: f64,
     /// R2: walk-forward windows.
     pub windows: usize,
@@ -742,31 +820,59 @@ pub enum VerdictState {
     Invalid,
 }
 
-/// Combines the lines of the three layers into a state, reading a layer only when the earlier
-/// ones pass: integrity, then evidence (inconclusive before failed), then kind. A layer that is
-/// reached but has no lines makes the verdict `invalid`, since nothing checked it; so a battery
-/// that stops early need not fill the later layers.
+/// Combines the lines of the three layers into a state. The first rule that applies decides:
+///
+/// 1. `invalid` if the integrity layer has no lines, or a line that neither passes nor warns.
+/// 2. `invalid` if the evidence layer has no lines.
+/// 3. `not_enough_evidence` if a sample line is inconclusive: R2's trades, days or windows, or a
+///    kind's own minimum trade count (high_risk's 50 trades). A sample too small to confirm an
+///    edge cannot confirm a failure either, so it outranks every failure, in either layer.
+/// 4. `no_trade` if an evidence line fails.
+/// 5. `not_enough_evidence` if an evidence line is inconclusive: the luck test, with p between
+///    its thresholds or not computed. A clear failure outranks it, since no p could rescue the
+///    strategy.
+/// 6. `invalid` if the kind layer has no lines.
+/// 7. `no_trade` if a kind line fails.
+/// 8. `not_enough_evidence` if a kind line is inconclusive, such as a drawdown against a
+///    benchmark whose drawdown is missing.
+/// 9. `trade`.
+///
+/// A warning ([`Outcome::Warn`]) never changes the state. A layer that is reached but has no
+/// lines is `invalid`, since nothing checked it, so a battery that stops early need not fill the
+/// later layers; it should still fill the kind layer once it has the out-of-sample curve, since
+/// rule 3 reads a kind's trade count.
 pub fn combine(criteria: &[Criterion]) -> VerdictState {
+    use Layer::{Evidence, Integrity, Kind};
+    use Outcome::{Fail, Inconclusive, Pass, Warn};
     let layer = |l: Layer| criteria.iter().filter(move |c| c.layer == l);
-    let all_pass = |l: Layer| layer(l).all(|c| c.outcome == Outcome::Pass);
+    let any = |l: Layer, o: Outcome| layer(l).any(|c| c.outcome == o);
     let empty = |l: Layer| layer(l).next().is_none();
-    if empty(Layer::Integrity) || !all_pass(Layer::Integrity) {
+    let short_sample = |c: &Criterion| {
+        c.outcome == Inconclusive && SAMPLE_LINES.contains(&(c.layer, c.id.as_str()))
+    };
+    if empty(Integrity) || layer(Integrity).any(|c| !matches!(c.outcome, Pass | Warn)) {
         return VerdictState::Invalid;
     }
-    if empty(Layer::Evidence) {
+    if empty(Evidence) {
         return VerdictState::Invalid;
     }
-    if layer(Layer::Evidence).any(|c| c.outcome == Outcome::Inconclusive) {
+    if criteria.iter().any(short_sample) {
         return VerdictState::NotEnoughEvidence;
     }
-    if !all_pass(Layer::Evidence) {
+    if any(Evidence, Fail) {
         return VerdictState::NoTrade;
     }
-    if empty(Layer::Kind) {
+    if any(Evidence, Inconclusive) {
+        return VerdictState::NotEnoughEvidence;
+    }
+    if empty(Kind) {
         return VerdictState::Invalid;
     }
-    if !all_pass(Layer::Kind) {
+    if any(Kind, Fail) {
         return VerdictState::NoTrade;
+    }
+    if any(Kind, Inconclusive) {
+        return VerdictState::NotEnoughEvidence;
     }
     VerdictState::Trade
 }
@@ -850,21 +956,22 @@ mod tests {
         let dd = &lines[1];
         assert_eq!(
             (dd.name.as_str(), dd.value, dd.limit),
-            ("Max drawdown", Some(0.10), 0.30)
+            ("Max drawdown", Some(0.10), Some(0.30))
         );
         assert_eq!(
             (dd.comparison, dd.unit),
             (Comparison::AtMost, Unit::Percent)
         );
         // The benchmark line's limit is 75% of the benchmark's drawdown.
-        assert_eq!(lines[2].limit, 0.1875);
+        assert_eq!(lines[2].limit, Some(0.1875));
+        assert!(lines.iter().all(|c| c.note.is_none()));
     }
 
     #[test]
     fn portfolio_fails_on_each_criterion() {
         type Tweak = fn(&mut KindInputs);
         let rule = portfolio(PortfolioBenchmark::BuyAndHold);
-        let cases: [(&str, Tweak); 7] = [
+        let cases: [(&str, Tweak); 6] = [
             ("sharpe", |x| x.sharpe = Some(0.99)),
             ("sharpe", |x| x.sharpe = None),
             ("max_drawdown", |x| {
@@ -873,7 +980,6 @@ mod tests {
                 x.max_drawdown = Some(0.35);
             }),
             ("drawdown_vs_benchmark", |x| x.max_drawdown = Some(0.19)),
-            ("drawdown_vs_benchmark", |x| x.benchmark_max_drawdown = None),
             ("alpha", |x| x.alpha = Some(-0.01)),
             ("p_mean_not_positive", |x| {
                 x.p_mean_not_positive = Some(0.11);
@@ -913,6 +1019,32 @@ mod tests {
         assert_eq!(not_passing(&evaluate(&rule, &at_30)), []);
     }
 
+    /// Without the benchmark's drawdown there is no limit to judge against: the line is
+    /// inconclusive, shows the strategy's own drawdown with no limit, and says why.
+    #[test]
+    fn a_missing_benchmark_drawdown_is_inconclusive_with_no_limit() {
+        let x = KindInputs {
+            benchmark_max_drawdown: None,
+            ..good_portfolio()
+        };
+        let lines = evaluate(&portfolio(PortfolioBenchmark::BuyAndHold), &x);
+        assert_eq!(
+            not_passing(&lines),
+            [("drawdown_vs_benchmark", Outcome::Inconclusive)]
+        );
+        let line = &lines[2];
+        assert_eq!((line.value, line.limit), (Some(0.10), None));
+        assert!(
+            line.note
+                .as_deref()
+                .is_some_and(|n| n.contains("benchmark's drawdown could not be computed")),
+            "{line:?}"
+        );
+        let json = serde_json::to_value(line).unwrap();
+        assert_eq!(json["limit"], serde_json::Value::Null);
+        assert_eq!(json["outcome"], "inconclusive");
+    }
+
     #[test]
     fn a_cash_benchmark_has_no_drawdown_comparison() {
         let x = KindInputs {
@@ -939,7 +1071,7 @@ mod tests {
         };
         let lines = evaluate(&rule, &good_portfolio());
         assert_eq!(not_passing(&lines), [("sharpe", Outcome::Fail)]);
-        assert_eq!(lines[0].limit, 2.0);
+        assert_eq!(lines[0].limit, Some(2.0));
     }
 
     // Prop firm
@@ -981,7 +1113,7 @@ mod tests {
         );
         assert_eq!(not_passing(&lines), []);
         // Half the firm's limits.
-        assert_eq!((lines[0].limit, lines[1].limit), (0.025, 0.05));
+        assert_eq!((lines[0].limit, lines[1].limit), (Some(0.025), Some(0.05)));
         assert_eq!(lines[1].value, Some(0.03));
         assert_eq!(lines[1].name, "Max drawdown from the starting balance");
         assert_eq!(lines[3].name, "Chance of breaching a limit within 90 days");
@@ -1079,31 +1211,34 @@ mod tests {
             ]
         );
         assert_eq!(not_passing(&lines), []);
-        assert_eq!((lines[0].value, lines[0].limit), (Some(80.0), 50.0));
+        assert_eq!((lines[0].value, lines[0].limit), (Some(80.0), Some(50.0)));
     }
 
+    /// Each criterion fails on its own, except the trade count: too few trades is a sample too
+    /// small to judge, so that line is inconclusive.
     #[test]
     fn high_risk_fails_on_each_criterion() {
+        use Outcome::{Fail, Inconclusive};
         type Tweak = fn(&mut KindInputs);
-        let cases: [(&str, Tweak); 7] = [
-            ("trades", |x| x.trades = 49),
-            ("expectancy", |x| x.expectancy = Some(-0.5)),
-            ("expectancy_lower_bound", |x| {
+        let cases: [(&str, Outcome, Tweak); 7] = [
+            ("trades", Inconclusive, |x| x.trades = 49),
+            ("expectancy", Fail, |x| x.expectancy = Some(-0.5)),
+            ("expectancy_lower_bound", Fail, |x| {
                 x.expectancy_lower_bound = Some(-3.0);
             }),
-            ("profit_factor", |x| x.profit_factor = Some(1.29)),
-            ("profit_factor", |x| x.profit_factor = None),
-            ("risk_of_ruin", |x| x.risk_of_ruin = Some(0.051)),
-            ("return_without_best_trade", |x| {
+            ("profit_factor", Fail, |x| x.profit_factor = Some(1.29)),
+            ("profit_factor", Fail, |x| x.profit_factor = None),
+            ("risk_of_ruin", Fail, |x| x.risk_of_ruin = Some(0.051)),
+            ("return_without_best_trade", Fail, |x| {
                 x.return_without_best_trade = Some(-0.01);
             }),
         ];
-        for (id, tweak) in cases {
+        for (id, outcome, tweak) in cases {
             let mut x = good_high_risk();
             tweak(&mut x);
             assert_eq!(
                 not_passing(&evaluate(&high_risk(), &x)),
-                [(id, Outcome::Fail)],
+                [(id, outcome)],
                 "{id}"
             );
         }
@@ -1298,9 +1433,13 @@ mod tests {
     // Combining the layers
 
     fn line(layer: Layer, outcome: Outcome) -> Criterion {
+        line_id(layer, "x", outcome)
+    }
+
+    fn line_id(layer: Layer, id: &str, outcome: Outcome) -> Criterion {
         let mut c = Criterion::new(
             layer,
-            "x",
+            id,
             "X",
             Some(1.0),
             Comparison::AtLeast,
@@ -1317,7 +1456,7 @@ mod tests {
         use Outcome::{Fail, Inconclusive, Pass};
         use VerdictState::{Invalid, NoTrade, NotEnoughEvidence, Trade};
         type Case = (&'static str, Vec<(Layer, Outcome)>, VerdictState);
-        let cases: [Case; 13] = [
+        let cases: [Case; 12] = [
             (
                 "all pass",
                 vec![(Integrity, Pass), (Evidence, Pass), (Kind, Pass)],
@@ -1355,16 +1494,6 @@ mod tests {
                     (Evidence, Pass),
                     (Evidence, Inconclusive),
                     (Kind, Pass),
-                ],
-                NotEnoughEvidence,
-            ),
-            (
-                "evidence inconclusive beats evidence and kind failures",
-                vec![
-                    (Integrity, Pass),
-                    (Evidence, Fail),
-                    (Evidence, Inconclusive),
-                    (Kind, Fail),
                 ],
                 NotEnoughEvidence,
             ),
@@ -1409,6 +1538,179 @@ mod tests {
             assert_eq!(combine(&criteria), want, "{name}");
         }
         assert_eq!(combine(&[]), Invalid);
+    }
+
+    /// One case per step of `combine`'s order, each with the next step's condition also present,
+    /// so a case only passes when its step comes first.
+    #[test]
+    fn combine_reads_its_rules_in_order() {
+        use Layer::{Evidence, Integrity, Kind};
+        use Outcome::{Fail, Inconclusive, Pass, Warn};
+        use VerdictState::{Invalid, NoTrade, NotEnoughEvidence, Trade};
+        type Case = (
+            &'static str,
+            Vec<(Layer, &'static str, Outcome)>,
+            VerdictState,
+        );
+        let cases: [Case; 12] = [
+            (
+                "1. integrity fails before a short sample",
+                vec![
+                    (Integrity, "x", Fail),
+                    (Evidence, "oos_trades", Inconclusive),
+                ],
+                Invalid,
+            ),
+            (
+                "3. a short R2 sample before an evidence failure",
+                vec![
+                    (Integrity, "x", Pass),
+                    (Evidence, "oos_return", Fail),
+                    (Evidence, "oos_days", Inconclusive),
+                    (Kind, "x", Pass),
+                ],
+                NotEnoughEvidence,
+            ),
+            (
+                "3. a short R2 window count before an evidence failure",
+                vec![
+                    (Integrity, "x", Pass),
+                    (Evidence, "windows", Inconclusive),
+                    (Evidence, "oos_return", Fail),
+                ],
+                NotEnoughEvidence,
+            ),
+            (
+                "3. a kind's short trade count before an evidence failure",
+                vec![
+                    (Integrity, "x", Pass),
+                    (Evidence, "oos_return", Fail),
+                    (Kind, "trades", Inconclusive),
+                ],
+                NotEnoughEvidence,
+            ),
+            (
+                "4. an evidence failure before an inconclusive luck test",
+                vec![
+                    (Integrity, "x", Pass),
+                    (Evidence, "oos_return", Fail),
+                    (Evidence, "luck_p", Inconclusive),
+                    (Kind, "x", Pass),
+                ],
+                NoTrade,
+            ),
+            (
+                "5. an inconclusive luck test before a kind failure",
+                vec![
+                    (Integrity, "x", Pass),
+                    (Evidence, "luck_p", Inconclusive),
+                    (Kind, "profit_factor", Fail),
+                ],
+                NotEnoughEvidence,
+            ),
+            (
+                "5. an inconclusive luck test before missing kind lines",
+                vec![(Integrity, "x", Pass), (Evidence, "luck_p", Inconclusive)],
+                NotEnoughEvidence,
+            ),
+            (
+                "6. missing kind lines",
+                vec![(Integrity, "x", Pass), (Evidence, "x", Pass)],
+                Invalid,
+            ),
+            (
+                "7. a kind failure before an inconclusive kind line",
+                vec![
+                    (Integrity, "x", Pass),
+                    (Evidence, "x", Pass),
+                    (Kind, "drawdown_vs_benchmark", Inconclusive),
+                    (Kind, "alpha", Fail),
+                ],
+                NoTrade,
+            ),
+            (
+                "8. an inconclusive kind line that is not a sample",
+                vec![
+                    (Integrity, "x", Pass),
+                    (Evidence, "x", Pass),
+                    (Kind, "drawdown_vs_benchmark", Inconclusive),
+                ],
+                NotEnoughEvidence,
+            ),
+            (
+                "9. a warning does not change a trade",
+                vec![
+                    (Integrity, "x", Pass),
+                    (Integrity, "too_good", Warn),
+                    (Evidence, "x", Pass),
+                    (Kind, "x", Pass),
+                ],
+                Trade,
+            ),
+            (
+                "1. integrity with only a warning still counts as checked",
+                vec![
+                    (Integrity, "too_good", Warn),
+                    (Evidence, "oos_return", Fail),
+                ],
+                NoTrade,
+            ),
+        ];
+        for (name, lines, want) in cases {
+            let criteria: Vec<Criterion> =
+                lines.iter().map(|&(l, id, o)| line_id(l, id, o)).collect();
+            assert_eq!(combine(&criteria), want, "{name}");
+        }
+    }
+
+    /// An I4-style check warns instead of failing: the line keeps its outcome and note on the
+    /// verdict, and the state is what the other lines make it.
+    #[test]
+    fn a_warning_stays_on_the_verdict_without_changing_its_state() {
+        let too_good = Criterion::new(
+            Layer::Integrity,
+            "too_good_to_be_true",
+            "Out-of-sample Sharpe",
+            Some(5.2),
+            Comparison::AtMost,
+            4.0,
+            Unit::Ratio,
+        )
+        .warning_on_fail()
+        .with_note("Check the strategy before trusting a Sharpe this high.");
+        assert_eq!(too_good.outcome, Outcome::Warn);
+        let mut criteria = vec![too_good];
+        criteria.extend(evaluate_evidence(
+            &EvidenceSettings::default(),
+            &good_evidence(),
+        ));
+        criteria.extend(evaluate(&high_risk(), &good_high_risk()));
+        let id = InstrumentId {
+            venue: Venue::Binance,
+            symbol: "BTCUSDT".into(),
+            kind: InstrumentKind::Spot,
+        };
+        let v = Verdict::new(id, criteria);
+        assert_eq!(v.state, VerdictState::Trade);
+        assert_eq!(v.criteria[0].outcome, Outcome::Warn);
+        let json = serde_json::to_value(&v.criteria[0]).unwrap();
+        assert_eq!(json["outcome"], "warn");
+        assert_eq!(
+            json["note"],
+            "Check the strategy before trusting a Sharpe this high."
+        );
+        // A passing check does not warn.
+        let calm = Criterion::new(
+            Layer::Integrity,
+            "too_good_to_be_true",
+            "Out-of-sample Sharpe",
+            Some(2.0),
+            Comparison::AtMost,
+            4.0,
+            Unit::Ratio,
+        )
+        .warning_on_fail();
+        assert_eq!(calm.outcome, Outcome::Pass);
     }
 
     /// The evaluators' own lines combine as #35 says: a sample below the minimum and a luck p
@@ -1470,5 +1772,46 @@ mod tests {
             ..good_high_risk()
         };
         assert_eq!(verdict(good_evidence(), weak).state, VerdictState::NoTrade);
+
+        // A clear evidence failure outranks an inconclusive luck test: the sample is big enough,
+        // the out-of-sample return is -12% with a quarter of the windows profitable, and the
+        // stressed return is negative, so no p could rescue it.
+        for luck_p in [Some(0.07), None] {
+            let losing = EvidenceInputs {
+                oos_return: Some(-0.12),
+                profitable_windows: Some(0.25),
+                stressed_return: Some(-0.2),
+                luck_p,
+                ..good_evidence()
+            };
+            assert_eq!(
+                verdict(losing, good_high_risk()).state,
+                VerdictState::NoTrade,
+                "luck_p {luck_p:?}"
+            );
+        }
+        // A high-risk strategy with 40 out-of-sample trades clears R2's 30 but not its kind's 50:
+        // not enough evidence, even when the evidence layer also fails.
+        let forty = |e: EvidenceInputs| {
+            verdict(
+                EvidenceInputs {
+                    oos_trades: 40,
+                    ..e
+                },
+                KindInputs {
+                    trades: 40,
+                    ..good_high_risk()
+                },
+            )
+        };
+        assert_eq!(
+            forty(good_evidence()).state,
+            VerdictState::NotEnoughEvidence
+        );
+        let losing = EvidenceInputs {
+            oos_return: Some(-0.12),
+            ..good_evidence()
+        };
+        assert_eq!(forty(losing).state, VerdictState::NotEnoughEvidence);
     }
 }

@@ -743,13 +743,28 @@ export type BacktestSettings = {
  */
 starting_cash: number, 
 /**
- * Slippage on market and stop fills, in basis points of price.
- */
-slippage_bps: number, 
-/**
  * The perpetual leverage cap, as in [`BacktestConfig::max_leverage`]; 1.0 is 1x.
  */
-max_leverage: number, };
+max_leverage: number, 
+/**
+ * Slippage set for some of the plan's instruments. An instrument not listed here uses the
+ * backtest config's default slippage for that instrument (#35: 2 bps on BTC and ETH, 5 bps
+ * on other large caps); an empty list uses the default everywhere.
+ */
+slippage: Array<SlippageOverride>, };
+
+/**
+ * One instrument's slippage, overriding the backtest config's default for it.
+ */
+export type SlippageOverride = { 
+/**
+ * One of the plan's instruments.
+ */
+instrument: InstrumentId, 
+/**
+ * Slippage on market and stop fills, in basis points of price.
+ */
+bps: number, };
 
 /**
  * The parameter grid. It always runs as a full grid, because the plateau test (R5) reads each
@@ -789,6 +804,11 @@ start_offsets: number, };
 
 /**
  * R2: below any of these, the verdict is `not_enough_evidence`.
+ *
+ * A day here is a day of bars, as in [`WalkForwardPlan`]: 24 hours of the market's open bars,
+ * so the days a market is closed (an FX pair's weekends) do not count. It is the unit the
+ * walk-forward windows are laid in, so a run's out-of-sample days are its windows times
+ * `test_days`.
  */
 export type MinSample = { 
 /**
@@ -796,7 +816,7 @@ export type MinSample = {
  */
 trades: number, 
 /**
- * Days covered by the stitched out-of-sample curve.
+ * Days of bars covered by the stitched out-of-sample curve, as defined above.
  */
 days: number, 
 /**
@@ -941,7 +961,7 @@ export type Comparison = "at_least" | "above" | "at_most";
  */
 export type Unit = "percent" | "ratio" | "count" | "days" | "quote";
 
-export type Outcome = "pass" | "fail" | "inconclusive";
+export type Outcome = "pass" | "warn" | "fail" | "inconclusive";
 
 /**
  * One criterion of a verdict.
@@ -958,7 +978,17 @@ name: string,
 /**
  * `None` when the battery could not compute it; the criterion then does not pass.
  */
-value: number | null, comparison: Comparison, limit: number, unit: Unit, outcome: Outcome, };
+value: number | null, comparison: Comparison, 
+/**
+ * `None` when there is no limit to hold the value against, such as a drawdown against a
+ * benchmark whose drawdown is missing; the line is then inconclusive and `note` says why.
+ */
+limit: number | null, unit: Unit, outcome: Outcome, 
+/**
+ * Why the line warns or is inconclusive, in words the GUI shows. `None` when the value and
+ * the limit say it all.
+ */
+note: string | null, };
 
 export type VerdictState = "trade" | "no_trade" | "not_enough_evidence" | "invalid";
 

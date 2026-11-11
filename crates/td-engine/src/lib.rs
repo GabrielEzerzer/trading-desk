@@ -47,7 +47,8 @@ pub use metrics::MetricsReport;
 pub use params::{ParamKind, ParamSpec, ParamValue, Params};
 pub use plan::{
     BacktestSettings, EvidenceSettings, LuckTest, MIN_PERMUTATIONS, MIN_PROFITABLE_WINDOWS,
-    MinSample, Period, PlanError, Plateau, SweepPlan, TestPlan, WalkForwardPlan, date,
+    MinSample, Period, PlanError, Plateau, SlippageOverride, SweepPlan, TestPlan, WalkForwardPlan,
+    date,
 };
 pub use portfolio::Portfolio;
 pub use registry::{StrategyEntry, build_strategy, find_strategy, strategies};

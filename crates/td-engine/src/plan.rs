@@ -71,15 +71,39 @@ pub struct Period {
 
 /// What every run of the plan shares.
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BacktestSettings {
     /// Starting balance in the quote asset.
     pub starting_cash: f64,
-    /// Slippage on market and stop fills, in basis points of price.
-    pub slippage_bps: f64,
     /// The perpetual leverage cap, as in [`BacktestConfig::max_leverage`]; 1.0 is 1x.
     pub max_leverage: f64,
+    /// Slippage set for some of the plan's instruments. An instrument not listed here uses the
+    /// backtest config's default slippage for that instrument (#35: 2 bps on BTC and ETH, 5 bps
+    /// on other large caps); an empty list uses the default everywhere.
+    pub slippage: Vec<SlippageOverride>,
+}
+
+/// One instrument's slippage, overriding the backtest config's default for it.
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SlippageOverride {
+    /// One of the plan's instruments.
+    pub instrument: InstrumentId,
+    /// Slippage on market and stop fills, in basis points of price.
+    pub bps: f64,
+}
+
+impl BacktestSettings {
+    /// The slippage the plan sets for `instrument`, or `None` when it leaves it to the backtest
+    /// config's default.
+    pub fn slippage_bps(&self, instrument: &InstrumentId) -> Option<f64> {
+        self.slippage
+            .iter()
+            .find(|o| &o.instrument == instrument)
+            .map(|o| o.bps)
+    }
 }
 
 /// The parameter grid. It always runs as a full grid, because the plateau test (R5) reads each
@@ -124,13 +148,18 @@ pub struct EvidenceSettings {
 }
 
 /// R2: below any of these, the verdict is `not_enough_evidence`.
+///
+/// A day here is a day of bars, as in [`WalkForwardPlan`]: 24 hours of the market's open bars,
+/// so the days a market is closed (an FX pair's weekends) do not count. It is the unit the
+/// walk-forward windows are laid in, so a run's out-of-sample days are its windows times
+/// `test_days`.
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MinSample {
     /// Closed out-of-sample trades.
     pub trades: u32,
-    /// Days covered by the stitched out-of-sample curve.
+    /// Days of bars covered by the stitched out-of-sample curve, as defined above.
     pub days: u32,
     /// Walk-forward windows.
     pub windows: u32,
@@ -273,8 +302,22 @@ impl WalkForwardPlan {
 
 impl TestPlan {
     /// The backtest of `strategy` on `instrument` over the plan's period, with the sweep's fixed
-    /// parameters.
-    pub fn backtest_config(&self, strategy: &str, instrument: Instrument) -> BacktestConfig {
+    /// parameters. `default_slippage_bps` is the backtest config's default slippage for
+    /// `instrument`, used when the plan sets none for it.
+    ///
+    /// shortcut: the caller passes the default because it lives with the backtest config, which
+    /// #35 part 1 adds (`runner::default_slippage_bps`) on its own branch; once that merges, call
+    /// it here and drop the argument.
+    pub fn backtest_config(
+        &self,
+        strategy: &str,
+        instrument: Instrument,
+        default_slippage_bps: f64,
+    ) -> BacktestConfig {
+        let slippage_bps = self
+            .backtest
+            .slippage_bps(&instrument.id)
+            .unwrap_or(default_slippage_bps);
         BacktestConfig {
             strategy: strategy.to_string(),
             params: self.sweep.fixed.clone(),
@@ -283,7 +326,7 @@ impl TestPlan {
             from: self.period.from,
             to: self.period.to,
             starting_cash: self.backtest.starting_cash,
-            slippage_bps: self.backtest.slippage_bps,
+            slippage_bps,
             fee_override: None,
             max_leverage: self.backtest.max_leverage,
             warmup_from: None,
@@ -291,10 +334,16 @@ impl TestPlan {
         }
     }
 
-    /// The plan's grid sweep over the whole period.
-    pub fn sweep_spec(&self, strategy: &str, instrument: Instrument) -> SweepSpec {
+    /// The plan's grid sweep over the whole period. `default_slippage_bps` as in
+    /// [`TestPlan::backtest_config`].
+    pub fn sweep_spec(
+        &self,
+        strategy: &str,
+        instrument: Instrument,
+        default_slippage_bps: f64,
+    ) -> SweepSpec {
         SweepSpec {
-            base: self.backtest_config(strategy, instrument),
+            base: self.backtest_config(strategy, instrument, default_slippage_bps),
             axes: self.sweep.axes.clone(),
             mode: SweepMode::Grid,
             objective: self.sweep.objective,
@@ -302,16 +351,26 @@ impl TestPlan {
         }
     }
 
-    pub fn walk_forward_spec(&self, strategy: &str, instrument: Instrument) -> WalkForwardSpec {
+    pub fn walk_forward_spec(
+        &self,
+        strategy: &str,
+        instrument: Instrument,
+        default_slippage_bps: f64,
+    ) -> WalkForwardSpec {
         WalkForwardSpec {
-            sweep: self.sweep_spec(strategy, instrument),
+            sweep: self.sweep_spec(strategy, instrument, default_slippage_bps),
             windows: self.walk_forward.window_spec(self.timeframe),
         }
     }
 
-    pub fn oos_spec(&self, strategy: &str, instrument: Instrument) -> Option<OosSpec> {
+    pub fn oos_spec(
+        &self,
+        strategy: &str,
+        instrument: Instrument,
+        default_slippage_bps: f64,
+    ) -> Option<OosSpec> {
         self.out_of_sample.map(|split| OosSpec {
-            sweep: self.sweep_spec(strategy, instrument),
+            sweep: self.sweep_spec(strategy, instrument, default_slippage_bps),
             split,
         })
     }
@@ -343,8 +402,19 @@ impl TestPlan {
         if !(b.starting_cash > 0.0 && b.starting_cash.is_finite()) {
             return refuse("the starting cash must be a positive number");
         }
-        if !(b.slippage_bps >= 0.0 && b.slippage_bps.is_finite()) {
-            return refuse("the slippage must be zero or more");
+        for (i, o) in b.slippage.iter().enumerate() {
+            let id = &o.instrument;
+            if !self.instruments.contains(id) {
+                return refuse(format!(
+                    "the slippage for {id} names an instrument the plan does not test"
+                ));
+            }
+            if b.slippage[..i].iter().any(|p| &p.instrument == id) {
+                return refuse(format!("the slippage for {id} is set twice"));
+            }
+            if !(o.bps >= 0.0 && o.bps.is_finite()) {
+                return refuse(format!("the slippage for {id} must be zero or more"));
+            }
         }
         if !(b.max_leverage > 0.0 && b.max_leverage.is_finite()) {
             return refuse("the leverage cap must be a positive number");
@@ -375,9 +445,10 @@ impl TestPlan {
                 taker: 0.0,
             },
         };
-        let wf = self.walk_forward_spec(strategy, stand_in.clone());
+        // The slippage does not change these checks, so a stand-in 0 serves.
+        let wf = self.walk_forward_spec(strategy, stand_in.clone(), 0.0);
         wf.check().map_err(|e| PlanError(e.to_string()))?;
-        if let Some(oos) = self.oos_spec(strategy, stand_in) {
+        if let Some(oos) = self.oos_spec(strategy, stand_in, 0.0) {
             if let Split::Fraction(f) = oos.split
                 && !(f > 0.0 && f < 1.0)
             {
@@ -411,7 +482,9 @@ impl TestPlan {
             let oos_days = windows as u64 * u64::from(w.test_days);
             if windows < min.windows as usize || oos_days < u64::from(min.days) {
                 return refuse(format!(
-                    "on {id} the period holds {windows} walk-forward windows and {oos_days} days                      of out-of-sample bars, below the minimum sample of {} windows and {} days:                      lengthen the period or shorten the windows",
+                    "on {id} the period holds {windows} walk-forward windows and {oos_days} days \
+                     of out-of-sample bars, below the minimum sample of {} windows and {} days: \
+                     lengthen the period or shorten the windows",
                     min.windows, min.days
                 ));
             }
@@ -558,22 +631,71 @@ mod tests {
                 taker: 0.001,
             },
         };
-        let wf = plan.walk_forward_spec("sma_cross", inst.clone());
+        let wf = plan.walk_forward_spec("sma_cross", inst.clone(), 2.0);
         assert_eq!(wf.sweep.mode, SweepMode::Grid);
         assert_eq!(wf.sweep.base.from, plan.period.from);
         assert_eq!(wf.sweep.base.starting_cash, 10_000.0);
         assert_eq!(wf.sweep.base.instrument, inst);
         assert_eq!(wf.check(), Ok(()));
         assert_eq!(
-            plan.oos_spec("sma_cross", inst).unwrap().split,
+            plan.oos_spec("sma_cross", inst, 2.0).unwrap().split,
             Split::Fraction(0.7)
         );
+    }
+
+    /// An instrument the plan sets no slippage for takes the backtest config's default; one it
+    /// sets takes the plan's value. JSON naming the old single field is refused.
+    #[test]
+    fn slippage_is_the_backtest_default_unless_the_plan_overrides_it() {
+        let mut plan = example_plan();
+        assert!(plan.backtest.slippage.is_empty());
+        let instrument = |id: &InstrumentId| Instrument {
+            id: id.clone(),
+            base: String::new(),
+            quote: "USDT".into(),
+            tick_size: 0.01,
+            lot_size: 0.00001,
+            min_qty: 0.00001,
+            min_notional: 5.0,
+            fees: FeeSchedule {
+                maker: 0.001,
+                taker: 0.001,
+            },
+        };
+        let (btc, eth) = (plan.instruments[0].clone(), plan.instruments[1].clone());
+        let slip = |plan: &TestPlan, id: &InstrumentId| {
+            plan.backtest_config("sma_cross", instrument(id), 2.0)
+                .slippage_bps
+        };
+        assert_eq!((slip(&plan, &btc), slip(&plan, &eth)), (2.0, 2.0));
+        plan.backtest.slippage = vec![SlippageOverride {
+            instrument: eth.clone(),
+            bps: 7.5,
+        }];
+        assert_eq!(plan.validate("sma_cross"), Ok(()));
+        assert_eq!(plan.backtest.slippage_bps(&btc), None);
+        assert_eq!(plan.backtest.slippage_bps(&eth), Some(7.5));
+        assert_eq!((slip(&plan, &btc), slip(&plan, &eth)), (2.0, 7.5));
+        let wf = plan.walk_forward_spec("sma_cross", instrument(&eth), 2.0);
+        assert_eq!(wf.sweep.base.slippage_bps, 7.5);
+
+        let json = serde_json::to_value(&plan).unwrap();
+        assert_eq!(
+            serde_json::from_value::<TestPlan>(json.clone()).unwrap(),
+            plan
+        );
+        let mut old = json.clone();
+        old["backtest"]["slippage_bps"] = serde_json::json!(2.0);
+        assert!(serde_json::from_value::<TestPlan>(old).is_err());
+        let mut unknown = json;
+        unknown["backtest"]["slippage"][0]["spread"] = serde_json::json!(1.0);
+        assert!(serde_json::from_value::<TestPlan>(unknown).is_err());
     }
 
     #[test]
     fn invalid_plans_are_refused() {
         type Tweak = fn(&mut TestPlan);
-        let cases: [(&str, Tweak); 14] = [
+        let cases: [(&str, Tweak); 16] = [
             ("no instruments", |p| p.instruments.clear()),
             ("an instrument twice", |p| {
                 let first = p.instruments[0].clone();
@@ -584,7 +706,27 @@ mod tests {
                 p.period.from += 60_000;
             }),
             ("no starting cash", |p| p.backtest.starting_cash = 0.0),
-            ("negative slippage", |p| p.backtest.slippage_bps = -1.0),
+            ("negative slippage", |p| {
+                p.backtest.slippage = vec![SlippageOverride {
+                    instrument: p.instruments[0].clone(),
+                    bps: -1.0,
+                }];
+            }),
+            ("slippage for an instrument the plan does not test", |p| {
+                let mut other = p.instruments[0].clone();
+                other.symbol = "SOLUSDT".into();
+                p.backtest.slippage = vec![SlippageOverride {
+                    instrument: other,
+                    bps: 5.0,
+                }];
+            }),
+            ("slippage set twice for one instrument", |p| {
+                let o = SlippageOverride {
+                    instrument: p.instruments[0].clone(),
+                    bps: 3.0,
+                };
+                p.backtest.slippage = vec![o.clone(), o];
+            }),
             ("no leverage", |p| p.backtest.max_leverage = 0.0),
             ("no test days", |p| p.walk_forward.test_days = 0),
             ("days that are not whole weekly bars", |p| {

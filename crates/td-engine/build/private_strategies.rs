@@ -6,10 +6,32 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+/// Rust's strict and reserved keywords in the 2024 edition. None of them can name a module.
+const KEYWORDS: &[&str] = &[
+    // strict
+    "as", "async", "await", "break", "const", "continue", "crate", "dyn", "else", "enum", "extern",
+    "false", "fn", "for", "gen", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut",
+    "pub", "ref", "return", "self", "Self", "static", "struct", "super", "trait", "true", "type",
+    "unsafe", "use", "where", "while", // reserved
+    "abstract", "become", "box", "do", "final", "macro", "override", "priv", "try", "typeof",
+    "unsized", "virtual", "yield",
+];
+
+/// Whether `stem` can be written as `mod stem;`: lowercase ASCII letters, digits and
+/// underscores, not starting with a digit, not a bare `_` and not a keyword.
+fn is_module_name(stem: &str) -> bool {
+    stem.starts_with(|c: char| c.is_ascii_lowercase() || c == '_')
+        && stem
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        && stem != "_"
+        && !KEYWORDS.contains(&stem)
+}
+
 /// Source declaring one module per `*.rs` file directly in `dir`, by its absolute path, and an
 /// `entries()` function listing each module's `entry()`, in file name order. A missing `dir`
 /// gives an empty list. Files whose name starts with a dot (editor backups) are skipped; any other
-/// file name must be a module name such as `my_strategy.rs`.
+/// file name must be a module name such as `my_strategy.rs`, and not a Rust keyword or `_`.
 pub fn generate(dir: &Path) -> Result<String, String> {
     let mut files: Vec<PathBuf> = Vec::new();
     match fs::read_dir(dir) {
@@ -30,13 +52,10 @@ pub fn generate(dir: &Path) -> Result<String, String> {
     let mut calls = Vec::new();
     for path in &files {
         let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-        let valid = stem.starts_with(|c: char| c.is_ascii_lowercase() || c == '_')
-            && stem
-                .chars()
-                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
-        if !valid {
+        if !is_module_name(stem) {
             return Err(format!(
-                "{}: a strategy file's name must be a Rust module name such as my_strategy.rs",
+                "{}: a strategy file's name must be a Rust module name such as my_strategy.rs, \
+                 and not a Rust keyword or _",
                 path.display()
             ));
         }
@@ -106,11 +125,47 @@ mod tests {
 
     #[test]
     fn a_file_name_that_is_not_a_module_name_is_an_error() {
-        for name in ["My-Strategy.rs", "2fast.rs", "MyStrategy.rs"] {
+        let names = [
+            "My-Strategy.rs",
+            "2fast.rs",
+            "MyStrategy.rs",
+            "_.rs",
+            "mod.rs",
+            "type.rs",
+            "match.rs",
+            "self.rs",
+            "Self.rs",
+            "super.rs",
+            "crate.rs",
+            "gen.rs",
+            "yield.rs",
+        ];
+        for name in names {
             let dir = tempfile::tempdir().unwrap();
             fs::write(dir.path().join(name), "").unwrap();
             let err = generate(dir.path()).unwrap_err();
             assert!(err.contains(name), "{err}");
         }
+    }
+
+    #[test]
+    fn module_names_exclude_keywords_but_not_names_that_contain_them() {
+        for good in [
+            "my_strategy",
+            "_private",
+            "typed",
+            "mod_cross",
+            "self_test",
+            "r2",
+            "union",
+        ] {
+            assert!(is_module_name(good), "{good}");
+        }
+        for bad in [
+            "", "_", "mod", "type", "match", "self", "Self", "super", "crate", "async",
+        ] {
+            assert!(!is_module_name(bad), "{bad}");
+        }
+        assert!(KEYWORDS.iter().all(|k| !is_module_name(k)));
     }
 }

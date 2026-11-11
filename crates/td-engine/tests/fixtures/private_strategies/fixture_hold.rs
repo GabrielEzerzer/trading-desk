@@ -67,8 +67,10 @@ fn plan() -> TestPlan {
         },
         backtest: BacktestSettings {
             starting_cash: 1_000.0,
-            slippage_bps: 5.0,
             max_leverage: 1.0,
+            // Each instrument takes the backtest config's default slippage; list a
+            // SlippageOverride here to set one.
+            slippage: Vec::new(),
         },
         sweep: SweepPlan {
             fixed: Params::new(),

@@ -20,8 +20,10 @@ import type {
   StartSessionRequest,
   Status,
   StrategyInfo,
+  TestPlan,
   Timeframe,
   PaperTrade as Trade,
+  VerdictRule,
 } from '@td/shared'
 import { TIMEFRAME_MS, addCandle } from '../src/renderer/src/trading/candles'
 import { onLot, onTick } from '../src/renderer/src/trading/order'
@@ -528,6 +530,48 @@ declare global {
   }
 }
 
+// The test plan and verdict rule every mock strategy carries, shaped like sma_cross's own. Trading
+// reads only the names and parameters; the Lab has its own fixtures.
+const MOCK_PLAN: TestPlan = {
+  instruments: [
+    { venue: 'binance', symbol: 'BTCUSDT', kind: 'spot' },
+    { venue: 'binance', symbol: 'ETHUSDT', kind: 'spot' },
+  ],
+  timeframe: '1h',
+  period: { from: Date.UTC(2023, 0, 1), to: Date.UTC(2025, 0, 1) },
+  backtest: { starting_cash: 10_000, max_leverage: 1, slippage: [] },
+  sweep: {
+    fixed: {},
+    axes: [
+      { name: 'fast', space: { kind: 'range', from: 5, to: 20, step: 5 } },
+      { name: 'slow', space: { kind: 'range', from: 30, to: 70, step: 10 } },
+    ],
+    objective: { metric: 'sharpe', direction: 'maximize' },
+    min_trades: 10,
+  },
+  walk_forward: { train_days: 180, test_days: 60 },
+  out_of_sample: { fraction: 0.7 },
+  evidence: {
+    min_sample: { trades: 30, days: 180, windows: 4 },
+    luck: { permutations: 199, pass_p: 0.05, inconclusive_p: 0.1 },
+    cost_stress: 2,
+    plateau: { min_median_ratio: 0.6, min_positive_share: 0.8 },
+    start_offsets: 8,
+  },
+}
+
+const MOCK_RULE: VerdictRule = {
+  kind: 'portfolio',
+  benchmark: 'buy_and_hold',
+  limits: {
+    min_sharpe: 1,
+    max_drawdown: 0.3,
+    max_drawdown_vs_benchmark: 0.75,
+    min_alpha: 0,
+    max_p_mean_not_positive: 0.1,
+  },
+}
+
 export function createMockTradingSource({ liveMs = 1500, listMs = 400 }: MockTradingOptions = {}): TradingSource {
   const feeds = new Map<string, Feed>()
   const sessions = new Map<string, MockSession>()
@@ -549,7 +593,14 @@ export function createMockTradingSource({ liveMs = 1500, listMs = 400 }: MockTra
   }
 
   const strategies: StrategyInfo[] = (labFixtures as { strategies: { name: string; description: string }[] }).strategies.map(
-    (s) => ({ name: s.name, description: s.description, params: [] }),
+    (s) => ({
+      name: s.name,
+      description: s.description,
+      params: [],
+      kind: MOCK_RULE.kind,
+      plan: MOCK_PLAN,
+      rule: MOCK_RULE,
+    }),
   )
 
   if (typeof window !== 'undefined') {
