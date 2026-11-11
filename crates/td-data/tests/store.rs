@@ -949,6 +949,38 @@ fn a_1m_link_is_reported_and_not_read() {
     assert_eq!(strays(&stored), ["candles/binance/spot/ETHUSDT/1m"]);
 }
 
+/// A file another program holds open without sharing cannot be removed on Windows; elsewhere an
+/// open file can be.
+#[cfg(windows)]
+#[test]
+fn a_delete_that_stops_part_way_says_how_much_it_removed() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let store = Store::new(dir.path());
+    let id = btc(InstrumentKind::Spot);
+    store_three_months(&store, &id);
+    let jan_bytes = file_size(store.candle_path(&id, month("2024-01")).unwrap());
+    let held = std::fs::File::options()
+        .read(true)
+        .share_mode(0)
+        .open(store.candle_path(&id, month("2024-02")).unwrap())
+        .expect("opens");
+
+    let error = store
+        .delete_instrument(&id)
+        .expect_err("February cannot be removed")
+        .to_string();
+    assert!(
+        error.contains(&format!("files removed before it: 1, {jan_bytes} bytes")),
+        "{error}"
+    );
+    drop(held);
+    assert_eq!(
+        store.months(&id).expect("lists"),
+        [month("2024-02"), month("2024-03")]
+    );
+}
+
 #[test]
 fn a_hostile_symbol_cannot_make_a_delete_leave_the_store() {
     let dir = tempfile::tempdir().expect("a temp dir");

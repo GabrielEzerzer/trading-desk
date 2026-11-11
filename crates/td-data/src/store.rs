@@ -805,7 +805,13 @@ fn remove_locked(path: &Path, report: &mut DeleteReport) -> Result<(), DataError
                 report.bytes += bytes;
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return Err(DataError::io(&file)(e)),
+            Err(e) => {
+                let DeleteReport { files, bytes } = *report;
+                let stopped = format!(
+                    "{e} (the delete stopped; files removed before it: {files}, {bytes} bytes)"
+                );
+                return Err(DataError::io(&file)(io::Error::new(e.kind(), stopped)));
+            }
         }
     }
     Ok(())
