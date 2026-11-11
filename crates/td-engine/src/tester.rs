@@ -695,6 +695,7 @@ fn refuse_base_warmup(spec: &SweepSpec) -> Result<(), TesterError> {
 
 /// A luck test by bar permutation (R3 in #35): the same sweep on the real bars and on
 /// `permutations` shuffled copies of them.
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PermutationSpec {
     pub sweep: SweepSpec,
@@ -707,6 +708,7 @@ pub struct PermutationSpec {
 }
 
 /// The result of a luck test by bar permutation.
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PermutationResult {
     pub spec: PermutationSpec,

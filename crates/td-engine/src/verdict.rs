@@ -487,6 +487,7 @@ pub const TOO_GOOD_SHARPE: f64 = 4.0;
 /// plan's backtest before anything else runs. I2 and I3 then also run on each parameter set the
 /// walk-forward chose, and hold the worst result over every set checked. A check the battery
 /// could not make is `None` and fails, which makes the verdict `invalid`.
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct IntegrityInputs {
     /// I1: the buckets of the period's open hours that have no bar, over all of them.
@@ -502,6 +503,7 @@ pub struct IntegrityInputs {
 
 /// The integrity checks read on the stitched walk-forward out-of-sample curve (I4 and I5),
 /// computed once it exists.
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct OosIntegrityInputs {
     /// I4: the annualised Sharpe ratio of the curve's daily returns.
@@ -648,6 +650,7 @@ pub fn evaluate_oos_integrity(x: &OosIntegrityInputs, max_leverage: f64) -> Vec<
 /// walk-forward out-of-sample curve. Fractions are of equity unless said otherwise. A statistic
 /// the battery could not compute is `None` and fails its criterion. Each kind reads only its own
 /// fields.
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct KindInputs {
     // portfolio
@@ -863,6 +866,7 @@ pub fn evaluate(rule: &VerdictRule, x: &KindInputs) -> Vec<Criterion> {
 // ---------------------------------------------------------------------------------------------
 
 /// The statistics the evidence layer reads (#35, R1 to R6), computed by the battery.
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct EvidenceInputs {
     /// R1: total return of the stitched out-of-sample curve.

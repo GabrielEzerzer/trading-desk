@@ -235,6 +235,7 @@ fn a_planted_edge_reaches_trade_with_every_input_from_the_runs() {
     let wf = r.walk_forward.as_ref().unwrap();
     let stress = r.cost_stress.as_ref().unwrap();
     let luck = r.permutation.as_ref().unwrap();
+    assert!(!r.luck_cancelled);
     assert_eq!(wf.windows.len(), 4);
     assert_eq!(r.start_offsets.len(), 8);
     assert_eq!(luck.spec.permutations, PERMUTATIONS);
@@ -455,6 +456,7 @@ fn a_cancel_in_the_luck_test_leaves_its_line_inconclusive() {
     };
     let r = battery(&plan, &cash_rule(), &bars, 7, Some(&progress)).unwrap();
     assert!(r.permutation.is_none());
+    assert!(r.luck_cancelled);
     assert_eq!(r.evidence.luck_p, None);
     let luck = line(&r, "luck_p");
     assert_eq!(luck.outcome, Outcome::Inconclusive);
@@ -709,6 +711,8 @@ fn on_a_market_with_quotes_the_asks_reach_every_run() {
     assert_eq!(r.start_offsets.len(), 8);
     assert_ne!(r.cost_stress, flat.cost_stress);
     assert!(r.permutation.is_none());
+    // Skipped, not cancelled.
+    assert!(!r.luck_cancelled);
     let luck = line(&r, "luck_p");
     assert_eq!(luck.outcome, Outcome::Inconclusive);
     assert_eq!(

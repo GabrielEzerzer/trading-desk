@@ -442,7 +442,7 @@ fn lab_backtest(
     split(&mut p.run);
     let trades = result.trades.len();
     let saved = SavedRun::Backtest(Box::new(result));
-    let id = save_run(&saved, &data.report, runs.path()).map_err(job_error)?;
+    let id = save_run(&saved, &data.report, &[], runs.path()).map_err(job_error)?;
     let done = RunDone {
         summary: saved.summary(id.clone()),
         run_id: id,
@@ -492,8 +492,10 @@ fn api_error(e: ApiError) -> String {
 
 fn job_error(e: JobError) -> String {
     match e {
-        JobError::Cancelled => "cancelled".into(),
-        JobError::Failed(body) => format!("{}: {}", body.code, body.message),
+        JobError::Cancelled | JobError::CancelledWith(_) => "cancelled".into(),
+        JobError::Failed(body) | JobError::FailedWith(body, _) => {
+            format!("{}: {}", body.code, body.message)
+        }
     }
 }
 

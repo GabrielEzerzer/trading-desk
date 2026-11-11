@@ -30,6 +30,11 @@ const HOST: &str = "https://api-fxpractice.oanda.com";
 const TOKEN_VAR: &str = "OANDA_API_TOKEN";
 /// The most candles one request returns.
 const PAGE: usize = 5_000;
+/// The shortest run of open minutes without a candle that is taken for a closure or an outage
+/// rather than a quiet market, and so left missing instead of filled. Quiet stretches in an open FX
+/// market are minutes long: the gaps inside the week in OANDA's USD/JPY minutes are 1 to 5 minutes.
+/// A market holiday the weekend rule does not know, such as 25 December, is a whole day.
+const CLOSURE_MINUTES: i64 = 60;
 /// The pauses before each retry of a page after a failed connection, a 429 or a 5xx: five tries
 /// over about 40 seconds.
 const RETRY_DELAYS: [Duration; 4] = [
@@ -195,10 +200,12 @@ pub(crate) struct Counts {
 /// connection, a 429 or a 5xx is tried again after each of `delays`, and any other failure fails
 /// the whole call, so a month never comes back short of a page OANDA failed to serve.
 ///
-/// A page is refused whole when it names another instrument or granularity, or holds a time or a
-/// price that does not read, a candle that is not valid, or a time that is not after the one
-/// before it. Then, by [`fill`]: a candle still forming, in closed hours or with the ask crossed
-/// below the bid is left out and counted, and an open minute without a candle is filled.
+/// A page is refused whole when it names another instrument or granularity, starts before the time
+/// asked, or holds a time or a price that does not read, a candle that is not valid, or a time
+/// that is not after the one before it. Then, by [`fill`]: a candle still forming, in closed
+/// hours or with the ask crossed below the bid is left out and counted, and an open minute
+/// without a candle is filled, but never in a run of an hour or more without one, and never at or
+/// after the candle still forming, even when the local clock is ahead of OANDA's.
 pub(crate) fn history(
     id: &InstrumentId,
     from: Millis,
@@ -221,6 +228,9 @@ pub(crate) fn history(
     let mut quotes = Vec::new();
     let mut previous: Option<Millis> = None;
     let mut cursor = from;
+    // `to`, or the open time of the candle still forming: OANDA's clock says that minute has not
+    // ended, whatever the local clock says, so nothing from it on is filled.
+    let mut end = to;
     while cursor < to {
         let url = page_url(HOST, &name, cursor);
         let body = with_retries(delays, || {
@@ -228,9 +238,21 @@ pub(crate) fn history(
             answer(&url, status, body, &token)
         })?;
         let page = parse_page(&url, &body, &name, &id.symbol)?;
-        let Some(last) = page.last() else { break };
+        let (Some(first), Some(last)) = (page.first(), page.last()) else {
+            break;
+        };
+        if first.bid.open_time < cursor {
+            return Err(DataError::parse(
+                &url,
+                format!(
+                    "it starts at {} UTC, before the {} UTC asked for",
+                    format_minute(first.bid.open_time),
+                    format_minute(cursor)
+                ),
+            ));
+        }
         let last_time = last.bid.open_time;
-        let forming = page.iter().any(|q| !q.complete);
+        let forming = page.iter().find(|q| !q.complete).map(|q| q.bid.open_time);
         for q in page {
             if previous.is_some_and(|p| q.bid.open_time <= p) {
                 return Err(DataError::parse(
@@ -248,12 +270,16 @@ pub(crate) fn history(
                 quotes.push(q);
             }
         }
-        if forming || last_time + MINUTE >= to {
+        if let Some(forming) = forming {
+            end = forming.min(to);
+            break;
+        }
+        if last_time + MINUTE >= to {
             break;
         }
         cursor = last_time + MINUTE;
     }
-    let history = fill(id.kind, to, now, quotes, &mut counts);
+    let history = fill(id.kind, end, now, quotes, &mut counts);
     if counts != Counts::default() {
         eprintln!(
             "td-data: {id} {}: left out {} candles with the ask below the bid, {} in the closed \
@@ -285,7 +311,11 @@ struct Quote {
 /// - an open minute with no candle is filled with a flat candle on each side at that side's last
 ///   close, with no volume, and counted. Before the first candle there is nothing to fill at, and
 ///   closed hours clear the last close, so the minutes after a weekend's open stay missing until
-///   its first candle: a fill never reaches across closed hours.
+///   its first candle: a fill never reaches across closed hours;
+/// - a run of [`CLOSURE_MINUTES`] or more open minutes with no candle, up to the next candle or
+///   closed hours, is a closure or an outage, such as a market holiday: it is left missing whole,
+///   so it shows in the download's gaps and in coverage, and nothing is filled again until the
+///   next candle that is kept. A crossed candle still ends such a run, as OANDA was quoting then.
 ///
 /// The minutes are open by [`InstrumentKind::is_open`], which agrees with the closed spans the
 /// store's coverage counts open minutes by.
@@ -294,8 +324,9 @@ struct Quote {
 /// starts with nothing to fill at; carry the last close in from the month before if those gaps
 /// matter.
 ///
-/// shortcut: a long quiet stretch in open hours is filled at a stale price; cap the fill if a
-/// holiday ever shows up as a flat day.
+/// shortcut: a run is measured only up to the end of the read (the month's end or the present), so
+/// a closure that starts less than an hour before that is filled up to it; read on past the end if
+/// a closure ever starts in a month's last hour or a download runs in a closure's first hour.
 fn fill(
     kind: InstrumentKind,
     to: Millis,
@@ -334,6 +365,17 @@ fn fill(
             Some(q) if !crossed(&q.bid, &q.ask) => (q.bid, q.ask),
             quote => {
                 counts.crossed += usize::from(quote.is_some());
+                // A run that stays open with no candle for `CLOSURE_MINUTES` is a closure: clearing
+                // the last close at its first minute leaves all of it unfilled.
+                let next = quotes.peek().map_or(end, |q| q.bid.open_time);
+                if quote.is_none()
+                    && last.is_some()
+                    && (0..CLOSURE_MINUTES)
+                        .map(|i| minute + i * MINUTE)
+                        .all(|m| m < next && kind.is_open(m))
+                {
+                    last = None;
+                }
                 let Some((bid, ask)) = last else { continue };
                 counts.filled_minutes += 1;
                 (flat(minute, bid), flat(minute, ask))
@@ -389,11 +431,17 @@ fn get_page(
     http.get_with_headers(&page_url(base, instrument, from), headers)
 }
 
-/// Reads OANDA's answer for the page at `url`: its body, or an error that keeps only the status and
-/// OANDA's `errorMessage`, with any copy of the token taken out.
-fn answer(url: &str, status: u16, body: Vec<u8>, token: &Token) -> Result<Vec<u8>, DataError> {
+/// Reads OANDA's answer for the page at `url`: its body as text, or an error that keeps only the
+/// status and OANDA's `errorMessage`. Either way any copy of the token is taken out first, so no
+/// error built from the answer can show it.
+///
+/// shortcut: a copy of the token in a 2xx body written with JSON escapes (`t...`) is not
+/// found; scrub the decoded strings instead if a server ever sends one back that way.
+fn answer(url: &str, status: u16, body: Vec<u8>, token: &Token) -> Result<String, DataError> {
     if (200..300).contains(&status) {
-        return Ok(body);
+        let text = String::from_utf8(body)
+            .map_err(|_| DataError::parse(url, "the answer is not UTF-8 text"))?;
+        return Ok(token.scrub(&text));
     }
     #[derive(Deserialize)]
     struct ErrorBody {
@@ -467,8 +515,8 @@ struct RawPrices {
 
 /// The minutes of one page from `url`, in its order. `name` is the instrument as OANDA names it
 /// and `symbol` as the desk does, for errors.
-fn parse_page(url: &str, body: &[u8], name: &str, symbol: &str) -> Result<Vec<Quote>, DataError> {
-    let page: Page = serde_json::from_slice(body).map_err(|e| DataError::parse(url, e))?;
+fn parse_page(url: &str, body: &str, name: &str, symbol: &str) -> Result<Vec<Quote>, DataError> {
+    let page: Page = serde_json::from_str(body).map_err(|e| DataError::parse(url, e))?;
     if page.instrument != name || page.granularity != "M1" {
         return Err(DataError::parse(
             url,
@@ -706,28 +754,32 @@ mod tests {
         let forming = monday + 10 * HOUR;
         let mut served = open_minutes(monday + 9 * HOUR, forming, &[forming - MINUTE]);
         served.push(raw(forming, false));
-        let asked = RefCell::new(Vec::new());
-        let now = forming + 30_000;
-        let (history, counts) = history(
-            &usdjpy(),
-            monday,
-            now,
-            now,
-            env,
-            &NO_WAIT,
-            serve(&served, &asked),
-        )
-        .expect("reads");
-        assert_eq!(counts.incomplete, 1);
-        // The minute before it had no candle and is filled; the forming minute is not.
-        assert_eq!(
-            history.candles.last().map(|c| c.open_time),
-            Some(forming - MINUTE)
-        );
-        assert_eq!(history.candles.last().map(|c| c.volume), Some(0.0));
-        assert_eq!(counts.filled_minutes, 1);
-        assert_eq!(history.candles.len(), 60);
-        assert_eq!(*asked.borrow(), [monday]);
+        // The local clock agreeing with OANDA's, and two minutes ahead of it: either way neither
+        // the forming minute nor any after it is filled.
+        for now in [forming + 30_000, forming + 2 * MINUTE + 30_000] {
+            let asked = RefCell::new(Vec::new());
+            let (history, counts) = history(
+                &usdjpy(),
+                monday,
+                now,
+                now,
+                env,
+                &NO_WAIT,
+                serve(&served, &asked),
+            )
+            .expect("reads");
+            assert_eq!(counts.incomplete, 1);
+            // The minute before it had no candle and is filled; the forming minute is not.
+            assert_eq!(
+                history.candles.last().map(|c| c.open_time),
+                Some(forming - MINUTE),
+                "now {now}"
+            );
+            assert_eq!(history.candles.last().map(|c| c.volume), Some(0.0));
+            assert_eq!(counts.filled_minutes, 1);
+            assert_eq!((history.candles.len(), history.asks.len()), (60, 60));
+            assert_eq!(*asked.borrow(), [monday]);
+        }
     }
 
     #[test]
@@ -775,6 +827,87 @@ mod tests {
             Counts {
                 closed_minutes: 1,
                 filled_minutes: 2,
+                ..Counts::default()
+            }
+        );
+    }
+
+    #[test]
+    fn a_quiet_hour_is_left_missing_whole_and_filling_starts_again_at_the_next_candle() {
+        // Monday 8 January 2024 from 09:00 UTC: 59 quiet minutes, a candle at 10:00, 60 quiet
+        // minutes, a candle at 11:01, then 2 quiet minutes.
+        let nine = parse_date("2024-01-08").expect("a date") + 9 * HOUR;
+        let minutes = |from: Millis, n: i64| (0..n).map(move |i| from + i * MINUTE);
+        let (short, long, resumed) = (nine + MINUTE, nine + HOUR + MINUTE, nine + 122 * MINUTE);
+        let quiet: Vec<Millis> = minutes(short, 59)
+            .chain(minutes(long, 60))
+            .chain(minutes(resumed, 2))
+            .collect();
+        let to = nine + 3 * HOUR;
+        let served = open_minutes(nine, to, &quiet);
+        let asked = RefCell::new(Vec::new());
+        let (history, counts) = history(
+            &usdjpy(),
+            nine,
+            to,
+            far_future(),
+            env,
+            &NO_WAIT,
+            serve(&served, &asked),
+        )
+        .expect("reads");
+
+        // The hour is left out whole; the 59 minutes before it and the 2 after it are filled.
+        let expected: Vec<Millis> = minutes(nine, 180)
+            .filter(|t| !(long..long + HOUR).contains(t))
+            .collect();
+        assert_eq!(times(&history.candles), expected);
+        assert_eq!(times(&history.asks), expected);
+        assert_eq!(
+            counts,
+            Counts {
+                filled_minutes: 61,
+                ..Counts::default()
+            }
+        );
+        // Each filled minute is flat at the close of the candle before its stretch.
+        let at = |t: Millis| {
+            let i = history.candles.iter().position(|c| c.open_time == t);
+            &history.candles[i.expect("stored")]
+        };
+        for (stretch, n, before) in [(short, 59, nine), (resumed, 2, long + HOUR)] {
+            let close = at(before).close;
+            for t in minutes(stretch, n) {
+                assert_eq!((at(t).open, at(t).low, at(t).volume), (close, close, 0.0));
+            }
+        }
+    }
+
+    #[test]
+    fn a_crossed_candle_ends_a_quiet_run() {
+        // A candle at 09:00, a crossed one at 09:01, 59 quiet minutes, then a candle at 10:01:
+        // OANDA was quoting at 09:01, so the run without a candle is 59 minutes and is filled.
+        let nine = parse_date("2024-01-08").expect("a date") + 9 * HOUR;
+        let quiet: Vec<Millis> = (2..61).map(|i| nine + i * MINUTE).collect();
+        let mut served = open_minutes(nine, nine + 2 * HOUR, &quiet);
+        served[1]["ask"]["l"] = json!("118.000");
+        let asked = RefCell::new(Vec::new());
+        let (history, counts) = history(
+            &usdjpy(),
+            nine,
+            nine + 2 * HOUR,
+            far_future(),
+            env,
+            &NO_WAIT,
+            serve(&served, &asked),
+        )
+        .expect("reads");
+        assert_eq!(history.candles.len(), 120);
+        assert_eq!(
+            counts,
+            Counts {
+                crossed: 1,
+                filled_minutes: 60,
                 ..Counts::default()
             }
         );
@@ -847,6 +980,23 @@ mod tests {
         let mut c = good.clone();
         c.swap(1, 2);
         refused(c, "not after the one before");
+        // A page that starts before the time asked, as from a server that ignores `from`.
+        let early = open_minutes(monday - 2 * MINUTE, monday + 3 * MINUTE, &[]);
+        let mut ignores_from = |_: &Token, _| Ok((200, page(&early)));
+        let result = history(
+            &usdjpy(),
+            monday,
+            monday + 3 * MINUTE,
+            far_future(),
+            env,
+            &NO_WAIT,
+            &mut ignores_from,
+        );
+        let says = "it starts at 2024-01-08 08:58 UTC, before the 2024-01-08 09:00 UTC asked for";
+        assert!(
+            matches!(&result, Err(e) if e.to_string().contains(says)),
+            "{result:?}"
+        );
 
         let mut wrong = |_: &Token, _| {
             Ok((
@@ -866,6 +1016,57 @@ mod tests {
             &mut wrong,
         );
         assert!(result.is_err_and(|e| e.to_string().contains("EUR_USD M1 candles, not USD_JPY")),);
+    }
+
+    /// Every error built from a page's text (serde's, the instrument or granularity, a time, a
+    /// price) shows `[token]` where the page held the token.
+    #[test]
+    fn a_page_that_does_not_read_never_shows_the_token() {
+        let monday = parse_date("2024-01-08").expect("a date") + 9 * HOUR;
+        let good = open_minutes(monday, monday + 3 * MINUTE, &[]);
+        let candles_with = |field: &str, side: Option<&str>| {
+            let mut c = good.clone();
+            match side {
+                Some(side) => c[1][side][field] = json!(TOKEN),
+                None => c[1][field] = json!(TOKEN),
+            }
+            c
+        };
+        let good_page = json!({ "instrument": "USD_JPY", "granularity": "M1", "candles": good });
+        let with = |key: &str, value: Value| {
+            let mut p = good_page.clone();
+            p[key] = value;
+            p
+        };
+        let bodies = [
+            with("instrument", json!(format!("USD_JPY {TOKEN}"))),
+            with("granularity", json!(TOKEN)),
+            with("candles", json!(candles_with("time", None))),
+            with("candles", json!(candles_with("o", Some("bid")))),
+            // A string where serde wants a number, which serde's own error quotes.
+            with("candles", json!(candles_with("volume", None))),
+        ];
+        for body in bodies {
+            let body = body.to_string().into_bytes();
+            let mut get = |_: &Token, _| Ok((200, body.clone()));
+            let error = history(
+                &usdjpy(),
+                monday,
+                monday + 3 * MINUTE,
+                far_future(),
+                env,
+                &NO_WAIT,
+                &mut get,
+            )
+            .expect_err("refused");
+            let shown = format!("{error} {error:?}");
+            assert!(!shown.contains(TOKEN), "{shown}");
+            assert!(shown.contains("[token]"), "{shown}");
+        }
+        // A body that is not UTF-8 is not JSON, and is refused before it is read.
+        let token = Token(TOKEN.into());
+        let error = answer("u", 200, vec![b'{', 0xff, b'}'], &token).expect_err("refused");
+        assert!(error.to_string().contains("not UTF-8"), "{error}");
     }
 
     #[test]
@@ -1016,9 +1217,9 @@ mod tests {
         let result = with_retries(&NO_WAIT, || {
             calls += 1;
             let status = if calls < 3 { 429 } else { 200 };
-            answer("u", status, vec![1], &token)
+            answer("u", status, b"[]".to_vec(), &token)
         });
-        assert_eq!((result.ok(), calls), (Some(vec![1]), 3));
+        assert_eq!((result.ok(), calls), (Some("[]".to_string()), 3));
     }
 
     /// The request [`get_page`] sends, read back by a local one-shot server: the path and query,

@@ -80,10 +80,12 @@ pub(super) async fn instrument_list(
 /// that do not exist.
 pub const EARLIEST_FROM: Millis = 1_483_228_800_000;
 
-/// The earliest `from` an OANDA download accepts: 2005-01-01 00:00 UTC. OANDA's practice API
-/// returned full pages of USDJPY minutes from 2005 when it was tried on 2026-11-11; the desk's FX
-/// history starts in 2016.
-pub const OANDA_EARLIEST_FROM: Millis = 1_104_537_600_000;
+/// The earliest `from` an OANDA download accepts: 2007-01-01 00:00 UTC. The FX market hours
+/// ([`InstrumentKind::is_open`]) follow the US daylight-saving rule in force since 2007, so for
+/// earlier years about four weeks a year would have the weekend an hour off: real candles thrown
+/// away as closed, and gaps. OANDA's practice API has minutes from 2005; the desk's FX history
+/// starts in 2016.
+pub const OANDA_EARLIEST_FROM: Millis = 1_167_609_600_000;
 
 /// The earliest time anything of `venue`'s is downloaded or charted from, and the message refusing
 /// a download from earlier.
@@ -96,7 +98,8 @@ pub(super) fn earliest_from(venue: Venue) -> (Millis, &'static str) {
         ),
         Venue::Oanda => (
             OANDA_EARLIEST_FROM,
-            "`from` must not be before 2005-01-01 00:00 UTC (1104537600000) for oanda",
+            "`from` must not be before 2007-01-01 00:00 UTC (1167609600000) for oanda: the FX \
+             market hours follow the US daylight-saving rule in force since 2007",
         ),
     }
 }
@@ -107,7 +110,7 @@ pub(super) fn earliest_from(venue: Venue) -> (Millis, &'static str) {
 pub struct DownloadRequest {
     pub instrument: InstrumentId,
     /// Not before 2017-01-01 00:00 UTC (1483228800000) for binance and bybit, or before
-    /// 2005-01-01 00:00 UTC (1104537600000) for oanda; earlier is a 400.
+    /// 2007-01-01 00:00 UTC (1167609600000) for oanda; earlier is a 400.
     pub from: Millis,
     pub to: Millis,
 }

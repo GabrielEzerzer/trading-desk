@@ -161,6 +161,7 @@ impl BootstrapSpec {
 }
 
 /// Quantiles of the resampled means.
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Quantiles {
     pub p05: f64,
@@ -171,6 +172,7 @@ pub struct Quantiles {
 }
 
 /// The distribution of a sample's mean under resampling.
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MeanBootstrap {
     /// The mean of the sample itself.
@@ -352,6 +354,7 @@ pub struct PropFirmSpec {
 }
 
 /// The odds of a prop-firm challenge over simulated paths.
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct PropFirmOdds {
     /// The fraction of paths that reach the target within the horizon before breaching any

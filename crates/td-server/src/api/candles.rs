@@ -4,7 +4,8 @@
 //! Bars come from the local store first, resampled from its 1-minute candles by the store's own
 //! rule ([`td_data::resample`]). The bar slots the store does not cover are fetched from the
 //! venue's REST API at the timeframe itself, the way a paper session warms up, and are not written
-//! to the store: only download jobs fill it.
+//! to the store: only download jobs fill it. A venue with no live stream (oanda) has no such REST
+//! bars, so there those slots are reported missing.
 
 use std::sync::Arc;
 
@@ -54,7 +55,7 @@ pub struct CandlesResponse {
     /// The bar slots the response covers: open times in `[from, to)`, each on a bar boundary. `to`
     /// is the asked `to` rounded up to a boundary, but no later than the open time of the bar
     /// still forming; `from` is later than asked when the limit cut the range, and never before
-    /// the venue's earliest download date (2017-01-01, or 2005-01-01 for oanda).
+    /// the venue's earliest download date (2017-01-01, or 2007-01-01 for oanda).
     pub from: Millis,
     pub to: Millis,
     /// `from` was given and the range held more than `limit` bar slots, so the oldest were left
@@ -152,9 +153,11 @@ fn read_candles(
         slots.iter().rposition(Option::is_none),
     ) {
         let (span_from, span_to) = (from + first as i64 * dur, from + (last as i64 + 1) * dur);
-        let fetched = rest
-            .klines(&id, timeframe, span_from, span_to)
-            .map_err(|e| venue_error(&id, timeframe, e))?;
+        let fetched = match rest.klines(&id, timeframe, span_from, span_to) {
+            // A venue with no live stream (oanda) has no REST bars either: its slots stay missing.
+            Err(DataError::NoLiveStream(_)) => Vec::new(),
+            fetched => fetched.map_err(|e| venue_error(&id, timeframe, e))?,
+        };
         // A bar that fails validation is skipped, as in a session's warm-up.
         for bar in fetched.into_iter().filter(|b| b.validate().is_ok()) {
             if let Some(i) = slot_of(bar.open_time)
