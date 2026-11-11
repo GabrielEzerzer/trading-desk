@@ -320,14 +320,15 @@ pub(crate) fn decode_day(
     let mut raw = Vec::new();
     lzma_rs::lzma_decompress(&mut Cursor::new(bi5), &mut raw)
         .map_err(|e| bad(format!("does not decompress as LZMA: {e}")))?;
-    if raw.len() % RECORD != 0 {
+    let (records, rest) = raw.as_chunks::<RECORD>();
+    if !rest.is_empty() {
         return Err(bad(format!(
             "decompresses to {} bytes, which is not a whole number of {RECORD}-byte records",
             raw.len()
         )));
     }
-    let mut candles: Vec<Candle> = Vec::with_capacity(raw.len() / RECORD);
-    for record in raw.chunks_exact(RECORD) {
+    let mut candles: Vec<Candle> = Vec::with_capacity(records.len());
+    for record in records {
         let word = |i: usize| u32::from_be_bytes(record[i..i + 4].try_into().expect("4 bytes"));
         let seconds = Millis::from(word(0));
         let open_time = day + seconds * 1000;
