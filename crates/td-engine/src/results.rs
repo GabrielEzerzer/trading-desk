@@ -2,7 +2,9 @@
 //!
 //! A run is stored as `<runs_dir>/<run_id>/config.json` (the backtest configuration or tester
 //! spec alone, for reading by hand) and `result.json` (the whole [`SavedRun`]: its kind and the
-//! result, which holds the configuration or spec, so any run can be run again).
+//! result, which holds the configuration or spec, so any run can be run again). A plan run, one
+//! instrument's test battery under a strategy's plan, saves the strategy, the instrument, the plan,
+//! the rule and the seed as its `config.json`.
 
 use std::fmt;
 use std::fs;
@@ -17,7 +19,10 @@ use td_core::{InstrumentId, Millis, Timeframe};
 
 use crate::metrics::MetricsReport;
 use crate::runner::hex;
-use crate::{BacktestConfig, BacktestResult, OosResult, SweepResult, WalkForwardResult};
+use crate::{
+    BacktestConfig, BacktestResult, BatteryResult, ENGINE_REVISION, EngineError, OosResult,
+    SweepResult, TestPlan, VerdictRule, WalkForwardResult, config_fingerprint,
+};
 
 const CONFIG_FILE: &str = "config.json";
 const RESULT_FILE: &str = "result.json";
@@ -102,6 +107,8 @@ pub enum RunKind {
     Sweep,
     Oos,
     WalkForward,
+    /// One instrument's test battery under a strategy's plan.
+    Plan,
 }
 
 /// A result as saved, tagged with its kind: `{"kind": "...", "result": {...}}`.
@@ -113,6 +120,65 @@ pub enum SavedRun {
     Sweep(Box<SweepResult>),
     Oos(Box<OosResult>),
     WalkForward(Box<WalkForwardResult>),
+    Plan(Box<PlanRun>),
+}
+
+/// One instrument's test battery (#35) under a strategy's plan, as saved: what was tested, the
+/// engine that tested it and everything the battery produced, its verdict and seed included.
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PlanRun {
+    pub strategy: String,
+    /// The plan's backtest on the instrument ([`TestPlan::backtest_config`]): the period, the
+    /// fixed parameters, the starting cash, the slippage and the instrument's trading rules.
+    pub config: BacktestConfig,
+    /// The plan and the rule as they were when the battery ran.
+    pub plan: TestPlan,
+    pub rule: VerdictRule,
+    /// The td-engine crate version that produced the run.
+    pub engine_version: String,
+    /// The [`ENGINE_REVISION`] that produced the run. A verdict from another revision may differ
+    /// from what this engine would give on the same data.
+    pub engine_revision: u32,
+    /// The fingerprint of the data the battery was given, over `config`'s range; see
+    /// [`config_fingerprint`].
+    pub data_fingerprint: String,
+    pub battery: BatteryResult,
+}
+
+impl PlanRun {
+    /// Wraps a battery's result with what it was run on, stamped with this engine's revision.
+    pub fn new(
+        strategy: &str,
+        plan: &TestPlan,
+        rule: &VerdictRule,
+        instrument: td_core::Instrument,
+        battery: BatteryResult,
+        bars: &[td_core::Candle],
+        funding: &[(Millis, f64)],
+    ) -> Result<PlanRun, EngineError> {
+        let config = plan.backtest_config(strategy, instrument);
+        Ok(PlanRun {
+            strategy: strategy.to_string(),
+            data_fingerprint: config_fingerprint(&config, bars, funding)?,
+            config,
+            plan: plan.clone(),
+            rule: rule.clone(),
+            engine_version: env!("CARGO_PKG_VERSION").to_string(),
+            engine_revision: ENGINE_REVISION,
+            battery,
+        })
+    }
+}
+
+/// A plan run's `config.json`: what was tested, without the results.
+#[derive(Serialize)]
+struct PlanConfig<'a> {
+    strategy: &'a str,
+    instrument: &'a td_core::Instrument,
+    plan: &'a TestPlan,
+    rule: &'a VerdictRule,
+    seed: u64,
 }
 
 impl SavedRun {
@@ -122,6 +188,7 @@ impl SavedRun {
             SavedRun::Sweep(_) => RunKind::Sweep,
             SavedRun::Oos(_) => RunKind::Oos,
             SavedRun::WalkForward(_) => RunKind::WalkForward,
+            SavedRun::Plan(_) => RunKind::Plan,
         }
     }
 
@@ -133,6 +200,7 @@ impl SavedRun {
             SavedRun::Sweep(r) => &r.spec.base,
             SavedRun::Oos(r) => &r.spec.sweep.base,
             SavedRun::WalkForward(r) => &r.spec.sweep.base,
+            SavedRun::Plan(r) => &r.config,
         }
     }
 
@@ -144,6 +212,7 @@ impl SavedRun {
             SavedRun::Sweep(r) => &r.data_fingerprint,
             SavedRun::Oos(r) => &r.data_fingerprint,
             SavedRun::WalkForward(r) => &r.data_fingerprint,
+            SavedRun::Plan(r) => &r.data_fingerprint,
         }
     }
 
@@ -155,6 +224,7 @@ impl SavedRun {
             SavedRun::Sweep(r) => r.best.as_ref().map(|b| b.engine_revision),
             SavedRun::Oos(r) => Some(r.out_of_sample.engine_revision),
             SavedRun::WalkForward(r) => r.windows.first().map(|w| w.out_of_sample.engine_revision),
+            SavedRun::Plan(r) => Some(r.engine_revision),
         }
     }
 
@@ -165,6 +235,7 @@ impl SavedRun {
             SavedRun::Sweep(r) => r.best.as_ref().map(|b| &b.metrics),
             SavedRun::Oos(r) => Some(&r.out_of_sample.metrics),
             SavedRun::WalkForward(r) => Some(&r.metrics),
+            SavedRun::Plan(r) => r.battery.walk_forward.as_ref().map(|w| &w.metrics),
         };
         summary_row(id, self.kind(), self.base_config(), metrics)
     }
@@ -172,7 +243,8 @@ impl SavedRun {
 
 /// One row of the run list. The strategy and range are the base configuration's. The metrics
 /// are the backtest's, the sweep's best run's (none if no run qualified), the out-of-sample
-/// segment's, or the stitched walk-forward curve's.
+/// segment's, or the stitched walk-forward curve's (for a plan run, its battery's walk-forward,
+/// none when that did not run).
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunSummary {
@@ -225,6 +297,16 @@ pub fn save_with_files(
         SavedRun::Sweep(r) => to_json(&r.spec, runs_dir)?,
         SavedRun::Oos(r) => to_json(&r.spec, runs_dir)?,
         SavedRun::WalkForward(r) => to_json(&r.spec, runs_dir)?,
+        SavedRun::Plan(r) => to_json(
+            &PlanConfig {
+                strategy: &r.strategy,
+                instrument: &r.config.instrument,
+                plan: &r.plan,
+                rule: &r.rule,
+                seed: r.battery.seed,
+            },
+            runs_dir,
+        )?,
     };
     let result_json = to_json(run, runs_dir)?;
     let now = SystemTime::now()
@@ -316,6 +398,11 @@ pub fn list(runs_dir: &Path) -> Result<Vec<RunSummary>, StoreError> {
             Head::WalkForward { spec, metrics } => {
                 (RunKind::WalkForward, spec.sweep.base, Some(metrics))
             }
+            Head::Plan { config, battery } => (
+                RunKind::Plan,
+                config,
+                battery.walk_forward.map(|w| w.metrics),
+            ),
         };
         runs.push(summary_row(id, kind, &config, metrics.as_ref()));
     }
@@ -366,6 +453,15 @@ enum Head {
         spec: TesterHead,
         metrics: MetricsReport,
     },
+    Plan {
+        config: BacktestConfig,
+        battery: BatteryHead,
+    },
+}
+
+#[derive(Deserialize)]
+struct BatteryHead {
+    walk_forward: Option<MetricsHead>,
 }
 
 #[derive(Deserialize)]
