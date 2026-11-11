@@ -268,6 +268,13 @@ button {
   margin-left: 0;
 }
 
+.menu-heading {
+  padding: var(--space-2) var(--space-3) var(--space-1) 36px;
+  color: var(--grey-1);
+  font-size: var(--text-label);
+  line-height: var(--text-label-line);
+}
+
 .menu-separator {
   height: 1px;
   margin: 6px var(--space-1);
@@ -403,6 +410,11 @@ button {
   overflow: hidden;
   border-radius: var(--radius-pill);
   background: var(--fill);
+}
+
+/* A control under a bar, such as Cancel under a download, stands clear of it. */
+.progress + .button-float {
+  margin-top: var(--space-5);
 }
 
 .progress-fill {

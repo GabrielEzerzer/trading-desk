@@ -20,6 +20,37 @@ describe('validateRequest', () => {
     })
   })
 
+  it('passes the run routes the Lab uses', () => {
+    const id = '1794242520000-0a1b2c3d'
+    expect(validateRequest({ method: 'GET', path: '/runs' })).toEqual({ method: 'GET', path: '/runs' })
+    expect(validateRequest({ method: 'GET', path: `/runs/${id}` })).toEqual({ method: 'GET', path: `/runs/${id}` })
+    expect(validateRequest({ method: 'GET', path: '/jobs/7/result' })).toEqual({ method: 'GET', path: '/jobs/7/result' })
+    const config = { strategy: 'sma_cross', params: {}, from: 1, to: 2 }
+    expect(validateRequest({ method: 'POST', path: '/runs/backtest', body: config })).toEqual({
+      method: 'POST',
+      path: '/runs/backtest',
+      body: config,
+    })
+  })
+
+  it.each([
+    ['a run id without its hash', { method: 'GET', path: '/runs/1794242520000' }],
+    ['a run id with a short time', { method: 'GET', path: '/runs/179424252000-0a1b2c3d' }],
+    ['a run id with upper-case hex', { method: 'GET', path: '/runs/1794242520000-0A1B2C3D' }],
+    ['a run id with a long hash', { method: 'GET', path: '/runs/1794242520000-0a1b2c3d9' }],
+    ['a run id that climbs out', { method: 'GET', path: '/runs/../health' }],
+    ['a trailing slash on the run list', { method: 'GET', path: '/runs/' }],
+    ['POST on the run list', { method: 'POST', path: '/runs', body: {} }],
+    ['GET on the backtest route', { method: 'GET', path: '/runs/backtest' }],
+    ['the backtest route without a body', { method: 'POST', path: '/runs/backtest' }],
+    ['a run route the Lab does not use', { method: 'POST', path: '/runs/sweep', body: {} }],
+    ['POST on a job result', { method: 'POST', path: '/jobs/7/result' }],
+    ['a job result with a bad id', { method: 'GET', path: '/jobs/x/result' }],
+    ['a job result with a suffix', { method: 'GET', path: '/jobs/7/results' }],
+  ])('refuses %s', (_name, input) => {
+    expect(() => validateRequest(input)).toThrow(RefusedRequest)
+  })
+
   it.each([
     ['an unknown path', { method: 'GET', path: '/admin' }],
     ['a path that climbs out', { method: 'GET', path: '/jobs/../health' }],
