@@ -112,13 +112,16 @@ fn frame(c: &Candle) -> String {
     )
 }
 
-/// Lists the one test instrument for any venue and kind; downloads are not used here.
+/// Lists the one test instrument, as the kind asked for, for any venue; downloads are not used
+/// here.
 struct Venues;
 
 impl MarketSource for Venues {
-    fn instruments(&self, _: Venue, _: InstrumentKind) -> Result<InstrumentList, DataError> {
+    fn instruments(&self, _: Venue, kind: InstrumentKind) -> Result<InstrumentList, DataError> {
+        let mut listed = instrument();
+        listed.id.kind = kind;
         Ok(InstrumentList {
-            instruments: vec![instrument()],
+            instruments: vec![listed],
             rejected: Vec::new(),
         })
     }
@@ -1403,5 +1406,28 @@ async fn a_manual_order_is_refused_while_catching_up_and_takes_effect_from_the_f
         state
     };
     assert_eq!(without_status(&replayed), without_status(&state));
+    api.shutdown().await;
+}
+
+/// A market quoted as a bid and an ask has no live ask feed, so a paper session on it is refused
+/// before anything is made, rather than started to fail on its first bar.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_paper_session_on_a_quoted_market_is_400_and_creates_nothing() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let venue = Exchange::start().await;
+    let api = Api::start(&dir, &venue).await;
+    let mut body: Value = serde_json::from_str(&start_body()).expect("JSON");
+    body["instrument"]["kind"] = json!("fx");
+    let (status, refused) = api.post("/sessions", &body.to_string()).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+    assert_eq!(refused["error"]["code"], "bad_request");
+    assert_eq!(
+        refused["error"]["message"],
+        "binance:TESTUSDT:fx is quoted as a bid and an ask, and there is no live ask feed yet, so \
+         it cannot be paper traded"
+    );
+    let (_, sessions) = api.get("/sessions").await;
+    assert_eq!(sessions, json!([]));
+    assert!(!dir.path().join("paper").exists(), "no session folder");
     api.shutdown().await;
 }
