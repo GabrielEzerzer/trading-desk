@@ -552,7 +552,9 @@ impl PaperSession {
     /// reports its events. A warm-up bar goes through [`Session::warm_up`], with trading disabled.
     /// A live bar's line is synced to disk before this returns; warm-up lines are synced with the
     /// first live one. On an engine error nothing changes; on a log error the bar has been applied
-    /// but may not be saved and is not reported, so stop the session.
+    /// but may not be saved and is not reported, so stop the session. After
+    /// [`td_engine::EngineError::StrategyFailed`] the engine session has taken the bar in full,
+    /// but the bar is not logged or reported, so stop the session then too.
     pub fn feed(
         &mut self,
         bar: Candle,

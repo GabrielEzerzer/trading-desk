@@ -168,9 +168,11 @@ impl Session {
     /// in the gap since the previous bar.
     ///
     /// The bar must be valid, on a timeframe boundary and later than the previous bar; gaps are
-    /// allowed. On an error nothing changes. Then, in order: funding due at the bar's open, or in
-    /// the gap between the previous bar's end and this bar's open, is charged on the position held
-    /// going into the bar, at the open price; open orders are checked against this bar; a
+    /// allowed. On an error nothing changes, except on [`EngineError::StrategyFailed`], which is
+    /// returned after the bar has been fed in full, with its fills, portfolio changes and equity
+    /// point. Then, in order: funding due at the bar's open, or in the gap between the previous
+    /// bar's end and this bar's open, is charged on the position held going into the bar, at the
+    /// open price; open orders are checked against this bar; a
     /// perpetual position is checked for liquidation; funding due later in the bar is charged on
     /// the position after this bar's fills, at the close; equity is marked at the close; and the
     /// strategy is called. The first bar fed takes no funding from before its open.
