@@ -1,4 +1,4 @@
-import type { InstrumentId, SessionEvent, SessionState } from '@td/shared'
+import type { Candle, InstrumentId, SessionEvent, SessionState } from '@td/shared'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { MANUAL } from '../src/renderer/src/trading/source'
 import { aggregate, createMockTradingSource, fixtureHistory } from './trading'
@@ -34,6 +34,43 @@ describe('mock Trading fixtures', () => {
   it('scales the shared path for instruments without their own history', () => {
     const sol = fixtureHistory({ venue: 'binance', symbol: 'SOLUSDT', kind: 'spot' }, '1h')
     expect(sol.at(-1)?.close).toBeCloseTo(152.4, 2)
+  })
+})
+
+describe('mock live bars', () => {
+  beforeEach(() => vi.useFakeTimers())
+  afterEach(() => vi.useRealTimers())
+
+  it('shows the bar in progress twice before it closes, then closes on time', async () => {
+    const source = createMockTradingSource({ liveMs: 1000 })
+    const last = (await source.history(btc, '1m')).at(-1)!
+    const seen: [string, number, Candle][] = []
+    const start = Date.now()
+    const stop = source.candles(btc, '1m', {
+      onClosed: (c) => seen.push(['closed', Date.now() - start, c]),
+      onForming: (c) => seen.push(['forming', Date.now() - start, c]),
+    })
+    await vi.advanceTimersByTimeAsync(1000)
+    expect(seen.map(([kind, at]) => [kind, at])).toEqual([
+      ['forming', 750],
+      ['forming', 900],
+      ['closed', 1000],
+    ])
+    const [first, second, closed] = seen.map(([, , c]) => c) as [Candle, Candle, Candle]
+    for (const c of [first, second]) {
+      expect(c.open_time).toBe(closed.open_time)
+      expect(c.open).toBe(last.close)
+      expect(c.high).toBeLessThanOrEqual(closed.high)
+      expect(c.low).toBeGreaterThanOrEqual(closed.low)
+      expect(c.volume).toBeLessThan(closed.volume)
+    }
+    expect(second).not.toEqual(first)
+    expect(closed.open_time).toBe(last.open_time + 60_000)
+    expect((await source.history(btc, '1m')).at(-1)).toEqual(closed)
+
+    stop()
+    await vi.advanceTimersByTimeAsync(3000)
+    expect(seen).toHaveLength(3)
   })
 })
 

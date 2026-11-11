@@ -156,11 +156,11 @@ const nextBar = async (page) => {
 }
 
 /**
- * Lets React commit what the last timers changed, then runs 100 ms of frames so the chart draws
+ * Lets React commit what the last timers changed, then runs `ms` of frames so the chart draws
  * it. React commits on message tasks, which the clock does not hold, so a long `tick` can end with
  * the page's text a bar ahead of the chart's canvas.
  */
-const draw = async (page) => {
+const draw = async (page, ms = 100) => {
   await page.evaluate(async () => {
     for (let i = 0; i < 3; i++) {
       await new Promise((resolve) => {
@@ -170,7 +170,7 @@ const draw = async (page) => {
       })
     }
   })
-  await tick(page, 100)
+  await tick(page, ms)
 }
 
 /**
@@ -185,11 +185,14 @@ const quiet = async (page) => {
   await draw(page)
 }
 
-/** Lets the engine stub emit `count` bars, waits until it has, and draws them. */
+/**
+ * Lets the engine stub emit `count` bars, waits until it has, and draws them. It stops 100 ms past
+ * the last close, short of the next bar's forming step half way to its close.
+ */
 const engineBars = async (page, count) => {
   await tick(page, count * ENGINE_MS + 50)
   await page.waitForFunction((n) => (window.__stubCandles ?? 0) >= n, count)
-  await draw(page)
+  await draw(page, 50)
 }
 
 const toTrading = async (page) => {
@@ -516,15 +519,62 @@ export const STATES = [
     },
   },
   {
-    name: 'trading-engine-empty',
+    // The history drawn before any live bar: the stub answers GET /candles at once, and the held
+    // clock lets no live bar through.
+    name: 'trading-engine-history',
     section: 'trading',
-    config: { ...engineTrading, candles: null },
+    config: engineTrading,
     clock: true,
     steps: async (page) => {
       await heldTrading(page)
-      await page.getByText('Waiting for the first closed 1m bar').waitFor()
+      await page.locator('.ticker-price').filter({ hasText: '64,210.00' }).waitFor()
       await page.getByText('No paper session on BTCUSDT').waitFor()
-      await quiet(page)
+      await page.locator('.chart-empty').waitFor({ state: 'detached' })
+      await draw(page)
+    },
+  },
+  {
+    // History that has not answered yet, with the live stream's first bars already drawn.
+    name: 'trading-engine-history-loading',
+    section: 'trading',
+    config: { ...engineTrading, history: { '*': 'hang' } },
+    clock: true,
+    steps: async (page) => {
+      await heldTrading(page)
+      await page.locator('.chart-empty').getByText('Loading candle history').waitFor()
+      await engineBars(page, 6)
+    },
+  },
+  {
+    name: 'trading-engine-history-failed',
+    section: 'trading',
+    config: { ...engineTrading, history: { '*': 'fail' } },
+    clock: true,
+    steps: async (page) => {
+      await heldTrading(page)
+      await page.locator('.chart-empty').getByText('The candle history did not load.').waitFor()
+      await engineBars(page, 12)
+    },
+  },
+  {
+    // A 5m chart whose last candle is the bar still forming: the stub shows it half way between
+    // two closes, so after the twelfth close (3000 ms) the time moves to 3150 ms, past the
+    // thirteenth bar's forming step (3125 ms) and short of its close (3250 ms).
+    name: 'trading-engine-forming',
+    section: 'trading',
+    config: engineTrading,
+    clock: true,
+    steps: async (page) => {
+      await heldTrading(page)
+      await page.getByRole('button', { name: 'Timeframe: 1m' }).click()
+      await page.getByRole('menuitemradio', { name: '5m', exact: true }).click()
+      await page.getByRole('button', { name: 'Timeframe: 5m' }).waitFor()
+      await page.mouse.move(0, 0)
+      await page.locator('.chart-empty').waitFor({ state: 'detached' })
+      await engineBars(page, 12)
+      await tick(page, 50)
+      await page.waitForFunction(() => window.__stubFormed > 12)
+      await draw(page, 50)
     },
   },
   {
