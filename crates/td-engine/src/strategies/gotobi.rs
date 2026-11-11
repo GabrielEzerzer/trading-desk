@@ -102,7 +102,9 @@ pub(crate) fn entry() -> StrategyEntry {
                 name: "risk_pct",
                 kind: ParamKind::Float,
                 default: ParamValue::Float(0.5),
-                min: Some(0.0),
+                // At 0 every entry is rejected for a zero size, a run with no trades that looks
+                // like a real result.
+                min: Some(0.01),
                 max: Some(100.0),
                 description: "Percentage of equity lost if the stop is hit.",
             },

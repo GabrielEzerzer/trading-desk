@@ -241,6 +241,22 @@ fn the_size_risks_the_percentage_and_rounds_down_to_the_lot() {
 }
 
 #[test]
+fn a_risk_below_a_hundredth_of_a_percent_is_refused() {
+    let build = |pct: f64| {
+        build_strategy("gotobi", &Params::new().with("risk_pct", ParamValue::Float(pct))).err()
+    };
+    for pct in [0.0, 0.005, 100.5] {
+        assert!(
+            matches!(&build(pct), Some(EngineError::InvalidParam { name, .. }) if name == "risk_pct"),
+            "{pct}"
+        );
+    }
+    for pct in [0.01, 100.0] {
+        assert_eq!(build(pct), None, "{pct}");
+    }
+}
+
+#[test]
 fn a_missing_decision_bar_means_no_trade_that_day() {
     // The bar that closes at 00:55 is missing from the data.
     let day = gotobi_tuesday();
