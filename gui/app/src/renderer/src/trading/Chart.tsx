@@ -23,7 +23,7 @@ import {
   createSeriesMarkers,
 } from 'lightweight-charts'
 import { useEffect, useRef, useState } from 'react'
-import { bucketOf } from './candles'
+import { bucketOf, onlyLastChanged } from './candles'
 import { stepDecimals } from './order'
 
 const TRADINGVIEW_URL = 'https://www.tradingview.com/'
@@ -46,6 +46,8 @@ const seconds = (ms: number) => (ms / 1000) as UTCTimestamp
 
 const toBar = (c: Candle) => ({ time: seconds(c.open_time), open: c.open, high: c.high, low: c.low, close: c.close })
 
+const inRange = (t: number, first: number, last: number) => t >= first && t <= last
+
 function token(name: string): string {
   return getComputedStyle(document.documentElement).getPropertyValue(name).trim()
 }
@@ -56,7 +58,7 @@ export function Chart({ candles, seriesKey, revision, timeframe, instrument, fil
   const chart = useRef<IChartApi | null>(null)
   const series = useRef<ISeriesApi<'Candlestick'> | null>(null)
   const markers = useRef<ISeriesMarkersPluginApi<Time> | null>(null)
-  const drawn = useRef({ key: '', revision: -1 })
+  const drawn = useRef({ key: '', revision: -1, candles: [] as readonly Candle[] })
   const [scaleWidth, setScaleWidth] = useState(0)
 
   // One chart per mount; the section unmounts when hidden, which disposes it.
@@ -110,7 +112,7 @@ export function Chart({ candles, seriesKey, revision, timeframe, instrument, fil
       chart.current = null
       series.current = null
       markers.current = null
-      drawn.current = { key: '', revision: -1 }
+      drawn.current = { key: '', revision: -1, candles: [] }
     }
   }, [])
 
@@ -120,24 +122,30 @@ export function Chart({ candles, seriesKey, revision, timeframe, instrument, fil
     series.current?.applyOptions({ priceFormat: { type: 'price', precision: stepDecimals(tick), minMove: tick } })
   }, [instrument])
 
-  // New bars are drawn in place; another instrument, timeframe or a backfill (a new `revision`)
-  // redraws everything.
+  // A new or changed last bar is drawn in place; another instrument, timeframe, a backfill (a new
+  // `revision`) or a change before the last bar redraws everything.
   useEffect(() => {
     const s = series.current
     if (!s) return
     const prev = drawn.current
     const last = candles.at(-1)
-    if (prev.key === seriesKey && prev.revision === revision && last) {
+    if (prev.key === seriesKey && prev.revision === revision && last && onlyLastChanged(prev.candles, candles)) {
       s.update(toBar(last))
     } else {
       s.setData(candles.map(toBar))
       if (prev.key !== seriesKey) chart.current?.timeScale().scrollToRealTime()
     }
-    drawn.current = { key: seriesKey, revision }
+    drawn.current = { key: seriesKey, revision, candles }
   }, [candles, seriesKey, revision])
 
+  // The markers plugin moves a marker outside the drawn bars onto the first or last bar, which
+  // would show a fill at the wrong time, so only fills inside the loaded bars get one.
+  const first = candles[0]?.open_time
+  const last = candles.at(-1)?.open_time
   useEffect(() => {
-    const list: SeriesMarker<Time>[] = fills.map((f) => ({
+    const shown =
+      first === undefined || last === undefined ? [] : fills.filter((f) => inRange(bucketOf(f.time, timeframe), first, last))
+    const list: SeriesMarker<Time>[] = shown.map((f) => ({
       time: seconds(bucketOf(f.time, timeframe)),
       position: f.side === 'buy' ? 'belowBar' : 'aboveBar',
       shape: f.side === 'buy' ? 'arrowUp' : 'arrowDown',
@@ -146,7 +154,7 @@ export function Chart({ candles, seriesKey, revision, timeframe, instrument, fil
     }))
     list.sort((a, b) => (a.time as number) - (b.time as number))
     markers.current?.setMarkers(list)
-  }, [fills, timeframe, seriesKey])
+  }, [fills, timeframe, seriesKey, first, last])
 
   // The position's entry and each resting limit order are quiet lines across the chart.
   useEffect(() => {

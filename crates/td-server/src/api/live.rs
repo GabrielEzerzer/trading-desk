@@ -10,14 +10,23 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use td_core::{Candle, InstrumentId, Timeframe};
-use td_data::live::{FeedEvent, SharedStream, run_feed_on};
+use td_data::live::{ChartEvent, FeedEvent, SharedStream, run_chart_feed_on};
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 
 use super::source::LiveSource;
 
-/// Closed bars buffered per `candles:` subscriber; one that falls further behind skips bars.
+/// Messages (closed and forming bars) buffered per `candles:` subscriber; one that falls further
+/// behind skips messages.
 const CANDLE_BUFFER: usize = 256;
+
+/// What a `candles:` topic sends: a closed bar, or the bar still forming, which is for display
+/// only and never reaches a paper session.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum ChartBar {
+    Closed(Candle),
+    Forming(Candle),
+}
 
 /// Aborts a spawned task when dropped.
 pub(crate) struct AbortOnDrop(pub(crate) JoinHandle<()>);
@@ -42,7 +51,7 @@ pub(crate) struct Streams {
 
 /// The feed behind one `candles:` topic. Dropping the last handle stops it.
 pub(crate) struct CandleFeed {
-    bars: broadcast::Sender<Candle>,
+    bars: broadcast::Sender<ChartBar>,
     _task: AbortOnDrop,
 }
 
@@ -71,13 +80,13 @@ impl Streams {
         stream
     }
 
-    /// Subscribes to the closed bars of `id` at `timeframe`, starting the feed if no one else is
-    /// subscribed. Keep the returned handle for as long as the subscription lasts.
+    /// Subscribes to the bars of `id` at `timeframe`, closed and forming, starting the feed if no
+    /// one else is subscribed. Keep the returned handle for as long as the subscription lasts.
     pub(crate) fn candles(
         &self,
         id: &InstrumentId,
         timeframe: Timeframe,
-    ) -> (Arc<CandleFeed>, broadcast::Receiver<Candle>) {
+    ) -> (Arc<CandleFeed>, broadcast::Receiver<ChartBar>) {
         let mut feeds = lock(&self.candles);
         feeds.retain(|_, feed| feed.strong_count() > 0);
         let key = (id.clone(), timeframe);
@@ -88,14 +97,17 @@ impl Streams {
         let (bars, rx) = broadcast::channel(CANDLE_BUFFER);
         let (feed_tx, mut feed_rx) = mpsc::channel(CANDLE_BUFFER);
         // Bars from whatever minute closes first: the topic streams what happens from now on.
-        let run = run_feed_on(self.stream(id), timeframe, None, self.live.rest(), feed_tx);
+        let run = run_chart_feed_on(self.stream(id), timeframe, None, self.live.rest(), feed_tx);
         let out = bars.clone();
         let task = tokio::spawn(async move {
             let _feed = AbortOnDrop(tokio::spawn(run));
             while let Some(event) = feed_rx.recv().await {
-                if let FeedEvent::Bar(bar) = event {
-                    let _ = out.send(bar);
-                }
+                let bar = match event {
+                    ChartEvent::Feed(FeedEvent::Bar(bar)) => ChartBar::Closed(bar),
+                    ChartEvent::Forming(bar) => ChartBar::Forming(bar),
+                    ChartEvent::Feed(_) => continue,
+                };
+                let _ = out.send(bar);
             }
         });
         let feed = Arc::new(CandleFeed {

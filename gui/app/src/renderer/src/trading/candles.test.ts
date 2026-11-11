@@ -1,6 +1,15 @@
 import type { Candle } from '@td/shared'
 import { describe, expect, it } from 'vitest'
-import { addCandle, bucketOf, mergeCandles } from './candles'
+import {
+  EMPTY_SERIES,
+  addCandle,
+  bucketOf,
+  mergeCandles,
+  onlyLastChanged,
+  withClosed,
+  withForming,
+  withHistory,
+} from './candles'
 
 const bar = (open_time: number, close = 100): Candle => ({
   open_time,
@@ -67,5 +76,73 @@ describe('bucketOf', () => {
     expect(bucketOf(3_600_000 * 5 + 1234, '1h')).toBe(3_600_000 * 5)
     expect(bucketOf(60_000 * 7, '1m')).toBe(60_000 * 7)
     expect(bucketOf(900_000 * 3 - 1, '15m')).toBe(900_000 * 2)
+  })
+})
+
+describe('the live series', () => {
+  it('draws the forming bar as the last candle until its closed bar replaces it', () => {
+    let s = withForming(EMPTY_SERIES, bar(60, 1))
+    s = withForming(s, bar(60, 2))
+    expect(s.candles).toEqual([bar(60, 2)])
+    expect(s.closed).toBeNull()
+    s = withClosed(s, bar(60, 3))
+    expect(s.candles).toEqual([bar(60, 3)])
+    expect(s.closed).toBe(60)
+    s = withForming(s, bar(120, 4))
+    expect(times(s.candles)).toEqual([60, 120])
+    expect(s.revision).toBe(0)
+  })
+
+  it('ignores a forming bar that a closed bar already settled', () => {
+    const s = withClosed(withForming(EMPTY_SERIES, bar(60, 1)), bar(60, 2))
+    expect(withForming(s, bar(60, 9))).toBe(s)
+    expect(withForming(s, bar(0, 9))).toBe(s)
+  })
+
+  it('puts the history under live bars and redraws', () => {
+    const live = withForming(withClosed(EMPTY_SERIES, bar(180, 18)), bar(240, 24))
+    const s = withHistory(live, [bar(60, 6), bar(120, 12), bar(180, 17)])
+    expect(times(s.candles)).toEqual([60, 120, 180, 240])
+    expect(s.candles[2]?.close).toBe(18)
+    expect(s.candles[3]?.close).toBe(24)
+    expect(s.closed).toBe(180)
+    expect(s.revision).toBe(live.revision + 1)
+  })
+
+  it('lets the history replace a forming bar that has closed since', () => {
+    const forming = withForming(EMPTY_SERIES, bar(120, 11))
+    const s = withHistory(forming, [bar(60, 6), bar(120, 12)])
+    expect(s.candles).toEqual([bar(60, 6), bar(120, 12)])
+    expect(s.closed).toBe(120)
+    // Its late forming updates no longer apply.
+    expect(withForming(s, bar(120, 13))).toBe(s)
+  })
+
+  it('changes nothing for an empty history', () => {
+    const s = withClosed(EMPTY_SERIES, bar(60))
+    expect(withHistory(s, [])).toBe(s)
+  })
+})
+
+describe('onlyLastChanged', () => {
+  const drawn = withForming(withClosed(EMPTY_SERIES, bar(1)), bar(2, 101))
+
+  it('holds for a forming bar that moves and for one appended bar', () => {
+    const moved = withForming(drawn, bar(2, 102))
+    expect(onlyLastChanged(drawn.candles, moved.candles)).toBe(true)
+    expect(onlyLastChanged(moved.candles, withForming(withClosed(moved, bar(2, 103)), bar(2, 103)).candles)).toBe(true)
+    expect(onlyLastChanged([], [bar(1)])).toBe(true)
+  })
+
+  it('fails when a bar closes and the next starts forming before one render', () => {
+    const next = withForming(withClosed(drawn, bar(2, 103)), bar(3, 104))
+    expect(next.revision).toBe(drawn.revision)
+    expect(onlyLastChanged(drawn.candles, next.candles)).toBe(false)
+  })
+
+  it('fails when two bars arrive before one render', () => {
+    const next = withClosed(withClosed(drawn, bar(3)), bar(4))
+    expect(onlyLastChanged(drawn.candles, next.candles)).toBe(false)
+    expect(onlyLastChanged([], [bar(1), bar(2)])).toBe(false)
   })
 })
