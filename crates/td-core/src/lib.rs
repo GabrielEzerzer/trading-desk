@@ -6,12 +6,14 @@
 //! - Timestamps are [`Millis`]: milliseconds since the Unix epoch, UTC.
 
 mod candle;
+mod civil;
 mod error;
 mod instrument;
 mod order;
 mod timeframe;
 
 pub use candle::Candle;
+pub use civil::{civil_from_days, days_from_civil};
 pub use error::CoreError;
 pub use instrument::{FeeSchedule, Instrument, InstrumentId, InstrumentKind, Rounding, Venue};
 pub use order::{Fill, Liquidity, OrderId, OrderRequest, OrderType, Side, TimeInForce};
