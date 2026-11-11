@@ -836,3 +836,95 @@ fn a_dollar_backtest_runs_end_to_end_and_reports_pips() {
         );
     }
 }
+
+#[test]
+fn a_dollar_backtest_converts_the_benchmark_excursions_return_and_turnover_at_their_prices() {
+    // The SMA cross with fast 1 and slow 2 is long while a close is above the one before and flat
+    // otherwise. On 100 000 dollars at 0.003 yen a unit, with half the equity: bar 1 closes up,
+    // so it buys 100 000 * 0.5 / (150.500 / 150.500) = 50 000 (under its cap of 100 000 * 0.995
+    // = 99 500) at bar 2's ask open, 150.500; bar 4 closes down, so it sells them at bar 5's bid
+    // open, 151.200; bars 5 and 6 do not close up.
+    let quotes: Vec<Quote> = [
+        [150.000, 150.000, 150.000, 150.000],
+        [150.000, 150.600, 149.900, 150.500],
+        [150.480, 151.000, 149.800, 150.900],
+        [150.900, 152.000, 150.500, 151.500],
+        [151.500, 151.600, 150.600, 151.000],
+        [151.200, 151.300, 150.900, 151.000],
+        [150.900, 150.900, 150.900, 150.900],
+    ]
+    .into_iter()
+    .map(spread)
+    .collect();
+    let bids: Vec<Candle> = quotes
+        .iter()
+        .enumerate()
+        .map(|(i, (bid, _))| candle(i as i64, *bid))
+        .collect();
+    let asks: Vec<Candle> = asks_of(&quotes).into_iter().flatten().collect();
+    let config = td_engine::BacktestConfig {
+        params: td_engine::Params::new()
+            .with("fast", td_engine::ParamValue::Int(1))
+            .with("slow", td_engine::ParamValue::Int(2))
+            .with("equity_fraction", td_engine::ParamValue::Float(0.5)),
+        instrument: usdjpy(),
+        starting_cash: 100_000.0,
+        fee_override: Some(PER_UNIT),
+        account_currency: AccountCurrency::Base,
+        ..crypto_backtest(quotes.len())
+    };
+    let result = td_engine::run(&config, &bids, &asks, &[]).unwrap();
+
+    // The trade: 50 000 from 150.500 to 151.200. Gross 50 000 * 0.700 = 35 000 yen at the exit's
+    // 151.200; fees 50 000 * 0.003 = 150 yen at 150.500 and 150 yen at 151.200.
+    assert_eq!(result.trades.len(), 1);
+    let t = &result.trades[0];
+    assert!(!t.open);
+    assert_eq!(t.qty, 50_000.0);
+    approx(t.entry_price, 150.500);
+    approx(t.exit_price, 151.200);
+    let entry_fee = 150.0 / 150.500;
+    let net = 35_000.0 / 151.200 - entry_fee - 150.0 / 151.200;
+    approx(t.net_pnl, net);
+    // The notional is the 50 000 dollars bought (50 000 * 150.500 yen at 150.500); over 7 525 000
+    // yen instead, the return would be 150.5 times smaller.
+    approx(t.return_on_notional, net / 50_000.0);
+    // The long is valued on the bid. Its worst price is bar 2's low after the entry, 149.800:
+    // 50 000 * -0.700 = -35 000 yen at 149.800. Its best is bar 3's high, 152.000: 50 000 *
+    // 1.500 = 75 000 yen at 152.000.
+    approx(t.mae.unwrap(), 35_000.0 / 149.800);
+    approx(t.mfe.unwrap(), 75_000.0 / 152.000);
+
+    // The equity at each close: 100 000 until the entry; while long, less the entry fee, with the
+    // long marked at the bid close; then 100 000 plus the trade's net.
+    let long = |close: f64| 100_000.0 - entry_fee + 50_000.0 * (close - 150.500) / close;
+    let closes = [
+        100_000.0,
+        100_000.0,
+        long(150.900),
+        long(151.500),
+        long(151.000),
+        100_000.0 + net,
+        100_000.0 + net,
+    ];
+    assert_eq!(result.equity.len(), closes.len());
+    for (point, close) in result.equity.iter().zip(closes) {
+        approx(point.equity, close);
+    }
+    // Turnover: the 50 000 bought and the 50 000 sold are 100 000 dollars traded, each fill's yen
+    // notional at its own price, over the mean equity at the closes. In yen the traded amount
+    // would be about 151 times larger.
+    let mean = closes.iter().sum::<f64>() / closes.len() as f64;
+    approx(result.metrics.turnover.unwrap(), 100_000.0 / mean);
+
+    // Buy and hold puts the 100 000 dollars into bar 0's ask open, 150.020. A unit costs
+    // (150.020 + 0.003) / 150.020 dollars, so the cash buys 100 000 * 150.020 / 150.023 =
+    // 99 998.0003, rounded down to the lot: 99 998 (at a unit cost in yen, 666). The fee is
+    // 99 998 * 0.003 = 299.994 yen at 150.020, 2.00 dollars. At the last bid close, 150.900, the
+    // long is up 99 998 * 0.880 = 87 998.24 yen at 150.900, 583.16 dollars.
+    let bench = &result.benchmark;
+    approx(bench.entry_price, 150.020);
+    assert_eq!(bench.qty, 99_998.0);
+    let end = 100_000.0 - 99_998.0 * 0.003 / 150.020 + 99_998.0 * (150.900 - 150.020) / 150.900;
+    approx(bench.equity.last().unwrap().equity, end);
+}
