@@ -763,9 +763,10 @@ fixed: Params, axes: Array<ParamAxis>, objective: Objective,
 min_trades: number, };
 
 /**
- * Rolling walk-forward windows, in days of the plan's timeframe. Each test segment starts where
- * the previous one ended, so the stitched out-of-sample curve has no holes. Both lengths must be
- * whole bars of the timeframe.
+ * Rolling walk-forward windows, in days of bars: a day is 24 hours of bars of the plan's
+ * timeframe, so on an FX pair, closed at weekends, a window spans more calendar days. Each test
+ * segment starts where the previous one ended, so the stitched out-of-sample curve has no holes.
+ * Both lengths must be whole bars of the timeframe.
  */
 export type WalkForwardPlan = { train_days: number, test_days: number, };
 

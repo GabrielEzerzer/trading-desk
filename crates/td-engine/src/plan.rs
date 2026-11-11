@@ -14,7 +14,7 @@
 //! the permutation count can go down to [`MIN_PERMUTATIONS`] for a quicker luck test.
 
 use serde::{Deserialize, Serialize};
-use td_core::{FeeSchedule, Instrument, InstrumentId, Millis, Timeframe};
+use td_core::{FeeSchedule, Instrument, InstrumentId, Millis, Timeframe, days_from_civil};
 
 use crate::metrics::DAY_MS;
 use crate::{
@@ -39,15 +39,8 @@ fn refuse<T>(message: impl Into<String>) -> Result<T, PlanError> {
 }
 
 /// Midnight UTC at the start of a date, for writing a plan's period: `date(2024, 1, 1)`.
-pub const fn date(year: i64, month: i64, day: i64) -> Millis {
-    // Howard Hinnant's days_from_civil.
-    let y = if month <= 2 { year - 1 } else { year };
-    let era = (if y >= 0 { y } else { y - 399 }) / 400;
-    let yoe = y - era * 400;
-    let mp = (month + 9) % 12;
-    let doy = (153 * mp + 2) / 5 + day - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    (era * 146_097 + doe - 719_468) * DAY_MS
+pub fn date(year: i64, month: u32, day: u32) -> Millis {
+    days_from_civil(year, month, day) * DAY_MS
 }
 
 /// Everything the battery needs to test a strategy, with no data.
@@ -103,9 +96,10 @@ pub struct SweepPlan {
     pub min_trades: usize,
 }
 
-/// Rolling walk-forward windows, in days of the plan's timeframe. Each test segment starts where
-/// the previous one ended, so the stitched out-of-sample curve has no holes. Both lengths must be
-/// whole bars of the timeframe.
+/// Rolling walk-forward windows, in days of bars: a day is 24 hours of bars of the plan's
+/// timeframe, so on an FX pair, closed at weekends, a window spans more calendar days. Each test
+/// segment starts where the previous one ended, so the stitched out-of-sample curve has no holes.
+/// Both lengths must be whole bars of the timeframe.
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -397,23 +391,30 @@ impl TestPlan {
             oos.check().map_err(|e| PlanError(e.to_string()))?;
         }
         self.evidence.validate()?;
-        // The windows as the tester lays them, on a period with no gaps.
-        let bars = ((to - from) / bar) as usize;
+        // The windows as the tester lays them, on data with no gaps: the bars of the period's
+        // open hours, so an FX pair, closed at weekends, has fewer than a crypto pair.
         let ws = &wf.windows;
-        let windows = if bars < ws.train_bars + ws.test_bars {
-            0
-        } else {
-            (bars - ws.train_bars - ws.test_bars) / ws.step_bars + 1
-        };
         let min = &self.evidence.min_sample;
-        let oos_days = windows as u64 * u64::from(w.test_days);
-        if windows < min.windows as usize || oos_days < u64::from(min.days) {
-            return refuse(format!(
-                "the period holds {windows} walk-forward windows and {oos_days} out-of-sample \
-                 days, below the minimum sample of {} windows and {} days: lengthen the period \
-                 or shorten the windows",
-                min.windows, min.days
-            ));
+        for id in &self.instruments {
+            let closed: Millis = id
+                .kind
+                .closed_spans(from, to)
+                .iter()
+                .map(|s| s.end - s.start)
+                .sum();
+            let bars = ((to - from - closed) / bar) as usize;
+            let windows = if bars < ws.train_bars + ws.test_bars {
+                0
+            } else {
+                (bars - ws.train_bars - ws.test_bars) / ws.step_bars + 1
+            };
+            let oos_days = windows as u64 * u64::from(w.test_days);
+            if windows < min.windows as usize || oos_days < u64::from(min.days) {
+                return refuse(format!(
+                    "on {id} the period holds {windows} walk-forward windows and {oos_days} days                      of out-of-sample bars, below the minimum sample of {} windows and {} days:                      lengthen the period or shorten the windows",
+                    min.windows, min.days
+                ));
+            }
         }
         Ok(())
     }
@@ -624,6 +625,29 @@ mod tests {
             example_plan().validate("nope").is_err(),
             "an unknown strategy"
         );
+    }
+
+    /// An FX pair is a valid instrument, and its weekends count against the minimum sample: a
+    /// period that holds four windows of round-the-clock bars holds fewer of FX bars.
+    #[test]
+    fn fx_plans_count_only_the_open_hours() {
+        let fx = InstrumentId {
+            venue: td_core::Venue::Binance,
+            symbol: "EURUSD".into(),
+            kind: td_core::InstrumentKind::Fx,
+        };
+        let mut plan = example_plan();
+        plan.period = Period {
+            from: date(2023, 1, 1),
+            to: date(2023, 1, 1) + 420 * DAY_MS,
+        };
+        assert_eq!(plan.validate("sma_cross"), Ok(()));
+        plan.instruments.push(fx.clone());
+        let err = plan.validate("sma_cross").unwrap_err();
+        assert!(err.0.contains("EURUSD"), "{err}");
+        plan.instruments = vec![fx];
+        plan.period.to = date(2023, 1, 1) + 600 * DAY_MS;
+        assert_eq!(plan.validate("sma_cross"), Ok(()));
     }
 
     /// The minimum-sample check counts windows as the tester lays them: a period that holds
