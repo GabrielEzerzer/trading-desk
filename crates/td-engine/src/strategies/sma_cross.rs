@@ -126,8 +126,8 @@ impl Strategy for SmaCross {
         }
         // On spot a buy only happens from flat, where the equity is all cash.
         let equity = ctx.equity();
-        let size =
-            (equity * self.equity_fraction / bar.close).min(affordable_qty(ctx, equity, bar.close));
+        let size = (equity * self.equity_fraction / ctx.to_account(bar.close))
+            .min(affordable_qty(ctx, equity, bar.close));
         let target = want * size;
         let delta = target - position;
         let side = if delta > 0.0 { Side::Buy } else { Side::Sell };

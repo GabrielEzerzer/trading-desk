@@ -254,7 +254,10 @@ impl<M: FillModel> SimBroker<M> {
                 }
             }
         }
-        let fee = self.fees.fee(price, qty, rate);
+        // The fee arises in the quote currency, at the fill's price.
+        let fee = book
+            .account()
+            .from_quote(self.fees.fee(price, qty, rate), price);
         book.apply_fill(req.side, qty, price, fee);
         Ok(Fill {
             order_id: order.id,

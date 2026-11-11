@@ -87,8 +87,20 @@ impl Context<'_> {
         self.portfolio.cash()
     }
 
+    /// The account's equity, in the account currency.
     pub fn equity(&self) -> f64 {
         self.portfolio.equity()
+    }
+
+    /// `quote_amount`, in the instrument's quote currency, in the account currency at the current
+    /// bar's close (the bid close on a market with quotes); the amount itself on a quote account.
+    /// A strategy sizes a trade with it as `risk_fraction * ctx.equity() /
+    /// ctx.to_account(stop_distance)`: on USD/JPY at 150.00 with 100,000 dollars of equity, 0.5%
+    /// risk on a 0.12 yen (12-pip) stop is `500 / (0.12 / 150) = 625,000` units.
+    pub fn to_account(&self, quote_amount: f64) -> f64 {
+        self.portfolio
+            .account()
+            .from_quote(quote_amount, self.bar().close)
     }
 
     pub fn open_orders(&self) -> &[Order] {
@@ -121,7 +133,9 @@ impl Context<'_> {
     /// worst case is that the reduce-only orders close what they can first and the others open a
     /// fresh position on the other side, and that fresh position is what is capped. The position
     /// is valued at this bar's close, and each order at its limit price, its trigger, or this
-    /// bar's close for a market order, without the fee.
+    /// bar's close for a market order, without the fee. On a base account each of those values is
+    /// converted to the account currency at the price it is valued at, so a position of `q` units
+    /// of USD/JPY is worth `q` dollars, before it is compared with the equity.
     ///
     /// shortcut: a reduce-only order is never checked, so one submitted after a plain order on
     /// the same side that it would make room for (a reduce-only market close after a plain limit
@@ -350,6 +364,9 @@ impl Context<'_> {
         if rules.margin && !req.reduce_only {
             let close = self.bar().close;
             let position = self.position();
+            let account = self.portfolio.account();
+            // The value of `qty` at `price`, in the account currency.
+            let value = |qty: f64, price: f64| account.from_quote(qty * price, price);
             // This order and the open orders on its side, and those of them that are not
             // reduce-only, with their value.
             let side: Vec<&OrderRequest> = self
@@ -368,7 +385,7 @@ impl Context<'_> {
                 .collect();
             plain.sort_by(|a, b| b.1.total_cmp(&a.1));
             let plain_qty: f64 = plain.iter().map(|(q, _)| q).sum();
-            let plain_value: f64 = plain.iter().map(|(q, p)| q * p).sum();
+            let plain_value: f64 = plain.iter().map(|&(q, p)| value(q, p)).sum();
             let notional = if req.side.sign() * position < 0.0 {
                 // Against the position: the fresh position on the other side if it closes first.
                 // Any of the orders may be the ones that close it, so the fresh quantity is valued
@@ -376,19 +393,19 @@ impl Context<'_> {
                 let fresh = plain_qty.min(total - position.abs());
                 (total > position.abs() * (1.0 + 1e-9)).then(|| {
                     let mut left = fresh;
-                    let mut value = 0.0;
+                    let mut worth = 0.0;
                     for (qty, price) in &plain {
                         let take = qty.min(left);
-                        value += take * price;
+                        worth += value(take, *price);
                         left -= take;
                         if left <= 0.0 {
                             break;
                         }
                     }
-                    value
+                    worth
                 })
             } else {
-                Some((position * close + req.side.sign() * plain_value).abs())
+                Some((value(position, close) + req.side.sign() * plain_value).abs())
             };
             if let Some(notional) = notional {
                 let equity = self.equity();

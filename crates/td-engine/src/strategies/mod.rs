@@ -43,11 +43,12 @@ fn order(
 const HEADROOM: f64 = 0.005;
 
 /// The largest quantity whose value at `price`, plus the taker fee and slippage on it, fits in
-/// `budget` with [`HEADROOM`] to spare. Within it, a spot buy passes the cash check at submission
-/// and a perpetual position stays within 1x of the budget.
+/// `budget` (in the account currency) with [`HEADROOM`] to spare. Within it, a spot buy passes the
+/// cash check at submission and a margined position stays within 1x of the budget. The value is
+/// converted to the account currency at the current close ([`Context::to_account`]).
 fn affordable_qty(ctx: &Context, budget: f64, price: f64) -> f64 {
     let costs = 1.0 + ctx.fees().taker + ctx.slippage_bps() / 10_000.0;
-    budget * (1.0 - HEADROOM) / (price * costs)
+    budget * (1.0 - HEADROOM) / ctx.to_account(price * costs)
 }
 
 /// -1, 0 or 1. Unlike `f64::signum`, zero maps to zero.
