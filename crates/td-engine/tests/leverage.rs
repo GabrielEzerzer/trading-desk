@@ -24,7 +24,7 @@ fn run(
     bars: &[td_core::Candle],
     strategy: Box<dyn Strategy>,
 ) -> Session {
-    run_backtest(strategy, inst, Timeframe::M1, bars, &[], cfg).unwrap()
+    run_backtest(strategy, inst, Timeframe::M1, bars, &[], &[], cfg).unwrap()
 }
 
 fn equity(s: &Session) -> Vec<f64> {
@@ -74,7 +74,7 @@ fn a_10x_short_through_a_30_percent_wick_is_liquidated_at_the_maintenance_price(
     approx(s.portfolio().shortfall_written_off(), 0.0);
 
     // The liquidation closes the trade in the trade list: -9,250 gross, 750 of fees.
-    let trades = build_trades(s.fills(), s.bars(), s.bar_funding());
+    let trades = build_trades(s.fills(), s.bars(), &[], s.bar_funding());
     assert_eq!(trades.len(), 1);
     assert_eq!(trades[0].side, TradeSide::Short);
     assert!(!trades[0].open);
@@ -398,7 +398,7 @@ fn funding_owed_later_in_the_bar_brings_the_liquidation_price_closer() {
     // 0.1% funding half way through bar 2: the long of 1,000 owes 1,000 * 95 * 0.001 = 95.
     let funding = [(2 * MIN + 30_000, 0.001)];
     let (script, _) = Script::new(vec![(0, req(&i, Side::Buy, 1000.0, OrderType::Market))]);
-    let s = run_backtest(script, i, Timeframe::M1, &bars, &funding, lev(10.0)).unwrap();
+    let s = run_backtest(script, i, Timeframe::M1, &bars, &[], &funding, lev(10.0)).unwrap();
 
     // Without the funding the long is liquidated at 90.66 (second test), above bar 2's low of 90.7.
     // With it, cash 9,800 - 95 = 9,705 meets maintenance at (100,000 - 9,705) / 995 = 90.7487...,

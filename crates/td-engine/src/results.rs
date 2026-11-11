@@ -147,23 +147,24 @@ pub struct PlanRun {
 }
 
 impl PlanRun {
-    /// Wraps a battery's result with what it was run on, stamped with this engine's revision.
+    /// Wraps the battery's result of `spec` with what it was run on, stamped with this engine's
+    /// revision. `bars`, `asks` and `funding` are the data the battery was given.
     pub fn new(
-        strategy: &str,
-        plan: &TestPlan,
-        rule: &VerdictRule,
-        instrument: td_core::Instrument,
+        spec: &crate::BatterySpec,
         battery: BatteryResult,
         bars: &[td_core::Candle],
+        asks: &[td_core::Candle],
         funding: &[(Millis, f64)],
     ) -> Result<PlanRun, EngineError> {
-        let config = plan.backtest_config(strategy, instrument);
+        let config = spec
+            .plan
+            .backtest_config(spec.strategy, spec.instrument.clone());
         Ok(PlanRun {
-            strategy: strategy.to_string(),
-            data_fingerprint: config_fingerprint(&config, bars, funding)?,
+            strategy: spec.strategy.to_string(),
+            data_fingerprint: config_fingerprint(&config, bars, asks, funding)?,
             config,
-            plan: plan.clone(),
-            rule: *rule,
+            plan: spec.plan.clone(),
+            rule: *spec.rule,
             engine_version: env!("CARGO_PKG_VERSION").to_string(),
             engine_revision: ENGINE_REVISION,
             battery,

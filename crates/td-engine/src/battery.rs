@@ -9,13 +9,18 @@
 //!    If any of them fails, the verdict is `invalid` and nothing else runs.
 //! 2. **The sweep** over the full period, for the parameter plateau (R5).
 //! 3. **R1**, the rolling walk-forward, stitched: the out-of-sample curve every later line is
-//!    judged on.
+//!    judged on. Then I2 and I3 again on each parameter set the walk-forward chose, the plan's
+//!    backtest with those parameters over the same period, since the verdict rests on them: a
+//!    plan whose fixed parameters place no orders passes I3 on its own backtest vacuously. Each
+//!    line keeps the worst result over every set checked, and a failure there makes the verdict
+//!    `invalid` too; the steps after the statistics are then skipped.
 //! 4. **The statistics that need no further runs:** R2, R5, R7 (a block bootstrap of the daily
 //!    returns), R8 (where the profit came from), I4, I5 and the kind rule's inputs.
 //! 5. **R4**, the walk-forward's chosen parameters run again on each test window at
 //!    `cost_stress` times the fees and slippage.
 //! 6. **R6**, the walk-forward again with its windows moved by `start_offsets` different offsets.
-//! 7. **R3**, the luck test, last: the sweep repeated on shuffled bars.
+//! 7. **R3**, the luck test, last: the sweep repeated on shuffled bars. It does not run on a kind
+//!    whose rules have quotes, since it cannot shuffle the asks with the bars yet.
 //!
 //! Steps 5 to 7 run only when their lines could still change the verdict. When the lines before
 //! them already decide it (a sample below the minimum, a failed evidence line, or a failed I5),
@@ -26,11 +31,12 @@
 //!
 //! The battery reports one running total over every run it makes: the three integrity backtests,
 //! every backtest of the sweep, of the walk-forward's train sweeps, of R6's walk-forwards and of
-//! R3's sweeps, and R4's runs. (The tester's own extra runs, a sweep's best run again and a
-//! walk-forward's test runs, are not reported by it and so not counted.) The total is known before
-//! anything runs. On a full run every count from 1 to the total is reported once; when steps are
-//! skipped, or a walk-forward or the luck test stops early, the count jumps ahead and the battery
-//! reports the total itself at the end.
+//! R3's sweeps, R4's runs, and three integrity runs per walk-forward window. A window whose
+//! parameters were already checked counts its three without running them again. (The tester's
+//! own extra runs, a sweep's best run again and a walk-forward's test runs, are not reported by
+//! it and so not counted.) The total is known before anything runs. On a full run every count
+//! from 1 to the total is reported once; when steps are skipped, or a walk-forward or the luck
+//! test stops early, the count jumps ahead and the battery reports the total itself at the end.
 //! (Reports come from the worker threads, so they can arrive slightly out of order.)
 //!
 //! The progress callback is also the cancel signal, as for every tester call: returning
@@ -63,10 +69,10 @@ use crate::verdict::{
 };
 use crate::{
     BacktestConfig, BacktestResult, Criterion, Direction, DrawdownMode, EquityPoint,
-    EvidenceInputs, KindInputs, MAX_RUNS, Order, Outcome, PermutationResult, PermutationSpec,
-    PortfolioBenchmark, Progress, SweepResult, SweepRow, SweepSpec, TestPlan, TesterError, Trade,
-    TradeSide, Verdict, VerdictRule, WalkForwardResult, WalkForwardSpec, combine, evaluate,
-    evaluate_evidence, permutation_test, run, sweep, walk_forward,
+    EvidenceInputs, KindInputs, MAX_RUNS, Order, Outcome, Params, PermutationResult,
+    PermutationSpec, PortfolioBenchmark, Progress, SweepResult, SweepRow, SweepSpec, TestPlan,
+    TesterError, Trade, TradeSide, Verdict, VerdictRule, WalkForwardResult, WalkForwardSpec,
+    combine, evaluate, evaluate_evidence, permutation_test, run, sweep, walk_forward,
 };
 
 /// The seed streams of the battery's seeded steps, derived from its seed.
@@ -262,7 +268,10 @@ pub struct BatterySpec<'a> {
 }
 
 /// Runs the battery of `spec`. `bars` holds the plan's period and may hold warm-up bars before
-/// it; `funding` is `(time, rate)` in any order.
+/// it. `bars`, `asks` and `funding` are the data as [`crate::run`] takes it: `asks` is empty for a
+/// kind whose rules have no quotes, and every run, sweep and walk-forward gets them. The luck test
+/// (R3) cannot shuffle asks with the bars yet (see [`permutation_test`]), so on a kind with quotes
+/// it does not run and its line is inconclusive with a note.
 ///
 /// The instrument must be one of the plan's and the rule must pass its checks. The plan itself is
 /// not checked again with [`TestPlan::validate`]: the registry's test checks every registered
@@ -275,6 +284,7 @@ pub struct BatterySpec<'a> {
 pub fn run_battery(
     spec: &BatterySpec,
     bars: &[Candle],
+    asks: &[Candle],
     funding: &[(Millis, f64)],
     progress: Option<Progress>,
 ) -> Result<BatteryResult, TesterError> {
@@ -321,30 +331,12 @@ pub fn run_battery(
 
     // 1. Integrity: I1 to I3.
     let (open_buckets, dropped_buckets) = bucket_counts(&base, &traded);
-    let first = run(&base, bars, funding)?;
-    meter.tick()?;
-    let again = run(&base, bars, funding)?;
-    meter.tick()?;
     let split = (traded.len() >= 2).then(|| traded[traded.len() / 2].open_time);
-    let prefix_differences = match split {
-        Some(at) => {
-            let half = run(
-                &BacktestConfig {
-                    to: at,
-                    ..base.clone()
-                },
-                bars,
-                funding,
-            )?;
-            Some(prefix_differences(&first.orders, &half.orders, at))
-        }
-        None => None,
-    };
-    meter.tick()?;
-    let integrity_inputs = IntegrityInputs {
+    let base_checks = repeat_and_prefix(&base, bars, asks, funding, split, &mut meter)?;
+    let mut integrity_inputs = IntegrityInputs {
         dropped_share: (open_buckets > 0).then(|| dropped_buckets as f64 / open_buckets as f64),
-        repeat_differences: Some(repeat_differences(&first, &again)),
-        prefix_differences,
+        repeat_differences: Some(base_checks.0),
+        prefix_differences: base_checks.1,
     };
     let integrity = IntegrityReport {
         open_buckets,
@@ -381,7 +373,7 @@ pub fn run_battery(
     }
 
     // 2. The sweep over the full period.
-    let swept = sweep(&sweep_spec, bars, funding, Some(&meter.step()))?;
+    let swept = sweep(&sweep_spec, bars, asks, funding, Some(&meter.step()))?;
     meter.base += per_sweep;
 
     // 3. R1: the rolling walk-forward, stitched.
@@ -392,7 +384,7 @@ pub fn run_battery(
         };
         (None, Some(error))
     } else {
-        match walk_forward(&wf_spec, bars, funding, Some(&meter.step())) {
+        match walk_forward(&wf_spec, bars, asks, funding, Some(&meter.step())) {
             Ok(wf) => (Some(wf), None),
             Err(e @ (TesterError::NoQualifyingRun { .. } | TesterError::InvalidSpec(_))) => {
                 (None, Some(e.to_string()))
@@ -401,6 +393,54 @@ pub fn run_battery(
         }
     };
     meter.base += windows * per_sweep;
+
+    // 3b. I2 and I3 again on each parameter set the walk-forward chose, since the verdict rests
+    // on those and not on the plan's backtest. Each set is checked once; a window that chose a
+    // set already checked counts its three runs without making them.
+    if let Some(wf) = &wf {
+        let mut checked: Vec<(&Params, (usize, Option<usize>))> = vec![(&base.params, base_checks)];
+        for w in &wf.windows {
+            if checked.iter().any(|(p, _)| **p == w.params) {
+                for _ in 0..3 {
+                    meter.tick()?;
+                }
+                continue;
+            }
+            let config = BacktestConfig {
+                params: w.params.clone(),
+                ..base.clone()
+            };
+            let checks = repeat_and_prefix(&config, bars, asks, funding, split, &mut meter)?;
+            checked.push((&w.params, checks));
+        }
+        meter.base += 3 * (windows - wf.windows.len());
+        // The worst result over every set, and the set it came from when that is not the plan's
+        // backtest (the first, which wins a tie).
+        let mut repeat = (base_checks.0, None);
+        let mut prefix = (base_checks.1, None);
+        for &(params, (r, p)) in &checked[1..] {
+            if r > repeat.0 {
+                repeat = (r, Some(params));
+            }
+            if p > prefix.0 {
+                prefix = (p, Some(params));
+            }
+        }
+        integrity_inputs.repeat_differences = Some(repeat.0);
+        integrity_inputs.prefix_differences = prefix.0;
+        result.integrity.inputs = integrity_inputs.clone();
+        criteria = evaluate_integrity(&integrity_inputs);
+        for (id, from) in [("determinism", repeat.1), ("prefix_consistency", prefix.1)] {
+            if let (Some(params), Some(line)) = (from, criteria.iter_mut().find(|c| c.id == id)) {
+                line.note = Some(format!(
+                    "Failed with the parameters the walk-forward chose: {}.",
+                    params_text(params)
+                ));
+            }
+        }
+    } else {
+        meter.base += 3 * windows;
+    }
 
     // 4. The statistics that need no further runs.
     let mut evidence = EvidenceInputs::default();
@@ -537,10 +577,7 @@ pub fn run_battery(
     if let (Some(wf), false) = (&wf, decided) {
         // 5. R4: the chosen parameters on each test window at higher costs.
         let fees = base.fee_override.unwrap_or(instrument.fees);
-        let stressed_fees = FeeSchedule {
-            maker: fees.maker * ev.cost_stress,
-            taker: fees.taker * ev.cost_stress,
-        };
+        let stressed_fees = stressed(fees, ev.cost_stress);
         let mut window_returns = Vec::with_capacity(wf.windows.len());
         let mut level = 1.0f64;
         for w in &wf.windows {
@@ -549,7 +586,7 @@ pub fn run_battery(
                 slippage_bps: w.out_of_sample.config.slippage_bps * ev.cost_stress,
                 ..w.out_of_sample.config.clone()
             };
-            let r = run(&config, bars, funding)?;
+            let r = run(&config, bars, asks, funding)?;
             meter.tick()?;
             let growth = r.equity.last().map_or(1.0, |p| p.equity / cash);
             window_returns.push(growth - 1.0);
@@ -580,7 +617,7 @@ pub fn run_battery(
                 // it, so that bar exists.
                 let mut spec: WalkForwardSpec = wf_spec.clone();
                 spec.sweep.base.to = traded[traded.len() - shift].open_time;
-                match walk_forward(&spec, bars, funding, Some(&meter.step())) {
+                match walk_forward(&spec, bars, asks, funding, Some(&meter.step())) {
                     Ok(r) => offset.oos_return = r.metrics.total_return,
                     Err(
                         e @ (TesterError::NoQualifyingRun { .. } | TesterError::InvalidSpec(_)),
@@ -607,7 +644,19 @@ pub fn run_battery(
             permutations,
             seed: derive_seed(seed, SEED_LUCK),
         };
-        match permutation_test(&spec, bars, funding, Some(&meter.step())) {
+        let luck = if instrument.id.kind.rules().quotes {
+            Err(None)
+        } else {
+            permutation_test(&spec, bars, funding, Some(&meter.step())).map_err(Some)
+        };
+        match luck {
+            Err(None) => {
+                result.luck_note = Some(
+                    "The luck test does not run on a market with quotes yet: it shuffles the bars \
+                     and cannot shuffle the asks with them."
+                        .into(),
+                );
+            }
             Ok(p) => {
                 evidence.luck_p = Some(p.p_value);
                 let smallest = 1.0 / (p.qualified_copies as f64 + 1.0);
@@ -620,17 +669,17 @@ pub fn run_battery(
                 }
                 result.permutation = Some(p);
             }
-            Err(TesterError::Cancelled) => {
+            Err(Some(TesterError::Cancelled)) => {
                 result.luck_note = Some(
                     "The luck test was cancelled, so it gave no p-value; run the battery again \
                      to complete it."
                         .into(),
                 );
             }
-            Err(e @ TesterError::NoQualifyingRun { .. }) => {
+            Err(Some(e @ TesterError::NoQualifyingRun { .. })) => {
                 result.luck_note = Some(format!("The luck test could not run: {e}."));
             }
-            Err(e) => return Err(e),
+            Err(Some(e)) => return Err(e),
         }
         meter.base += per_sweep * (permutations + 1);
     }
@@ -729,6 +778,7 @@ fn layout(
     let total = 3
         + per_sweep
         + windows * per_sweep
+        + 3 * windows
         + windows
         + offset_windows.iter().sum::<usize>() * per_sweep
         + per_sweep * (permutations + 1);
@@ -810,6 +860,60 @@ fn bucket_counts(config: &BacktestConfig, traded: &[Candle]) -> (usize, usize) {
         t += step;
     }
     (open, dropped)
+}
+
+/// R4's fees: every fee of `fees`, the per-unit commission too, times `multiplier`.
+fn stressed(fees: FeeSchedule, multiplier: f64) -> FeeSchedule {
+    FeeSchedule {
+        maker: fees.maker * multiplier,
+        taker: fees.taker * multiplier,
+        per_unit: fees.per_unit * multiplier,
+    }
+}
+
+/// I2 and I3 on one backtest, in three counted runs: the backtest twice, then once on the bars
+/// before `split` alone. Returns I2's and I3's differences; I3's is `None` without a split.
+fn repeat_and_prefix(
+    config: &BacktestConfig,
+    bars: &[Candle],
+    asks: &[Candle],
+    funding: &[(Millis, f64)],
+    split: Option<Millis>,
+    meter: &mut Meter,
+) -> Result<(usize, Option<usize>), TesterError> {
+    let first = run(config, bars, asks, funding)?;
+    meter.tick()?;
+    let again = run(config, bars, asks, funding)?;
+    meter.tick()?;
+    let prefix = match split {
+        Some(at) => {
+            let half = run(
+                &BacktestConfig {
+                    to: at,
+                    ..config.clone()
+                },
+                bars,
+                asks,
+                funding,
+            )?;
+            Some(prefix_differences(&first.orders, &half.orders, at))
+        }
+        None => None,
+    };
+    meter.tick()?;
+    Ok((repeat_differences(&first, &again), prefix))
+}
+
+/// A parameter set as `name = value` pairs, for a note.
+fn params_text(params: &Params) -> String {
+    match serde_json::to_value(params) {
+        Ok(serde_json::Value::Object(map)) => map
+            .iter()
+            .map(|(name, value)| format!("{name} = {value}"))
+            .collect::<Vec<_>>()
+            .join(", "),
+        _ => format!("{params:?}"),
+    }
 }
 
 /// I2: 0 when the two runs have identical fills and equity, 1 otherwise.
@@ -1107,6 +1211,7 @@ mod tests {
             fees: FeeSchedule {
                 maker: 0.001,
                 taker: 0.002,
+                per_unit: 0.0,
             },
         }
     }
@@ -1149,7 +1254,7 @@ mod tests {
             })
             .collect();
         let config = test_config();
-        let a = run(&config, &bars, &[]).unwrap();
+        let a = run(&config, &bars, &[], &[]).unwrap();
         assert!(!a.fills.is_empty());
         assert_eq!(repeat_differences(&a, &a.clone()), 0);
 
@@ -1160,6 +1265,73 @@ mod tests {
         let mut fills = a.clone();
         fills.fills[0].price += 0.01;
         assert_eq!(repeat_differences(&a, &fills), 1);
+    }
+
+    /// A strategy that never trades with its defaults passes I2 and I3 on the plan's backtest
+    /// vacuously. The walk-forward chooses its one swept value, which trades and fills
+    /// differently on every run, and the checks on that set make the verdict `invalid`. Every
+    /// window chooses the same set, so it is checked once and the count still reaches the total
+    /// one run at a time.
+    #[test]
+    fn i2_and_i3_also_check_the_parameters_the_walk_forward_chose() {
+        let entry = crate::find_strategy("test_unrepeatable").unwrap();
+        let plan = entry.plan;
+        let step = plan.timeframe.duration_ms();
+        let count = ((plan.period.to - plan.period.from) / step) as usize;
+        let bars: Vec<Candle> = (0..count)
+            .map(|i| {
+                let close = 100.0 + 10.0 * ((i as f64) / 15.0).sin();
+                Candle {
+                    open_time: plan.period.from + i as Millis * step,
+                    open: close,
+                    high: close * 1.001,
+                    low: close * 0.999,
+                    close,
+                    volume: 1.0,
+                    quote_volume: close,
+                }
+            })
+            .collect();
+        let instrument = test_instrument();
+        let spec = BatterySpec {
+            strategy: entry.name,
+            plan: &plan,
+            rule: &entry.rule,
+            instrument: &instrument,
+            seed: 7,
+        };
+        let calls = std::sync::Mutex::new(Vec::new());
+        let progress = |done, total| {
+            calls.lock().unwrap().push((done, total));
+            ControlFlow::Continue(())
+        };
+        let r = run_battery(&spec, &bars, &[], &[], Some(&progress)).unwrap();
+
+        let wf = r.walk_forward.as_ref().unwrap();
+        assert_eq!(wf.windows.len(), 4);
+        let chosen = Params::new().with("trade", crate::ParamValue::Bool(true));
+        assert!(wf.windows.iter().all(|w| w.params == chosen));
+        assert_eq!(r.verdict.state, crate::VerdictState::Invalid);
+        let line = |id: &str| r.verdict.criteria.iter().find(|c| c.id == id).unwrap();
+        for id in ["determinism", "prefix_consistency"] {
+            assert_eq!(line(id).outcome, Outcome::Fail, "{id}");
+            assert_eq!(
+                line(id).note.as_deref(),
+                Some("Failed with the parameters the walk-forward chose: trade = true.")
+            );
+        }
+        assert_eq!(line("dropped_buckets").outcome, Outcome::Pass);
+        assert_eq!(r.integrity.inputs.repeat_differences, Some(1));
+        assert!(r.integrity.inputs.prefix_differences > Some(0));
+
+        // 3 integrity runs, 1 for the sweep, 4 train sweeps of 1 and 3 per window are counted
+        // one at a time; the later steps, which the failed lines leave nothing to decide, are
+        // skipped and the count jumps to the total.
+        let calls = calls.into_inner().unwrap();
+        assert!(calls.iter().all(|&(_, total)| total == r.runs));
+        let mut done: Vec<usize> = calls.iter().map(|&(d, _)| d).collect();
+        done.sort_unstable();
+        assert_eq!(done, (1..=20).chain([r.runs]).collect::<Vec<_>>());
     }
 
     /// A row of a hand-built 3 x 3 sweep: its grid coordinates, its objective (Sharpe or max
@@ -1273,6 +1445,23 @@ mod tests {
         // No qualified best: no plateau.
         let none = vec![row([0, 0], None, 0.1), row([0, 1], None, 0.1)];
         assert_eq!(plateau(&swept(none), Sharpe, Direction::Maximize), None);
+    }
+
+    #[test]
+    fn the_cost_stress_multiplies_every_fee_the_per_unit_commission_too() {
+        let fees = FeeSchedule {
+            maker: 0.001,
+            taker: 0.002,
+            per_unit: 0.000_035,
+        };
+        assert_eq!(
+            stressed(fees, 2.0),
+            FeeSchedule {
+                maker: 0.002,
+                taker: 0.004,
+                per_unit: 0.000_07,
+            }
+        );
     }
 
     #[test]

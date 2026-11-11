@@ -61,12 +61,35 @@ impl fmt::Display for InstrumentId {
     }
 }
 
-/// Trading fees as fractions of notional: 0.001 means 0.1%.
+/// Trading fees. A fill pays `price * qty * rate + qty * per_unit`, where the rate is the maker or
+/// taker fraction of notional (0.001 means 0.1%) and `per_unit` a commission per unit of the base
+/// asset, in the quote currency.
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct FeeSchedule {
     pub maker: f64,
     pub taker: f64,
+    /// Commission per unit of the base asset on every fill, in the quote currency, as FX brokers
+    /// charge. Left out of saved JSON when it is zero, the default.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub per_unit: f64,
+}
+
+impl FeeSchedule {
+    /// The fee on a fill of `qty` at `price` paying `rate` of notional. The per-unit term is added
+    /// only when it is set, so a schedule without one gives exactly `price * qty * rate`.
+    pub fn fee(&self, price: f64, qty: f64, rate: f64) -> f64 {
+        let fee = price * qty * rate;
+        if self.per_unit == 0.0 {
+            fee
+        } else {
+            fee + qty * self.per_unit
+        }
+    }
+}
+
+fn is_zero(x: &f64) -> bool {
+    *x == 0.0
 }
 
 /// Which way [`Instrument::round_price`] moves a price that is not on a tick.
@@ -235,6 +258,7 @@ mod tests {
             fees: FeeSchedule {
                 maker: 0.0002,
                 taker: 0.0005,
+                per_unit: 0.0,
             },
         }
     }
@@ -496,5 +520,29 @@ mod tests {
             assert_eq!(serde_json::from_str::<InstrumentKind>(&json).unwrap(), kind);
         }
         assert!(serde_json::from_str::<InstrumentKind>("\"forex\"").is_err());
+    }
+
+    #[test]
+    fn a_zero_per_unit_commission_stays_out_of_json_and_out_of_the_fee() {
+        let fees = btc_perp().fees;
+        let json = serde_json::to_string(&fees).unwrap();
+        assert!(!json.contains("per_unit"), "{json}");
+        assert_eq!(serde_json::from_str::<FeeSchedule>(&json).unwrap(), fees);
+        // Exactly the rate's fee, bit for bit.
+        assert_eq!(
+            fees.fee(65_000.1, 0.003, fees.taker),
+            65_000.1 * 0.003 * fees.taker
+        );
+
+        let fx = FeeSchedule {
+            maker: 0.0,
+            taker: 0.0,
+            per_unit: 0.0035,
+        };
+        let json = serde_json::to_string(&fx).unwrap();
+        assert!(json.contains("\"per_unit\":0.0035"), "{json}");
+        assert_eq!(serde_json::from_str::<FeeSchedule>(&json).unwrap(), fx);
+        // 10 000 units at 0.0035 a unit: 35.
+        assert!((fx.fee(150.0, 10_000.0, fx.taker) - 35.0).abs() < 1e-9);
     }
 }

@@ -337,8 +337,11 @@ fn execute(
             }
             std::ops::ControlFlow::Continue(())
         };
-        let outcome =
-            own_pool(|| td_engine::run_battery(&spec, &data.bars, &data.funding, Some(&progress)));
+        // No asks, as the backtest and tester jobs pass none: the data check only refuses a month
+        // of a kind with quotes whose file has no ask prices.
+        let outcome = own_pool(|| {
+            td_engine::run_battery(&spec, &data.bars, &[], &data.funding, Some(&progress))
+        });
         let battery = match outcome {
             Ok(Ok(battery)) => battery,
             Ok(Err(TesterError::Cancelled)) => return Err(cancelled(done)),
@@ -414,12 +417,10 @@ fn save_plan_run(
         complete,
     };
     let run = PlanRun::new(
-        entry.name,
-        &entry.plan,
-        &entry.rule,
-        instrument.clone(),
+        &battery_spec(entry, instrument),
         battery,
         &data.bars,
+        &[],
         &data.funding,
     )
     .map_err(|e| ApiError::internal(e.to_string()))?;

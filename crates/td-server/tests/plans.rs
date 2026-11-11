@@ -65,6 +65,7 @@ fn instrument(kind: InstrumentKind) -> Instrument {
         fees: FeeSchedule {
             maker: 0.0002,
             taker: 0.0005,
+            per_unit: 0.0,
         },
     }
 }

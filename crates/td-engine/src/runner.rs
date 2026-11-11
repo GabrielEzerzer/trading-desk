@@ -2,11 +2,15 @@
 
 use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
-use td_core::{Candle, FeeSchedule, Fill, Instrument, Millis, OrderId, Side, Timeframe};
+use std::collections::{HashMap, HashSet};
+
+use td_core::{
+    Candle, FeeSchedule, Fill, Instrument, InstrumentKind, Millis, OrderId, Side, Timeframe,
+};
 
 use crate::metrics::{self, DAY_MS, DAYS_PER_YEAR, EquitySeries, MetricsReport};
 use crate::risk::{self, EquityRange, Intrabar};
-use crate::session::{funding_ranges, sorted_funding};
+use crate::session::{check_quote, funding_ranges, sorted_funding};
 use crate::{
     BarFunding, CLOSE_OUT_TAG, CandleFillModel, EngineError, EquityPoint, Order, Params, Portfolio,
     Session, SessionConfig, Trade, attach_stops, build_strategy, build_trades,
@@ -67,12 +71,12 @@ pub struct BacktestConfig {
     /// Replaces the instrument's fee schedule when set.
     #[serde(default)]
     pub fee_override: Option<FeeSchedule>,
-    /// The largest perpetual position allowed, as its notional over equity: 1.0 means 1x, the
-    /// default. At 1x a long is liquidated only near a price of zero and a short only once the
-    /// price has about doubled (see [`Session::on_bar`]). Orders that would take the position
-    /// over it are rejected when submitted; orders that reduce the position are always allowed
-    /// (see [`crate::Context::submit`]). Spot ignores it. Left out of the saved result when it is
-    /// the default.
+    /// The largest position allowed on a margined kind (perpetual, FX), as its notional over
+    /// equity: 1.0 means 1x, the default. On a perpetual at 1x a long is liquidated only near a
+    /// price of zero and a short only once the price has about doubled (see [`Session::on_bar`]).
+    /// Orders that would take the position over it are rejected when submitted; orders that
+    /// reduce the position are always allowed (see [`crate::Context::submit`]). A kind without
+    /// margin, such as spot, ignores it. Left out of the saved result when it is the default.
     #[serde(
         default = "default_max_leverage",
         skip_serializing_if = "is_default_max_leverage"
@@ -152,8 +156,9 @@ fn is_default_max_leverage(max_leverage: &f64) -> bool {
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Benchmark {
-    /// Quantity bought at the first bar's open: all starting cash, after the taker fee, rounded
-    /// down to the lot size. In a walk-forward, the first test window's purchase.
+    /// Quantity bought at the first bar's open: all starting cash, after the taker fee and any
+    /// per-unit commission, rounded down to the lot size. In a walk-forward, the first test
+    /// window's purchase.
     pub qty: f64,
     /// The first bar's open with slippage, rounded up to the tick. In a walk-forward, the first
     /// test window's.
@@ -192,7 +197,7 @@ pub struct BacktestResult {
     pub engine_version: String,
     /// The [`ENGINE_REVISION`] that produced the result.
     pub engine_revision: u32,
-    /// SHA-256 of the bars (warm-up bars first) and funding the run used; see
+    /// SHA-256 of the bars (warm-up bars first), asks and funding the run used; see
     /// [`data_fingerprint`].
     pub data_fingerprint: String,
     /// Equity at each bar's close.
@@ -223,9 +228,15 @@ pub struct Rerun {
 /// Runs a backtest.
 ///
 /// `bars` may cover more than the configured range; only bars inside `from..to` are traded, and
-/// bars inside `warmup_from..from` warm the strategy up first. `funding` is `(time, rate)` in any
-/// order. An event in a gap between traded bars is charged at the next bar's open, like one due at
-/// that open; events before the first traded bar or from the last traded bar's end on are ignored.
+/// bars inside `warmup_from..from` warm the strategy up first. `asks` is the ask series beside
+/// `bars`, which then hold the bid, matched to them by open time: empty for a kind whose rules have
+/// no quotes, and for a kind with quotes one for every bar used (warm-up bars too), never filled in
+/// from the bid. An ask that matches no bar in `bars`, or a second ask at one time, is an error, and
+/// so is one that is not a valid candle or is below its bid (see [`EngineError::CrossedQuote`]), on
+/// a warm-up bar as on a traded one.
+/// `funding` is `(time, rate)` in any order. An event in a gap between traded bars is charged at
+/// the next bar's open, like one due at that open; events before the first traded bar or from the
+/// last traded bar's end on are ignored.
 ///
 /// The strategy is built through the registry and run on a [`Session`], then the trade list,
 /// metrics and buy-and-hold benchmark are derived from the session's record.
@@ -235,9 +246,16 @@ pub struct Rerun {
 pub fn run(
     config: &BacktestConfig,
     bars: &[Candle],
+    asks: &[Candle],
     funding: &[(Millis, f64)],
 ) -> Result<BacktestResult, EngineError> {
-    let (warmup, bars) = select_bars(config, bars)?;
+    let (warmup, traded) = select_bars(config, bars)?;
+    let mut used_asks = match_asks(config.instrument.id.kind, bars, asks, &warmup)?;
+    let traded_asks = match_asks(config.instrument.id.kind, bars, asks, &traded)?;
+    // The session checks each traded bar's ask as it is fed, but warm-up bars are fed without one.
+    check_quotes(&warmup, &used_asks)?;
+    used_asks.extend_from_slice(&traded_asks);
+    let bars = traded;
     let tf = config.timeframe;
     let funding = sorted_funding(funding);
     let ranges = funding_ranges(tf, &bars, &funding);
@@ -257,9 +275,9 @@ pub fn run(
     let mut used_funding = Vec::new();
     // The bar whose close decides the close-out, so it fills at the last bar's open.
     let close_out_at = bars.len().checked_sub(2).filter(|_| config.close_at_end);
-    for (i, (bar, range)) in bars.iter().zip(&ranges).enumerate() {
+    for (i, ((bar, ask), range)) in bars.iter().zip(&traded_asks).zip(&ranges).enumerate() {
         let events = &funding[range.clone()];
-        session.on_bar(*bar, events)?;
+        session.on_bar_with_ask(*bar, *ask, events)?;
         positions.push(session.portfolio().position());
         used_funding.extend_from_slice(events);
         if close_out_at == Some(i) {
@@ -268,13 +286,14 @@ pub fn run(
     }
 
     let fills = session.fills().to_vec();
-    let mut trades = build_trades(&fills, &bars, session.bar_funding());
+    let mut trades = build_trades(&fills, &bars, &traded_asks, session.bar_funding());
     attach_stops(&mut trades, &bars, session.bar_stops());
     mark_forced_closes(&mut trades, &fills, session.orders());
     let series = EquitySeries::new(config.starting_cash, session.equity(), tf);
     let intrabar = risk::intrabar(
         config.starting_cash,
         &bars,
+        &traded_asks,
         session.equity(),
         &fills,
         session.bar_funding(),
@@ -287,15 +306,24 @@ pub fn run(
         &fills,
         session.portfolio().funding_paid(),
     );
-    let benchmark = benchmark(config, &bars, &funding, &ranges, &series, &report);
+    let benchmark = benchmark(
+        config,
+        &bars,
+        &traded_asks,
+        &funding,
+        &ranges,
+        &series,
+        &report,
+    );
     let mut used_bars = warmup;
     used_bars.extend_from_slice(&bars);
+    let used_asks: Vec<Candle> = used_asks.into_iter().flatten().collect();
 
     Ok(BacktestResult {
         config: config.clone(),
         engine_version: env!("CARGO_PKG_VERSION").to_string(),
         engine_revision: ENGINE_REVISION,
-        data_fingerprint: data_fingerprint(&used_bars, &used_funding),
+        data_fingerprint: data_fingerprint(&used_bars, &used_asks, &used_funding),
         equity: session.equity().to_vec(),
         orders: session.orders().to_vec(),
         fills,
@@ -324,6 +352,58 @@ fn mark_forced_closes(trades: &mut [Trade], fills: &[Fill], orders: &[Order]) {
             t.force_closed = true;
         }
     }
+}
+
+/// The ask of each of `used`, from `asks` matched by open time, or `None` for every bar when the
+/// kind has no quotes. `all` is every bar given to the run, which every ask must match. Errors for
+/// asks given on a kind without quotes, an ask that matches no bar in `all`, two asks with one open
+/// time, and a bar in `used` without an ask on a kind with quotes.
+pub(crate) fn match_asks(
+    kind: InstrumentKind,
+    all: &[Candle],
+    asks: &[Candle],
+    used: &[Candle],
+) -> Result<Vec<Option<Candle>>, EngineError> {
+    if !kind.rules().quotes {
+        if !asks.is_empty() {
+            return Err(EngineError::AsksWithoutQuotes { kind });
+        }
+        return Ok(vec![None; used.len()]);
+    }
+    let times: HashSet<Millis> = all.iter().map(|b| b.open_time).collect();
+    if let Some(ask) = asks.iter().find(|a| !times.contains(&a.open_time)) {
+        return Err(EngineError::UnmatchedAsk {
+            time: ask.open_time,
+        });
+    }
+    let mut by_time = HashMap::with_capacity(asks.len());
+    for ask in asks {
+        if by_time.insert(ask.open_time, *ask).is_some() {
+            return Err(EngineError::DuplicateAsk {
+                time: ask.open_time,
+            });
+        }
+    }
+    used.iter()
+        .map(|bar| match by_time.get(&bar.open_time) {
+            Some(ask) => Ok(Some(*ask)),
+            None => Err(EngineError::MissingAsk {
+                time: bar.open_time,
+                kind,
+            }),
+        })
+        .collect()
+}
+
+/// Checks the ask that [`match_asks`] matched to each of `bars`, where there is one, as the session
+/// checks a bar's ask (see [`check_quote`]).
+fn check_quotes(bars: &[Candle], asks: &[Option<Candle>]) -> Result<(), EngineError> {
+    for (bar, ask) in bars.iter().zip(asks) {
+        if let Some(ask) = ask {
+            check_quote(bar, ask)?;
+        }
+    }
+    Ok(())
 }
 
 /// The warm-up bars (`warmup_from..from`) and the traded bars (`from..to`) of `bars`, after
@@ -359,29 +439,38 @@ pub(crate) fn select_bars(
 
 /// The fingerprint [`run`] would record for `config` on this data, without running it. A tester
 /// result's `data_fingerprint` is this over its base configuration, so comparing it with a saved
-/// run's tells whether the data changed since, as [`rerun`] does for a backtest.
+/// run's tells whether the data changed since, as [`rerun`] does for a backtest. It refuses the
+/// asks [`run`] refuses, on warm-up and traded bars alike.
 pub fn config_fingerprint(
     config: &BacktestConfig,
     bars: &[Candle],
+    asks: &[Candle],
     funding: &[(Millis, f64)],
 ) -> Result<String, EngineError> {
     let (mut used, traded) = select_bars(config, bars)?;
+    let mut used_asks = match_asks(config.instrument.id.kind, bars, asks, &used)?;
+    used_asks.extend(match_asks(config.instrument.id.kind, bars, asks, &traded)?);
+    used.extend_from_slice(&traded);
+    // No session runs here to check the traded bars' asks, so every ask is checked.
+    check_quotes(&used, &used_asks)?;
+    let used_asks: Vec<Candle> = used_asks.into_iter().flatten().collect();
     let funding = sorted_funding(funding);
     let used_funding: Vec<(Millis, f64)> = funding_ranges(config.timeframe, &traded, &funding)
         .into_iter()
         .flat_map(|r| funding[r].iter().copied())
         .collect();
-    used.extend_from_slice(&traded);
-    Ok(data_fingerprint(&used, &used_funding))
+    Ok(data_fingerprint(&used, &used_asks, &used_funding))
 }
 
-/// Runs a saved result's configuration again on `bars` and `funding`.
+/// Runs a saved result's configuration again on `bars`, `asks` and `funding`, as [`run`] takes
+/// them.
 pub fn rerun(
     saved: &BacktestResult,
     bars: &[Candle],
+    asks: &[Candle],
     funding: &[(Millis, f64)],
 ) -> Result<Rerun, EngineError> {
-    let result = run(&saved.config, bars, funding)?;
+    let result = run(&saved.config, bars, asks, funding)?;
     let fingerprint_matches = result.data_fingerprint == saved.data_fingerprint;
     let engine_matches = result.engine_revision == saved.engine_revision;
     Ok(Rerun {
@@ -408,29 +497,32 @@ pub(crate) struct Held {
     pub(crate) intrabar: Intrabar,
 }
 
-/// [`hold`] over `bars`, the bars of `config`'s range, with `funding` in any order and the same
-/// rules as [`run`]: an event in a gap between bars is charged at the next bar's open, and events
-/// before the first bar or from the last bar's end on are ignored.
+/// [`hold`] over `bars`, the bars of `config`'s range, with their `asks` from [`match_asks`] and
+/// `funding` in any order and the same rules as [`run`]: an event in a gap between bars is charged
+/// at the next bar's open, and events before the first bar or from the last bar's end on are
+/// ignored.
 pub(crate) fn hold_over(
     config: &BacktestConfig,
     bars: &[Candle],
+    asks: &[Option<Candle>],
     funding: &[(Millis, f64)],
 ) -> Held {
     let funding = sorted_funding(funding);
     let ranges = funding_ranges(config.timeframe, bars, &funding);
-    hold(config, bars, &funding, &ranges)
+    hold(config, bars, asks, &funding, &ranges)
 }
 
 /// Buy and hold over `bars`, compared with the strategy: see [`hold`] and [`compare`].
 fn benchmark(
     config: &BacktestConfig,
     bars: &[Candle],
+    asks: &[Option<Candle>],
     funding: &[(Millis, f64)],
     ranges: &[std::ops::Range<usize>],
     strategy_series: &EquitySeries,
     strategy_report: &MetricsReport,
 ) -> Benchmark {
-    let held = hold(config, bars, funding, ranges);
+    let held = hold(config, bars, asks, funding, ranges);
     let series = EquitySeries::new(config.starting_cash, &held.equity, config.timeframe);
     let report = metrics::report_with(
         &series,
@@ -486,13 +578,16 @@ pub(crate) fn compare(
     }
 }
 
-/// Buys at the first bar's open with all starting cash (taker fee, the run's slippage) and holds
-/// to the last close, paying funding on a perpetual like the session does: funding due at a bar's
-/// open or in the gap before it on the position held going into the bar, at the open price, so
-/// none at the first open, and funding due later in the bar at the close.
+/// Buys at the first bar's open with all starting cash (taker fee, per-unit commission, the run's
+/// slippage) and holds to the last close, paying funding on a perpetual like the session does:
+/// funding due at a bar's open or in the gap before it on the position held going into the bar,
+/// at the open price, so none at the first open, and funding due later in the bar at the close.
+/// With an ask series the purchase is at the first ask open, and the long is marked at the bid
+/// closes, as the session marks a long. `asks` holds each bar's ask, `None` without quotes.
 fn hold(
     config: &BacktestConfig,
     bars: &[Candle],
+    asks: &[Option<Candle>],
     funding: &[(Millis, f64)],
     ranges: &[std::ops::Range<usize>],
 ) -> Held {
@@ -502,8 +597,9 @@ fn hold(
         slippage_bps: config.slippage_bps,
     };
     let first = bars[0];
-    let price = model.slip(first.open, Side::Buy, inst);
-    let qty = inst.round_qty(config.starting_cash / (price * (1.0 + fees.taker)));
+    let entry = asks.first().copied().flatten().unwrap_or(first);
+    let price = model.slip(entry.open, Side::Buy, inst);
+    let qty = inst.round_qty(config.starting_cash / (price * (1.0 + fees.taker) + fees.per_unit));
     let mut portfolio = Portfolio::new(inst.id.kind, config.starting_cash);
     let mut fills = Vec::new();
     let mut equity = Vec::with_capacity(bars.len());
@@ -523,7 +619,7 @@ fn hold(
                 time: first.open_time,
                 price,
                 qty,
-                fee: price * qty * fees.taker,
+                fee: fees.fee(price, qty, fees.taker),
                 liquidity: td_core::Liquidity::Taker,
             };
             portfolio.apply_fill(fill.side, fill.qty, fill.price, fill.fee);
@@ -541,8 +637,15 @@ fn hold(
         positions.push(portfolio.position());
     }
 
-    let trades = build_trades(&fills, bars, &bar_funding);
-    let intrabar = risk::intrabar(config.starting_cash, bars, &equity, &fills, &bar_funding);
+    let trades = build_trades(&fills, bars, asks, &bar_funding);
+    let intrabar = risk::intrabar(
+        config.starting_cash,
+        bars,
+        asks,
+        &equity,
+        &fills,
+        &bar_funding,
+    );
     Held {
         qty: fills.first().map_or(0.0, |f| f.qty),
         entry_price: price,
@@ -591,23 +694,31 @@ fn annualised_alpha_beta(times: &[Millis], returns: &(Vec<f64>, Vec<f64>)) -> Op
     metrics::alpha_beta(s, b, s.len() as f64 / years)
 }
 
-/// SHA-256, as lowercase hex, over the bars and funding in a fixed byte form: the bar count as a
-/// little-endian u64, then per bar the open time as a little-endian i64 and open, high, low,
+/// SHA-256, as lowercase hex, over the bars, asks and funding in a fixed byte form: the bar count
+/// as a little-endian u64, then per bar the open time as a little-endian i64 and open, high, low,
 /// close, volume and quote volume as the little-endian bits of each f64; then the funding count
-/// and per event its time and the bits of its rate, in time order.
-pub fn data_fingerprint(bars: &[Candle], funding: &[(Millis, f64)]) -> String {
+/// and per event its time and the bits of its rate, in time order. When there are asks, their
+/// count and each ask in the same form as a bar follow. Without asks nothing is added, so a
+/// fingerprint from before asks existed is unchanged.
+pub fn data_fingerprint(bars: &[Candle], asks: &[Candle], funding: &[(Millis, f64)]) -> String {
     let mut h = Sha256::new();
-    h.update((bars.len() as u64).to_le_bytes());
-    for b in bars {
-        h.update(b.open_time.to_le_bytes());
-        for v in [b.open, b.high, b.low, b.close, b.volume, b.quote_volume] {
-            h.update(v.to_bits().to_le_bytes());
+    let candles = |h: &mut Sha256, candles: &[Candle]| {
+        h.update((candles.len() as u64).to_le_bytes());
+        for b in candles {
+            h.update(b.open_time.to_le_bytes());
+            for v in [b.open, b.high, b.low, b.close, b.volume, b.quote_volume] {
+                h.update(v.to_bits().to_le_bytes());
+            }
         }
-    }
+    };
+    candles(&mut h, bars);
     h.update((funding.len() as u64).to_le_bytes());
     for &(time, rate) in funding {
         h.update(time.to_le_bytes());
         h.update(rate.to_bits().to_le_bytes());
+    }
+    if !asks.is_empty() {
+        candles(&mut h, asks);
     }
     hex(&h.finalize())
 }

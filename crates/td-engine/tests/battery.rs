@@ -1,14 +1,15 @@
 //! The strategy test battery end to end on synthetic four-hour bars: a planted edge reaches
 //! `trade`, noise does not, a short range gives `not_enough_evidence`, missing bars give
 //! `invalid`, a cancel in the luck test gives an inconclusive luck line, the same seed gives the
-//! same result at any thread count, and the progress count adds up.
+//! same result at any thread count, the progress count adds up, and on a market with quotes the
+//! asks reach the runs.
 
 mod common;
 
 use std::ops::ControlFlow;
 use std::sync::Mutex;
 
-use td_core::{Candle, Instrument, Millis, Timeframe};
+use td_core::{Candle, Instrument, InstrumentKind, Millis, Timeframe};
 use td_engine::{
     BatteryResult, BatterySpec, Direction, DrawdownMode, EvidenceSettings, FirmLimits,
     HighRiskLimits, Layer, MAX_RUNS, Metric, Objective, Outcome, ParamAxis, ParamSpace, ParamValue,
@@ -196,7 +197,7 @@ fn battery(
         instrument: &instrument,
         seed,
     };
-    run_battery(&spec, bars, &[], progress)
+    run_battery(&spec, bars, &[], &[], progress)
 }
 
 fn line<'a>(r: &'a BatteryResult, id: &str) -> &'a td_engine::Criterion {
@@ -211,6 +212,7 @@ fn line<'a>(r: &'a BatteryResult, id: &str) -> &'a td_engine::Criterion {
 fn full_total(windows: usize, offset_windows: usize) -> usize {
     3 + PER_SWEEP
         + windows * PER_SWEEP
+        + 3 * windows
         + windows
         + offset_windows * PER_SWEEP
         + PER_SWEEP * (PERMUTATIONS + 1)
@@ -621,4 +623,98 @@ fn a_luck_test_over_the_run_limit_is_refused_before_anything_runs() {
         })
     );
     assert_eq!(calls.into_inner().unwrap(), 0);
+}
+
+/// 340 days of the planted edge on FX, without the four-hour bars that lie wholly in the weekend's
+/// closed hours (Friday 22:00 to Sunday 22:00 UTC), with asks a constant `spread` above the bars.
+/// 31 of every 42 bars are left, enough for four 45-day test windows after a 60-day train window.
+fn fx_bars(spread: f64) -> (Vec<Candle>, Vec<Candle>) {
+    let bars: Vec<Candle> = edge_bars(340)
+        .into_iter()
+        .filter(|b| {
+            let end = b.open_time + BAR;
+            let closed = InstrumentKind::Fx.closed_spans(b.open_time, end);
+            !matches!(closed.as_slice(), [span] if *span == (b.open_time..end))
+        })
+        .collect();
+    let asks = bars
+        .iter()
+        .map(|b| Candle {
+            open: b.open + spread,
+            high: b.high + spread,
+            low: b.low + spread,
+            close: b.close + spread,
+            ..*b
+        })
+        .collect();
+    (bars, asks)
+}
+
+fn fx_battery(bars: &[Candle], asks: &[Candle]) -> BatteryResult {
+    let instrument = common::instrument(InstrumentKind::Fx);
+    let mut plan = plan(340);
+    plan.instruments = vec![instrument.id.clone()];
+    let spec = BatterySpec {
+        strategy: "sma_cross",
+        plan: &plan,
+        rule: &cash_rule(),
+        instrument: &instrument,
+        seed: 7,
+    };
+    run_battery(&spec, bars, asks, &[], None).unwrap()
+}
+
+/// The battery runs on FX with its asks: every run fills buys on the ask, so a spread lowers each
+/// swept set's return against the same bars with a zero spread. I1 leaves the closed weekend out of
+/// the buckets, and the luck test, which cannot shuffle asks yet, is inconclusive.
+#[test]
+fn on_a_market_with_quotes_the_asks_reach_every_run() {
+    let (bars, wide) = fx_bars(0.05);
+    let (_, zero) = fx_bars(0.0);
+    let r = fx_battery(&bars, &wide);
+    let flat = fx_battery(&bars, &zero);
+
+    assert_eq!(r.integrity.open_buckets, bars.len());
+    assert_eq!(r.integrity.dropped_buckets, 0);
+    assert_ne!(
+        r.verdict.state,
+        VerdictState::Invalid,
+        "{:#?}",
+        r.verdict.criteria
+    );
+    assert_eq!(r.walk_forward.as_ref().unwrap().windows.len(), 4);
+
+    // The sweep and the walk-forward ran on the asks.
+    let rows = &r.sweep.as_ref().unwrap().rows;
+    let flat_rows = &flat.sweep.as_ref().unwrap().rows;
+    let mut compared = 0;
+    for row in rows
+        .iter()
+        .filter(|row| row.metrics.is_some_and(|m| m.trades > 0))
+    {
+        let same = flat_rows.iter().find(|f| f.index == row.index).unwrap();
+        let ret = |row: &td_engine::SweepRow| row.metrics.unwrap().total_return.unwrap();
+        assert!(ret(row) < ret(same), "set {}", row.index);
+        compared += 1;
+    }
+    assert_eq!(compared, PER_SWEEP);
+    assert_ne!(
+        r.walk_forward.as_ref().unwrap().metrics.total_return,
+        flat.walk_forward.as_ref().unwrap().metrics.total_return
+    );
+
+    // R4 and R6 ran, and the luck test did not.
+    assert!(r.cost_stress.is_some(), "{:#?}", r.verdict.criteria);
+    assert_eq!(r.start_offsets.len(), 8);
+    assert_ne!(r.cost_stress, flat.cost_stress);
+    assert!(r.permutation.is_none());
+    let luck = line(&r, "luck_p");
+    assert_eq!(luck.outcome, Outcome::Inconclusive);
+    assert_eq!(
+        luck.note.as_deref(),
+        Some(
+            "The luck test does not run on a market with quotes yet: it shuffles the bars and \
+             cannot shuffle the asks with them."
+        )
+    );
 }
