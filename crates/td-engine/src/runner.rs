@@ -47,12 +47,12 @@ pub struct BacktestConfig {
     /// Replaces the instrument's fee schedule when set.
     #[serde(default)]
     pub fee_override: Option<FeeSchedule>,
-    /// The largest perpetual position allowed, as its notional over equity: 1.0 means 1x, the
-    /// default. At 1x a long is liquidated only near a price of zero and a short only once the
-    /// price has about doubled (see [`Session::on_bar`]). Orders that would take the position
-    /// over it are rejected when submitted; orders that reduce the position are always allowed
-    /// (see [`crate::Context::submit`]). Spot ignores it. Left out of the saved result when it is
-    /// the default.
+    /// The largest position allowed on a margined kind (perpetual, FX), as its notional over
+    /// equity: 1.0 means 1x, the default. On a perpetual at 1x a long is liquidated only near a
+    /// price of zero and a short only once the price has about doubled (see [`Session::on_bar`]).
+    /// Orders that would take the position over it are rejected when submitted; orders that
+    /// reduce the position are always allowed (see [`crate::Context::submit`]). A kind without
+    /// margin, such as spot, ignores it. Left out of the saved result when it is the default.
     #[serde(
         default = "default_max_leverage",
         skip_serializing_if = "is_default_max_leverage"
@@ -89,7 +89,8 @@ fn is_default_max_leverage(max_leverage: &f64) -> bool {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Benchmark {
     /// Quantity bought at the first bar's open: all starting cash, after the taker fee and any
-    /// per-unit commission, rounded down to the lot size. In a walk-forward, the first test window's purchase.
+    /// per-unit commission, rounded down to the lot size. In a walk-forward, the first test
+    /// window's purchase.
     pub qty: f64,
     /// The first bar's open with slippage, rounded up to the tick. In a walk-forward, the first
     /// test window's.

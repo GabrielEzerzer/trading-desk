@@ -21,7 +21,8 @@ pub enum EngineError {
     #[error("funding rate {rate} at {time} is not a finite number")]
     InvalidFundingRate { time: Millis, rate: f64 },
 
-    #[error("funding was given for a spot instrument")]
+    /// Funding given for a kind whose rules have none (spot, FX). The name is older than FX.
+    #[error("funding was given for a market that has no funding")]
     FundingOnSpot,
 
     #[error("asks were given for a {kind} instrument, which has no separate ask price")]

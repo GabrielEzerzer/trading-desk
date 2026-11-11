@@ -2,8 +2,8 @@ use std::cmp::Ordering;
 
 use serde::{Deserialize, Serialize};
 use td_core::{
-    Candle, FeeSchedule, Fill, Instrument, InstrumentKind, Liquidity, Millis, OrderId,
-    OrderRequest, OrderType, Side, TimeInForce,
+    Candle, FeeSchedule, Fill, Instrument, Liquidity, Millis, OrderId, OrderRequest, OrderType,
+    Side, TimeInForce,
 };
 
 use crate::{FillCheck, FillModel, Portfolio};
@@ -228,7 +228,7 @@ impl<M: FillModel> SimBroker<M> {
             Liquidity::Maker => self.fees.maker,
             Liquidity::Taker => self.fees.taker,
         };
-        if inst.id.kind == InstrumentKind::Spot && req.side == Side::Buy {
+        if !inst.id.kind.rules().margin && req.side == Side::Buy {
             let unit_cost = price * (1.0 + rate) + self.fees.per_unit;
             let cash = book.cash();
             if qty * unit_cost > cash {

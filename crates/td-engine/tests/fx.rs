@@ -648,3 +648,139 @@ fn the_fingerprint_covers_the_asks_and_is_unchanged_without_them() {
         "7e1973b2e1f7195998b82e84290884c5953883179b654faa6d8472066c3a60cf"
     );
 }
+
+/// Runs `script` on FX over `(bid, ask)` one-minute bars with `max_leverage`.
+fn run_script(script: Box<Script>, bars: &[([f64; 4], [f64; 4])], max_leverage: f64) -> Session {
+    let config = SessionConfig {
+        max_leverage,
+        ..fx_config()
+    };
+    let mut s = Session::new(script, usdjpy(), Timeframe::M1, config).unwrap();
+    for (i, (bid, ask)) in bars.iter().enumerate() {
+        let i = i as i64;
+        s.on_bar_with_ask(candle(i, *bid), Some(candle(i, *ask)), &[])
+            .unwrap();
+    }
+    s
+}
+
+#[test]
+fn an_fx_short_is_allowed_from_flat_with_a_protective_stop() {
+    // Flat at bar 0's close, a sell of 1000 with a buy stop at 150.500 above it: spot would refuse
+    // both (no short, no stop on a sell). On FX the sell fills at bar 1's bid open, 150.000, the
+    // position is -1000, and the stop rests as the one open order, a buy.
+    let s = run_fx(
+        vec![(0, Send::WithStop(market(Side::Sell, 1000.0), 150.500))],
+        &[DECIDE, DECIDE],
+    );
+    assert_eq!(fills(&s), vec![(Side::Sell, 150.000, 1000.0)]);
+    assert_eq!(s.portfolio().position(), -1000.0);
+    let open = s.open_orders();
+    assert_eq!(open.len(), 1);
+    assert_eq!(open[0].request.side, Side::Buy);
+    assert_eq!(
+        open[0].request.order_type,
+        OrderType::Stop { trigger: 150.500 }
+    );
+}
+
+#[test]
+fn an_fx_position_is_capped_by_the_leverage_setting() {
+    // Flat with 1 000 000 yen of equity; orders are valued at the decision bar's close, 150.000.
+    // At 1x the cap is 1 000 000: a sell of 6667 would be worth 6667 * 150 = 1 000 050 and is
+    // refused, one of 6666 is worth 999 900 and is accepted, filling at the bid open, 150.000.
+    let (script, log) = Script::new(vec![
+        (0, market(Side::Sell, 6667.0)),
+        (0, market(Side::Sell, 6666.0)),
+    ]);
+    let s = run_script(script, &[DECIDE, DECIDE], 1.0);
+    let log = log.lock().unwrap();
+    let err = log[0].as_ref().unwrap_err();
+    assert!(
+        err.reason.starts_with("over the leverage cap of 1x"),
+        "{}",
+        err.reason
+    );
+    assert!(log[1].is_ok());
+    assert_eq!(fills(&s), vec![(Side::Sell, 150.000, 6666.0)]);
+
+    // At 2x the cap is 2 000 000: a buy of 13 334 would be worth 2 000 100 and is refused, one of
+    // 13 333 is worth 1 999 950 and is accepted. That is more than the cash, which FX does not
+    // check or cut, as it would on spot: it fills whole at the ask open, 150.020.
+    let (script, log) = Script::new(vec![
+        (0, market(Side::Buy, 13_334.0)),
+        (0, market(Side::Buy, 13_333.0)),
+    ]);
+    let s = run_script(script, &[DECIDE, DECIDE], 2.0);
+    let log = log.lock().unwrap();
+    let err = log[0].as_ref().unwrap_err();
+    assert!(
+        err.reason.starts_with("over the leverage cap of 2x"),
+        "{}",
+        err.reason
+    );
+    assert!(log[1].is_ok());
+    assert_eq!(fills(&s), vec![(Side::Buy, 150.020, 13_333.0)]);
+}
+
+#[test]
+fn funding_on_an_fx_session_is_refused() {
+    // FX has no funding: an event inside the bar's minute is an error, not a charge.
+    let mut s = Session::new(Box::new(Plan(vec![])), usdjpy(), Timeframe::M1, fx_config()).unwrap();
+    let (bid, ask) = DECIDE;
+    assert_eq!(
+        s.on_bar_with_ask(candle(0, bid), Some(candle(0, ask)), &[(30_000, 0.0001)]),
+        Err(EngineError::FundingOnSpot)
+    );
+}
+
+#[test]
+fn the_built_in_strategies_short_on_fx() {
+    // Bids falling 0.010 a minute from 150 with asks 0.020 above. With allow_short, the moving
+    // average cross goes short once the fast average is below the slow one, and the Donchian
+    // breakout goes short on a close below the previous lows; each first fill is a sell.
+    let n = 12;
+    let bids: Vec<Candle> = (0..n)
+        .map(|i| {
+            let p = 150.0 - 0.01 * i as f64;
+            candle(i, [p, p + 0.005, p - 0.005, p + 0.002])
+        })
+        .collect();
+    let asks: Vec<Candle> = bids
+        .iter()
+        .map(|b| Candle {
+            open: b.open + 0.02,
+            high: b.high + 0.02,
+            low: b.low + 0.02,
+            close: b.close + 0.02,
+            ..*b
+        })
+        .collect();
+    let short = td_engine::ParamValue::Bool(true);
+    let sma = td_engine::BacktestConfig {
+        params: td_engine::Params::new()
+            .with("fast", td_engine::ParamValue::Int(2))
+            .with("slow", td_engine::ParamValue::Int(4))
+            .with("allow_short", short),
+        ..fx_backtest(n as usize)
+    };
+    let int = td_engine::ParamValue::Int;
+    let donchian = td_engine::BacktestConfig {
+        strategy: "donchian_breakout".into(),
+        params: td_engine::Params::new()
+            .with("entry", int(2))
+            .with("exit", int(2))
+            .with("atr_period", int(2))
+            .with("allow_short", short),
+        ..fx_backtest(n as usize)
+    };
+    for config in [sma, donchian] {
+        let result = td_engine::run(&config, &bids, &asks, &[]).unwrap();
+        assert_eq!(
+            result.fills.first().map(|f| f.side),
+            Some(Side::Sell),
+            "{}",
+            config.strategy
+        );
+    }
+}

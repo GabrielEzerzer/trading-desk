@@ -2,8 +2,8 @@ use std::ops::Range;
 
 use serde::{Deserialize, Serialize};
 use td_core::{
-    Candle, FeeSchedule, Fill, Instrument, InstrumentKind, Liquidity, Millis, OrderId,
-    OrderRequest, OrderType, Rounding, Side, TimeInForce, Timeframe,
+    Candle, FeeSchedule, Fill, Instrument, Liquidity, Millis, OrderId, OrderRequest, OrderType,
+    Rounding, Side, TimeInForce, Timeframe,
 };
 
 use crate::broker::ENTRY_CANCELLED;
@@ -39,8 +39,9 @@ pub struct SessionConfig {
     pub slippage_bps: f64,
     /// Replaces the instrument's fee schedule when set.
     pub fees: Option<FeeSchedule>,
-    /// The largest perpetual position allowed, as its notional over the account's equity: 1.0
-    /// means 1x. Checked when an order is submitted (see [`Context::submit`]). Spot ignores it.
+    /// The largest position allowed on a margined kind (perpetual, FX), as its notional over the
+    /// account's equity: 1.0 means 1x. Checked when an order is submitted (see
+    /// [`Context::submit`]). A kind without margin, such as spot, ignores it.
     pub max_leverage: f64,
 }
 
@@ -499,7 +500,7 @@ impl Session {
             .last()
             .map_or(bar.open_time, |prev| prev.open_time + step);
         for &(time, rate) in funding {
-            if self.instrument.id.kind == InstrumentKind::Spot {
+            if !self.instrument.id.kind.rules().funding {
                 return Err(EngineError::FundingOnSpot);
             }
             if !(start..end).contains(&time) {
@@ -598,7 +599,7 @@ fn liquidation_trigger(
     funding: &[(Millis, f64)],
 ) -> Option<f64> {
     let q = book.position();
-    if inst.id.kind != InstrumentKind::Perpetual || q == 0.0 {
+    if !inst.id.kind.rules().liquidation || q == 0.0 {
         return None;
     }
     // Funding the position will pay later in this bar, at the close.
@@ -686,7 +687,7 @@ pub(crate) fn funding_ranges(
 
 #[cfg(test)]
 mod tests {
-    use td_core::{InstrumentId, Venue};
+    use td_core::{InstrumentId, InstrumentKind, Venue};
 
     use super::*;
 
