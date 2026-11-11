@@ -193,6 +193,7 @@ pub(crate) mod fake {
             Ok(FeeSchedule {
                 maker: 0.0,
                 taker: 0.0,
+                per_unit: 0.0,
             })
         }
 

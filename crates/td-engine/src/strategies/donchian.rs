@@ -20,7 +20,7 @@ use crate::{
 /// Donchian channel breakout with volatility-based sizing.
 ///
 /// Enters long when the close breaks above the highest high of the previous `entry` bars (short
-/// below the lowest low, with `allow_short` on a perpetual), and exits when the close breaks the
+/// below the lowest low, with `allow_short` on a kind that can short), and exits when the close breaks the
 /// opposite `exit` channel. The position is sized so that a stop `atr_stop` ATRs from the entry
 /// loses `risk` of equity. That stop sits `atr_stop` ATRs from the close the entry is decided on
 /// and is attached to the entry, so it is placed as a reduce-only stop order when the entry fills
@@ -83,7 +83,8 @@ pub(crate) fn entry() -> StrategyEntry {
                 default: ParamValue::Bool(false),
                 min: None,
                 max: None,
-                description: "Also trade downside breakouts. Perpetuals only; ignored on spot.",
+                description: "Also trade downside breakouts, on markets that allow shorts \
+                              (perpetuals, FX); ignored on spot.",
             },
         ],
         build,
@@ -148,8 +149,7 @@ impl Strategy for DonchianBreakout {
             if atr <= 0.0 {
                 return;
             }
-            let can_short =
-                self.allow_short && ctx.instrument().id.kind == InstrumentKind::Perpetual;
+            let can_short = self.allow_short && ctx.instrument().id.kind.rules().can_short;
             let distance = self.atr_stop * atr;
             let (side, trigger) = if bar.close > highest(channel) {
                 (Side::Buy, bar.close - distance)

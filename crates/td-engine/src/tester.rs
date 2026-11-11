@@ -21,7 +21,7 @@ use crate::metrics::{self, EquitySeries, MetricsReport};
 use crate::permute::permute_bars;
 use crate::risk::{EquityRange, Intrabar};
 use crate::rng::{SplitMix64, derive_seed};
-use crate::runner::{compare, config_fingerprint, hold_over, select_bars};
+use crate::runner::{compare, config_fingerprint, hold_over, match_asks, select_bars};
 use crate::{
     BacktestConfig, BacktestResult, Benchmark, EngineError, EquityPoint, ParamKind, ParamSpec,
     ParamValue, Params, Trade, find_strategy, run,
@@ -530,30 +530,36 @@ fn sample_indices(total: u64, samples: usize, seed: u64) -> Vec<u64> {
 /// The parameter space is checked first: every value against the strategy's specs, the grid
 /// size (or sample count) against [`MAX_RUNS`], and the base range against the data. A
 /// parameter set the strategy refuses when building (a rule across parameters) becomes a row
-/// with its error; any other run error stops the sweep.
+/// with its error; any other run error stops the sweep. `bars`, `asks` and `funding` are the data
+/// as [`crate::run`] takes it.
 pub fn sweep(
     spec: &SweepSpec,
     bars: &[Candle],
+    asks: &[Candle],
     funding: &[(Millis, f64)],
     progress: Option<Progress>,
 ) -> Result<SweepResult, TesterError> {
     let plan = Plan::new(spec)?;
-    sweep_planned(spec, &plan, bars, funding, progress)
+    sweep_planned(spec, &plan, bars, asks, funding, progress)
 }
 
 fn sweep_planned(
     spec: &SweepSpec,
     plan: &Plan,
     bars: &[Candle],
+    asks: &[Candle],
     funding: &[(Millis, f64)],
     progress: Option<Progress>,
 ) -> Result<SweepResult, TesterError> {
-    let data_fingerprint = config_fingerprint(&spec.base, bars, funding)?;
-    let rows = ranked_rows(spec, plan, bars, funding, progress)?;
+    let data_fingerprint = config_fingerprint(&spec.base, bars, asks, funding)?;
+    let rows = ranked_rows(spec, plan, bars, asks, funding, progress)?;
     let best = match rows.first() {
-        Some(top) if top.qualified => {
-            Some(run(&with_params(&spec.base, &top.params), bars, funding)?)
-        }
+        Some(top) if top.qualified => Some(run(
+            &with_params(&spec.base, &top.params),
+            bars,
+            asks,
+            funding,
+        )?),
         _ => None,
     };
     Ok(SweepResult {
@@ -570,6 +576,7 @@ fn ranked_rows(
     spec: &SweepSpec,
     plan: &Plan,
     bars: &[Candle],
+    asks: &[Candle],
     funding: &[(Millis, f64)],
     progress: Option<Progress>,
 ) -> Result<Vec<SweepRow>, TesterError> {
@@ -584,7 +591,7 @@ fn ranked_rows(
             if stopped.load(Ordering::Relaxed) {
                 return None;
             }
-            let row = run_row(spec, plan, index, bars, funding);
+            let row = run_row(spec, plan, index, bars, asks, funding);
             let n = done.fetch_add(1, Ordering::Relaxed) + 1;
             if let Some(report) = progress
                 && report(n, total).is_break()
@@ -637,10 +644,11 @@ fn run_row(
     plan: &Plan,
     index: u64,
     bars: &[Candle],
+    asks: &[Candle],
     funding: &[(Millis, f64)],
 ) -> Result<SweepRow, EngineError> {
     let params = plan.params(&spec.base.params, index).resolve(&plan.specs)?;
-    match run(&with_params(&spec.base, &params), bars, funding) {
+    match run(&with_params(&spec.base, &params), bars, asks, funding) {
         Ok(result) => {
             let h = Headline::new(&result.metrics);
             let qualified = h.trades >= spec.min_trades && h.value(spec.objective.metric).is_some();
@@ -741,6 +749,10 @@ pub struct PermutationResult {
 ///
 /// shortcut: copies run one after another, so a grid smaller than the core count leaves cores
 /// idle; run copies in parallel if small grids become common.
+///
+/// shortcut: it takes no ask series, so a kind whose rules have quotes (FX) is refused with
+/// [`EngineError::MissingAsk`]; shuffle the asks with the bars' permutation when the luck test
+/// runs on FX.
 pub fn permutation_test(
     spec: &PermutationSpec,
     bars: &[Candle],
@@ -763,7 +775,7 @@ pub fn permutation_test(
         });
     }
     let base = &spec.sweep.base;
-    let data_fingerprint = config_fingerprint(base, bars, funding)?;
+    let data_fingerprint = config_fingerprint(base, bars, &[], funding)?;
     let total = per_sweep * (copies + 1);
     let objective = spec.sweep.objective;
     let best_of = |sweep_no: usize, bars: &[Candle]| -> Result<Option<f64>, TesterError> {
@@ -772,7 +784,14 @@ pub fn permutation_test(
             Some(report) => report(offset + done, total),
             None => ControlFlow::Continue(()),
         };
-        let rows = ranked_rows(&spec.sweep, &plan, bars, funding, Some(&sweep_progress))?;
+        let rows = ranked_rows(
+            &spec.sweep,
+            &plan,
+            bars,
+            &[],
+            funding,
+            Some(&sweep_progress),
+        )?;
         Ok(rows
             .first()
             .filter(|top| top.qualified)
@@ -893,10 +912,12 @@ pub struct OosResult {
 
 /// Optimises on the in-sample segment, then runs the best parameters on the out-of-sample
 /// segment with the in-sample bars as warm-up. An objective undefined on the in-sample segment
-/// whatever the parameters (see [`Metric`]) is refused before anything runs.
+/// whatever the parameters (see [`Metric`]) is refused before anything runs. `bars`, `asks` and
+/// `funding` are the data as [`crate::run`] takes it.
 pub fn out_of_sample(
     spec: &OosSpec,
     bars: &[Candle],
+    asks: &[Candle],
     funding: &[(Millis, f64)],
     progress: Option<Progress>,
 ) -> Result<OosResult, TesterError> {
@@ -917,7 +938,7 @@ pub fn out_of_sample(
     is_spec.base.to = split_at;
     // Close out like the out-of-sample run, so both sides count a position held at the end alike.
     is_spec.base.close_at_end = true;
-    let in_sample = sweep_planned(&is_spec, &plan, bars, funding, progress)?;
+    let in_sample = sweep_planned(&is_spec, &plan, bars, asks, funding, progress)?;
     let best = in_sample
         .best
         .as_ref()
@@ -931,7 +952,7 @@ pub fn out_of_sample(
         close_at_end: true,
         ..with_params(base, &best.config.params)
     };
-    let out_of_sample = run(&oos_config, bars, funding)?;
+    let out_of_sample = run(&oos_config, bars, asks, funding)?;
 
     let degradation = degradation(
         spec.sweep.objective.metric,
@@ -941,7 +962,7 @@ pub fn out_of_sample(
     Ok(OosResult {
         spec: spec.clone(),
         engine_version: env!("CARGO_PKG_VERSION").to_string(),
-        data_fingerprint: config_fingerprint(base, bars, funding)?,
+        data_fingerprint: config_fingerprint(base, bars, asks, funding)?,
         split_at,
         in_sample,
         out_of_sample,
@@ -1172,10 +1193,12 @@ pub struct WalkForwardResult {
 }
 
 /// Runs walk-forward optimisation: for each window, a sweep on the train segment, then the best
-/// parameters on the test segment, warmed up with the train bars.
+/// parameters on the test segment, warmed up with the train bars. `bars`, `asks` and `funding` are
+/// the data as [`crate::run`] takes it.
 pub fn walk_forward(
     spec: &WalkForwardSpec,
     bars: &[Candle],
+    asks: &[Candle],
     funding: &[(Millis, f64)],
     progress: Option<Progress>,
 ) -> Result<WalkForwardResult, TesterError> {
@@ -1219,7 +1242,7 @@ pub fn walk_forward(
             Some(report) => report(offset + done, total),
             None => ControlFlow::Continue(()),
         };
-        let swept = sweep_planned(&train, &plan, bars, funding, Some(&window_progress))?;
+        let swept = sweep_planned(&train, &plan, bars, asks, funding, Some(&window_progress))?;
         let best = swept.best.ok_or(TesterError::NoQualifyingRun {
             min_trades: spec.sweep.min_trades,
             window: Some(k),
@@ -1238,7 +1261,7 @@ pub fn walk_forward(
             test_to,
             params: best.config.params,
             in_sample: Headline::new(&best.metrics),
-            out_of_sample: run(&test_config, bars, funding)?,
+            out_of_sample: run(&test_config, bars, asks, funding)?,
         });
     }
 
@@ -1251,7 +1274,7 @@ pub fn walk_forward(
         trades,
         fills,
     } = stitched_report(base, &segments);
-    let benchmark = stitched_benchmark(base, &results, bars, funding, &series, &metrics)?;
+    let benchmark = stitched_benchmark(base, &results, bars, asks, funding, &series, &metrics)?;
     let param_changes = results
         .windows(2)
         .filter(|w| w[0].params != w[1].params)
@@ -1261,7 +1284,7 @@ pub fn walk_forward(
     Ok(WalkForwardResult {
         spec: spec.clone(),
         engine_version: env!("CARGO_PKG_VERSION").to_string(),
-        data_fingerprint: config_fingerprint(base, bars, funding)?,
+        data_fingerprint: config_fingerprint(base, bars, asks, funding)?,
         windows: results,
         equity,
         metrics,
@@ -1548,6 +1571,7 @@ fn stitched_benchmark(
     base: &BacktestConfig,
     windows: &[WindowResult],
     bars: &[Candle],
+    asks: &[Candle],
     funding: &[(Millis, f64)],
     strategy_series: &EquitySeries,
     strategy_report: &MetricsReport,
@@ -1563,7 +1587,8 @@ fn stitched_benchmark(
                 ..base.clone()
             };
             let (_, test_bars) = select_bars(&config, bars)?;
-            Ok(hold_over(&config, &test_bars, funding))
+            let test_asks = match_asks(base.instrument.id.kind, bars, asks, &test_bars)?;
+            Ok(hold_over(&config, &test_bars, &test_asks, funding))
         })
         .collect::<Result<Vec<_>, TesterError>>()?;
     let segments: Vec<Segment> = held
@@ -1739,6 +1764,7 @@ mod tests {
             fees: FeeSchedule {
                 maker: 0.001,
                 taker: 0.002,
+                per_unit: 0.0,
             },
         };
         // Warm-up on bars 0..40, traded range 40..220, and bars after the range in the input.
@@ -1776,7 +1802,7 @@ mod tests {
         };
         let r = permutation_test(&spec, &bars, &[], None).unwrap();
         let best = |bars: &[Candle]| {
-            let swept = sweep(&spec.sweep, bars, &[], None).unwrap();
+            let swept = sweep(&spec.sweep, bars, &[], &[], None).unwrap();
             swept.rows[0].metrics.unwrap().total_return
         };
         assert_eq!(Some(r.real_best), best(&bars));
@@ -2031,6 +2057,7 @@ mod tests {
             fees: FeeSchedule {
                 maker: 0.001,
                 taker: 0.002,
+                per_unit: 0.0,
             },
         };
         let bars: Vec<Candle> = (0..40)
@@ -2069,7 +2096,7 @@ mod tests {
                 to: to * HOUR,
                 ..base.clone()
             };
-            let out_of_sample = run(&config, &bars, &[]).unwrap();
+            let out_of_sample = run(&config, &bars, &[], &[]).unwrap();
             assert!(!out_of_sample.trades.is_empty() && !out_of_sample.fills.is_empty());
             WindowResult {
                 train_from: 0,

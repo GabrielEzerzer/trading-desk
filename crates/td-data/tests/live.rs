@@ -464,6 +464,7 @@ mod fake_sources {
             Ok(FeeSchedule {
                 maker: 0.0,
                 taker: 0.0,
+                per_unit: 0.0,
             })
         }
         fn minute_history(
@@ -544,6 +545,7 @@ mod fake_sources {
             Ok(FeeSchedule {
                 maker: 0.0,
                 taker: 0.0,
+                per_unit: 0.0,
             })
         }
         fn minute_history(
