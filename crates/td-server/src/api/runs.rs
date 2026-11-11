@@ -1023,9 +1023,7 @@ mod tests {
         gotobi.strategy = "gotobi".into();
         gotobi.timeframe = Timeframe::M15;
         let bars: Vec<Candle> = minutes(t0, t0 + HOUR).into_iter().step_by(15).collect();
-        let failed = td_engine::run(&gotobi, &bars, &[], &[])
-            .err()
-            .expect("gotobi refuses 15m bars");
+        let failed = td_engine::run(&gotobi, &bars, &[], &[]).expect_err("gotobi refuses 15m bars");
         assert!(matches!(failed, EngineError::StrategyFailed(_)), "{failed}");
         for e in [
             engine_error(failed.clone()),
