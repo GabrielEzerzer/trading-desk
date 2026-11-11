@@ -27,8 +27,8 @@ enum Command {
         #[arg(long)]
         kind: KindArg,
     },
-    /// Download 1-minute candles (and funding rates, for a perpetual) into the store. Dukascopy
-    /// needs AWS credentials in AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY.
+    /// Download 1-minute candles (and funding rates, for a perpetual) into the store. OANDA needs
+    /// the token of a practice account in OANDA_API_TOKEN.
     Download {
         #[command(flatten)]
         instrument: InstrumentArgs,
@@ -89,7 +89,7 @@ impl InstrumentArgs {
 enum VenueArg {
     Binance,
     Bybit,
-    Dukascopy,
+    Oanda,
 }
 
 impl From<VenueArg> for Venue {
@@ -97,7 +97,7 @@ impl From<VenueArg> for Venue {
         match v {
             VenueArg::Binance => Venue::Binance,
             VenueArg::Bybit => Venue::Bybit,
-            VenueArg::Dukascopy => Venue::Dukascopy,
+            VenueArg::Oanda => Venue::Oanda,
         }
     }
 }
@@ -368,12 +368,12 @@ mod tests {
     }
 
     #[test]
-    fn a_download_names_dukascopy_by_its_venue_name() {
+    fn a_download_names_oanda_by_its_venue_name() {
         let cli = Cli::try_parse_from([
             "td-data",
             "download",
             "--venue",
-            "dukascopy",
+            "oanda",
             "--kind",
             "fx",
             "--symbol",
@@ -387,6 +387,6 @@ mod tests {
         let Command::Download { instrument, .. } = cli.command else {
             panic!("not the download command");
         };
-        assert_eq!(instrument.id().to_string(), "dukascopy:USDJPY:fx");
+        assert_eq!(instrument.id().to_string(), "oanda:USDJPY:fx");
     }
 }

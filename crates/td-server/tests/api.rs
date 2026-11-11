@@ -12,10 +12,10 @@ use futures_util::{SinkExt, StreamExt};
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 use td_core::{Candle, FeeSchedule, Instrument, InstrumentId, InstrumentKind, Millis, Venue};
-use td_data::time::{MINUTE, Month, now_ms, parse_date};
+use td_data::time::{DAY, MINUTE, Month, now_ms, parse_date};
 use td_data::{DataError, DownloadReport, InstrumentList, Store};
 use td_server::api::auth::Token;
-use td_server::api::data::EARLIEST_FROM;
+use td_server::api::data::{EARLIEST_FROM, OANDA_EARLIEST_FROM};
 use td_server::api::error::ApiError;
 use td_server::api::jobs::{JobInfo, JobResult, JobStatus};
 use td_server::api::source::{LiveSource, MarketSource};
@@ -94,11 +94,9 @@ impl MarketSource for FakeSource {
         from: Millis,
         to: Millis,
     ) -> Result<DownloadReport, DataError> {
-        // Fails as the real source does when the server has no AWS credentials.
-        if id.venue == Venue::Dukascopy {
-            return Err(DataError::MissingAwsCredentials {
-                missing: vec!["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"],
-            });
+        // Fails as the real source does when the server has no OANDA token.
+        if id.venue == Venue::Oanda {
+            return Err(DataError::MissingOandaToken);
         }
         if self.gated {
             let mut permits = self.permits.lock().unwrap();
@@ -449,9 +447,9 @@ async fn instruments_come_from_the_source_once_per_list_and_then_from_memory() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["instruments"][0]["id"]["kind"], "perpetual");
     assert_eq!(t.source.instrument_calls.load(Ordering::SeqCst), 2);
-    let (status, body) = t.get("/instruments?venue=dukascopy&kind=fx").await;
+    let (status, body) = t.get("/instruments?venue=oanda&kind=fx").await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["instruments"][0]["id"]["venue"], "dukascopy");
+    assert_eq!(body["instruments"][0]["id"]["venue"], "oanda");
     assert_eq!(body["instruments"][0]["id"]["kind"], "fx");
 
     for bad in [
@@ -580,32 +578,27 @@ async fn a_download_job_reaches_done_on_the_jobs_topic_and_shows_in_coverage() {
         .await;
     assert_eq!(empty["months"], json!([]));
     assert_eq!(empty["funding"], Value::Null);
-    let (status, fx) = t.get("/data/coverage?instrument=dukascopy:USDJPY:fx").await;
+    let (status, fx) = t.get("/data/coverage?instrument=oanda:USDJPY:fx").await;
     assert_eq!(status, StatusCode::OK, "{fx}");
     assert_eq!(fx["months"], json!([]));
 }
 
-/// Missing or refused AWS credentials are the client's to fix, not the venue failing: a 400 with
-/// the `bad_request` code, as a failed download job carries it.
+/// A missing or refused OANDA token is the client's to fix, not the venue failing: a 400 with the
+/// `bad_request` code, as a failed download job carries it.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_dukascopy_download_without_aws_credentials_fails_as_a_bad_request() {
-    let missing = DataError::MissingAwsCredentials {
-        missing: vec!["AWS_SECRET_ACCESS_KEY"],
+async fn an_oanda_download_without_a_token_fails_as_a_bad_request() {
+    let refused = DataError::OandaRefused {
+        url: "https://api-fxpractice.oanda.com/v3/instruments/USD_JPY/candles".into(),
+        status: 401,
+        message: "Insufficient authorization to perform request.".into(),
     };
-    let refused = DataError::AwsRefused {
-        url: "s3://bucket/key".into(),
-        code: "InvalidAccessKeyId".into(),
-    };
-    for error in [missing, refused] {
+    for error in [DataError::MissingOandaToken, refused] {
         let api = ApiError::from(error);
         assert_eq!(
             (api.status.as_u16(), api.body.code.as_str()),
             (400, "bad_request")
         );
-        assert!(
-            api.body.message.contains("AWS_SECRET_ACCESS_KEY"),
-            "{api:?}"
-        );
+        assert!(api.body.message.contains("OANDA_API_TOKEN"), "{api:?}");
     }
 
     let t = TestServer::start(FakeSource::default()).await;
@@ -617,7 +610,7 @@ async fn a_dukascopy_download_without_aws_credentials_fails_as_a_bad_request() {
         Some(ServerMessage::Subscribed { .. })
     ));
     let body = json!({
-        "instrument": { "venue": "dukascopy", "symbol": "USDJPY", "kind": "fx" },
+        "instrument": { "venue": "oanda", "symbol": "USDJPY", "kind": "fx" },
         "from": day("2024-01-08"),
         "to": day("2024-01-15"),
     });
@@ -630,7 +623,7 @@ async fn a_dukascopy_download_without_aws_credentials_fails_as_a_bad_request() {
     assert!(
         error
             .message
-            .contains("AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY not set"),
+            .contains("needs an API token: set OANDA_API_TOKEN"),
         "{}",
         error.message
     );
@@ -738,6 +731,54 @@ async fn bad_requests_get_json_errors_with_matching_statuses() {
     let (status, body) = t.post("/health", "").await;
     assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
     assert_eq!(body["error"]["code"], "method_not_allowed");
+}
+
+/// The earliest `from` is the venue's: Binance and Bybit keep 2017-01-01 and its message, and
+/// OANDA's FX history downloads from 2016, back to 2005-01-01.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_earliest_download_from_is_the_venues() {
+    let t = TestServer::start(FakeSource::default()).await;
+    let download = |venue: &str, symbol: &str, kind: &str, from: Millis| {
+        json!({
+            "instrument": { "venue": venue, "symbol": symbol, "kind": kind },
+            "from": from,
+            "to": from + 7 * DAY,
+        })
+        .to_string()
+    };
+
+    assert_eq!(EARLIEST_FROM, day("2017-01-01"));
+    for (venue, kind) in [("binance", "spot"), ("bybit", "perpetual")] {
+        for from in [EARLIEST_FROM - MINUTE, day("2016-01-01")] {
+            let body = download(venue, "BTCUSDT", kind, from);
+            let (status, answer) = t.post("/data/download", &body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(
+                answer["error"]["message"],
+                "`from` must not be before 2017-01-01 00:00 UTC (1483228800000), before either \
+                 venue's earliest data"
+            );
+        }
+    }
+    assert_eq!(t.get("/jobs").await.1, json!([]), "no job was started");
+
+    assert_eq!(OANDA_EARLIEST_FROM, day("2005-01-01"));
+    let early = download("oanda", "USDJPY", "fx", OANDA_EARLIEST_FROM - MINUTE);
+    let (status, answer) = t.post("/data/download", &early).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{answer}");
+    assert_eq!(
+        answer["error"]["message"],
+        "`from` must not be before 2005-01-01 00:00 UTC (1104537600000) for oanda"
+    );
+    for from in [day("2016-01-01"), OANDA_EARLIEST_FROM] {
+        let body = download("oanda", "USDJPY", "fx", from);
+        let (status, created) = t.post("/data/download", &body).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}: {created}");
+        // The fake fails the job as a server without an OANDA token does; the next download of
+        // the same instrument waits for that, or it would be a 409.
+        let id = created["job_id"].as_u64().expect("a job id");
+        t.until_status(id, "failed").await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

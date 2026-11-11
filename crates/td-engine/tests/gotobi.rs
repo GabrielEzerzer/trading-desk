@@ -18,7 +18,7 @@ const SPREAD: f64 = 0.004;
 fn usdjpy() -> Instrument {
     Instrument {
         id: InstrumentId {
-            venue: Venue::Dukascopy,
+            venue: Venue::Oanda,
             symbol: "USDJPY".into(),
             kind: InstrumentKind::Fx,
         },

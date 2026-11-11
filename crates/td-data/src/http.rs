@@ -123,10 +123,19 @@ pub(crate) mod stub {
         headers: &[(&str, &str)],
         body: Vec<u8>,
     ) -> (String, JoinHandle<String>) {
+        serve_once_with("200 OK", headers, body)
+    }
+
+    /// [`serve_once`] answering with `status`, such as `"302 Found"`.
+    pub(crate) fn serve_once_with(
+        status: &str,
+        headers: &[(&str, &str)],
+        body: Vec<u8>,
+    ) -> (String, JoinHandle<String>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let base = format!("http://{}", listener.local_addr().expect("an address"));
         let mut head = format!(
-            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n",
+            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n",
             body.len()
         );
         for (name, value) in headers {
@@ -188,5 +197,36 @@ mod tests {
             request.lines().any(|l| l == "user-agent: trading-desk"),
             "{request}"
         );
+    }
+
+    /// The client follows a redirect, but not with a secret: a redirect to another host arrives
+    /// without the `Authorization` header the first request carried, as reqwest drops it.
+    #[test]
+    fn a_redirect_to_another_host_does_not_carry_the_authorization_header() {
+        let (target, landed) = stub::serve_once(&[], b"moved here".to_vec());
+        // `localhost` rather than `127.0.0.1`: another host name and another port.
+        let location = target.replace("127.0.0.1", "localhost") + "/elsewhere";
+        let (base, first) =
+            stub::serve_once_with("302 Found", &[("Location", location.as_str())], Vec::new());
+        let mut headers = HeaderMap::new();
+        let mut secret = reqwest::header::HeaderValue::from_static("Bearer not-a-real-token");
+        secret.set_sensitive(true);
+        headers.insert(reqwest::header::AUTHORIZATION, secret);
+        let http = Http::new().expect("an HTTP client");
+        let (status, body) = http
+            .get_with_headers(&format!("{base}/start"), headers)
+            .expect("an answer");
+        assert_eq!((status, body), (200, b"moved here".to_vec()));
+        let first = first.join().expect("the first server");
+        assert!(
+            first
+                .lines()
+                .any(|l| l == "authorization: bearer not-a-real-token"),
+            "{first}"
+        );
+        let landed = landed.join().expect("the redirect's server");
+        assert!(landed.starts_with("get /elsewhere "), "{landed}");
+        assert!(!landed.contains("authorization"), "{landed}");
+        assert!(!landed.contains("not-a-real-token"), "{landed}");
     }
 }

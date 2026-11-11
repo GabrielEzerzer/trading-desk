@@ -475,6 +475,67 @@ async fn the_bar_still_open_is_never_returned() {
     api.shutdown().await;
 }
 
+/// A chart starts no earlier than the venue's earliest download date: OANDA's stored FX minutes
+/// from 2016 are served, back to 2005-01-01, while Binance keeps 2017-01-01.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_earliest_bar_is_the_venues_earliest_download_date() {
+    let api = Api::start(&[], FakeRest::new(Vec::new(), T0)).await;
+    // Monday 4 January 2016, 00:00 UTC: an hour of USDJPY bids and asks.
+    let monday: Millis = 1_451_865_600_000;
+    let usdjpy = InstrumentId {
+        venue: Venue::Oanda,
+        symbol: "USDJPY".into(),
+        kind: InstrumentKind::Fx,
+    };
+    let bids: Vec<Candle> = (0..60)
+        .map(|i| Candle {
+            open_time: monday + i * MIN,
+            open: 119.0,
+            high: 119.01,
+            low: 118.99,
+            close: 119.0,
+            volume: 25.0,
+            quote_volume: 0.0,
+        })
+        .collect();
+    let asks: Vec<Candle> = bids
+        .iter()
+        .map(|b| Candle {
+            open: b.open + 0.007,
+            high: b.high + 0.007,
+            low: b.low + 0.007,
+            close: b.close + 0.007,
+            ..*b
+        })
+        .collect();
+    api.store
+        .write_quotes(&usdjpy, &bids, &asks)
+        .expect("writes the fixture");
+
+    let path = |instrument: &str, timeframe: &str, from: Millis, to: Millis| {
+        format!("/candles?instrument={instrument}&timeframe={timeframe}&from={from}&to={to}")
+    };
+    let server = &api;
+    let get = |path: String| async move {
+        let (status, body) = server.get(&path).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        serde_json::from_value::<CandlesResponse>(body).expect("a candles response")
+    };
+    let got = get(path("oanda:USDJPY:fx", "1m", monday, monday + HOUR)).await;
+    assert_eq!(got.from, monday);
+    assert_eq!(got.candles, bids);
+
+    // 2004-06-01 to 2005-03-01: OANDA's range starts at 2005-01-01, Binance's is empty at
+    // 2017-01-01.
+    let (june_2004, march_2005) = (1_086_048_000_000, 1_109_635_200_000);
+    let got = get(path("oanda:USDJPY:fx", "1d", june_2004, march_2005)).await;
+    assert_eq!((got.from, got.to), (1_104_537_600_000, march_2005));
+    let got = get(path(INSTRUMENT, "1d", june_2004, march_2005)).await;
+    assert_eq!((got.from, got.to), (1_483_228_800_000, 1_483_228_800_000));
+    assert!(got.candles.is_empty());
+    api.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn bad_instruments_timeframes_and_ranges_are_400() {
     let api = Api::start(&stored(0..60), FakeRest::new(at_venue(0..60), T0 + HOUR)).await;

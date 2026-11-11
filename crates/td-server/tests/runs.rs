@@ -1251,6 +1251,57 @@ async fn fx_sweeps_out_of_sample_and_walk_forward_runs_trade_on_the_asks() {
     assert!(buys > 0 && sells > 0, "{buys} buys and {sells} sells");
 }
 
+/// Sets the ask high of the minute at `open_time` in its stored month file to `high`, past the
+/// store's checks.
+fn plant_ask_high(store: &Store, id: &InstrumentId, open_time: Millis, high: f64) {
+    use arrow::array::{Array, ArrayRef, Float64Array, Int64Array};
+    use arrow::record_batch::RecordBatch;
+    use parquet::arrow::ArrowWriter;
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+    let path = store
+        .candle_path(id, Month::containing(open_time))
+        .expect("a path");
+    let file = std::fs::File::open(&path).expect("the month file");
+    let batches: Vec<RecordBatch> = ParquetRecordBatchReaderBuilder::try_new(file)
+        .expect("parquet")
+        .build()
+        .expect("a reader")
+        .collect::<Result<_, _>>()
+        .expect("reads");
+    let mut planted = 0;
+    let batches: Vec<RecordBatch> = batches
+        .into_iter()
+        .map(|batch| {
+            let column = |name: &str| batch.column_by_name(name).expect(name).clone();
+            let times = column("open_time");
+            let times = times.as_any().downcast_ref::<Int64Array>().expect("i64");
+            let highs = column("ask_high");
+            let highs = highs.as_any().downcast_ref::<Float64Array>().expect("f64");
+            let highs: Float64Array = times
+                .values()
+                .iter()
+                .zip(highs.values())
+                .map(|(&t, &h)| {
+                    planted += usize::from(t == open_time);
+                    if t == open_time { high } else { h }
+                })
+                .collect();
+            let mut columns = batch.columns().to_vec();
+            let index = batch.schema().index_of("ask_high").expect("ask_high");
+            columns[index] = std::sync::Arc::new(highs) as ArrayRef;
+            RecordBatch::try_new(batch.schema(), columns).expect("a batch")
+        })
+        .collect();
+    assert_eq!(planted, 1);
+    let file = std::fs::File::create(&path).expect("rewrites");
+    let mut writer = ArrowWriter::try_new(file, batches[0].schema(), None).expect("a writer");
+    for batch in &batches {
+        writer.write(batch).expect("writes");
+    }
+    writer.close().expect("closes");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_crossed_stored_quote_fails_the_run_as_data_missing() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -1258,22 +1309,22 @@ async fn a_crossed_stored_quote_fails_the_run_as_data_missing() {
     let times = open_minutes(fx_t0(), fx_t0() + FX_DAYS * DAY);
     let bids: Vec<Candle> = times.iter().map(|&t| fx_bid(t)).collect();
     let mut asks: Vec<Candle> = times.iter().map(|&t| fx_ask(t, SPREAD)).collect();
-    // One minute's ask high below its bid high: the store checks only the open and the close, so
-    // it takes it, and the engine refuses the bar on 1m. (On 1h the other minutes' asks lift the
-    // hour's ask high back over its bid high.)
+    // One minute's ask high below its bid high. The store refuses that, so it is planted in the
+    // month file after the write, as a month written before the store checked the high would hold
+    // it; the engine refuses the bar on 1m. (On 1h the other minutes' asks lift the hour's ask
+    // high back over its bid high.)
     let crossed = fx_t0() + DAY + 10 * HOUR + 30 * MINUTE;
     let i = times.iter().position(|&t| t == crossed).unwrap();
     // The bid's open, low and close, a zero spread the store allows, and a high a tick under the
     // bid's, which is still above the open and the close.
     asks[i] = Candle {
-        high: bids[i].high - 0.01,
         volume: 0.0,
         quote_volume: 0.0,
         ..bids[i]
     };
-    store
-        .write_quotes(&fx_instrument("EURUSD").id, &bids, &asks)
-        .expect("the store takes it");
+    let id = fx_instrument("EURUSD").id;
+    store.write_quotes(&id, &bids, &asks).expect("writes");
+    plant_ask_high(&store, &id, crossed, bids[i].high - 0.01);
     let t = TestServer::on(dir, store).await;
 
     let config = fx_config("EURUSD", Timeframe::M1);

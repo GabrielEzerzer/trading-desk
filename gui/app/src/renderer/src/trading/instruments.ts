@@ -8,7 +8,7 @@ export type KindFilter = 'all' | InstrumentKind
 // ever wanted.
 export const MAX_ROWS = 60
 
-const VENUES = { binance: 'Binance', bybit: 'Bybit' } as const
+const VENUES = { binance: 'Binance', bybit: 'Bybit', oanda: 'OANDA' } as const
 
 export function venueLabel(id: InstrumentId): string {
   return `${VENUES[id.venue]} ${id.kind}`

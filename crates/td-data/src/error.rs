@@ -126,22 +126,24 @@ pub enum DataError {
     #[error("no data directory: set TD_DATA_DIR")]
     NoDataDir,
 
-    /// Names the variables that are not set, never a value.
+    /// Names the variable, never a value.
     #[error(
-        "dukascopy's history is read from a requester-pays S3 bucket, which needs AWS \
-         credentials: {} not set (set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY, and \
-         AWS_SESSION_TOKEN with temporary credentials)",
-        .missing.join(" and ")
+        "oanda's history needs an API token: set OANDA_API_TOKEN to the token of an OANDA \
+         practice account"
     )]
-    MissingAwsCredentials { missing: Vec<&'static str> },
+    MissingOandaToken,
 
-    /// S3 answered 403. `code` is S3's error code alone: the rest of its answer can echo the
-    /// access key and the signature, so it is never kept.
+    /// OANDA answered 401 or 403. `message` is OANDA's `errorMessage` alone, with any copy of the
+    /// token taken out; nothing of the request is kept.
     #[error(
-        "{url} was refused (403 {code}): the AWS credentials in AWS_ACCESS_KEY_ID and \
-         AWS_SECRET_ACCESS_KEY are not valid, or may not read this requester-pays bucket"
+        "{url} was refused ({status}: {message}): the token in OANDA_API_TOKEN is not valid, or \
+         is not a practice account's token"
     )]
-    AwsRefused { url: String, code: String },
+    OandaRefused {
+        url: String,
+        status: u16,
+        message: String,
+    },
 }
 
 impl DataError {

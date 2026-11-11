@@ -67,7 +67,7 @@ const EXIT_UTC: Millis = 90 * MINUTE;
 /// shortcut: a gotobi day whose decision bar (the bar that closes at 00:55) is missing from the
 /// data has no trade, and an entry whose fill bar is missing fills at the next bar there is. Data
 /// with gaps in the Tokyo morning then undercounts trades; fill the decision from the last bar
-/// before 00:55 if gaps there turn out to matter in the Dukascopy data.
+/// before 00:55 if gaps there turn out to matter in the OANDA data.
 #[derive(Debug, Clone)]
 pub struct Gotobi {
     pub stop_pips: f64,
@@ -241,7 +241,7 @@ impl Strategy for Gotobi {
 // 2. The test plan
 // ---------------------------------------------------------------------------------------------
 
-/// Dukascopy USD/JPY on 5-minute bars over the published period, on a dollar account.
+/// OANDA USD/JPY on 5-minute bars over the published period, on a dollar account.
 ///
 /// - **Timeframe.** 5m, the coarsest on which bars close at both 00:55 and 01:30 UTC.
 /// - **Account.** Dollars, the pair's base currency, as the published test reports; 100,000 of
@@ -273,7 +273,7 @@ impl Strategy for Gotobi {
 ///   none.
 fn plan() -> TestPlan {
     let usdjpy = || InstrumentId {
-        venue: Venue::Dukascopy,
+        venue: Venue::Oanda,
         symbol: "USDJPY".into(),
         kind: InstrumentKind::Fx,
     };
