@@ -198,7 +198,8 @@ pub(crate) struct Counts {
 /// A page is refused whole when it names another instrument or granularity, or holds a time or a
 /// price that does not read, a candle that is not valid, or a time that is not after the one
 /// before it. Then, by [`fill`]: a candle still forming, in closed hours or with the ask crossed
-/// below the bid is left out and counted, and an open minute without a candle is filled.
+/// below the bid is left out and counted, and an open minute without a candle is filled, but
+/// never at or after the candle still forming, even when the local clock is ahead of OANDA's.
 pub(crate) fn history(
     id: &InstrumentId,
     from: Millis,
@@ -221,6 +222,9 @@ pub(crate) fn history(
     let mut quotes = Vec::new();
     let mut previous: Option<Millis> = None;
     let mut cursor = from;
+    // `to`, or the open time of the candle still forming: OANDA's clock says that minute has not
+    // ended, whatever the local clock says, so nothing from it on is filled.
+    let mut end = to;
     while cursor < to {
         let url = page_url(HOST, &name, cursor);
         let body = with_retries(delays, || {
@@ -230,7 +234,7 @@ pub(crate) fn history(
         let page = parse_page(&url, &body, &name, &id.symbol)?;
         let Some(last) = page.last() else { break };
         let last_time = last.bid.open_time;
-        let forming = page.iter().any(|q| !q.complete);
+        let forming = page.iter().find(|q| !q.complete).map(|q| q.bid.open_time);
         for q in page {
             if previous.is_some_and(|p| q.bid.open_time <= p) {
                 return Err(DataError::parse(
@@ -248,12 +252,16 @@ pub(crate) fn history(
                 quotes.push(q);
             }
         }
-        if forming || last_time + MINUTE >= to {
+        if let Some(forming) = forming {
+            end = forming.min(to);
+            break;
+        }
+        if last_time + MINUTE >= to {
             break;
         }
         cursor = last_time + MINUTE;
     }
-    let history = fill(id.kind, to, now, quotes, &mut counts);
+    let history = fill(id.kind, end, now, quotes, &mut counts);
     if counts != Counts::default() {
         eprintln!(
             "td-data: {id} {}: left out {} candles with the ask below the bid, {} in the closed \
@@ -706,28 +714,32 @@ mod tests {
         let forming = monday + 10 * HOUR;
         let mut served = open_minutes(monday + 9 * HOUR, forming, &[forming - MINUTE]);
         served.push(raw(forming, false));
-        let asked = RefCell::new(Vec::new());
-        let now = forming + 30_000;
-        let (history, counts) = history(
-            &usdjpy(),
-            monday,
-            now,
-            now,
-            env,
-            &NO_WAIT,
-            serve(&served, &asked),
-        )
-        .expect("reads");
-        assert_eq!(counts.incomplete, 1);
-        // The minute before it had no candle and is filled; the forming minute is not.
-        assert_eq!(
-            history.candles.last().map(|c| c.open_time),
-            Some(forming - MINUTE)
-        );
-        assert_eq!(history.candles.last().map(|c| c.volume), Some(0.0));
-        assert_eq!(counts.filled_minutes, 1);
-        assert_eq!(history.candles.len(), 60);
-        assert_eq!(*asked.borrow(), [monday]);
+        // The local clock agreeing with OANDA's, and two minutes ahead of it: either way neither
+        // the forming minute nor any after it is filled.
+        for now in [forming + 30_000, forming + 2 * MINUTE + 30_000] {
+            let asked = RefCell::new(Vec::new());
+            let (history, counts) = history(
+                &usdjpy(),
+                monday,
+                now,
+                now,
+                env,
+                &NO_WAIT,
+                serve(&served, &asked),
+            )
+            .expect("reads");
+            assert_eq!(counts.incomplete, 1);
+            // The minute before it had no candle and is filled; the forming minute is not.
+            assert_eq!(
+                history.candles.last().map(|c| c.open_time),
+                Some(forming - MINUTE),
+                "now {now}"
+            );
+            assert_eq!(history.candles.last().map(|c| c.volume), Some(0.0));
+            assert_eq!(counts.filled_minutes, 1);
+            assert_eq!((history.candles.len(), history.asks.len()), (60, 60));
+            assert_eq!(*asked.borrow(), [monday]);
+        }
     }
 
     #[test]
