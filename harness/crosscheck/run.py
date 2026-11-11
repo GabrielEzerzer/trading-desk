@@ -324,9 +324,25 @@ def differences(case: dict, results: dict) -> list[str]:
             f"{abs(r['funding_total_ours'] - r['funding_total_nautilus']):.6f}, from the position "
             "sizes above (same stamps, rates and prices)."
         )
+    walk = "stop-limit fills on the same bar in both engines"
     for cmp in (gap_cmp, real_cmp):
+        moved = any(c.name == walk and not c.ok for c in cmp.checks)
         for c in cmp.checks:
-            if not c.ok:
+            if c.ok:
+                continue
+            if c.name == walk:
+                out.append(
+                    f"- **Fails, cause known, {cmp.series} bars:** {c.value}. Nautilus 1.231 walks "
+                    "a bar through its open, high, low and close only, so it triggers a stop-limit "
+                    "at the first of those points past the trigger; where the limit is not "
+                    "marketable there, the order rests, and here it rests past the bar, where our "
+                    "engine fills it at the trigger (expected difference 4). The fill, and every "
+                    f"decision the strategy makes from it, then lands a bar later. {c.note}."
+                )
+            elif moved:
+                out.append(f"- **Fails, following from the moved stop-limit fills, {cmp.series} "
+                           f"bars, {c.name}:** {c.value} (limit {c.limit}). {c.note}")
+            else:
                 out.append(f"- **Unexplained, {cmp.series} bars, {c.name}:** {c.value} (limit "
                            f"{c.limit}). {c.note}")
     if not out:

@@ -1,9 +1,9 @@
 {
   "name": "case10",
   "title": "sma_cross with a resting limit, long only, Binance spot BTCUSDT, 1h, March 2023 with the exchange's outage of 24 March",
-  "exercises": "Dropped buckets, a resting limit filled across a gap in the data, cancels after N bars, equity sizing",
+  "exercises": "Two missing hours (one bucket dropped as incomplete, one with no minutes), a sell limit resting across them and filled on the first bar after, cancels after N bars, equity sizing",
   "strategy": "crosscheck_sma_limit",
-  "params": { "fast": 10, "slow": 30, "equity_fraction": 0.95, "offset": 0.001, "cancel_after": 3 },
+  "params": { "fast": 5, "slow": 20, "equity_fraction": 0.95, "offset": 0.002, "cancel_after": 3 },
   "venue": "binance",
   "kind": "spot",
   "symbol": "BTCUSDT",

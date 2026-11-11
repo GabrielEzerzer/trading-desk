@@ -650,7 +650,7 @@ def stop_limit_pair(limit: float = 110.5, their_fee=None) -> tuple[dict, dict]:
         )
 
     ours = side(fee_o, 3 * H, "taker")
-    ours["fills"][0].update(at_decision=False, order_type=ot)
+    ours["fills"][0].update(at_decision=False, order_type=ot, order_id=1)
     ours["resting"] = [resting(3, order(1, "buy", 1.0, "stop_limit", price=limit, trigger=110.0))]
     theirs = side(fee_t, 4 * H, "maker")
     return ours, theirs
@@ -665,6 +665,8 @@ def test_a_stop_limit_maker_fee_is_expected_difference_four():
     real = compare_real(ours, theirs, bars(), TAKER, maker=MAKER, tick=TICK)
     assert real.ok, [c for c in real.checks if not c.ok]
     assert abs(real.numbers["stop_limit_fee"] - 110.0 * (TAKER - MAKER)) < 1e-12
+    n = real.numbers
+    assert abs(n["bound_sum"] - (n["bound1"] + n["stop_limit_fee"])) < 1e-12
 
 
 def test_a_stop_limit_maker_fee_off_the_maker_rate_fails():
@@ -731,3 +733,105 @@ def test_our_trades_that_do_not_follow_from_our_fills_cannot_be_paired():
     ours["trades"][0]["entry_time"] = 3 * H
     check = by_name(compare_gapless(ours, theirs, bars(), TICK))[TRADES_PAIR]
     assert not check.ok and "do not follow from our fills" in check.note
+
+
+def walk_bars(rows: list[tuple]) -> Bars:
+    return Bars(
+        [{"open_time": i * H, "open": o, "high": h, "low": lo, "close": c}
+         for i, (o, h, lo, c) in enumerate(rows)],
+        H,
+    )
+
+
+FLAT_BAR = (99.0, 99.5, 98.5, 99.0)
+
+
+def test_nautilus_stop_limit_follows_its_bar_walk():
+    # The same bars as tests/test_nautilus_fills.py, which pins them against Nautilus itself.
+    buy = order(1, "buy", 1.0, "stop_limit", price=101.0, trigger=100.0, submitted=0)
+    walk = compare.nautilus_stop_limit
+    assert walk(buy, walk_bars([FLAT_BAR, (99, 100.5, 98, 99.5)])) == (1, 100.0, "taker")
+    assert walk(buy, walk_bars([FLAT_BAR, (99, 102, 98, 99.5)])) == (1, 100.0, "maker")
+    assert walk(buy, walk_bars([FLAT_BAR, (100.5, 100.8, 100.2, 100.5)])) == (1, 100.0, "taker")
+    assert walk(buy, walk_bars([FLAT_BAR, (102, 103, 100.5, 102)])) == (1, 100.5, "maker")
+    sell = order(1, "sell", 1.0, "stop_limit", price=99.0, trigger=100.0, submitted=0)
+    # Triggered at the low 98.5, below the limit; the close 99.5 is back above it: filled there.
+    assert walk(sell, walk_bars([(101, 101.5, 100.5, 101), (101, 101.2, 98.5, 99.5)])) == (
+        1, 99.5, "maker")
+    # The close 98.8 is still below it: filled on the next bar, at its high, no better than 100.
+    assert walk(sell, walk_bars([(101, 101.5, 100.5, 101), (101, 101.2, 98.5, 98.8),
+                                 (98.8, 99.6, 98.6, 99.0)])) == (2, 99.6, "maker")
+
+
+def walked_sell_pair(their_price: float = 108.6) -> tuple[dict, dict]:
+    """Short 1.0 entered by a stop-limit sell, trigger 108.5, limit 108.2, inside bar 3 (open 109,
+    high 112, low 108, close 111): ours fills at the trigger as a taker. Nautilus triggers at the
+    low 108, where the limit is not marketable, and fills as a maker at `their_price`. Closed at
+    the market, decided on bar 4 (115). Equity marks the short at each close."""
+    ot = {"type": "stop_limit", "price": 108.2, "trigger": 108.5}
+
+    def side(price: float, fee: float, t: int, liquidity: str) -> dict:
+        fee_x = 115.0 * TAKER
+        marks = [price - 111.0 - fee, price - 114.0 - fee, price - 115.0 - fee - fee_x]
+        return result(
+            [fill(t, "sell", 1.0, price, fee, liquidity=liquidity),
+             fill(5 * H, "buy", 1.0, 115.0, fee_x, liquidity="taker")],
+            [10_000.0] * 3 + [10_000.0 + m for m in marks],
+            trades=[trade(t, 5 * H, "short", 1.0, price, 115.0, fee + fee_x)],
+        )
+
+    ours = side(108.5, 108.5 * TAKER, 3 * H, "taker")
+    ours["fills"][0].update(at_decision=False, order_type=ot, order_id=1)
+    # Decided on bar 2, so bar 3 is the first it can trigger on.
+    ours["resting"] = [
+        resting(3, order(1, "sell", 1.0, "stop_limit", price=108.2, trigger=108.5, submitted=2))
+    ]
+    theirs = side(their_price, their_price * MAKER, 4 * H, "maker")
+    return ours, theirs
+
+
+def test_a_stop_limit_rested_by_the_walk_is_held_to_the_walks_price():
+    # min(close 111, trigger 108.5) = 108.5: the same price, the maker fee.
+    ours, theirs = walked_sell_pair(108.5)
+    cmp = compare_gapless(ours, theirs, bars(), TICK, maker=MAKER, taker=TAKER)
+    assert cmp.ok, [c for c in cmp.checks if not c.ok]
+    assert cmp.numbers["stop_limit_maker_fills"] == 1
+    assert compare_real(ours, theirs, bars(), TAKER, maker=MAKER, tick=TICK).ok
+    # Any other Nautilus price is a difference the walk does not explain.
+    ours, theirs = walked_sell_pair(108.8)
+    assert not by_name(compare_gapless(ours, theirs, bars(), TICK, maker=MAKER, taker=TAKER))[
+        "prices within one tick"].ok
+    assert not by_name(compare_real(ours, theirs, bars(), TAKER, maker=MAKER, tick=TICK))[
+        "each price difference within its bound"].ok
+
+
+def test_a_walked_price_difference_is_taken_out_of_trade_pnl_and_equity():
+    rows = [dict(r) for r in bars().bars]
+    # The close comes back above the limit 108.2 but stays below the trigger 108.5: Nautilus
+    # fills there, at 108.3, 0.2 worse than ours for a sell.
+    rows[3]["close"] = 108.3
+    b = Bars(rows, H)
+    ours, theirs = walked_sell_pair(108.3)
+    cmp = compare_gapless(ours, theirs, b, TICK, maker=MAKER, taker=TAKER)
+    assert cmp.ok, [c for c in cmp.checks if not c.ok]
+    shift = -(108.3 - 108.5) + (108.3 * MAKER - 108.5 * TAKER)
+    assert abs(cmp.numbers["final_equity_explained"] - shift) < 1e-9
+    real = compare_real(ours, theirs, b, TAKER, maker=MAKER, tick=TICK)
+    assert real.ok, [c for c in real.checks if not c.ok]
+    # Without the order (so no prediction) the same fills fail the exact comparison.
+    ours["resting"] = []
+    assert not compare_gapless(ours, theirs, b, TICK, maker=MAKER, taker=TAKER).ok
+
+
+def test_a_stop_limit_the_walk_fills_on_a_later_bar_is_named():
+    rows = [dict(r) for r in bars().bars]
+    rows[3]["close"] = 108.1  # still below the limit 108.2 at the close: rests into bar 4
+    b = Bars(rows, H)
+    ours, theirs = walked_sell_pair()
+    moved = compare.walked_elsewhere(ours["fills"], b, compare.open_orders(ours["resting"]))
+    for cmp in (compare_gapless(ours, theirs, b, TICK, maker=MAKER, taker=TAKER),
+                compare_real(ours, theirs, b, TAKER, maker=MAKER, tick=TICK)):
+        assert not by_name(cmp)["stop-limit fills on the same bar in both engines"].ok
+    assert moved == ["our sell stop-limit fill of bar 3 at 108.5: Nautilus's walk fills it on bar 4 "
+                     "at 108.5"]
+    assert compare.walked_elsewhere(ours["fills"], bars(), compare.open_orders(ours["resting"])) == []

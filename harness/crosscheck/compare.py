@@ -33,11 +33,17 @@ bars within that and the bounds of its other fills. The P&L difference of each s
 out of our equity from its exit bar on, and the bars from an ambiguous entry to the exit are not
 compared, so the rest of the curve is still held to the exact rule.
 
-Expected difference 4, the stop-limit's liquidity: a stop-limit triggered inside a bar whose range
-runs past its limit fills in both engines at the trigger, ours as a taker; Nautilus 1.231 sees only
-the bar's open, high, low and close, finds the limit not marketable at the high where it triggers,
-rests it, and fills it at the trigger as a maker when the price comes back. Its fee is then the
-maker fee, checked exactly, and the fee difference is taken out of our trade P&L and equity.
+Expected difference 4, the stop-limit in Nautilus's bar walk: Nautilus 1.231 moves the price
+through a bar's open, high, low and close only, so it triggers a stop-limit at the first of those
+points past the trigger, not at the trigger. If the limit is marketable there it fills at the
+trigger as a taker, as ours does. If not, the order rests and fills as a maker at the first later
+point where the limit is marketable, at that point's price but no better than the trigger
+(`nautilus_stop_limit`, pinned in `tests/test_nautilus_fills.py`). Our engine follows the price
+through the trigger itself and fills there as a taker. Where Nautilus's fill lands on the same bar,
+its price must be the predicted one within a tick and its fee the maker fee, and the value
+difference (price and fee) is taken out of our trade P&L and equity from that bar on; on the real
+bars it adds `qty * (|price difference| + price * |taker - maker|)` to the bounds. Where it lands on
+a later bar the fills cannot pair, and the case fails with that cause named.
 
 Round-trip trades are paired the same way, by the bar of their entry fill and their side, and must
 close on the same bar (or both still be open at the end). Our trades get their bars from our fills,
@@ -308,29 +314,101 @@ def through(pair: dict, bars: Bars) -> float:
     return 0.0
 
 
-def is_stop_limit_maker(pair: dict, bars: Bars) -> bool:
-    """Expected difference 4: our stop-limit filled as a taker at its trigger point, Nautilus's as
-    a maker, on a bar whose range runs past the limit (above it for a buy)."""
-    o, t = pair["ours"], pair["theirs"]
-    ot = o.get("order_type") or {}
-    if ot.get("type") != "stop_limit" or o.get("liquidity") != "taker":
-        return False
-    if t.get("liquidity") != "maker":
-        return False
-    b = bars.bars[pair["bar"]]
-    return b["high"] > ot["price"] if o["side"] == "buy" else b["low"] < ot["price"]
+def nautilus_stop_limit(order: dict, bars: Bars) -> tuple[int, float, str] | None:
+    """Where Nautilus 1.231 fills one of our stop-limit orders, from the bar after its decision:
+    (bar, price, liquidity), or None if it never fills in the bars given.
+
+    Nautilus walks each bar open, high, low, close and triggers the order at the first point past
+    its trigger. If the limit is marketable at that point, it fills at the trigger as a taker.
+    Otherwise it rests, and fills as a maker at the first later point where the limit is
+    marketable, at that point's price but no better than the trigger: `max(point, trigger)` for a
+    buy, `min(point, trigger)` for a sell."""
+    req = order["request"]
+    ot, buy = req["order_type"], req["side"] == "buy"
+    trigger, limit = ot["trigger"], ot["price"]
+    d = bars.index_of(order["submitted_at"])
+    triggered = False
+    for j in range(0 if d is None else d + 1, len(bars.bars)):
+        b = bars.bars[j]
+        for point in (b["open"], b["high"], b["low"], b["close"]):
+            marketable = point <= limit if buy else point >= limit
+            if not triggered:
+                if point >= trigger if buy else point <= trigger:
+                    triggered = True
+                    if marketable:
+                        return j, trigger, "taker"
+                continue
+            if marketable:
+                return j, max(point, trigger) if buy else min(point, trigger), "maker"
+    return None
 
 
-def classify(pairs: list[dict], bars: Bars, ambiguous: dict[int, dict]) -> None:
-    """Sets each pair's `class`: ambiguous (a resting fill on an ambiguous bar), the stop-limit
-    fee difference, or exact."""
+def open_orders(resting: list[dict]) -> dict[int, dict]:
+    """Our orders by id, from the open orders listed before each bar."""
+    return {o["id"]: o for snap in resting for o in snap["orders"]}
+
+
+def walked_elsewhere(fills: list[dict], bars: Bars, orders: dict[int, dict]) -> list[str]:
+    """Our stop-limit fills that Nautilus's bar walk fills on another bar (expected difference 4,
+    the part that cannot pair)."""
+    out = []
+    for f in fills:
+        order = orders.get(f.get("order_id"))
+        if order is None or order["request"]["order_type"]["type"] != "stop_limit":
+            continue
+        n = our_fill_bar(f, bars)
+        predicted = nautilus_stop_limit(order, bars)
+        if predicted is not None and predicted[0] != n:
+            out.append(
+                f"our {f['side']} stop-limit fill of bar {n} at {f['price']:g}: Nautilus's walk "
+                f"fills it on bar {predicted[0]} at {predicted[1]:g}"
+            )
+    return out
+
+
+def walk_check(fills: list[dict], bars: Bars, orders: dict[int, dict]) -> Check | None:
+    """Fails, naming each fill, when Nautilus's bar walk moves a stop-limit fill to another bar:
+    the triggered order rests past the bar in Nautilus, where our engine fills it at the trigger.
+    The cause is known (expected difference 4) but the fills, and what the strategy decides from
+    them, cannot be paired."""
+    moved = walked_elsewhere(fills, bars, orders)
+    if not moved:
+        return None
+    return Check(
+        "stop-limit fills on the same bar in both engines",
+        False,
+        f"{len(moved)} moved by Nautilus's bar walk",
+        "none",
+        "; ".join(moved[:5]),
+    )
+
+
+def classify(pairs: list[dict], bars: Bars, ambiguous: dict[int, dict],
+             orders: dict[int, dict] | None = None) -> None:
+    """Sets each pair's `class`: ambiguous (a resting fill on an ambiguous bar), the stop-limit in
+    Nautilus's bar walk (with `predicted`, Nautilus's expected price), or exact."""
+    orders = orders or {}
     for p in pairs:
-        if not p["ours"].get("at_decision", True) and p["bar"] in ambiguous:
+        o = p["ours"]
+        if not o.get("at_decision", True) and p["bar"] in ambiguous:
             p["class"] = AMBIGUOUS
-        elif is_stop_limit_maker(p, bars):
+            continue
+        p["class"] = EXACT
+        order = orders.get(o.get("order_id"))
+        if order is None or order["request"]["order_type"]["type"] != "stop_limit":
+            continue
+        predicted = nautilus_stop_limit(order, bars)
+        if predicted is not None and predicted[0] == p["bar"] and predicted[2] == "maker":
             p["class"] = STOP_LIMIT_MAKER
-        else:
-            p["class"] = EXACT
+            p["predicted"] = predicted[1]
+
+
+def value_shift(p: dict) -> float:
+    """Our equity less Nautilus's from a fill pair onwards, with the same quantity: the price
+    difference on the quantity, against the fill's side, and the fee difference."""
+    o, t = p["ours"], p["theirs"]
+    sign = 1.0 if o["side"] == "buy" else -1.0
+    return sign * o["qty"] * (t["price"] - o["price"]) + (t["fee"] - o["fee"])
 
 
 def expected_fee(p: dict, maker: float) -> float:
@@ -398,9 +476,8 @@ def fee_check(pairs: list[dict], maker: float = 0.0) -> Check:
     makers = sum(1 for p in pairs if p.get("class") == STOP_LIMIT_MAKER)
     if makers:
         notes.append(
-            f"{makers} stop-limit fill(s) triggered inside a bar that runs past the limit carry "
-            "Nautilus's maker fee against our taker fee, at the same price: expected difference 4, "
-            "held to the maker fee exactly"
+            f"{makers} stop-limit fill(s) rest in Nautilus's bar walk and carry its maker fee "
+            "against our taker fee: expected difference 4, held to the maker fee exactly"
         )
     return Check(
         "fees",
@@ -579,11 +656,13 @@ def trade_fills(trade_pairs: list[dict], fill_pairs: list[dict]) -> None:
         tp["ambiguous_entry"] = any(
             p.get("class") == AMBIGUOUS for role, p, _ in tp["fills"] if role == "entry"
         )
-        tp["fee_adj"] = sum(
-            share * (p["theirs"]["fee"] - p["ours"]["fee"])
-            for _, p, share in tp["fills"]
-            if p.get("class") == STOP_LIMIT_MAKER
-        )
+        walked = [(p, share) for _, p, share in tp["fills"] if p.get("class") == STOP_LIMIT_MAKER]
+        tp["fee_adj"] = sum(share * (p["theirs"]["fee"] - p["ours"]["fee"]) for p, share in walked)
+        # Our P&L less Nautilus's from the walked fills: the trade's share of each fill's value
+        # difference, against the trade's own side (a fill that closes a trade has the opposite
+        # side to it, which `value_shift` already accounts for).
+        tp["pnl_adj"] = sum(share * value_shift(p) for p, share in walked)
+        tp["walked_price"] = any(p["ours"]["price"] != p["theirs"]["price"] for p, _ in walked)
 
 
 def gapless_trade_checks(pairs: list[dict], tick: float) -> tuple[list[Check], dict]:
@@ -605,6 +684,8 @@ def gapless_trade_checks(pairs: list[dict], tick: float) -> tuple[list[Check], d
     )
     price = 0.0
     for p in pairs:
+        if p.get("walked_price"):
+            continue  # its fills' prices are held to Nautilus's walk instead
         price = max(price, abs(p["ours"]["entry_price"] - p["theirs"]["entry_price"]))
         price = max(price, abs(p["ours"]["exit_price"] - p["theirs"]["exit_price"]))
     checks.append(
@@ -652,7 +733,7 @@ def gapless_trade_checks(pairs: list[dict], tick: float) -> tuple[list[Check], d
     )
     pnl_c, pnl_rel, pnl_abs = amount_check(
         "trades: P&L net of fees, before funding",
-        lambda p: pnl(p["ours"]) - p.get("fee_adj", 0.0),
+        lambda p: pnl(p["ours"]) - p.get("pnl_adj", 0.0),
         lambda p: pnl(p["theirs"]),
         PNL_REL,
     )
@@ -698,7 +779,7 @@ def ambiguous_trade_check(pairs: list[dict], allowance=lambda p: 0.0) -> tuple[C
     over = []
     worst_gap = 0.0  # the largest amount by which ours is below Nautilus's
     for p in pairs:
-        a = pnl(p["ours"]) - p.get("fee_adj", 0.0)
+        a = pnl(p["ours"]) - p.get("pnl_adj", 0.0)
         b = pnl(p["theirs"]) * (p["ours"]["qty"] / p["theirs"]["qty"] if p["theirs"]["qty"] else 1.0)
         worst_gap = max(worst_gap, b - a)
         if a > b + money_floor(p["theirs"]) + allowance(p) * (1.0 + SLACK_REL):
@@ -737,10 +818,14 @@ def compare_gapless(
     amb = ambiguous if ambiguous is not None else ambiguous_bars(
         ours.get("resting", []), bars, maker, taker
     )
+    orders = open_orders(ours.get("resting", []))
     pairs, problems = pair_fills(ours["fills"], theirs["fills"], bars)
-    classify(pairs, bars, amb)
+    classify(pairs, bars, amb, orders)
     cmp.pairs = pairs
     cmp.checks.append(pairing_check(pairs, problems, len(ours["fills"]), len(theirs["fills"])))
+    walk = walk_check(ours["fills"], bars, orders)
+    if walk:
+        cmp.checks.append(walk)
     qty_bad = [p for p in pairs if rel(p["ours"]["qty"], p["theirs"]["qty"]) > QTY_REL]
     cmp.checks.append(
         Check(
@@ -755,7 +840,12 @@ def compare_gapless(
     )
     exact = [p for p in pairs if p["class"] != AMBIGUOUS]
     n_amb_fills = len(pairs) - len(exact)
-    price_diffs = [abs(p["ours"]["price"] - p["theirs"]["price"]) for p in exact]
+    # A walked stop-limit is held to Nautilus's predicted price, the others to ours.
+    price_diffs = [
+        abs((p["predicted"] if p["class"] == STOP_LIMIT_MAKER else p["ours"]["price"])
+            - p["theirs"]["price"])
+        for p in exact
+    ]
     max_price = max(price_diffs, default=0.0)
     cmp.checks.append(
         Check(
@@ -809,14 +899,12 @@ def compare_gapless(
     eq_o, eq_t = ours["equity"], theirs["equity"]
     last = len(eq_o) - 1
     shifts: list[tuple[int, float]] = [
-        (p["bar"], p["theirs"]["fee"] - p["ours"]["fee"])
-        for p in pairs
-        if p["class"] == STOP_LIMIT_MAKER
+        (p["bar"], value_shift(p)) for p in pairs if p["class"] == STOP_LIMIT_MAKER
     ]
     skipped: set[int] = set()
     for t in amb_trades:
         exit_bar = last if t["ours"]["open"] else t["exit_bar"]
-        shifts.append((exit_bar, (pnl(t["ours"]) - t["fee_adj"]) - pnl(t["theirs"])))
+        shifts.append((exit_bar, (pnl(t["ours"]) - t["pnl_adj"]) - pnl(t["theirs"])))
         if t["ambiguous_entry"]:
             skipped.update(range(t["bar"], exit_bar))
     explained = [0.0] * len(eq_o)
@@ -835,7 +923,7 @@ def compare_gapless(
     if shifts:
         notes.append(
             f"ours taken less {explained[-1]:.6g} of explained differences from the bar each is "
-            "realized on (stop-limit fees, ambiguous trades)"
+            "realized on (stop-limits in Nautilus's bar walk, ambiguous trades)"
         )
     if skipped:
         notes.append(f"{len(skipped)} bar(s) from an ambiguous entry to its exit not compared")
@@ -899,8 +987,12 @@ def fill_allowance(p: dict, bars: Bars, ambiguous: dict[int, dict], maker: float
     out["per_unit"] = gap + PRICE_TICKS * tick
     out["bound3"] = qty * gap * (1.0 + taker)
     if p["class"] == STOP_LIMIT_MAKER:
-        # The fee on the same fill at the other rate: expected difference 4.
-        out["fee4_per_unit"] = max(o["price"], t["price"]) * abs(taker - maker)
+        # Expected difference 4: Nautilus's price is held to its walk's (`predicted`, within a
+        # tick), so the fills differ by the price difference and the fee at the other rate.
+        out["per_unit"] = PRICE_TICKS * tick
+        out["fee4_per_unit"] = abs(o["price"] - t["price"]) + max(o["price"], t["price"]) * abs(
+            taker - maker
+        )
         out["fee4"] = qty * out["fee4_per_unit"]
     return out
 
@@ -983,10 +1075,14 @@ def compare_real(
     amb = ambiguous if ambiguous is not None else ambiguous_bars(
         ours.get("resting", []), bars, maker, taker
     )
+    orders = open_orders(ours.get("resting", []))
     pairs, problems = pair_fills(ours["fills"], theirs["fills"], bars)
-    classify(pairs, bars, amb)
+    classify(pairs, bars, amb, orders)
     cmp.pairs = pairs
     cmp.checks.append(pairing_check(pairs, problems, len(ours["fills"]), len(theirs["fills"])))
+    walk = walk_check(ours["fills"], bars, orders)
+    if walk:
+        cmp.checks.append(walk)
     cmp.checks.append(rejections_check(ours, theirs))
     over = []
     bound1 = bound3 = fee4 = 0.0
@@ -1001,8 +1097,9 @@ def compare_real(
         fee4 += a["fee4"]
         if a["per_unit"] is None:
             continue
-        diff = abs(p["ours"]["price"] - p["theirs"]["price"])
-        max_price = max(max_price, diff)
+        reference = p["predicted"] if p["class"] == STOP_LIMIT_MAKER else p["ours"]["price"]
+        diff = abs(reference - p["theirs"]["price"])
+        max_price = max(max_price, abs(p["ours"]["price"] - p["theirs"]["price"]))
         limit = a["per_unit"] + SLACK_REL * p["ours"]["price"]
         if diff > limit:
             over.append(f"bar {p['bar']}: diff {diff:.10g} > {a['per_unit']:.10g}")
@@ -1015,7 +1112,7 @@ def compare_real(
             not over,
             f"max diff {max_price:.10g}",
             "per fill: |open[N+1] - close[N]| at the decision price; one tick plus bound 3 per "
-            "unit for a resting order",
+            "unit for a resting order; one tick from Nautilus's walk for a stop-limit it rests",
             "; ".join(over[:5]),
         )
     )

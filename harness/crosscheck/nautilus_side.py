@@ -246,6 +246,9 @@ class CrosscheckStrategy(Strategy):
         self.orders: dict[int, dict] = {}
         self._by_coid: dict[str, int] = {}
         self._next_id = 1
+        # Cancels sent and not yet acknowledged, and the orders held back until they are.
+        self._cancelling: set[str] = set()
+        self._held: list[dict] = []
         self.s: dict = {}  # the strategy's own state
 
     def on_start(self) -> None:
@@ -431,6 +434,13 @@ class CrosscheckStrategy(Strategy):
         return oid
 
     def transmit(self, rec: dict) -> None:
+        if self._cancelling:
+            # Our engine frees what a cancelled order held at once, so an order sent after a cancel
+            # is checked against the freed cash. Nautilus's cash account keeps it locked until the
+            # cancel is processed, and would reject the new order on the locked balance: it is
+            # held until the cancel is acknowledged, in the same bar's processing.
+            self._held.append(rec)
+            return
         f = self.order_factory
         side = OrderSide.BUY if rec["side"] == "buy" else OrderSide.SELL
         qty = Quantity(rec["qty"], self.instrument.size_precision)
@@ -462,6 +472,7 @@ class CrosscheckStrategy(Strategy):
         if rec["coid"] is not None:
             order = self.cache.order(ClientOrderId(rec["coid"]))
             if order is not None and order.is_open:
+                self._cancelling.add(rec["coid"])
                 self.cancel_order(order)
         return True
 
@@ -735,6 +746,8 @@ class CrosscheckStrategy(Strategy):
         order = self.cache.order(event.client_order_id)
         if order is None or order.is_closed:
             self.orders.pop(rec["id"], None)
+            if rec["coid"] in self._cancelling:
+                self._release(rec["coid"])
         if rec["attach"] is not None:
             # Our broker places the attached stop when its entry fills, for the filled quantity.
             stop = {
@@ -751,7 +764,19 @@ class CrosscheckStrategy(Strategy):
                 self.transmit(self.orders[then])
         rec["then"] = []
 
+    def _release(self, coid: str) -> None:
+        """A cancel was acknowledged (or the order closed otherwise): send the held orders once no
+        cancel is outstanding, those our engine still has open."""
+        self._cancelling.discard(coid)
+        if self._cancelling:
+            return
+        held, self._held = self._held, []
+        for rec in held:
+            if rec["id"] in self.orders:
+                self.transmit(rec)
+
     def _gone(self, event, rejected: bool) -> None:
+        self._release(event.client_order_id.value)
         rec = self._rec(event)
         if rec is not None:
             self.orders.pop(rec["id"], None)
@@ -771,6 +796,9 @@ class CrosscheckStrategy(Strategy):
 
     def on_order_denied(self, event) -> None:
         self._gone(event, rejected=True)
+
+    def on_order_cancel_rejected(self, event) -> None:
+        self._release(event.client_order_id.value)
 
 
 # -------------------------------------------------------------------------------------------------
@@ -869,11 +897,26 @@ def read_funding(path: Path) -> list[list]:
         return [[int(r["time"]), float(r["rate"])] for r in csv.DictReader(f)]
 
 
-def make_instrument(case: dict, inst: dict):
+def price_decimals(bars: list[dict]) -> int:
+    """The most decimals any bar price has, up to 8."""
+    most = 0
+    for b in bars:
+        for k in ("open", "high", "low", "close"):
+            text = f"{b[k]:.8f}".rstrip("0")
+            most = max(most, len(text.split(".")[1]) if "." in text else 0)
+    return most
+
+
+def make_instrument(case: dict, inst: dict, data_decimals: int = 0):
+    """The Nautilus instrument for a case. Its price precision is the tick's, or more when the
+    bars have more decimals: a venue's tick can be coarser now than when the bars traded (Bybit's
+    BTCUSDT spot moved from 0.01 to 0.1), and Nautilus would round every bar price to its
+    precision, while our engine reads the bars as they are. Orders are still rounded to the
+    current tick on both sides."""
     venue = Venue(case["venue"].upper())
     base = Currency.from_str(inst["base"])
     quote = Currency.from_str(inst["quote"])
-    price_precision = step_decimals(inst["tick_size"])
+    price_precision = max(step_decimals(inst["tick_size"]), data_decimals)
     size_precision = step_decimals(inst["lot_size"])
     common = dict(
         raw_symbol=Symbol(case["symbol"]),
@@ -914,7 +957,7 @@ def run_case(case: dict, harness: Path, series: str) -> dict:
     funding = read_funding(data / "funding.csv") if case["kind"] == "perpetual" else []
     tf_ms = TIMEFRAME_MS[case["timeframe"]]
 
-    instrument = make_instrument(case, inst)
+    instrument = make_instrument(case, inst, price_decimals(bars))
     venue = instrument.id.venue
     engine = BacktestEngine(
         BacktestEngineConfig(
