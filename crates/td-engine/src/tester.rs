@@ -15,13 +15,13 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use td_core::{Candle, Fill, Millis, Side};
+use td_core::{Candle, Fill, Millis, Side, Timeframe};
 
 use crate::metrics::{self, EquitySeries, MetricsReport};
-use crate::runner::{config_fingerprint, select_bars};
+use crate::runner::{compare, config_fingerprint, hold_over, select_bars};
 use crate::{
-    BacktestConfig, BacktestResult, EngineError, EquityPoint, ParamKind, ParamSpec, ParamValue,
-    Params, Trade, find_strategy, run,
+    BacktestConfig, BacktestResult, Benchmark, EngineError, EquityPoint, ParamKind, ParamSpec,
+    ParamValue, Params, Trade, find_strategy, run,
 };
 
 /// The most backtests one sweep may run: the grid size, or the sample count in random mode. A
@@ -109,6 +109,12 @@ pub enum SweepMode {
 }
 
 /// A metrics report field a sweep can rank by.
+///
+/// `Sharpe` and `Sortino` are undefined on a range with fewer than
+/// [`metrics::MIN_DAILY_RETURNS`] daily returns on days with a bar close, and `Cagr` and `Calmar`
+/// on a range shorter than [`metrics::MIN_CAGR_DAYS`] days; a run whose objective is undefined
+/// does not qualify (see [`SweepRow::qualified`]). In a walk-forward that applies to each train
+/// window's length, and in an out-of-sample test to the in-sample segment's.
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -151,9 +157,15 @@ pub struct SweepSpec {
     pub axes: Vec<ParamAxis>,
     pub mode: SweepMode,
     pub objective: Objective,
-    /// Runs with fewer closed trades than this rank after every run that has enough.
-    #[serde(default)]
+    /// Runs with fewer closed trades than this rank after every run that has enough. Defaults to
+    /// 1 when left out, so a parameter set that never trades (no drawdown, no losses) cannot top
+    /// a ranking by drawdown; set 0 to rank such sets too.
+    #[serde(default = "default_min_trades")]
     pub min_trades: usize,
+}
+
+fn default_min_trades() -> usize {
+    1
 }
 
 impl SweepSpec {
@@ -174,11 +186,14 @@ impl OosSpec {
 }
 
 impl WalkForwardSpec {
-    /// [`SweepSpec::check`], plus the walk-forward rules that need no data. Whether the windows
-    /// fit the range is checked by the run.
+    /// [`SweepSpec::check`], plus the walk-forward rules that need no data, among them that the
+    /// first train window can be long enough for a Sharpe, Sortino, CAGR or Calmar objective with
+    /// no gaps in the data. Whether the windows fit the range, and whether each train window in
+    /// the data is long enough, is checked by the run before it runs anything.
     pub fn check(&self) -> Result<(), TesterError> {
         refuse_base_warmup(&self.sweep)?;
-        self.sweep.check()
+        self.sweep.check()?;
+        refuse_short_train_bars(self)
     }
 }
 
@@ -236,8 +251,9 @@ pub struct SweepRow {
     /// The full parameter set the run used, defaults included.
     pub params: Params,
     /// Whether the run ranks by its objective: it ran, made at least `min_trades` closed trades
-    /// and its objective is defined. Other runs rank after all qualified ones: first those that
-    /// ran, then those the strategy refused, each in grid order.
+    /// and its objective is defined (see [`Metric`] for when it is not). Other runs rank after
+    /// all qualified ones: first those that ran, then those the strategy refused, each in grid
+    /// order.
     pub qualified: bool,
     /// `None` when the strategy refused the parameter set.
     pub metrics: Option<Headline>,
@@ -696,11 +712,19 @@ pub struct OosResult {
     /// cumulative return grows with it. `None` if either value is undefined or the in-sample
     /// value is zero. For a maximised metric below 1 is worse out of sample; for a minimised one
     /// above 1 is worse. Not meaningful when the in-sample value is negative.
+    ///
+    /// With `TotalReturn`, `Cagr` or `Calmar` it is therefore `None` when either segment is
+    /// shorter than [`metrics::MIN_CAGR_DAYS`] days, and with `Sharpe` or `Sortino` when either
+    /// has fewer than [`metrics::MIN_DAILY_RETURNS`] daily returns on days with a bar close (the
+    /// in-sample segment is refused up front then, so this is the out-of-sample one). It does not
+    /// fall back to the ratio of total returns, which would compare segments of different
+    /// lengths; compare the two runs' metrics directly then.
     pub degradation: Option<f64>,
 }
 
 /// Optimises on the in-sample segment, then runs the best parameters on the out-of-sample
-/// segment with the in-sample bars as warm-up.
+/// segment with the in-sample bars as warm-up. An objective undefined on the in-sample segment
+/// whatever the parameters (see [`Metric`]) is refused before anything runs.
 pub fn out_of_sample(
     spec: &OosSpec,
     bars: &[Candle],
@@ -712,6 +736,13 @@ pub fn out_of_sample(
     let plan = Plan::new(&spec.sweep)?;
     let (_, traded) = select_bars(base, bars)?;
     let split_at = split_time(&traded, spec.split)?;
+    let in_sample_bars = traded.partition_point(|b| b.open_time < split_at);
+    refuse_short_segment(
+        spec.sweep.objective.metric,
+        base.timeframe,
+        &traded[..in_sample_bars],
+        FloorRange::InSample,
+    )?;
 
     let mut is_spec = spec.sweep.clone();
     is_spec.base.to = split_at;
@@ -756,8 +787,8 @@ pub fn out_of_sample(
 /// annualised, profit factor and win rate are per-trade ratios, and the maximum drawdown is a
 /// depth, not a sum over time (a longer segment tends to reach a deeper one, but no exact
 /// rescaling exists for it). Totals that do grow with length, such as trade counts and fee or
-/// funding sums, cannot be objectives. `None` if either value is undefined or the in-sample
-/// value is zero.
+/// funding sums, cannot be objectives. `None` if either value is undefined (a segment too short
+/// for a CAGR or a Sharpe ratio, see [`OosResult::degradation`]) or the in-sample value is zero.
 fn degradation(metric: Metric, in_sample: &Headline, out_of_sample: &Headline) -> Option<f64> {
     let compared = match metric {
         Metric::TotalReturn => Metric::Cagr,
@@ -807,11 +838,18 @@ pub enum WindowMode {
 
 /// Walk-forward windows, in bars of the base range.
 ///
-/// Window k tests bars `train + k * step .. train + k * step + test`. Its train window is the
-/// `train` bars before that (rolling) or every bar before it (anchored), so a test segment never
-/// overlaps its own train window. `step` must be at least `test`, so test segments never overlap
-/// each other; with `step == test` they are contiguous. Trailing bars that do not fill a whole
-/// test segment are not tested.
+/// The windows are laid back from the end of the range, so the most recent bars are always
+/// tested: the last test segment ends on the last bar, and each earlier one starts `step` bars
+/// before the next. There are as many windows as fit with a whole train window before the first
+/// test segment. A window's train window is the `train` bars before its test segment (rolling)
+/// or every bar before it (anchored), so a test segment never overlaps its own train window.
+/// `step` must be at least `test`, so test segments never overlap each other; with
+/// `step == test` they are contiguous, and with a longer step the untested bars sit before each
+/// test segment.
+///
+/// The leftover bars at the start, fewer than `step`, are never tested. In rolling mode the first
+/// train sweep is warmed up on them (as many as the train length); in anchored mode every train
+/// window starts at the first bar, so they are part of each one's training data.
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WindowSpec {
@@ -849,24 +887,23 @@ impl WindowSpec {
                 "one window needs {needed} bars, the range has {bars}"
             )));
         }
-        let mut out = Vec::new();
-        let mut start = self.train_bars;
-        loop {
-            let end = start.checked_add(self.test_bars).ok_or_else(overflow)?;
-            if end > bars {
-                break;
-            }
-            let train_start = match self.mode {
-                WindowMode::Rolling => start - self.train_bars,
-                WindowMode::Anchored => 0,
-            };
-            out.push(Window {
-                train: train_start..start,
-                test: start..end,
-            });
-            start = start.checked_add(self.step_bars).ok_or_else(overflow)?;
-        }
-        Ok(out)
+        // Laid back from the end: `count - 1` steps after the first test segment, the last one ends
+        // on the last bar. `(count - 1) * step <= bars - needed`, so nothing below overflows.
+        let count = (bars - needed) / self.step_bars + 1;
+        let first_test = bars - (count - 1) * self.step_bars - self.test_bars;
+        Ok((0..count)
+            .map(|k| {
+                let start = first_test + k * self.step_bars;
+                let train_start = match self.mode {
+                    WindowMode::Rolling => start - self.train_bars,
+                    WindowMode::Anchored => 0,
+                };
+                Window {
+                    train: train_start..start,
+                    test: start..start + self.test_bars,
+                }
+            })
+            .collect())
     }
 }
 
@@ -912,12 +949,15 @@ pub struct WindowResult {
 /// Train sweeps close out the same way, so a window's in-sample and out-of-sample trade counts
 /// (and `min_trades`) count a position held at the end alike. A rolling window's train sweep is
 /// warmed up on the bars just before it, as many as the window's train length (fewer near the
-/// start of the range), the same warm-up its test run gets; the first window's, and every
-/// anchored window's, starts cold because no bars come before it.
+/// start of the range), the same warm-up its test run gets; the first window's uses the leftover
+/// bars before it (see [`WindowSpec`]) and starts cold if there are none. Every anchored window's
+/// starts cold, because its train window begins at the first bar.
 ///
 /// The stitched metrics are computed like a single backtest's (see [`MetricsReport`]): the
 /// stitched Sharpe, Sortino and volatility come from the stitched curve's daily UTC returns, not
-/// from its per-bar returns, so they are comparable with a backtest's on any timeframe.
+/// from its per-bar returns, so they are comparable with a backtest's on any timeframe. The floors
+/// on annualised metrics apply to the stitched curve as a whole, so it can have a Sharpe ratio or
+/// a CAGR when no single test window is long enough for one.
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WalkForwardResult {
@@ -930,6 +970,18 @@ pub struct WalkForwardResult {
     pub equity: Vec<EquityPoint>,
     /// Metrics of the stitched curve, its trades and its fills.
     pub metrics: MetricsReport,
+    /// Buy and hold in each test window, stitched like the test runs: each window buys at its
+    /// first test bar's open with the starting cash and holds to its last test bar's close, with
+    /// the fill, fee and funding rules of a backtest's benchmark, and the windows are compounded
+    /// with [`stitch`] as the test segments are. The two curves are therefore exposed over the
+    /// same bars: with a step longer than the test, neither holds through the bars between test
+    /// windows. Its excess return is the stitched total return minus its own.
+    ///
+    /// Unlike a test run it never sells, so it pays one taker fee per window to the test run's
+    /// two, and it holds through each window's last bar, on whose open a test run closes out.
+    /// `None` only in a result saved before walk-forwards had a benchmark.
+    #[serde(default)]
+    pub benchmark: Option<Benchmark>,
     /// Every test segment's trades in time order, with quantities, P&L, fees and funding scaled
     /// by the same factor as the segment's equity, so they add up to the stitched equity's
     /// changes. Segments after the stitched equity reached zero (factor 0, see [`stitch`]) traded
@@ -956,8 +1008,15 @@ pub fn walk_forward(
     let base = &spec.sweep.base;
     refuse_base_warmup(&spec.sweep)?;
     let plan = Plan::new(&spec.sweep)?;
+    refuse_short_train_bars(spec)?;
     let (_, traded) = select_bars(base, bars)?;
     let windows = spec.windows.windows(traded.len())?;
+    refuse_short_train(
+        spec.sweep.objective.metric,
+        base.timeframe,
+        &traded,
+        &windows,
+    )?;
     let time_at = |i: usize| traded.get(i).map_or(base.to, |b| b.open_time);
 
     let per_window = plan.indices.len();
@@ -1009,12 +1068,15 @@ pub fn walk_forward(
         });
     }
 
+    let segments = test_segments(&results);
     let Stitched {
+        series,
         equity,
         metrics,
         trades,
         fills,
-    } = stitched_report(base, &results);
+    } = stitched_report(base, &segments);
+    let benchmark = stitched_benchmark(base, &results, bars, funding, &series, &metrics)?;
     let param_changes = results
         .windows(2)
         .filter(|w| w[0].params != w[1].params)
@@ -1028,11 +1090,210 @@ pub fn walk_forward(
         windows: results,
         equity,
         metrics,
+        benchmark: Some(benchmark),
         trades,
         fills,
         param_changes,
         param_change_rate,
     })
+}
+
+/// The name of `metric` when it is undefined on a run too short for it (see [`Metric`]), `None`
+/// otherwise.
+fn floored_metric_name(metric: Metric) -> Option<&'static str> {
+    match metric {
+        Metric::Sharpe => Some("Sharpe"),
+        Metric::Sortino => Some("Sortino"),
+        Metric::Cagr => Some("CAGR"),
+        Metric::Calmar => Some("Calmar"),
+        _ => None,
+    }
+}
+
+/// Refuses, without data, a walk-forward whose objective is undefined on its first train window
+/// whatever the data: a Sharpe or Sortino objective when that window cannot hold
+/// [`metrics::MIN_DAILY_RETURNS`] daily returns on days with a bar close (without gaps, at most
+/// one per day it spans and one per bar), or a CAGR or Calmar objective when it cannot span
+/// [`metrics::MIN_CAGR_DAYS`] days. The first train window is the shortest: `train_bars` long when
+/// rolling, and when anchored up to `step_bars - 1` bars longer, since it starts at the first bar
+/// and so also takes the bars left over before the first test.
+///
+/// Bars without gaps span their count times the timeframe, and hold the most daily returns when
+/// they start on the last bar of a UTC day. A data gap would stretch a window over more days, but
+/// a window that reaches the floor only through a gap would have its metric measured partly on
+/// days with no bars, so the rule counts bars. [`refuse_short_train`] then checks each window in
+/// the data.
+fn refuse_short_train_bars(spec: &WalkForwardSpec) -> Result<(), TesterError> {
+    let Some(name) = floored_metric_name(spec.sweep.objective.metric) else {
+        return Ok(());
+    };
+    let w = &spec.windows;
+    // A train length of zero is refused by the run's window rules, with their own message.
+    if w.train_bars == 0 {
+        return Ok(());
+    }
+    let bars = match w.mode {
+        WindowMode::Rolling => w.train_bars,
+        WindowMode::Anchored => w.train_bars.saturating_add(w.step_bars.saturating_sub(1)),
+    };
+    let tf = spec.sweep.base.timeframe;
+    let bar = tf.duration_ms();
+    // A span too long for milliseconds in an i64 is far past every floor.
+    let Some(span) = i64::try_from(bars).ok().and_then(|n| n.checked_mul(bar)) else {
+        return Ok(());
+    };
+    let window = match w.mode {
+        WindowMode::Rolling => format!("a train window of {bars} {tf} bars"),
+        WindowMode::Anchored => format!("the first train window, at most {bars} {tf} bars,"),
+    };
+    match spec.sweep.objective.metric {
+        Metric::Sharpe | Metric::Sortino => {
+            // Bars starting `offset` into a UTC day hold a daily return for each 00:00 UTC after
+            // the first bar's open up to the last bar's close, and one more for the day the close
+            // falls in unless it falls on 00:00 (see [`metrics::daily_equity`]). That is the span
+            // plus the offset, in days, rounded up. Bars shorter than a day divide it, so the last
+            // one of a day starts a bar short of its end; daily and weekly bars start at 00:00.
+            let end = (metrics::DAY_MS - bar).max(0) + span;
+            let most = end / metrics::DAY_MS + i64::from(end % metrics::DAY_MS != 0);
+            if most < metrics::MIN_DAILY_RETURNS as i64 {
+                return Err(TesterError::InvalidSpec(format!(
+                    "a {name} objective needs at least {} daily returns in every train window, \
+                     and {window} has at most {most}",
+                    metrics::MIN_DAILY_RETURNS
+                )));
+            }
+            // Bars longer than a day reach the daily floor with fewer bars than daily returns.
+            if bars < metrics::MIN_DAILY_RETURNS {
+                return Err(TesterError::InvalidSpec(format!(
+                    "a {name} objective needs at least {min} bars as well as {min} daily returns \
+                     in every train window, and {window} is shorter",
+                    min = metrics::MIN_DAILY_RETURNS
+                )));
+            }
+        }
+        _ => {
+            if span < metrics::MIN_CAGR_DAYS * metrics::DAY_MS {
+                return Err(TesterError::InvalidSpec(format!(
+                    "a {name} objective needs train windows of at least {} days, and {window} \
+                     spans {}",
+                    metrics::MIN_CAGR_DAYS,
+                    describe_span(span)
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Refuses a walk-forward whose objective is undefined on one of its train windows whatever the
+/// parameters; see [`refuse_short_segment`]. Every train sweep there would end without a
+/// qualifying run; this says why before anything runs.
+fn refuse_short_train(
+    metric: Metric,
+    timeframe: Timeframe,
+    traded: &[Candle],
+    windows: &[Window],
+) -> Result<(), TesterError> {
+    for (k, w) in windows.iter().enumerate() {
+        refuse_short_segment(
+            metric,
+            timeframe,
+            &traded[w.train.clone()],
+            FloorRange::Train(k),
+        )?;
+    }
+    Ok(())
+}
+
+/// The run a [`refuse_short_segment`] refusal is about.
+#[derive(Debug, Clone, Copy)]
+enum FloorRange {
+    /// A walk-forward's train window, by index.
+    Train(usize),
+    /// An out-of-sample test's in-sample segment.
+    InSample,
+}
+
+/// Refuses a Sharpe or Sortino objective on a segment with fewer than
+/// [`metrics::MIN_DAILY_RETURNS`] daily returns, or as many on days with a bar close (see
+/// [`metrics::observed_daily_returns`]), or a CAGR or Calmar objective on one
+/// shorter than [`metrics::MIN_CAGR_DAYS`] days: the metric is undefined on it whatever the
+/// parameters. The daily returns and length are counted from the bars as the run's metrics count
+/// them, from the first bar's open to the last bar's close.
+fn refuse_short_segment(
+    metric: Metric,
+    timeframe: Timeframe,
+    segment: &[Candle],
+    which: FloorRange,
+) -> Result<(), TesterError> {
+    let Some(name) = floored_metric_name(metric) else {
+        return Ok(());
+    };
+    // Train windows and in-sample segments are at least one bar long.
+    let Some(first) = segment.first().map(|b| b.open_time) else {
+        return Ok(());
+    };
+    let step = timeframe.duration_ms();
+    let times: Vec<Millis> = std::iter::once(first)
+        .chain(segment.iter().map(|b| b.open_time + step))
+        .collect();
+    let span = times[times.len() - 1] - first;
+    let length = format!("{} bars over {}", segment.len(), describe_span(span));
+    let (every, spans, this) = match which {
+        FloorRange::Train(k) => (
+            "every train window",
+            "train windows",
+            format!("train window {k}"),
+        ),
+        FloorRange::InSample => (
+            "the in-sample segment",
+            "an in-sample segment",
+            "it".to_string(),
+        ),
+    };
+    let min = metrics::MIN_DAILY_RETURNS;
+    let refusal = match metric {
+        Metric::Sharpe | Metric::Sortino => {
+            let returns = metrics::daily_equity(&times, &vec![1.0; times.len()]).len() - 1;
+            // Counted as the report counts them: only days that hold a bar close.
+            let observed = metrics::observed_daily_returns(&times);
+            if returns < min {
+                format!(
+                    "a {name} objective needs at least {min} daily returns in {every}, and {this} \
+                     ({length}) has {returns}"
+                )
+            } else if observed < min {
+                format!(
+                    "a {name} objective needs at least {min} daily returns on days with a bar \
+                     close in {every}, and {this} ({length}) has {observed}"
+                )
+            } else {
+                return Ok(());
+            }
+        }
+        _ if span < metrics::MIN_CAGR_DAYS * metrics::DAY_MS => format!(
+            "a {name} objective needs {spans} of at least {} days, and {this} is {length}",
+            metrics::MIN_CAGR_DAYS
+        ),
+        _ => return Ok(()),
+    };
+    Err(TesterError::InvalidSpec(refusal))
+}
+
+/// A span of time as whole days and hours, rounded down, such as "8 days 8 hours".
+fn describe_span(ms: Millis) -> String {
+    const HOUR_MS: Millis = 3_600_000;
+    let days = ms / metrics::DAY_MS;
+    let hours = ms % metrics::DAY_MS / HOUR_MS;
+    let unit = |n: Millis, one: &str| match n {
+        1 => format!("1 {one}"),
+        _ => format!("{n} {one}s"),
+    };
+    match (days, hours) {
+        (0, h) => unit(h, "hour"),
+        (d, 0) => unit(d, "day"),
+        (d, h) => format!("{} {}", unit(d, "day"), unit(h, "hour")),
+    }
 }
 
 /// The factor each segment's equity is multiplied by in the stitched curve: the stitched equity
@@ -1076,8 +1337,80 @@ pub fn stitch(starting_cash: f64, segments: &[&[EquityPoint]]) -> Vec<EquityPoin
         .collect()
 }
 
+/// One run stitched into a curve: a test run's, or buy and hold's in a test window.
+struct Segment<'a> {
+    equity: &'a [EquityPoint],
+    fills: &'a [Fill],
+    trades: &'a [Trade],
+    funding_paid: f64,
+}
+
+/// The windows' test runs as segments of the stitched curve.
+fn test_segments(windows: &[WindowResult]) -> Vec<Segment<'_>> {
+    windows
+        .iter()
+        .map(|w| {
+            let r = &w.out_of_sample;
+            Segment {
+                equity: &r.equity,
+                fills: &r.fills,
+                trades: &r.trades,
+                funding_paid: r.metrics.funding_paid,
+            }
+        })
+        .collect()
+}
+
+/// Buy and hold in each test window, stitched like the test runs and compared with the stitched
+/// curve: see [`WalkForwardResult::benchmark`].
+fn stitched_benchmark(
+    base: &BacktestConfig,
+    windows: &[WindowResult],
+    bars: &[Candle],
+    funding: &[(Millis, f64)],
+    strategy_series: &EquitySeries,
+    strategy_report: &MetricsReport,
+) -> Result<Benchmark, TesterError> {
+    let held = windows
+        .iter()
+        .map(|w| {
+            let config = BacktestConfig {
+                from: w.test_from,
+                to: w.test_to,
+                warmup_from: None,
+                close_at_end: false,
+                ..base.clone()
+            };
+            let (_, test_bars) = select_bars(&config, bars)?;
+            Ok(hold_over(&config, &test_bars, funding))
+        })
+        .collect::<Result<Vec<_>, TesterError>>()?;
+    let segments: Vec<Segment> = held
+        .iter()
+        .map(|h| Segment {
+            equity: &h.equity,
+            fills: &h.fills,
+            trades: &h.trades,
+            funding_paid: h.funding_paid,
+        })
+        .collect();
+    let stitched = stitched_report(base, &segments);
+    // `windows` fails unless at least one window fits, so there is a first.
+    Ok(compare(
+        held[0].qty,
+        held[0].entry_price,
+        stitched.equity,
+        &stitched.series,
+        stitched.metrics,
+        strategy_series,
+        strategy_report,
+    ))
+}
+
 /// The stitched curve with its metrics, trades and fills.
 struct Stitched {
+    /// The stitched curve as the metrics read it, starting from the starting cash.
+    series: EquitySeries,
     equity: Vec<EquityPoint>,
     metrics: MetricsReport,
     trades: Vec<Trade>,
@@ -1088,12 +1421,9 @@ struct Stitched {
 /// scaled by the segment's factor, so trade P&L adds up to the stitched equity's changes. A
 /// segment with factor 0 (after ruin) contributes no trades or fills: zero-sized ones would
 /// count as trades in the statistics without having traded anything.
-fn stitched_report(base: &BacktestConfig, windows: &[WindowResult]) -> Stitched {
+fn stitched_report(base: &BacktestConfig, runs: &[Segment]) -> Stitched {
     let cash = base.starting_cash;
-    let segments: Vec<&[EquityPoint]> = windows
-        .iter()
-        .map(|w| w.out_of_sample.equity.as_slice())
-        .collect();
+    let segments: Vec<&[EquityPoint]> = runs.iter().map(|r| r.equity).collect();
     let equity = stitch(cash, &segments);
     let scales = segment_scales(cash, &segments);
     let lot = base.instrument.lot_size;
@@ -1101,13 +1431,12 @@ fn stitched_report(base: &BacktestConfig, windows: &[WindowResult]) -> Stitched 
     let mut fills: Vec<Fill> = Vec::new();
     let mut trades: Vec<Trade> = Vec::new();
     let mut funding = 0.0;
-    for (w, s) in windows.iter().zip(scales) {
-        let r = &w.out_of_sample;
+    for (r, s) in runs.iter().zip(scales) {
         // The position after each bar's fills, rebuilt from the fills (a fill's time is the open
         // time of the bar it filled on) and snapped to the lot size against rounding error.
         let mut position = 0.0;
         let mut next = 0;
-        for p in &r.equity {
+        for p in r.equity {
             while next < r.fills.len() && r.fills[next].time <= p.time {
                 let f = &r.fills[next];
                 position += match f.side {
@@ -1139,11 +1468,12 @@ fn stitched_report(base: &BacktestConfig, windows: &[WindowResult]) -> Stitched 
             net_pnl: t.net_pnl * s,
             ..t.clone()
         }));
-        funding += r.metrics.funding_paid * s;
+        funding += r.funding_paid * s;
     }
     let series = EquitySeries::new(cash, &equity, base.timeframe);
     let metrics = metrics::report(&series, &positions, &trades, &fills, funding);
     Stitched {
+        series,
         equity,
         metrics,
         trades,
@@ -1185,12 +1515,13 @@ mod tests {
             step_bars: 5,
             mode: WindowMode::Rolling,
         };
+        // 32 bars: the last test ends on bar 31, and bars 0 and 1 are left over.
         let w = spec.windows(32).unwrap();
         let expected = [
-            (0..10, 10..15),
-            (5..15, 15..20),
-            (10..20, 20..25),
-            (15..25, 25..30),
+            (2..12, 12..17),
+            (7..17, 17..22),
+            (12..22, 22..27),
+            (17..27, 27..32),
         ];
         assert_eq!(w.len(), expected.len());
         for (got, (train, test)) in w.iter().zip(expected) {
@@ -1205,6 +1536,61 @@ mod tests {
             // Contiguous, non-overlapping test segments.
             assert_eq!(pair[0].test.end, pair[1].test.start);
         }
+    }
+
+    #[test]
+    fn the_last_test_window_ends_on_the_last_bar_and_the_leftover_is_at_the_start() {
+        // Three years of 6-hour bars with a year of training and four months of testing: the
+        // windows fit 12 360 bars after the first train window into 8 steps with 680 left over.
+        for mode in [WindowMode::Rolling, WindowMode::Anchored] {
+            let spec = WindowSpec {
+                train_bars: 4_380,
+                test_bars: 1_460,
+                step_bars: 1_460,
+                mode,
+            };
+            let w = spec.windows(18_200).unwrap();
+            assert_eq!(w.len(), 9, "{mode:?}");
+            assert_eq!(w.last().unwrap().test.end, 18_200, "{mode:?}");
+            // The 680 leftover bars come before the first train window, not after the last test.
+            let first = &w[0];
+            assert_eq!(first.test.start, 680 + 4_380, "{mode:?}");
+            match mode {
+                WindowMode::Rolling => assert_eq!(first.train, 680..5_060),
+                WindowMode::Anchored => assert_eq!(first.train, 0..5_060),
+            }
+            // Everything after the leftover and the first train window is tested exactly once.
+            for pair in w.windows(2) {
+                assert_eq!(pair[0].test.end, pair[1].test.start);
+            }
+            let tested: usize = w.iter().map(|x| x.test.len()).sum();
+            assert_eq!(tested, 18_200 - 5_060);
+            for x in &w {
+                assert_eq!(x.train.end, x.test.start);
+                assert_eq!(x.test.len(), 1_460);
+                if mode == WindowMode::Rolling {
+                    assert_eq!(x.train.len(), 4_380);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn with_a_step_longer_than_the_test_the_gaps_fall_before_each_test_and_the_last_ends_the_range()
+    {
+        let spec = WindowSpec {
+            train_bars: 4,
+            test_bars: 2,
+            step_bars: 3,
+            mode: WindowMode::Rolling,
+        };
+        // 13 bars: the windows sit one bar later than from the start, so bar 12 is tested.
+        let w = spec.windows(13).unwrap();
+        assert_eq!(
+            w.iter().map(|x| x.test.clone()).collect::<Vec<_>>(),
+            [5..7, 8..10, 11..13]
+        );
+        assert_eq!(w[0].train, 1..5);
     }
 
     #[test]
@@ -1357,7 +1743,7 @@ mod tests {
         ruined.out_of_sample.equity.last_mut().unwrap().equity = 0.0;
         let windows = [ruined, window(20, 40)];
         let first = &windows[0].out_of_sample;
-        let st = stitched_report(&base, &windows);
+        let st = stitched_report(&base, &test_segments(&windows));
         assert_eq!(st.trades, first.trades);
         assert_eq!(st.fills, first.fills);
         assert_eq!(st.metrics.trades, first.metrics.trades);
@@ -1383,16 +1769,24 @@ mod tests {
                 step_bars: usize::MAX,
                 ..ok
             },
-            WindowSpec {
-                step_bars: usize::MAX,
-                ..ok
-            },
         ] {
             assert!(
                 matches!(bad.windows(100), Err(TesterError::InvalidSpec(_))),
                 "{bad:?}"
             );
         }
+        // A step longer than the range is no overflow: one window, ending on the last bar.
+        let long_step = WindowSpec {
+            step_bars: usize::MAX,
+            ..ok
+        };
+        assert_eq!(
+            long_step.windows(100).unwrap(),
+            [Window {
+                train: 85..95,
+                test: 95..100,
+            }]
+        );
     }
 
     #[test]
