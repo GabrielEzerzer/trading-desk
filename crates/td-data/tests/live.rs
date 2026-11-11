@@ -457,11 +457,11 @@ mod fake_sources {
         fn instruments(&self, _: &Http, _: InstrumentKind) -> Result<InstrumentList, DataError> {
             Ok(InstrumentList::default())
         }
-        fn default_fees(&self, _: InstrumentKind) -> FeeSchedule {
-            FeeSchedule {
+        fn default_fees(&self, _: InstrumentKind) -> Result<FeeSchedule, DataError> {
+            Ok(FeeSchedule {
                 maker: 0.0,
                 taker: 0.0,
-            }
+            })
         }
         fn minute_history(
             &self,
@@ -537,11 +537,11 @@ mod fake_sources {
         fn instruments(&self, _: &Http, _: InstrumentKind) -> Result<InstrumentList, DataError> {
             Ok(InstrumentList::default())
         }
-        fn default_fees(&self, _: InstrumentKind) -> FeeSchedule {
-            FeeSchedule {
+        fn default_fees(&self, _: InstrumentKind) -> Result<FeeSchedule, DataError> {
+            Ok(FeeSchedule {
                 maker: 0.0,
                 taker: 0.0,
-            }
+            })
         }
         fn minute_history(
             &self,
@@ -627,6 +627,31 @@ mod fake_sources {
             .expect("an event in time");
         let error = DataError::NoLiveStream(Venue::Binance).to_string();
         assert_eq!(error, "binance has no live stream");
+        assert_eq!(event, Some(FeedEvent::ConnectFailed { error }));
+        feed.abort();
+    }
+
+    #[tokio::test]
+    async fn a_stream_for_a_kind_the_venue_does_not_list_says_so_instead_of_connecting() {
+        let id = InstrumentId {
+            kind: InstrumentKind::Fx,
+            ..btc(Venue::Binance)
+        };
+        let url = td_data::live::stream_url(&id);
+        assert_eq!(url, "");
+        let stream = Arc::new(SharedStream::open(id, url));
+        let (tx, mut rx) = mpsc::channel(64);
+        let feed = tokio::spawn(run_feed_on(
+            stream,
+            Timeframe::M1,
+            None,
+            FakeRest::new(Vec::new(), 0),
+            tx,
+        ));
+        let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("an event in time");
+        let error = "binance does not list fx instruments".to_string();
         assert_eq!(event, Some(FeedEvent::ConnectFailed { error }));
         feed.abort();
     }
