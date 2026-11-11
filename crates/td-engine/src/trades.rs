@@ -3,7 +3,7 @@
 use std::ops::Range;
 
 use serde::{Deserialize, Serialize};
-use td_core::{Candle, Fill, Liquidity, Millis, Side};
+use td_core::{AccountCurrency, Candle, Fill, Liquidity, Millis, Side};
 
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -23,6 +23,9 @@ impl TradeSide {
 }
 
 /// One round trip: the position leaves zero, then returns to it.
+///
+/// Prices are in the quote currency; every money amount (P&L, fees, funding, excursions) is in the
+/// account currency, converted as [`build_trades`] describes.
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Trade {
@@ -44,7 +47,9 @@ pub struct Trade {
     pub exit_price: f64,
     /// `sign * exit_qty * (exit_price - entry_price)`, before fees and funding. Over a closed
     /// round trip this is the exit notional minus the entry notional (reversed for a short),
-    /// which is what the portfolio's average-cost realised P&L adds up to.
+    /// which is what the portfolio's average-cost realised P&L adds up to. On a base account it is
+    /// that realised P&L itself: each reducing fill's P&L against the average cost, converted at
+    /// that fill's price (and an open trade's remainder at the mark).
     pub gross_pnl: f64,
     /// Fees of the trade's fills. A fill that flips the position splits its fee between the two
     /// trades in proportion to the quantity that closed and that opened.
@@ -55,7 +60,8 @@ pub struct Trade {
     pub funding: f64,
     /// `gross_pnl - fees - funding`.
     pub net_pnl: f64,
-    /// `net_pnl / (entry_price * qty)`: net P&L over the largest entry notional.
+    /// `net_pnl / (entry_price * qty)`: net P&L over the largest entry notional, the notional
+    /// converted to the account currency at `entry_price` on a base account.
     pub return_on_notional: f64,
     /// Bars from the entry fill's bar to the exit fill's bar; for an open trade, to the end of the
     /// last bar. It counts bars fed, not time: missing bars in a gap are not counted, so across a
@@ -66,15 +72,16 @@ pub struct Trade {
     /// without one, and in a result saved before trades kept their stop.
     #[serde(default)]
     pub stop: Option<f64>,
-    /// `net_pnl` over the initial risk, `qty * |entry_price - stop|`: the trade's result in
-    /// multiples of what it risked at its stop; see [`attach_stops`]. `None` without a stop, with
-    /// a stop at or beyond the entry price (no risk), or when not finite.
+    /// `net_pnl` over the initial risk, `qty * |entry_price - stop|` (converted at the stop on a
+    /// base account): the trade's result in multiples of what it risked at its stop; see
+    /// [`attach_stops`]. `None` without a stop, with a stop at or beyond the entry price (no
+    /// risk), or when not finite.
     #[serde(default)]
     pub r_multiple: Option<f64>,
     /// Maximum adverse excursion: the largest unrealised loss of the open position at any price
-    /// it met, in the quote asset, before fees and funding; 0 if it never went against the
-    /// entry. See [`build_trades`] for the prices counted. `None` in a result saved before
-    /// trades had it.
+    /// it met, in the account currency (converted at that price on a base account), before fees
+    /// and funding; 0 if it never went against the entry. See [`build_trades`] for the prices
+    /// counted. `None` in a result saved before trades had it.
     #[serde(default)]
     pub mae: Option<f64>,
     /// Maximum favourable excursion: the largest unrealised gain, measured like `mae`.
@@ -84,6 +91,17 @@ pub struct Trade {
     /// than by the strategy: in a walk-forward, at the end of its test window.
     #[serde(default)]
     pub force_closed: bool,
+    /// The price move in pips, on a market with quotes (see [`td_core::Instrument::pip_size`]):
+    /// `sign * (exit_price - entry_price) / pip`. The spread is in it, since buys fill on the ask
+    /// and sells on the bid; commission and funding are not. An open trade's is on its mark, as its
+    /// P&L is. `None` without pips, and left out of saved JSON then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pips: Option<f64>,
+    /// `net_pnl` in pips: `net_pnl` over the value of one pip on the quantity the trade closed (its
+    /// whole size for one entry and one exit), in the account currency, converted at `exit_price`
+    /// on a base account. After commission, so `pips - net_pips` is the commission in pips.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub net_pips: Option<f64>,
 }
 
 /// The funding a session charged on one bar, split by the position it was charged on.
@@ -118,6 +136,7 @@ impl BarStops {
 }
 
 struct Building {
+    account: AccountCurrency,
     side: TradeSide,
     /// Index of the trade's first fill.
     entry_fill: usize,
@@ -132,11 +151,36 @@ struct Building {
     funding: f64,
     mae: f64,
     mfe: f64,
+    /// The average cost of the open position, by the portfolio's rule, and the P&L of the
+    /// reducing fills against it, each converted at its fill's price: the gross P&L on a base
+    /// account.
+    avg_cost: f64,
+    realised: f64,
+}
+
+/// A trade's side and its first fill, at which it opens with `qty` and pays `fee` of the fill's
+/// fee.
+struct Opening<'a> {
+    side: TradeSide,
+    fill: &'a Fill,
+    index: usize,
+    bar: usize,
+    qty: f64,
+    fee: f64,
 }
 
 impl Building {
-    fn new(side: TradeSide, fill: &Fill, index: usize, bar: usize, qty: f64, fee: f64) -> Building {
+    fn new(account: AccountCurrency, o: Opening) -> Building {
+        let Opening {
+            side,
+            fill,
+            index,
+            bar,
+            qty,
+            fee,
+        } = o;
         Building {
+            account,
             side,
             entry_fill: index,
             entry_time: fill.time,
@@ -150,26 +194,46 @@ impl Building {
             funding: 0.0,
             mae: 0.0,
             mfe: 0.0,
+            avg_cost: fill.price,
+            realised: 0.0,
         }
+    }
+
+    /// Counts `closed` of the position reducing at `price`, against the average cost.
+    fn reduce(&mut self, closed: f64, price: f64) {
+        self.exit_qty += closed;
+        self.exit_notional += closed * price;
+        let pnl = self.side.sign() * closed * (price - self.avg_cost);
+        self.realised += self.account.from_quote(pnl, price);
     }
 
     /// Counts the unrealised P&L of `qty` (the absolute position) at `price` against the entry
     /// price so far.
     fn excursion(&mut self, price: f64, qty: f64) {
         let pnl = self.side.sign() * qty * (price - self.entry_notional / self.entry_qty);
+        let pnl = self.account.from_quote(pnl, price);
         self.mae = self.mae.max(-pnl);
         self.mfe = self.mfe.max(pnl);
     }
 
-    fn finish(self, exit_time: Millis, bars_held: usize, open: bool) -> Trade {
+    /// The trade row. `pip` is the instrument's pip size, if it has one.
+    fn finish(self, exit_time: Millis, bars_held: usize, open: bool, pip: Option<f64>) -> Trade {
+        let account = self.account;
         let entry_price = self.entry_notional / self.entry_qty;
         let exit_price = if self.exit_qty > 0.0 {
             self.exit_notional / self.exit_qty
         } else {
             0.0
         };
-        let gross_pnl = self.side.sign() * self.exit_qty * (exit_price - entry_price);
+        let gross_pnl = match account {
+            AccountCurrency::Quote => self.side.sign() * self.exit_qty * (exit_price - entry_price),
+            AccountCurrency::Base => self.realised,
+        };
         let net_pnl = gross_pnl - self.fees - self.funding;
+        let pips = pip.and_then(|pip| finite(self.side.sign() * (exit_price - entry_price) / pip));
+        let net_pips = pip
+            .and_then(|pip| finite(net_pnl / account.from_quote(self.exit_qty * pip, exit_price)));
+        let notional = account.from_quote(entry_price * self.max_abs, entry_price);
         Trade {
             side: self.side,
             entry_time: self.entry_time,
@@ -182,15 +246,22 @@ impl Building {
             fees: self.fees,
             funding: self.funding,
             net_pnl,
-            return_on_notional: net_pnl / (entry_price * self.max_abs),
+            return_on_notional: net_pnl / notional,
             bars_held,
             stop: None,
             r_multiple: None,
             mae: Some(self.mae),
             mfe: Some(self.mfe),
             force_closed: false,
+            pips,
+            net_pips,
         }
     }
+}
+
+/// `Some(x)` if `x` is finite.
+fn finite(x: f64) -> Option<f64> {
+    x.is_finite().then_some(x)
 }
 
 /// The candle a position of `pos` would close on, as the session marks it: on a market with
@@ -222,6 +293,13 @@ pub(crate) fn closing_side(bar: &Candle, ask: Option<Candle>, pos: f64) -> Candl
 /// Positions follow the portfolio's rule for float residue: a position within `1e-9` of the
 /// traded size of zero is flat.
 ///
+/// Money is in the account currency `account`. On [`AccountCurrency::Base`] each amount that arises
+/// in the quote currency is converted at the price it arises at: a reducing fill's P&L against
+/// the average cost (the portfolio's realised P&L) at that fill's price, an open trade's remainder
+/// at its mark, and each excursion at the price it is measured at. The fills' fees are in the
+/// account currency already. `pip` is the instrument's pip size
+/// ([`td_core::Instrument::pip_size`]), for [`Trade::pips`] and [`Trade::net_pips`].
+///
 /// The excursions (`mae`, `mfe`) are the unrealised P&L of the position, against the entry price
 /// so far, at the prices it met on the fill model's path through each bar, on the candle it would
 /// close on: the open, for a position held into the bar; the price of each fill, for the position
@@ -240,8 +318,10 @@ pub fn build_trades(
     bars: &[Candle],
     asks: &[Option<Candle>],
     bar_funding: &[BarFunding],
+    account: AccountCurrency,
+    pip: Option<f64>,
 ) -> Vec<Trade> {
-    build_trades_with_fills(fills, bars, asks, bar_funding)
+    build_trades_with_fills(fills, bars, asks, bar_funding, account, pip)
         .into_iter()
         .map(|(trade, _)| trade)
         .collect()
@@ -254,6 +334,8 @@ pub fn build_trades_with_fills(
     bars: &[Candle],
     asks: &[Option<Candle>],
     bar_funding: &[BarFunding],
+    account: AccountCurrency,
+    pip: Option<f64>,
 ) -> Vec<(Trade, Range<usize>)> {
     let mut trades = Vec::new();
     let mut current: Option<Building> = None;
@@ -288,8 +370,7 @@ pub fn build_trades_with_fills(
                     t.excursion(adverse, f64::abs(pos));
                 }
                 let closed = qty.min(f64::abs(pos));
-                t.exit_qty += closed;
-                t.exit_notional += closed * fill.price;
+                t.reduce(closed, fill.price);
                 let flipped = new != 0.0 && new.signum() != f64::signum(pos);
                 let closing_fee = if flipped {
                     fill.fee * closed / qty
@@ -301,7 +382,7 @@ pub fn build_trades_with_fills(
                     let done = current.take().expect("checked above");
                     let held = k - done.entry_bar;
                     let range = done.entry_fill..next;
-                    trades.push((done.finish(fill.time, held, false), range));
+                    trades.push((done.finish(fill.time, held, false, pip), range));
                 }
                 if flipped {
                     let side = if new > 0.0 {
@@ -311,12 +392,15 @@ pub fn build_trades_with_fills(
                     };
                     let rest = qty - closed;
                     current = Some(Building::new(
-                        side,
-                        fill,
-                        next - 1,
-                        k,
-                        rest,
-                        fill.fee - closing_fee,
+                        account,
+                        Opening {
+                            side,
+                            fill,
+                            index: next - 1,
+                            bar: k,
+                            qty: rest,
+                            fee: fill.fee - closing_fee,
+                        },
                     ));
                 }
             } else if let Some(t) = current.as_mut() {
@@ -329,6 +413,8 @@ pub fn build_trades_with_fills(
                 // the fill model records it.
                 let c = closing_side(bar, ask, pos);
                 t.excursion(fill.price.clamp(c.low, c.high), f64::abs(pos));
+                // The portfolio's average cost after the add.
+                t.avg_cost = (f64::abs(pos) * t.avg_cost + qty * fill.price) / new.abs();
                 t.entry_qty += qty;
                 t.entry_notional += qty * fill.price;
                 t.fees += fill.fee;
@@ -339,7 +425,17 @@ pub fn build_trades_with_fills(
                 } else {
                     TradeSide::Short
                 };
-                current = Some(Building::new(side, fill, next - 1, k, qty, fill.fee));
+                current = Some(Building::new(
+                    account,
+                    Opening {
+                        side,
+                        fill,
+                        index: next - 1,
+                        bar: k,
+                        qty,
+                        fee: fill.fee,
+                    },
+                ));
             }
             pos = new;
         }
@@ -351,13 +447,11 @@ pub fn build_trades_with_fills(
         }
     }
     if let (Some(mut t), Some(last)) = (current, bars.last()) {
-        let remaining = f64::abs(pos);
-        t.exit_qty += remaining;
         let ask = asks.get(bars.len() - 1).copied().flatten();
-        t.exit_notional += remaining * closing_side(last, ask, pos).close;
+        t.reduce(f64::abs(pos), closing_side(last, ask, pos).close);
         let held = bars.len() - t.entry_bar;
         let range = t.entry_fill..next;
-        trades.push((t.finish(last.open_time, held, true), range));
+        trades.push((t.finish(last.open_time, held, true, pip), range));
     }
     trades
 }
@@ -380,7 +474,18 @@ pub fn build_trades_with_fills(
 /// for a short, with the trade's largest position and volume-weighted entry price, before fees;
 /// the R multiple is `net_pnl` over it, so fees and funding count against the result. A stop at or
 /// beyond the entry price risks nothing: the trade then has a stop but no R multiple.
-pub fn attach_stops(trades: &mut [Trade], bars: &[Candle], stops: &[BarStops]) {
+///
+/// On an [`AccountCurrency::Base`] account the risk is converted at the stop price, where that
+/// loss would be realised, while `net_pnl` was converted at the exit fills' prices (see
+/// [`build_trades`]). So a trade with one entry and one exit that exits exactly at its stop, before
+/// costs, is -1R in either currency, and one that exits elsewhere differs from its quote-currency R
+/// by the ratio of the stop price to the exit price (and the fees' conversion).
+pub fn attach_stops(
+    trades: &mut [Trade],
+    bars: &[Candle],
+    stops: &[BarStops],
+    account: AccountCurrency,
+) {
     for t in trades {
         let Ok(k) = bars.binary_search_by_key(&t.entry_time, |b| b.open_time) else {
             continue;
@@ -391,7 +496,7 @@ pub fn attach_stops(trades: &mut [Trade], bars: &[Candle], stops: &[BarStops]) {
             TradeSide::Short => at.buy,
         };
         t.r_multiple = t.stop.and_then(|stop| {
-            let risk = t.side.sign() * t.qty * (t.entry_price - stop);
+            let risk = account.from_quote(t.side.sign() * t.qty * (t.entry_price - stop), stop);
             let r = t.net_pnl / risk;
             (risk > 0.0 && r.is_finite()).then_some(r)
         });
@@ -484,7 +589,7 @@ mod tests {
         funding[4].at_open = 0.4;
         funding[6].at_open = 0.07;
         funding[7].at_open = 1.0;
-        let t = build_trades(&fills, &b, &[], &funding);
+        let t = build_trades(&fills, &b, &[], &funding, AccountCurrency::Quote, None);
         assert_eq!(t.len(), 3);
 
         // Long: gross 2 * (120 - 105) = 30, fees 0.45, funding bars 1-3 = 0.75 and the open of
@@ -525,10 +630,11 @@ mod tests {
         assert_eq!(t[2].bars_held, 3);
 
         // The flip at bar 4 ends the long's fills and starts the short's.
-        let ranges: Vec<Range<usize>> = build_trades_with_fills(&fills, &b, &[], &funding)
-            .into_iter()
-            .map(|(_, range)| range)
-            .collect();
+        let ranges: Vec<Range<usize>> =
+            build_trades_with_fills(&fills, &b, &[], &funding, AccountCurrency::Quote, None)
+                .into_iter()
+                .map(|(_, range)| range)
+                .collect();
         assert_eq!(ranges, [0..3, 2..4, 4..5]);
     }
 
@@ -540,7 +646,14 @@ mod tests {
             fill(1, Side::Sell, 1.0, 110.0, 0.0),
             fill(2, Side::Sell, 1.0, 130.0, 0.0),
         ];
-        let t = build_trades(&fills, &bars(&[100.0; 3]), &[], &in_bar(&[0.0; 3]));
+        let t = build_trades(
+            &fills,
+            &bars(&[100.0; 3]),
+            &[],
+            &in_bar(&[0.0; 3]),
+            AccountCurrency::Quote,
+            None,
+        );
         assert_eq!(t.len(), 1);
         approx(t[0].exit_price, 120.0);
         approx(t[0].gross_pnl, 40.0);
@@ -554,7 +667,14 @@ mod tests {
             fill(0, Side::Buy, 0.2, 10.0, 0.0),
             fill(1, Side::Sell, 0.3, 11.0, 0.0),
         ];
-        let t = build_trades(&fills, &bars(&[10.0, 11.0]), &[], &in_bar(&[0.0; 2]));
+        let t = build_trades(
+            &fills,
+            &bars(&[10.0, 11.0]),
+            &[],
+            &in_bar(&[0.0; 2]),
+            AccountCurrency::Quote,
+            None,
+        );
         assert_eq!(t.len(), 1);
         assert!(!t[0].open);
         approx(t[0].gross_pnl, 0.3);
@@ -562,7 +682,17 @@ mod tests {
 
     #[test]
     fn no_fills_no_trades() {
-        assert!(build_trades(&[], &bars(&[1.0, 2.0]), &[], &[]).is_empty());
+        assert!(
+            build_trades(
+                &[],
+                &bars(&[1.0, 2.0]),
+                &[],
+                &[],
+                AccountCurrency::Quote,
+                None
+            )
+            .is_empty()
+        );
     }
 
     fn candle(i: i64, open: f64, high: f64, low: f64, close: f64) -> Candle {
@@ -592,7 +722,14 @@ mod tests {
             candle(2, 105.0, 109.0, 95.0, 107.0),
         ];
         let fills = [fill(0, Side::Buy, 2.0, 100.0, 0.0), exit];
-        build_trades(&fills, &b, &[], &in_bar(&[0.0; 3]))
+        build_trades(
+            &fills,
+            &b,
+            &[],
+            &in_bar(&[0.0; 3]),
+            AccountCurrency::Quote,
+            None,
+        )
     }
 
     #[test]
@@ -629,7 +766,14 @@ mod tests {
             // Bar 2: closed at the open, 54, which is -7. The low 45 comes after the close.
             fill(2, Side::Buy, 2.0, 54.0, 0.0),
         ];
-        let t = build_trades(&fills, &b, &[], &in_bar(&[0.0; 3]));
+        let t = build_trades(
+            &fills,
+            &b,
+            &[],
+            &in_bar(&[0.0; 3]),
+            AccountCurrency::Quote,
+            None,
+        );
         assert_eq!(t.len(), 1);
         approx(t[0].entry_price, 50.5);
         approx(t[0].mae.unwrap(), 9.0);
@@ -651,7 +795,14 @@ mod tests {
             // the fills meets at most 1 * (110 - 104) = +6: the +8 is met only before the add.
             maker(fill(1, Side::Sell, 1.0, 105.0, 0.0)),
         ];
-        let t = build_trades(&fills, &b, &[], &in_bar(&[0.0; 2]));
+        let t = build_trades(
+            &fills,
+            &b,
+            &[],
+            &in_bar(&[0.0; 2]),
+            AccountCurrency::Quote,
+            None,
+        );
         assert_eq!(t.len(), 1);
         approx(t[0].entry_price, 104.0);
         approx(t[0].mfe.unwrap(), 8.0);
@@ -670,6 +821,8 @@ mod tests {
             &b,
             &[],
             &in_bar(&[0.0; 2]),
+            AccountCurrency::Quote,
+            None,
         );
         assert!(t[0].open);
         approx(t[0].mae.unwrap(), 0.0);
@@ -704,30 +857,73 @@ mod tests {
             fill(0, Side::Buy, 2.0, 100.0, 1.0),
             fill(2, Side::Sell, 2.0, 107.0, 1.0),
         ];
-        let mut t = build_trades(&fills, &b, &[], &in_bar(&[0.0; 3]));
+        let mut t = build_trades(
+            &fills,
+            &b,
+            &[],
+            &in_bar(&[0.0; 3]),
+            AccountCurrency::Quote,
+            None,
+        );
         let stops = [
             stop(Some(95.0), Some(120.0)),
             stop(Some(99.0), None),
             stop(None, None),
         ];
-        attach_stops(&mut t, &b, &stops);
+        attach_stops(&mut t, &b, &stops, AccountCurrency::Quote);
         assert_eq!(t[0].stop, Some(95.0));
         approx(t[0].r_multiple.unwrap(), 1.2);
 
         // A long takes a sell stop only.
-        let mut t = build_trades(&fills, &b, &[], &in_bar(&[0.0; 3]));
-        attach_stops(&mut t, &b, &[stop(None, Some(90.0))]);
+        let mut t = build_trades(
+            &fills,
+            &b,
+            &[],
+            &in_bar(&[0.0; 3]),
+            AccountCurrency::Quote,
+            None,
+        );
+        attach_stops(
+            &mut t,
+            &b,
+            &[stop(None, Some(90.0))],
+            AccountCurrency::Quote,
+        );
         assert_eq!((t[0].stop, t[0].r_multiple), (None, None));
 
         // A stop at the entry price risks nothing: a stop, but no R.
-        let mut t = build_trades(&fills, &b, &[], &in_bar(&[0.0; 3]));
-        attach_stops(&mut t, &b, &[stop(Some(100.0), None)]);
+        let mut t = build_trades(
+            &fills,
+            &b,
+            &[],
+            &in_bar(&[0.0; 3]),
+            AccountCurrency::Quote,
+            None,
+        );
+        attach_stops(
+            &mut t,
+            &b,
+            &[stop(Some(100.0), None)],
+            AccountCurrency::Quote,
+        );
         assert_eq!((t[0].stop, t[0].r_multiple), (Some(100.0), None));
 
         // A stop beyond the entry price risks nothing either. A sell stop at 101 above a long's
         // entry at 100 gives a negative risk, 2 * -1, whose finite R of 12 / -2 is dropped.
-        let mut t = build_trades(&fills, &b, &[], &in_bar(&[0.0; 3]));
-        attach_stops(&mut t, &b, &[stop(Some(101.0), None)]);
+        let mut t = build_trades(
+            &fills,
+            &b,
+            &[],
+            &in_bar(&[0.0; 3]),
+            AccountCurrency::Quote,
+            None,
+        );
+        attach_stops(
+            &mut t,
+            &b,
+            &[stop(Some(101.0), None)],
+            AccountCurrency::Quote,
+        );
         assert_eq!((t[0].stop, t[0].r_multiple), (Some(101.0), None));
 
         // Short 2 @ 100 (entry bar 1), bought back @ 107: net -14. A buy stop at 103 risks
@@ -736,19 +932,39 @@ mod tests {
             fill(1, Side::Sell, 2.0, 100.0, 0.0),
             fill(2, Side::Buy, 2.0, 107.0, 0.0),
         ];
-        let mut t = build_trades(&fills, &b, &[], &in_bar(&[0.0; 3]));
+        let mut t = build_trades(
+            &fills,
+            &b,
+            &[],
+            &in_bar(&[0.0; 3]),
+            AccountCurrency::Quote,
+            None,
+        );
         attach_stops(
             &mut t,
             &b,
             &[stop(None, None), stop(Some(90.0), Some(103.0))],
+            AccountCurrency::Quote,
         );
         assert_eq!(t[0].stop, Some(103.0));
         approx(t[0].r_multiple.unwrap(), -14.0 / 6.0);
 
         // A buy stop at 95, below the short's entry at 100, is beyond it: a risk of 2 * -5 and a
         // finite R of -14 / -10 that is dropped.
-        let mut t = build_trades(&fills, &b, &[], &in_bar(&[0.0; 3]));
-        attach_stops(&mut t, &b, &[stop(None, None), stop(None, Some(95.0))]);
+        let mut t = build_trades(
+            &fills,
+            &b,
+            &[],
+            &in_bar(&[0.0; 3]),
+            AccountCurrency::Quote,
+            None,
+        );
+        attach_stops(
+            &mut t,
+            &b,
+            &[stop(None, None), stop(None, Some(95.0))],
+            AccountCurrency::Quote,
+        );
         assert_eq!((t[0].stop, t[0].r_multiple), (Some(95.0), None));
     }
 }
