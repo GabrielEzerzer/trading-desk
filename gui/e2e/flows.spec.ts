@@ -213,14 +213,16 @@ test.describe('running on the engine', () => {
   })
 
   test('a cancel that lands after the last checkpoint still shows the saved result', async ({ page, open }) => {
-    await open(engine)
+    // Slow steps, so the job can't finish between finding Cancel and clicking it: Cancel and Run
+    // are one button, and a late click would start a second run instead.
+    await open({ ...engine, stepMs: 2_500 })
     await page.getByRole('button', { name: /Donchian breakout/ }).click()
     await page.getByRole('button', { name: 'Run', exact: true }).click()
     // The stub, like the engine, saves the run once its last step has started, cancel or not.
-    await expect(page.getByText('Step 1 of 1 · Saving the result')).toBeVisible()
+    await expect(page.getByText('Step 1 of 1 · Saving the result')).toBeVisible({ timeout: 10_000 })
     await page.getByRole('button', { name: 'Cancel the run' }).click()
     await expect(page.getByRole('progressbar')).toHaveCount(0)
-    await expect(page.locator('#verdict')).toHaveText('No verdict rule yet', { timeout: 10_000 })
+    await expect(page.locator('#verdict')).toHaveText('No verdict rule yet', { timeout: 15_000 })
     await expect(page.getByRole('alert')).toHaveCount(0)
     expect(await cancelSent(page)).toBe(true)
   })

@@ -17,6 +17,8 @@ export interface StubConfig {
   noData?: boolean
   /** How POST /runs/backtest answers. */
   backtest?: 'ok' | 'data_missing' | 'too_many_runs' | 'fails'
+  /** Time between a job's steps, 700 ms by default. */
+  stepMs?: number
 }
 
 export interface State {
