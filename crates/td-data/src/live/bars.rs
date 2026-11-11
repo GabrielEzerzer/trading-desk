@@ -1,7 +1,7 @@
 //! Turning closed 1-minute bars, as they arrive, into an ordered stream and completed bars of the
 //! session's timeframe. Pure, so recorded frames and the live socket drive the same code.
 
-use td_core::{Candle, Millis, Timeframe};
+use td_core::{Candle, InstrumentKind, Millis, Timeframe};
 
 use crate::resample::{LoadedCandles, resample};
 use crate::time::MINUTE;
@@ -100,7 +100,10 @@ impl BarBuilder {
     }
 
     fn finish(&mut self) -> LoadedCandles {
-        let loaded = resample(&self.bucket, self.timeframe, false);
+        // shortcut: live streams serve crypto only, which never closes, so a bucket expects every
+        // minute and is settled at its last; give the builder the instrument's kind, for both
+        // `resample` and settling, when a source with closed hours gets a live stream.
+        let loaded = resample(InstrumentKind::Spot, &self.bucket, self.timeframe, false);
         self.bucket.clear();
         loaded
     }

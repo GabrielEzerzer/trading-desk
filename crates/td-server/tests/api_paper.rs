@@ -162,7 +162,7 @@ impl Rest for FakeRest {
         let bars = if timeframe == Timeframe::M1 {
             self.minutes.clone()
         } else {
-            resample(&self.minutes, timeframe, false).candles
+            resample(InstrumentKind::Spot, &self.minutes, timeframe, false).candles
         };
         Ok(bars
             .into_iter()

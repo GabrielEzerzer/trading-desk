@@ -276,7 +276,10 @@ async fn a_dropped_connection_is_reconnected_and_the_missed_minutes_backfilled()
     };
     let events = collect(spec, Arc::clone(&rest), 1).await;
 
-    assert_eq!(bars(&events), resample(&all, Timeframe::M5, false).candles);
+    assert_eq!(
+        bars(&events),
+        resample(InstrumentKind::Spot, &all, Timeframe::M5, false).candles
+    );
     assert_eq!(
         rest.calls(),
         [(T0, T0 + MIN), (T0, T0 + MIN), (T0 + 3 * MIN, T0 + 4 * MIN)]
@@ -363,7 +366,7 @@ async fn feeds_of_two_timeframes_share_one_connection_which_closes_when_both_are
     assert_eq!(m1_bars, all);
     assert_eq!(
         vec![next_bar(&mut m5).await],
-        resample(&all, Timeframe::M5, false).candles
+        resample(InstrumentKind::Spot, &all, Timeframe::M5, false).candles
     );
     assert!(rest.calls().is_empty(), "nothing was missed");
 

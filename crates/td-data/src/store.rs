@@ -13,6 +13,14 @@
 //! Readers take no lock: the rename means they see the old file or the new one, never half of one.
 //! Missing minutes are reported, never filled.
 //!
+//! A kind whose rules require quotes ([`td_core::MarketRules::quotes`], FX) has a bid and an ask
+//! price. Its month file holds the bid candle in the candle columns and the ask candle in four more,
+//! `ask_open`, `ask_high`, `ask_low` and `ask_close`, written together by [`Store::write_quotes`]
+//! under one lock and one rename, so a minute is never stored on one side only. Readers select
+//! columns by name, so [`Store::read_month`] reads the bids of such a file as it reads a crypto
+//! file, and the listing and delete treat it as any other month file. A kind without quotes is
+//! written by [`Store::write_candles`], with no ask columns.
+//!
 //! Deleting ([`Store::delete_months`], [`Store::delete_instrument`]) is the one way data leaves the
 //! store. A delete takes the same lock a writer takes, removes the data file and any temp files a
 //! crashed writer left beside it, and lets the lock go. It leaves the sidecar and the folders as
@@ -38,7 +46,7 @@ use td_core::{Candle, InstrumentId, InstrumentKind, Millis, Timeframe, Venue};
 
 use crate::DataError;
 use crate::resample::{LoadedCandles, resample};
-use crate::time::{MINUTE, Month, round_to_minute};
+use crate::time::{MINUTE, Month, format_minute, round_to_minute};
 
 const CANDLE_COLUMNS: [&str; 7] = [
     "open_time",
@@ -49,6 +57,11 @@ const CANDLE_COLUMNS: [&str; 7] = [
     "volume",
     "quote_volume",
 ];
+/// The ask candle's prices beside the bid candle, in the month file of a kind with quotes. The ask
+/// series has no volume of its own.
+const ASK_COLUMNS: [&str; 4] = ["ask_open", "ask_high", "ask_low", "ask_close"];
+/// What [`Store::read_month_asks`] reads.
+const ASK_READ_COLUMNS: [&str; 5] = ["open_time", "ask_open", "ask_high", "ask_low", "ask_close"];
 const FUNDING_COLUMNS: [&str; 2] = ["time", "rate"];
 
 /// A run of missing minutes: open times `from`, `from + 1m`, ... up to but not including `to`.
@@ -64,27 +77,57 @@ impl Gap {
     }
 }
 
-/// The missing minutes in `[from, to)` among `candles`, which are sorted by open time.
-pub fn missing_minutes(candles: &[Candle], from: Millis, to: Millis) -> Vec<Gap> {
+/// The missing minutes in `[from, to)` among `candles`, which are sorted by open time, for a market
+/// of `kind`. Its closed hours ([`InstrumentKind::closed_spans`]) are never missing: they are cut
+/// out of each gap, so an FX week with its weekend absent has no gap, and a gap that runs into the
+/// weekend ends at the close. For a market that never closes every absent minute is missing.
+pub fn missing_minutes(
+    kind: InstrumentKind,
+    candles: &[Candle],
+    from: Millis,
+    to: Millis,
+) -> Vec<Gap> {
+    missing_among(kind, candles.iter().map(|c| c.open_time), from, to)
+}
+
+/// [`missing_minutes`] among sorted open times.
+fn missing_among(
+    kind: InstrumentKind,
+    open_times: impl IntoIterator<Item = Millis>,
+    from: Millis,
+    to: Millis,
+) -> Vec<Gap> {
     let mut gaps = Vec::new();
+    let mut push = |from: Millis, to: Millis| {
+        let mut start = from;
+        for closed in kind.closed_spans(from, to) {
+            if start < closed.start {
+                gaps.push(Gap {
+                    from: start,
+                    to: closed.start,
+                });
+            }
+            start = closed.end;
+        }
+        if start < to {
+            gaps.push(Gap { from: start, to });
+        }
+    };
     let mut expected = from;
-    for c in candles {
-        if c.open_time < expected {
+    for t in open_times {
+        if t < expected {
             continue;
         }
-        if c.open_time >= to {
+        if t >= to {
             break;
         }
-        if c.open_time > expected {
-            gaps.push(Gap {
-                from: expected,
-                to: c.open_time,
-            });
+        if t > expected {
+            push(expected, t);
         }
-        expected = c.open_time + MINUTE;
+        expected = t + MINUTE;
     }
     if expected < to {
-        gaps.push(Gap { from: expected, to });
+        push(expected, to);
     }
     gaps
 }
@@ -97,7 +140,8 @@ pub struct WriteReport {
     /// Candles given that replaced a stored candle or an earlier one in the same batch with the
     /// same open time.
     pub duplicates: usize,
-    /// Missing minutes between the first and last candle given, after the write.
+    /// Missing minutes between the first and last candle given, after the write, by the
+    /// instrument's trading hours ([`missing_minutes`]).
     pub gaps: Vec<Gap>,
 }
 
@@ -109,7 +153,7 @@ pub struct MonthCoverage {
     pub minutes: usize,
     pub first: Millis,
     pub last: Millis,
-    /// Missing minutes between `first` and `last`.
+    /// Missing minutes between `first` and `last`, by the instrument's trading hours.
     pub gaps: Vec<Gap>,
     /// The month file's size on disk.
     pub bytes: u64,
@@ -246,23 +290,88 @@ impl Store {
 
     /// Merges 1-minute candles into the store. Every candle must be valid and start on a minute;
     /// if any is not, nothing is written. A candle replaces a stored one with the same open time.
+    /// A kind whose rules require quotes is refused: its candles are written with their asks by
+    /// [`Store::write_quotes`].
     pub fn write_candles(
         &self,
         id: &InstrumentId,
         candles: &[Candle],
     ) -> Result<WriteReport, DataError> {
-        let mut report = WriteReport::default();
-        let mut by_month: BTreeMap<Month, Vec<Candle>> = BTreeMap::new();
+        if id.kind.rules().quotes {
+            return Err(DataError::QuotesRequired(id.to_string()));
+        }
         for c in candles {
             check_candle(id, c)?;
+        }
+        self.merge_months(
+            id,
+            candles,
+            |c| c.open_time,
+            |month| self.read_month(id, month),
+            candle_batch,
+        )
+    }
+
+    /// Merges the 1-minute bid and ask candles of a kind whose rules require quotes into the store,
+    /// as [`Store::write_candles`] merges candles: under the same lock, with the same atomic rename,
+    /// a minute replacing a stored one. The ask candle of each minute is stored beside its bid; its
+    /// volumes are not stored and read back as 0.
+    ///
+    /// The batch is refused, and nothing is written, when the kind takes no quotes, when a candle
+    /// is not valid or not on a minute, when the `i`-th ask does not have the `i`-th bid's open
+    /// time, when an ask's open or close is below its bid's (a crossed quote), or when a minute is
+    /// in the kind's closed hours.
+    pub fn write_quotes(
+        &self,
+        id: &InstrumentId,
+        bids: &[Candle],
+        asks: &[Candle],
+    ) -> Result<WriteReport, DataError> {
+        if !id.kind.rules().quotes {
+            return Err(DataError::NoQuotes(id.to_string()));
+        }
+        if bids.len() != asks.len() {
+            return Err(DataError::QuoteMinutes {
+                instrument: id.to_string(),
+                reason: format!("{} bids and {} asks", bids.len(), asks.len()),
+            });
+        }
+        let quotes: Vec<(Candle, Candle)> =
+            bids.iter().copied().zip(asks.iter().copied()).collect();
+        for (bid, ask) in &quotes {
+            check_quote(id, bid, ask)?;
+        }
+        self.merge_months(
+            id,
+            &quotes,
+            |(bid, _)| bid.open_time,
+            |month| self.read_quote_month(id, month),
+            quote_batch,
+        )
+    }
+
+    /// Merges rows, already checked, into their month files: for each month, under its lock, reads
+    /// what is stored, lets each new row replace a stored one with the same open time, and writes
+    /// the month back atomically.
+    fn merge_months<T: Copy>(
+        &self,
+        id: &InstrumentId,
+        rows: &[T],
+        open_time: impl Fn(&T) -> Millis,
+        read: impl Fn(Month) -> Result<Vec<T>, DataError>,
+        batch: impl Fn(&[T]) -> Result<RecordBatch, DataError>,
+    ) -> Result<WriteReport, DataError> {
+        let mut report = WriteReport::default();
+        let mut by_month: BTreeMap<Month, Vec<T>> = BTreeMap::new();
+        for row in rows {
             by_month
-                .entry(Month::containing(c.open_time))
+                .entry(Month::containing(open_time(row)))
                 .or_default()
-                .push(*c);
+                .push(*row);
         }
         let (Some(first), Some(last)) = (
-            candles.iter().map(|c| c.open_time).min(),
-            candles.iter().map(|c| c.open_time).max(),
+            rows.iter().map(&open_time).min(),
+            rows.iter().map(&open_time).max(),
         ) else {
             return Ok(report);
         };
@@ -272,33 +381,76 @@ impl Store {
             let lock = file_lock(&path);
             let _held = hold(&lock);
             let _locked = lock_across_processes(&path)?;
-            let mut merged: BTreeMap<Millis, Candle> = self
-                .read_month(id, month)?
+            let mut merged: BTreeMap<Millis, T> = read(month)?
                 .into_iter()
-                .map(|c| (c.open_time, c))
+                .map(|r| (open_time(&r), r))
                 .collect();
-            for c in new {
-                if merged.insert(c.open_time, c).is_some() {
+            for row in new {
+                if merged.insert(open_time(&row), row).is_some() {
                     report.duplicates += 1;
                 }
             }
-            let merged: Vec<Candle> = merged.into_values().collect();
-            write_atomic(&path, &candle_batch(&merged)?)?;
+            let merged: Vec<T> = merged.into_values().collect();
+            write_atomic(&path, &batch(&merged)?)?;
             report.months.push(month);
             merged_span.extend(
                 merged
-                    .into_iter()
-                    .filter(|c| (first..=last).contains(&c.open_time)),
+                    .iter()
+                    .map(&open_time)
+                    .filter(|t| (first..=last).contains(t)),
             );
         }
-        report.gaps = missing_minutes(&merged_span, first, last + MINUTE);
+        report.gaps = missing_among(id.kind, merged_span, first, last + MINUTE);
         Ok(report)
     }
 
-    /// One month of an instrument's 1-minute candles, sorted; empty when none are stored.
+    /// One month of an instrument's 1-minute candles, sorted; empty when none are stored. For a
+    /// kind with quotes these are the bids.
     pub fn read_month(&self, id: &InstrumentId, month: Month) -> Result<Vec<Candle>, DataError> {
+        self.read_rows(id, month, &CANDLE_COLUMNS)
+    }
+
+    /// One month of the 1-minute ask candles of a kind whose rules require quotes, sorted, with the
+    /// same open times as [`Store::read_month`] returns for the month; empty when none are stored.
+    /// Their volumes are 0. A kind without quotes is refused, and so is a month file that has no
+    /// ask columns ([`DataError::NoAskColumns`]).
+    pub fn read_month_asks(
+        &self,
+        id: &InstrumentId,
+        month: Month,
+    ) -> Result<Vec<Candle>, DataError> {
+        if !id.kind.rules().quotes {
+            return Err(DataError::NoQuotes(id.to_string()));
+        }
         let path = self.candle_path(id, month)?;
-        let Some(columns) = read_columns(&path, &CANDLE_COLUMNS)? else {
+        if has_columns(&path, &ASK_COLUMNS)? == Some(false) {
+            return Err(DataError::NoAskColumns { path });
+        }
+        self.read_rows(id, month, &ASK_READ_COLUMNS)
+    }
+
+    /// One month's stored bids and asks, paired by minute.
+    fn read_quote_month(
+        &self,
+        id: &InstrumentId,
+        month: Month,
+    ) -> Result<Vec<(Candle, Candle)>, DataError> {
+        let asks = self.read_month_asks(id, month)?;
+        // Both come from the one file's rows, so they pair up row by row.
+        Ok(self.read_month(id, month)?.into_iter().zip(asks).collect())
+    }
+
+    /// The candles of one month file, sorted, from the columns `names`: the open time, the open,
+    /// high, low and close, and optionally the two volumes, which are 0 when not named. Empty when
+    /// the file does not exist.
+    fn read_rows(
+        &self,
+        id: &InstrumentId,
+        month: Month,
+        names: &[&str],
+    ) -> Result<Vec<Candle>, DataError> {
+        let path = self.candle_path(id, month)?;
+        let Some(columns) = read_columns(&path, names)? else {
             return Ok(Vec::new());
         };
         let [open_time, rest @ ..] = &columns[..] else {
@@ -309,6 +461,7 @@ impl Store {
             .iter()
             .map(|c| float_column(&path, c))
             .collect::<Result<Vec<_>, _>>()?;
+        let volume = |i: usize, row: usize| values.get(i).map_or(0.0, |v| v[row]);
         let mut candles = Vec::with_capacity(open_time.len());
         let mut previous = Millis::MIN;
         for (row, &t) in open_time.iter().enumerate() {
@@ -318,8 +471,8 @@ impl Store {
                 high: values[1][row],
                 low: values[2][row],
                 close: values[3][row],
-                volume: values[4][row],
-                quote_volume: values[5][row],
+                volume: volume(4, row),
+                quote_volume: volume(5, row),
             };
             check_candle(id, &candle)?;
             if t <= previous || Month::containing(t) != month {
@@ -355,7 +508,8 @@ impl Store {
         Ok(months)
     }
 
-    /// Which months and minutes are stored for an instrument.
+    /// Which months and minutes are stored for an instrument, with gaps by its kind's trading hours
+    /// ([`missing_minutes`]).
     pub fn coverage(&self, id: &InstrumentId) -> Result<Vec<MonthCoverage>, DataError> {
         let mut coverage = Vec::new();
         for month in self.months(id)? {
@@ -368,7 +522,7 @@ impl Store {
                 minutes: candles.len(),
                 first: first.open_time,
                 last: last.open_time,
-                gaps: missing_minutes(&candles, first.open_time, last.open_time + MINUTE),
+                gaps: missing_minutes(id.kind, &candles, first.open_time, last.open_time + MINUTE),
                 bytes: file_bytes(&self.candle_path(id, month)?)?.unwrap_or(0),
             });
         }
@@ -376,7 +530,7 @@ impl Store {
     }
 
     /// Bars of `timeframe` resampled from the stored 1-minute candles with open times in
-    /// `[from, to)`, by the rules of [`resample`].
+    /// `[from, to)`, by the rules of [`resample`] for the instrument's kind.
     ///
     /// Minutes outside the range are not read, so a bucket that `from` or `to` falls inside is
     /// missing minutes, and it is dropped or kept by the same rule as a bucket with minutes missing
@@ -397,7 +551,30 @@ impl Store {
                     .filter(|c| (from..to).contains(&c.open_time)),
             );
         }
-        Ok(resample(&minutes, timeframe, include_incomplete))
+        Ok(resample(id.kind, &minutes, timeframe, include_incomplete))
+    }
+
+    /// Ask bars of `timeframe` for a kind whose rules require quotes, resampled from the stored
+    /// 1-minute asks with open times in `[from, to)` as [`Store::load_candles`] resamples the bids:
+    /// the same minutes, so the same buckets are built, dropped and tolerated, and each ask bar is
+    /// the exact OHLC of its minutes' asks.
+    pub fn load_asks(
+        &self,
+        id: &InstrumentId,
+        timeframe: Timeframe,
+        from: Millis,
+        to: Millis,
+        include_incomplete: bool,
+    ) -> Result<LoadedCandles, DataError> {
+        let mut minutes = Vec::new();
+        for month in Month::range(from, to) {
+            minutes.extend(
+                self.read_month_asks(id, month)?
+                    .into_iter()
+                    .filter(|c| (from..to).contains(&c.open_time)),
+            );
+        }
+        Ok(resample(id.kind, &minutes, timeframe, include_incomplete))
     }
 
     /// Merges funding rates `(funding time, rate)` into a perpetual's funding file, replacing any
@@ -724,6 +901,45 @@ fn check_candle(id: &InstrumentId, c: &Candle) -> Result<(), DataError> {
     Ok(())
 }
 
+/// A minute of bid and ask: each candle valid and on a minute, the same open time, the ask's open
+/// and close not below the bid's, and the market open.
+fn check_quote(id: &InstrumentId, bid: &Candle, ask: &Candle) -> Result<(), DataError> {
+    check_candle(id, bid)?;
+    check_candle(id, ask)?;
+    let instrument = || id.to_string();
+    if bid.open_time != ask.open_time {
+        return Err(DataError::QuoteMinutes {
+            instrument: instrument(),
+            reason: format!(
+                "the bid at {} UTC is paired with the ask at {} UTC",
+                format_minute(bid.open_time),
+                format_minute(ask.open_time)
+            ),
+        });
+    }
+    for (field, b, a) in [
+        ("open", bid.open, ask.open),
+        ("close", bid.close, ask.close),
+    ] {
+        if a < b {
+            return Err(DataError::CrossedQuote {
+                instrument: instrument(),
+                open_time: bid.open_time,
+                field,
+                bid: b,
+                ask: a,
+            });
+        }
+    }
+    if !id.kind.is_open(bid.open_time) {
+        return Err(DataError::ClosedMinute {
+            instrument: instrument(),
+            open_time: bid.open_time,
+        });
+    }
+    Ok(())
+}
+
 fn bad_file(path: &Path, reason: impl Into<String>) -> DataError {
     DataError::BadFile {
         path: path.to_path_buf(),
@@ -759,6 +975,24 @@ fn candle_batch(candles: &[Candle]) -> Result<RecordBatch, DataError> {
             float(|c| c.quote_volume),
         ],
     )
+}
+
+/// The bid candle's columns and the ask candle's prices beside them.
+fn quote_batch(quotes: &[(Candle, Candle)]) -> Result<RecordBatch, DataError> {
+    let (bids, asks): (Vec<Candle>, Vec<Candle>) = quotes.iter().copied().unzip();
+    let float = |f: fn(&Candle) -> f64| -> ArrayRef {
+        Arc::new(Float64Array::from_iter_values(asks.iter().map(f)))
+    };
+    let mut names = CANDLE_COLUMNS.to_vec();
+    names.extend(ASK_COLUMNS);
+    let mut columns = candle_batch(&bids)?.columns().to_vec();
+    columns.extend([
+        float(|c| c.open),
+        float(|c| c.high),
+        float(|c| c.low),
+        float(|c| c.close),
+    ]);
+    record_batch(&names, columns)
 }
 
 /// The lock that serialises read-merge-write of one store file among this process's threads.
@@ -974,6 +1208,27 @@ fn retry_denied<T>(mut op: impl FnMut() -> io::Result<T>) -> io::Result<T> {
         }
     }
     op()
+}
+
+/// Whether the Parquet file at `path` has every column in `names`, from its footer; `None` when the
+/// file does not exist.
+fn has_columns(path: &Path, names: &[&str]) -> Result<Option<bool>, DataError> {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(DataError::io(path)(e)),
+    };
+    let builder =
+        ParquetRecordBatchReaderBuilder::try_new(file).map_err(|source| DataError::Parquet {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let schema = builder.schema();
+    Ok(Some(
+        names
+            .iter()
+            .all(|name| schema.column_with_name(name).is_some()),
+    ))
 }
 
 /// Reads the named columns of a Parquet file, one array per column across all row groups. `None`

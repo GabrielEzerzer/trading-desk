@@ -122,6 +122,7 @@ impl DataSource for Binance {
         )?;
         Ok(MinuteHistory {
             candles,
+            asks: Vec::new(),
             missing_files,
         })
     }

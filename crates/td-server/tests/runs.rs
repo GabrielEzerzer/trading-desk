@@ -11,14 +11,14 @@ use serde_json::{Value, json};
 use td_core::{
     Candle, FeeSchedule, Instrument, InstrumentId, InstrumentKind, Millis, Timeframe, Venue,
 };
-use td_data::time::{DAY, MINUTE, parse_date};
+use td_data::time::{DAY, MINUTE, Month, parse_date};
 use td_data::{DataError, DownloadReport, InstrumentList, Store};
 use td_engine::{BacktestConfig, Params, SavedRun};
 use td_server::api::auth::Token;
 use td_server::api::data::GapInfo;
 use td_server::api::jobs::{JobInfo, JobRequest, JobResult, JobStatus};
 const MAX_RUN_JOBS: usize = 8;
-use td_server::api::runs::RunDetail;
+use td_server::api::runs::{RunDetail, check_run_data, load_run_data};
 use td_server::api::source::{LiveSource, MarketSource};
 use td_server::api::ws::ServerMessage;
 use td_server::api::{ApiConfig, Server};
@@ -863,4 +863,93 @@ async fn a_queued_run_loads_its_data_only_when_it_starts() {
         "{}",
         error.message
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_fx_run_whose_stored_month_has_no_asks_is_422_data_missing_and_starts_no_job() {
+    let t = TestServer::seeded(3).await;
+    let (spot, fx) = (
+        instrument(InstrumentKind::Spot).id,
+        instrument(InstrumentKind::Fx).id,
+    );
+    // The spot month file copied into the FX folder: bids with no ask columns.
+    let march = Month::containing(t0());
+    let path = t.store.candle_path(&fx, march).expect("a path");
+    std::fs::create_dir_all(path.parent().expect("a folder")).expect("makes the folder");
+    std::fs::copy(t.store.candle_path(&spot, march).expect("a path"), &path).expect("copies");
+
+    let body = serde_json::to_value(config(InstrumentKind::Fx, 3)).unwrap();
+    let (status, body) = t.post("/runs/backtest", &body).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["error"]["code"], "data_missing");
+    assert_eq!(
+        body["error"]["message"],
+        "the store's binance:BTCUSDT:fx candles for 2024-03 have no ask prices; delete the month \
+         and download it again"
+    );
+    let (_, jobs) = t.get("/jobs").await;
+    assert_eq!(jobs, json!([]), "no job was created");
+}
+
+#[test]
+fn an_fx_week_with_its_weekend_closed_passes_the_data_check_with_no_gap_or_dropped_bucket() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = Store::new(dir.path());
+    // Monday 8 January 2024 to the Monday after, without the FX weekend (Friday 22:00 UTC to
+    // Sunday 22:00 UTC).
+    let monday = parse_date("2024-01-08").unwrap();
+    let bids: Vec<Candle> = (0..7 * DAY / MINUTE)
+        .map(|i| monday + i * MINUTE)
+        .filter(|&t| InstrumentKind::Fx.is_open(t))
+        .map(|t| {
+            let price = 150.0 + tri((t - monday) as f64 / (97.0 * MINUTE as f64));
+            Candle {
+                open_time: t,
+                open: price,
+                high: price + 0.02,
+                low: price - 0.02,
+                close: price + 0.01,
+                volume: 1.0,
+                quote_volume: price,
+            }
+        })
+        .collect();
+    let asks: Vec<Candle> = bids
+        .iter()
+        .map(|b| Candle {
+            open: b.open + 0.01,
+            high: b.high + 0.01,
+            low: b.low + 0.01,
+            close: b.close + 0.01,
+            ..*b
+        })
+        .collect();
+    let fx = config(InstrumentKind::Fx, 7);
+    let fx = BacktestConfig {
+        from: monday,
+        to: monday + 7 * DAY,
+        ..fx
+    };
+    store
+        .write_quotes(&fx.instrument.id, &bids, &asks)
+        .expect("seeds");
+
+    check_run_data(&store, &fx).expect("the weekend is closed, not missing");
+    let data = load_run_data(&store, &fx).expect("loads");
+    assert_eq!(data.report.gaps, []);
+    assert_eq!(data.report.dropped, [] as [Millis; 0]);
+    assert_eq!(data.report.bars, 5 * 24, "five open days of hourly bars");
+
+    // The same minutes as spot, which never closes: the weekend is two days missing.
+    let spot = BacktestConfig {
+        instrument: instrument(InstrumentKind::Spot),
+        ..fx.clone()
+    };
+    store
+        .write_candles(&spot.instrument.id, &bids)
+        .expect("seeds");
+    match check_run_data(&store, &spot) {
+        Err(e) => assert_eq!(e.body.code, "data_missing", "{e:?}"),
+        Ok(()) => panic!("spot with the weekend missing must be refused"),
+    }
 }

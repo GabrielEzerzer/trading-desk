@@ -101,6 +101,7 @@ impl DataSource for Bybit {
     ) -> Result<MinuteHistory, DataError> {
         Ok(MinuteHistory {
             candles: fetch_klines(http, id, Timeframe::M1, from, to)?,
+            asks: Vec::new(),
             missing_files: Vec::new(),
         })
     }

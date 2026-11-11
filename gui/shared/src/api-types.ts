@@ -141,6 +141,10 @@ export type Params = { [key in string]: ParamValue };
 
 /**
  * Everything that defines a backtest apart from the data itself.
+ *
+ * It loads from JSON as it saves, except that `slippage_bps` may be left out or null: it then
+ * takes [`default_slippage_bps`] for the instrument, and the configuration holds that number
+ * from then on, so the saved result records the slippage the run used.
  */
 export type BacktestConfig = { 
 /**
@@ -160,7 +164,9 @@ from: number, to: number,
  */
 starting_cash: number, 
 /**
- * Slippage on market and stop fills, in basis points of price.
+ * Slippage on market and stop fills, in basis points of price. Left out when loading, it is
+ * the instrument's default ([`default_slippage_bps`]); a value given, zero included, is
+ * used as it is.
  */
 slippage_bps: number, 
 /**
@@ -214,7 +220,12 @@ equity: Array<EquityPoint>,
 /**
  * Every order submitted, rejected ones included (warm-up bars' too), in submission order.
  */
-orders: Array<Order>, fills: Array<Fill>, trades: Array<Trade>, metrics: MetricsReport, benchmark: Benchmark, };
+orders: Array<Order>, fills: Array<Fill>, trades: Array<Trade>, metrics: MetricsReport, benchmark: Benchmark, 
+/**
+ * The lowest and highest equity inside each bar, one per bar like `equity`; see
+ * [`risk::intrabar`]. Empty in a result saved before results had them.
+ */
+equity_extremes: Array<EquityRange>, };
 
 /**
  * Buy and hold of the same instrument over the same bars: a backtest's traded bars, or in a
@@ -243,12 +254,34 @@ excess_return: number | null,
  * In a backtest the two have the same bars, and in a walk-forward the same test windows, so
  * the times match one to one.
  */
-correlation: number | null, };
+correlation: number | null, 
+/**
+ * The strategy's annualised alpha against the benchmark, on the same per-bar returns as the
+ * correlation: the intercept of the least-squares fit of the strategy's returns on the
+ * benchmark's, times the returns observed per 365-day year (simple, not compounded), with a
+ * risk-free rate of zero; see [`metrics::alpha_beta`]. The returns per year are their count
+ * over the time from the first to the last point of the strategy's equity series, so a market
+ * that closes (FX at weekends) or a gap in the data is not counted as bars it did not have. A
+ * return across a gap in the bars, or between two walk-forward test windows, counts as one
+ * return. `None` when the correlation would be, and in a result saved before benchmarks had
+ * it.
+ */
+alpha: number | null, 
+/**
+ * The slope of that fit, `cov(strategy, benchmark) / var(benchmark)`: how much of the
+ * benchmark's move the strategy's equity follows.
+ */
+beta: number | null, };
 
 /**
  * Equity at the close of the bar that opened at `time`.
  */
 export type EquityPoint = { time: number, equity: number, };
+
+/**
+ * The lowest and highest equity one bar reached, in the quote asset.
+ */
+export type EquityRange = { low: number, high: number, };
 
 /**
  * An order the session accepted or rejected, with its request as rounded at submission.
@@ -342,7 +375,34 @@ return_on_notional: number,
  * gap it understates how long the position was held. For a closed trade, the time between
  * the entry and exit fills' bars is `exit_time - entry_time`.
  */
-bars_held: number, };
+bars_held: number, 
+/**
+ * The protective stop in force when the trade opened, if any: see [`attach_stops`]. `None`
+ * without one, and in a result saved before trades kept their stop.
+ */
+stop: number | null, 
+/**
+ * `net_pnl` over the initial risk, `qty * |entry_price - stop|`: the trade's result in
+ * multiples of what it risked at its stop; see [`attach_stops`]. `None` without a stop, with
+ * a stop at or beyond the entry price (no risk), or when not finite.
+ */
+r_multiple: number | null, 
+/**
+ * Maximum adverse excursion: the largest unrealised loss of the open position at any price
+ * it met, in the quote asset, before fees and funding; 0 if it never went against the
+ * entry. See [`build_trades`] for the prices counted. `None` in a result saved before
+ * trades had it.
+ */
+mae: number | null, 
+/**
+ * Maximum favourable excursion: the largest unrealised gain, measured like `mae`.
+ */
+mfe: number | null, 
+/**
+ * Closed by the end-of-run close-out (see [`crate::BacktestConfig::close_at_end`]) rather
+ * than by the strategy: in a walk-forward, at the end of its test window.
+ */
+force_closed: boolean, };
 
 export type TradeSide = "long" | "short";
 
@@ -424,7 +484,56 @@ fees_paid: number,
 /**
  * Net funding paid; negative when the position received funding.
  */
-funding_paid: number, };
+funding_paid: number, 
+/**
+ * The drawdown from the running peak measured inside bars: see
+ * [`risk::trailing_drawdown`], with each bar's equity range. `None` when the report was
+ * built without ranges (see [`report_with`]), and in a result saved before reports had it.
+ */
+max_drawdown_intrabar: number | null, 
+/**
+ * The fall from the starting equity to the lowest close, as a fraction of the starting
+ * equity; see [`risk::static_drawdown`].
+ */
+static_drawdown: number | null, 
+/**
+ * [`MetricsReport::static_drawdown`] to the lowest equity inside any bar. `None` without
+ * ranges.
+ */
+static_drawdown_intrabar: number | null, 
+/**
+ * The largest loss from one UTC day's start to its end, as a fraction of the starting
+ * equity; see [`risk::worst_daily_loss`]. Other day rollovers are in [`risk::daily_pnl`].
+ */
+worst_daily_loss: number | null, 
+/**
+ * The largest fall from one UTC day's start to its lowest equity inside a bar, as a
+ * fraction of the starting equity; see [`risk::worst_daily_loss_intraday`]. `None` without
+ * ranges.
+ */
+worst_daily_loss_intrabar: number | null, 
+/**
+ * See [`risk::Intrabar::peak_leverage`]. `None` without ranges.
+ */
+peak_leverage: number | null, 
+/**
+ * Mean R multiple of the closed trades that have one (see [`crate::attach_stops`]); trades
+ * without a stop are left out. The P&L expectancy per trade is `avg_trade_pnl`.
+ */
+expectancy_r: number | null, 
+/**
+ * See [`payoff_ratio`].
+ */
+payoff_ratio: number | null, 
+/**
+ * See [`longest_losing_streak`].
+ */
+longest_losing_streak: number, 
+/**
+ * Closed trades the end-of-run close-out closed (see [`Trade::force_closed`]): at most one
+ * in a backtest with `close_at_end`, up to one per test window in a walk-forward.
+ */
+force_closed_trades: number, };
 
 /**
  * The values one parameter takes in a sweep.
@@ -491,6 +600,13 @@ export type SweepRow = {
  * Position in the grid order. Runs that rank equal are ordered by it.
  */
 index: number, 
+/**
+ * The row's place on each axis of the grid, in the order of the spec's axes: the position
+ * of its value in that axis's values, from 0. The grid index is these coordinates read as a
+ * mixed-radix number with the last axis as its lowest digit. Empty in a result saved before
+ * rows had them.
+ */
+coords: Array<number>, 
 /**
  * The full parameter set the run used, defaults included.
  */
@@ -668,6 +784,12 @@ equity: Array<EquityPoint>,
  * Metrics of the stitched curve, its trades and its fills.
  */
 metrics: MetricsReport, 
+/**
+ * The stitched equity's range through each bar, one per point of `equity`: each test run's
+ * [`BacktestResult::equity_extremes`] scaled by its segment's factor. Empty in a result saved
+ * before walk-forwards had them, or when a test run has none.
+ */
+equity_extremes: Array<EquityRange>, 
 /**
  * Buy and hold in each test window, stitched like the test runs: each window buys at its
  * first test bar's open with the starting cash and holds to its last test bar's close, with
@@ -1317,14 +1439,15 @@ export type DataReport = {
 bars: number, 
 /**
  * Every stretch of minutes in the range (warm-up included) the store has no candle for,
- * oldest first, including any at the start or the end of the range. Each is shorter than a
- * day; a longer one refuses the run.
+ * oldest first, including any at the start or the end of the range, in the instrument's open
+ * hours. Each is shorter than a day; a longer one refuses the run.
  */
 gaps: Array<GapInfo>, 
 /**
  * Open times of every bucket in the range the run has no bar for: buckets with no minutes at
  * all, and buckets left out because too many of their minutes are missing (td-data's rule: a
- * bucket needs its first and last minute and at most 1% missing).
+ * bucket needs its first and last open minute and at most 1% of its open minutes missing). A
+ * bucket wholly inside the market's closed hours is not listed.
  */
 dropped: Array<number>, 
 /**
@@ -1526,7 +1649,34 @@ return_on_notional: number,
  * gap it understates how long the position was held. For a closed trade, the time between
  * the entry and exit fills' bars is `exit_time - entry_time`.
  */
-bars_held: number, };
+bars_held: number, 
+/**
+ * The protective stop in force when the trade opened, if any: see [`attach_stops`]. `None`
+ * without one, and in a result saved before trades kept their stop.
+ */
+stop: number | null, 
+/**
+ * `net_pnl` over the initial risk, `qty * |entry_price - stop|`: the trade's result in
+ * multiples of what it risked at its stop; see [`attach_stops`]. `None` without a stop, with
+ * a stop at or beyond the entry price (no risk), or when not finite.
+ */
+r_multiple: number | null, 
+/**
+ * Maximum adverse excursion: the largest unrealised loss of the open position at any price
+ * it met, in the quote asset, before fees and funding; 0 if it never went against the
+ * entry. See [`build_trades`] for the prices counted. `None` in a result saved before
+ * trades had it.
+ */
+mae: number | null, 
+/**
+ * Maximum favourable excursion: the largest unrealised gain, measured like `mae`.
+ */
+mfe: number | null, 
+/**
+ * Closed by the end-of-run close-out (see [`crate::BacktestConfig::close_at_end`]) rather
+ * than by the strategy: in a walk-forward, at the end of its test window.
+ */
+force_closed: boolean, };
 
 /**
  * `POST /sessions/{id}/orders`: an order placed by hand. It goes through the same rounding,
