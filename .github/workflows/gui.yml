@@ -53,7 +53,18 @@ jobs:
           path: ~/.cache/ms-playwright
           key: playwright-${{ runner.os }}-${{ hashFiles('gui/pnpm-lock.yaml') }}
       - name: Install Chromium
-        run: pnpm exec playwright install --with-deps --only-shell chromium
+        run: pnpm exec playwright install --only-shell chromium
+      # Its system libraries come from Ubuntu's mirrors. When those cannot be reached, the gates run on
+      # the libraries the runner image already carries for its own Chrome; a missing library or font
+      # then fails the gates or their screenshots, so nothing passes unchecked.
+      - name: Install Chromium's system libraries
+        id: deps
+        continue-on-error: true
+        timeout-minutes: 5
+        run: pnpm exec playwright install-deps chromium
+      - name: Warn that the system libraries were not installed
+        if: steps.deps.outcome == 'failure'
+        run: echo "::warning::Ubuntu's mirrors could not be reached; the UI gates ran on the runner image's own libraries."
       - name: UI gates
         run: pnpm gates
       # Playwright writes a missing baseline and passes, so a run that wrote one compared nothing.
