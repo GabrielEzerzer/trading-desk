@@ -185,27 +185,29 @@ fn minutes() -> Vec<Candle> {
 }
 
 /// A store holding [`minutes`] for BTCUSDT spot and perpetual and perpetual funding every 8
-/// hours, written once and copied by each test: writing the minutes takes seconds in a debug
-/// build. It lives under Cargo's scratch folder for tests, named by a fingerprint of the minutes,
-/// so a change to them writes a new one.
+/// hours, written once per test process and copied by each test: writing the minutes takes seconds
+/// in a debug build. It is rebuilt by every process rather than kept between runs, because whether
+/// a store folder reads back depends on the store's code as well as the minutes, and a template
+/// kept from an older build (CI restores Cargo's scratch folder from its cache) read as empty.
+/// Templates left by earlier processes are deleted first.
 fn template_store() -> &'static Path {
     static TEMPLATE: OnceLock<PathBuf> = OnceLock::new();
     TEMPLATE.get_or_init(|| {
-        let candles = minutes();
-        let fingerprint = candles.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, c| {
-            [c.open_time as u64, c.open.to_bits(), c.close.to_bits()]
-                .into_iter()
-                .fold(h, |h, x| (h ^ x).wrapping_mul(0x0100_0000_01b3))
-        });
-        let dir =
-            Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("plans-store-{fingerprint:016x}"));
-        if dir.exists() {
-            return dir;
+        let scratch = Path::new(env!("CARGO_TARGET_TMPDIR"));
+        if let Ok(entries) = std::fs::read_dir(scratch) {
+            for entry in entries.flatten() {
+                if entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("plans-store-")
+                {
+                    let _ = std::fs::remove_dir_all(entry.path());
+                }
+            }
         }
-        // Written beside it and renamed into place, so a run stopped halfway leaves no template.
-        let building = dir.with_extension(format!("tmp-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&building);
-        let store = Store::new(&building);
+        let dir = scratch.join(format!("plans-store-{}", std::process::id()));
+        let store = Store::new(&dir);
+        let candles = minutes();
         for kind in [InstrumentKind::Spot, InstrumentKind::Perpetual] {
             store.write_candles(&id(kind), &candles).expect("seeds");
         }
@@ -215,10 +217,6 @@ fn template_store() -> &'static Path {
         store
             .write_funding(&id(InstrumentKind::Perpetual), &rates)
             .expect("seeds");
-        if std::fs::rename(&building, &dir).is_err() {
-            // Another test process got there first.
-            let _ = std::fs::remove_dir_all(&building);
-        }
         dir
     })
 }
