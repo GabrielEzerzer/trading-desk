@@ -54,11 +54,11 @@ const PAIRS: [&str; 20] = [
 ];
 
 /// FX at Dukascopy is charged a commission per unit rather than a fraction of notional, so the
-/// fractional fees are 0. The default FX commission is set when the per-unit commission field
-/// lands.
+/// fractional fees are 0. No default per-unit commission is set: a run sets its own.
 const FX_FEES: FeeSchedule = FeeSchedule {
     maker: 0.0,
     taker: 0.0,
+    per_unit: 0.0,
 };
 
 /// Dukascopy's historical feed: FX pairs only.
