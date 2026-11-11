@@ -195,7 +195,7 @@ fn run(cli: Cli) -> Result<(), DataError> {
                     id,
                     month.month,
                     month.minutes,
-                    month.month.minutes(),
+                    month.open_minutes,
                     format_minute(month.first),
                     format_minute(month.last)
                 );

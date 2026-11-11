@@ -8,6 +8,8 @@
 pub mod donchian;
 pub mod gotobi_calendar;
 pub mod sma_cross;
+#[cfg(test)]
+pub(crate) mod test_only;
 
 /// The strategies in `private/`, compiled in by build.rs; an empty list without the folder.
 pub(crate) mod private {

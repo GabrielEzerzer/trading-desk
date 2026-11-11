@@ -20,8 +20,8 @@ use td_core::{
 
 use crate::metrics::DAY_MS;
 use crate::{
-    BacktestConfig, Objective, OosSpec, ParamAxis, Params, Split, SweepMode, SweepSpec,
-    WalkForwardSpec, WindowMode, WindowSpec,
+    BacktestConfig, MAX_RUNS, Objective, OosSpec, ParamAxis, Params, Split, SweepMode, SweepSpec,
+    WalkForwardSpec, WindowMode, WindowSpec, default_slippage_bps,
 };
 
 /// The fewest permutations the luck test (R3) may run. With 49 the smallest p it can report is
@@ -38,6 +38,22 @@ pub struct PlanError(pub String);
 
 fn refuse<T>(message: impl Into<String>) -> Result<T, PlanError> {
     Err(PlanError(message.into()))
+}
+
+/// R6 moves the walk-forward windows back by `start_offsets` shifts. The windows step by one test
+/// window, so a shift moves their edges by the shift modulo the test length: a test window of
+/// `n` bars has `n - 1` edge positions besides the main run's, and more offsets than that would
+/// repeat a run.
+pub(crate) fn check_start_offsets(test_bars: usize, start_offsets: u32) -> Result<(), String> {
+    if test_bars <= start_offsets as usize {
+        return Err(format!(
+            "the walk-forward test window is {test_bars} bars, too short for {start_offsets} start \
+             offsets: R6 needs at least {} bars per test window to move the window edges to \
+             {start_offsets} different places",
+            u64::from(start_offsets) + 1
+        ));
+    }
+    Ok(())
 }
 
 /// Midnight UTC at the start of a date, for writing a plan's period: `date(2024, 1, 1)`.
@@ -305,22 +321,13 @@ impl WalkForwardPlan {
 
 impl TestPlan {
     /// The backtest of `strategy` on `instrument` over the plan's period, with the sweep's fixed
-    /// parameters. `default_slippage_bps` is the backtest config's default slippage for
-    /// `instrument`, used when the plan sets none for it.
-    ///
-    /// shortcut: the caller passes the default because it lives with the backtest config, which
-    /// #35 part 1 adds (`runner::default_slippage_bps`) on its own branch; once that merges, call
-    /// it here and drop the argument.
-    pub fn backtest_config(
-        &self,
-        strategy: &str,
-        instrument: Instrument,
-        default_slippage_bps: f64,
-    ) -> BacktestConfig {
+    /// parameters. The slippage is the plan's for `instrument`, or [`default_slippage_bps`] for it
+    /// when the plan sets none.
+    pub fn backtest_config(&self, strategy: &str, instrument: Instrument) -> BacktestConfig {
         let slippage_bps = self
             .backtest
             .slippage_bps(&instrument.id)
-            .unwrap_or(default_slippage_bps);
+            .unwrap_or_else(|| default_slippage_bps(&instrument));
         BacktestConfig {
             strategy: strategy.to_string(),
             params: self.sweep.fixed.clone(),
@@ -340,16 +347,11 @@ impl TestPlan {
         }
     }
 
-    /// The plan's grid sweep over the whole period. `default_slippage_bps` as in
+    /// The plan's grid sweep over the whole period, with the slippage of
     /// [`TestPlan::backtest_config`].
-    pub fn sweep_spec(
-        &self,
-        strategy: &str,
-        instrument: Instrument,
-        default_slippage_bps: f64,
-    ) -> SweepSpec {
+    pub fn sweep_spec(&self, strategy: &str, instrument: Instrument) -> SweepSpec {
         SweepSpec {
-            base: self.backtest_config(strategy, instrument, default_slippage_bps),
+            base: self.backtest_config(strategy, instrument),
             axes: self.sweep.axes.clone(),
             mode: SweepMode::Grid,
             objective: self.sweep.objective,
@@ -357,26 +359,16 @@ impl TestPlan {
         }
     }
 
-    pub fn walk_forward_spec(
-        &self,
-        strategy: &str,
-        instrument: Instrument,
-        default_slippage_bps: f64,
-    ) -> WalkForwardSpec {
+    pub fn walk_forward_spec(&self, strategy: &str, instrument: Instrument) -> WalkForwardSpec {
         WalkForwardSpec {
-            sweep: self.sweep_spec(strategy, instrument, default_slippage_bps),
+            sweep: self.sweep_spec(strategy, instrument),
             windows: self.walk_forward.window_spec(self.timeframe),
         }
     }
 
-    pub fn oos_spec(
-        &self,
-        strategy: &str,
-        instrument: Instrument,
-        default_slippage_bps: f64,
-    ) -> Option<OosSpec> {
+    pub fn oos_spec(&self, strategy: &str, instrument: Instrument) -> Option<OosSpec> {
         self.out_of_sample.map(|split| OosSpec {
-            sweep: self.sweep_spec(strategy, instrument, default_slippage_bps),
+            sweep: self.sweep_spec(strategy, instrument),
             split,
         })
     }
@@ -452,10 +444,11 @@ impl TestPlan {
                 per_unit: 0.0,
             },
         };
-        // The slippage does not change these checks, so a stand-in 0 serves.
-        let wf = self.walk_forward_spec(strategy, stand_in.clone(), 0.0);
+        let wf = self.walk_forward_spec(strategy, stand_in.clone());
         wf.check().map_err(|e| PlanError(e.to_string()))?;
-        if let Some(oos) = self.oos_spec(strategy, stand_in, 0.0) {
+        check_start_offsets(wf.windows.test_bars, self.evidence.start_offsets)
+            .map_err(PlanError)?;
+        if let Some(oos) = self.oos_spec(strategy, stand_in) {
             if let Split::Fraction(f) = oos.split
                 && !(f > 0.0 && f < 1.0)
             {
@@ -469,6 +462,18 @@ impl TestPlan {
             oos.check().map_err(|e| PlanError(e.to_string()))?;
         }
         self.evidence.validate()?;
+        // The luck test repeats the sweep once per permutation; the battery refuses it past the
+        // tester's run limit, so a plan that would reach it is refused here.
+        let per_sweep = wf.sweep.runs().map_err(|e| PlanError(e.to_string()))?;
+        let luck_runs = per_sweep as u128 * (u128::from(self.evidence.luck.permutations) + 1);
+        if luck_runs > MAX_RUNS as u128 {
+            return refuse(format!(
+                "the luck test would run {luck_runs} backtests ({per_sweep} parameter sets times \
+                 {} sweeps), above the limit of {MAX_RUNS}: shrink the grid or run fewer \
+                 permutations",
+                self.evidence.luck.permutations + 1
+            ));
+        }
         // The windows as the tester lays them, on data with no gaps: the bars of the period's
         // open hours, so an FX pair, closed at weekends, has fewer than a crypto pair.
         let ws = &wf.windows;
@@ -639,14 +644,14 @@ mod tests {
                 per_unit: 0.0,
             },
         };
-        let wf = plan.walk_forward_spec("sma_cross", inst.clone(), 2.0);
+        let wf = plan.walk_forward_spec("sma_cross", inst.clone());
         assert_eq!(wf.sweep.mode, SweepMode::Grid);
         assert_eq!(wf.sweep.base.from, plan.period.from);
         assert_eq!(wf.sweep.base.starting_cash, 10_000.0);
         assert_eq!(wf.sweep.base.instrument, inst);
         assert_eq!(wf.check(), Ok(()));
         assert_eq!(
-            plan.oos_spec("sma_cross", inst, 2.0).unwrap().split,
+            plan.oos_spec("sma_cross", inst).unwrap().split,
             Split::Fraction(0.7)
         );
     }
@@ -659,7 +664,7 @@ mod tests {
         assert!(plan.backtest.slippage.is_empty());
         let instrument = |id: &InstrumentId| Instrument {
             id: id.clone(),
-            base: String::new(),
+            base: id.symbol.trim_end_matches("USDT").into(),
             quote: "USDT".into(),
             tick_size: 0.01,
             lot_size: 0.00001,
@@ -673,7 +678,7 @@ mod tests {
         };
         let (btc, eth) = (plan.instruments[0].clone(), plan.instruments[1].clone());
         let slip = |plan: &TestPlan, id: &InstrumentId| {
-            plan.backtest_config("sma_cross", instrument(id), 2.0)
+            plan.backtest_config("sma_cross", instrument(id))
                 .slippage_bps
         };
         assert_eq!((slip(&plan, &btc), slip(&plan, &eth)), (2.0, 2.0));
@@ -685,7 +690,7 @@ mod tests {
         assert_eq!(plan.backtest.slippage_bps(&btc), None);
         assert_eq!(plan.backtest.slippage_bps(&eth), Some(7.5));
         assert_eq!((slip(&plan, &btc), slip(&plan, &eth)), (2.0, 7.5));
-        let wf = plan.walk_forward_spec("sma_cross", instrument(&eth), 2.0);
+        let wf = plan.walk_forward_spec("sma_cross", instrument(&eth));
         assert_eq!(wf.sweep.base.slippage_bps, 7.5);
 
         let json = serde_json::to_value(&plan).unwrap();
@@ -776,6 +781,52 @@ mod tests {
             example_plan().validate("nope").is_err(),
             "an unknown strategy"
         );
+    }
+
+    /// The luck test repeats the sweep once per permutation, and a plan whose luck test would
+    /// pass the tester's run limit is refused before the battery spends hours on the steps
+    /// before it: a 25 x 25 grid at 199 permutations is 625 x 200 = 125,000 runs.
+    #[test]
+    fn a_luck_test_over_the_run_limit_is_refused() {
+        let mut plan = example_plan();
+        let axis = |name: &str, from: f64| ParamAxis {
+            name: name.into(),
+            space: ParamSpace::Range {
+                from,
+                to: from + 24.0,
+                step: 1.0,
+            },
+        };
+        plan.sweep.axes = vec![axis("fast", 1.0), axis("slow", 30.0)];
+        plan.evidence.luck.permutations = 199;
+        let err = plan.validate("sma_cross").unwrap_err();
+        assert_eq!(
+            err.0,
+            "the luck test would run 125000 backtests (625 parameter sets times 200 sweeps), \
+             above the limit of 100000: shrink the grid or run fewer permutations"
+        );
+        // 159 permutations are 625 x 160 = 100,000 runs, exactly the limit.
+        assert_eq!(625 * 160, MAX_RUNS);
+        plan.evidence.luck.permutations = 159;
+        assert_eq!(plan.validate("sma_cross"), Ok(()));
+    }
+
+    /// R6's windows step by one test window, so a shift moves their edges by the shift modulo
+    /// the test length: eight start offsets need at least nine bars per test window, or two of
+    /// them repeat the main run or each other.
+    #[test]
+    fn test_windows_too_short_for_the_start_offsets_are_refused() {
+        let mut plan = example_plan();
+        assert_eq!(plan.evidence.start_offsets, 8);
+        plan.timeframe = Timeframe::D1;
+        plan.walk_forward.test_days = 8;
+        assert_eq!(
+            plan.validate("sma_cross").unwrap_err().0,
+            "the walk-forward test window is 8 bars, too short for 8 start offsets: R6 needs at \
+             least 9 bars per test window to move the window edges to 8 different places"
+        );
+        plan.walk_forward.test_days = 9;
+        assert_eq!(plan.validate("sma_cross"), Ok(()));
     }
 
     /// An FX pair is a valid instrument, and its weekends count against the minimum sample: a
