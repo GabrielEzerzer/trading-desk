@@ -1,0 +1,16 @@
+{
+  "name": "case05",
+  "title": "donchian_breakout long/short with its attached stop, Binance perpetual BTCUSDT, 15m, the FTX crash week of 7 to 13 November 2022",
+  "exercises": "Attached stops filling inside the bar and through gaps, reduce-only exits, risk sizing, funding",
+  "strategy": "donchian_breakout",
+  "params": { "entry": 20, "exit": 10, "atr_period": 14, "atr_stop": 2.0, "risk": 0.01, "allow_short": true },
+  "venue": "binance",
+  "kind": "perpetual",
+  "symbol": "BTCUSDT",
+  "timeframe": "15m",
+  "from": "2022-11-07",
+  "to": "2022-11-14",
+  "starting_cash": 10000.0,
+  "fees": { "maker": 0.0002, "taker": 0.0005 },
+  "data": "data/export/case05"
+}

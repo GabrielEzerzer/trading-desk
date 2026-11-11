@@ -80,12 +80,16 @@ def run_case(exe: Path, case_path: Path, refetch: bool) -> bool:
         theirs = nautilus_side.run_case(case, HERE, series)
         (out / f"nautilus_{series}.json").write_text(json.dumps(theirs, indent=1))
         bars = compare.Bars(nautilus_side.read_bars(data / f"bars_{series}.csv"), tf_ms)
+        maker, taker = case["fees"]["maker"], case["fees"]["taker"]
         if series == "gapless":
             cmp = compare.compare_gapless(
-                mine, theirs, bars, inst["tick_size"], perpetual=case["kind"] == "perpetual"
+                mine, theirs, bars, inst["tick_size"], maker=maker, taker=taker,
+                perpetual=case["kind"] == "perpetual",
             )
         else:
-            cmp = compare.compare_real(mine, theirs, bars, case["fees"]["taker"])
+            cmp = compare.compare_real(
+                mine, theirs, bars, taker, maker=maker, tick=inst["tick_size"]
+            )
         m_ours = metrics(exe, mine, case, out / f"metrics_ours_{series}.json")
         m_theirs = metrics(exe, theirs, case, out / f"metrics_nautilus_{series}.json")
         results[series] = (cmp, mine, theirs, m_ours, m_theirs)
@@ -171,9 +175,16 @@ def report(case: dict, meta: dict, inst: dict, results: dict, ok: bool) -> str:
         "## Gapless bars",
         "",
         "Every open set to the previous close, so a market order filled at the next open (ours) and "
-        "one filled at the decision bar's close (Nautilus) get the same price. Everything must match. "
-        "Round-trip trades pair by the decision bar of their entry fill and their side, and must "
-        "close on the same decision bar or both be open at the end; then the same quantity, entry "
+        "one filled at the decision bar's close (Nautilus) get the same price. Everything must match, "
+        "outside the ambiguous bars (two or more resting orders reachable inside one bar's range): "
+        "a fill on one must still pair, and each trade entered or closed on one must have our P&L at "
+        "most Nautilus's; its P&L difference is taken out of our equity from its exit on. A "
+        "stop-limit triggered inside a bar that runs past its limit carries Nautilus's maker fee "
+        "against our taker fee (expected difference 4), held to the maker fee exactly and taken out "
+        "of our trade P&L and equity. "
+        "Fills pair by the bar Nautilus makes them on (the decision bar of a market order, the bar a "
+        "resting order fills on). Round-trip trades pair by the bar of their entry fill and their "
+        "side, and must close on the same bar or both be open at the end; then the same quantity, entry "
         "and exit prices within one tick, fees within 1e-9 relative, P&L net of fees and before "
         "funding within 1e-6 relative, and funding within 1e-9 of the size of its charges. Fees and "
         "P&L may also differ by up to four units of the 8th decimal, Nautilus's rounding of money.",
@@ -187,18 +198,24 @@ def report(case: dict, meta: dict, inst: dict, results: dict, ok: bool) -> str:
         "## Real bars",
         "",
         "Nautilus fills a market order at the close of the bar it was decided on, our engine at the "
-        "next bar's open (expected difference 1). Fills must pair one to one, each price difference "
-        "must stay within `|open[N+1] - close[N]|`, and the final equity difference within the sum "
-        "of bound 1, `qty * |open[N+1] - close[N]| * (1 + taker)` over the fills (the taker factor "
-        "is the fee on that price difference). Cases 1 to 4 have no stops or limits, so bounds 2 "
-        "and 3 are zero. Trades must pair one to one as on the gapless bars, and each trade's P&L "
-        "(net of fees, before funding) must stay within the bound 1 of its entry and exit fills at "
-        "our quantity, after Nautilus's P&L is scaled to our quantity to remove the sizing "
-        "difference.",
+        "next bar's open (expected difference 1). Fills must pair one to one. A fill at the price of "
+        "its decision must be within `|open[N+1] - close[N]|` of Nautilus's; a resting order's fill "
+        "within one tick plus how far the bar opened through its level; a fill on an ambiguous bar "
+        "is not held on price. The final equity difference must stay within the sum of the bounds: "
+        "bound 1, `qty * |open[N+1] - close[N]| * (1 + taker)` per fill at the decision price; bound "
+        "2, per ambiguous bar, `qty * (highest - lowest level) + qty * highest * (|maker| + "
+        "|taker|)`; bound 3, `qty * |open - level| * (1 + taker)` per resting fill the bar opened "
+        "through; and the stop-limit fee difference, `qty * price * |taker - maker|`. Trades must "
+        "pair one to one as on the gapless bars, and each trade's P&L (net of fees, before funding) "
+        "must stay within the bounds of its fills at our quantity, after Nautilus's P&L is scaled "
+        "to our quantity to remove the sizing difference.",
         "",
         checks_table(real_cmp),
         "",
-        f"Bound 1 total {r['bound1']:.6f}; largest relative quantity difference between paired fills "
+        f"Bound 1 total {r['bound1']:.6f}, bound 2 {r['bound2']:.6f} over {r['ambiguous_bars']} "
+        f"ambiguous bar(s), bound 3 {r['bound3']:.6f} over {r['through_fills']} fill(s) the bar "
+        f"opened through, stop-limit fee difference {r['stop_limit_fee']:.6f} over "
+        f"{r['stop_limit_maker_fills']} fill(s); largest relative quantity difference between paired fills "
         f"{r['max_qty_rel']:.2e} (sizing reads each engine's own equity, which differs by the earlier "
         "fill price differences). Funding total: ours "
         f"{r['funding_total_ours']:.6f}, Nautilus {r['funding_total_nautilus']:.6f}.",
@@ -215,7 +232,11 @@ def report(case: dict, meta: dict, inst: dict, results: dict, ok: bool) -> str:
         "",
         f"- Gapless: {g['fills_compared']} fills compared, max price difference "
         f"{g['max_price_diff']:.6g}, final equity {g['final_equity_ours']:.8f} (ours) vs "
-        f"{g['final_equity_nautilus']:.8f} (Nautilus), relative {g['final_equity_rel']:.2e}.",
+        f"{g['final_equity_nautilus']:.8f} (Nautilus), relative {g['final_equity_rel']:.2e} after "
+        f"{g['final_equity_explained']:.6g} of explained differences.",
+        f"- Gapless ambiguous bars: {g['ambiguous_bars']}, with {g['ambiguous_fills']} fill(s) and "
+        f"{g['ambiguous_trades']} trade(s) on them; ours up to {g['max_ambiguous_shortfall']:.6g} "
+        f"below Nautilus's P&L. Stop-limit maker fills: {g['stop_limit_maker_fills']}.",
         f"- Gapless trades: {g['trades_compared']} compared ({g['trades_open']} open at the end), "
         f"max entry or exit price difference {g['max_trade_price_diff']:.6g}, max fee difference "
         f"{g['max_trade_fee_abs']:.2e}, max P&L difference {g['max_trade_pnl_abs']:.2e} (relative "
@@ -255,11 +276,23 @@ def differences(case: dict, results: dict) -> list[str]:
             out.append(f"- Gapless, {c.name}: {c.note}.")
     real_cmp = results["real"][0]
     r = real_cmp.numbers
+    g = gap_cmp.numbers
+    if g["ambiguous_trades"] or r["ambiguous_trades"]:
+        out.append(
+            f"- Ambiguous bars (expected difference 2): {g['ambiguous_bars']} on the gapless bars "
+            f"and {r['ambiguous_bars']} on the real bars, where two or more resting orders are "
+            "reachable inside the range. Our engine fills the stop first; Nautilus walks the bar "
+            "open, high, low, close and may fill the other order. Our P&L on those trades is up to "
+            f"{max(g['max_ambiguous_shortfall'], r['max_ambiguous_shortfall']):.6g} below "
+            "Nautilus's and never above it."
+        )
     if r["max_price_diff"] > 0:
         out.append(
-            f"- Real bars, fill prices: up to {r['max_price_diff']:.6g} apart, each within its bar's "
-            "`|open[N+1] - close[N]|`: expected difference 1 (Nautilus fills at the decision bar's "
-            "close, we fill at the next open)."
+            f"- Real bars, fill prices: up to {r['max_price_diff']:.6g} apart, each within its "
+            "bound: a market fill within its bar's `|open[N+1] - close[N]|` (expected difference "
+            "1: Nautilus fills at the decision bar's close, we fill at the next open), a resting "
+            "fill within one tick plus how far the bar opened through its level (expected "
+            "difference 3)."
         )
     if r["max_qty_rel"] > 0:
         out.append(

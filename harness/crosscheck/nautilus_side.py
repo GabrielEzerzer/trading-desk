@@ -20,7 +20,10 @@ positions in the cache plus the snapshots a NETTING account takes of each closed
 reuses its ID); see `round_trips`.
 
 The strategies are written again here from their Rust source, decision for decision, including
-the lot rounding and the order checks our engine applies when an order is submitted.
+the rounding and the order checks our engine applies when an order is submitted, against a mirror
+of our engine's open orders (see `CrosscheckStrategy`). Market, limit, stop and stop-limit orders
+map to Nautilus's own types, all good till cancelled; an attached protective stop is a reduce-only
+stop-market order sent when its entry fills.
 """
 
 from __future__ import annotations
@@ -28,7 +31,7 @@ from __future__ import annotations
 import csv
 import json
 import math
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
 
 from nautilus_trader.backtest.engine import BacktestEngine, BacktestEngineConfig
@@ -38,8 +41,20 @@ from nautilus_trader.config import LoggingConfig, StrategyConfig
 from nautilus_trader.model.currencies import USDT
 from nautilus_trader.model.objects import Currency
 from nautilus_trader.model.data import Bar, BarType
-from nautilus_trader.model.enums import AccountType, OmsType, OrderSide, TimeInForce
-from nautilus_trader.model.identifiers import InstrumentId, Symbol, TraderId, Venue
+from nautilus_trader.model.enums import (
+    AccountType,
+    LiquiditySide,
+    OmsType,
+    OrderSide,
+    TimeInForce,
+)
+from nautilus_trader.model.identifiers import (
+    ClientOrderId,
+    InstrumentId,
+    Symbol,
+    TraderId,
+    Venue,
+)
 from nautilus_trader.model.instruments import CryptoPerpetual, CurrencyPair
 from nautilus_trader.model.objects import Money, Price, Quantity
 from nautilus_trader.trading.strategy import Strategy
@@ -65,6 +80,8 @@ BAR_SPEC = {
 }
 # The reference strategies' unspent budget fraction (crates/td-engine/src/strategies/mod.rs).
 HEADROOM = 0.005
+# td-core's relative tolerance on the minimum quantity and notional.
+TOLERANCE = 1e-9
 LEVERAGE = Decimal(10)
 
 
@@ -83,13 +100,30 @@ def step_decimals(step: float) -> int:
     return 15
 
 
-def round_down(value: float, step: float) -> float:
-    """td-core's `round_to_step(.., Rounding::Down)`, which `Instrument::round_qty` uses."""
+def round_step(value: float, step: float, mode: str) -> float:
+    """td-core's `round_to_step`: `mode` is "down", "up" or "nearest" (half away from zero, as
+    Rust's `f64::round`; Python's `round` would round half to even)."""
     scale = 10.0 ** step_decimals(step)
     step_units = float(round(step * scale))
     steps = value * scale / step_units
     eps = max(abs(steps) * 4.0 * 2.220446049250313e-16, 1e-9)
-    return math.floor(steps + eps) * step_units / scale
+    if mode == "down":
+        n = math.floor(steps + eps)
+    elif mode == "up":
+        n = math.ceil(steps - eps)
+    else:
+        n = float(Decimal(steps).to_integral_value(rounding=ROUND_HALF_UP))
+    return n * step_units / scale
+
+
+def reference_price(rec: dict, last: float) -> float:
+    """The price an order is valued at before it fills (td-engine's `reference_price`): its limit
+    price (a stop-limit's too), its trigger for a stop, or `last` for a market order."""
+    if rec["kind"] == "market":
+        return last
+    if rec["kind"] == "stop":
+        return rec["trigger"]
+    return rec["price"]
 
 
 def sma(closes: list[float], n: int) -> float:
@@ -105,6 +139,25 @@ def sma(closes: list[float], n: int) -> float:
 
 def direction(x: float) -> float:
     return 1.0 if x > 0.0 else (-1.0 if x < 0.0 else 0.0)
+
+
+def atr(bars: list[dict], n: int) -> float:
+    """The simple mean of the true range over the last n bars, as `donchian_breakout` computes it
+    (and the example's `atr`), summed in the same order; needs n + 1 bars."""
+    tail = bars[len(bars) - n - 1 :]
+    total = 0.0
+    for prev, b in zip(tail, tail[1:]):
+        p = prev["close"]
+        total += max(max(b["high"] - b["low"], abs(b["high"] - p)), abs(b["low"] - p))
+    return total / n
+
+
+def highest(bars: list[dict]) -> float:
+    return max(b["high"] for b in bars)
+
+
+def lowest(bars: list[dict]) -> float:
+    return min(b["low"] for b in bars)
 
 
 # -------------------------------------------------------------------------------------------------
@@ -143,6 +196,7 @@ class CrosscheckConfig(StrategyConfig, frozen=True):
     last_bar_open: int
     kind: str
     taker: float
+    tick_size: float
     lot_size: float
     min_qty: float
     min_notional: float
@@ -154,7 +208,16 @@ class CrosscheckConfig(StrategyConfig, frozen=True):
 
 class CrosscheckStrategy(Strategy):
     """Records fills, equity and funding the way the harness compares them, and runs the case's
-    strategy logic in `decide`."""
+    strategy logic in `decide`.
+
+    Orders go through `send`, a port of our `Context::submit`: the same rounding and checks,
+    against `self.orders`, a mirror of our engine's open orders at the decision (an order leaves it
+    when it fills, when the strategy cancels it, and when Nautilus cancels or rejects it). A
+    protective stop attached to an entry is sent when the entry fills, as our broker places it
+    then. Nautilus rejects a reduce-only order sent while there is no position, so an exit decided
+    together with its entry (`transmit=False`) passes our checks at the decision and joins the
+    open orders then, but is sent to Nautilus when the entry fills.
+    """
 
     def __init__(self, config: CrosscheckConfig, module: FundingModule | None) -> None:
         super().__init__(config)
@@ -167,6 +230,7 @@ class CrosscheckStrategy(Strategy):
         self.equity: list[dict] = []
         self.funding: list[dict] = []
         self.closes: list[float] = []
+        self.bars: list[dict] = []
         self._next_stamp = 0
         self._first_open: int | None = None
         # The position held going into the next bar: after this bar's fills, before the orders
@@ -175,7 +239,14 @@ class CrosscheckStrategy(Strategy):
         self._carried = 0.0
         self._carried_opened: int | None = None
         self._bar_open = 0
+        self._close = 0.0
+        self._final = False
         self.sent = False
+        # Our engine's open orders, by our numbering; `_by_coid` maps Nautilus's ids back.
+        self.orders: dict[int, dict] = {}
+        self._by_coid: dict[str, int] = {}
+        self._next_id = 1
+        self.s: dict = {}  # the strategy's own state
 
     def on_start(self) -> None:
         self.instrument = self.cache.instrument(self.instrument_id)
@@ -192,6 +263,10 @@ class CrosscheckStrategy(Strategy):
         account reuses the position ID, but each fill opens at most one position."""
         positions = self.cache.positions_open(instrument_id=self.instrument_id)
         return positions[0].ts_opened // MS if positions else None
+
+    def cash(self) -> float:
+        account = self.portfolio.account(self.instrument_id.venue)
+        return account.balance_total(USDT).as_double()
 
     def account_equity(self, close: float) -> float:
         account = self.portfolio.account(self.instrument_id.venue)
@@ -218,25 +293,193 @@ class CrosscheckStrategy(Strategy):
              "price": price, "payment": payment, "at": at, "trade": opened if position else None}
         )
 
-    def submit(self, side: OrderSide, qty: float, close: float) -> None:
-        """Rounds and checks the order as `Context::submit` does, then sends it as a market order.
+    # -- orders: our Context::submit, ported ---------------------------------------------------
 
-        Rejections our engine would make (below the lot, the minimum size or notional) are
-        recorded and nothing is sent, as our strategies then do nothing on the bar.
-        """
-        qty = round_down(qty, self.c.lot_size)
-        if not qty > 0.0 or qty < self.c.min_qty or qty * close < self.c.min_notional:
-            self.rejections.append(
-                {"bar": self._bar_open, "qty": qty, "reason": "below the lot, minimum size or notional"}
+    def reject(self, reason: str, qty: float) -> None:
+        self.rejections.append({"bar": self._bar_open, "qty": qty, "reason": reason})
+
+    def validate(self, rec: dict) -> str | None:
+        """td-core's `Instrument::validate_order` on a rounded order; None when it passes."""
+        c = self.c
+        qty = rec["qty"]
+        if not qty > 0.0:
+            return "qty must be above zero"
+        for name in ("price", "trigger"):
+            if rec.get(name) is not None and not rec[name] > 0.0:
+                return f"{name} must be above zero"
+        if qty < c.min_qty * (1.0 - TOLERANCE):
+            return "qty below the minimum"
+        exempt = rec["reduce_only"] and c.kind == "perpetual"
+        notional = qty * reference_price(rec, self._close)
+        if not exempt and notional < c.min_notional * (1.0 - TOLERANCE):
+            return "notional below the minimum"
+        return None
+
+    def check(self, rec: dict) -> str | None:
+        """`Context::prepare`'s checks after the rounding; None when the order passes."""
+        reason = self.validate(rec)
+        if reason:
+            return reason
+        close = self._close
+        spot = self.c.kind == "spot"
+        if spot and rec["side"] == "sell":
+            # Open sells count against the holding.
+            pending = sum(o["qty"] for o in self.orders.values() if o["side"] == "sell")
+            if rec["qty"] > (self.position() - pending) * (1.0 + 1e-9):
+                return "spot cannot sell more than it holds"
+        if spot and rec["side"] == "buy":
+            # Open buys count against the cash, each at its reference price plus the taker fee.
+            def cost(o: dict) -> float:
+                return o["qty"] * reference_price(o, close) * (1.0 + self.c.taker)
+
+            pending = sum(cost(o) for o in self.orders.values() if o["side"] == "buy")
+            if cost(rec) + pending > self.cash() * (1.0 + 1e-9):
+                return "spot cannot buy for more than its cash"
+        if not spot and not rec["reduce_only"]:
+            # The leverage cap, with the open orders on this side.
+            position = self.position()
+            side = [o for o in self.orders.values() if o["side"] == rec["side"]] + [rec]
+            total = sum(o["qty"] for o in side)
+            plain = sorted(
+                ((o["qty"], reference_price(o, close)) for o in side if not o["reduce_only"]),
+                key=lambda qp: -qp[1],
             )
-            return
-        order = self.order_factory.market(
-            instrument_id=self.instrument_id,
-            order_side=side,
-            quantity=Quantity(qty, self.instrument.size_precision),
-            time_in_force=TimeInForce.GTC,
-        )
+            plain_qty = sum(q for q, _ in plain)
+            plain_value = sum(q * p for q, p in plain)
+            sign = 1.0 if rec["side"] == "buy" else -1.0
+            notional = None
+            if sign * position < 0.0:
+                if total > abs(position) * (1.0 + 1e-9):
+                    left = min(plain_qty, total - abs(position))
+                    notional = 0.0
+                    for q, p in plain:
+                        take = min(q, left)
+                        notional += take * p
+                        left -= take
+                        if left <= 0.0:
+                            break
+            else:
+                notional = abs(position * close + sign * plain_value)
+            if notional is not None:
+                allowed = self.c.max_leverage * self.account_equity(close)
+                if notional > allowed * (1.0 + 1e-9):
+                    return "over the leverage cap"
+        return None
+
+    def check_stop(self, entry: dict, trigger: float) -> str | None:
+        """`Context::check_stop` for a stop attached to `entry`."""
+        if entry["reduce_only"]:
+            return "a reduce-only order cannot have a protective stop attached"
+        if self.c.kind == "spot" and entry["side"] == "sell":
+            return "spot cannot attach a protective stop to a sell"
+        stop = {"qty": entry["qty"], "kind": "stop", "price": None, "trigger": trigger,
+                "reduce_only": True}
+        reason = self.validate(stop)
+        if reason:
+            return f"protective stop: {reason}"
+        price = reference_price(entry, self._close)
+        wrong = trigger >= price if entry["side"] == "buy" else trigger <= price
+        return "a protective stop must be beyond its entry" if wrong else None
+
+    def send(
+        self, side: str, qty: float, kind: str, price: float | None = None,
+        trigger: float | None = None, reduce_only: bool = False, stop: float | None = None,
+        transmit: bool = True,
+    ) -> int | None:
+        """`Context::submit` (or `submit_with_stop` with `stop`): rounds the order as our engine
+        does (quantity down to the lot; limit prices down for a buy and up for a sell; triggers to
+        the nearest tick), applies its checks, and sends it to Nautilus. Returns our id for the
+        order, or None if our engine would reject it, recorded as a rejection. With `transmit`
+        False the order joins the open orders now but is sent when the order before it fills."""
+        c = self.c
+        limit_mode = "down" if side == "buy" else "up"
+        rec = {
+            "side": side,
+            "qty": round_step(qty, c.lot_size, "down"),
+            "kind": kind,
+            "price": None if price is None else round_step(price, c.tick_size, limit_mode),
+            "trigger": None if trigger is None else round_step(trigger, c.tick_size, "nearest"),
+            "reduce_only": reduce_only,
+            "sent": len(self.bars),
+            "attach": None,
+            "then": [],
+            "coid": None,
+        }
+        reason = self.check(rec)
+        if reason is None and stop is not None:
+            stop = round_step(stop, c.tick_size, "nearest")
+            reason = self.check_stop(rec, stop)
+            rec["attach"] = stop
+        if reason is not None:
+            self.reject(reason, rec["qty"])
+            return None
+        if self._final:
+            # Decided on the last bar: our engine accepts it and it never fills, while Nautilus
+            # would fill a market order at this close, so it is not sent.
+            return None
+        oid = self._next_id
+        # An attached stop takes the next id in our engine.
+        self._next_id += 2 if stop is not None else 1
+        rec["id"] = oid
+        if transmit:
+            self.orders[oid] = rec
+            self.transmit(rec)
+        else:
+            before = max(self.orders)
+            self.orders[oid] = rec
+            self.orders[before]["then"].append(oid)
+        return oid
+
+    def transmit(self, rec: dict) -> None:
+        f = self.order_factory
+        side = OrderSide.BUY if rec["side"] == "buy" else OrderSide.SELL
+        qty = Quantity(rec["qty"], self.instrument.size_precision)
+        pp = self.instrument.price_precision
+        common = dict(instrument_id=self.instrument_id, order_side=side, quantity=qty,
+                      time_in_force=TimeInForce.GTC, reduce_only=rec["reduce_only"])
+        if rec["kind"] == "market":
+            order = f.market(**common)
+        elif rec["kind"] == "limit":
+            order = f.limit(price=Price(rec["price"], pp), **common)
+        elif rec["kind"] == "stop":
+            order = f.stop_market(trigger_price=Price(rec["trigger"], pp), **common)
+        elif rec["kind"] == "stop_limit":
+            order = f.stop_limit(price=Price(rec["price"], pp),
+                                 trigger_price=Price(rec["trigger"], pp), **common)
+        else:
+            raise ValueError(rec["kind"])
+        rec["coid"] = order.client_order_id.value
+        self._by_coid[rec["coid"]] = rec["id"]
         self.submit_order(order)
+
+    def cancel(self, oid: int | None) -> bool:
+        """`Context::cancel`: the order leaves the open orders at once, as in our engine."""
+        rec = self.orders.pop(oid, None) if oid is not None else None
+        if rec is None:
+            return False
+        for then in rec["then"]:
+            self.orders.pop(then, None)
+        if rec["coid"] is not None:
+            order = self.cache.order(ClientOrderId(rec["coid"]))
+            if order is not None and order.is_open:
+                self.cancel_order(order)
+        return True
+
+    def cancel_all(self) -> None:
+        for oid in list(self.orders):
+            self.cancel(oid)
+
+    def track(self, slot: str, cancel_after: int) -> str:
+        """The example's `track`: "resting", "expired" (cancelled now) or "gone"."""
+        oid = self.s.get(slot)
+        self.s[slot] = None
+        if oid is None or oid not in self.orders:
+            return "gone"
+        if len(self.bars) - self.orders[oid]["sent"] < cancel_after:
+            self.s[slot] = oid
+            return "resting"
+        self.cancel(oid)
+        return "expired"
 
     # -- events ------------------------------------------------------------------------------
 
@@ -268,33 +511,48 @@ class CrosscheckStrategy(Strategy):
         equity = self.account_equity(c)
         self.equity.append({"time": bar_open, "equity": equity})
         self.closes.append(c)
-        # An order decided on the last bar never fills in our engine; Nautilus would fill it at
-        # this close, so no decision is made here.
-        if bar_open >= self.c.last_bar_open:
-            return
+        self.bars.append(
+            {"open": o, "high": bar.high.as_double(), "low": bar.low.as_double(), "close": c}
+        )
+        self._close = c
+        # An order decided on the last bar never fills in our engine; Nautilus would fill a market
+        # order at this close, so the decision is made but nothing is sent (see `send`).
+        self._final = bar_open >= self.c.last_bar_open
         self.decide(c, equity, now)
 
     def decide(self, close: float, equity: float, position: float) -> None:
         s = self.c.strategy
         if s in ("crosscheck_buy_and_hold", "crosscheck_short_and_hold"):
-            if self.sent:
+            if self.sent or self._final:
                 return
             self.sent = True
             qty = equity * self.c.params["fraction"] / (close * (1.0 + self.c.taker))
-            side = OrderSide.BUY if s == "crosscheck_buy_and_hold" else OrderSide.SELL
-            self.submit(side, qty, close)
+            self.send("buy" if s == "crosscheck_buy_and_hold" else "sell", qty, "market")
         elif s == "sma_cross":
             self.sma_cross(close, equity, position)
+        elif s == "donchian_breakout":
+            self.donchian(close, position)
+        elif s == "crosscheck_limit_revert":
+            self.limit_revert(close, position)
+        elif s == "crosscheck_bracket":
+            self.bracket(close, position)
+        elif s == "crosscheck_stop_limit_breakout":
+            self.stop_limit_breakout(close, position)
+        elif s == "crosscheck_sma_limit":
+            self.sma_limit(close, equity, position)
         else:
             raise ValueError(f"no Nautilus version of strategy {s!r}")
+
+    def affordable(self, budget: float, price: float) -> float:
+        """`affordable_qty` with zero slippage: costs of 1.0 + taker + 0.0."""
+        return budget * (1.0 - HEADROOM) / (price * (1.0 + self.c.taker + 0.0))
 
     def sma_cross(self, close: float, equity: float, position: float) -> None:
         """crates/td-engine/src/strategies/sma_cross.rs, `on_bar`."""
         p = self.c.params
         fast_n, slow_n = int(p.get("fast", 10)), int(p.get("slow", 30))
         frac = float(p.get("equity_fraction", 0.95))
-        open_orders = self.cache.orders_open(instrument_id=self.instrument_id)
-        if len(self.closes) < slow_n or open_orders:
+        if len(self.closes) < slow_n or self.orders:
             return
         fast, slow = sma(self.closes, fast_n), sma(self.closes, slow_n)
         can_short = bool(p.get("allow_short", False)) and self.c.kind == "perpetual"
@@ -306,33 +564,213 @@ class CrosscheckStrategy(Strategy):
             want = 0.0
         if direction(position) == want:
             return
-        # affordable_qty with zero slippage: 1.0 + taker + 0.0.
-        costs = 1.0 + self.c.taker + 0.0
-        affordable = equity * (1.0 - HEADROOM) / (close * costs)
-        size = min(equity * frac / close, affordable)
-        target = want * size
-        delta = target - position
-        side = OrderSide.BUY if delta > 0.0 else OrderSide.SELL
-        self.submit(side, abs(delta), close)
+        size = min(equity * frac / close, self.affordable(equity, close))
+        delta = want * size - position
+        self.send("buy" if delta > 0.0 else "sell", abs(delta), "market")
+
+    def donchian(self, close: float, position: float) -> None:
+        """crates/td-engine/src/strategies/donchian.rs, `on_bar`."""
+        p = self.c.params
+        entry_n, exit_n, atr_n = int(p["entry"]), int(p["exit"]), int(p["atr_period"])
+        bars = self.bars
+        n = len(bars)
+        if n < max(entry_n, exit_n, atr_n) + 1:
+            return
+        # Wait while an entry or exit order is in flight.
+        stop = self.s.get("stop")
+        if any(oid != stop for oid in self.orders):
+            return
+        previous = bars[: n - 1]
+        if position == 0.0:
+            self.s["stop"] = None
+            channel = previous[len(previous) - entry_n :]
+            a = atr(bars, atr_n)
+            if a <= 0.0:
+                return
+            can_short = bool(p["allow_short"]) and self.c.kind == "perpetual"
+            distance = float(p["atr_stop"]) * a
+            if close > highest(channel):
+                side, trigger = "buy", close - distance
+            elif can_short and close < lowest(channel):
+                side, trigger = "sell", close + distance
+            else:
+                return
+            if round_step(trigger, self.c.tick_size, "nearest") <= 0.0:
+                return
+            # Flat here, so the cash is the whole equity.
+            affordable = self.affordable(self.cash(), close)
+            qty = min(float(p["risk"]) * self.account_equity(close) / distance, affordable)
+            oid = self.send(side, qty, "market", stop=trigger)
+            if oid is not None:
+                self.s["stop"] = oid + 1
+        else:
+            channel = previous[len(previous) - exit_n :]
+            leave = close < lowest(channel) if position > 0.0 else close > highest(channel)
+            if leave:
+                if self.s.get("stop") is not None:
+                    self.cancel(self.s["stop"])
+                    self.s["stop"] = None
+                side = "sell" if position > 0.0 else "buy"
+                self.send(side, abs(position), "market", reduce_only=True)
+
+    def limit_revert(self, close: float, position: float) -> None:
+        """`LimitRevert` in crates/td-engine/examples/crosscheck.rs."""
+        p = self.c.params
+        if self.track("order", int(p["cancel_after"])) == "resting":
+            return
+        offset = float(p["offset"])
+        if position == 0.0:
+            price = close * (1.0 - offset)
+            qty = self.cash() * float(p["fraction"]) / (price * (1.0 + self.c.taker))
+            oid = self.send("buy", qty, "limit", price=price)
+        else:
+            price = close * (1.0 + offset)
+            oid = self.send("sell", position, "limit", price=price, reduce_only=True)
+        if oid is not None:
+            self.s["order"] = oid
+
+    def bracket(self, close: float, position: float) -> None:
+        """`Bracket` in crates/td-engine/examples/crosscheck.rs."""
+        p = self.c.params
+        fast_n, slow_n, atr_n = int(p["fast"]), int(p["slow"]), int(p["atr_period"])
+        if len(self.bars) < max(slow_n, atr_n + 1) or position != 0.0:
+            return
+        fast, slow = sma(self.closes, fast_n), sma(self.closes, slow_n)
+        a = atr(self.bars, atr_n)
+        self.cancel_all()
+        if fast == slow or a <= 0.0:
+            return
+        sign = 1.0 if fast > slow else -1.0
+        side, exit_side = ("buy", "sell") if fast > slow else ("sell", "buy")
+        stop = close - sign * float(p["stop_atr"]) * a
+        target = close + sign * float(p["target_atr"]) * a
+        qty = float(p["qty"])
+        if self.send(side, qty, "market", stop=stop) is not None:
+            self.send(exit_side, qty, "limit", price=target, reduce_only=True, transmit=False)
+
+    def stop_limit_breakout(self, close: float, position: float) -> None:
+        """`StopLimitBreakout` in crates/td-engine/examples/crosscheck.rs."""
+        p = self.c.params
+        channel_n, trend_n = int(p["channel"]), int(p["trend"])
+        n = len(self.bars)
+        if n < max(channel_n, trend_n):
+            return
+        channel = self.bars[n - channel_n :]
+        high, low = highest(channel), lowest(channel)
+        above_trend = close > sma(self.closes, trend_n)
+        if position != 0.0:
+            self.s["entry"] = None
+            self.s["held"] = self.s.get("held", 0) + 1
+            if self.s["held"] >= int(p["hold"]):
+                side = "sell" if position > 0.0 else "buy"
+                self.send(side, abs(position), "market", reduce_only=True)
+            return
+        self.s["held"] = 0
+        if self.track("entry", int(p["cancel_after"])) == "resting":
+            return
+        gap, offset = float(p["trigger_gap"]), float(p["limit_offset"])
+        if above_trend:
+            side, trigger, sign = "buy", high * (1.0 + gap), 1.0
+        else:
+            side, trigger, sign = "sell", low * (1.0 - gap), -1.0
+        price = trigger * (1.0 + sign * offset)
+        oid = self.send(side, float(p["qty"]), "stop_limit", price=price, trigger=trigger)
+        if oid is not None:
+            self.s["entry"] = oid
+
+    def sma_limit(self, close: float, equity: float, position: float) -> None:
+        """`SmaLimit` in crates/td-engine/examples/crosscheck.rs."""
+        p = self.c.params
+        fast_n, slow_n = int(p["fast"]), int(p["slow"])
+        if len(self.closes) < slow_n:
+            return
+        fast, slow = sma(self.closes, fast_n), sma(self.closes, slow_n)
+        if self.track("order", int(p["cancel_after"])) != "gone":
+            return
+        can_short = self.c.kind == "perpetual"
+        if fast > slow:
+            want = 1.0
+        elif fast < slow and can_short:
+            want = -1.0
+        else:
+            want = 0.0
+        if direction(position) == want:
+            return
+        size = min(equity * float(p["equity_fraction"]) / close, self.affordable(equity, close))
+        delta = want * size - position
+        offset = float(p["offset"])
+        if delta > 0.0:
+            side, price = "buy", close * (1.0 - offset)
+        else:
+            side, price = "sell", close * (1.0 + offset)
+        oid = self.send(side, abs(delta), "limit", price=price)
+        if oid is not None:
+            self.s["order"] = oid
+
+    # -- order events --------------------------------------------------------------------------
+
+    def _rec(self, event) -> dict | None:
+        oid = self._by_coid.get(event.client_order_id.value)
+        return None if oid is None else self.orders.get(oid)
 
     def on_order_filled(self, event) -> None:
+        rec = self._rec(event)
+        side = "buy" if event.order_side == OrderSide.BUY else "sell"
         self.fills.append(
             {
                 "time": event.ts_event // MS,
-                "side": "buy" if event.order_side == OrderSide.BUY else "sell",
+                "side": side,
                 "qty": event.last_qty.as_double(),
                 "price": event.last_px.as_double(),
                 "fee": event.commission.as_double(),
                 "fee_currency": event.commission.currency.code,
                 "fee_precision": event.commission.currency.precision,
+                "liquidity": "maker" if event.liquidity_side == LiquiditySide.MAKER else "taker",
+                "order_id": self._by_coid.get(event.client_order_id.value),
+                "order_kind": None if rec is None else rec["kind"],
             }
         )
+        if rec is None:
+            return
+        order = self.cache.order(event.client_order_id)
+        if order is None or order.is_closed:
+            self.orders.pop(rec["id"], None)
+        if rec["attach"] is not None:
+            # Our broker places the attached stop when its entry fills, for the filled quantity.
+            stop = {
+                "id": rec["id"] + 1, "side": "sell" if side == "buy" else "buy",
+                "qty": event.last_qty.as_double(), "kind": "stop", "price": None,
+                "trigger": rec["attach"], "reduce_only": True, "sent": rec["sent"],
+                "attach": None, "then": [], "coid": None,
+            }
+            rec["attach"] = None
+            self.orders[stop["id"]] = stop
+            self.transmit(stop)
+        for then in rec["then"]:
+            if then in self.orders:
+                self.transmit(self.orders[then])
+        rec["then"] = []
+
+    def _gone(self, event, rejected: bool) -> None:
+        rec = self._rec(event)
+        if rec is not None:
+            self.orders.pop(rec["id"], None)
+            for then in rec["then"]:
+                self.orders.pop(then, None)
+        if rejected:
+            self.rejections.append({"time": event.ts_event // MS, "reason": str(event.reason)})
+
+    def on_order_canceled(self, event) -> None:
+        self._gone(event, rejected=False)
+
+    def on_order_expired(self, event) -> None:
+        self._gone(event, rejected=False)
 
     def on_order_rejected(self, event) -> None:
-        self.rejections.append({"time": event.ts_event // MS, "reason": str(event.reason)})
+        self._gone(event, rejected=True)
 
     def on_order_denied(self, event) -> None:
-        self.rejections.append({"time": event.ts_event // MS, "reason": str(event.reason)})
+        self._gone(event, rejected=True)
 
 
 # -------------------------------------------------------------------------------------------------
@@ -526,6 +964,7 @@ def run_case(case: dict, harness: Path, series: str) -> dict:
         last_bar_open=bars[-1]["open_time"],
         kind=case["kind"],
         taker=case["fees"]["taker"],
+        tick_size=inst["tick_size"],
         lot_size=inst["lot_size"],
         min_qty=inst["min_qty"],
         min_notional=inst["min_notional"],
