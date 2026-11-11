@@ -436,9 +436,10 @@ impl Criterion {
     }
 
     /// The same line, a warning instead of failed: for an integrity check the user acknowledges
-    /// rather than one that makes the verdict `invalid`, such as I4.
+    /// rather than one that makes the verdict `invalid`, such as I4. A line with no value stays
+    /// failed: a check that could not be measured is not a warning about what it measured.
     pub fn warning_on_fail(mut self) -> Criterion {
-        if self.outcome == Outcome::Fail {
+        if self.outcome == Outcome::Fail && self.value.is_some() {
             self.outcome = Outcome::Warn;
         }
         self
@@ -1711,6 +1712,18 @@ mod tests {
         )
         .warning_on_fail();
         assert_eq!(calm.outcome, Outcome::Pass);
+        // A check with no value stays failed rather than warning.
+        let unmeasured = Criterion::new(
+            Layer::Integrity,
+            "too_good_to_be_true",
+            "Out-of-sample Sharpe",
+            None,
+            Comparison::AtMost,
+            4.0,
+            Unit::Ratio,
+        )
+        .warning_on_fail();
+        assert_eq!(unmeasured.outcome, Outcome::Fail);
     }
 
     /// The evaluators' own lines combine as #35 says: a sample below the minimum and a luck p
