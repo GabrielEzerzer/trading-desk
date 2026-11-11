@@ -163,7 +163,7 @@ impl PlanRun {
             data_fingerprint: config_fingerprint(&config, bars, funding)?,
             config,
             plan: plan.clone(),
-            rule: rule.clone(),
+            rule: *rule,
             engine_version: env!("CARGO_PKG_VERSION").to_string(),
             engine_revision: ENGINE_REVISION,
             battery,
