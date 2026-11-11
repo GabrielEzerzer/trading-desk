@@ -22,5 +22,6 @@ tokio-tungstenite.workspace = true
 zip.workspace = true
 
 [dev-dependencies]
+flate2.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
