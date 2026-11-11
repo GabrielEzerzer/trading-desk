@@ -8,8 +8,8 @@ use td_core::{
 
 use crate::broker::ENTRY_CANCELLED;
 use crate::{
-    BarFunding, Broker, BrokerEvent, CandleFillModel, Context, EngineError, Order, OrderStatus,
-    Portfolio, SimBroker, Strategy,
+    BarFunding, BarStops, Broker, BrokerEvent, CandleFillModel, Context, EngineError, Order,
+    OrderStatus, Portfolio, SimBroker, Strategy,
 };
 
 /// Why [`Session::close_out`] cancels the open orders.
@@ -20,6 +20,9 @@ const LIQUIDATED: &str = "cancelled by a liquidation";
 
 /// The `client_tag` of the order a liquidation records.
 pub const LIQUIDATION_TAG: &str = "liquidation";
+
+/// The `client_tag` of the market order [`Session::close_out`] submits at the end of a run.
+pub const CLOSE_OUT_TAG: &str = "close-out";
 
 /// The maintenance margin of a perpetual position, as a fraction of its notional at the current
 /// price: below it the position is liquidated (see [`Session::on_bar`]). 0.5% is close to the
@@ -69,6 +72,7 @@ pub struct Session {
     fills: Vec<Fill>,
     equity: Vec<EquityPoint>,
     bar_funding: Vec<BarFunding>,
+    bar_stops: Vec<BarStops>,
 }
 
 impl Session {
@@ -116,6 +120,7 @@ impl Session {
             fills: Vec::new(),
             equity: Vec::new(),
             bar_funding: Vec::new(),
+            bar_stops: Vec::new(),
         })
     }
 
@@ -179,10 +184,14 @@ impl Session {
         let first_new_fill = self.fills.len();
         let instrument = &self.instrument;
         let breached = |book: &Portfolio| liquidation_trigger(instrument, book, &bar, funding);
+        // The protective stops placed or filled on this bar, then those open after it.
+        let mut stops = BarStops::default();
         for event in self.broker.on_bar(&bar, &self.portfolio, &breached) {
             match event {
                 BrokerEvent::Filled(fill) => {
-                    self.order_mut(fill.order_id).status = OrderStatus::Filled;
+                    let order = self.order_mut(fill.order_id);
+                    order.status = OrderStatus::Filled;
+                    add_stop(&mut stops, order);
                     self.portfolio
                         .apply_fill(fill.side, fill.qty, fill.price, fill.fee);
                     self.fills.push(fill);
@@ -191,6 +200,7 @@ impl Session {
                     self.order_mut(id).status = OrderStatus::Cancelled(reason);
                 }
                 BrokerEvent::Placed(order) => {
+                    add_stop(&mut stops, &order);
                     let id = order.id;
                     *self.order_mut(id) = order;
                 }
@@ -215,6 +225,10 @@ impl Session {
         });
         self.bars.push(bar);
         self.call_strategy(&bar, first_new_fill, false);
+        for order in self.broker.open_orders() {
+            add_stop(&mut stops, order);
+        }
+        self.bar_stops.push(stops);
         Ok(())
     }
 
@@ -270,7 +284,7 @@ impl Session {
             order_type: OrderType::Market,
             tif: TimeInForce::Gtc,
             reduce_only: true,
-            client_tag: Some("close-out".into()),
+            client_tag: Some(CLOSE_OUT_TAG.into()),
         };
         let mut ctx = Context {
             bars: &self.bars,
@@ -459,6 +473,15 @@ impl Session {
         &self.bar_funding
     }
 
+    /// The protective stops of each live bar, one entry per bar fed with [`Session::on_bar`], like
+    /// [`Session::equity`]: the nearest reduce-only stop on each side (by trigger, for stop-limits
+    /// too) among those placed on the bar (an entry's attached stop is placed when it fills),
+    /// filled on it, or open after the strategy has handled it. A trade takes its stop from the
+    /// entry for the bar it opened on; see [`crate::attach_stops`].
+    pub fn bar_stops(&self) -> &[BarStops] {
+        &self.bar_stops
+    }
+
     pub fn fills(&self) -> &[Fill] {
         &self.fills
     }
@@ -474,6 +497,17 @@ impl Session {
 
     pub fn portfolio(&self) -> &Portfolio {
         &self.portfolio
+    }
+}
+
+/// Counts `order` in `stops` if it is a reduce-only stop or stop-limit.
+fn add_stop(stops: &mut BarStops, order: &Order) {
+    let req = &order.request;
+    if !req.reduce_only {
+        return;
+    }
+    if let OrderType::Stop { trigger } | OrderType::StopLimit { trigger, .. } = req.order_type {
+        stops.add(req.side, trigger);
     }
 }
 

@@ -74,6 +74,7 @@ pub fn render() -> String {
         td_engine::BacktestResult,
         td_engine::Benchmark,
         td_engine::EquityPoint,
+        td_engine::EquityRange,
         td_engine::Order,
         td_engine::AttachedStop,
         td_engine::OrderStatus,

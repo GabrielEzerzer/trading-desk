@@ -1,7 +1,7 @@
 //! Round-trip trades built from fills.
 
 use serde::{Deserialize, Serialize};
-use td_core::{Candle, Fill, Millis};
+use td_core::{Candle, Fill, Liquidity, Millis, Side};
 
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -59,6 +59,28 @@ pub struct Trade {
     /// gap it understates how long the position was held. For a closed trade, the time between
     /// the entry and exit fills' bars is `exit_time - entry_time`.
     pub bars_held: usize,
+    /// The protective stop in force when the trade opened, if any: see [`attach_stops`]. `None`
+    /// without one, and in a result saved before trades kept their stop.
+    #[serde(default)]
+    pub stop: Option<f64>,
+    /// `net_pnl` over the initial risk, `qty * |entry_price - stop|`: the trade's result in
+    /// multiples of what it risked at its stop; see [`attach_stops`]. `None` without a stop, with
+    /// a stop at or beyond the entry price (no risk), or when not finite.
+    #[serde(default)]
+    pub r_multiple: Option<f64>,
+    /// Maximum adverse excursion: the largest unrealised loss of the open position at any price
+    /// it met, in the quote asset, before fees and funding; 0 if it never went against the
+    /// entry. See [`build_trades`] for the prices counted. `None` in a result saved before
+    /// trades had it.
+    #[serde(default)]
+    pub mae: Option<f64>,
+    /// Maximum favourable excursion: the largest unrealised gain, measured like `mae`.
+    #[serde(default)]
+    pub mfe: Option<f64>,
+    /// Closed by the end-of-run close-out (see [`crate::BacktestConfig::close_at_end`]) rather
+    /// than by the strategy: in a walk-forward, at the end of its test window.
+    #[serde(default)]
+    pub force_closed: bool,
 }
 
 /// The funding a session charged on one bar, split by the position it was charged on.
@@ -69,6 +91,27 @@ pub struct BarFunding {
     pub at_open: f64,
     /// Due later in the bar, charged on the position after the bar's fills.
     pub in_bar: f64,
+}
+
+/// The protective stops open on one bar, from which a trade that opened on it takes its stop; see
+/// [`attach_stops`].
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct BarStops {
+    /// The highest trigger among the reduce-only sell stops: the one nearest a long position's
+    /// price, which would trigger first.
+    pub sell: Option<f64>,
+    /// The lowest trigger among the reduce-only buy stops, for a short.
+    pub buy: Option<f64>,
+}
+
+impl BarStops {
+    /// Counts a reduce-only stop on `side` with `trigger`.
+    pub(crate) fn add(&mut self, side: Side, trigger: f64) {
+        match side {
+            Side::Sell => self.sell = Some(self.sell.map_or(trigger, |t| t.max(trigger))),
+            Side::Buy => self.buy = Some(self.buy.map_or(trigger, |t| t.min(trigger))),
+        }
+    }
 }
 
 struct Building {
@@ -82,6 +125,8 @@ struct Building {
     exit_notional: f64,
     fees: f64,
     funding: f64,
+    mae: f64,
+    mfe: f64,
 }
 
 impl Building {
@@ -97,7 +142,17 @@ impl Building {
             exit_notional: 0.0,
             fees: fee,
             funding: 0.0,
+            mae: 0.0,
+            mfe: 0.0,
         }
+    }
+
+    /// Counts the unrealised P&L of `qty` (the absolute position) at `price` against the entry
+    /// price so far.
+    fn excursion(&mut self, price: f64, qty: f64) {
+        let pnl = self.side.sign() * qty * (price - self.entry_notional / self.entry_qty);
+        self.mae = self.mae.max(-pnl);
+        self.mfe = self.mfe.max(pnl);
     }
 
     fn finish(self, exit_time: Millis, bars_held: usize, open: bool) -> Trade {
@@ -123,6 +178,11 @@ impl Building {
             net_pnl,
             return_on_notional: net_pnl / (entry_price * self.max_abs),
             bars_held,
+            stop: None,
+            r_multiple: None,
+            mae: Some(self.mae),
+            mfe: Some(self.mfe),
+            force_closed: false,
         }
     }
 }
@@ -139,6 +199,16 @@ impl Building {
 ///
 /// Positions follow the portfolio's rule for float residue: a position within `1e-9` of the
 /// traded size of zero is flat.
+///
+/// The excursions (`mae`, `mfe`) are the unrealised P&L of the position, against the entry price
+/// so far, at the prices it met on the fill model's path through each bar: the open, for a
+/// position held into the bar; each fill's price, for the position before that fill; and the
+/// whole bar range, for the position after the bar's fills, since the session counts the whole
+/// range as coming after them (see [`crate::Session::on_bar`]). A position reduced by a maker fill
+/// (a limit, which fills after the stops inside the range, in the order worse for the strategy)
+/// is counted at the bar's adverse extreme too. A taker fill happened at the open or at a stop's
+/// trigger, which the market reached before going further, so the position before it met no worse
+/// price. `stop` and `r_multiple` are left empty; [`attach_stops`] fills them.
 pub fn build_trades(fills: &[Fill], bars: &[Candle], bar_funding: &[BarFunding]) -> Vec<Trade> {
     let mut trades = Vec::new();
     let mut current: Option<Building> = None;
@@ -148,6 +218,8 @@ pub fn build_trades(fills: &[Fill], bars: &[Candle], bar_funding: &[BarFunding])
         let funding = bar_funding.get(k).copied().unwrap_or_default();
         if let Some(t) = current.as_mut() {
             t.funding += funding.at_open;
+            // Held into the bar: the market moved from the previous close to the open.
+            t.excursion(bar.open, f64::abs(pos));
         }
         // Fills are stamped with the open time of the bar they happened in.
         while next < fills.len() && fills[next].time <= bar.open_time {
@@ -162,6 +234,11 @@ pub fn build_trades(fills: &[Fill], bars: &[Candle], bar_funding: &[BarFunding])
             let reducing = pos != 0.0 && f64::signum(pos) != dq.signum();
             if reducing {
                 let t = current.as_mut().expect("a non-zero position has a trade");
+                t.excursion(fill.price, f64::abs(pos));
+                if fill.liquidity == Liquidity::Maker {
+                    let adverse = if pos > 0.0 { bar.low } else { bar.high };
+                    t.excursion(adverse, f64::abs(pos));
+                }
                 let closed = qty.min(f64::abs(pos));
                 t.exit_qty += closed;
                 t.exit_notional += closed * fill.price;
@@ -187,6 +264,7 @@ pub fn build_trades(fills: &[Fill], bars: &[Candle], bar_funding: &[BarFunding])
                     current = Some(Building::new(side, fill, k, rest, fill.fee - closing_fee));
                 }
             } else if let Some(t) = current.as_mut() {
+                t.excursion(fill.price, f64::abs(pos));
                 t.entry_qty += qty;
                 t.entry_notional += qty * fill.price;
                 t.fees += fill.fee;
@@ -203,6 +281,8 @@ pub fn build_trades(fills: &[Fill], bars: &[Candle], bar_funding: &[BarFunding])
         }
         if let Some(t) = current.as_mut() {
             t.funding += funding.in_bar;
+            t.excursion(bar.low, f64::abs(pos));
+            t.excursion(bar.high, f64::abs(pos));
         }
     }
     if let (Some(mut t), Some(last)) = (current, bars.last()) {
@@ -213,6 +293,40 @@ pub fn build_trades(fills: &[Fill], bars: &[Candle], bar_funding: &[BarFunding])
         trades.push(t.finish(last.open_time, held, true));
     }
     trades
+}
+
+/// Gives each trade the protective stop in force when it opened, and its R multiple.
+///
+/// The rule: a trade takes its stop from the bar of its first fill (`stops[k]` for the bar
+/// `bars[k]` that opens at its `entry_time`). It is the nearest reduce-only stop on the trade's
+/// closing side, a sell stop for a long and a buy stop for a short, among those placed on that
+/// bar, filled on it, or open once the strategy has handled it (see [`crate::Session::bar_stops`]).
+/// So a stop attached to the entry ([`crate::Context::submit_with_stop`]) counts, since it is
+/// placed the moment the entry fills, even when it fills on the same bar; so do a reduce-only stop
+/// resting from before and one the strategy submits on the entry bar's close in reaction to the
+/// fill. The nearest is the one that would trigger first: the highest sell stop, the lowest buy
+/// stop. A stop moved later does not change the trade's stop. Stop-limits count by their trigger.
+///
+/// The initial risk is `qty * (entry_price - stop)` for a long and `qty * (stop - entry_price)`
+/// for a short, with the trade's largest position and volume-weighted entry price, before fees;
+/// the R multiple is `net_pnl` over it, so fees and funding count against the result. A stop at or
+/// beyond the entry price risks nothing: the trade then has a stop but no R multiple.
+pub fn attach_stops(trades: &mut [Trade], bars: &[Candle], stops: &[BarStops]) {
+    for t in trades {
+        let Ok(k) = bars.binary_search_by_key(&t.entry_time, |b| b.open_time) else {
+            continue;
+        };
+        let at = stops.get(k).copied().unwrap_or_default();
+        t.stop = match t.side {
+            TradeSide::Long => at.sell,
+            TradeSide::Short => at.buy,
+        };
+        t.r_multiple = t.stop.and_then(|stop| {
+            let risk = t.side.sign() * t.qty * (t.entry_price - stop);
+            let r = t.net_pnl / risk;
+            (risk > 0.0 && r.is_finite()).then_some(r)
+        });
+    }
 }
 
 #[cfg(test)]
@@ -373,5 +487,156 @@ mod tests {
     #[test]
     fn no_fills_no_trades() {
         assert!(build_trades(&[], &bars(&[1.0, 2.0]), &[]).is_empty());
+    }
+
+    fn candle(i: i64, open: f64, high: f64, low: f64, close: f64) -> Candle {
+        Candle {
+            open_time: i * MIN,
+            open,
+            high,
+            low,
+            close,
+            volume: 1.0,
+            quote_volume: close,
+        }
+    }
+
+    fn maker(f: Fill) -> Fill {
+        Fill {
+            liquidity: Liquidity::Maker,
+            ..f
+        }
+    }
+
+    /// Long 2 @ 100, sold 2 @ 107 on bar 2, whose low is 95.
+    fn long_trade(exit: Fill) -> Vec<Trade> {
+        let b = [
+            candle(0, 100.0, 104.0, 97.0, 101.0),
+            candle(1, 102.0, 108.0, 99.0, 106.0),
+            candle(2, 105.0, 109.0, 95.0, 107.0),
+        ];
+        let fills = [fill(0, Side::Buy, 2.0, 100.0, 0.0), exit];
+        build_trades(&fills, &b, &in_bar(&[0.0; 3]))
+    }
+
+    #[test]
+    fn excursions_follow_the_fill_models_path() {
+        // Bar 0, after the entry: low 97 is 2 * -3 = -6, high 104 is +8. Bar 1: open 102 is +4,
+        // low 99 is -2, high 108 is +16. Bar 2: open 105 is +10, the exit at 107 is +14. A limit
+        // (maker) exit fills after the stops inside the range, so the position also met the low
+        // 95 first: 2 * -5 = -10.
+        let t = long_trade(maker(fill(2, Side::Sell, 2.0, 107.0, 0.0)));
+        assert_eq!(t.len(), 1);
+        approx(t[0].mae.unwrap(), 10.0);
+        approx(t[0].mfe.unwrap(), 16.0);
+
+        // A market or stop (taker) exit met no worse price than its own, so bar 2's low does
+        // not count once the position is closed: the worst stays bar 0's low.
+        let t = long_trade(fill(2, Side::Sell, 2.0, 107.0, 0.0));
+        approx(t[0].mae.unwrap(), 6.0);
+        approx(t[0].mfe.unwrap(), 16.0);
+    }
+
+    #[test]
+    fn excursions_of_a_short_scaled_into_use_the_entry_price_so_far() {
+        let b = [
+            candle(0, 50.0, 52.0, 48.0, 50.0),
+            candle(1, 51.0, 55.0, 49.0, 54.0),
+            candle(2, 54.0, 54.0, 45.0, 46.0),
+        ];
+        let fills = [
+            // Short 1 @ 50: bar 0's high 52 is -2, its low 48 is +2.
+            fill(0, Side::Sell, 1.0, 50.0, 0.0),
+            // Bar 1: the open and the add at 51 are -1 on the short 1. The entry is then 50.5 on
+            // 2: the high 55 is 2 * -4.5 = -9, the low 49 is 2 * 1.5 = +3.
+            fill(1, Side::Sell, 1.0, 51.0, 0.0),
+            // Bar 2: closed at the open, 54, which is -7. The low 45 comes after the close.
+            fill(2, Side::Buy, 2.0, 54.0, 0.0),
+        ];
+        let t = build_trades(&fills, &b, &in_bar(&[0.0; 3]));
+        assert_eq!(t.len(), 1);
+        approx(t[0].entry_price, 50.5);
+        approx(t[0].mae.unwrap(), 9.0);
+        approx(t[0].mfe.unwrap(), 3.0);
+    }
+
+    #[test]
+    fn a_trade_that_never_goes_against_its_entry_has_zero_mae() {
+        let b = [
+            candle(0, 10.0, 12.0, 10.0, 11.0),
+            candle(1, 11.0, 13.0, 11.0, 13.0),
+        ];
+        let t = build_trades(
+            &[fill(0, Side::Buy, 1.0, 10.0, 0.0)],
+            &b,
+            &in_bar(&[0.0; 2]),
+        );
+        assert!(t[0].open);
+        approx(t[0].mae.unwrap(), 0.0);
+        approx(t[0].mfe.unwrap(), 3.0);
+    }
+
+    #[test]
+    fn bar_stops_keep_the_nearest_trigger_per_side() {
+        let mut s = BarStops::default();
+        s.add(Side::Sell, 90.0);
+        s.add(Side::Sell, 95.0);
+        s.add(Side::Sell, 92.0);
+        s.add(Side::Buy, 110.0);
+        s.add(Side::Buy, 105.0);
+        s.add(Side::Buy, 108.0);
+        assert_eq!(s.sell, Some(95.0));
+        assert_eq!(s.buy, Some(105.0));
+    }
+
+    #[test]
+    fn r_multiple_is_net_pnl_over_the_risk_to_the_stop() {
+        let b = [
+            candle(0, 100.0, 104.0, 97.0, 101.0),
+            candle(1, 102.0, 108.0, 99.0, 106.0),
+            candle(2, 105.0, 109.0, 95.0, 107.0),
+        ];
+        let stop = |sell: Option<f64>, buy: Option<f64>| BarStops { sell, buy };
+
+        // Long 2 @ 100 sold @ 107 with a fee of 1 at each end: net 14 - 2 = 12. A sell stop at
+        // 95 risks 2 * 5 = 10, so R = 1.2. The entry bar's stops count, not later bars'.
+        let fills = [
+            fill(0, Side::Buy, 2.0, 100.0, 1.0),
+            fill(2, Side::Sell, 2.0, 107.0, 1.0),
+        ];
+        let mut t = build_trades(&fills, &b, &in_bar(&[0.0; 3]));
+        let stops = [
+            stop(Some(95.0), Some(120.0)),
+            stop(Some(99.0), None),
+            stop(None, None),
+        ];
+        attach_stops(&mut t, &b, &stops);
+        assert_eq!(t[0].stop, Some(95.0));
+        approx(t[0].r_multiple.unwrap(), 1.2);
+
+        // A long takes a sell stop only.
+        let mut t = build_trades(&fills, &b, &in_bar(&[0.0; 3]));
+        attach_stops(&mut t, &b, &[stop(None, Some(90.0))]);
+        assert_eq!((t[0].stop, t[0].r_multiple), (None, None));
+
+        // A stop at the entry price risks nothing: a stop, but no R.
+        let mut t = build_trades(&fills, &b, &in_bar(&[0.0; 3]));
+        attach_stops(&mut t, &b, &[stop(Some(100.0), None)]);
+        assert_eq!((t[0].stop, t[0].r_multiple), (Some(100.0), None));
+
+        // Short 2 @ 100 (entry bar 1), bought back @ 107: net -14. A buy stop at 103 risks
+        // 2 * 3 = 6, so R = -14 / 6.
+        let fills = [
+            fill(1, Side::Sell, 2.0, 100.0, 0.0),
+            fill(2, Side::Buy, 2.0, 107.0, 0.0),
+        ];
+        let mut t = build_trades(&fills, &b, &in_bar(&[0.0; 3]));
+        attach_stops(
+            &mut t,
+            &b,
+            &[stop(None, None), stop(Some(90.0), Some(103.0))],
+        );
+        assert_eq!(t[0].stop, Some(103.0));
+        approx(t[0].r_multiple.unwrap(), -14.0 / 6.0);
     }
 }

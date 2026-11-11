@@ -1,15 +1,30 @@
 //! The backtest runner: one configuration and its data in, a full result out.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
 use td_core::{Candle, FeeSchedule, Fill, Instrument, Millis, OrderId, Side, Timeframe};
 
-use crate::metrics::{self, EquitySeries, MetricsReport};
+use crate::metrics::{self, DAY_MS, DAYS_PER_YEAR, EquitySeries, MetricsReport};
+use crate::risk::{self, EquityRange, Intrabar};
 use crate::session::{funding_ranges, sorted_funding};
 use crate::{
-    BarFunding, CandleFillModel, EngineError, EquityPoint, Order, Params, Portfolio, Session,
-    SessionConfig, Trade, build_strategy, build_trades,
+    BarFunding, CLOSE_OUT_TAG, CandleFillModel, EngineError, EquityPoint, Order, Params, Portfolio,
+    Session, SessionConfig, Trade, attach_stops, build_strategy, build_trades,
 };
+
+/// The slippage a backtest gets when its configuration leaves `slippage_bps` out, in basis
+/// points of price: 2 for BTC and ETH, the most liquid markets, and 5 for every other
+/// instrument, which suits the other large caps.
+///
+/// shortcut: one default for everything outside BTC and ETH; small caps slip more than 5 bps, so
+/// set their slippage explicitly, or carry a liquidity tier on the instrument when strategies
+/// trade them.
+pub fn default_slippage_bps(instrument: &Instrument) -> f64 {
+    match instrument.base.as_str() {
+        "BTC" | "ETH" => 2.0,
+        _ => 5.0,
+    }
+}
 
 /// The revision of the engine's behaviour, stored in every result so a rerun can tell an engine
 /// change from a data change.
@@ -21,8 +36,12 @@ use crate::{
 pub const ENGINE_REVISION: u32 = 4;
 
 /// Everything that defines a backtest apart from the data itself.
+///
+/// It loads from JSON as it saves, except that `slippage_bps` may be left out or null: it then
+/// takes [`default_slippage_bps`] for the instrument, and the configuration holds that number
+/// from then on, so the saved result records the slippage the run used.
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct BacktestConfig {
     /// A name from the strategy registry.
     pub strategy: String,
@@ -36,7 +55,9 @@ pub struct BacktestConfig {
     pub to: Millis,
     /// Starting balance in the quote asset.
     pub starting_cash: f64,
-    /// Slippage on market and stop fills, in basis points of price.
+    /// Slippage on market and stop fills, in basis points of price. Left out when loading, it is
+    /// the instrument's default ([`default_slippage_bps`]); a value given, zero included, is
+    /// used as it is.
     pub slippage_bps: f64,
     /// Replaces the instrument's fee schedule when set.
     #[serde(default)]
@@ -68,6 +89,50 @@ pub struct BacktestConfig {
     pub close_at_end: bool,
 }
 
+impl<'de> Deserialize<'de> for BacktestConfig {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        /// The configuration as JSON gives it, with the slippage optional.
+        #[derive(Deserialize)]
+        struct Given {
+            strategy: String,
+            #[serde(default)]
+            params: Params,
+            instrument: Instrument,
+            timeframe: Timeframe,
+            from: Millis,
+            to: Millis,
+            starting_cash: f64,
+            #[serde(default)]
+            slippage_bps: Option<f64>,
+            #[serde(default)]
+            fee_override: Option<FeeSchedule>,
+            #[serde(default = "default_max_leverage")]
+            max_leverage: f64,
+            #[serde(default)]
+            warmup_from: Option<Millis>,
+            #[serde(default)]
+            close_at_end: bool,
+        }
+        let g = Given::deserialize(deserializer)?;
+        Ok(BacktestConfig {
+            slippage_bps: g
+                .slippage_bps
+                .unwrap_or_else(|| default_slippage_bps(&g.instrument)),
+            strategy: g.strategy,
+            params: g.params,
+            instrument: g.instrument,
+            timeframe: g.timeframe,
+            from: g.from,
+            to: g.to,
+            starting_cash: g.starting_cash,
+            fee_override: g.fee_override,
+            max_leverage: g.max_leverage,
+            warmup_from: g.warmup_from,
+            close_at_end: g.close_at_end,
+        })
+    }
+}
+
 fn default_max_leverage() -> f64 {
     1.0
 }
@@ -97,6 +162,18 @@ pub struct Benchmark {
     /// In a backtest the two have the same bars, and in a walk-forward the same test windows, so
     /// the times match one to one.
     pub correlation: Option<f64>,
+    /// The strategy's annualised alpha against the benchmark, on the same per-bar returns as the
+    /// correlation: the intercept of the least-squares fit of the strategy's returns on the
+    /// benchmark's, times the bars in a 365-day year of the timeframe (simple, not compounded),
+    /// with a risk-free rate of zero; see [`metrics::alpha_beta`]. A return across a gap in the
+    /// bars, or between two walk-forward test windows, counts as one bar's. `None` when the
+    /// correlation would be, and in a result saved before benchmarks had it.
+    #[serde(default)]
+    pub alpha: Option<f64>,
+    /// The slope of that fit, `cov(strategy, benchmark) / var(benchmark)`: how much of the
+    /// benchmark's move the strategy's equity follows.
+    #[serde(default)]
+    pub beta: Option<f64>,
 }
 
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -118,6 +195,10 @@ pub struct BacktestResult {
     pub trades: Vec<Trade>,
     pub metrics: MetricsReport,
     pub benchmark: Benchmark,
+    /// The lowest and highest equity inside each bar, one per bar like `equity`; see
+    /// [`risk::intrabar`]. Empty in a result saved before results had them.
+    #[serde(default)]
+    pub equity_extremes: Vec<EquityRange>,
 }
 
 /// A saved configuration run again.
@@ -179,10 +260,20 @@ pub fn run(
     }
 
     let fills = session.fills().to_vec();
-    let trades = build_trades(&fills, &bars, session.bar_funding());
+    let mut trades = build_trades(&fills, &bars, session.bar_funding());
+    attach_stops(&mut trades, &bars, session.bar_stops());
+    mark_forced_closes(&mut trades, &fills, session.orders());
     let series = EquitySeries::new(config.starting_cash, session.equity(), tf);
-    let report = metrics::report(
+    let intrabar = risk::intrabar(
+        config.starting_cash,
+        &bars,
+        session.equity(),
+        &fills,
+        session.bar_funding(),
+    );
+    let report = metrics::report_with(
         &series,
+        Some(&intrabar),
         &positions,
         &trades,
         &fills,
@@ -203,7 +294,28 @@ pub fn run(
         trades,
         metrics: report,
         benchmark,
+        equity_extremes: intrabar.ranges,
     })
+}
+
+/// Marks the trade each fill of the end-of-run close-out order closed (see
+/// [`Session::close_out`]) as force-closed: the last closed trade that exits on the fill's bar.
+fn mark_forced_closes(trades: &mut [Trade], fills: &[Fill], orders: &[Order]) {
+    for fill in fills {
+        let order = fill
+            .order_id
+            .0
+            .checked_sub(1)
+            .and_then(|i| orders.get(i as usize));
+        if order.is_some_and(|o| o.request.client_tag.as_deref() == Some(CLOSE_OUT_TAG))
+            && let Some(t) = trades
+                .iter_mut()
+                .rev()
+                .find(|t| !t.open && t.exit_time == fill.time)
+        {
+            t.force_closed = true;
+        }
+    }
 }
 
 /// The warm-up bars (`warmup_from..from`) and the traded bars (`from..to`) of `bars`, after
@@ -284,6 +396,8 @@ pub(crate) struct Held {
     /// The entry as one trade, still open at the end.
     pub(crate) trades: Vec<Trade>,
     pub(crate) funding_paid: f64,
+    /// The equity's range through each bar and the peak leverage: see [`risk::intrabar`].
+    pub(crate) intrabar: Intrabar,
 }
 
 /// [`hold`] over `bars`, the bars of `config`'s range, with `funding` in any order and the same
@@ -310,8 +424,9 @@ fn benchmark(
 ) -> Benchmark {
     let held = hold(config, bars, funding, ranges);
     let series = EquitySeries::new(config.starting_cash, &held.equity, config.timeframe);
-    let report = metrics::report(
+    let report = metrics::report_with(
         &series,
+        Some(&held.intrabar),
         &held.positions,
         &held.trades,
         &held.fills,
@@ -325,11 +440,14 @@ fn benchmark(
         report,
         strategy_series,
         strategy_report,
+        config.timeframe,
     )
 }
 
-/// The benchmark from buy and hold's curve and metrics, with the strategy's excess return over it
-/// and the correlation of their per-bar returns.
+/// The benchmark from buy and hold's curve and metrics, with the strategy's excess return over it,
+/// the correlation of their per-bar returns, and the strategy's alpha and beta against it on the
+/// same returns, the alpha annualised by the bars in a 365-day year of `timeframe`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn compare(
     qty: f64,
     entry_price: f64,
@@ -338,18 +456,29 @@ pub(crate) fn compare(
     report: MetricsReport,
     strategy_series: &EquitySeries,
     strategy_report: &MetricsReport,
+    timeframe: Timeframe,
 ) -> Benchmark {
     let excess_return = match (strategy_report.total_return, report.total_return) {
         (Some(s), Some(b)) => Some(s - b),
         _ => None,
     };
+    let returns = aligned_returns(strategy_series, series);
+    let correlation = returns
+        .as_ref()
+        .and_then(|(s, b)| metrics::correlation(s, b));
+    let bars_per_year = DAYS_PER_YEAR * DAY_MS as f64 / timeframe.duration_ms() as f64;
+    let alpha_beta = returns
+        .as_ref()
+        .and_then(|(s, b)| metrics::alpha_beta(s, b, bars_per_year));
     Benchmark {
         qty,
         entry_price,
         equity,
         metrics: report,
         excess_return,
-        correlation: aligned_correlation(strategy_series, series),
+        correlation,
+        alpha: alpha_beta.map(|(a, _)| a),
+        beta: alpha_beta.map(|(_, b)| b),
     }
 }
 
@@ -409,6 +538,7 @@ fn hold(
     }
 
     let trades = build_trades(&fills, bars, &bar_funding);
+    let intrabar = risk::intrabar(config.starting_cash, bars, &equity, &fills, &bar_funding);
     Held {
         qty: fills.first().map_or(0.0, |f| f.qty),
         entry_price: price,
@@ -417,14 +547,15 @@ fn hold(
         fills,
         trades,
         funding_paid: portfolio.funding_paid(),
+        intrabar,
     }
 }
 
-/// The correlation of the strategy's per-bar returns with the benchmark's, with the benchmark's
+/// The strategy's per-bar returns and the benchmark's over the same bars, with the benchmark's
 /// equity read at the strategy series' times. Every strategy time must be one of the benchmark's
 /// (both are the first bar's open, then bar closes, and the benchmark holds through every bar);
-/// `None` otherwise. With equal times this is the plain correlation of the two return series.
-fn aligned_correlation(strategy: &EquitySeries, bench: &EquitySeries) -> Option<f64> {
+/// `None` otherwise, or when either series has a return that cannot be computed.
+fn aligned_returns(strategy: &EquitySeries, bench: &EquitySeries) -> Option<(Vec<f64>, Vec<f64>)> {
     let mut sampled = Vec::with_capacity(strategy.times.len());
     let mut j = 0;
     for &t in &strategy.times {
@@ -438,7 +569,7 @@ fn aligned_correlation(strategy: &EquitySeries, bench: &EquitySeries) -> Option<
     }
     let s = metrics::per_bar_returns(&strategy.values)?;
     let b = metrics::per_bar_returns(&sampled)?;
-    metrics::correlation(&s, &b)
+    Some((s, b))
 }
 
 /// SHA-256, as lowercase hex, over the bars and funding in a fixed byte form: the bar count as a
