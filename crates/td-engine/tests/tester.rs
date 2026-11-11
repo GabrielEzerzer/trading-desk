@@ -1199,6 +1199,7 @@ fn gap_wf_spec() -> WalkForwardSpec {
     b.fee_override = Some(FeeSchedule {
         maker: 0.0,
         taker: 0.0,
+        per_unit: 0.0,
     });
     s
 }

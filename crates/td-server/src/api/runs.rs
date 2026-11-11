@@ -756,6 +756,7 @@ mod tests {
                 fees: FeeSchedule {
                     maker: 0.0,
                     taker: 0.0,
+                    per_unit: 0.0,
                 },
             },
             timeframe: Timeframe::H1,

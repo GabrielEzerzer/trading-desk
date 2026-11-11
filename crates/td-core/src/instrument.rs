@@ -61,12 +61,35 @@ impl fmt::Display for InstrumentId {
     }
 }
 
-/// Trading fees as fractions of notional: 0.001 means 0.1%.
+/// Trading fees. A fill pays `price * qty * rate + qty * per_unit`, where the rate is the maker or
+/// taker fraction of notional (0.001 means 0.1%) and `per_unit` a commission per unit of the base
+/// asset, in the quote currency.
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct FeeSchedule {
     pub maker: f64,
     pub taker: f64,
+    /// Commission per unit of the base asset on every fill, in the quote currency, as FX brokers
+    /// charge. Left out of saved JSON when it is zero, the default.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub per_unit: f64,
+}
+
+impl FeeSchedule {
+    /// The fee on a fill of `qty` at `price` paying `rate` of notional. The per-unit term is added
+    /// only when it is set, so a schedule without one gives exactly `price * qty * rate`.
+    pub fn fee(&self, price: f64, qty: f64, rate: f64) -> f64 {
+        let fee = price * qty * rate;
+        if self.per_unit == 0.0 {
+            fee
+        } else {
+            fee + qty * self.per_unit
+        }
+    }
+}
+
+fn is_zero(x: &f64) -> bool {
+    *x == 0.0
 }
 
 /// Which way [`Instrument::round_price`] moves a price that is not on a tick.
@@ -235,6 +258,7 @@ mod tests {
             fees: FeeSchedule {
                 maker: 0.0002,
                 taker: 0.0005,
+                per_unit: 0.0,
             },
         }
     }

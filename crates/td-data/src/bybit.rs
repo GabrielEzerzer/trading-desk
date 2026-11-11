@@ -26,11 +26,13 @@ use crate::{DataError, InstrumentList};
 pub const BYBIT_SPOT_FEES: FeeSchedule = FeeSchedule {
     maker: 0.001,
     taker: 0.001,
+    per_unit: 0.0,
 };
 /// Bybit linear perpetuals: 0.02% maker, 0.055% taker.
 pub const BYBIT_LINEAR_FEES: FeeSchedule = FeeSchedule {
     maker: 0.0002,
     taker: 0.00055,
+    per_unit: 0.0,
 };
 
 const INSTRUMENTS_URL: &str = "https://api.bybit.com/v5/market/instruments-info";

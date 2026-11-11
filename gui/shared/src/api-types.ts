@@ -19,9 +19,16 @@ export type InstrumentId = { venue: Venue,
 symbol: string, kind: InstrumentKind, };
 
 /**
- * Trading fees as fractions of notional: 0.001 means 0.1%.
+ * Trading fees. A fill pays `price * qty * rate + qty * per_unit`, where the rate is the maker or
+ * taker fraction of notional (0.001 means 0.1%) and `per_unit` a commission per unit of the base
+ * asset, in the quote currency.
  */
-export type FeeSchedule = { maker: number, taker: number, };
+export type FeeSchedule = { maker: number, taker: number, 
+/**
+ * Commission per unit of the base asset on every fill, in the quote currency, as FX brokers
+ * charge. Left out of saved JSON when it is zero, the default.
+ */
+per_unit?: number, };
 
 /**
  * A tradable instrument with the venue's trading rules.

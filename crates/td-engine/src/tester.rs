@@ -1688,6 +1688,7 @@ mod tests {
             fees: FeeSchedule {
                 maker: 0.001,
                 taker: 0.002,
+                per_unit: 0.0,
             },
         };
         let bars: Vec<Candle> = (0..40)
