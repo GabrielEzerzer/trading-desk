@@ -16,9 +16,12 @@ use crate::{
 /// points of price: 2 for BTC and ETH, the most liquid markets, and 5 for every other
 /// instrument, which suits the other large caps.
 ///
-/// shortcut: one default for everything outside BTC and ETH; small caps slip more than 5 bps, so
-/// set their slippage explicitly, or carry a liquidity tier on the instrument when strategies
-/// trade them.
+/// It depends on the asset's liquidity, not on the market type, so it is keyed by the base asset
+/// rather than kept in the per-kind rules table ([`td_core::InstrumentKind::rules`]).
+///
+/// shortcut: one default for everything outside BTC and ETH; small caps slip more than 5 bps and
+/// FX majors far less (their ask series already carries the spread), so set their slippage
+/// explicitly, or carry a liquidity tier on the instrument when strategies trade them.
 pub fn default_slippage_bps(instrument: &Instrument) -> f64 {
     match instrument.base.as_str() {
         "BTC" | "ETH" => 2.0,

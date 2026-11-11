@@ -703,4 +703,86 @@ mod tests {
         assert!((fill.fee - 110.11 * 0.002).abs() < 1e-12);
         assert_eq!(s.orders()[4].status, OrderStatus::Filled);
     }
+
+    /// Buys with a stop attached at 99.5 on bar 0's close, buys again without one on bar 1's
+    /// close, and rests a reduce-only sell stop at 90 on bar 2's close.
+    struct StopsThreeWays;
+
+    impl Strategy for StopsThreeWays {
+        fn on_bar(&mut self, ctx: &mut Context, _bar: &Candle) {
+            let req = |side, order_type, reduce_only| OrderRequest {
+                instrument: ctx.instrument().id.clone(),
+                side,
+                qty: 1.0,
+                order_type,
+                tif: TimeInForce::Gtc,
+                reduce_only,
+                client_tag: None,
+            };
+            match ctx.bars().len() {
+                1 => {
+                    let entry = req(Side::Buy, OrderType::Market, false);
+                    ctx.submit_with_stop(entry, 99.5).unwrap();
+                }
+                2 => {
+                    ctx.submit(req(Side::Buy, OrderType::Market, false))
+                        .unwrap();
+                }
+                3 => {
+                    let stop = OrderType::Stop { trigger: 90.0 };
+                    ctx.submit(req(Side::Sell, stop, true)).unwrap();
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn bar_stops_hold_the_stops_placed_filled_or_open_on_each_bar() {
+        let inst = Instrument {
+            id: InstrumentId {
+                venue: Venue::Binance,
+                symbol: "TESTUSDT".into(),
+                kind: InstrumentKind::Perpetual,
+            },
+            base: "TEST".into(),
+            quote: "USDT".into(),
+            tick_size: 0.01,
+            lot_size: 0.001,
+            min_qty: 0.001,
+            min_notional: 1.0,
+            fees: FeeSchedule {
+                maker: 0.001,
+                taker: 0.002,
+            },
+        };
+        let config = SessionConfig {
+            starting_cash: 10_000.0,
+            slippage_bps: 0.0,
+            fees: None,
+            max_leverage: 1.0,
+        };
+        let mut s = Session::new(Box::new(StopsThreeWays), inst, Timeframe::M1, config).unwrap();
+        let opens = [100.0, 100.0, 101.0, 102.0, 89.0];
+        for (i, &open) in opens.iter().enumerate() {
+            s.on_bar(bar(i as i64, open), &[]).unwrap();
+        }
+        let stops = s.bar_stops();
+        assert_eq!(stops.len(), 5);
+        assert_eq!(stops[0], BarStops::default());
+        // Bar 1: the entry fills at the open, which places its stop at 99.5, and the bar's low,
+        // 99, fills that stop on the same bar. It still counts for the bar.
+        assert_eq!(s.orders()[1].status, OrderStatus::Filled);
+        assert_eq!(stops[1].sell, Some(99.5));
+        // Bar 2: the second entry has no stop until the strategy rests one on the bar's close.
+        assert_eq!(stops[2].sell, Some(90.0));
+        // Bar 3: the stop is still open.
+        assert_eq!(stops[3].sell, Some(90.0));
+        // Bar 4 opens below it, at 89: it fills at the open, so it is neither placed on the bar
+        // nor open after it, and counts as filled on it.
+        assert_eq!(s.portfolio().position(), 0.0);
+        assert_eq!(s.fills().last().unwrap().price, 89.0);
+        assert_eq!(stops[4].sell, Some(90.0));
+        assert!(stops.iter().all(|x| x.buy.is_none()));
+    }
 }

@@ -202,9 +202,12 @@ impl Building {
 ///
 /// The excursions (`mae`, `mfe`) are the unrealised P&L of the position, against the entry price
 /// so far, at the prices it met on the fill model's path through each bar: the open, for a
-/// position held into the bar; each fill's price, for the position before that fill; and the
-/// whole bar range, for the position after the bar's fills, since the session counts the whole
-/// range as coming after them (see [`crate::Session::on_bar`]). A position reduced by a maker fill
+/// position held into the bar; the price of each fill that reduces it, for the position before
+/// that fill; and the whole bar range, for the position after the bar's fills, since the session
+/// counts the whole range as coming after them (see [`crate::Session::on_bar`]). A fill that adds
+/// to the position is not counted at its own price: within the bar's range the range after it
+/// counts a loss at least as large, and a price slipped beyond the range is not one the market
+/// traded at. A position reduced by a maker fill
 /// (a limit, which fills after the stops inside the range, in the order worse for the strategy)
 /// is counted at the bar's adverse extreme too. A taker fill happened at the open or at a stop's
 /// trigger, which the market reached before going further, so the position before it met no worse
@@ -264,7 +267,6 @@ pub fn build_trades(fills: &[Fill], bars: &[Candle], bar_funding: &[BarFunding])
                     current = Some(Building::new(side, fill, k, rest, fill.fee - closing_fee));
                 }
             } else if let Some(t) = current.as_mut() {
-                t.excursion(fill.price, f64::abs(pos));
                 t.entry_qty += qty;
                 t.entry_notional += qty * fill.price;
                 t.fees += fill.fee;
@@ -547,7 +549,7 @@ mod tests {
         let fills = [
             // Short 1 @ 50: bar 0's high 52 is -2, its low 48 is +2.
             fill(0, Side::Sell, 1.0, 50.0, 0.0),
-            // Bar 1: the open and the add at 51 are -1 on the short 1. The entry is then 50.5 on
+            // Bar 1: the open, 51, is -1 on the short 1. After the add at 51 the entry is 50.5 on
             // 2: the high 55 is 2 * -4.5 = -9, the low 49 is 2 * 1.5 = +3.
             fill(1, Side::Sell, 1.0, 51.0, 0.0),
             // Bar 2: closed at the open, 54, which is -7. The low 45 comes after the close.

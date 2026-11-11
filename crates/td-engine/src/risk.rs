@@ -7,7 +7,7 @@
 //! infinity.
 
 use serde::{Deserialize, Serialize};
-use td_core::{Candle, Fill, Liquidity, Millis};
+use td_core::{Candle, Fill, Liquidity, Millis, civil_from_days, days_from_civil};
 
 use crate::metrics::{DAY_MS, EquitySeries};
 use crate::{BarFunding, EquityPoint};
@@ -236,27 +236,6 @@ impl DayRollover {
     }
 }
 
-/// Days since the epoch of a proleptic Gregorian date (Howard Hinnant's `days_from_civil`).
-fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
-    let y = if month <= 2 { year - 1 } else { year };
-    let era = y.div_euclid(400);
-    let yoe = y - era * 400;
-    let doy = (153 * ((month + 9) % 12) + 2) / 5 + day - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146_097 + doe - 719_468
-}
-
-/// The year of a date given as days since the epoch (from Hinnant's `civil_from_days`).
-fn year_of(days: i64) -> i64 {
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    yoe + era * 400 + i64::from(mp >= 10)
-}
-
 /// The first Sunday on or after a date. 1970-01-01, day 0, was a Thursday.
 fn sunday_on_or_after(days: i64) -> i64 {
     let weekday = (days + 4).rem_euclid(7); // 0 is Sunday
@@ -264,8 +243,12 @@ fn sunday_on_or_after(days: i64) -> i64 {
 }
 
 /// Whether US daylight saving time is in force at 17:00 New York time on this date.
+///
+/// shortcut: the US rule since 2007, as td-core's FX week uses; days before 2007 between the two
+/// rules (mid-March to early April, late October to early November) roll over an hour off.
+/// Upgrade to a per-year rule, shared with the FX week, when the desk tests data before 2007.
 fn us_daylight_saving(days: i64) -> bool {
-    let year = year_of(days);
+    let (year, _, _) = civil_from_days(days);
     let start = sunday_on_or_after(days_from_civil(year, 3, 1)) + 7;
     let end = sunday_on_or_after(days_from_civil(year, 11, 1));
     (start..end).contains(&days)
@@ -617,11 +600,7 @@ mod tests {
         assert!(us_daylight_saving(days_from_civil(2007, 3, 11)));
         assert!(us_daylight_saving(days_from_civil(2007, 11, 3)));
         assert!(!us_daylight_saving(days_from_civil(2007, 11, 4)));
-        assert_eq!(days_from_civil(1970, 1, 1), 0);
         assert_eq!(days_from_civil(2024, 3, 1) * DAY, mar1);
-        assert_eq!(year_of(days_from_civil(2024, 12, 31)), 2024);
-        assert_eq!(year_of(days_from_civil(2025, 1, 1)), 2025);
-        assert_eq!(year_of(days_from_civil(2024, 2, 29)), 2024);
     }
 
     /// From 12:00 on day 0: closes at 18:00, 00:00 on day 1, 12:00 and 20:00 on day 1, none on
