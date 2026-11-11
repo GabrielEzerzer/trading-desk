@@ -359,6 +359,8 @@ impl Sessions {
                     format!("paper session {id:?} is already running"),
                 ));
             }
+            // Taken under the session's lock after the run is seen to be over, so a manual order
+            // being written as it ended is in the log before it is read (see `Sessions::manual`).
             Some(entry) => lock(&entry.session).check_resumable()?,
         }
         let (dir, name) = (self.data_dir.clone(), id.to_string());
@@ -381,35 +383,55 @@ impl Sessions {
         self.summary_of(id)
     }
 
-    /// Places a manual order on a running session, or cancels one, with `act`. The session's log
-    /// is written under the lock of the list, so a resume cannot reopen the session between the
-    /// check that it runs and the write. When the log cannot be written, the session is stopped.
+    /// Places a manual order on a running session, or cancels one, with `act`. Like the bar feed,
+    /// it writes the session's log under the session's lock only, so the write's sync does not
+    /// hold up the list. A resume still cannot reopen the log between the check that the session
+    /// runs and the write: the check is made again under the session's lock, and a resume, once
+    /// it sees the run is over, takes that lock before it reads the log (see [`Sessions::resume`]).
+    /// When the log cannot be written, the session is stopped.
     fn manual(
         &self,
         id: &str,
         act: impl FnOnce(&mut PaperSession) -> Result<PaperOrder, ManualError>,
     ) -> Result<PaperOrder, ApiError> {
-        let mut entries = self.entries();
-        let entry = entries.get_mut(id).ok_or_else(|| session_not_found(id))?;
-        if !entry.run.as_ref().is_some_and(|run| !run.is_over()) {
+        let (session, ended, generation) = {
+            let entries = self.entries();
+            let entry = entries.get(id).ok_or_else(|| session_not_found(id))?;
+            match &entry.run {
+                Some(run) if !run.is_over() => {
+                    (entry.session.clone(), run.ended.clone(), run.generation)
+                }
+                _ => return Err(not_running(id)),
+            }
+        };
+        let mut paper = lock(&session);
+        if *ended.borrow() {
             return Err(not_running(id));
         }
-        let done = act(&mut lock(&entry.session));
+        let done = act(&mut paper);
         if let Err(ManualError::Paper(e)) = &done {
-            let mut paper = lock(&entry.session);
             paper.warn(format!("stopped: {e}"));
             drop(paper);
             // Its supervisor stops it and lets the run go; it is not waited for here.
-            if let Some(run) = entry.run.take() {
+            let mut entries = self.entries();
+            if let Some(entry) = entries.get_mut(id)
+                && entry
+                    .run
+                    .as_ref()
+                    .is_some_and(|r| r.generation == generation)
+                && let Some(run) = entry.run.take()
+            {
                 let _ = run.stop.send(());
             }
         }
         done.map_err(ApiError::from)
     }
 
-    /// Places a manual order on a running session.
+    /// Places a manual order on a running session, accepted at the time the session's live
+    /// source gives as the order is applied.
     pub(crate) fn place(&self, id: &str, order: &ManualOrder) -> Result<PaperOrder, ApiError> {
-        self.manual(id, |paper| paper.place(order))
+        let rest = self.streams.live().rest();
+        self.manual(id, |paper| paper.place(order, rest.now()))
     }
 
     /// Cancels a manual order on a running session.

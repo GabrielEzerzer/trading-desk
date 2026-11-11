@@ -241,7 +241,10 @@ export type EquityPoint = { time: number, equity: number, };
  */
 export type Order = { id: OrderId, request: OrderRequest, 
 /**
- * Open time of the bar the order was decided on. It can first fill on a later bar.
+ * Open time of the bar the order was decided on. It can first fill on a later bar. For a
+ * strategy's order that is the bar at whose close it was sent; for one placed between bars
+ * from outside the strategy, such as a manual order, it is the bar in progress when it was
+ * accepted, so it never fills on a price from before then.
  */
 submitted_at: number, 
 /**
@@ -988,7 +991,10 @@ export type OrderSource = "strategy" | "manual" | "liquidation";
  */
 export type PaperOrder = { source: OrderSource, id: OrderId, request: OrderRequest, 
 /**
- * Open time of the bar the order was decided on. It can first fill on a later bar.
+ * Open time of the bar the order was decided on. It can first fill on a later bar. For a
+ * strategy's order that is the bar at whose close it was sent; for one placed between bars
+ * from outside the strategy, such as a manual order, it is the bar in progress when it was
+ * accepted, so it never fills on a price from before then.
  */
 submitted_at: number, 
 /**
@@ -1080,7 +1086,8 @@ bars_held: number, };
 
 /**
  * `POST /sessions/{id}/orders`: an order placed by hand. It goes through the same rounding,
- * checks and broker as a strategy's order, as if submitted at the close of the last bar fed.
+ * checks and broker as a strategy's order, checked at the close of the last bar fed, and takes
+ * effect from the first bar that opens at or after the moment it is accepted.
  */
 export type ManualOrder = { side: Side, 
 /**
@@ -1098,8 +1105,9 @@ limit_price?: number,
 reduce_only?: boolean, };
 
 /**
- * A manual order's type. A market order fills at the next bar's open; a limit order rests, good
- * till cancelled, until a bar reaches its price.
+ * A manual order's type. A market order fills at the open of the first bar that opens at or after
+ * it is accepted; a limit order rests, good till cancelled, until a bar from then on reaches its
+ * price.
  */
 export type ManualOrderType = "market" | "limit";
 

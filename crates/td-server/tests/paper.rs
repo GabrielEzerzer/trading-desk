@@ -920,9 +920,19 @@ fn script() -> Vec<(i64, Hand)> {
     ]
 }
 
-fn by_hand(paper: &mut PaperSession, hand: &Hand) -> Result<td_server::PaperOrder, ManualError> {
+/// The close of the minute `i` minutes after `T0`.
+fn close_of(i: i64) -> Millis {
+    T0 + (i + 1) * MIN
+}
+
+/// Does `hand`, placing an order as accepted at `at`.
+fn by_hand(
+    paper: &mut PaperSession,
+    hand: &Hand,
+    at: Millis,
+) -> Result<td_server::PaperOrder, ManualError> {
     match hand {
-        Hand::Place(order) => paper.place(order),
+        Hand::Place(order) => paper.place(order, at),
         Hand::Cancel(id) => paper.cancel(OrderId(*id)),
     }
 }
@@ -932,7 +942,7 @@ fn feed_by_hand(paper: &mut PaperSession, live: std::ops::Range<i64>, script: &[
     for i in live {
         paper.feed(minute(i), Vec::new(), false).expect("feeds");
         for (_, hand) in script.iter().filter(|(m, _)| *m == i) {
-            by_hand(paper, hand).expect("accepted");
+            by_hand(paper, hand, close_of(i)).expect("accepted");
         }
     }
 }
@@ -997,12 +1007,12 @@ fn manual_orders_take_the_strategy_orders_path_and_fill_by_the_engines_rules() {
         let dir = tempfile::tempdir().expect("temp dir");
         let mut paper = PaperSession::create(dir.path(), "hand", cfg.clone()).expect("creates");
         // Refused until the first live bar, warm-up bars included.
-        let early = paper.place(&market(Side::Buy, 1.0));
+        let early = paper.place(&market(Side::Buy, 1.0), T0);
         assert!(matches!(early, Err(ManualError::NotLive)), "{early:?}");
         for bar in minutes(-20..0) {
             paper.feed(bar, Vec::new(), true).expect("warm-up bar");
         }
-        let early = paper.place(&market(Side::Buy, 1.0));
+        let early = paper.place(&market(Side::Buy, 1.0), T0);
         assert!(matches!(early, Err(ManualError::NotLive)), "{early:?}");
         feed_by_hand(&mut paper, 0..60, &script());
 
@@ -1091,10 +1101,11 @@ fn a_refused_manual_order_records_nothing_and_says_why() {
     paper.feed(minute(0), Vec::new(), false).expect("live bar");
     let log = paper_dir(dir.path(), "refused").join("events.jsonl");
     let lines = || fs::read_to_string(&log).expect("reads").lines().count();
-    let refused = |paper: &mut PaperSession, order: ManualOrder| match paper.place(&order) {
-        Err(ManualError::Rejected(reason)) => reason,
-        other => panic!("expected a rejection, got {other:?}"),
-    };
+    let refused =
+        |paper: &mut PaperSession, order: ManualOrder| match paper.place(&order, close_of(0)) {
+            Err(ManualError::Rejected(reason)) => reason,
+            other => panic!("expected a rejection, got {other:?}"),
+        };
 
     // Rounded down to the lot it is zero.
     let reason = refused(&mut paper, market(Side::Buy, 0.0004));
@@ -1116,7 +1127,9 @@ fn a_refused_manual_order_records_nothing_and_says_why() {
     assert_eq!(lines(), 1, "only the bar is in the log");
 
     // The next order accepted takes the first id.
-    let placed = paper.place(&market(Side::Buy, 1.0)).expect("accepted");
+    let placed = paper
+        .place(&market(Side::Buy, 1.0), close_of(0))
+        .expect("accepted");
     assert_eq!(
         (placed.order.id, placed.source),
         (OrderId(1), OrderSource::Manual)
@@ -1154,7 +1167,7 @@ fn manual_orders_on_a_strategy_session_are_marked_manual_and_only_they_can_be_ca
         reduce_only: Some(true),
         ..market(side, position.abs())
     };
-    let close = paper.place(&close).expect("accepted");
+    let close = paper.place(&close, close_of(39)).expect("accepted");
     assert_eq!(close.source, OrderSource::Manual);
     assert_eq!(
         rx.try_recv(),
@@ -1168,7 +1181,7 @@ fn manual_orders_on_a_strategy_session_are_marked_manual_and_only_they_can_be_ca
     assert!(last.starts_with(r#"{"manual_order":{"id":"#), "{last}");
 
     // A resting limit far from the price, cancelled by hand.
-    let resting = paper.place(&far).expect("accepted");
+    let resting = paper.place(&far, close_of(39)).expect("accepted");
     assert!(rx.try_recv().is_ok(), "the order is reported");
     let cancelled = paper.cancel(resting.order.id).expect("cancels");
     assert_eq!(
@@ -1319,5 +1332,144 @@ fn a_log_written_before_manual_orders_existed_still_opens() {
         old.fills_with_source()
             .iter()
             .all(|f| f.source == OrderSource::Strategy)
+    );
+}
+
+/// An hour bar `i` hours after `T0` that opens and closes at `open` and dips to `low`.
+fn hour(i: i64, open: f64, low: f64) -> Candle {
+    Candle {
+        open_time: T0 + i * HOUR,
+        open,
+        high: open + 1.0,
+        low,
+        close: open,
+        volume: 2.0,
+        quote_volume: 2.0 * open,
+    }
+}
+
+/// What the hourly manual test does, after the hour each step is paired with, at the time given.
+/// After 00:00, at 01:50 while the 01:00 bar is in progress: a market buy, and a limit buy at 95,
+/// which the 01:00 bar dips to. After 02:00, at 06:30 while the feed is behind, as during a
+/// backfill: a market sell, and a marketable limit buy that is cancelled before it takes effect.
+fn hourly_script() -> Vec<(i64, Millis, Hand)> {
+    let at = |h: i64, m: i64| T0 + h * HOUR + m * MIN;
+    vec![
+        (0, at(1, 50), Hand::Place(market(Side::Buy, 1.0))),
+        (0, at(1, 50), Hand::Place(limit(Side::Buy, 1.0, 95.0))),
+        (2, at(6, 30), Hand::Place(market(Side::Sell, 1.0))),
+        (2, at(6, 30), Hand::Place(limit(Side::Buy, 1.0, 200.0))),
+        (2, at(6, 30), Hand::Cancel(4)),
+    ]
+}
+
+/// The hour bars the hourly manual test feeds: none after 01:00 dips to 95.
+fn hourly_bars() -> Vec<Candle> {
+    let mut bars = vec![hour(0, 100.0, 99.0), hour(1, 101.0, 94.0)];
+    bars.extend((2..10).map(|i| hour(i, 100.0 + i as f64, 99.0 + i as f64)));
+    bars
+}
+
+/// Feeds the hour bars in `live` as live bars, doing what the hourly script says after each.
+fn feed_hours(paper: &mut PaperSession, live: std::ops::Range<usize>) {
+    let bars = hourly_bars();
+    for i in live {
+        paper.feed(bars[i], Vec::new(), false).expect("feeds");
+        for (_, at, hand) in hourly_script().iter().filter(|(h, ..)| *h == i as i64) {
+            by_hand(paper, hand, *at).expect("accepted");
+        }
+    }
+}
+
+#[test]
+fn a_manual_order_never_fills_on_a_bar_from_before_it_was_placed_and_replays_so() {
+    let cfg = PaperConfig {
+        timeframe: Timeframe::H1,
+        ..manual_config(InstrumentKind::Perpetual)
+    };
+    let dir = tempfile::tempdir().expect("temp dir");
+    let mut whole = PaperSession::create(dir.path(), "whole", cfg.clone()).expect("creates");
+    feed_hours(&mut whole, 0..10);
+    let fills: Vec<(u64, Millis)> = whole
+        .fills()
+        .iter()
+        .map(|f| (f.order_id.0, f.time))
+        .collect();
+    // The buy placed at 01:50 fills at the 02:00 open, not the 01:00 one; the limit at 95, which
+    // only the 01:00 bar reached, never fills; the sell placed at 06:30 fills at the 07:00 open,
+    // not on the bars from 03:00 to 06:00 fed after it.
+    assert_eq!(fills, [(1, T0 + 2 * HOUR), (3, T0 + 7 * HOUR)]);
+    let open = whole.fills()[0].price;
+    assert!(
+        open > 102.0 && open < 102.1,
+        "the 02:00 open with slippage: {open}"
+    );
+    let orders = whole.orders();
+    assert_eq!(
+        orders.iter().map(|o| o.submitted_at).collect::<Vec<_>>(),
+        [T0 + HOUR, T0 + HOUR, T0 + 6 * HOUR, T0 + 6 * HOUR]
+    );
+    assert_eq!(orders[1].status, OrderStatus::Open);
+    assert_eq!(
+        orders[3].status,
+        OrderStatus::Cancelled("cancelled manually".into())
+    );
+
+    // Stopped after 02:00, with both orders placed at 06:30 not yet in effect, and reopened: the
+    // replay places them as they were, and the rest goes as in the session that ran through.
+    let mut first = PaperSession::create(dir.path(), "split", cfg).expect("creates");
+    feed_hours(&mut first, 0..3);
+    let mut reopened = PaperSession::open(dir.path(), "split").expect("opens");
+    assert_same_marked_state(&first, &reopened);
+    drop(first);
+    feed_hours(&mut reopened, 3..10);
+    assert_same_marked_state(&whole, &reopened);
+    drop(reopened);
+    let again = PaperSession::open(dir.path(), "split").expect("opens");
+    assert_same_marked_state(&whole, &again);
+    assert!(again.warnings().is_empty(), "{:?}", again.warnings());
+}
+
+#[test]
+fn a_manual_order_that_would_replay_under_another_id_is_refused_or_skipped() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let cfg = manual_config(InstrumentKind::Perpetual);
+    let mut paper = PaperSession::create(dir.path(), "edited", cfg).expect("creates");
+    feed_by_hand(
+        &mut paper,
+        0..10,
+        &[(4, Hand::Place(market(Side::Buy, 1.0)))],
+    );
+    assert_eq!(paper.fills().len(), 1);
+    drop(paper);
+    let path = paper_dir(dir.path(), "edited").join("events.jsonl");
+    let log = fs::read_to_string(&path).expect("reads");
+    let edited = log.replace(r#"{"manual_order":{"id":1,"#, r#"{"manual_order":{"id":2,"#);
+    assert_ne!(edited, log, "the order's line is in the log");
+    fs::write(&path, edited).expect("writes");
+
+    // Made by this engine, the log no longer matches what the session did: it does not open.
+    match PaperSession::open(dir.path(), "edited") {
+        Err(PaperError::BadFile { reason, .. }) => {
+            assert!(
+                reason.contains("manual order 2 would replay as order 1"),
+                "{reason}"
+            );
+        }
+        Err(other) => panic!("expected a bad file, got {other}"),
+        Ok(_) => panic!("a log that does not replay opened"),
+    }
+
+    // Made by an older engine, it opens to be looked at, with the order skipped and never placed.
+    save_as_engine(dir.path(), "edited", Some(ENGINE_REVISION - 1));
+    let old = PaperSession::open(dir.path(), "edited").expect("opens");
+    assert!(old.orders().is_empty(), "{:?}", old.orders());
+    assert!(old.fills().is_empty(), "{:?}", old.fills());
+    assert_eq!(old.session().bars(), minutes(0..10));
+    assert_eq!(old.warnings().len(), 2, "{:?}", old.warnings());
+    assert!(
+        old.warnings()[1].contains("manual order 2 would replay as order 1; skipped"),
+        "{:?}",
+        old.warnings()
     );
 }

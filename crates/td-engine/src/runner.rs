@@ -16,8 +16,10 @@ use crate::{
 ///
 /// Bump it whenever the engine's behaviour changes: fills, fees, funding, the trade list, metrics
 /// or the benchmark, including changes the expected fixture does not cover (it has no gaps, for
-/// example). A regenerated `tests/fixtures/backtest_expected.json` always needs a bump, but an
-/// unchanged fixture does not mean the behaviour is unchanged.
+/// example). Order ids, and which orders are accepted or rejected, count as behaviour too: paper
+/// sessions save manual orders by id, so a change there shifts those ids in saved sessions. A
+/// regenerated `tests/fixtures/backtest_expected.json` always needs a bump, but an unchanged
+/// fixture does not mean the behaviour is unchanged.
 pub const ENGINE_REVISION: u32 = 3;
 
 /// Everything that defines a backtest apart from the data itself.

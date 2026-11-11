@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
@@ -143,9 +143,11 @@ impl MarketSource for Venues {
     }
 }
 
-/// Serves minutes (and bars resampled from them) and the funding rates, as of 00:00:30.
+/// Serves minutes (and bars resampled from them) and the funding rates, as of its clock: 00:00:30
+/// unless a test moves it.
 struct FakeRest {
     minutes: Vec<Candle>,
+    now: Arc<AtomicI64>,
 }
 
 impl Rest for FakeRest {
@@ -180,7 +182,7 @@ impl Rest for FakeRest {
     }
 
     fn now(&self) -> Millis {
-        T0 + 30_000
+        self.now.load(Ordering::SeqCst)
     }
 }
 
@@ -192,6 +194,8 @@ struct Exchange {
     push: broadcast::Sender<String>,
     accepted: Arc<AtomicUsize>,
     open: Arc<AtomicUsize>,
+    /// The time its REST source gives, kept across server restarts.
+    now: Arc<AtomicI64>,
 }
 
 impl Exchange {
@@ -203,6 +207,7 @@ impl Exchange {
             push: broadcast::channel(1024).0,
             accepted: Arc::new(AtomicUsize::new(0)),
             open: Arc::new(AtomicUsize::new(0)),
+            now: Arc::new(AtomicI64::new(T0 + 30_000)),
         };
         let serving = venue.clone();
         tokio::spawn(async move {
@@ -281,6 +286,7 @@ impl Api {
             venue: venue.clone(),
             rest: Arc::new(FakeRest {
                 minutes: minutes(-60..60),
+                now: venue.now.clone(),
             }),
         };
         let server = Server::start(ApiConfig {
@@ -549,7 +555,9 @@ fn reference_by_hand(
             match hand {
                 Hand::Place(body) => {
                     let order = serde_json::from_value(body.clone()).expect("an order");
-                    paper.place(&order).expect("accepted");
+                    // Accepted as the bar closes.
+                    let at = bar.open_time + MIN;
+                    paper.place(&order, at).expect("accepted");
                 }
                 Hand::Cancel(id) => {
                     paper.cancel(OrderId(*id)).expect("cancels");
@@ -1322,5 +1330,50 @@ async fn a_manual_order_on_a_strategy_session_is_marked_manual() {
             .as_array()
             .is_some_and(|o| o.iter().any(|o| o["id"] == placed_id))
     );
+    api.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_manual_order_takes_effect_from_the_first_bar_that_opens_after_it_is_placed() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let venue = Exchange::start().await;
+    let api = Api::start(&dir, &venue).await;
+    let mut body: Value = serde_json::from_str(&start_body()).unwrap();
+    body["strategy"] = json!("none");
+    body["params"] = json!({});
+    let (status, created) = api.post("/sessions", &body.to_string()).await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let id = created["id"].as_str().expect("an id").to_string();
+    api.until_live(&id).await;
+    venue.until_open(1).await;
+    venue.send(&minutes(0..5));
+    api.until_bar(&id, T0 + 4 * MIN).await;
+
+    // Placed at 00:12:30 while the feed has only reached 00:05, as during a backfill: the bars up
+    // to 00:12 that it feeds next are from before the order and cannot fill it.
+    venue.now.store(T0 + 12 * MIN + 30_000, Ordering::SeqCst);
+    let order = json!({ "side": "buy", "qty": 1.0, "type": "market" });
+    let (status, placed) = api
+        .post(&format!("/sessions/{id}/orders"), &order.to_string())
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{placed}");
+    assert_eq!(placed["submitted_at"], T0 + 12 * MIN);
+    venue.send(&minutes(5..20));
+    let state = api.until_bar(&id, T0 + 19 * MIN).await;
+    let fills = state["fills"].as_array().expect("fills");
+    assert_eq!(fills.len(), 1, "{fills:?}");
+    assert_eq!(fills[0]["time"], T0 + 13 * MIN, "filled at the 00:13 open");
+
+    // Replayed from its log after a restart, it is the same.
+    api.shutdown().await;
+    venue.until_open(0).await;
+    let api = Api::start(&dir, &venue).await;
+    let (_, replayed) = api.get(&format!("/sessions/{id}")).await;
+    let without_status = |state: &Value| {
+        let mut state = state.clone();
+        state.as_object_mut().expect("an object").remove("status");
+        state
+    };
+    assert_eq!(without_status(&replayed), without_status(&state));
     api.shutdown().await;
 }

@@ -5,15 +5,21 @@
 //! Files live in `<data_dir>/paper/<session_id>/`: `config.json`, the config and the
 //! [`ENGINE_REVISION`] the session was made with, written once and synced to disk before it takes
 //! its name, and `events.jsonl`, one JSON object per line: a [`FedBar`] (`{"bar": ...}`), a manual
-//! order (`{"manual_order": {"id", "request"}}`: the request before rounding and the id it got) or
-//! a manual cancel (`{"manual_cancel": {"id"}}`). Logs written before manual orders existed hold
-//! only bars and read as before. A line is appended after its bar or order is applied, so the log
-//! never holds a bar the session refused or an order it rejected, and a manual line sits between
-//! the bars it was placed between, so a replay places it exactly. Each append goes straight to the
-//! operating system, so it survives the process dying. Each live bar's line and each manual line
-//! is also synced to disk, with the warm-up lines before it, so a power cut loses at most the line
-//! being written and any warm-up lines not yet followed by a live bar; a resume fetches those
-//! again. A manual order is answered only once its line is on disk.
+//! order (`{"manual_order": {"id", "request", "accepted_at"}}`: the request before rounding, the id
+//! it got and when it was accepted) or a manual cancel (`{"manual_cancel": {"id"}}`). Logs written
+//! before manual orders existed hold only bars and read as before. A line is appended after its
+//! bar or order is applied, so the log never holds a bar the session refused or an order it
+//! rejected, and a manual line sits between the bars it was placed between; with its time, a
+//! replay places it exactly. Each append goes straight to the operating system, so it survives the
+//! process dying. Each live bar's line and each manual line is also synced to disk, with the
+//! warm-up lines before it, so a power cut loses at most the line being written and any warm-up
+//! lines not yet followed by a live bar; a resume fetches those again. A manual order is answered
+//! only once its line is on disk; a line that could not be written whole and synced is cut from
+//! the file again where possible, so a refused order does not come back on a resume.
+//!
+//! A manual order takes effect from the first bar that opens at or after the moment it was
+//! accepted (see [`Session::submit`]): it never fills on a price from before then, neither on the
+//! bar in progress when it was placed nor on bars a backfill feeds after it.
 //!
 //! A session runs a registered strategy, or none: strategy [`MANUAL_STRATEGY`] (`none`) makes a
 //! manual session, where only manual orders trade. Manual orders are also allowed on a strategy
@@ -121,10 +127,12 @@ pub struct FedBar {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum ManualLine {
-    /// The request as the API built it, before rounding, and the id it was given.
+    /// The request as the API built it, before rounding, the id it was given and when it was
+    /// accepted, which sets the first bar it can fill on.
     ManualOrder {
         id: OrderId,
         request: OrderRequest,
+        accepted_at: Millis,
     },
     ManualCancel {
         id: OrderId,
@@ -152,7 +160,8 @@ impl Line {
 }
 
 /// `POST /sessions/{id}/orders`: an order placed by hand. It goes through the same rounding,
-/// checks and broker as a strategy's order, as if submitted at the close of the last bar fed.
+/// checks and broker as a strategy's order, checked at the close of the last bar fed, and takes
+/// effect from the first bar that opens at or after the moment it is accepted.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[serde(deny_unknown_fields)]
 pub struct ManualOrder {
@@ -172,8 +181,9 @@ pub struct ManualOrder {
     pub reduce_only: Option<bool>,
 }
 
-/// A manual order's type. A market order fills at the next bar's open; a limit order rests, good
-/// till cancelled, until a bar reaches its price.
+/// A manual order's type. A market order fills at the open of the first bar that opens at or after
+/// it is accepted; a limit order rests, good till cancelled, until a bar from then on reaches its
+/// price.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum ManualOrderType {
@@ -338,6 +348,8 @@ pub struct PaperSession {
     session: Session,
     log: File,
     log_path: PathBuf,
+    /// The length of the log: the lines written whole, where a line that fails is cut back to.
+    log_len: u64,
     status: Status,
     funding: Vec<Funding>,
     /// Open time of the first bar fed live, after warm-up.
@@ -399,6 +411,7 @@ impl PaperSession {
             session,
             log,
             log_path,
+            log_len: 0,
             status: Status::Stopped,
             funding: Vec::new(),
             live_from: None,
@@ -465,6 +478,7 @@ impl PaperSession {
             engine_revision: saved.engine_revision,
             log,
             log_path: log_path.clone(),
+            log_len: complete as u64,
             status: Status::Stopped,
             funding: Vec::new(),
             live_from: None,
@@ -501,17 +515,23 @@ impl PaperSession {
     /// Applies a manual line from the log as it was applied when it was written.
     fn replay(&mut self, line: ManualLine) -> Result<(), String> {
         match line {
-            ManualLine::ManualOrder { id, request } => {
-                let order = self
-                    .session
-                    .submit(request)
-                    .map_err(|reason| format!("manual order {} is now rejected: {reason}", id.0))?;
-                if order.id != id {
+            ManualLine::ManualOrder {
+                id,
+                request,
+                accepted_at,
+            } => {
+                // Checked before it is submitted: an order placed under another id stays placed,
+                // and would count as the strategy's.
+                let next = self.session.orders().len() as u64 + 1;
+                if id.0 != next {
                     return Err(format!(
-                        "manual order {} replays as order {}",
-                        id.0, order.id.0
+                        "manual order {} would replay as order {next}",
+                        id.0
                     ));
                 }
+                self.session
+                    .submit(request, accepted_at)
+                    .map_err(|reason| format!("manual order {} is now rejected: {reason}", id.0))?;
                 self.manual.insert(id);
             }
             ManualLine::ManualCancel { id } => {
@@ -550,14 +570,20 @@ impl PaperSession {
         Ok(())
     }
 
-    /// Places a manual order between bars, as if submitted at the close of the last bar fed: the
-    /// engine rounds and checks it as it does a strategy's (see [`Session::submit`]), and a market
-    /// order fills at the next bar's open. An accepted order is appended to the log and synced,
-    /// then reported and returned. A rejected one changes nothing.
+    /// Places a manual order between bars, accepted at time `accepted_at`: the engine rounds and
+    /// checks it at the close of the last bar fed, as it does a strategy's, and it takes effect
+    /// from the first bar that opens at or after `accepted_at` (see [`Session::submit`]). A market
+    /// order fills at that bar's open, and no bar before it can fill a limit, so the order never
+    /// fills on a price from before it was placed. An accepted order is appended to the log with
+    /// `accepted_at` and synced, then reported and returned. A rejected one changes nothing.
     ///
     /// Refused before the first live bar. On a log error the order has been placed but is not
     /// saved, and the session takes no more bars or orders: stop it.
-    pub fn place(&mut self, order: &ManualOrder) -> Result<PaperOrder, ManualError> {
+    pub fn place(
+        &mut self,
+        order: &ManualOrder,
+        accepted_at: Millis,
+    ) -> Result<PaperOrder, ManualError> {
         self.check_log()?;
         if self.live_from.is_none() {
             return Err(ManualError::NotLive);
@@ -567,11 +593,16 @@ impl PaperSession {
             .map_err(ManualError::Rejected)?;
         let placed = self
             .session
-            .submit(request.clone())
+            .submit(request.clone(), accepted_at)
             .map_err(ManualError::Rejected)?;
         let id = placed.id;
         self.manual.insert(id);
-        self.append(&ManualLine::ManualOrder { id, request }, true)?;
+        let line = ManualLine::ManualOrder {
+            id,
+            request,
+            accepted_at,
+        };
+        self.append(&line, true)?;
         let order = self.with_source(&placed);
         self.emit(SessionEvent::Order {
             order: order.clone(),
@@ -618,7 +649,8 @@ impl PaperSession {
     }
 
     /// Appends one line to the log, synced to disk if `sync`. A failure breaks the session (see
-    /// [`PaperSession::check_log`]).
+    /// [`PaperSession::check_log`]) and cuts from the file whatever part of the line reached it,
+    /// so a line the caller is told failed does not replay.
     fn append(&mut self, line: &impl Serialize, sync: bool) -> Result<(), PaperError> {
         let mut text = serde_json::to_string(line).map_err(|e| PaperError::BadFile {
             path: self.log_path.clone(),
@@ -629,12 +661,25 @@ impl PaperSession {
         let written = self
             .log
             .write_all(text.as_bytes())
-            .and_then(|()| if sync { self.log.sync_data() } else { Ok(()) })
-            .map_err(PaperError::io(&self.log_path));
-        if let Err(e) = &written {
-            self.broken = Some(e.to_string());
+            .and_then(|()| if sync { sync_data(&self.log) } else { Ok(()) });
+        let Err(e) = written else {
+            self.log_len += text.len() as u64;
+            return Ok(());
+        };
+        let e = PaperError::io(&self.log_path)(e);
+        let mut reason = e.to_string();
+        // Through a handle of its own: the log's is append-only, which cannot truncate.
+        let cut = OpenOptions::new()
+            .write(true)
+            .open(&self.log_path)
+            .and_then(|file| file.set_len(self.log_len).and_then(|()| file.sync_data()));
+        if let Err(cut) = cut {
+            reason.push_str(&format!(
+                "; the line could not be cut from the log either, so a resume replays it: {cut}"
+            ));
         }
-        written
+        self.broken = Some(reason);
+        Err(e)
     }
 
     /// Where the orders and fills stand, to report what a bar changes.
@@ -899,6 +944,21 @@ struct Mark {
     pending: Vec<(usize, OrderStatus)>,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Makes [`sync_data`] fail on this thread, to test a line that was written but not synced.
+    static FAIL_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// [`File::sync_data`]; tests can make it fail.
+fn sync_data(file: &File) -> std::io::Result<()> {
+    #[cfg(test)]
+    if FAIL_SYNC.get() {
+        return Err(std::io::Error::other("sync failed (test)"));
+    }
+    file.sync_data()
+}
+
 /// The strategy of a manual session.
 struct NoStrategy;
 
@@ -1094,6 +1154,43 @@ mod tests {
     }
 
     #[test]
+    fn a_manual_order_written_but_not_synced_is_cut_from_the_log_and_does_not_replay() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let config = PaperConfig {
+            strategy: MANUAL_STRATEGY.into(),
+            ..config()
+        };
+        let mut paper = PaperSession::create(dir.path(), "unsynced", config).expect("creates");
+        paper.feed(bar(0), Vec::new(), false).expect("live bar");
+        let before = fs::read(&paper.log_path).expect("reads");
+        let order = ManualOrder {
+            side: Side::Buy,
+            qty: 1.0,
+            order_type: ManualOrderType::Market,
+            limit_price: None,
+            reduce_only: None,
+        };
+
+        // The line reaches the file, but syncing it fails: the caller is told the order failed.
+        FAIL_SYNC.set(true);
+        let placed = paper.place(&order, MIN);
+        FAIL_SYNC.set(false);
+        assert!(
+            matches!(placed, Err(ManualError::Paper(PaperError::Io { .. }))),
+            "{placed:?}"
+        );
+        assert_eq!(
+            fs::read(&paper.log_path).expect("reads"),
+            before,
+            "the failed line is still in the log"
+        );
+        drop(paper);
+        let reopened = PaperSession::open(dir.path(), "unsynced").expect("opens");
+        assert!(reopened.orders().is_empty(), "{:?}", reopened.orders());
+        assert_eq!(reopened.session().bars(), [bar(0)]);
+    }
+
+    #[test]
     fn a_manual_order_whose_line_cannot_be_written_is_not_reported_and_stops_the_session() {
         let dir = tempfile::tempdir().expect("temp dir");
         let config = PaperConfig {
@@ -1116,7 +1213,7 @@ mod tests {
         // A handle that cannot write: the order's line fails.
         paper.log = File::open(&paper.log_path).expect("opens read-only");
         assert!(matches!(
-            paper.place(&order),
+            paper.place(&order, MIN),
             Err(ManualError::Paper(PaperError::Io { .. }))
         ));
         assert_eq!(
@@ -1131,7 +1228,7 @@ mod tests {
             .open(&paper.log_path)
             .expect("opens");
         assert!(matches!(
-            paper.place(&order),
+            paper.place(&order, MIN),
             Err(ManualError::Paper(PaperError::LogFailed(_)))
         ));
         assert!(matches!(

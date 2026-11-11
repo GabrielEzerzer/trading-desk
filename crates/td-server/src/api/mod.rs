@@ -49,8 +49,14 @@
 //!   - `POST /sessions/{id}/orders` `{side, qty, type: "market"|"limit", limit_price?,
 //!     reduce_only?}`: places a manual order (a `ManualOrder`), on a strategy session too. It goes
 //!     through the same rounding, checks (lot, tick and minimums, the spot cash and holding, the
-//!     leverage cap) and broker as a strategy's order, as if submitted at the close of the last
-//!     bar: a market order fills at the next bar's open. 201 with the order (a `PaperOrder`,
+//!     leverage cap) and broker as a strategy's order, checked at the close of the last bar fed.
+//!     It takes effect from the first bar that opens at or after the moment it is accepted, so it
+//!     never fills on a price from before then: a market order fills at that bar's open, and a
+//!     limit is first checked against that bar. The bar in progress when it is placed cannot fill
+//!     it, nor can the bars a backfill feeds after it; one placed exactly as a bar closes takes
+//!     effect from the next bar, like a strategy's. Its `submitted_at` is the open of the bar
+//!     before the one it takes effect from (at the earliest, the last bar fed), and it can be
+//!     cancelled before it takes effect. 201 with the order (a `PaperOrder`,
 //!     `source: "manual"`). 400 `invalid_order` with the engine's reason when it is refused, 4xx
 //!     `bad_request` for a body that does not read, 409 `not_running` on a session that is not
 //!     running, 409 `not_live` before its first live bar. Its fills and trades are marked manual

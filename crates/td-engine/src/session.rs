@@ -276,22 +276,33 @@ impl Session {
         let _ = self.context().submit(request);
     }
 
-    /// Submits an order from outside the strategy, such as a person's manual order, between bars.
-    /// It is taken as decided at the close of the last bar fed, exactly like an order the strategy
-    /// submits from that bar's callbacks: rounded, validated and checked against the spot cash and
-    /// holding and the leverage cap as [`Context::submit`] describes, and first able to fill on
-    /// the next bar, a market order at its open.
+    /// Submits an order from outside the strategy, such as a person's manual order, between bars,
+    /// accepted at time `accepted_at`. It is rounded, validated and checked against the spot cash
+    /// and holding and the leverage cap as [`Context::submit`] describes, at the close of the last
+    /// bar fed, like an order the strategy submits from that bar's callbacks.
+    ///
+    /// It takes effect from the first bar that opens at or after `accepted_at`
+    /// ([`Timeframe::ceil`]), so it never fills on a price from before it was accepted: a market
+    /// order fills at that bar's open, and a limit is first checked against that bar. Bars fed
+    /// before then, such as a bar already in progress when it was accepted or the bars a backfill
+    /// feeds afterwards, cannot fill it. Its [`Order::submitted_at`] is the open of the bar before
+    /// that one, or the last bar fed if `accepted_at` is before that bar's close. An order the
+    /// strategy submits at a bar's close is the case `accepted_at` = that close: it takes effect
+    /// from the next bar.
     ///
     /// Unlike a strategy's, a rejected order is not recorded: the reason is returned and nothing
     /// changes, so the next order takes the id this one would have had. It is refused before the
     /// first live bar, while trading is disabled or no bar has been fed. Returns the order as
     /// recorded.
-    pub fn submit(&mut self, request: OrderRequest) -> Result<Order, String> {
-        if self.equity.is_empty() {
+    pub fn submit(&mut self, request: OrderRequest, accepted_at: Millis) -> Result<Order, String> {
+        let Some(last) = self.bars.last().filter(|_| !self.equity.is_empty()) else {
             return Err("orders can be placed once the session has fed its first live bar".into());
-        }
+        };
+        // The broker fills an order only on bars that open after the bar it was decided on.
+        let active_from = self.timeframe.ceil(accepted_at);
+        let decided_on = (active_from - self.timeframe.duration_ms()).max(last.open_time);
         let mut ctx = self.context();
-        match ctx.submit(request) {
+        match ctx.submit_during(request, decided_on) {
             Ok(id) => Ok(self.order_mut(id).clone()),
             Err(rejected) => {
                 // Context records the rejected order last; it is taken back out.
@@ -698,32 +709,42 @@ mod tests {
             reduce_only: false,
             client_tag: None,
         };
+        // Accepted as bar 1 closes.
+        let at = 120_000;
         // Refused until the first live bar, warm-up bars included.
-        assert!(s.submit(req(Side::Buy, 1.0, OrderType::Market)).is_err());
+        assert!(
+            s.submit(req(Side::Buy, 1.0, OrderType::Market), at)
+                .is_err()
+        );
         s.warm_up(bar(0, 100.0), &[]).unwrap();
-        assert!(s.submit(req(Side::Buy, 1.0, OrderType::Market)).is_err());
+        assert!(
+            s.submit(req(Side::Buy, 1.0, OrderType::Market), at)
+                .is_err()
+        );
         s.on_bar(bar(1, 100.0), &[]).unwrap();
 
         // Rejections give the engine's reason and record nothing.
         let reason = s
-            .submit(req(Side::Buy, 0.0004, OrderType::Market))
+            .submit(req(Side::Buy, 0.0004, OrderType::Market), at)
             .unwrap_err();
         assert!(reason.contains("qty"), "{reason}");
         let reason = s
-            .submit(req(Side::Buy, 101.0, OrderType::Market))
+            .submit(req(Side::Buy, 101.0, OrderType::Market), at)
             .unwrap_err();
         assert!(reason.contains("leverage cap"), "{reason}");
         assert!(s.orders().is_empty());
 
         // Rounded as a strategy's order is: the quantity down, a buy limit down.
-        let market = s.submit(req(Side::Buy, 1.0004, OrderType::Market)).unwrap();
+        let market = s
+            .submit(req(Side::Buy, 1.0004, OrderType::Market), at)
+            .unwrap();
         assert_eq!((market.id, market.request.qty), (OrderId(1), 1.0));
         assert_eq!(
             (market.submitted_at, market.decision_close),
             (60_000, 100.0)
         );
         let limit = s
-            .submit(req(Side::Buy, 1.0, OrderType::Limit { price: 90.009 }))
+            .submit(req(Side::Buy, 1.0, OrderType::Limit { price: 90.009 }), at)
             .unwrap();
         assert_eq!(limit.request.order_type, OrderType::Limit { price: 90.0 });
         assert_eq!(s.open_orders().len(), 2);
@@ -743,6 +764,90 @@ mod tests {
         assert!(!s.cancel(OrderId(2), "again"), "already cancelled");
         assert!(!s.cancel(OrderId(1), "filled"), "already filled");
         assert!(s.open_orders().is_empty());
+    }
+
+    #[test]
+    fn an_order_from_outside_never_fills_on_a_bar_from_before_it_was_accepted() {
+        const HOUR: Millis = 3_600_000;
+        const MIN: Millis = 60_000;
+        // An hour bar that opens and closes at `open` and dips to `low`.
+        let hour = |i: i64, open: f64, low: f64| Candle {
+            open_time: i * HOUR,
+            open,
+            high: open + 1.0,
+            low,
+            close: open,
+            volume: 1.0,
+            quote_volume: open,
+        };
+        let config = SessionConfig {
+            starting_cash: 10_000.0,
+            slippage_bps: 0.0,
+            fees: None,
+            max_leverage: 1.0,
+        };
+        let mut s = Session::new(Box::new(Idle), perp(), Timeframe::H1, config).unwrap();
+        let req = |side, order_type| OrderRequest {
+            instrument: perp().id,
+            side,
+            qty: 1.0,
+            order_type,
+            tif: TimeInForce::Gtc,
+            reduce_only: false,
+            client_tag: None,
+        };
+        let fills = |s: &Session| -> Vec<(u64, Millis, f64)> {
+            s.fills()
+                .iter()
+                .map(|f| (f.order_id.0, f.time, f.price))
+                .collect()
+        };
+        s.on_bar(hour(0, 100.0, 99.0), &[]).unwrap();
+
+        // Placed at 01:50, while the 01:00 bar is in progress: a market buy, and a buy limit at 95,
+        // a price the 01:00 bar dipped to before then.
+        let market = s.submit(req(Side::Buy, OrderType::Market), HOUR + 50 * MIN);
+        assert_eq!(market.map(|o| o.submitted_at), Ok(HOUR));
+        let limit = OrderType::Limit { price: 95.0 };
+        s.submit(req(Side::Buy, limit), HOUR + 50 * MIN).unwrap();
+        s.on_bar(hour(1, 101.0, 94.0), &[]).unwrap();
+        assert_eq!(fills(&s), [], "filled on the bar in progress when placed");
+        // The market buy fills at the 02:00 open; that bar never reaches the limit.
+        s.on_bar(hour(2, 102.0, 101.0), &[]).unwrap();
+        assert_eq!(fills(&s), [(1, 2 * HOUR, 102.0)]);
+        assert_eq!(s.orders()[1].status, OrderStatus::Open);
+
+        // Placed exactly at 03:00, as the 02:00 bar closes: it takes effect from the 03:00 bar, as
+        // a strategy's order sent at that close does.
+        let at_close = s.submit(req(Side::Sell, OrderType::Market), 3 * HOUR);
+        assert_eq!(at_close.map(|o| o.submitted_at), Ok(2 * HOUR));
+        // Placed at 06:30 while the feed is still behind, as during a backfill: the bars up to
+        // 06:00 that come after it cannot fill it.
+        let behind = s.submit(req(Side::Buy, OrderType::Market), 6 * HOUR + 30 * MIN);
+        assert_eq!(behind.map(|o| o.submitted_at), Ok(6 * HOUR));
+        // And one placed then that is cancelled before it takes effect.
+        let marketable = OrderType::Limit { price: 200.0 };
+        let cancelled = s.submit(req(Side::Buy, marketable), 6 * HOUR + 30 * MIN);
+        assert_eq!(cancelled.map(|o| o.id), Ok(OrderId(5)));
+        s.on_bar(hour(3, 103.0, 102.0), &[]).unwrap();
+        assert!(s.cancel(OrderId(5), "cancelled by hand"));
+        for i in 4..=6 {
+            s.on_bar(hour(i, 100.0 + i as f64, 99.0), &[]).unwrap();
+        }
+        assert_eq!(fills(&s), [(1, 2 * HOUR, 102.0), (3, 3 * HOUR, 103.0)]);
+        s.on_bar(hour(7, 107.0, 106.0), &[]).unwrap();
+        assert_eq!(
+            fills(&s),
+            [
+                (1, 2 * HOUR, 102.0),
+                (3, 3 * HOUR, 103.0),
+                (4, 7 * HOUR, 107.0)
+            ]
+        );
+        assert_eq!(
+            s.orders()[4].status,
+            OrderStatus::Cancelled("cancelled by hand".into())
+        );
     }
 
     #[test]
