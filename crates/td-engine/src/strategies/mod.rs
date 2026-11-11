@@ -1,6 +1,7 @@
 //! Reference strategies.
 
 pub mod donchian;
+pub mod gotobi_calendar;
 pub mod sma_cross;
 
 use td_core::{OrderRequest, OrderType, Side, TimeInForce};
