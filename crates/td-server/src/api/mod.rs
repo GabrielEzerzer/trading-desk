@@ -23,7 +23,8 @@
 //!   timeframe with open times in `[from, to)`, oldest first, for a chart (see [`candles`]). Bars
 //!   come from the store, resampled from its minutes; the slots it does not cover are fetched from
 //!   the venue's REST API, as a paper session's warm-up does, and are not stored, so an instrument
-//!   with no stored data works too. A bar still open is never returned. `to` defaults to now and
+//!   with no stored data works too. Oanda has no live stream and so no REST bars: there the slots
+//!   the store does not cover are reported missing. A bar still open is never returned. `to` defaults to now and
 //!   `from` to the venue's earliest download date (2017-01-01, or 2005-01-01 for oanda), which
 //!   is also the earliest bar served; either one between bar boundaries is rounded up to the
 //!   next. `limit` defaults to and is capped at [`candles::MAX_CANDLES`]; a range
