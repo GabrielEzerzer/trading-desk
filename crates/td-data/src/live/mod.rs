@@ -123,10 +123,10 @@ impl Rest for VenueRest {
 
 /// The public kline stream for an instrument's 1-minute bars, from its source.
 ///
-/// shortcut: a source with no live stream gives an empty URL, because callers (td-server's
-/// `run::start`) take a `String`; a [`SharedStream`] opened on it reports the source's
-/// [`DataError::NoLiveStream`] instead of connecting. Return a `Result` once those callers can
-/// take one.
+/// shortcut: a source with no live stream, or one that does not list the instrument's kind, gives
+/// an empty URL, because callers (td-server's `run::start`) take a `String`; a [`SharedStream`]
+/// opened on it reports the source's [`DataError::NoLiveStream`] or [`DataError::KindNotListed`]
+/// instead of connecting. Return a `Result` once those callers can take one.
 pub fn stream_url(id: &InstrumentId) -> String {
     source(id.venue)
         .live()
@@ -213,8 +213,9 @@ impl SharedStream {
     }
 
     /// Connects to `url`, which serves `source`'s message format: [`SharedStream::open`] on a
-    /// source other than the venue's own, such as a fake. A source with no live stream does not
-    /// connect; the stream reports its [`DataError::NoLiveStream`] as a failed connection, again
+    /// source other than the venue's own, such as a fake. A source with no live stream, or one
+    /// that does not list `id`'s kind, does not connect; the stream reports its
+    /// [`DataError::NoLiveStream`] or [`DataError::KindNotListed`] as a failed connection, again
     /// after each backoff.
     pub fn open_on(source: &'static dyn DataSource, id: InstrumentId, url: String) -> SharedStream {
         install_crypto_provider();
@@ -224,7 +225,17 @@ impl SharedStream {
         let (out, flag) = (frames.clone(), connected.clone());
         // Wrapped here, not inside the task below: a stream dropped before that task first runs
         // must still abort the socket task, or it would connect once with nobody listening.
-        let socket = AbortOnDrop(match source.live() {
+        let live = source.live().and_then(|live| {
+            if source.kinds().contains(&id.kind) {
+                Ok(live)
+            } else {
+                Err(DataError::KindNotListed {
+                    venue: source.venue(),
+                    kind: id.kind,
+                })
+            }
+        });
+        let socket = AbortOnDrop(match live {
             Ok(live) => tokio::spawn(ws::run_reader(url, live.greeting(&id), reader_tx)),
             Err(e) => tokio::spawn(refuse(e.to_string(), reader_tx)),
         });

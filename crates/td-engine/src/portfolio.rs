@@ -90,9 +90,10 @@ impl Portfolio {
     }
 
     pub fn equity(&self) -> f64 {
-        match self.kind {
-            InstrumentKind::Spot => self.cash + self.position * self.mark_price,
-            InstrumentKind::Perpetual => self.cash + self.unrealised_pnl(),
+        if self.kind.rules().margin {
+            self.cash + self.unrealised_pnl()
+        } else {
+            self.cash + self.position * self.mark_price
         }
     }
 

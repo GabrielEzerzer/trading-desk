@@ -19,7 +19,7 @@
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use td_core::{Candle, InstrumentId, InstrumentKind, Millis, Timeframe};
+use td_core::{Candle, InstrumentId, Millis, Timeframe};
 use td_data::live::{FeedEvent, Rest, SharedStream, run_feed_on, stream_url};
 use td_data::time::round_to_minute;
 use td_data::{DataError, Store};
@@ -221,9 +221,10 @@ async fn drive(
         }
     };
 
-    let mut funding = match id.kind {
-        InstrumentKind::Spot => None,
-        InstrumentKind::Perpetual => Some(funding_clock(shared, &rest, &id, start).await),
+    let mut funding = if id.kind.rules().funding {
+        Some(funding_clock(shared, &rest, &id, start).await)
+    } else {
+        None
     };
 
     lock(shared).set_status(Status::Reconnecting);
@@ -439,6 +440,8 @@ impl FundingClock {
 
 #[cfg(test)]
 mod tests {
+    use td_core::InstrumentKind;
+
     use super::*;
 
     const T: Millis = 1_704_067_200_000; // 2024-01-01 00:00 UTC
