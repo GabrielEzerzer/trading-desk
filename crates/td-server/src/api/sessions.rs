@@ -582,6 +582,15 @@ pub(super) async fn start(
 ) -> Result<(StatusCode, Json<SessionSummary>), ApiError> {
     let Json(request) = body?;
     let id = &request.instrument;
+    // The paper path feeds bars with no asks, and no live feed gives them, so a quoted market
+    // would fail on its first bar.
+    // shortcut: refused outright; lift this when a live FX feed gives the asks.
+    if id.kind.rules().quotes {
+        return Err(ApiError::bad_request(format!(
+            "{id} is quoted as a bid and an ask, and there is no live ask feed yet, so it cannot \
+             be paper traded"
+        )));
+    }
     let list = data::instrument_list(&state, id.venue, id.kind).await?;
     let instrument = list
         .instruments
