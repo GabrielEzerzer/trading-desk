@@ -14,7 +14,10 @@ use crate::{FillCheck, FillModel, Portfolio};
 pub struct Order {
     pub id: OrderId,
     pub request: OrderRequest,
-    /// Open time of the bar the order was decided on. It can first fill on a later bar.
+    /// Open time of the bar the order was decided on. It can first fill on a later bar. For a
+    /// strategy's order that is the bar at whose close it was sent; for one placed between bars
+    /// from outside the strategy, such as a manual order, it is the bar in progress when it was
+    /// accepted, so it never fills on a price from before then.
     pub submitted_at: Millis,
     /// Close of the bar the order was decided on: the last price before it was sent.
     pub decision_close: f64,

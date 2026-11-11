@@ -58,4 +58,4 @@ pub use tester::{
     WalkForwardSpec, Window, WindowMode, WindowResult, WindowSpec, out_of_sample, stitch, sweep,
     walk_forward,
 };
-pub use trades::{BarFunding, Trade, TradeSide, build_trades};
+pub use trades::{BarFunding, Trade, TradeSide, build_trades, build_trades_with_fills};

@@ -70,6 +70,17 @@ impl Timeframe {
         t - (t - origin).rem_euclid(self.duration_ms())
     }
 
+    /// The open time of the first bar that opens at or after `t`: `t` itself on a bar's open, the
+    /// next bar's open otherwise.
+    pub fn ceil(self, t: Millis) -> Millis {
+        let start = self.floor(t);
+        if start == t {
+            t
+        } else {
+            start + self.duration_ms()
+        }
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Timeframe::M1 => "1m",
@@ -131,6 +142,20 @@ mod tests {
             assert!(start <= T && T < start + tf.duration_ms());
         }
         assert_eq!(Timeframe::M1.floor(-1), -60_000);
+    }
+
+    #[test]
+    fn ceil_is_the_next_open_or_the_open_itself() {
+        assert_eq!(Timeframe::M1.ceil(T), 1_710_431_280_000); // 15:48:00
+        assert_eq!(Timeframe::H4.ceil(T), 1_710_432_000_000); // 16:00:00
+        assert_eq!(Timeframe::W1.ceil(T), 1_710_720_000_000); // Monday 2024-03-18
+        for tf in Timeframe::ALL {
+            let start = tf.floor(T);
+            assert_eq!(tf.ceil(start), start, "{tf}");
+            assert_eq!(tf.ceil(start + 1), start + tf.duration_ms(), "{tf}");
+            assert_eq!(tf.ceil(start - 1), start, "{tf}");
+        }
+        assert_eq!(Timeframe::M1.ceil(-1), 0);
     }
 
     #[test]

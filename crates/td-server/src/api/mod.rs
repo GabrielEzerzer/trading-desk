@@ -47,7 +47,8 @@
 //! - Paper sessions (see [`sessions`]):
 //!   - `POST /sessions` `{strategy, params, instrument, timeframe, starting_cash, slippage_bps,
 //!     fees?}`: creates a session and starts it, 201 with its summary. `instrument` is an
-//!     instrument id; its trading rules come from `GET /instruments`.
+//!     instrument id; its trading rules come from `GET /instruments`. Strategy `none`, with no
+//!     parameters, makes a manual session: no strategy runs and only manual orders trade.
 //!   - `GET /sessions`: every session, oldest first, with its status and equity.
 //!   - `GET /sessions/{id}`: a session's full state: status, position, cash, equity curve, open
 //!     orders, fills and trades so far.
@@ -58,6 +59,31 @@
 //!     `engine_changed` if the session was created by another engine revision: it still lists
 //!     and shows, replayed by this engine with a warning saying so, but cannot go on; start a new
 //!     session instead.
+//!   - `POST /sessions/{id}/orders` `{side, qty, type: "market"|"limit", limit_price?,
+//!     reduce_only?}`: places a manual order (a `ManualOrder`), on a strategy session too. It goes
+//!     through the same rounding, checks (lot, tick and minimums, the spot cash and holding, the
+//!     leverage cap) and broker as a strategy's order, checked at the close of the last bar fed.
+//!     It takes effect from the first bar that opens at or after the moment it is accepted (by
+//!     the local clock, assumed in step with the venue), so it
+//!     never fills on a price from before then: a market order fills at that bar's open, and a
+//!     limit is first checked against that bar. The bar in progress when it is placed cannot fill
+//!     it, nor can the bars a backfill feeds after it; one placed exactly as a bar closes takes
+//!     effect from the next bar, like a strategy's. Its `submitted_at` is the open of the bar
+//!     before the one it takes effect from (at the earliest, the last bar fed), and it can be
+//!     cancelled before it takes effect. 201 with the order (a `PaperOrder`,
+//!     `source: "manual"`). 400 `invalid_order` with the engine's reason when it is refused, 4xx
+//!     `bad_request` for a body that does not read, 409 `not_running` on a session that is not
+//!     running, 409 `not_live` before its first live bar, 409 `catching_up` while the session is
+//!     still replaying bars it missed: its last bar fed opens more than one bar before the last
+//!     bar closed by the same clock, as during a resume's backfill or behind a lagging feed. The
+//!     strategy's checks at each bar's close count pending orders, so this keeps an order from
+//!     changing its decisions on bars from before the order, apart from at most one bar that
+//!     closed before it but was delivered after it. Its fills and trades are marked manual too,
+//!     and the order is in the session's log, so a resume replays it.
+//!   - `POST /sessions/{id}/orders/{order_id}/cancel`: cancels an open manual order, 200 with the
+//!     order, while catching up too. 404 for an unknown order, 409 `not_manual` for one the
+//!     strategy placed, 409 `order_done` for one already filled or cancelled, 409 `not_running`
+//!     as above.
 //!
 //!   An unknown session id is a 404.
 //! - `GET /ws`: topic subscriptions: `jobs`, `candles:...` and `session:<id>` (see [`ws`]).
@@ -269,6 +295,11 @@ pub(crate) fn router(state: Arc<AppState>) -> Router {
         .route("/sessions/{id}", get(sessions::get))
         .route("/sessions/{id}/stop", post(sessions::stop))
         .route("/sessions/{id}/resume", post(sessions::resume))
+        .route("/sessions/{id}/orders", post(sessions::place_order))
+        .route(
+            "/sessions/{id}/orders/{order_id}/cancel",
+            post(sessions::cancel_order),
+        )
         .route("/ws", get(ws::upgrade))
         .fallback(not_found)
         .method_not_allowed_fallback(method_not_allowed)
