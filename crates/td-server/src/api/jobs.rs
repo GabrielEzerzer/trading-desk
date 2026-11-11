@@ -145,7 +145,8 @@ pub struct JobInfo {
     /// The latest progress line, for people.
     pub message: String,
     pub request: JobRequest,
-    /// Set when `status` is `done`, and on a `cancelled` plan job that kept some instruments.
+    /// Set when `status` is `done`, and on a `cancelled` or `failed` plan job that kept some
+    /// instruments.
     pub result: Option<JobResult>,
     /// Set when `status` is `failed`.
     pub error: Option<ErrorBody>,
@@ -169,6 +170,8 @@ pub enum JobError {
     /// Cancelled, keeping what was done before the cancel.
     CancelledWith(Box<JobResult>),
     Failed(ErrorBody),
+    /// Failed, keeping what was saved before the error.
+    FailedWith(ErrorBody, Box<JobResult>),
 }
 
 impl From<ApiError> for JobError {
@@ -505,6 +508,12 @@ impl Jobs {
                     job.status = JobStatus::Failed;
                     job.message = error.message.clone();
                     job.error = Some(error);
+                }
+                Err(JobError::FailedWith(error, result)) => {
+                    job.status = JobStatus::Failed;
+                    job.message = error.message.clone();
+                    job.error = Some(error);
+                    job.result = Some(*result);
                 }
             }
         });

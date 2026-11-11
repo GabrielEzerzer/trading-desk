@@ -696,15 +696,16 @@ pub(super) async fn job_result(
                 format!("job {id} is {:?}, not done yet", job.status).to_lowercase(),
             ));
         }
+        _ if matches!(job.result, Some(JobResult::Plan(_))) => {
+            return Err(no_result(format!(
+                "job {id} ran a test plan, which saves one run per instrument; their ids are in \
+                 GET /jobs/{id} (`result.instruments`), each at GET /runs/{{run_id}}"
+            )));
+        }
         JobStatus::Failed => {
             let why = job.error.map(|e| e.message).unwrap_or_default();
             return Err(no_result(format!(
                 "job {id} failed, so it saved no run: {why}"
-            )));
-        }
-        _ if matches!(job.result, Some(JobResult::Plan(_))) => {
-            return Err(no_result(format!(
-                "job {id} ran a test plan, which saves one run per instrument; their ids are in                  GET /jobs/{id} (`result.instruments`), each at GET /runs/{{run_id}}"
             )));
         }
         JobStatus::Cancelled => {

@@ -1792,7 +1792,8 @@ progress: number,
  */
 message: string, request: JobRequest, 
 /**
- * Set when `status` is `done`, and on a `cancelled` plan job that kept some instruments.
+ * Set when `status` is `done`, and on a `cancelled` or `failed` plan job that kept some
+ * instruments.
  */
 result: JobResult | null, 
 /**
@@ -1845,7 +1846,8 @@ instruments?: Array<InstrumentId>, };
 
 /**
  * What a plan job kept: one entry per instrument whose battery finished or reached the luck test
- * before a cancel, in the plan's order.
+ * before a cancel, in the plan's order. A failed plan job holds the instruments it saved before
+ * the error.
  */
 export type PlanDone = { strategy: string, instruments: Array<PlanInstrumentDone>, };
 
@@ -1871,7 +1873,8 @@ seed: number,
 dropped_buckets: number, };
 
 /**
- * One row of `GET /verdicts`: the latest verdict of a strategy on an instrument.
+ * One row of `GET /verdicts`: the latest verdict of a strategy on an instrument, the newest
+ * complete one when the pair has any.
  */
 export type VerdictSummary = { strategy: string, instrument: InstrumentId, 
 /**
@@ -1879,7 +1882,8 @@ export type VerdictSummary = { strategy: string, instrument: InstrumentId,
  */
 verdict: Verdict, 
 /**
- * The latest saved battery of this strategy on this instrument.
+ * The newest complete battery of this strategy on this instrument, or the newest battery when
+ * none is complete.
  */
 run_id: RunId, created_at: number, 
 /**
@@ -1890,7 +1894,16 @@ engine_revision: number,
  * False when another engine revision produced it: this engine may judge the same data
  * differently, so run the plan again.
  */
-engine_matches: boolean, seed: number, 
+engine_matches: boolean, 
+/**
+ * False when the strategy is no longer registered, its plan or rule has changed since the
+ * battery ran, or the plan no longer tests the instrument: run the plan again.
+ */
+plan_matches: boolean, 
+/**
+ * False when a cancel stopped the battery's luck test, so its luck line is inconclusive.
+ */
+complete: boolean, seed: number, 
 /**
  * How many batteries have been saved for this strategy on this instrument, this one included.
  * An instrument a cancel stopped before the luck test saved none and is not counted.

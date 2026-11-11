@@ -21,6 +21,11 @@
 //! instrument whose battery the cancel stopped during the luck test (R3): the battery then returns
 //! its verdict with the luck line inconclusive. An instrument stopped before R3 is dropped and the
 //! later ones never start. The job ends `cancelled`, with the instruments it kept in its result.
+//! A battery the cancel stopped during the luck test is saved as incomplete
+//! ([`VerdictRecord::complete`]), and the verdict list prefers a complete one.
+//!
+//! An error on one instrument (its battery or its save) fails the job; the instruments saved
+//! before it stay saved and are in the failed job's result.
 //!
 //! Each kept instrument is saved as its own run (kind `plan`, a [`PlanRun`]) under the runs folder,
 //! with the [`super::runs::DataReport`] in `data.json` and a small `verdict.json` ([`VerdictRecord`]) that
@@ -31,6 +36,7 @@ use std::fs;
 use std::io;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use axum::Json;
 use axum::extract::rejection::{JsonRejection, QueryRejection};
@@ -40,8 +46,8 @@ use serde::{Deserialize, Serialize};
 use td_core::{Instrument, InstrumentId, Millis};
 use td_data::Store;
 use td_engine::{
-    BatterySpec, ENGINE_REVISION, PlanRun, RunId, SavedRun, StrategyEntry, TesterError, Verdict,
-    VerdictRule,
+    BatterySpec, ENGINE_REVISION, PlanRun, RunId, SavedRun, StrategyEntry, TestPlan, TesterError,
+    Verdict, VerdictRule,
 };
 use ts_rs::TS;
 
@@ -70,7 +76,8 @@ pub struct PlanRequest {
 }
 
 /// What a plan job kept: one entry per instrument whose battery finished or reached the luck test
-/// before a cancel, in the plan's order.
+/// before a cancel, in the plan's order. A failed plan job holds the instruments it saved before
+/// the error.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 pub struct PlanDone {
     pub strategy: String,
@@ -90,7 +97,9 @@ pub struct PlanInstrumentDone {
     pub dropped_buckets: usize,
 }
 
-/// A plan run's `verdict.json`: what the verdict list needs, without the battery's runs.
+/// A plan run's `verdict.json`: what the verdict list needs, without the battery's runs. A record
+/// that lacks a field (written before it existed) or does not parse is read from the run's
+/// `result.json` instead.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct VerdictRecord {
     pub strategy: String,
@@ -98,16 +107,24 @@ pub struct VerdictRecord {
     pub seed: u64,
     pub engine_revision: u32,
     pub verdict: Verdict,
+    /// The plan and the rule the battery ran under. Both are compiled in, and editing one does not
+    /// change [`ENGINE_REVISION`], so the verdict list compares them with the registered ones.
+    pub plan: TestPlan,
+    pub rule: VerdictRule,
+    /// False when a cancel stopped the luck test (R3), so the verdict lacks it.
+    pub complete: bool,
 }
 
-/// One row of `GET /verdicts`: the latest verdict of a strategy on an instrument.
+/// One row of `GET /verdicts`: the latest verdict of a strategy on an instrument, the newest
+/// complete one when the pair has any.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 pub struct VerdictSummary {
     pub strategy: String,
     pub instrument: InstrumentId,
     /// The state and every criterion line; the runs behind it are at `GET /runs/{run_id}`.
     pub verdict: Verdict,
-    /// The latest saved battery of this strategy on this instrument.
+    /// The newest complete battery of this strategy on this instrument, or the newest battery when
+    /// none is complete.
     pub run_id: RunId,
     pub created_at: Millis,
     /// The engine revision that produced the verdict.
@@ -115,6 +132,11 @@ pub struct VerdictSummary {
     /// False when another engine revision produced it: this engine may judge the same data
     /// differently, so run the plan again.
     pub engine_matches: bool,
+    /// False when the strategy is no longer registered, its plan or rule has changed since the
+    /// battery ran, or the plan no longer tests the instrument: run the plan again.
+    pub plan_matches: bool,
+    /// False when a cancel stopped the battery's luck test, so its luck line is inconclusive.
+    pub complete: bool,
     pub seed: u64,
     /// How many batteries have been saved for this strategy on this instrument, this one included.
     /// An instrument a cancel stopped before the luck test saved none and is not counted.
@@ -128,13 +150,15 @@ pub(super) struct VerdictsQuery {
 
 /// The seed of a battery: fixed per strategy and instrument, so running the plan again on the same
 /// data and engine gives the same verdict, and running it again cannot draw a luckier luck test.
-/// FNV-1a over `strategy|venue:symbol:kind`.
+/// FNV-1a over `strategy|venue:symbol:kind`, kept to its low 53 bits so it stays exact as a
+/// JavaScript number in the GUI.
 pub fn plan_seed(strategy: &str, instrument: &InstrumentId) -> u64 {
-    format!("{strategy}|{instrument}")
+    let hash = format!("{strategy}|{instrument}")
         .bytes()
         .fold(0xcbf2_9ce4_8422_2325, |h: u64, b| {
             (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
-        })
+        });
+    hash & ((1 << 53) - 1)
 }
 
 fn invalid(code: &str, message: impl Into<String>) -> ApiError {
@@ -289,8 +313,13 @@ fn execute(
         let spec = battery_spec(entry, instrument);
         let id = &instrument.id;
         let step = (grand / 200).max(1);
+        // Set when the cancel is seen during the luck test, the one step a cancel lets end early.
+        let stopped_in_luck = AtomicBool::new(false);
         let progress = |count: usize, total: usize| {
             if ctx.is_cancelled() {
+                if count > runs.luck_from {
+                    stopped_in_luck.store(true, Ordering::SeqCst);
+                }
                 return std::ops::ControlFlow::Break(());
             }
             if count.is_multiple_of(step) || count == total {
@@ -306,22 +335,23 @@ fn execute(
             std::ops::ControlFlow::Continue(())
         };
         let outcome =
-            own_pool(|| td_engine::run_battery(&spec, &data.bars, &data.funding, Some(&progress)))?;
+            own_pool(|| td_engine::run_battery(&spec, &data.bars, &data.funding, Some(&progress)));
         let battery = match outcome {
-            Ok(battery) => battery,
-            Err(TesterError::Cancelled) => return Err(cancelled(done)),
-            Err(e) => {
+            Ok(Ok(battery)) => battery,
+            Ok(Err(TesterError::Cancelled)) => return Err(cancelled(done)),
+            Ok(Err(e)) => {
                 let e = tester_error(e);
-                return Err(ApiError::new(
-                    e.status,
-                    &e.body.code,
-                    format!("{id}: {}", e.body.message),
-                )
-                .into());
+                let e = ApiError::new(e.status, &e.body.code, format!("{id}: {}", e.body.message));
+                return Err(failed(done, e.into()));
             }
+            Err(e) => return Err(failed(done, e)),
         };
-        let saved = save_plan_run(entry, instrument, battery, data, runs_dir)?;
-        done.instruments.push(saved);
+        // A luck test that ran to the end gave a p-value; one the cancel stopped gave none.
+        let complete = battery.permutation.is_some() || !stopped_in_luck.load(Ordering::SeqCst);
+        match save_plan_run(entry, instrument, battery, complete, data, runs_dir) {
+            Ok(saved) => done.instruments.push(saved),
+            Err(e) => return Err(failed(done, e)),
+        }
         // A cancel during the luck test returns the verdict without it; it is kept, and the job
         // stops here.
         if ctx.is_cancelled() {
@@ -341,6 +371,16 @@ fn cancelled(done: PlanDone) -> JobError {
     }
 }
 
+/// How a failed plan job ends: with the instruments it saved before the error, if any.
+fn failed(done: PlanDone, e: JobError) -> JobError {
+    match e {
+        JobError::Failed(error) if !done.instruments.is_empty() => {
+            JobError::FailedWith(error, Box::new(JobResult::Plan(done)))
+        }
+        e => e,
+    }
+}
+
 fn battery_spec<'a>(entry: &'a StrategyEntry, instrument: &'a Instrument) -> BatterySpec<'a> {
     BatterySpec {
         strategy: entry.name,
@@ -356,6 +396,7 @@ fn save_plan_run(
     entry: &StrategyEntry,
     instrument: &Instrument,
     battery: td_engine::BatteryResult,
+    complete: bool,
     data: &RunData,
     runs_dir: &Path,
 ) -> Result<PlanInstrumentDone, JobError> {
@@ -365,6 +406,9 @@ fn save_plan_run(
         seed: battery.seed,
         engine_revision: ENGINE_REVISION,
         verdict: battery.verdict.clone(),
+        plan: entry.plan.clone(),
+        rule: entry.rule,
+        complete,
     };
     let run = PlanRun::new(
         entry.name,
@@ -402,11 +446,16 @@ struct PlanConfigHead {
 }
 
 /// The verdict record of the run in `dir`, if it is a plan run. A run saved without a
-/// `verdict.json` (by another tool) is read from its `result.json`. `None` for other kinds and for
-/// a run that cannot be read, so one damaged run does not hide the rest.
+/// `verdict.json` (by another tool), or whose `verdict.json` does not parse (damaged, or written
+/// before a field existed), is read from its `result.json` and counted as complete. `None` for
+/// other kinds and for a run that cannot be read, so one damaged run does not hide the rest.
 fn read_record(dir: &Path) -> Option<VerdictRecord> {
     match fs::read(dir.join(VERDICT_FILE)) {
-        Ok(bytes) => return serde_json::from_slice(&bytes).ok(),
+        Ok(bytes) => {
+            if let Ok(record) = serde_json::from_slice(&bytes) {
+                return Some(record);
+            }
+        }
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
         Err(_) => return None,
     }
@@ -421,15 +470,21 @@ fn read_record(dir: &Path) -> Option<VerdictRecord> {
             seed: run.battery.seed,
             engine_revision: run.engine_revision,
             verdict: run.battery.verdict,
+            plan: run.plan,
+            rule: run.rule,
+            complete: true,
         }),
         _ => None,
     }
 }
 
-/// The latest verdict per strategy and instrument, with how many batteries each pair has saved,
-/// ordered by strategy and then instrument. Only `strategy`'s when it is given.
+/// The latest verdict per strategy and instrument (the newest complete one, or the newest when none
+/// is complete), with how many batteries each pair has saved, ordered by strategy and then
+/// instrument. Only `strategy`'s when it is given. Each verdict's plan and rule are compared with
+/// those of the registered `strategies`.
 pub fn latest_verdicts(
     runs_dir: &Path,
+    strategies: &[StrategyEntry],
     strategy: Option<&str>,
 ) -> Result<Vec<VerdictSummary>, ApiError> {
     let entries = match fs::read_dir(runs_dir) {
@@ -458,6 +513,12 @@ pub fn latest_verdicts(
         }
         let key = (record.strategy.clone(), record.instrument.to_string());
         let runs = latest.get(&key).map_or(0, |s| s.runs) + 1;
+        let plan_matches = strategies.iter().any(|e| {
+            e.name == record.strategy
+                && e.plan == record.plan
+                && e.rule == record.rule
+                && e.plan.instruments.contains(&record.instrument)
+        });
         let row = VerdictSummary {
             strategy: record.strategy,
             instrument: record.instrument,
@@ -466,11 +527,16 @@ pub fn latest_verdicts(
             run_id: id,
             engine_revision: record.engine_revision,
             engine_matches: record.engine_revision == ENGINE_REVISION,
+            plan_matches,
+            complete: record.complete,
             seed: record.seed,
             runs,
         };
+        // A complete run beats an incomplete one; between two of the same, the newer wins.
         match latest.get_mut(&key) {
-            Some(seen) if seen.run_id > row.run_id => seen.runs = runs,
+            Some(seen) if (seen.complete, &seen.run_id) > (row.complete, &row.run_id) => {
+                seen.runs = runs;
+            }
             _ => {
                 latest.insert(key, row);
             }
@@ -485,9 +551,41 @@ pub(super) async fn verdicts(
     query: Result<Query<VerdictsQuery>, QueryRejection>,
 ) -> Result<Json<Vec<VerdictSummary>>, ApiError> {
     let Query(VerdictsQuery { strategy }) = query?;
-    let runs_dir = state.runs_dir();
-    let rows = tokio::task::spawn_blocking(move || latest_verdicts(&runs_dir, strategy.as_deref()))
-        .await
-        .map_err(|e| ApiError::internal(format!("the verdict list stopped: {e}")))??;
+    let (runs_dir, strategies) = (state.runs_dir(), state.strategies.clone());
+    let rows = tokio::task::spawn_blocking(move || {
+        latest_verdicts(&runs_dir, &strategies, strategy.as_deref())
+    })
+    .await
+    .map_err(|e| ApiError::internal(format!("the verdict list stopped: {e}")))??;
     Ok(Json(rows))
+}
+
+#[cfg(test)]
+mod tests {
+    use td_core::{InstrumentKind, Venue};
+
+    use super::*;
+
+    fn id(symbol: &str, kind: InstrumentKind) -> InstrumentId {
+        InstrumentId {
+            venue: Venue::Binance,
+            symbol: symbol.into(),
+            kind,
+        }
+    }
+
+    #[test]
+    fn the_seed_is_stable_and_exact_as_a_javascript_number() {
+        let spot = id("BTCUSDT", InstrumentKind::Spot);
+        let cases = [
+            plan_seed("sma_cross", &spot),
+            plan_seed("sma_cross", &id("BTCUSDT", InstrumentKind::Perpetual)),
+            plan_seed("donchian_breakout", &id("ETHUSDT", InstrumentKind::Spot)),
+        ];
+        // Each full 64-bit hash here is above 2^53; the seed keeps its low 53 bits.
+        assert!(cases.iter().all(|&s| s < 1 << 53), "{cases:?}");
+        assert_eq!(cases[0], 1_706_792_435_730_898);
+        assert_eq!(plan_seed("sma_cross", &spot), cases[0]);
+        assert_ne!(cases[0], cases[1]);
+    }
 }

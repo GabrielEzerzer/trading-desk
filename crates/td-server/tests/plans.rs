@@ -2,8 +2,9 @@
 //! started in-process on 127.0.0.1:0, with a temporary data directory seeded with synthetic
 //! 1-minute candles and a small test plan: no network.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
@@ -16,7 +17,7 @@ use td_data::time::{DAY, MINUTE, Month, parse_date};
 use td_data::{DataError, DownloadReport, InstrumentList, Store};
 use td_engine::{
     BacktestSettings, Direction, ENGINE_REVISION, EvidenceSettings, LuckTest, Metric, Objective,
-    ParamAxis, ParamSpace, Params, Period, PortfolioBenchmark, PortfolioLimits, SavedRun,
+    ParamAxis, ParamSpace, Params, Period, PortfolioBenchmark, PortfolioLimits, RunId, SavedRun,
     StrategyEntry, SweepPlan, TestPlan, VerdictRule, WalkForwardPlan,
 };
 use td_server::api::auth::Token;
@@ -69,13 +70,22 @@ fn instrument(kind: InstrumentKind) -> Instrument {
 }
 
 /// Lists the two test instruments, as a venue's exchange info would; never downloads.
-struct ListOnly;
+#[derive(Default)]
+struct ListOnly {
+    /// Lists the perpetual with fees that are not numbers, which the engine refuses when its
+    /// battery starts: the route does not check fees, so the job fails on that instrument.
+    nan_perpetual_fees: bool,
+}
 
 impl MarketSource for ListOnly {
     fn instruments(&self, venue: Venue, kind: InstrumentKind) -> Result<InstrumentList, DataError> {
         assert_eq!(venue, Venue::Binance);
+        let mut listed = instrument(kind);
+        if self.nan_perpetual_fees && kind == InstrumentKind::Perpetual {
+            listed.fees.taker = f64::NAN;
+        }
         Ok(InstrumentList {
-            instruments: vec![instrument(kind)],
+            instruments: vec![listed],
             rejected: Vec::new(),
         })
     }
@@ -123,8 +133,8 @@ impl td_data::live::Rest for NoRest {
 }
 
 impl LiveSource for NoLive {
-    fn rest(&self) -> std::sync::Arc<dyn td_data::live::Rest> {
-        std::sync::Arc::new(NoRest)
+    fn rest(&self) -> Arc<dyn td_data::live::Rest> {
+        Arc::new(NoRest)
     }
     fn stream_url(&self, _: &InstrumentId) -> String {
         "ws://127.0.0.1:9/".into()
@@ -270,7 +280,8 @@ struct TestServer {
     server: Server,
     store: Store,
     client: reqwest::Client,
-    _dir: TempDir,
+    /// Shared with a server [`TestServer::restarted`] on the same store.
+    dir: Arc<TempDir>,
 }
 
 impl Drop for TestServer {
@@ -282,15 +293,34 @@ impl Drop for TestServer {
 impl TestServer {
     /// A server running `entries`, whose store is a copy of [`template_store`].
     async fn seeded(entries: Vec<StrategyEntry>) -> TestServer {
+        TestServer::seeded_listing(entries, ListOnly::default()).await
+    }
+
+    /// [`TestServer::seeded`] with the venue list `listing`.
+    async fn seeded_listing(entries: Vec<StrategyEntry>, listing: ListOnly) -> TestServer {
         let dir = tempfile::tempdir().expect("temp dir");
         let template = tokio::task::spawn_blocking(template_store).await.unwrap();
         copy_dir(template, dir.path());
+        TestServer::start(Arc::new(dir), entries, listing).await
+    }
+
+    /// Another server on this one's store, running `entries`, as after a rebuild that changed the
+    /// compiled-in strategies.
+    async fn restarted(&self, entries: Vec<StrategyEntry>) -> TestServer {
+        TestServer::start(self.dir.clone(), entries, ListOnly::default()).await
+    }
+
+    async fn start(
+        dir: Arc<TempDir>,
+        entries: Vec<StrategyEntry>,
+        listing: ListOnly,
+    ) -> TestServer {
         let store = Store::new(dir.path());
         let server = Server::start_with_strategies(
             ApiConfig {
                 store: store.clone(),
-                source: std::sync::Arc::new(ListOnly),
-                live: std::sync::Arc::new(NoLive),
+                source: Arc::new(listing),
+                live: Arc::new(NoLive),
                 token: Token::generate().expect("rng"),
                 port: 0,
             },
@@ -302,8 +332,12 @@ impl TestServer {
             server,
             store,
             client: reqwest::Client::new(),
-            _dir: dir,
+            dir,
         }
+    }
+
+    fn runs_dir(&self) -> PathBuf {
+        self.store.root().join("runs")
     }
 
     fn url(&self, path: &str) -> String {
@@ -427,6 +461,23 @@ impl Ws {
         }
     }
 
+    /// The final state of each of `ids`, in that order, however their states interleave.
+    async fn finish_all(&mut self, ids: &[u64]) -> Vec<JobInfo> {
+        let mut finished: BTreeMap<u64, JobInfo> = BTreeMap::new();
+        while finished.len() < ids.len() {
+            match self.next().await {
+                Some(ServerMessage::Job { job }) if ids.contains(&job.id) => {
+                    if job.status.is_finished() {
+                        finished.insert(job.id, *job);
+                    }
+                }
+                Some(_) => {}
+                None => panic!("the topic closed"),
+            }
+        }
+        ids.iter().map(|id| finished.remove(id).unwrap()).collect()
+    }
+
     /// Follows job `id` until a state whose message contains every one of `parts`; panics if the
     /// job finishes first.
     async fn until_message(&mut self, id: u64, parts: &[&str]) -> JobInfo {
@@ -536,6 +587,7 @@ async fn a_plan_runs_every_instrument_saves_its_verdicts_and_counts_the_runs() {
         assert_eq!((row.run_id.clone(), row.runs), (kept.run_id.clone(), 1));
         assert_eq!(row.verdict, kept.verdict);
         assert!(row.engine_matches);
+        assert!(row.plan_matches && row.complete, "{row:?}");
         assert_eq!(row.engine_revision, ENGINE_REVISION);
         assert_eq!(row.created_at, row.run_id.created_at());
     }
@@ -580,6 +632,7 @@ async fn a_plan_runs_every_instrument_saves_its_verdicts_and_counts_the_runs() {
     assert_eq!(rows[1].runs, 3);
     assert_eq!(rows[1].engine_revision, ENGINE_REVISION - 1);
     assert!(!rows[1].engine_matches);
+    assert!(rows[1].plan_matches && rows[1].complete, "{:?}", rows[1]);
     assert!(rows[0].engine_matches);
     let (_, detail) = t.get(&format!("/runs/{old_id}")).await;
     assert_eq!(detail["check"]["engine_matches"], json!(false));
@@ -591,10 +644,12 @@ async fn a_cancel_keeps_finished_instruments_and_one_stopped_in_its_luck_test() 
     let t = TestServer::seeded(vec![entry(199)]).await;
     let mut ws = t.websocket().await;
 
-    // Cancelled before any luck test: nothing is kept.
+    // Cancelled before any luck test: nothing is kept. The cancel is sent once the job reports
+    // that it is loading the data, before any battery has started, so it lands before R3 by the
+    // whole data load and the first battery's runs before its luck test, not by a few runs.
     let job = t.start_plan(&json!({ "strategy": "sma_cross" })).await;
-    let state = ws.until_message(job, &["(1 of 2)"]).await;
-    assert!(!state.message.contains("luck test"), "{}", state.message);
+    let state = ws.until_message(job, &["loading the data"]).await;
+    assert_eq!(state.status, JobStatus::Running);
     let (status, body) = t.post(&format!("/jobs/{job}/cancel"), &json!(null)).await;
     assert_eq!(status, StatusCode::ACCEPTED, "{body}");
     let done = ws.follow(job).await.pop().unwrap();
@@ -637,6 +692,9 @@ async fn a_cancel_keeps_finished_instruments_and_one_stopped_in_its_luck_test() 
     let ids: Vec<_> = rows.iter().map(|r| r.run_id.clone()).collect();
     assert_eq!(ids, [kept[1].run_id.clone(), kept[0].run_id.clone()]);
     assert!(rows.iter().all(|r| r.runs == 1));
+    // The perpetual has no complete battery, so its stopped one is its row, marked incomplete.
+    let complete: Vec<bool> = rows.iter().map(|r| r.complete).collect();
+    assert_eq!(complete, [false, true]);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -703,6 +761,17 @@ async fn bad_requests_are_400_and_missing_data_is_refused_naming_the_span() {
         message.contains("from 2024-02-01 00:00 to 2024-03-01 00:00 UTC"),
         "{message}"
     );
+    // So does a subset that holds the perpetual.
+    let (status, answer) = t
+        .post(
+            "/runs/plan",
+            &json!({ "strategy": "sma_cross", "instruments": [id(InstrumentKind::Perpetual)] }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{answer}");
+    assert_eq!(answer["error"]["code"], "data_missing");
+    let message = answer["error"]["message"].as_str().unwrap();
+    assert!(message.contains("binance:BTCUSDT:perpetual"), "{message}");
     let (_, jobs) = t.get("/jobs").await;
     assert_eq!(jobs, json!([]), "no job was created");
 
@@ -719,13 +788,213 @@ async fn bad_requests_are_400_and_missing_data_is_refused_naming_the_span() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_refused_rule_and_an_instrument_the_venue_does_not_list_are_400() {
+    // A rule whose limit is not a number: 400 invalid_plan naming the rule.
+    let mut bad_rule = entry(49);
+    bad_rule.rule = VerdictRule::Portfolio {
+        benchmark: PortfolioBenchmark::Cash,
+        limits: PortfolioLimits {
+            min_sharpe: f64::NAN,
+            ..PortfolioLimits::default()
+        },
+    };
+    let t = TestServer::seeded(vec![bad_rule]).await;
+    let (status, answer) = t
+        .post("/runs/plan", &json!({ "strategy": "sma_cross" }))
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{answer}");
+    assert_eq!(answer["error"]["code"], "invalid_plan", "{answer}");
+    let message = answer["error"]["message"].as_str().unwrap();
+    assert!(message.contains("verdict rule"), "{message}");
+
+    // A plan instrument the venue's list (faked, offline) does not hold: 400 invalid_config.
+    let unlisted = InstrumentId {
+        venue: Venue::Binance,
+        symbol: "ETHUSDT".into(),
+        kind: InstrumentKind::Spot,
+    };
+    let mut on_unlisted = entry(49);
+    on_unlisted.plan.instruments = vec![id(InstrumentKind::Spot), unlisted];
+    let t = TestServer::seeded(vec![on_unlisted]).await;
+    let (status, answer) = t
+        .post("/runs/plan", &json!({ "strategy": "sma_cross" }))
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{answer}");
+    assert_eq!(answer["error"]["code"], "invalid_config", "{answer}");
+    let message = answer["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("does not list binance:ETHUSDT:spot"),
+        "{message}"
+    );
+    let (_, jobs) = t.get("/jobs").await;
+    assert_eq!(jobs, json!([]), "no job was created");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn two_plan_jobs_on_one_strategy_at_once_both_save_and_count() {
+    let t = TestServer::seeded(vec![entry(49)]).await;
+    let mut ws = t.websocket().await;
+    let spot = json!({ "strategy": "sma_cross", "instruments": [id(InstrumentKind::Spot)] });
+    let jobs = [t.start_plan(&spot).await, t.start_plan(&spot).await];
+    let done = ws.finish_all(&jobs).await;
+    let mut saved = Vec::new();
+    for job in &done {
+        assert_eq!(job.status, JobStatus::Done, "{:?}", job.error);
+        saved.push(plan_done(job).instruments[0].run_id.clone());
+    }
+    // The same seed on the same data gives the same result; the two saves still get two runs.
+    assert_ne!(saved[0], saved[1]);
+    let rows = t.verdicts("").await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].runs, 2);
+    assert_eq!(&rows[0].run_id, saved.iter().max().unwrap());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failure_partway_keeps_the_instruments_saved_before_it() {
+    // The perpetual, second in the plan, is listed with fees the engine refuses.
+    let listing = ListOnly {
+        nan_perpetual_fees: true,
+    };
+    let t = TestServer::seeded_listing(vec![entry(49)], listing).await;
+    let mut ws = t.websocket().await;
+    let job = t.start_plan(&json!({ "strategy": "sma_cross" })).await;
+    let done = ws.follow(job).await.pop().unwrap();
+    assert_eq!(done.status, JobStatus::Failed);
+    let error = done.error.as_ref().expect("an error");
+    assert_eq!(error.code, "invalid_config", "{error:?}");
+    assert!(
+        error.message.contains("binance:BTCUSDT:perpetual"),
+        "{error:?}"
+    );
+
+    // The spot instrument was saved before the error, and the failed job says so.
+    let kept = &plan_done(&done).instruments;
+    assert_eq!(kept.len(), 1, "{kept:?}");
+    assert_eq!(kept[0].verdict.instrument, id(InstrumentKind::Spot));
+    let (status, body) = t.get(&format!("/runs/{}", kept[0].run_id)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let rows = t.verdicts("").await;
+    let ids: Vec<_> = rows.iter().map(|r| r.run_id.clone()).collect();
+    assert_eq!(ids, [kept[0].run_id.clone()]);
+    // The job result route points to the saved run, not to "no run".
+    let (status, body) = t.get(&format!("/jobs/{job}/result")).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let message = body["error"]["message"].as_str().unwrap();
+    assert!(message.contains("per instrument"), "{message}");
+    assert!(!message.contains("  "), "{message}");
+}
+
+/// Rewrites the `verdict.json` of run `id`.
+fn rewrite_record(runs_dir: &Path, id: &RunId, change: impl FnOnce(&mut Value)) {
+    let path = runs_dir.join(id.as_str()).join("verdict.json");
+    let mut record: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    change(&mut record);
+    std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_verdict_list_flags_a_changed_plan_and_prefers_a_complete_battery() {
+    let t = TestServer::seeded(vec![entry(49)]).await;
+    let mut ws = t.websocket().await;
+    let spot = json!({ "strategy": "sma_cross", "instruments": [id(InstrumentKind::Spot)] });
+    let job = t.start_plan(&spot).await;
+    let done = ws.follow(job).await.pop().unwrap();
+    assert_eq!(done.status, JobStatus::Done, "{:?}", done.error);
+    let first = plan_done(&done).instruments[0].run_id.clone();
+    let row = |rows: Vec<VerdictSummary>| -> VerdictSummary {
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        rows.into_iter().next().unwrap()
+    };
+    let r = row(t.verdicts("").await);
+    assert_eq!(r.run_id, first);
+    assert!(r.plan_matches && r.complete, "{r:?}");
+
+    // The plans and rules are compiled in: a server built with other ones sees the saved verdict
+    // as stale. The same entry still matches.
+    let same = t.restarted(vec![entry(49)]).await;
+    assert!(row(same.verdicts("").await).plan_matches);
+    let mut other_rule = entry(49);
+    other_rule.rule = VerdictRule::Portfolio {
+        benchmark: PortfolioBenchmark::Cash,
+        limits: PortfolioLimits {
+            min_sharpe: 1.5,
+            ..PortfolioLimits::default()
+        },
+    };
+    let mut without_spot = entry(49);
+    without_spot.plan.instruments = vec![id(InstrumentKind::Perpetual)];
+    let stale = [
+        vec![entry(50)],
+        vec![other_rule],
+        vec![without_spot],
+        Vec::new(),
+    ];
+    for entries in stale {
+        let changed = t.restarted(entries).await;
+        let r = row(changed.verdicts("").await);
+        assert_eq!(r.run_id, first);
+        assert!(!r.plan_matches, "{r:?}");
+        assert!(r.engine_matches);
+    }
+
+    // A damaged verdict record does not hide the run: it is read from its result.
+    let runs_dir = t.runs_dir();
+    let record = runs_dir.join(first.as_str()).join("verdict.json");
+    let intact = std::fs::read(&record).unwrap();
+    std::fs::write(&record, b"{\"strategy\": \"sma_cro").unwrap();
+    let r = row(t.verdicts("").await);
+    assert_eq!((r.run_id.clone(), r.runs), (first.clone(), 1));
+    assert!(r.plan_matches && r.complete, "{r:?}");
+    // So is one written before the plan, the rule and the completeness were recorded.
+    std::fs::write(&record, &intact).unwrap();
+    rewrite_record(&runs_dir, &first, |v| {
+        let v = v.as_object_mut().unwrap();
+        for field in ["plan", "rule", "complete"] {
+            v.remove(field);
+        }
+    });
+    let r = row(t.verdicts("").await);
+    assert_eq!((r.run_id.clone(), r.runs), (first.clone(), 1));
+    assert!(r.plan_matches && r.complete, "{r:?}");
+    std::fs::write(&record, &intact).unwrap();
+
+    // A newer battery whose luck test a cancel stopped is counted but does not replace the
+    // complete one as the pair's row.
+    let copy = |runs_dir: &Path| {
+        let SavedRun::Plan(run) = td_engine::load(runs_dir, first.as_str()).unwrap() else {
+            panic!("a plan run");
+        };
+        std::thread::sleep(Duration::from_millis(5));
+        let id = td_engine::save(&SavedRun::Plan(run), runs_dir).unwrap();
+        std::fs::copy(&record, runs_dir.join(id.as_str()).join("verdict.json")).unwrap();
+        id
+    };
+    let stopped = copy(&runs_dir);
+    assert!(stopped > first);
+    rewrite_record(&runs_dir, &stopped, |v| v["complete"] = json!(false));
+    let r = row(t.verdicts("").await);
+    assert_eq!((r.run_id.clone(), r.runs), (first.clone(), 2));
+    assert!(r.complete);
+
+    // With no complete battery left, the newest one is the row.
+    let newest = copy(&runs_dir);
+    for id in [&first, &newest] {
+        rewrite_record(&runs_dir, id, |v| v["complete"] = json!(false));
+    }
+    let r = row(t.verdicts("").await);
+    assert_eq!((r.run_id.clone(), r.runs), (newest, 3));
+    assert!(!r.complete);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn the_plan_routes_need_the_token() {
     let dir = tempfile::tempdir().unwrap();
     let server = Server::start_with_strategies(
         ApiConfig {
             store: Store::new(dir.path()),
-            source: std::sync::Arc::new(ListOnly),
-            live: std::sync::Arc::new(NoLive),
+            source: Arc::new(ListOnly::default()),
+            live: Arc::new(NoLive),
             token: Token::generate().unwrap(),
             port: 0,
         },

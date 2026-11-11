@@ -62,11 +62,14 @@
 //!   lacks part of the plan's period (nothing is downloaded); 429 `too_many_runs` as for the other
 //!   runs. The job's result (`PlanDone`) holds one verdict and saved run id per instrument; a
 //!   cancelled plan job keeps the instruments it finished, and the one it stopped during the luck
-//!   test, in its result. Each instrument's run (kind `plan`, a `PlanRun`) is at `GET /runs/{id}`.
+//!   test, in its result; a failed one keeps those it saved before the error. Each instrument's run
+//!   (kind `plan`, a `PlanRun`) is at `GET /runs/{id}`.
 //! - `GET /verdicts?strategy=`: the latest verdict of each strategy on each instrument
-//!   (`VerdictSummary`), with how many batteries that pair has saved, the run id, its time and the
-//!   engine revision, and whether that revision is this engine's (`engine_matches`). Only the given
-//!   strategy's with `strategy`.
+//!   (`VerdictSummary`; the newest complete one, so a luck test stopped by a cancel does not
+//!   replace a finished battery), with how many batteries that pair has saved, the run id, its time
+//!   and the engine revision, whether that revision is this engine's (`engine_matches`), whether
+//!   the strategy's plan and rule are still the ones it ran under (`plan_matches`) and whether its
+//!   luck test finished (`complete`). Only the given strategy's with `strategy`.
 //! - Paper sessions (see [`sessions`]):
 //!   - `POST /sessions` `{strategy, params, instrument, timeframe, starting_cash, slippage_bps,
 //!     fees?}`: creates a session and starts it, 201 with its summary. `instrument` is an
