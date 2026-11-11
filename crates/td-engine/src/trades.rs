@@ -234,6 +234,9 @@ pub fn build_trades_with_fills(
     if let (Some(mut t), Some(last)) = (current, bars.last()) {
         let remaining = f64::abs(pos);
         t.exit_qty += remaining;
+        // shortcut: an open short on a market with an ask series is marked here at the last bid
+        // close, while the session's equity marks it at the ask close. Pass the last ask in when
+        // FX runs report open trades without `close_at_end`.
         t.exit_notional += remaining * last.close;
         let held = bars.len() - t.entry_bar;
         let range = t.entry_fill..next;

@@ -1,4 +1,4 @@
-use td_core::{CoreError, Millis, OrderId, Timeframe};
+use td_core::{CoreError, InstrumentKind, Millis, OrderId, Timeframe};
 
 /// Errors from building a session or strategy and from feeding it data.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
@@ -23,6 +23,18 @@ pub enum EngineError {
 
     #[error("funding was given for a spot instrument")]
     FundingOnSpot,
+
+    #[error("asks were given for a {kind} instrument, which has no separate ask price")]
+    AsksWithoutQuotes { kind: InstrumentKind },
+
+    #[error("no ask for the bar at {time}: a {kind} instrument needs one for every bar")]
+    MissingAsk { time: Millis, kind: InstrumentKind },
+
+    #[error("the ask at {time} matches no bar")]
+    UnmatchedAsk { time: Millis },
+
+    #[error("bar at {time} lies wholly in the market's closed hours")]
+    ClosedBar { time: Millis },
 
     #[error("warm-up bars must all come before the first live bar")]
     WarmUpAfterLive,

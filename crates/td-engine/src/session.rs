@@ -65,6 +65,8 @@ pub struct Session {
     broker: Box<dyn Broker>,
     portfolio: Portfolio,
     bars: Vec<Candle>,
+    /// The ask candle of the last live bar, for a market with an ask series.
+    ask: Option<Candle>,
     orders: Vec<Order>,
     fills: Vec<Fill>,
     equity: Vec<EquityPoint>,
@@ -112,6 +114,7 @@ impl Session {
             max_leverage: config.max_leverage,
             broker: Box::new(broker),
             bars: Vec::new(),
+            ask: None,
             orders: Vec::new(),
             fills: Vec::new(),
             equity: Vec::new(),
@@ -165,8 +168,28 @@ impl Session {
     /// stops. So a position opened inside the bar is checked against the part of the range before
     /// it too, and when its attached stop fills inside the same bar, beyond the liquidation price,
     /// it fills at its own, worse, price; the floor keeps that loss to the equity.
+    ///
+    /// This is [`Session::on_bar_with_ask`] without an ask, for a market that trades on one price.
     pub fn on_bar(&mut self, bar: Candle, funding: &[(Millis, f64)]) -> Result<(), EngineError> {
+        self.on_bar_with_ask(bar, None, funding)
+    }
+
+    /// [`Session::on_bar`] for a market with a bid and an ask: `bar` is the bid candle and `ask`
+    /// the ask candle of the same bar. A kind whose rules have quotes needs an ask on every bar, and
+    /// any other kind must not have one; the ask must be a valid candle with the bar's open time.
+    ///
+    /// Each order sees the candle of its own side (see [`SimBroker`]), and an open position is
+    /// marked at the close of the side that would close it: a long at the bid close and a short at
+    /// the ask close, so open equity includes the cost of closing. The strategy sees the bid bars.
+    pub fn on_bar_with_ask(
+        &mut self,
+        bar: Candle,
+        ask: Option<Candle>,
+        funding: &[(Millis, f64)],
+    ) -> Result<(), EngineError> {
         self.check_bar(&bar, funding)?;
+        self.check_ask(&bar, ask)?;
+        let ask_bar = ask.unwrap_or(bar);
 
         // Funding due at the open, or in the gap before it, is owed by the position held going
         // into the bar, before this bar's fills.
@@ -179,7 +202,10 @@ impl Session {
         let first_new_fill = self.fills.len();
         let instrument = &self.instrument;
         let breached = |book: &Portfolio| liquidation_trigger(instrument, book, &bar, funding);
-        for event in self.broker.on_bar(&bar, &self.portfolio, &breached) {
+        for event in self
+            .broker
+            .on_bar(&bar, &ask_bar, &self.portfolio, &breached)
+        {
             match event {
                 BrokerEvent::Filled(fill) => {
                     self.order_mut(fill.order_id).status = OrderStatus::Filled;
@@ -208,12 +234,19 @@ impl Session {
             }
         }
         self.bar_funding.push(charged);
-        self.portfolio.mark(bar.close);
+        // A short closes with a buy, at the ask.
+        let mark = if self.portfolio.position() < 0.0 {
+            ask_bar.close
+        } else {
+            bar.close
+        };
+        self.portfolio.mark(mark);
         self.equity.push(EquityPoint {
             time: bar.open_time,
             equity: self.portfolio.equity(),
         });
         self.bars.push(bar);
+        self.ask = ask;
         self.call_strategy(&bar, first_new_fill, false);
         Ok(())
     }
@@ -323,6 +356,7 @@ impl Session {
     fn context(&mut self) -> Context<'_> {
         Context {
             bars: &self.bars,
+            ask: self.ask,
             instrument: &self.instrument,
             timeframe: self.timeframe,
             fees: self.fees,
@@ -406,6 +440,24 @@ impl Session {
         });
     }
 
+    /// Checks that `ask` is the ask candle `bar` needs: one for a kind whose rules have quotes,
+    /// with the bar's open time, and none for any other kind.
+    fn check_ask(&self, bar: &Candle, ask: Option<Candle>) -> Result<(), EngineError> {
+        let kind = self.instrument.id.kind;
+        match ask {
+            None if kind.rules().quotes => Err(EngineError::MissingAsk {
+                time: bar.open_time,
+                kind,
+            }),
+            None => Ok(()),
+            Some(_) if !kind.rules().quotes => Err(EngineError::AsksWithoutQuotes { kind }),
+            Some(ask) if ask.open_time != bar.open_time => Err(EngineError::UnmatchedAsk {
+                time: ask.open_time,
+            }),
+            Some(ask) => Ok(ask.validate()?),
+        }
+    }
+
     /// Checks that `bar` can be fed next, with `funding` inside it or in the gap before it.
     fn check_bar(&self, bar: &Candle, funding: &[(Millis, f64)]) -> Result<(), EngineError> {
         bar.validate()?;
@@ -430,6 +482,16 @@ impl Session {
         }
         let step = self.timeframe.duration_ms();
         let end = bar.open_time + step;
+        // A bar can hold trades only if some of its span is open: a daily bar that opens at 00:00
+        // UTC on Sunday holds the FX week's first hours.
+        let closed = self.instrument.id.kind.closed_spans(bar.open_time, end);
+        if let [span] = closed.as_slice()
+            && *span == (bar.open_time..end)
+        {
+            return Err(EngineError::ClosedBar {
+                time: bar.open_time,
+            });
+        }
         // From the previous bar's end, so funding due in a gap is charged at this bar's open.
         let start = self
             .bars
@@ -457,6 +519,7 @@ impl Session {
     fn call_strategy(&mut self, bar: &Candle, first_new_fill: usize, warming_up: bool) {
         let mut ctx = Context {
             bars: &self.bars,
+            ask: self.ask,
             instrument: &self.instrument,
             timeframe: self.timeframe,
             fees: self.fees,

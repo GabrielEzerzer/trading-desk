@@ -22,6 +22,8 @@ pub trait Strategy: Send {
 /// What a strategy can see and do during a callback.
 pub struct Context<'a> {
     pub(crate) bars: &'a [Candle],
+    /// The current bar's ask candle, for a market with an ask series.
+    pub(crate) ask: Option<Candle>,
     pub(crate) instrument: &'a Instrument,
     pub(crate) timeframe: Timeframe,
     pub(crate) fees: FeeSchedule,
@@ -179,7 +181,11 @@ impl Context<'_> {
         submitted_at: Millis,
     ) -> Result<(OrderId, Option<OrderId>), OrderRejected> {
         let id = OrderId(self.orders.len() as u64 + 1);
-        let decision_close = self.bar().close;
+        // A buy is decided against the ask, a sell against the bid.
+        let decision_close = match (request.side, self.ask) {
+            (Side::Buy, Some(ask)) => ask.close,
+            _ => self.bar().close,
+        };
         let (request, mut check) = self.prepare(request);
         if self.warming_up {
             check = Err(WARM_UP.into());
