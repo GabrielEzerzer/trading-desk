@@ -25,8 +25,10 @@
 //! `n^(1/3)` are the rate-optimal choice for the variance of a mean (Hall, Horowitz and Jing,
 //! 1995), and the values land in the 5 to 10 day range commonly used for daily data.
 //!
-//! Trade results are resampled one trade at a time (a mean block of 1, the plain bootstrap):
-//! trades are separate events spread over time, and their order says little about the next one.
+//! For the mean of trade results, trades are resampled one at a time (a mean block of 1, the
+//! plain bootstrap): the spread of a mean depends little on the order of separate trades. The
+//! risk of ruin does depend on it, because ruin comes from a run of losses, so [`risk_of_ruin`]
+//! draws trades in blocks too.
 
 use serde::{Deserialize, Serialize};
 
@@ -248,6 +250,9 @@ pub struct RuinSpec {
     /// ruin over another stretch as long as the test.
     pub horizon: usize,
     pub paths: usize,
+    /// The mean block length of the stationary bootstrap over the trades; [`default_block_len`]
+    /// of the number of trades is the default, and 1 draws single trades.
+    pub mean_block: usize,
     pub seed: u64,
 }
 
@@ -255,17 +260,21 @@ pub struct RuinSpec {
 /// equity paths that fall to `ruin_level` of the starting equity within `horizon` trades.
 ///
 /// `trade_returns` are each trade's P&L as a fraction of the equity when it was entered (the
-/// caller divides the trade's P&L by that equity). A path draws `horizon` of them one at a time
-/// with replacement and compounds them, `equity *= 1 + r`, so a strategy that sizes by a fraction
-/// of equity is simulated as it trades. Trades, not daily returns, because ruin is a question
-/// about a run of losing trades, and a `high_risk` strategy's few large trades are what its
-/// equity moves on; drawing single trades follows the module's rule for trade results.
+/// caller divides the trade's P&L by that equity). A path draws `horizon` of them with the
+/// stationary bootstrap, restarted for each path, and compounds them, `equity *= 1 + r`, so a
+/// strategy that sizes by a fraction of equity is simulated as it trades. Trades, not daily
+/// returns, because ruin is a question about a run of losing trades, and a `high_risk`
+/// strategy's few large trades are what its equity moves on.
+///
+/// Blocks of consecutive trades keep the runs of losses that a strategy hits in a bad regime.
+/// Drawing single trades would scatter those losses across the path and report a much smaller
+/// chance of ruin than the strategy's own history shows; a mean block of 1 does exactly that.
 ///
 /// shortcut: assumes one position at a time, so trades compound one after another; overlapping
 /// positions would need their returns combined per day first.
 pub fn risk_of_ruin(trade_returns: &[f64], spec: &RuinSpec) -> Result<f64, StatsError> {
     check_values(trade_returns)?;
-    check_count(spec.paths, 1)?;
+    check_count(spec.paths, spec.mean_block)?;
     if !(spec.ruin_level > 0.0 && spec.ruin_level < 1.0) {
         return Err(StatsError::InvalidSpec(
             "the ruin level must be strictly between 0 and 1",
@@ -274,9 +283,10 @@ pub fn risk_of_ruin(trade_returns: &[f64], spec: &RuinSpec) -> Result<f64, Stats
     if spec.horizon == 0 {
         return Err(StatsError::InvalidSpec("the horizon must be at least 1"));
     }
-    let mut draw = Resampler::new(trade_returns.len(), 1, spec.seed);
+    let mut draw = Resampler::new(trade_returns.len(), spec.mean_block, spec.seed);
     let ruined = (0..spec.paths)
         .filter(|_| {
+            draw.reset();
             let mut equity = 1.0;
             (0..spec.horizon).any(|_| {
                 equity *= 1.0 + trade_returns[draw.next()];
@@ -515,6 +525,7 @@ mod tests {
                 ruin_level: 0.9,
                 horizon: 30,
                 paths: 500,
+                mean_block: default_block_len(trades.len()),
                 seed,
             };
             risk_of_ruin(&trades, &spec).unwrap()
@@ -584,6 +595,7 @@ mod tests {
             ruin_level: 0.5,
             horizon,
             paths: 200,
+            mean_block: 1,
             seed: 3,
         }
     }
@@ -608,10 +620,13 @@ mod tests {
     fn risk_of_ruin_is_pinned_for_a_mixed_series() {
         // Wins of +10% and losses of -10% in equal numbers: ruin at 0.5 needs a run of losses.
         let x = [0.1, -0.1, 0.1, -0.1, 0.1, -0.1];
+        // The default block length for 6 trades is 1, so this draws single trades.
         let spec = RuinSpec {
             paths: 2_000,
+            mean_block: default_block_len(x.len()),
             ..ruin_spec(50)
         };
+        assert_eq!(spec.mean_block, 1);
         let p = risk_of_ruin(&x, &spec).unwrap();
         assert!(p > 0.0 && p < 0.5, "{p}");
         assert_eq!(p, PINNED_RUIN);
@@ -619,6 +634,49 @@ mod tests {
 
     /// 807 of 2,000 paths.
     const PINNED_RUIN: f64 = 0.4035;
+
+    #[test]
+    fn blocks_keep_a_run_of_losses_that_single_draws_scatter() {
+        // A bad regime of 8 trades at -10% (0.9^8 = 0.430, past half the account), then 92
+        // trades at +2%. Replaying this history from a uniformly random starting trade, with the
+        // wrap, ruins 9 of the 100 starts: the 8 starts with 0 to 7 wins before the losses
+        // (1.02^7 * 0.9^8 = 0.495 is ruin, 1.02^8 * 0.9^8 = 0.504 is not) and the start on the
+        // second loss (0.9^7 = 0.478).
+        let mut x = vec![-0.1; 8];
+        x.extend([0.02; 92]);
+        let ruined_starts = (0..x.len())
+            .filter(|&start| {
+                let mut equity = 1.0;
+                (0..x.len()).any(|k| {
+                    equity *= 1.0 + x[(start + k) % x.len()];
+                    equity <= 0.5
+                })
+            })
+            .count();
+        assert_eq!(ruined_starts, 9);
+        let spec = RuinSpec {
+            paths: 2_000,
+            mean_block: default_block_len(x.len()),
+            ..ruin_spec(100)
+        };
+        assert_eq!(spec.mean_block, 4);
+        let blocks = risk_of_ruin(&x, &spec).unwrap();
+        let single = risk_of_ruin(
+            &x,
+            &RuinSpec {
+                mean_block: 1,
+                ..spec
+            },
+        )
+        .unwrap();
+        // Blocks land near the 9% of the random starts, past #35's 5% gate; single draws do not.
+        assert!(blocks > 0.05 && blocks < 0.15, "{blocks}");
+        assert!(single < 0.01, "{single}");
+        assert_eq!((blocks, single), PINNED_CLUSTERED_RUIN);
+    }
+
+    /// 180 and 1 of 2,000 paths, seed 3.
+    const PINNED_CLUSTERED_RUIN: (f64, f64) = (0.09, 0.0005);
 
     fn challenge(horizon_days: usize) -> PropFirmSpec {
         PropFirmSpec {
