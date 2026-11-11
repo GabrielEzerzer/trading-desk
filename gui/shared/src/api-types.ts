@@ -926,8 +926,7 @@ export type Period = { from: number, to: number, };
  */
 export type BacktestSettings = { 
 /**
- * Starting balance in the quote asset: a plan's runs are on a quote-currency account (see
- * [`TestPlan::backtest_config`]).
+ * Starting balance in the account currency (`account_currency`).
  */
 starting_cash: number, 
 /**
@@ -939,7 +938,13 @@ max_leverage: number,
  * backtest config's default slippage for that instrument (#35: 2 bps on BTC and ETH, 5 bps
  * on other large caps); an empty list uses the default everywhere.
  */
-slippage: Array<SlippageOverride>, };
+slippage: Array<SlippageOverride>, 
+/**
+ * The currency the plan's runs hold and report in, as in
+ * [`BacktestConfig::account_currency`]: the quote currency, the default, or the base
+ * currency, as a dollar account trading USD/JPY. Left out of JSON when it is the default.
+ */
+account_currency?: AccountCurrency, };
 
 /**
  * One instrument's slippage, overriding the backtest config's default for it.
