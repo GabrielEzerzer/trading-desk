@@ -137,6 +137,177 @@ test('a failed engine starts again with Retry', async ({ page, open }) => {
   await expect(page.locator('.engine-dot')).toHaveCount(0)
 })
 
+// The engine source, on the bridge stub's fake engine (app/shots/bridge-stub.js, app/mock/engine.json).
+test.describe('running on the engine', () => {
+  const engine = { engine: 'running', mock: false } as const
+  type Call = { method: string; path: string; body?: Record<string, unknown> }
+  const calls = (page: Page) => page.evaluate(() => (window as unknown as { __tdCalls: Call[] }).__tdCalls)
+  const cancelSent = async (page: Page) => (await calls(page)).some((c) => c.method === 'POST' && /^\/jobs\/\d+\/cancel$/.test(c.path))
+
+  test('the list shows the latest run of each strategy, and a past result opens settled', async ({ page, open }) => {
+    await open(engine)
+    await expect(page.getByRole('button', { name: /SMA cross/ })).toContainText('9 Nov 2026 · +20.5%')
+    await expect(page.getByRole('button', { name: /Donchian breakout/ })).toContainText('Not run')
+    await page.getByRole('button', { name: /SMA cross/ }).click()
+    // Read the return in the frame the result first shows: a count-up would start near zero.
+    const first = await page.waitForFunction(() => document.getElementById('verdict') && document.querySelector('.key-number dd')?.textContent)
+    expect(await first.jsonValue()).toBe('+20.5%')
+    await expect(page.locator('#verdict')).toHaveText('No verdict rule yet')
+    await expect(page.locator('.criteria')).toHaveCount(0)
+    expect((await calls(page)).some((c) => c.path === '/runs/1794242520000-9e4b7a10')).toBe(true)
+  })
+
+  test('metrics the engine could not compute show a dash in the ink', async ({ page, open }) => {
+    await open(engine)
+    await page.getByRole('button', { name: /RSI reversion/ }).click()
+    const cagr = page.locator('.key-number').filter({ hasText: 'CAGR' }).locator('dd')
+    await expect(cagr).toHaveText('–')
+    await expect(cagr).not.toHaveAttribute('data-tone')
+    await expect(page.getByRole('row', { name: /Sharpe/ })).toContainText('–')
+  })
+
+  test('Run sends one backtest on the defaults over the chosen data, then shows the result', async ({ page, open }) => {
+    await open(engine)
+    await page.getByRole('button', { name: /Donchian breakout/ }).click()
+    await expect(page.getByText('Run it to backtest it on the chosen data.')).toBeVisible()
+    await page.getByRole('button', { name: 'Overrides' }).click()
+    await expect(page.getByRole('menuitemradio', { name: 'BTCUSDT perpetual, Binance' })).toHaveAttribute('aria-checked', 'true')
+    await page.getByRole('menuitemradio', { name: '1d' }).click()
+    await page.getByRole('button', { name: 'Run', exact: true }).click()
+    await expect(page.getByText('Step 1 of 1 · Running the backtest')).toBeVisible()
+    await expect(page.locator('#verdict')).toHaveText('No verdict rule yet', { timeout: 10_000 })
+
+    const sent = (await calls(page)).filter((c) => c.method === 'POST' && c.path === '/runs/backtest')
+    expect(sent).toHaveLength(1)
+    // The whole stored range of BTCUSDT perpetual (2024-01-01 to 2025-07-01), in whole days.
+    expect(sent[0]?.body).toMatchObject({
+      strategy: 'donchian_breakout',
+      params: { channel: 20 },
+      instrument: { id: { venue: 'binance', symbol: 'BTCUSDT', kind: 'perpetual' } },
+      timeframe: '1d',
+      from: Date.UTC(2024, 0, 1),
+      to: Date.UTC(2025, 6, 1),
+    })
+    // The run's last trade is still open at the end: no close date.
+    const lastTrade = page.locator('.table-trades tbody tr').last()
+    await expect(lastTrade.locator('td').nth(3)).toHaveText('Open')
+    await expect(page.locator('.table-trades tbody tr').first().locator('td').nth(3)).not.toHaveText('Open')
+    await page.locator('.pill').click()
+    await page.getByRole('menuitem', { name: 'All strategies' }).click()
+    await expect(page.getByRole('button', { name: /Donchian breakout/ })).toContainText('10 Nov 2026 ·')
+  })
+
+  test('Cancel asks the engine to stop the job', async ({ page, open }) => {
+    await open(engine)
+    await page.getByRole('button', { name: /Donchian breakout/ }).click()
+    await page.getByRole('button', { name: 'Run', exact: true }).click()
+    // Cancel before "Saving the result": past that, the job saves the run anyway.
+    await expect(page.getByText(/^Step 1 of 1 · (Loading the data|Running the backtest)$/)).toBeVisible()
+    await page.getByRole('button', { name: 'Cancel the run' }).click()
+    await expect(page.getByText('Not run', { exact: true })).toBeVisible()
+    await expect(page.getByRole('alert')).toHaveCount(0)
+    await expect.poll(() => cancelSent(page)).toBe(true)
+    // A job that ignored the cancel would show its result within its three 700 ms steps.
+    await page.waitForTimeout(3 * 700 + 300)
+    await expect(page.locator('#verdict')).toHaveCount(0)
+    await expect(page.getByText('Not run', { exact: true })).toBeVisible()
+  })
+
+  test('a cancel that lands after the last checkpoint still shows the saved result', async ({ page, open }) => {
+    // Slow steps, so the job can't finish between finding Cancel and clicking it: Cancel and Run
+    // are one button, and a late click would start a second run instead.
+    await open({ ...engine, stepMs: 2_500 })
+    await page.getByRole('button', { name: /Donchian breakout/ }).click()
+    await page.getByRole('button', { name: 'Run', exact: true }).click()
+    // The stub, like the engine, saves the run once its last step has started, cancel or not.
+    await expect(page.getByText('Step 1 of 1 · Saving the result')).toBeVisible({ timeout: 10_000 })
+    await page.getByRole('button', { name: 'Cancel the run' }).click()
+    await expect(page.getByRole('progressbar')).toHaveCount(0)
+    await expect(page.locator('#verdict')).toHaveText('No verdict rule yet', { timeout: 15_000 })
+    await expect(page.getByRole('alert')).toHaveCount(0)
+    expect(await cancelSent(page)).toBe(true)
+  })
+
+  test('a run refused for missing data offers the download, then runs', async ({ page, open }) => {
+    await open({ ...engine, backtest: 'data_missing' })
+    await page.getByRole('button', { name: /Donchian breakout/ }).click()
+    await page.getByRole('button', { name: 'Run', exact: true }).click()
+    await expect(page.getByText('Data missing', { exact: true })).toBeVisible()
+    await expect(page.getByText('No data downloaded')).toHaveCount(0)
+    await expect(page.getByText(/store has no candles for binance:BTCUSDT:perpetual/i)).toBeVisible()
+    await page.getByRole('button', { name: 'Download BTCUSDT history' }).click()
+    await expect(page.getByRole('progressbar', { name: 'Download progress' })).toBeVisible()
+    await expect(page.getByRole('button', { name: 'Run', exact: true })).toHaveAttribute('aria-disabled', 'true')
+    await expect(page.getByText('Not run', { exact: true })).toBeVisible({ timeout: 10_000 })
+    const download = (await calls(page)).find((c) => c.path === '/data/download')
+    expect(download?.body).toMatchObject({
+      instrument: { venue: 'binance', symbol: 'BTCUSDT', kind: 'perpetual' },
+      from: Date.UTC(2017, 0, 1),
+    })
+
+    await page.getByRole('button', { name: 'Run', exact: true }).click()
+    await expect(page.locator('#verdict')).toHaveText('No verdict rule yet', { timeout: 10_000 })
+  })
+
+  test('with nothing stored, Run waits for a download of the default instrument', async ({ page, open }) => {
+    await open({ ...engine, noData: true })
+    await page.getByRole('button', { name: /Donchian breakout/ }).click()
+    await expect(page.getByText('No data downloaded')).toBeVisible()
+    const run = page.getByRole('button', { name: 'Run', exact: true })
+    await expect(run).toHaveAttribute('aria-disabled', 'true')
+    await run.hover()
+    await expect(page.getByRole('tooltip')).toHaveText('Download data first.')
+    await page.mouse.move(0, 0)
+    await page.getByRole('button', { name: 'Download BTCUSDT history' }).click()
+    await expect(page.getByText('Not run', { exact: true })).toBeVisible({ timeout: 10_000 })
+    await expect(run).not.toHaveAttribute('aria-disabled', 'true')
+    await page.getByRole('button', { name: 'Overrides' }).click()
+    await expect(page.getByRole('menuitemradio', { name: 'BTCUSDT spot, Binance' })).toHaveAttribute('aria-checked', 'true')
+  })
+
+  test('with nothing stored, a strategy with a saved run still offers the download', async ({ page, open }) => {
+    await open({ ...engine, noData: true })
+    await page.getByRole('button', { name: /SMA cross/ }).click()
+    await expect(page.getByText('No data downloaded')).toBeVisible()
+    await page.getByRole('button', { name: 'Download BTCUSDT history' }).click()
+    await expect(page.getByRole('progressbar', { name: 'Download progress' })).toBeVisible()
+    // Once the data is stored, the saved result shows again.
+    await expect(page.locator('#verdict')).toHaveText('No verdict rule yet', { timeout: 10_000 })
+  })
+
+  test('a download can be cancelled', async ({ page, open }) => {
+    await open({ ...engine, noData: true })
+    await page.getByRole('button', { name: /Donchian breakout/ }).click()
+    await page.getByRole('button', { name: 'Download BTCUSDT history' }).click()
+    await page.getByRole('button', { name: 'Cancel the download' }).click()
+    // The engine stops the job at its next step; until then the view says so and Cancel is spent.
+    await expect(page.getByText('Cancelling the download')).toBeVisible()
+    await expect(page.getByRole('button', { name: 'Cancel the download' })).toHaveAttribute('aria-disabled', 'true')
+    await expect(page.getByRole('button', { name: 'Download BTCUSDT history' })).toBeVisible()
+    await expect(page.getByRole('alert')).toHaveCount(0)
+    await expect.poll(() => cancelSent(page)).toBe(true)
+  })
+
+  test('a busy engine says so in one line where the verdict goes, in its own words', async ({ page, open }) => {
+    await open({ ...engine, backtest: 'too_many_runs' })
+    await page.getByRole('button', { name: /Donchian breakout/ }).click()
+    await page.getByRole('button', { name: 'Run', exact: true }).click()
+    await expect(
+      page.getByText('8 runs are already queued or running, the most this server takes; wait for one to finish or cancel one.'),
+    ).toBeVisible()
+    await expect(page.getByRole('alert')).toHaveCount(0)
+    await expect(page.getByRole('button', { name: 'Run', exact: true })).not.toHaveAttribute('aria-disabled', 'true')
+  })
+
+  test('a job that fails shows the message from the server', async ({ page, open }) => {
+    await open({ ...engine, backtest: 'fails' })
+    await page.getByRole('button', { name: /Donchian breakout/ }).click()
+    await page.getByRole('button', { name: 'Run', exact: true }).click()
+    await expect(page.getByRole('alert')).toContainText('Run failed', { timeout: 10_000 })
+    await expect(page.getByRole('alert')).toContainText(/strategy refused its parameters: slow must be above fast/i)
+  })
+})
+
 test.describe('trading', () => {
   // Real time on the mock source: a closed bar every 1.5 s, and a market order fills at the next
   // bar's open, so the waits for a bar allow a few of them.

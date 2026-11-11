@@ -8,7 +8,7 @@ const clamp = (x: number) => Math.min(1, Math.max(0, x))
 /** How far the whole test plan has run, from 0 to 1: the finished steps plus the current step's share. */
 export function overallProgress(p: RunProgress): number {
   if (p.steps <= 0) return 0
-  const within = p.total ? clamp((p.done ?? 0) / p.total) : 0
+  const within = p.total ? clamp((p.done ?? 0) / p.total) : clamp(p.fraction ?? 0)
   return clamp((p.step - 1 + within) / p.steps)
 }
 
