@@ -90,9 +90,10 @@ impl Portfolio {
     }
 
     pub fn equity(&self) -> f64 {
-        match self.kind {
-            InstrumentKind::Spot => self.cash + self.position * self.mark_price,
-            InstrumentKind::Perpetual => self.cash + self.unrealised_pnl(),
+        if self.kind.rules().margin {
+            self.cash + self.unrealised_pnl()
+        } else {
+            self.cash + self.position * self.mark_price
         }
     }
 
@@ -101,14 +102,15 @@ impl Portfolio {
         let pos = self.position;
         self.cash -= fee;
         self.fees_paid += fee;
-        if self.kind == InstrumentKind::Spot {
+        let margin = self.kind.rules().margin;
+        if !margin {
             self.cash -= dq * price;
         }
         if pos != 0.0 && pos.signum() != dq.signum() {
             let closed = qty.min(pos.abs());
             let pnl = closed * (price - self.avg_entry) * pos.signum();
             self.realised_pnl += pnl;
-            if self.kind == InstrumentKind::Perpetual {
+            if margin {
                 self.cash += pnl;
             }
         }
@@ -182,6 +184,19 @@ mod tests {
         assert!(close(p.cash(), 1000.0 - 15.0));
         p.mark(80.0);
         assert!(close(p.equity(), 985.0 + 5.0));
+    }
+
+    #[test]
+    fn fx_books_profit_and_loss_into_cash_like_any_margined_market() {
+        let mut p = Portfolio::new(InstrumentKind::Fx, 1000.0);
+        p.apply_fill(Side::Sell, 1.0, 110.0, 0.0);
+        // Margined: opening a position moves no cash.
+        assert!(close(p.cash(), 1000.0));
+        p.mark(105.0);
+        assert!(close(p.equity(), 1005.0));
+        p.apply_fill(Side::Buy, 1.0, 100.0, 0.0);
+        assert!(close(p.cash(), 1010.0));
+        assert!(close(p.equity(), 1010.0));
     }
 
     #[test]

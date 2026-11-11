@@ -7,8 +7,9 @@ use crate::http::Http;
 use crate::source::{DataSource, source};
 use crate::{DataError, store};
 
-/// The default fee schedule for a venue and kind.
-pub fn default_fees(venue: Venue, kind: InstrumentKind) -> FeeSchedule {
+/// The default fee schedule for a venue and kind, or [`DataError::KindNotListed`] for a kind the
+/// venue does not list.
+pub fn default_fees(venue: Venue, kind: InstrumentKind) -> Result<FeeSchedule, DataError> {
     source(venue).default_fees(kind)
 }
 
