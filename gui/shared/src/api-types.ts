@@ -1118,8 +1118,8 @@ export type HighRiskLimits = {
  */
 min_trades: number, 
 /**
- * Mean net P&L per closed trade strictly above this, in the run's account currency (the
- * quote asset on a plan's runs).
+ * Mean net P&L per closed trade strictly above this, in the run's account currency (on a
+ * plan's runs, the one its backtest settings name).
  */
 min_expectancy: number, 
 /**
