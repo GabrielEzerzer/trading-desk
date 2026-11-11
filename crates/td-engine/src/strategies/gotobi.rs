@@ -354,8 +354,14 @@ fn plan() -> TestPlan {
 /// plan does not charge. The published numbers (775 trades, +2.35 pips, t = 5.5, 58% winners) are
 /// what a run is read against, not pass marks. The run to read against them is the plain backtest
 /// over the whole period at the default 12 pip stop, by its `avg_trade_pips`; the calendar allows
-/// at most 765 trades there. The walk-forward's out-of-sample curve covers about 8.5 of the years
-/// and picks a stop per window, so its trade count and its mean are not comparable.
+/// at most 765 trades there, and OANDA's data gives 758, because it is closed at the fixing on the
+/// seven 25 Decembers that fall on a weekday. The walk-forward's out-of-sample curve covers about
+/// 8.5 of the years and picks a stop per window, so its trade count and its mean are not
+/// comparable.
+///
+/// On FX the test battery skips its luck test (#83), and a skipped test counts as inconclusive,
+/// so this rule's verdict can be inconclusive at best until that test runs on FX. An inconclusive
+/// verdict here says the battery is incomplete, not that the edge is in doubt.
 fn rule() -> VerdictRule {
     VerdictRule::HighRisk {
         limits: HighRiskLimits {
