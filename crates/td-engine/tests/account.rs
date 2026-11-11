@@ -516,6 +516,10 @@ fn a_base_account_is_refused_on_spot_and_on_a_perpetual() {
             matches!(refused, Err(EngineError::InvalidConfig(_))),
             "{kind:?} accepted a base account"
         );
+        // The reason is one sentence with single spaces.
+        if let Err(EngineError::InvalidConfig(reason)) = refused {
+            assert!(!reason.contains("  "), "{kind:?}: {reason:?}");
+        }
     }
     // FX takes it, and every kind still takes a quote account.
     assert!(Session::new(Box::new(Plan(vec![])), usdjpy(), Timeframe::M1, dollars()).is_ok());

@@ -119,12 +119,14 @@ impl Session {
         if config.account_currency == AccountCurrency::Base {
             if !rules.margin {
                 return Err(EngineError::InvalidConfig(
-                    "a base-currency account needs a margined market: spot pays for what it buys                      in the quote currency",
+                    "a base-currency account needs a margined market: spot pays for what it buys \
+                     in the quote currency",
                 ));
             }
             if rules.funding || rules.liquidation {
                 return Err(EngineError::InvalidConfig(
-                    "a base-currency account is not modelled on a market with funding or                      liquidation (a perpetual), whose margin is in the quote currency",
+                    "a base-currency account is not modelled on a market with funding or \
+                     liquidation (a perpetual), whose margin is in the quote currency",
                 ));
             }
         }
