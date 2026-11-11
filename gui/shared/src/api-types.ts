@@ -2259,4 +2259,4 @@ export type ClientMessage = { "type": "subscribe", topic: string, } | { "type": 
 /**
  * A message from the server.
  */
-export type ServerMessage = { "type": "subscribed", topic: string, } | { "type": "unsubscribed", topic: string, } | { "type": "job", job: JobInfo, } | { "type": "candle", topic: string, candle: Candle, } | { "type": "session_state", session: SessionState, } | { "type": "session", id: string, event: SessionEvent, } | { "type": "error", error: ErrorBody, };
+export type ServerMessage = { "type": "subscribed", topic: string, } | { "type": "unsubscribed", topic: string, } | { "type": "job", job: JobInfo, } | { "type": "candle", topic: string, candle: Candle, } | { "type": "candle_forming", topic: string, candle: Candle, } | { "type": "session_state", session: SessionState, } | { "type": "session", id: string, event: SessionEvent, } | { "type": "error", error: ErrorBody, };

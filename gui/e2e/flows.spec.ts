@@ -507,6 +507,95 @@ test.describe('trading on the engine', () => {
     expect(await page.evaluate(() => (window as { __stubStarts?: number }).__stubStarts)).toBe(1)
   })
 
+  const subscribed = (page: Page) => page.evaluate(() => (window as { __stubSubscribed?: string[] }).__stubSubscribed ?? [])
+  const candleCalls = (page: Page) =>
+    page.evaluate(() =>
+      ((window as { __tdCalls?: { path: string; query?: Record<string, string> }[] }).__tdCalls ?? [])
+        .filter((c) => c.path === '/candles')
+        .map((c) => c.query),
+    )
+
+  test('draws the candle history before any live bar', async ({ page, open }) => {
+    // No live bars: the stub's stream is off, so whatever the chart shows came from GET /candles.
+    await openTrading(page, open, { ...engineTrading, candles: { ...engineTrading.candles!, everyMs: 3_600_000 } })
+    await expect(page.locator('.ticker-price')).toHaveText('64,210.00')
+    await expect(page.locator('.chart-empty')).toHaveCount(0)
+    await expect(page.getByText(/Waiting for the first/)).toHaveCount(0)
+    expect(await candleCalls(page)).toEqual([{ instrument: 'binance:BTCUSDT:spot', timeframe: '1m', limit: '500' }])
+  })
+
+  test('says the history is loading while live bars already fill the chart', async ({ page, open }) => {
+    await openTrading(page, open, { ...engineTrading, history: { '*': 'hang' } })
+    const loading = page.locator('.chart-empty[role="status"]')
+    await expect(loading).toHaveText('Loading candle history')
+    await expect(loading.locator('.state-quiet.shimmer')).toHaveCount(1)
+    // The stub's live bars walk on from 64,210: the price moves while the history still loads.
+    await expect(page.locator('.ticker-price')).toHaveText(/\d/)
+    await expect(page.locator('.ticker-price')).not.toHaveText('64,210.00')
+    await expect(loading).toBeVisible()
+  })
+
+  test('says in the engine’s words when the history did not load, and Retry loads it', async ({ page, open }) => {
+    await openTrading(page, open, { ...engineTrading, history: { '*': 'fail' } })
+    const alert = page.locator('.chart-empty[role="alert"]')
+    await expect(alert).toContainText('The candle history did not load.')
+    await expect(alert.locator('.chart-empty-note')).toHaveText(
+      'Fetching binance:BTCUSDT:spot 1m bars from the venue failed: connection timed out.',
+    )
+    // The live stream still fills the chart.
+    await expect(page.locator('.ticker-price')).toHaveText(/\d/)
+    // The venue answers again.
+    await page.evaluate(() => {
+      delete (window as { __stubHistory?: Record<string, unknown> }).__stubHistory?.['*']
+    })
+    await alert.getByRole('button', { name: 'Retry' }).click()
+    await expect(page.locator('.chart-empty')).toHaveCount(0)
+    expect(await candleCalls(page)).toHaveLength(2)
+  })
+
+  test('moves the last candle with the bar forming, then the closed bar replaces it', async ({ page, open }) => {
+    // On a held clock: the stub shows the bar forming half way to each close, here at 500 ms.
+    await open({ ...engineTrading, candles: { ...engineTrading.candles!, everyMs: 1_000 } }, { clock: true })
+    await page.getByRole('heading', { name: 'Strategies' }).waitFor()
+    await page.clock.pauseAt((await page.evaluate(() => Date.now())) + 1_000)
+    await page.keyboard.press('Control+2')
+    const price = page.locator('.ticker-price')
+    await expect(price).toHaveText('64,210.00')
+
+    // The first live bar opens at 64,210 and closes 38.53 higher (the stub's walk); half way, the
+    // forming bar is the last candle, and its close the price.
+    await page.clock.runFor(600)
+    await expect(price).toHaveText('64,229.26')
+    await page.clock.runFor(500)
+    await expect(price).toHaveText('64,248.53')
+    expect(await page.evaluate(() => (window as { __stubCandles?: number }).__stubCandles)).toBe(1)
+  })
+
+  test('a switch stops the old stream and drops the old history’s late answer', async ({ page, open }) => {
+    // BTCUSDT's history answers after 800 ms, ETHUSDT's never.
+    await openTrading(page, open, {
+      ...engineTrading,
+      candles: { ...engineTrading.candles!, everyMs: 3_600_000 },
+      history: { 'binance:BTCUSDT:spot': 800, '*': 'hang' },
+    })
+    await expect(page.locator('.chart-empty')).toHaveText('Loading candle history')
+    expect(await subscribed(page)).toEqual(['candles:binance:BTCUSDT:spot:1m'])
+
+    await page.locator('.ticker').click()
+    await page.getByRole('option', { name: /^ETHUSDT\s*Binance spot/ }).first().click()
+    await expect(page.locator('.ticker')).toHaveAccessibleName(/^ETHUSDT, Binance spot\./)
+    await expect.poll(() => subscribed(page)).toEqual(['candles:binance:ETHUSDT:spot:1m'])
+
+    // Past the BTCUSDT answer: its bars never reach the ETHUSDT chart.
+    await page.waitForTimeout(1_000)
+    await expect(page.locator('.chart-empty')).toHaveText('Loading candle history')
+    await expect(page.locator('.ticker-price')).not.toHaveText(/\d/)
+
+    await page.getByRole('button', { name: 'Timeframe: 1m' }).click()
+    await page.getByRole('menuitemradio', { name: '5m', exact: true }).click()
+    await expect.poll(() => subscribed(page)).toEqual(['candles:binance:ETHUSDT:spot:5m'])
+  })
+
   test('a session list that did not load says so with Retry, and offers no new session', async ({ page, open }) => {
     await openTrading(page, open, { ...engineTrading, failSessions: 1 })
     const line = page.locator('.position-line')
