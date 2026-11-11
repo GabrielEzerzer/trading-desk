@@ -27,6 +27,7 @@ mod plan;
 mod portfolio;
 mod registry;
 mod results;
+pub mod risk;
 mod runner;
 mod session;
 mod strategies;
@@ -55,12 +56,14 @@ pub use registry::{StrategyEntry, build_strategy, find_strategy, strategies};
 pub use results::{
     RunId, RunKind, RunSummary, SavedRun, StoreError, list, load, save, save_with_files,
 };
+pub use risk::{DayRollover, EquityRange};
 pub use runner::{
     BacktestConfig, BacktestResult, Benchmark, ENGINE_REVISION, Rerun, config_fingerprint,
-    data_fingerprint, rerun, run,
+    data_fingerprint, default_slippage_bps, rerun, run,
 };
 pub use session::{
-    EquityPoint, LIQUIDATION_TAG, MAINTENANCE_MARGIN_RATE, Session, SessionConfig, run_backtest,
+    CLOSE_OUT_TAG, EquityPoint, LIQUIDATION_TAG, MAINTENANCE_MARGIN_RATE, Session, SessionConfig,
+    run_backtest,
 };
 pub use strategies::gotobi_calendar;
 pub use strategy::{Context, Strategy};
@@ -70,7 +73,9 @@ pub use tester::{
     WalkForwardSpec, Window, WindowMode, WindowResult, WindowSpec, out_of_sample, stitch, sweep,
     walk_forward,
 };
-pub use trades::{BarFunding, Trade, TradeSide, build_trades, build_trades_with_fills};
+pub use trades::{
+    BarFunding, BarStops, Trade, TradeSide, attach_stops, build_trades, build_trades_with_fills,
+};
 pub use verdict::{
     Comparison, Criterion, DrawdownMode, EvidenceInputs, FirmLimits, HighRiskLimits, KindInputs,
     Layer, Outcome, PortfolioBenchmark, PortfolioLimits, PropFirmLimits, RuleKind, Unit, Verdict,
