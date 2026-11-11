@@ -38,6 +38,22 @@ fn refuse<T>(message: impl Into<String>) -> Result<T, PlanError> {
     Err(PlanError(message.into()))
 }
 
+/// R6 moves the walk-forward windows back by `start_offsets` shifts. The windows step by one test
+/// window, so a shift moves their edges by the shift modulo the test length: a test window of
+/// `n` bars has `n - 1` edge positions besides the main run's, and more offsets than that would
+/// repeat a run.
+pub(crate) fn check_start_offsets(test_bars: usize, start_offsets: u32) -> Result<(), String> {
+    if test_bars <= start_offsets as usize {
+        return Err(format!(
+            "the walk-forward test window is {test_bars} bars, too short for {start_offsets} start \
+             offsets: R6 needs at least {} bars per test window to move the window edges to \
+             {start_offsets} different places",
+            u64::from(start_offsets) + 1
+        ));
+    }
+    Ok(())
+}
+
 /// Midnight UTC at the start of a date, for writing a plan's period: `date(2024, 1, 1)`.
 pub fn date(year: i64, month: u32, day: u32) -> Millis {
     days_from_civil(year, month, day) * DAY_MS
@@ -423,6 +439,8 @@ impl TestPlan {
         };
         let wf = self.walk_forward_spec(strategy, stand_in.clone());
         wf.check().map_err(|e| PlanError(e.to_string()))?;
+        check_start_offsets(wf.windows.test_bars, self.evidence.start_offsets)
+            .map_err(PlanError)?;
         if let Some(oos) = self.oos_spec(strategy, stand_in) {
             if let Split::Fraction(f) = oos.split
                 && !(f > 0.0 && f < 1.0)
@@ -443,7 +461,9 @@ impl TestPlan {
         let luck_runs = per_sweep as u128 * (u128::from(self.evidence.luck.permutations) + 1);
         if luck_runs > MAX_RUNS as u128 {
             return refuse(format!(
-                "the luck test would run {luck_runs} backtests ({per_sweep} parameter sets times                  {} sweeps), above the limit of {MAX_RUNS}: shrink the grid or run fewer                  permutations",
+                "the luck test would run {luck_runs} backtests ({per_sweep} parameter sets times \
+                 {} sweeps), above the limit of {MAX_RUNS}: shrink the grid or run fewer \
+                 permutations",
                 self.evidence.luck.permutations + 1
             ));
         }
@@ -771,10 +791,32 @@ mod tests {
         plan.sweep.axes = vec![axis("fast", 1.0), axis("slow", 30.0)];
         plan.evidence.luck.permutations = 199;
         let err = plan.validate("sma_cross").unwrap_err();
-        assert!(err.0.contains("125000 backtests"), "{err}");
+        assert_eq!(
+            err.0,
+            "the luck test would run 125000 backtests (625 parameter sets times 200 sweeps), \
+             above the limit of 100000: shrink the grid or run fewer permutations"
+        );
         // 159 permutations are 625 x 160 = 100,000 runs, exactly the limit.
         assert_eq!(625 * 160, MAX_RUNS);
         plan.evidence.luck.permutations = 159;
+        assert_eq!(plan.validate("sma_cross"), Ok(()));
+    }
+
+    /// R6's windows step by one test window, so a shift moves their edges by the shift modulo
+    /// the test length: eight start offsets need at least nine bars per test window, or two of
+    /// them repeat the main run or each other.
+    #[test]
+    fn test_windows_too_short_for_the_start_offsets_are_refused() {
+        let mut plan = example_plan();
+        assert_eq!(plan.evidence.start_offsets, 8);
+        plan.timeframe = Timeframe::D1;
+        plan.walk_forward.test_days = 8;
+        assert_eq!(
+            plan.validate("sma_cross").unwrap_err().0,
+            "the walk-forward test window is 8 bars, too short for 8 start offsets: R6 needs at \
+             least 9 bars per test window to move the window edges to 8 different places"
+        );
+        plan.walk_forward.test_days = 9;
         assert_eq!(plan.validate("sma_cross"), Ok(()));
     }
 

@@ -542,20 +542,47 @@ fn progress_counts_every_run_once_against_one_total() {
     assert_eq!(windows, offset_windows);
 }
 
-/// R6 on test windows shorter than `start_offsets + 1` bars: seven daily bars against eight
-/// offsets. Each offset still moves the windows by a different, non-zero number of bars, so R6
-/// runs instead of indexing past the end of the bars.
-#[test]
-fn start_offsets_run_on_test_windows_shorter_than_the_offset_count() {
-    // 120-day train windows hold four legs of the wave; 400 days hold 40 test windows.
+/// Daily bars over 400 days with 120-day train windows (four legs of the wave) and test windows
+/// of `test_days`.
+fn daily_plan(test_days: u32) -> (TestPlan, Vec<Candle>) {
     let days = 400;
     let mut plan = plan(days);
     plan.timeframe = Timeframe::D1;
     plan.walk_forward = WalkForwardPlan {
         train_days: 120,
-        test_days: 7,
+        test_days,
     };
-    let bars = bars_every(DAY, &edge_closes(days as usize));
+    (plan, bars_every(DAY, &edge_closes(days as usize)))
+}
+
+/// R6's windows step by one test window, so a shift moves their edges by the shift modulo the
+/// test length: seven-bar test windows give eight offsets at most six new edge positions, and
+/// two of them would repeat a run. The battery refuses them before anything runs.
+#[test]
+fn test_windows_too_short_for_the_start_offsets_are_refused_before_anything_runs() {
+    let (plan, bars) = daily_plan(7);
+    let calls = Mutex::new(0usize);
+    let progress = |_: usize, _: usize| {
+        *calls.lock().unwrap() += 1;
+        ControlFlow::Continue(())
+    };
+    let r = battery(&plan, &cash_rule(), &bars, 7, Some(&progress));
+    assert_eq!(
+        r,
+        Err(TesterError::InvalidSpec(
+            "the walk-forward test window is 7 bars, too short for 8 start offsets: R6 needs at \
+             least 9 bars per test window to move the window edges to 8 different places"
+                .into()
+        ))
+    );
+    assert_eq!(calls.into_inner().unwrap(), 0);
+}
+
+/// Nine-bar test windows are the shortest that hold eight offsets: each moves the windows by a
+/// different number of bars, one to eight, and R6 runs all of them.
+#[test]
+fn start_offsets_run_on_the_shortest_test_windows_that_hold_them() {
+    let (plan, bars) = daily_plan(9);
     let r = battery(&plan, &cash_rule(), &bars, 7, None).unwrap();
     // The lines before R6 left it something to decide, so it ran.
     assert!(r.cost_stress.is_some(), "{:#?}", r.verdict.criteria);

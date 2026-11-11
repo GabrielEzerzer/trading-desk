@@ -51,6 +51,7 @@ use serde::{Deserialize, Serialize};
 use td_core::{Candle, FeeSchedule, Instrument, Millis};
 
 use crate::metrics::{self, DAY_MS, EquitySeries};
+use crate::plan::check_start_offsets;
 use crate::risk::{self, DayRollover};
 use crate::rng::derive_seed;
 use crate::runner::select_bars;
@@ -289,8 +290,10 @@ pub fn run_battery(
     let sweep_spec = plan.sweep_spec(strategy, instrument.clone());
     let wf_spec = plan.walk_forward_spec(strategy, instrument.clone());
     wf_spec.check()?;
-    let (_, traded) = select_bars(&base, bars)?;
     let ev = &plan.evidence;
+    check_start_offsets(wf_spec.windows.test_bars, ev.start_offsets)
+        .map_err(TesterError::InvalidSpec)?;
+    let (_, traded) = select_bars(&base, bars)?;
 
     // The total before anything runs.
     let per_sweep = sweep_spec.runs()?;
@@ -578,17 +581,12 @@ pub fn run_battery(
                 oos_return: None,
                 error: None,
             };
-            // The range ends at the open of the first bar left out. Every shift is at least 1,
-            // and a shift as long as the range leaves no window, so this bar exists whenever a
-            // window fits.
-            let end = traded
-                .len()
-                .checked_sub(shift)
-                .filter(|_| shift > 0)
-                .and_then(|i| traded.get(i));
-            if let (true, Some(end)) = (planned > 0, end) {
+            if planned > 0 {
+                // The range ends at the open of the first bar left out. Every shift is at least
+                // 1 (`check_start_offsets`), and a window fits in the `len - shift` bars before
+                // it, so that bar exists.
                 let mut spec: WalkForwardSpec = wf_spec.clone();
-                spec.sweep.base.to = end.open_time;
+                spec.sweep.base.to = traded[traded.len() - shift].open_time;
                 match walk_forward(&spec, bars, funding, Some(&meter.step())) {
                     Ok(r) => offset.oos_return = r.metrics.total_return,
                     Err(
@@ -705,11 +703,12 @@ fn later_lines_cannot_change(
 }
 
 /// R6's `n` shifts, in bars left out at the end of the period: the k-th is `k / (n + 1)` of a
-/// test window, so the window boundaries move to `n` evenly spaced points inside a test window,
-/// and at least `k` bars, so test windows shorter than `n + 1` bars still give `n` different,
-/// non-zero shifts.
+/// test window, rounded down, so the window boundaries move to `n` evenly spaced points inside a
+/// test window. With at least `n + 1` bars per test window (`check_start_offsets`) the shifts
+/// step by at least one bar and stay below a test window, so they are different, non-zero and
+/// never land back on the main run's boundaries.
 fn start_offset_shifts(test_bars: usize, n: usize) -> Vec<usize> {
-    (1..=n).map(|k| (k * test_bars / (n + 1)).max(k)).collect()
+    (1..=n).map(|k| k * test_bars / (n + 1)).collect()
 }
 
 /// -1, 0 or 1.
@@ -1207,15 +1206,13 @@ mod tests {
     }
 
     #[test]
-    fn start_offsets_are_distinct_and_never_zero_even_on_short_test_windows() {
+    fn start_offsets_are_evenly_spaced_inside_a_test_window() {
         // 270 bars of test window, 8 offsets: k * 30 bars.
         assert_eq!(
             start_offset_shifts(270, 8),
             (1..=8).map(|k| 30 * k).collect::<Vec<_>>()
         );
-        // 7 bars, 8 offsets: k * 7 / 9 is 0 for k = 1; at least k bars instead.
-        assert_eq!(start_offset_shifts(7, 8), (1..=8).collect::<Vec<_>>());
-        // 9 bars sit on the edge: k bars exactly.
+        // 9 bars, the shortest test window 8 offsets may run on: k bars exactly.
         assert_eq!(start_offset_shifts(9, 8), (1..=8).collect::<Vec<_>>());
         assert_eq!(start_offset_shifts(20, 8), vec![2, 4, 6, 8, 11, 13, 15, 17]);
     }
