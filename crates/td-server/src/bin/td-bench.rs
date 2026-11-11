@@ -412,8 +412,8 @@ fn lab_config(base: &BacktestConfig) -> Result<BacktestConfig, String> {
 /// a saved run only in a later session, so that phase reads through a store of its own and shares
 /// nothing the earlier phases kept in memory. Saves into an empty runs directory made and removed
 /// outside the timed phases. Returns the phases and the JSON to checksum: the coverage without the
-/// files' sizes, the saved backtest as read back and the run's check, without the run id, which
-/// carries the save time.
+/// files' sizes, then everything both reads return (the backtest, its data report, and the
+/// reopened run's check) except the run id, which carries the save time.
 fn lab_backtest(
     config: &BacktestConfig,
     store: &Store,
@@ -463,7 +463,19 @@ fn lab_backtest(
     for month in &mut coverage.months {
         month.bytes = 0;
     }
-    Ok((p, to_json(&(&coverage, &opened.run, &opened.check))?))
+    Ok((
+        p,
+        to_json(&(
+            &coverage,
+            &detail.run,
+            &detail.data,
+            &detail.data_error,
+            &opened.run,
+            &opened.data,
+            &opened.data_error,
+            &opened.check,
+        ))?,
+    ))
 }
 
 fn elapsed_ms(start: Instant) -> f64 {
@@ -781,6 +793,23 @@ mod tests {
             "min_trades": 0
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn the_lab_checksum_covers_the_data_report_of_both_reads() {
+        let w = workload(Mode::LabBacktest);
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path());
+        let (from, to) = dataset_range(1);
+        write_dataset(&store, w.kind, w.seed, from, to).unwrap();
+        let config = lab_config(&base_config(&w, from, to)).unwrap();
+        let (_, json) = lab_backtest(&config, &store, 0).unwrap();
+        let hashed: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        // The job result's report and the reopened run's, each read without an error.
+        for (data, error) in [(2, 3), (5, 6)] {
+            assert!(hashed[data]["bars"].as_u64().unwrap() > 0);
+            assert!(hashed[error].is_null());
+        }
     }
 
     #[test]
