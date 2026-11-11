@@ -33,9 +33,32 @@ Three pull requests, in this order:
 - **Targets (my defaults, Gabriel gave no number):** PR 1: the app's engine build at most 1/5 of baseline A on dev. PR 2: at most 1/2 of baseline B on dev, same checksums.
 - **No gaming:** the workloads file, the generator seed and the checksum code do not change after the baseline. The one planned harness edit is passing `&[]` for asks when #66 changes the engine signatures; the checksum must not move across that edit.
 
+## Baselines (commit `c4eb9a9`, 2026-11-11 11:49 to 12:03 UTC)
+
+Checksums are the same in debug and release: dev `1d66746fdcd697cb`, test `a866581ba9e3c049`.
+
+| Build | Split | Run | total_ms | load | backtest | sweep | walk-forward |
+|---|---|---|---|---|---|---|---|
+| A debug, reps 3 | dev | 1 | 21,802.0 | 10,048.4 | 1,304.1 | 3,895.3 | 6,554.2 |
+| A debug, reps 3 | dev | 2 | 19,966.2 | 5,604.9 | 797.2 | 3,977.4 | 9,586.6 |
+| A debug, reps 3 | test | 1 | 13,301.5 | 5,397.0 | 1,011.2 | 5,491.0 | 1,402.4 |
+| B release, reps 5 | dev | 1 | 2,250.7 | 1,028.6 | 115.5 | 316.3 | 790.2 |
+| B release, reps 5 | dev | 2 | 2,316.6 | 1,243.1 | 137.6 | 370.7 | 565.2 |
+| B release, reps 5 | test | 1 | 1,840.9 | 1,050.3 | 126.9 | 516.6 | 147.1 |
+
+Noise floor: the dev total moved 3% (release) to 9% (debug) between two unchanged runs; single workloads moved up to 45% because other agents were compiling. A round is kept only when the dev total, taken as the lower of two runs, improves by more than 10%.
+
+Baseline A for the target is the lower debug run, 19,966.2 ms. Baseline B is the lower release run, 2,250.7 ms.
+
 ## Rounds
 
-(none yet)
+### Round 1: the app starts the release build (kept)
+
+- **Hypothesis:** most of the slowness Gabriel sees is the build, not the algorithm. `pnpm dev` builds and starts `target/debug/td-server`, which has no optimisation.
+- **Change:** `pnpm dev` builds with `--release`, and the app, `quit-check` and the integration test look for `target/release/td-server`. No engine code changes; no `[profile.release]` section added, the defaults are used.
+- **Dev:** 19,966.2 ms to 2,250.7 ms, 8.9 times faster (target was 5). Test: 13,301.5 ms to 1,840.9 ms, 7.2 times.
+- **Guardrails:** checksums identical on both splits. Clean release build of `td-server` 570 s on this machine under load (one time). Rebuild after touching `crates/td-engine/src/runner.rs`: release 55 s, debug 36 s.
+- **Taught:** in release, loading data is 46% of the dev total (it reads every month of 1-minute candles and resamples them, twice per run in the app). That is the first target for PR 2, ahead of the sweep.
 
 ## Decisions made for Gabriel
 
@@ -49,4 +72,7 @@ Three pull requests, in this order:
 
 ## Open
 
-- Bench not built yet.
+- PR 1 (`perf-bench`): push, CI, review gate, merge.
+- PR 2 (`perf-engine`): waits for #66. Rounds planned: load caching, shared sweep preparation, incremental indicators.
+- PR 3 (`live-chart`): worker running in `D:\code\.worktrees	rading-desk-live-chart`.
+- The bench worker did not check that checksums match between Windows and Linux; CI does not run the bench, so this only matters if someone compares across machines.
