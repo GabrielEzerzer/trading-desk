@@ -19,6 +19,7 @@
 //! Before the first live bar, [`Session::warm_up`] can feed bars that only give the strategy the
 //! history its indicators need: the strategy sees them as usual, but cannot trade on them.
 
+mod battery;
 mod broker;
 mod error;
 mod fill;
@@ -45,6 +46,10 @@ mod verdict;
 #[path = "../build/private_strategies.rs"]
 mod private_strategies_build;
 
+pub use battery::{
+    BatteryResult, BatterySpec, Breakdown, CostStress, IntegrityReport, PlateauReport,
+    RegimeResult, SideResult, StartOffset, run_battery,
+};
 pub use broker::{AttachedStop, Broker, BrokerEvent, Order, OrderStatus, SimBroker};
 pub use error::{EngineError, OrderRejected};
 pub use fill::{CandleFillModel, FillCheck, FillModel};
@@ -82,7 +87,9 @@ pub use trades::{
     BarFunding, BarStops, Trade, TradeSide, attach_stops, build_trades, build_trades_with_fills,
 };
 pub use verdict::{
-    Comparison, Criterion, DrawdownMode, EvidenceInputs, FirmLimits, HighRiskLimits, KindInputs,
-    Layer, Outcome, PortfolioBenchmark, PortfolioLimits, PropFirmLimits, RuleKind, Unit, Verdict,
-    VerdictRule, VerdictState, combine, evaluate, evaluate_evidence,
+    Comparison, Criterion, DrawdownMode, EvidenceInputs, FirmLimits, HighRiskLimits,
+    IntegrityInputs, KindInputs, Layer, MAX_DROPPED_SHARE, OosIntegrityInputs, Outcome,
+    PortfolioBenchmark, PortfolioLimits, PropFirmLimits, RuleKind, TOO_GOOD_SHARPE, Unit, Verdict,
+    VerdictRule, VerdictState, combine, evaluate, evaluate_evidence, evaluate_integrity,
+    evaluate_oos_integrity,
 };

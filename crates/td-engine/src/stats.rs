@@ -243,9 +243,11 @@ fn quantile(sorted: &[f64], p: f64) -> f64 {
 /// How [`risk_of_ruin`] simulates.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct RuinSpec {
-    /// Ruin is equity at or below this fraction of the starting equity, strictly between 0 and
-    /// 1: 0.5 is ruin at a loss of half the account.
-    pub ruin_level: f64,
+    /// The drawdown from the path's running peak that counts as ruin, strictly between 0 and 1:
+    /// a path is ruined once its equity is at or below `peak * (1 - ruin_drawdown)`, where the
+    /// peak is the highest equity so far, the start included. 0.5 is ruin at a fall of half the
+    /// account from its high, wherever that high was.
+    pub ruin_drawdown: f64,
     /// Trades per path. A natural choice is the number of trades in the sample: the chance of
     /// ruin over another stretch as long as the test.
     pub horizon: usize,
@@ -257,7 +259,9 @@ pub struct RuinSpec {
 }
 
 /// The probability of ruin for the `high_risk` kind rule: the fraction of `paths` simulated
-/// equity paths that fall to `ruin_level` of the starting equity within `horizon` trades.
+/// equity paths that fall `ruin_drawdown` below their running peak within `horizon` trades. A
+/// path that first rises 60% and then falls 50% from that high is ruined, although it is still
+/// above its start: the rule's drawdown is measured from the peak.
 ///
 /// `trade_returns` are each trade's P&L as a fraction of the equity when it was entered (the
 /// caller divides the trade's P&L by that equity). A path draws `horizon` of them with the
@@ -275,26 +279,38 @@ pub struct RuinSpec {
 pub fn risk_of_ruin(trade_returns: &[f64], spec: &RuinSpec) -> Result<f64, StatsError> {
     check_values(trade_returns)?;
     check_count(spec.paths, spec.mean_block)?;
-    if !(spec.ruin_level > 0.0 && spec.ruin_level < 1.0) {
+    if !(spec.ruin_drawdown > 0.0 && spec.ruin_drawdown < 1.0) {
         return Err(StatsError::InvalidSpec(
-            "the ruin level must be strictly between 0 and 1",
+            "the ruin drawdown must be strictly between 0 and 1",
         ));
     }
     if spec.horizon == 0 {
         return Err(StatsError::InvalidSpec("the horizon must be at least 1"));
     }
     let mut draw = Resampler::new(trade_returns.len(), spec.mean_block, spec.seed);
-    let ruined = (0..spec.paths)
+    let ruined_paths = (0..spec.paths)
         .filter(|_| {
             draw.reset();
-            let mut equity = 1.0;
-            (0..spec.horizon).any(|_| {
-                equity *= 1.0 + trade_returns[draw.next()];
-                equity <= spec.ruin_level
-            })
+            let path = (0..spec.horizon).map(|_| trade_returns[draw.next()]);
+            ruined(path, spec.ruin_drawdown)
         })
         .count();
-    Ok(ruined as f64 / spec.paths as f64)
+    Ok(ruined_paths as f64 / spec.paths as f64)
+}
+
+/// Whether compounding `returns` from an equity of 1 ever takes the equity to `ruin_drawdown`
+/// or more below its running peak, the start included. Stops at the first such trade.
+fn ruined(returns: impl Iterator<Item = f64>, ruin_drawdown: f64) -> bool {
+    let keep = 1.0 - ruin_drawdown;
+    let (mut equity, mut peak) = (1.0f64, 1.0f64);
+    for r in returns {
+        equity *= 1.0 + r;
+        peak = peak.max(equity);
+        if equity <= peak * keep {
+            return true;
+        }
+    }
+    false
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -522,7 +538,7 @@ mod tests {
         let trades: Vec<f64> = x.iter().map(|r| r * 10.0).collect();
         let ruin = |seed| {
             let spec = RuinSpec {
-                ruin_level: 0.9,
+                ruin_drawdown: 0.1,
                 horizon: 30,
                 paths: 500,
                 mean_block: default_block_len(trades.len()),
@@ -592,7 +608,7 @@ mod tests {
 
     fn ruin_spec(horizon: usize) -> RuinSpec {
         RuinSpec {
-            ruin_level: 0.5,
+            ruin_drawdown: 0.5,
             horizon,
             paths: 200,
             mean_block: 1,
@@ -603,7 +619,7 @@ mod tests {
     #[test]
     fn risk_of_ruin_is_zero_when_every_trade_wins_and_one_when_each_loses_past_the_level() {
         assert_eq!(risk_of_ruin(&[0.01, 0.2, 0.05], &ruin_spec(100)), Ok(0.0));
-        // One trade of -60% takes equity from 1 to 0.4, past a ruin level of 0.5.
+        // One trade of -60% takes equity from 1 to 0.4, a drawdown past 0.5 from the start.
         assert_eq!(risk_of_ruin(&[-0.6, -0.7], &ruin_spec(1)), Ok(1.0));
     }
 
@@ -614,6 +630,21 @@ mod tests {
         assert_eq!(risk_of_ruin(&[-0.1], &ruin_spec(7)), Ok(1.0));
         // Landing exactly on the level is ruin: 1 * (1 - 0.5) is 0.5, exact in binary.
         assert_eq!(risk_of_ruin(&[-0.5], &ruin_spec(1)), Ok(1.0));
+    }
+
+    #[test]
+    fn ruin_is_a_drawdown_from_the_running_peak_not_from_the_start() {
+        // +60% then -50%: equity 1.6, then 0.8. That is half of the peak of 1.6, so ruin at a
+        // drawdown of 0.5, though still above the start's 0.5 floor.
+        let (rise, fall) = (0.6, -0.5);
+        assert!((1.0 + rise) * (1.0 + fall) > 0.5);
+        assert!(ruined([rise, fall].into_iter(), 0.5));
+        // A fall of 40% from the same peak, to 0.96, is not.
+        assert!(!ruined([rise, -0.4].into_iter(), 0.5));
+        // The peak is the highest equity so far, not the last one: +60%, -20%, -40% is 1.6,
+        // 1.28, then 0.768, below half the 1.6 high (0.8); with -35% last it is 0.832, above.
+        assert!(ruined([rise, -0.2, -0.4].into_iter(), 0.5));
+        assert!(!ruined([rise, -0.2, -0.35].into_iter(), 0.5));
     }
 
     #[test]
@@ -628,32 +659,28 @@ mod tests {
         };
         assert_eq!(spec.mean_block, 1);
         let p = risk_of_ruin(&x, &spec).unwrap();
-        assert!(p > 0.0 && p < 0.5, "{p}");
+        assert!(p > 0.0 && p < 1.0, "{p}");
         assert_eq!(p, PINNED_RUIN);
     }
 
-    /// 807 of 2,000 paths.
-    const PINNED_RUIN: f64 = 0.4035;
+    /// 1,271 of 2,000 paths. Measured from the start it was 807 (0.4035): a path that first
+    /// climbs has further to fall before the start's floor than before half its peak.
+    const PINNED_RUIN: f64 = 0.6355;
 
     #[test]
     fn blocks_keep_a_run_of_losses_that_single_draws_scatter() {
-        // A bad regime of 8 trades at -10% (0.9^8 = 0.430, past half the account), then 92
-        // trades at +2%. Replaying this history from a uniformly random starting trade, with the
-        // wrap, ruins 9 of the 100 starts: the 8 starts with 0 to 7 wins before the losses
-        // (1.02^7 * 0.9^8 = 0.495 is ruin, 1.02^8 * 0.9^8 = 0.504 is not) and the start on the
-        // second loss (0.9^7 = 0.478).
+        // A bad regime of 8 trades at -10% (0.9^8 = 0.430 of the high before it, past half the
+        // account), then 92 trades at +2%. Replaying this history from each of the 100 starting
+        // trades, with the wrap, ruins 95 of them: the 92 starts on a win, which meet the whole
+        // run after a high, and the starts on the first, second and last loss, whose run is
+        // split by the wrap into pieces of which one still holds 7 losses (0.9^7 = 0.478). The
+        // other five starts split it into pieces of at most 6 (0.9^6 = 0.531).
         let mut x = vec![-0.1; 8];
         x.extend([0.02; 92]);
         let ruined_starts = (0..x.len())
-            .filter(|&start| {
-                let mut equity = 1.0;
-                (0..x.len()).any(|k| {
-                    equity *= 1.0 + x[(start + k) % x.len()];
-                    equity <= 0.5
-                })
-            })
+            .filter(|&start| ruined((0..x.len()).map(|k| x[(start + k) % x.len()]), 0.5))
             .count();
-        assert_eq!(ruined_starts, 9);
+        assert_eq!(ruined_starts, 95);
         let spec = RuinSpec {
             paths: 2_000,
             mean_block: default_block_len(x.len()),
@@ -669,14 +696,16 @@ mod tests {
             },
         )
         .unwrap();
-        // Blocks land near the 9% of the random starts, past #35's 5% gate; single draws do not.
-        assert!(blocks > 0.05 && blocks < 0.15, "{blocks}");
+        // Blocks of mean length 4 carry enough of the run to pass #35's 5% gate, short of the
+        // whole history's 95%; single draws scatter it.
+        assert!(blocks > 0.05 && blocks < 0.95, "{blocks}");
         assert!(single < 0.01, "{single}");
         assert_eq!((blocks, single), PINNED_CLUSTERED_RUIN);
     }
 
-    /// 180 and 1 of 2,000 paths, seed 3.
-    const PINNED_CLUSTERED_RUIN: (f64, f64) = (0.09, 0.0005);
+    /// 624 and 3 of 2,000 paths, seed 3. Measured from the start they were 180 and 1 (0.09 and
+    /// 0.0005).
+    const PINNED_CLUSTERED_RUIN: (f64, f64) = (0.312, 0.0015);
 
     fn challenge(horizon_days: usize) -> PropFirmSpec {
         PropFirmSpec {
