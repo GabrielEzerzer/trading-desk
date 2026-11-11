@@ -5,7 +5,7 @@ import { EngineState } from './EngineState'
 import { useEngineStatus } from './engine'
 import { StrategyLab } from './lab/StrategyLab'
 import { SECTIONS, type Section, SectionToggle } from './SectionToggle'
-import { Trading } from './sections/Trading'
+import { Trading } from './trading/Trading'
 
 export function App() {
   const [section, setSection] = useState<Section>('lab')
@@ -34,14 +34,18 @@ export function App() {
           <EngineDot status={status} />
         </header>
         <main className="sheet" aria-label={label}>
-          {/* Both sections stay mounted so a run keeps going while Trading is open. A hidden
-              section's fade restarts when it is shown again: the switch is one 180 ms fade. */}
+          {/* The Lab stays mounted so a run keeps going while Trading is open. Trading unmounts
+              when hidden, which disposes its chart and ends its subscriptions; a paper session
+              keeps running in the engine. A section's fade restarts when it is shown again: the
+              switch is one 180 ms fade. */}
           <div className="sheet-content" hidden={section !== 'lab'}>
             {status.state === 'running' ? <StrategyLab /> : <EngineState status={status} />}
           </div>
-          <div className="sheet-content" hidden={section !== 'trading'}>
-            <Trading />
-          </div>
+          {section === 'trading' && (
+            <div className="sheet-content">
+              <Trading status={status} />
+            </div>
+          )}
         </main>
       </div>
     </Tooltip.Provider>

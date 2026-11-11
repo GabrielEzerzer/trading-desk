@@ -66,14 +66,25 @@ export function layoutAudit(): LayoutReport {
   // (the fade hides what passes under it; the clearance spec checks the last content clears it),
   // a table's sticky header covers the rows scrolled under it, and menus and tooltips float above
   // everything.
+  //
+  // Trading: the chart canvas fills the sheet edge to edge, under everything else in the section.
+  // The ticker switcher, the timeframe pill, the position line, the order composer, the attribution
+  // link and the empty-chart notes float over it on purpose, so the canvas is its own layer; those
+  // floating pieces stay on the page layer and are still checked against each other. The ticker
+  // menu and the session and start panels are popovers (role=dialog) that float over the page, and
+  // a menu opened from one of them (the start panel's strategy menu) floats over the panel.
   const layer = (e: Element) =>
     e.closest('[role=menu], [role=tooltip], .tooltip')
       ? 'popover'
-      : e.closest('.composer-dock')
+      : e.closest('[role=dialog]')
+        ? 'panel'
+        : e.closest('.composer-dock')
         ? 'composer'
         : e.closest('.table thead')
           ? 'sticky-header'
-          : 'page'
+          : e.closest('.chart-canvas')
+            ? 'chart'
+            : 'page'
   const boxes = [
     ...document.querySelectorAll('a,button,input,select,textarea,h1,h2,h3,h4,p,li,label,img,dt,dd,th,td,[role^=menuitem],[role=radio]'),
   ]
@@ -95,8 +106,9 @@ export function layoutAudit(): LayoutReport {
 
 /**
  * Hit areas: every visible control must answer clicks across a square of `min` CSS px around its
- * centre (the composer's controls 44, the rest 24, WCAG 2.5.8). Tests with elementFromPoint at the
- * centre plus and minus (min / 2 - 1) px on each axis, after scrolling the control to the middle.
+ * centre (44 for the controls in the Lab's composer and Trading's order composer, 24 for the rest,
+ * WCAG 2.5.8). Tests with elementFromPoint at the centre plus and minus (min / 2 - 1) px on each
+ * axis, after scrolling the control to the middle.
  */
 export function hitAudit(): unknown[] {
   const failures: unknown[] = []
@@ -115,11 +127,16 @@ export function hitAudit(): unknown[] {
   const answers = (e: Element, hit: Element | null) => {
     if (!hit) return false
     if (hit === e || e.contains(hit)) return true
+    // An open menu, popover or tooltip floats above the page on purpose (the layers in
+    // layoutAudit), so a point it covers does not count against a control underneath it. A
+    // control inside the floating layer itself is still checked.
+    const floating = hit.closest('[role=menu], [role=dialog], [role=tooltip]')
+    if (floating && !floating.contains(e)) return true
     const label = hit.closest('label')
     return !!label && (label.contains(e) || (label.htmlFor !== '' && label.htmlFor === e.id))
   }
   for (const e of controls) {
-    const min = e.closest('.composer') ? 44 : 24
+    const min = e.closest('.composer, .order-composer') ? 44 : 24
     e.scrollIntoView({ block: 'center', inline: 'center' })
     const r = e.getBoundingClientRect()
     const cx = r.left + r.width / 2

@@ -111,9 +111,10 @@ fn assert_same_state(a: &PaperSession, b: &PaperSession) {
 fn a_paper_session_fed_the_backtest_bars_matches_the_backtest() {
     for kind in [InstrumentKind::Spot, InstrumentKind::Perpetual] {
         let bars = minutes(0..300);
-        let funding: Vec<(Millis, f64)> = match kind {
-            InstrumentKind::Spot => Vec::new(),
-            InstrumentKind::Perpetual => (0..5).map(|h| (T0 + h * HOUR, 0.0001)).collect(),
+        let funding: Vec<(Millis, f64)> = if kind.rules().funding {
+            (0..5).map(|h| (T0 + h * HOUR, 0.0001)).collect()
+        } else {
+            Vec::new()
         };
         let cfg = config(kind, Timeframe::M1);
         let backtest = run_backtest(
@@ -604,11 +605,12 @@ async fn live_session_stops_and_resumes(kind: InstrumentKind) {
     let cfg = config(kind, tf);
     let history = resample(&minutes(-60..0), tf, false).candles;
     // A rate every hour, the ones before the session only telling it the interval.
-    let funding: Vec<(Millis, f64)> = match kind {
-        InstrumentKind::Spot => Vec::new(),
-        InstrumentKind::Perpetual => (-3..=3)
+    let funding: Vec<(Millis, f64)> = if kind.rules().funding {
+        (-3..=3)
             .map(|h| (T0 + h * HOUR, 0.0001 * (1 + h.rem_euclid(3)) as f64))
-            .collect(),
+            .collect()
+    } else {
+        Vec::new()
     };
     let rest = Arc::new(FakeRest {
         funding: funding.clone(),

@@ -272,14 +272,16 @@ fn archive_urls_follow_the_published_layout() {
         binance::archive_url(
             &id(InstrumentKind::Spot),
             binance::ArchivePeriod::Month(month)
-        ),
+        )
+        .expect("binance lists spot"),
         "https://data.binance.vision/data/spot/monthly/klines/BTCUSDT/1m/BTCUSDT-1m-2024-01.zip"
     );
     assert_eq!(
         binance::archive_url(
             &id(InstrumentKind::Perpetual),
             binance::ArchivePeriod::Day(1_704_153_600_000)
-        ),
+        )
+        .expect("binance lists perpetuals"),
         "https://data.binance.vision/data/futures/um/daily/klines/BTCUSDT/1m/BTCUSDT-1m-2024-01-02.zip"
     );
 }

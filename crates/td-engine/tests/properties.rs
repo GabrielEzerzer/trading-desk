@@ -168,11 +168,12 @@ fn check(
     let mut funding = Vec::new();
     for (b, spec) in bars.iter().zip(&specs) {
         let (at_open, later) = spec.4;
-        let events: Vec<(i64, f64)> = match kind {
-            InstrumentKind::Perpetual => (at_open.map(|rate| (b.open_time, rate)).into_iter())
+        let events: Vec<(i64, f64)> = if kind.rules().funding {
+            (at_open.map(|rate| (b.open_time, rate)).into_iter())
                 .chain(later.map(|rate| (b.open_time + 30_000, rate)))
-                .collect(),
-            InstrumentKind::Spot => vec![],
+                .collect()
+        } else {
+            vec![]
         };
         session.on_bar(*b, &events).unwrap();
         funding.push(events);

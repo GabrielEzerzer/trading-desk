@@ -44,9 +44,9 @@ pub trait DataSource: Send + Sync {
     /// listing endpoint returns its fixed list.
     fn instruments(&self, http: &Http, kind: InstrumentKind) -> Result<InstrumentList, DataError>;
 
-    /// The fee schedule an instrument of `kind` gets unless told otherwise. `kind` is one of
-    /// [`DataSource::kinds`].
-    fn default_fees(&self, kind: InstrumentKind) -> FeeSchedule;
+    /// The fee schedule an instrument of `kind` gets unless told otherwise, or
+    /// [`DataError::KindNotListed`] for a kind not in [`DataSource::kinds`].
+    fn default_fees(&self, kind: InstrumentKind) -> Result<FeeSchedule, DataError>;
 
     /// The 1-minute candles of `id` with open times in `[from, to)`, which lies inside one
     /// calendar month and ends no later than `now`. A source that publishes history as files
@@ -155,11 +155,11 @@ pub(crate) mod fake {
             Ok(InstrumentList::default())
         }
 
-        fn default_fees(&self, _: InstrumentKind) -> FeeSchedule {
-            FeeSchedule {
+        fn default_fees(&self, _: InstrumentKind) -> Result<FeeSchedule, DataError> {
+            Ok(FeeSchedule {
                 maker: 0.0,
                 taker: 0.0,
-            }
+            })
         }
 
         /// Every day file overlapping `[from, to)` whole, so the candles reach outside the range
@@ -207,6 +207,41 @@ mod tests {
         }
     }
 
+    /// Neither crypto venue lists FX: each place a request for an FX instrument reaches says so
+    /// with `KindNotListed` before it would touch the network.
+    #[test]
+    fn crypto_venues_refuse_fx_with_kind_not_listed() {
+        let http = Http::new().expect("an HTTP client");
+        let not_listed = |result: Result<(), DataError>, venue: Venue, what: &str| match result {
+            Err(e @ DataError::KindNotListed { .. }) => {
+                assert_eq!(
+                    e.to_string(),
+                    format!("{venue} does not list fx instruments")
+                );
+            }
+            other => panic!("{venue} {what}: {other:?}"),
+        };
+        for venue in [Venue::Binance, Venue::Bybit] {
+            let source = source(venue);
+            let id = InstrumentId {
+                venue,
+                symbol: "USDJPY".into(),
+                kind: InstrumentKind::Fx,
+            };
+            assert!(!source.kinds().contains(&InstrumentKind::Fx));
+            let fees = source.default_fees(InstrumentKind::Fx).map(|_| ());
+            not_listed(fees, venue, "fees");
+            let listed = crate::fetch_instruments(&http, venue, InstrumentKind::Fx);
+            not_listed(listed.map(|_| ()), venue, "instruments");
+            let history = source.minute_history(&http, &id, 0, 60_000, 120_000);
+            not_listed(history.map(|_| ()), venue, "history");
+            let live = source.live().expect("a live stream");
+            let klines = live.klines(&http, &id, td_core::Timeframe::M1, 0, 60_000);
+            not_listed(klines.map(|_| ()), venue, "klines");
+            assert_eq!(live.url(&id), "", "{venue} has no stream for fx");
+        }
+    }
+
     /// The streams, greetings and fees each venue had before its code moved behind the trait.
     #[test]
     fn each_venue_is_served_by_its_own_source_with_its_streams_and_fees() {
@@ -241,7 +276,7 @@ mod tests {
             let source = source(venue);
             assert_eq!(source.venue(), venue);
             assert_eq!(source.kinds(), [Spot, Perpetual]);
-            assert_eq!(source.default_fees(kind), fees, "{venue} {kind}");
+            assert_eq!(source.default_fees(kind).ok(), Some(fees), "{venue} {kind}");
             let live = source.live().expect("a live stream");
             let id = btc(venue, kind);
             assert_eq!(live.url(&id), url);

@@ -103,6 +103,7 @@ impl From<VenueArg> for Venue {
 enum KindArg {
     Spot,
     Perpetual,
+    Fx,
 }
 
 impl From<KindArg> for InstrumentKind {
@@ -110,6 +111,7 @@ impl From<KindArg> for InstrumentKind {
         match k {
             KindArg::Spot => InstrumentKind::Spot,
             KindArg::Perpetual => InstrumentKind::Perpetual,
+            KindArg::Fx => InstrumentKind::Fx,
         }
     }
 }
@@ -327,5 +329,38 @@ mod tests {
         assert!(parse(&["--to", "2024-01"]).is_err());
         assert!(parse(&["--from", "2024-1", "--to", "2024-03"]).is_err());
         assert!(parse(&["--from", "2024-01-01", "--to", "2024-03"]).is_err());
+    }
+
+    #[test]
+    fn the_kind_argument_takes_each_kind_by_its_name() {
+        for (name, kind) in [
+            ("spot", InstrumentKind::Spot),
+            ("perpetual", InstrumentKind::Perpetual),
+            ("fx", InstrumentKind::Fx),
+        ] {
+            let cli = Cli::try_parse_from([
+                "td-data",
+                "instruments",
+                "--venue",
+                "binance",
+                "--kind",
+                name,
+            ])
+            .expect("parses");
+            let Command::Instruments { kind: arg, .. } = cli.command else {
+                panic!("not the instruments command");
+            };
+            assert_eq!(InstrumentKind::from(arg), kind);
+            assert_eq!(kind.to_string(), name);
+        }
+        let bad = [
+            "td-data",
+            "instruments",
+            "--venue",
+            "binance",
+            "--kind",
+            "forex",
+        ];
+        assert!(Cli::try_parse_from(bad).is_err());
     }
 }
