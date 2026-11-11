@@ -211,6 +211,7 @@ fn line<'a>(r: &'a BatteryResult, id: &str) -> &'a td_engine::Criterion {
 fn full_total(windows: usize, offset_windows: usize) -> usize {
     3 + PER_SWEEP
         + windows * PER_SWEEP
+        + 3 * windows
         + windows
         + offset_windows * PER_SWEEP
         + PER_SWEEP * (PERMUTATIONS + 1)

@@ -482,16 +482,19 @@ pub const MAX_DROPPED_SHARE: f64 = 0.01;
 pub const TOO_GOOD_SHARPE: f64 = 4.0;
 
 /// The integrity checks of the data and the engine (I1 to I3), computed by the battery on the
-/// plan's backtest before anything else runs. A check the battery could not make is `None` and
-/// fails, which makes the verdict `invalid`.
+/// plan's backtest before anything else runs. I2 and I3 then also run on each parameter set the
+/// walk-forward chose, and hold the worst result over every set checked. A check the battery
+/// could not make is `None` and fails, which makes the verdict `invalid`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct IntegrityInputs {
     /// I1: the buckets of the period's open hours that have no bar, over all of them.
     pub dropped_share: Option<f64>,
-    /// I2: 0 when two runs of the same backtest gave identical fills and equity, 1 otherwise.
+    /// I2: 0 when two runs of each backtest checked gave identical fills and equity, 1
+    /// otherwise.
     pub repeat_differences: Option<usize>,
     /// I3: the orders decided on the first half of the period that differ between a run on
-    /// that half alone and the full run, counting an order only one of them has.
+    /// that half alone and the full run, counting an order only one of them has; the most over
+    /// the backtests checked.
     pub prefix_differences: Option<usize>,
 }
 
