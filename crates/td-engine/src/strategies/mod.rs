@@ -12,12 +12,6 @@ pub(crate) mod private {
     include!(concat!(env!("OUT_DIR"), "/private_strategies.rs"));
 }
 
-/// The fixture strategies in `tests/fixtures/private_strategies/`, compiled in the same way.
-#[cfg(test)]
-pub(crate) mod fixture {
-    include!(concat!(env!("OUT_DIR"), "/fixture_strategies.rs"));
-}
-
 use td_core::{OrderRequest, OrderType, Side, TimeInForce};
 
 use crate::Context;
@@ -61,4 +55,10 @@ fn direction(x: f64) -> f64 {
     } else {
         0.0
     }
+}
+
+/// The fixture strategies in `tests/fixtures/private_strategies/`, compiled in the same way.
+#[cfg(test)]
+pub(crate) mod fixture {
+    include!(concat!(env!("OUT_DIR"), "/fixture_strategies.rs"));
 }

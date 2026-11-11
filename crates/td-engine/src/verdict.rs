@@ -1316,7 +1316,8 @@ mod tests {
         use Layer::{Evidence, Integrity, Kind};
         use Outcome::{Fail, Inconclusive, Pass};
         use VerdictState::{Invalid, NoTrade, NotEnoughEvidence, Trade};
-        let cases: [(&str, Vec<(Layer, Outcome)>, VerdictState); 13] = [
+        type Case = (&'static str, Vec<(Layer, Outcome)>, VerdictState);
+        let cases: [Case; 13] = [
             (
                 "all pass",
                 vec![(Integrity, Pass), (Evidence, Pass), (Kind, Pass)],
