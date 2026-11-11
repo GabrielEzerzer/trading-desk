@@ -1164,7 +1164,8 @@ export type RejectedInstrument = { symbol: string, reason: string, };
  */
 export type DownloadRequest = { instrument: InstrumentId, 
 /**
- * Not before 2017-01-01 00:00 UTC (1483228800000); earlier is a 400.
+ * Not before 2017-01-01 00:00 UTC (1483228800000) for binance and bybit, or before
+ * 2003-01-01 00:00 UTC (1041379200000) for dukascopy; earlier is a 400.
  */
 from: number, to: number, };
 

@@ -75,16 +75,40 @@ pub(super) async fn instrument_list(
     Ok(response)
 }
 
-/// The earliest `from` a download accepts: 2017-01-01 00:00 UTC, before the earliest data either
-/// venue has. An earlier `from` would only ask the archive for years of files that do not exist.
+/// The earliest `from` a Binance or Bybit download accepts: 2017-01-01 00:00 UTC, before the
+/// earliest data either venue has. An earlier `from` would only ask the archive for years of files
+/// that do not exist.
 pub const EARLIEST_FROM: Millis = 1_483_228_800_000;
+
+/// The earliest `from` a Dukascopy download accepts: 2003-01-01 00:00 UTC. Dukascopy's "Data
+/// export" page (<https://wiki.dukascopy.com/en/development/data-export/>, read on 2026-11-11)
+/// names no earliest date, so this is a floor chosen early enough for the FX history the desk
+/// needs, from 2016; it is not taken from any pair's first file.
+pub const DUKASCOPY_EARLIEST_FROM: Millis = 1_041_379_200_000;
+
+/// The earliest `from` a download of `venue`'s data accepts, and the message refusing an earlier
+/// one.
+fn earliest_from(venue: Venue) -> (Millis, &'static str) {
+    match venue {
+        Venue::Binance | Venue::Bybit => (
+            EARLIEST_FROM,
+            "`from` must not be before 2017-01-01 00:00 UTC (1483228800000), before either \
+             venue's earliest data",
+        ),
+        Venue::Dukascopy => (
+            DUKASCOPY_EARLIEST_FROM,
+            "`from` must not be before 2003-01-01 00:00 UTC (1041379200000) for dukascopy",
+        ),
+    }
+}
 
 /// What to download: the 1-minute candles of `instrument` with open times in `[from, to)`, and
 /// for a perpetual its funding rates in the same range. Anything after now is skipped.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 pub struct DownloadRequest {
     pub instrument: InstrumentId,
-    /// Not before 2017-01-01 00:00 UTC (1483228800000); earlier is a 400.
+    /// Not before 2017-01-01 00:00 UTC (1483228800000) for binance and bybit, or before
+    /// 2003-01-01 00:00 UTC (1041379200000) for dukascopy; earlier is a 400.
     pub from: Millis,
     pub to: Millis,
 }
@@ -137,11 +161,9 @@ pub(super) async fn download(
     if request.from >= request.to {
         return Err(ApiError::bad_request("`to` must be after `from`"));
     }
-    if request.from < EARLIEST_FROM {
-        return Err(ApiError::bad_request(
-            "`from` must not be before 2017-01-01 00:00 UTC (1483228800000), before either \
-             venue's earliest data",
-        ));
+    let (earliest, refusal) = earliest_from(request.instrument.venue);
+    if request.from < earliest {
+        return Err(ApiError::bad_request(refusal));
     }
     // Rejects a symbol that cannot name a store folder before any work starts.
     state

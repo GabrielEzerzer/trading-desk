@@ -12,10 +12,10 @@ use futures_util::{SinkExt, StreamExt};
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 use td_core::{Candle, FeeSchedule, Instrument, InstrumentId, InstrumentKind, Millis, Venue};
-use td_data::time::{MINUTE, Month, now_ms, parse_date};
+use td_data::time::{DAY, MINUTE, Month, now_ms, parse_date};
 use td_data::{DataError, DownloadReport, InstrumentList, Store};
 use td_server::api::auth::Token;
-use td_server::api::data::EARLIEST_FROM;
+use td_server::api::data::{DUKASCOPY_EARLIEST_FROM, EARLIEST_FROM};
 use td_server::api::error::ApiError;
 use td_server::api::jobs::{JobInfo, JobResult, JobStatus};
 use td_server::api::source::{LiveSource, MarketSource};
@@ -738,6 +738,59 @@ async fn bad_requests_get_json_errors_with_matching_statuses() {
     let (status, body) = t.post("/health", "").await;
     assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
     assert_eq!(body["error"]["code"], "method_not_allowed");
+}
+
+/// The earliest `from` is the venue's: Binance and Bybit keep 2017-01-01 and its message, and
+/// Dukascopy's FX history downloads from 2016, back to 2003-01-01.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_earliest_download_from_is_the_venues() {
+    let t = TestServer::start(FakeSource::default()).await;
+    let download = |venue: &str, symbol: &str, kind: &str, from: Millis| {
+        json!({
+            "instrument": { "venue": venue, "symbol": symbol, "kind": kind },
+            "from": from,
+            "to": from + 7 * DAY,
+        })
+        .to_string()
+    };
+
+    assert_eq!(EARLIEST_FROM, day("2017-01-01"));
+    for (venue, kind) in [("binance", "spot"), ("bybit", "perpetual")] {
+        for from in [EARLIEST_FROM - MINUTE, day("2016-01-01")] {
+            let body = download(venue, "BTCUSDT", kind, from);
+            let (status, answer) = t.post("/data/download", &body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(
+                answer["error"]["message"],
+                "`from` must not be before 2017-01-01 00:00 UTC (1483228800000), before either \
+                 venue's earliest data"
+            );
+        }
+    }
+    assert_eq!(t.get("/jobs").await.1, json!([]), "no job was started");
+
+    assert_eq!(DUKASCOPY_EARLIEST_FROM, day("2003-01-01"));
+    let early = download(
+        "dukascopy",
+        "USDJPY",
+        "fx",
+        DUKASCOPY_EARLIEST_FROM - MINUTE,
+    );
+    let (status, answer) = t.post("/data/download", &early).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{answer}");
+    assert_eq!(
+        answer["error"]["message"],
+        "`from` must not be before 2003-01-01 00:00 UTC (1041379200000) for dukascopy"
+    );
+    for from in [day("2016-01-01"), DUKASCOPY_EARLIEST_FROM] {
+        let body = download("dukascopy", "USDJPY", "fx", from);
+        let (status, created) = t.post("/data/download", &body).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}: {created}");
+        // The fake fails the job as a server without AWS credentials does; the next download of
+        // the same instrument waits for that, or it would be a 409.
+        let id = created["job_id"].as_u64().expect("a job id");
+        t.until_status(id, "failed").await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

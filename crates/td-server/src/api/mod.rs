@@ -6,9 +6,10 @@
 //! - `GET /health`: the server version.
 //! - `GET /instruments?venue=&kind=`: the instruments a venue lists, cached per server run.
 //! - `POST /data/download` `{instrument, from, to}`: starts a download job, answers `{job_id}`.
-//!   `from` may not be before 2017-01-01 UTC ([`data::EARLIEST_FROM`]); an instrument that already
-//!   has an unfinished download in this server is a 409 `conflict` (a duplicate from another
-//!   server on the same data folder is safe, since the store locks across processes, just
+//!   `from` may not be before 2017-01-01 UTC for binance and bybit ([`data::EARLIEST_FROM`]), or
+//!   before 2003-01-01 UTC for dukascopy ([`data::DUKASCOPY_EARLIEST_FROM`]); an instrument that
+//!   already has an unfinished download in this server is a 409 `conflict` (a duplicate from
+//!   another server on the same data folder is safe, since the store locks across processes, just
 //!   redundant).
 //! - `GET /data/coverage?instrument=venue:symbol:kind`: which months and minutes the store holds,
 //!   and each month file's bytes.
