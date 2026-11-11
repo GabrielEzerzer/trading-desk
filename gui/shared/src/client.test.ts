@@ -12,10 +12,16 @@ describe('createClient', () => {
     expect(await client.health()).toEqual({ version: '0.1.0' })
     await client.coverage({ venue: 'binance', symbol: 'BTCUSDT', kind: 'spot' })
     await client.cancelJob(7)
+    await client.session('1762790400000-0a1b2c3d')
+    await client.stopSession('a')
+    await client.resumeSession('a')
     expect(sent).toEqual([
       { method: 'GET', path: '/health' },
       { method: 'GET', path: '/data/coverage', query: { instrument: 'binance:BTCUSDT:spot' } },
       { method: 'POST', path: '/jobs/7/cancel' },
+      { method: 'GET', path: '/sessions/1762790400000-0a1b2c3d' },
+      { method: 'POST', path: '/sessions/a/stop' },
+      { method: 'POST', path: '/sessions/a/resume' },
     ])
   })
 

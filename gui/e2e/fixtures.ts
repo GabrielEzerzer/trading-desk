@@ -3,7 +3,7 @@
 import { test as base, expect } from '@playwright/test'
 import { openApp, serve } from '../app/shots/harness.mjs'
 
-export type StubConfig = { engine: 'starting' | 'failed' | 'running'; mock: boolean; hangStrategies?: boolean }
+export type StubConfig = { engine: 'starting' | 'failed' | 'running'; mock: boolean; hangStrategies?: boolean; failSessions?: number }
 
 export const test = base.extend<{ open: (config: StubConfig, options?: { clock?: boolean }) => Promise<void> }, { appURL: string }>({
   appURL: [
