@@ -352,9 +352,12 @@ fn crossed(bid: &Candle, ask: &Candle) -> bool {
 }
 
 /// The URL of the page of `instrument` (OANDA's name) starting at `from`. It holds no secret.
+/// `includeFirst` is set because the spec names no default, and the candle at `from` must be in
+/// the page.
 fn page_url(base: &str, instrument: &str, from: Millis) -> String {
     format!(
-        "{base}/v3/instruments/{instrument}/candles?price=BA&granularity=M1&count={PAGE}&from={}.{:03}",
+        "{base}/v3/instruments/{instrument}/candles?price=BA&granularity=M1&count={PAGE}\
+         &includeFirst=true&from={}.{:03}",
         from.div_euclid(1000),
         from.rem_euclid(1000)
     )
@@ -887,7 +890,7 @@ mod tests {
         assert_eq!(
             page_url("https://h", "USD_JPY", monday + 61_234),
             "https://h/v3/instruments/USD_JPY/candles?price=BA&granularity=M1&count=5000\
-             &from=1704672061.234"
+             &includeFirst=true&from=1704672061.234"
         );
         assert_eq!(oanda_name("USDJPY"), "USD_JPY");
     }
@@ -1035,7 +1038,7 @@ mod tests {
         assert_eq!(
             first,
             "get /v3/instruments/usd_jpy/candles?price=ba&granularity=m1&count=5000\
-             &from=1704672000.000 http/1.1"
+             &includefirst=true&from=1704672000.000 http/1.1"
         );
         let lines: Vec<&str> = request.lines().filter(|l| l.contains(&lower)).collect();
         assert_eq!(lines, [format!("authorization: bearer {lower}")]);
