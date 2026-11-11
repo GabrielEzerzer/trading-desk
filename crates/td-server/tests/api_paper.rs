@@ -4,14 +4,15 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 use td_core::{
-    Candle, FeeSchedule, Instrument, InstrumentId, InstrumentKind, Millis, Timeframe, Venue,
+    Candle, FeeSchedule, Instrument, InstrumentId, InstrumentKind, Millis, OrderId, Timeframe,
+    Venue,
 };
 use td_data::live::Rest;
 use td_data::{DataError, DownloadReport, InstrumentList, Store, resample};
@@ -21,7 +22,7 @@ use td_server::api::sessions::SessionState;
 use td_server::api::source::{LiveSource, MarketSource};
 use td_server::api::ws::{MAX_CANDLE_TOPICS, ServerMessage};
 use td_server::api::{ApiConfig, JOB_GRACE, Server};
-use td_server::{Funding, PaperConfig, PaperSession, SessionEvent};
+use td_server::{Funding, MANUAL_STRATEGY, OrderSource, PaperConfig, PaperSession, SessionEvent};
 use tempfile::TempDir;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast;
@@ -142,9 +143,11 @@ impl MarketSource for Venues {
     }
 }
 
-/// Serves minutes (and bars resampled from them) and the funding rates, as of 00:00:30.
+/// Serves minutes (and bars resampled from them) and the funding rates, as of its clock: 00:00:30
+/// unless a test moves it.
 struct FakeRest {
     minutes: Vec<Candle>,
+    now: Arc<AtomicI64>,
 }
 
 impl Rest for FakeRest {
@@ -179,7 +182,7 @@ impl Rest for FakeRest {
     }
 
     fn now(&self) -> Millis {
-        T0 + 30_000
+        self.now.load(Ordering::SeqCst)
     }
 }
 
@@ -191,6 +194,8 @@ struct Exchange {
     push: broadcast::Sender<String>,
     accepted: Arc<AtomicUsize>,
     open: Arc<AtomicUsize>,
+    /// The time its REST source gives, kept across server restarts.
+    now: Arc<AtomicI64>,
 }
 
 impl Exchange {
@@ -202,6 +207,7 @@ impl Exchange {
             push: broadcast::channel(1024).0,
             accepted: Arc::new(AtomicUsize::new(0)),
             open: Arc::new(AtomicUsize::new(0)),
+            now: Arc::new(AtomicI64::new(T0 + 30_000)),
         };
         let serving = venue.clone();
         tokio::spawn(async move {
@@ -280,6 +286,7 @@ impl Api {
             venue: venue.clone(),
             rest: Arc::new(FakeRest {
                 minutes: minutes(-60..60),
+                now: venue.now.clone(),
             }),
         };
         let server = Server::start(ApiConfig {
@@ -512,8 +519,23 @@ fn config() -> PaperConfig {
 /// A library session warmed up on the hour before `T0` and fed `live` minutes with the funding
 /// due in each, as the server's session should have been.
 fn reference(live: &[Candle]) -> (TempDir, PaperSession) {
+    reference_by_hand(config(), live, &[])
+}
+
+/// Something done by hand between bars: a manual order's body, or a cancel of an order id.
+enum Hand {
+    Place(Value),
+    Cancel(u64),
+}
+
+/// [`reference`] for `cfg`, doing what `script` says after the minute each step is paired with.
+fn reference_by_hand(
+    cfg: PaperConfig,
+    live: &[Candle],
+    script: &[(i64, Hand)],
+) -> (TempDir, PaperSession) {
     let dir = tempfile::tempdir().expect("temp dir");
-    let mut paper = PaperSession::create(dir.path(), "ref", config()).expect("creates");
+    let mut paper = PaperSession::create(dir.path(), "ref", cfg).expect("creates");
     for bar in minutes(-60..0) {
         paper.feed(bar, Vec::new(), true).expect("warm-up bar");
     }
@@ -528,6 +550,20 @@ fn reference(live: &[Candle]) -> (TempDir, PaperSession) {
             })
             .collect();
         paper.feed(*bar, funding, false).expect("feeds");
+        let minute = (bar.open_time - T0) / MIN;
+        for (_, hand) in script.iter().filter(|(m, _)| *m == minute) {
+            match hand {
+                Hand::Place(body) => {
+                    let order = serde_json::from_value(body.clone()).expect("an order");
+                    // Accepted as the bar closes.
+                    let at = bar.open_time + MIN;
+                    paper.place(&order, at).expect("accepted");
+                }
+                Hand::Cancel(id) => {
+                    paper.cancel(OrderId(*id)).expect("cancels");
+                }
+            }
+        }
     }
     (dir, paper)
 }
@@ -612,7 +648,7 @@ async fn a_session_streams_its_events_matches_the_library_and_stops() {
             _ => None,
         })
         .collect();
-    assert_eq!(fills, reference.fills(), "each fill once");
+    assert_eq!(fills, reference.fills_with_source(), "each fill once");
     assert!(
         events
             .iter()
@@ -1017,6 +1053,12 @@ async fn session_routes_and_the_websocket_still_need_the_token() {
         api.client.get(api.url(&format!("/sessions/{id}"))),
         api.client.post(api.url(&format!("/sessions/{id}/stop"))),
         api.client.post(api.url(&format!("/sessions/{id}/resume"))),
+        api.client
+            .post(api.url(&format!("/sessions/{id}/orders")))
+            .header("content-type", "application/json")
+            .body(json!({ "side": "buy", "qty": 1.0, "type": "market" }).to_string()),
+        api.client
+            .post(api.url(&format!("/sessions/{id}/orders/1/cancel"))),
     ];
     for request in requests {
         let (status, body) = api.send(request).await;
@@ -1039,5 +1081,326 @@ async fn session_routes_and_the_websocket_still_need_the_token() {
         list[0]["status"]["status"], "stopped",
         "the refused stop did nothing"
     );
+    let (_, state) = api.get(&format!("/sessions/{id}")).await;
+    assert_eq!(
+        state["open_orders"],
+        json!([]),
+        "the refused order did nothing"
+    );
+    api.shutdown().await;
+}
+
+fn manual_config() -> PaperConfig {
+    PaperConfig {
+        strategy: MANUAL_STRATEGY.into(),
+        params: Params::new(),
+        ..config()
+    }
+}
+
+/// After minute 4: a market buy with its quantity off the lot, and a limit buy that is never
+/// reached. After minute 19: that limit buy cancelled, and a limit sell, off the tick, that rests
+/// until minute 37 reaches it.
+fn manual_script() -> Vec<(i64, Hand)> {
+    vec![
+        (
+            4,
+            Hand::Place(json!({ "side": "buy", "qty": 10.0004, "type": "market" })),
+        ),
+        (
+            4,
+            Hand::Place(
+                json!({ "side": "buy", "qty": 10.0, "type": "limit", "limit_price": 90.0 }),
+            ),
+        ),
+        (19, Hand::Cancel(2)),
+        (
+            19,
+            Hand::Place(
+                json!({ "side": "sell", "qty": 10.0, "type": "limit", "limit_price": 105.299 }),
+            ),
+        ),
+    ]
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_manual_session_trades_orders_placed_over_the_api_and_replays_them_after_a_restart() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let venue = Exchange::start().await;
+    let api = Api::start(&dir, &venue).await;
+    let mut body: Value = serde_json::from_str(&start_body()).unwrap();
+    body["strategy"] = json!("none");
+    body["params"] = json!({});
+    let (status, created) = api.post("/sessions", &body.to_string()).await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    assert_eq!(created["strategy"], "none");
+    let id = created["id"].as_str().expect("an id").to_string();
+    api.until_live(&id).await;
+    venue.until_open(1).await;
+    let orders = format!("/sessions/{id}/orders");
+    let cancel = |order: &str| format!("/sessions/{id}/orders/{order}/cancel");
+    let script = manual_script();
+    let place = |step: usize| match &script[step].1 {
+        Hand::Place(body) => body.to_string(),
+        Hand::Cancel(_) => unreachable!("a cancel"),
+    };
+
+    // Connected, but no live bar yet.
+    let (status, refused) = api.post(&orders, &place(0)).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+    assert_eq!(refused["error"]["code"], "not_live");
+
+    let mut ws = api.websocket().await;
+    ws.subscribe(&format!("session:{id}")).await;
+    let ServerMessage::SessionState { .. } = ws.next().await else {
+        panic!("the state comes right after subscribed");
+    };
+    venue.send(&minutes(0..5));
+    api.until_bar(&id, T0 + 4 * MIN).await;
+
+    let (status, market) = api.post(&orders, &place(0)).await;
+    assert_eq!(status, StatusCode::CREATED, "{market}");
+    assert_eq!(market["id"], 1);
+    assert_eq!(market["source"], "manual");
+    assert_eq!(market["request"]["qty"], 10.0, "rounded down to the lot");
+    assert_eq!(market["status"]["status"], "open");
+    assert_eq!(market["submitted_at"], T0 + 4 * MIN);
+    // It comes on the session's topic after the bars before it.
+    loop {
+        match ws.next().await {
+            ServerMessage::Session {
+                event: SessionEvent::Order { order },
+                ..
+            } => {
+                assert_eq!(order.order.id, OrderId(1));
+                assert_eq!(order.source, OrderSource::Manual);
+                break;
+            }
+            ServerMessage::Session {
+                event:
+                    SessionEvent::Bar { .. }
+                    | SessionEvent::Funding { .. }
+                    | SessionEvent::Status { .. },
+                ..
+            } => {}
+            other => panic!("expected the order, got {other:?}"),
+        }
+    }
+
+    // Refused with the engine's reason, and nothing changes.
+    for (order, reason) in [
+        (
+            json!({ "side": "buy", "qty": 0.0004, "type": "market" }),
+            "qty",
+        ),
+        (
+            json!({ "side": "buy", "qty": 1000.0, "type": "market" }),
+            "leverage cap",
+        ),
+        (
+            json!({ "side": "buy", "qty": 1.0, "type": "limit" }),
+            "limit_price",
+        ),
+    ] {
+        let (status, refused) = api.post(&orders, &order.to_string()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{order}: {refused}");
+        assert_eq!(refused["error"]["code"], "invalid_order");
+        let message = refused["error"]["message"].as_str().expect("a message");
+        assert!(message.contains(reason), "{order}: {message}");
+    }
+    for order in [
+        json!({ "side": "buy", "qty": 1.0, "type": "stop" }),
+        json!({ "side": "buy", "qty": 1.0, "type": "market", "post_only": true }),
+    ] {
+        let (status, refused) = api.post(&orders, &order.to_string()).await;
+        assert!(status.is_client_error(), "{order}: {status} {refused}");
+        assert_eq!(refused["error"]["code"], "bad_request", "{refused}");
+    }
+    let (status, resting) = api.post(&orders, &place(1)).await;
+    assert_eq!(status, StatusCode::CREATED, "{resting}");
+    assert_eq!(resting["id"], 2, "refused orders take no id");
+
+    venue.send(&minutes(5..20));
+    api.until_bar(&id, T0 + 19 * MIN).await;
+    let (status, cancelled) = api.post(&cancel("2"), "").await;
+    assert_eq!(status, StatusCode::OK, "{cancelled}");
+    assert_eq!(cancelled["status"]["status"], "cancelled");
+    assert_eq!(cancelled["source"], "manual");
+    let (status, again) = api.post(&cancel("2"), "").await;
+    assert_eq!(status, StatusCode::CONFLICT, "{again}");
+    assert_eq!(again["error"]["code"], "order_done");
+    let (status, filled) = api.post(&cancel("1"), "").await;
+    assert_eq!(status, StatusCode::CONFLICT, "{filled}");
+    assert_eq!(filled["error"]["code"], "order_done");
+    for path in [
+        cancel("99"),
+        cancel("x"),
+        "/sessions/nope/orders/1/cancel".to_string(),
+        "/sessions/nope/orders".to_string(),
+    ] {
+        let (status, missing) = api.post(&path, &place(0)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{path}: {missing}");
+        assert_eq!(missing["error"]["code"], "not_found");
+    }
+    let (status, sell) = api.post(&orders, &place(3)).await;
+    assert_eq!(status, StatusCode::CREATED, "{sell}");
+    assert_eq!(sell["id"], 3);
+
+    let (_, state) = api.get(&format!("/sessions/{id}")).await;
+    let (_dir, expected) = reference_by_hand(manual_config(), &minutes(0..20), &script);
+    assert_same_state(&state, &expected);
+    assert_eq!(state["fills"].as_array().map(Vec::len), Some(1));
+    assert_eq!(state["fills"][0]["source"], "manual");
+    assert_eq!(state["trades"][0]["source"], "manual");
+    assert_eq!(state["open_orders"][0]["id"], 3);
+
+    // The server stops and starts again: the session is replayed from its log, manual orders and
+    // the cancel included.
+    api.shutdown().await;
+    venue.until_open(0).await;
+    let api = Api::start(&dir, &venue).await;
+    let (_, replayed) = api.get(&format!("/sessions/{id}")).await;
+    assert_eq!(replayed["status"]["status"], "stopped");
+    assert_same_state(&replayed, &expected);
+    // Stopped, it takes no orders or cancels.
+    for path in [orders.clone(), cancel("3")] {
+        let (status, refused) = api.post(&path, &place(0)).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{path}: {refused}");
+        assert_eq!(refused["error"]["code"], "not_running");
+    }
+    let (_, unchanged) = api.get(&format!("/sessions/{id}")).await;
+    assert_same_state(&unchanged, &expected);
+
+    // Resumed, it backfills minutes 20 to 24 and the limit sell fills at minute 37, as in a
+    // session that was never interrupted.
+    let (status, resumed) = api.post(&format!("/sessions/{id}/resume"), "").await;
+    assert_eq!(status, StatusCode::OK, "{resumed}");
+    api.until_live(&id).await;
+    venue.until_open(1).await;
+    venue.send(&minutes(25..60));
+    let state = api.until_bar(&id, T0 + 59 * MIN).await;
+    let (_dir, expected) = reference_by_hand(manual_config(), &minutes(0..60), &script);
+    assert_same_state(&state, &expected);
+    let fills = state["fills"].as_array().expect("fills");
+    assert_eq!(fills.len(), 2, "{fills:?}");
+    assert_eq!(fills[1]["order_id"], 3);
+    assert_eq!(fills[1]["time"], T0 + 37 * MIN);
+    assert_eq!(state["trades"].as_array().map(Vec::len), Some(1));
+    assert_eq!(state["trades"][0]["source"], "manual");
+    assert_eq!(state["trades"][0]["open"], false);
+    api.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_manual_order_on_a_strategy_session_is_marked_manual() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let venue = Exchange::start().await;
+    let api = Api::start(&dir, &venue).await;
+    let id = api.start_session().await;
+    api.until_live(&id).await;
+    venue.until_open(1).await;
+    venue.send(&minutes(0..10));
+    api.until_bar(&id, T0 + 9 * MIN).await;
+    // A small buy far below the price, which rests.
+    let order = json!({ "side": "buy", "qty": 0.1, "type": "limit", "limit_price": 50.0 });
+    let (status, placed) = api
+        .post(&format!("/sessions/{id}/orders"), &order.to_string())
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{placed}");
+    assert_eq!(placed["source"], "manual");
+    let placed_id = placed["id"].as_u64().expect("an id");
+    venue.send(&minutes(10..30));
+    let state = api.until_bar(&id, T0 + 29 * MIN).await;
+    let script = [(9, Hand::Place(order))];
+    let (_dir, expected) = reference_by_hand(config(), &minutes(0..30), &script);
+    assert_same_state(&state, &expected);
+    for open in state["open_orders"].as_array().expect("open orders") {
+        let source = if open["id"] == placed_id {
+            "manual"
+        } else {
+            "strategy"
+        };
+        assert_eq!(open["source"], source, "{open}");
+    }
+    let fills = state["fills"].as_array().expect("fills");
+    assert!(!fills.is_empty(), "the strategy trades");
+    assert!(fills.iter().all(|f| f["source"] == "strategy"), "{fills:?}");
+    assert!(
+        state["open_orders"]
+            .as_array()
+            .is_some_and(|o| o.iter().any(|o| o["id"] == placed_id))
+    );
+    api.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_manual_order_is_refused_while_catching_up_and_takes_effect_from_the_first_bar_after_it()
+{
+    let dir = tempfile::tempdir().expect("temp dir");
+    let venue = Exchange::start().await;
+    let api = Api::start(&dir, &venue).await;
+    let mut body: Value = serde_json::from_str(&start_body()).unwrap();
+    body["strategy"] = json!("none");
+    body["params"] = json!({});
+    let (status, created) = api.post("/sessions", &body.to_string()).await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let id = created["id"].as_str().expect("an id").to_string();
+    api.until_live(&id).await;
+    venue.until_open(1).await;
+    venue.send(&minutes(0..5));
+    api.until_bar(&id, T0 + 4 * MIN).await;
+
+    // At 00:12:30 the last closed bar is 00:11. With the feed at 00:04, as during a backfill, the
+    // session is catching up: an order would be counted by the checks on bars from before it, so
+    // it is refused and leaves nothing behind. Still refused at 00:09, two bars behind.
+    venue.now.store(T0 + 12 * MIN + 30_000, Ordering::SeqCst);
+    let order = json!({ "side": "buy", "qty": 1.0, "type": "market" });
+    let orders = format!("/sessions/{id}/orders");
+    let log = td_server::paper_dir(dir.path(), &id).join("events.jsonl");
+    let manual_lines = || {
+        std::fs::read_to_string(&log)
+            .expect("reads")
+            .lines()
+            .filter(|l| l.contains("manual_order"))
+            .count()
+    };
+    for (bars, last) in [(5..5, 4), (5..10, 9)] {
+        venue.send(&minutes(bars));
+        api.until_bar(&id, T0 + last * MIN).await;
+        let (status, refused) = api.post(&orders, &order.to_string()).await;
+        assert_eq!(status, StatusCode::CONFLICT, "00:{last:02}: {refused}");
+        assert_eq!(refused["error"]["code"], "catching_up");
+        let message = refused["error"]["message"].as_str().expect("a message");
+        assert!(message.contains("replaying bars it missed"), "{message}");
+    }
+    assert_eq!(manual_lines(), 0, "a refused order is not in the log");
+
+    // At 00:10 it is one bar behind, which is allowed: accepted, as the first order. The 00:11
+    // bar, closed before it was placed but fed after it, and the 00:12 bar in progress when it
+    // was placed cannot fill it.
+    venue.send(&minutes(10..11));
+    api.until_bar(&id, T0 + 10 * MIN).await;
+    let (status, placed) = api.post(&orders, &order.to_string()).await;
+    assert_eq!(status, StatusCode::CREATED, "{placed}");
+    assert_eq!(placed["id"], 1, "a refused order takes no id");
+    assert_eq!(placed["submitted_at"], T0 + 12 * MIN);
+    assert_eq!(manual_lines(), 1);
+    venue.send(&minutes(11..20));
+    let state = api.until_bar(&id, T0 + 19 * MIN).await;
+    let fills = state["fills"].as_array().expect("fills");
+    assert_eq!(fills.len(), 1, "{fills:?}");
+    assert_eq!(fills[0]["time"], T0 + 13 * MIN, "filled at the 00:13 open");
+
+    // Replayed from its log after a restart, it is the same.
+    api.shutdown().await;
+    venue.until_open(0).await;
+    let api = Api::start(&dir, &venue).await;
+    let (_, replayed) = api.get(&format!("/sessions/{id}")).await;
+    let without_status = |state: &Value| {
+        let mut state = state.clone();
+        state.as_object_mut().expect("an object").remove("status");
+        state
+    };
+    assert_eq!(without_status(&replayed), without_status(&state));
     api.shutdown().await;
 }
