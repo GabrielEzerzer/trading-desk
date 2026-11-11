@@ -542,6 +542,11 @@ class MockSession {
       net_pnl,
       return_on_notional: net_pnl / (entry_price * t.maxQty),
       bars_held: t.bars,
+      stop: null,
+      r_multiple: null,
+      mae: null,
+      mfe: null,
+      force_closed: false,
     }
   }
 

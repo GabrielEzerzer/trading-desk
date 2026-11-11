@@ -29,6 +29,7 @@
 use serde::{Deserialize, Serialize};
 use td_core::{Fill, Millis, Timeframe};
 
+use crate::risk::{self, DayRollover, Intrabar};
 use crate::{EquityPoint, Trade};
 
 /// Days in a year for annualising: crypto markets trade every day.
@@ -106,6 +107,45 @@ pub struct MetricsReport {
     pub fees_paid: f64,
     /// Net funding paid; negative when the position received funding.
     pub funding_paid: f64,
+    /// The drawdown from the running peak measured inside bars: see
+    /// [`risk::trailing_drawdown`], with each bar's equity range. `None` when the report was
+    /// built without ranges (see [`report_with`]), and in a result saved before reports had it.
+    #[serde(default)]
+    pub max_drawdown_intrabar: Option<f64>,
+    /// The fall from the starting equity to the lowest close, as a fraction of the starting
+    /// equity; see [`risk::static_drawdown`].
+    #[serde(default)]
+    pub static_drawdown: Option<f64>,
+    /// [`MetricsReport::static_drawdown`] to the lowest equity inside any bar. `None` without
+    /// ranges.
+    #[serde(default)]
+    pub static_drawdown_intrabar: Option<f64>,
+    /// The largest loss from one UTC day's start to its end, as a fraction of the starting
+    /// equity; see [`risk::worst_daily_loss`]. Other day rollovers are in [`risk::daily_pnl`].
+    #[serde(default)]
+    pub worst_daily_loss: Option<f64>,
+    /// The largest fall from one UTC day's start to its lowest equity inside a bar, as a
+    /// fraction of the starting equity; see [`risk::worst_daily_loss_intraday`]. `None` without
+    /// ranges.
+    #[serde(default)]
+    pub worst_daily_loss_intrabar: Option<f64>,
+    /// See [`risk::Intrabar::peak_leverage`]. `None` without ranges.
+    #[serde(default)]
+    pub peak_leverage: Option<f64>,
+    /// Mean R multiple of the closed trades that have one (see [`crate::attach_stops`]); trades
+    /// without a stop are left out. The P&L expectancy per trade is `avg_trade_pnl`.
+    #[serde(default)]
+    pub expectancy_r: Option<f64>,
+    /// See [`payoff_ratio`].
+    #[serde(default)]
+    pub payoff_ratio: Option<f64>,
+    /// See [`longest_losing_streak`].
+    #[serde(default)]
+    pub longest_losing_streak: usize,
+    /// Closed trades the end-of-run close-out closed (see [`Trade::force_closed`]): at most one
+    /// in a backtest with `close_at_end`, up to one per test window in a walk-forward.
+    #[serde(default)]
+    pub force_closed_trades: usize,
 }
 
 /// An equity series in the form the metrics read: the starting value, then one value per bar
@@ -132,12 +172,28 @@ impl EquitySeries {
     }
 }
 
-/// Builds the full report, with the floors [`MIN_DAILY_RETURNS`] and [`MIN_CAGR_DAYS`].
-///
-/// `positions` is the position after each bar's fills, one per bar. `trades` may include an open
-/// trade at the end; the trade statistics skip it. `funding_paid` is the run's net funding.
+/// Builds the full report, with the floors [`MIN_DAILY_RETURNS`] and [`MIN_CAGR_DAYS`], without
+/// the measures inside bars: [`report_with`] and no ranges.
 pub fn report(
     series: &EquitySeries,
+    positions: &[f64],
+    trades: &[Trade],
+    fills: &[Fill],
+    funding_paid: f64,
+) -> MetricsReport {
+    report_with(series, None, positions, trades, fills, funding_paid)
+}
+
+/// Builds the full report, with the floors [`MIN_DAILY_RETURNS`] and [`MIN_CAGR_DAYS`].
+///
+/// `intrabar` holds each bar's equity range and the peak leverage (see [`risk::intrabar`]), one
+/// range per bar; without it, or with the wrong number of ranges, the measures inside bars are
+/// `None`. `positions` is the position after each bar's fills, one per bar. `trades` may include
+/// an open trade at the end; the trade statistics skip it. `funding_paid` is the run's net
+/// funding.
+pub fn report_with(
+    series: &EquitySeries,
+    intrabar: Option<&Intrabar>,
     positions: &[f64],
     trades: &[Trade],
     fills: &[Fill],
@@ -162,6 +218,14 @@ pub fn report(
     let closed: Vec<&Trade> = trades.iter().filter(|t| !t.open).collect();
     let pnls: Vec<f64> = closed.iter().map(|t| t.net_pnl).collect();
     let held: Vec<f64> = closed.iter().map(|t| t.bars_held as f64).collect();
+    let rs: Vec<f64> = closed.iter().filter_map(|t| t.r_multiple).collect();
+    let start = values.first().copied().unwrap_or(0.0);
+    let ranges = intrabar
+        .map(|x| x.ranges.as_slice())
+        .filter(|r| r.len() + 1 == values.len());
+    let utc = DayRollover::default();
+    let days = risk::daily_pnl(series, None, utc);
+    let days_intrabar = ranges.map(|r| risk::daily_pnl(series, Some(r), utc));
     MetricsReport {
         start_equity: values.first().copied().unwrap_or(0.0),
         end_equity: values.last().copied().unwrap_or(0.0),
@@ -184,6 +248,20 @@ pub fn report(
         turnover: turnover(fills, values.get(1..).unwrap_or(&[])),
         fees_paid: fills.iter().map(|f| f.fee).sum(),
         funding_paid,
+        max_drawdown_intrabar: ranges
+            .and_then(|r| risk::trailing_drawdown(start, r))
+            .map(|d| d.depth),
+        static_drawdown: risk::static_drawdown(start, values.iter().copied()),
+        static_drawdown_intrabar: ranges
+            .and_then(|r| risk::static_drawdown(start, r.iter().map(|x| x.low))),
+        worst_daily_loss: risk::worst_daily_loss(&days, start),
+        worst_daily_loss_intrabar: days_intrabar
+            .and_then(|d| risk::worst_daily_loss_intraday(&d, start)),
+        peak_leverage: ranges.and(intrabar).and_then(|x| x.peak_leverage),
+        expectancy_r: mean(&rs),
+        payoff_ratio: payoff_ratio(&pnls),
+        longest_losing_streak: longest_losing_streak(&pnls),
+        force_closed_trades: closed.iter().filter(|t| t.force_closed).count(),
     }
 }
 
@@ -412,6 +490,29 @@ pub fn profit_factor(pnls: &[f64]) -> Option<f64> {
     }
 }
 
+/// Mean winning trade over mean losing trade: `mean(p > 0) / |mean(p < 0)|` on net trade P&L.
+/// With the win rate `w` it gives the expectancy per trade as `mean_loss * (w * payoff - (1 -
+/// w))`. 0 when no trade won but some lost; `None` with no losing trade (including no trades),
+/// as for the profit factor, or a result that is not finite.
+pub fn payoff_ratio(pnls: &[f64]) -> Option<f64> {
+    let wins: Vec<f64> = pnls.iter().copied().filter(|&p| p > 0.0).collect();
+    let losses: Vec<f64> = pnls.iter().copied().filter(|&p| p < 0.0).collect();
+    let loss = mean(&losses)?;
+    finite(mean(&wins).unwrap_or(0.0) / -loss)
+}
+
+/// The most consecutive losing trades (net P&L below zero), in the order given, which for a
+/// trade list is the order the trades closed. A break-even trade ends a streak, as it is not a
+/// loss. 0 with no losing trade.
+pub fn longest_losing_streak(pnls: &[f64]) -> usize {
+    let (mut run, mut longest) = (0, 0);
+    for &p in pnls {
+        run = if p < 0.0 { run + 1 } else { 0 };
+        longest = longest.max(run);
+    }
+    longest
+}
+
 /// Arithmetic mean. `None` when empty or when the result is not finite.
 pub fn mean(xs: &[f64]) -> Option<f64> {
     if xs.is_empty() {
@@ -476,6 +577,37 @@ pub fn correlation(a: &[f64], b: &[f64]) -> Option<f64> {
     } else {
         None
     }
+}
+
+/// The alpha and beta of a strategy's returns against a benchmark's over the same periods.
+///
+/// Beta is the slope of the ordinary least-squares fit of the strategy's returns on the
+/// benchmark's, `cov(s, b) / var(b)`; alpha is its intercept, `mean(s) - beta * mean(b)`, the
+/// return per period the benchmark does not explain, annualised by multiplying by
+/// `periods_per_year` (simple, not compounded), with a risk-free rate of zero.
+/// `(alpha, beta)`; `None` if the lengths differ, there are fewer than two returns, the benchmark
+/// is constant, or either value is not finite.
+pub fn alpha_beta(
+    strategy: &[f64],
+    benchmark: &[f64],
+    periods_per_year: f64,
+) -> Option<(f64, f64)> {
+    if strategy.len() != benchmark.len() || strategy.len() < 2 {
+        return None;
+    }
+    let (ms, mb) = (mean_f(strategy), mean_f(benchmark));
+    let (mut cov, mut vb) = (0.0, 0.0);
+    for (s, b) in strategy.iter().zip(benchmark) {
+        cov += (s - ms) * (b - mb);
+        vb += (b - mb) * (b - mb);
+    }
+    // An infinite variance would give a misleading beta of 0.
+    if vb <= 0.0 || !vb.is_finite() {
+        return None;
+    }
+    let beta = finite(cov / vb)?;
+    let alpha = finite((ms - beta * mb) * periods_per_year)?;
+    Some((alpha, beta))
 }
 
 #[cfg(test)]
@@ -1000,5 +1132,135 @@ mod tests {
         let s = EquitySeries::new(100.0, &curve, Timeframe::M1);
         assert_eq!(s.values, vec![100.0, 101.0, 102.0]);
         assert_eq!(s.times, vec![0, 60_000, 120_000]);
+    }
+
+    #[test]
+    fn payoff_ratio_and_losing_streak() {
+        // Wins 10 and 8 average 9; losses 5, 3, 4, 2 and 1 average 3: payoff 3. The longest run
+        // of losses is -5, -3, -4; the break-even trade ends it before -2, -1.
+        let pnls = [10.0, -5.0, -3.0, -4.0, 0.0, -2.0, -1.0, 8.0];
+        some(payoff_ratio(&pnls), 3.0);
+        assert_eq!(longest_losing_streak(&pnls), 3);
+        // No wins: 0. No losses, or no trades: None, as for the profit factor.
+        some(payoff_ratio(&[-1.0, -2.0]), 0.0);
+        assert_eq!(payoff_ratio(&[1.0, 0.0]), None);
+        assert_eq!(payoff_ratio(&[]), None);
+        assert_eq!(longest_losing_streak(&[1.0, 0.0]), 0);
+        assert_eq!(longest_losing_streak(&[-1.0]), 1);
+        assert_eq!(longest_losing_streak(&[]), 0);
+    }
+
+    #[test]
+    fn alpha_and_beta_are_the_least_squares_fit_on_the_benchmark() {
+        // Benchmark mean 0, strategy mean 0.01. cov = 0.02 * 0.01 + (-0.01) * (-0.01) + 0 =
+        // 0.0003, var(b) = 0.0002: beta 1.5. Alpha 0.01 - 1.5 * 0 per period, 0.12 over 12.
+        let (alpha, beta) = alpha_beta(&[0.03, 0.0, 0.0], &[0.01, -0.01, 0.0], 12.0).unwrap();
+        approx(beta, 1.5);
+        approx(alpha, 0.12);
+        // Twice the benchmark plus 0.001 a period: beta 2, alpha 0.001 * 365.
+        let b = [0.01, -0.02, 0.03, 0.0];
+        let s: Vec<f64> = b.iter().map(|x| 2.0 * x + 0.001).collect();
+        let (alpha, beta) = alpha_beta(&s, &b, 365.0).unwrap();
+        approx(beta, 2.0);
+        approx(alpha, 0.365);
+        // A constant benchmark, unequal lengths or one return: None.
+        assert_eq!(alpha_beta(&[0.1, 0.2], &[0.01, 0.01], 1.0), None);
+        assert_eq!(alpha_beta(&[0.1, 0.2], &[0.01, 0.02, 0.03], 1.0), None);
+        assert_eq!(alpha_beta(&[0.1], &[0.01], 1.0), None);
+    }
+
+    fn trade(net_pnl: f64, r_multiple: Option<f64>, open: bool, force_closed: bool) -> Trade {
+        Trade {
+            side: crate::TradeSide::Long,
+            entry_time: 0,
+            exit_time: 0,
+            open,
+            qty: 1.0,
+            entry_price: 100.0,
+            exit_price: 100.0 + net_pnl,
+            gross_pnl: net_pnl,
+            fees: 0.0,
+            funding: 0.0,
+            net_pnl,
+            return_on_notional: net_pnl / 100.0,
+            bars_held: 1,
+            stop: r_multiple.map(|_| 90.0),
+            r_multiple,
+            mae: None,
+            mfe: None,
+            force_closed,
+        }
+    }
+
+    #[test]
+    fn report_has_the_risk_and_trade_measures() {
+        // Closes 104 at 12:00, 96 at the end of day 0, 99 and 110 on day 1.
+        let series = EquitySeries {
+            times: vec![0, 12 * HOUR, DAY, DAY + 12 * HOUR, 2 * DAY],
+            values: vec![100.0, 104.0, 96.0, 99.0, 110.0],
+        };
+        let range = |low, high| crate::EquityRange { low, high };
+        let intrabar = Intrabar {
+            ranges: vec![
+                range(98.0, 105.0),
+                range(94.0, 106.0),
+                range(95.0, 100.0),
+                range(97.0, 112.0),
+            ],
+            peak_leverage: Some(2.5),
+        };
+        let trades = [
+            trade(10.0, Some(2.0), false, false),
+            trade(-5.0, Some(-1.0), false, false),
+            trade(-3.0, None, false, false),
+            trade(-4.0, None, false, false),
+            trade(0.0, None, false, false),
+            trade(-2.0, None, false, false),
+            trade(-1.0, None, false, false),
+            trade(8.0, Some(2.0), false, true),
+            // Open trades count in none of the trade statistics.
+            trade(-50.0, Some(9.0), true, true),
+        ];
+        let r = report_with(&series, Some(&intrabar), &[0.0; 4], &trades, &[], 0.0);
+
+        // On closes the peak is 104 and the trough 96.
+        some(r.max_drawdown, 1.0 - 96.0 / 104.0);
+        // Inside bars each bar's high comes before its low: the deepest is from bar 3's high
+        // 112 to its low 97.
+        some(r.max_drawdown_intrabar, 1.0 - 97.0 / 112.0);
+        // From the starting 100: the lowest close is 96, the lowest low 94.
+        some(r.static_drawdown, 0.04);
+        some(r.static_drawdown_intrabar, 0.06);
+        // Day 0 runs 100 to 96 (the 00:00 close ends it), down to 94 inside it; day 1 runs 96
+        // to 110, down to 95. Both of the starting 100.
+        some(r.worst_daily_loss, 0.04);
+        some(r.worst_daily_loss_intrabar, 0.06);
+        some(r.peak_leverage, 2.5);
+        // R of 2, -1 and 2 among the closed trades with one.
+        some(r.expectancy_r, 1.0);
+        some(r.payoff_ratio, 3.0);
+        assert_eq!(r.longest_losing_streak, 3);
+        assert_eq!(r.force_closed_trades, 1);
+        assert_eq!(r.trades, 8);
+
+        // Without ranges, or with the wrong number, the measures inside bars are None and the
+        // rest is unchanged.
+        let short = Intrabar {
+            ranges: intrabar.ranges[..3].to_vec(),
+            peak_leverage: Some(2.5),
+        };
+        for without in [
+            report_with(&series, None, &[0.0; 4], &trades, &[], 0.0),
+            report_with(&series, Some(&short), &[0.0; 4], &trades, &[], 0.0),
+            report(&series, &[0.0; 4], &trades, &[], 0.0),
+        ] {
+            assert_eq!(without.max_drawdown_intrabar, None);
+            assert_eq!(without.static_drawdown_intrabar, None);
+            assert_eq!(without.worst_daily_loss_intrabar, None);
+            assert_eq!(without.peak_leverage, None);
+            assert_eq!(without.worst_daily_loss, r.worst_daily_loss);
+            assert_eq!(without.static_drawdown, r.static_drawdown);
+            assert_eq!(without.expectancy_r, r.expectancy_r);
+        }
     }
 }
