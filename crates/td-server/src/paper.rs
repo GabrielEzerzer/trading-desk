@@ -80,8 +80,9 @@ pub struct PaperConfig {
     pub slippage_bps: f64,
     /// Replaces the instrument's fee schedule when set.
     pub fees: Option<FeeSchedule>,
-    /// The largest perpetual position allowed, as its notional over equity, as in a backtest:
-    /// 1.0 means 1x, the default, which a config saved without it also gets. Spot ignores it.
+    /// The largest position allowed on a margined kind (perpetual, FX), as its notional over
+    /// equity, as in a backtest: 1.0 means 1x, the default, which a config saved without it also
+    /// gets. A kind without margin, such as spot, ignores it.
     #[serde(default = "default_max_leverage")]
     pub max_leverage: f64,
 }
@@ -887,7 +888,7 @@ impl PaperSession {
         let bars = session.bars();
         let live = &bars[bars.len().saturating_sub(session.bar_funding().len())..];
         let fills = session.fills();
-        build_trades_with_fills(fills, live, session.bar_funding())
+        build_trades_with_fills(fills, live, &[], session.bar_funding())
             .into_iter()
             .map(|(trade, range)| PaperTrade {
                 trade,
@@ -1073,6 +1074,7 @@ mod tests {
                 fees: FeeSchedule {
                     maker: 0.001,
                     taker: 0.002,
+                    per_unit: 0.0,
                 },
             },
             timeframe: Timeframe::M1,

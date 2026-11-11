@@ -2,11 +2,12 @@ use std::ops::Range;
 
 use serde::{Deserialize, Serialize};
 use td_core::{
-    Candle, FeeSchedule, Fill, Instrument, InstrumentKind, Liquidity, Millis, OrderId,
-    OrderRequest, OrderType, Rounding, Side, TimeInForce, Timeframe,
+    Candle, FeeSchedule, Fill, Instrument, Liquidity, Millis, OrderId, OrderRequest, OrderType,
+    Rounding, Side, TimeInForce, Timeframe,
 };
 
 use crate::broker::ENTRY_CANCELLED;
+use crate::runner::match_asks;
 use crate::{
     BarFunding, BarStops, Broker, BrokerEvent, CandleFillModel, Context, EngineError, Order,
     OrderStatus, Portfolio, SimBroker, Strategy,
@@ -41,8 +42,9 @@ pub struct SessionConfig {
     pub slippage_bps: f64,
     /// Replaces the instrument's fee schedule when set.
     pub fees: Option<FeeSchedule>,
-    /// The largest perpetual position allowed, as its notional over the account's equity: 1.0
-    /// means 1x. Checked when an order is submitted (see [`Context::submit`]). Spot ignores it.
+    /// The largest position allowed on a margined kind (perpetual, FX), as its notional over the
+    /// account's equity: 1.0 means 1x. Checked when an order is submitted (see
+    /// [`Context::submit`]). A kind without margin, such as spot, ignores it.
     pub max_leverage: f64,
 }
 
@@ -68,6 +70,8 @@ pub struct Session {
     broker: Box<dyn Broker>,
     portfolio: Portfolio,
     bars: Vec<Candle>,
+    /// The ask candle of the last live bar, for a market with an ask series.
+    ask: Option<Candle>,
     orders: Vec<Order>,
     fills: Vec<Fill>,
     equity: Vec<EquityPoint>,
@@ -99,7 +103,7 @@ impl Session {
             ));
         }
         let fees = config.fees.unwrap_or(instrument.fees);
-        if !(fees.maker.is_finite() && fees.taker.is_finite()) {
+        if !(fees.maker.is_finite() && fees.taker.is_finite() && fees.per_unit.is_finite()) {
             return Err(EngineError::InvalidConfig("fees must be finite numbers"));
         }
         let model = CandleFillModel {
@@ -116,6 +120,7 @@ impl Session {
             max_leverage: config.max_leverage,
             broker: Box::new(broker),
             bars: Vec::new(),
+            ask: None,
             orders: Vec::new(),
             fills: Vec::new(),
             equity: Vec::new(),
@@ -170,8 +175,30 @@ impl Session {
     /// stops. So a position opened inside the bar is checked against the part of the range before
     /// it too, and when its attached stop fills inside the same bar, beyond the liquidation price,
     /// it fills at its own, worse, price; the floor keeps that loss to the equity.
+    ///
+    /// This is [`Session::on_bar_with_ask`] without an ask, for a market that trades on one price.
     pub fn on_bar(&mut self, bar: Candle, funding: &[(Millis, f64)]) -> Result<(), EngineError> {
+        self.on_bar_with_ask(bar, None, funding)
+    }
+
+    /// [`Session::on_bar`] for a market with a bid and an ask: `bar` is the bid candle and `ask`
+    /// the ask candle of the same bar. A kind whose rules have quotes needs an ask on every bar, and
+    /// any other kind must not have one; the ask must be a valid candle with the bar's open time,
+    /// and each of its open, high, low and close at or above the bid's (see
+    /// [`EngineError::CrossedQuote`]).
+    ///
+    /// Each order sees the candle of its own side (see [`SimBroker`]), and an open position is
+    /// marked at the close of the side that would close it: a long at the bid close and a short at
+    /// the ask close, so open equity includes the cost of closing. The strategy sees the bid bars.
+    pub fn on_bar_with_ask(
+        &mut self,
+        bar: Candle,
+        ask: Option<Candle>,
+        funding: &[(Millis, f64)],
+    ) -> Result<(), EngineError> {
         self.check_bar(&bar, funding)?;
+        self.check_ask(&bar, ask)?;
+        let ask_bar = ask.unwrap_or(bar);
 
         // Funding due at the open, or in the gap before it, is owed by the position held going
         // into the bar, before this bar's fills.
@@ -187,7 +214,10 @@ impl Session {
         // The protective stops placed or filled on this bar since the last fill that opened a
         // position, then those open after it.
         let mut stops = BarStops::default();
-        for event in self.broker.on_bar(&bar, &self.portfolio, &breached) {
+        for event in self
+            .broker
+            .on_bar(&bar, &ask_bar, &self.portfolio, &breached)
+        {
             match event {
                 BrokerEvent::Filled(fill) => {
                     let before = self.portfolio.position();
@@ -229,12 +259,19 @@ impl Session {
             }
         }
         self.bar_funding.push(charged);
-        self.portfolio.mark(bar.close);
+        // A short closes with a buy, at the ask.
+        let mark = if self.portfolio.position() < 0.0 {
+            ask_bar.close
+        } else {
+            bar.close
+        };
+        self.portfolio.mark(mark);
         self.equity.push(EquityPoint {
             time: bar.open_time,
             equity: self.portfolio.equity(),
         });
         self.bars.push(bar);
+        self.ask = ask;
         self.call_strategy(&bar, first_new_fill, false);
         for order in self.broker.open_orders() {
             add_stop(&mut stops, order);
@@ -348,6 +385,7 @@ impl Session {
     fn context(&mut self) -> Context<'_> {
         Context {
             bars: &self.bars,
+            ask: self.ask,
             instrument: &self.instrument,
             timeframe: self.timeframe,
             fees: self.fees,
@@ -411,7 +449,7 @@ impl Session {
         });
         // The taker fee, then a liquidation fee of whatever equity is left after it: the venue
         // keeps the rest of the margin. None is left when the bar gapped through the price.
-        let taker = price * qty * self.fees.taker;
+        let taker = self.fees.fee(price, qty, self.fees.taker);
         let left = self.portfolio.cash() + q * (price - self.portfolio.avg_entry()) - taker;
         let fee = taker + left.max(0.0);
         self.portfolio.apply_fill(side, qty, price, fee);
@@ -429,6 +467,24 @@ impl Session {
             fee,
             liquidity: Liquidity::Taker,
         });
+    }
+
+    /// Checks that `ask` is the ask candle `bar` needs: one for a kind whose rules have quotes,
+    /// with the bar's open time and never below the bid, and none for any other kind.
+    fn check_ask(&self, bar: &Candle, ask: Option<Candle>) -> Result<(), EngineError> {
+        let kind = self.instrument.id.kind;
+        match ask {
+            None if kind.rules().quotes => Err(EngineError::MissingAsk {
+                time: bar.open_time,
+                kind,
+            }),
+            None => Ok(()),
+            Some(_) if !kind.rules().quotes => Err(EngineError::AsksWithoutQuotes { kind }),
+            Some(ask) if ask.open_time != bar.open_time => Err(EngineError::UnmatchedAsk {
+                time: ask.open_time,
+            }),
+            Some(ask) => check_quote(bar, &ask),
+        }
     }
 
     /// Checks that `bar` can be fed next, with `funding` inside it or in the gap before it.
@@ -455,13 +511,23 @@ impl Session {
         }
         let step = self.timeframe.duration_ms();
         let end = bar.open_time + step;
+        // A bar can hold trades only if some of its span is open: a daily bar that opens at 00:00
+        // UTC on Sunday holds the FX week's first hours.
+        let closed = self.instrument.id.kind.closed_spans(bar.open_time, end);
+        if let [span] = closed.as_slice()
+            && *span == (bar.open_time..end)
+        {
+            return Err(EngineError::ClosedBar {
+                time: bar.open_time,
+            });
+        }
         // From the previous bar's end, so funding due in a gap is charged at this bar's open.
         let start = self
             .bars
             .last()
             .map_or(bar.open_time, |prev| prev.open_time + step);
         for &(time, rate) in funding {
-            if self.instrument.id.kind == InstrumentKind::Spot {
+            if !self.instrument.id.kind.rules().funding {
                 return Err(EngineError::FundingOnSpot);
             }
             if !(start..end).contains(&time) {
@@ -482,6 +548,7 @@ impl Session {
     fn call_strategy(&mut self, bar: &Candle, first_new_fill: usize, warming_up: bool) {
         let mut ctx = Context {
             bars: &self.bars,
+            ask: self.ask,
             instrument: &self.instrument,
             timeframe: self.timeframe,
             fees: self.fees,
@@ -560,6 +627,21 @@ impl Session {
     }
 }
 
+/// Checks that `ask`, whose open time matches, can be the ask candle of the bid candle `bar`: a
+/// valid candle with each of its open, high, low and close at or above the bid's (see
+/// [`EngineError::CrossedQuote`]).
+pub(crate) fn check_quote(bar: &Candle, ask: &Candle) -> Result<(), EngineError> {
+    ask.validate()?;
+    // The ask is at or above the bid at every instant, so also at the open and the close, at the
+    // highest bid and at the lowest ask.
+    if ask.open < bar.open || ask.high < bar.high || ask.low < bar.low || ask.close < bar.close {
+        return Err(EngineError::CrossedQuote {
+            time: bar.open_time,
+        });
+    }
+    Ok(())
+}
+
 /// Counts `order` in `stops` if it is a reduce-only stop or stop-limit.
 fn add_stop(stops: &mut BarStops, order: &Order) {
     let req = &order.request;
@@ -581,7 +663,7 @@ fn liquidation_trigger(
     funding: &[(Millis, f64)],
 ) -> Option<f64> {
     let q = book.position();
-    if inst.id.kind != InstrumentKind::Perpetual || q == 0.0 {
+    if !inst.id.kind.rules().liquidation || q == 0.0 {
         return None;
     }
     // Funding the position will pay later in this bar, at the close.
@@ -610,22 +692,26 @@ fn liquidation_trigger(
 
 /// Runs a strategy over stored bars by feeding them to a new [`Session`] one at a time.
 ///
-/// `funding` is a series of `(time, rate)`, in any order; each event is charged on the bar whose
-/// time window contains it, an event in a gap between bars at the next bar's open, and events
-/// before the first bar or from the last bar's end on are not charged.
+/// `asks` is the ask series beside `bars`, matched by open time as [`crate::run`] matches it:
+/// empty for a kind without quotes, one for every bar for a kind with them. `funding` is a series
+/// of `(time, rate)`, in any order; each event is charged on the bar whose time window contains
+/// it, an event in a gap between bars at the next bar's open, and events before the first bar or
+/// from the last bar's end on are not charged.
 pub fn run_backtest(
     strategy: Box<dyn Strategy>,
     instrument: Instrument,
     timeframe: Timeframe,
     bars: &[Candle],
+    asks: &[Candle],
     funding: &[(Millis, f64)],
     config: SessionConfig,
 ) -> Result<Session, EngineError> {
+    let bar_asks = match_asks(instrument.id.kind, bars, asks, bars)?;
     let funding = sorted_funding(funding);
     let ranges = funding_ranges(timeframe, bars, &funding);
     let mut session = Session::new(strategy, instrument, timeframe, config)?;
-    for (bar, range) in bars.iter().zip(ranges) {
-        session.on_bar(*bar, &funding[range])?;
+    for ((bar, ask), range) in bars.iter().zip(bar_asks).zip(ranges) {
+        session.on_bar_with_ask(*bar, ask, &funding[range])?;
     }
     Ok(session)
 }
@@ -665,7 +751,7 @@ pub(crate) fn funding_ranges(
 
 #[cfg(test)]
 mod tests {
-    use td_core::{InstrumentId, Venue};
+    use td_core::{InstrumentId, InstrumentKind, Venue};
 
     use super::*;
 
@@ -727,6 +813,7 @@ mod tests {
             fees: FeeSchedule {
                 maker: 0.001,
                 taker: 0.002,
+                per_unit: 0.0,
             },
         }
     }
@@ -914,6 +1001,7 @@ mod tests {
             fees: FeeSchedule {
                 maker: 0.001,
                 taker: 0.002,
+                per_unit: 0.0,
             },
         };
         let config = SessionConfig {
@@ -1035,7 +1123,7 @@ mod tests {
 
     /// The trades of a session with their stops attached.
     fn trades_of(s: &Session) -> Vec<crate::Trade> {
-        let mut t = crate::build_trades(s.fills(), s.bars(), s.bar_funding());
+        let mut t = crate::build_trades(s.fills(), s.bars(), &[], s.bar_funding());
         crate::attach_stops(&mut t, s.bars(), s.bar_stops());
         t
     }
@@ -1117,6 +1205,7 @@ mod tests {
             fees: FeeSchedule {
                 maker: 0.001,
                 taker: 0.002,
+                per_unit: 0.0,
             },
         };
         let config = SessionConfig {

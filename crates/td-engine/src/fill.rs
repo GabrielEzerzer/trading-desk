@@ -70,8 +70,9 @@ pub trait FillModel: Send {
 /// The broker keeps to that assumption for what follows from the fill: it comes before the fills
 /// at the open, and an attached stop between the limit and the open fills at its trigger on the
 /// way. A reduce-only limit with nothing to reduce between the bars waits for the open instead
-/// (see [`crate::SimBroker`]). After a real jump (a halt or an outage that reopens past the limit) a venue would fill the
-/// limit at the reopening price, which is better, so this errs against the strategy. Stops the bar
+/// (see [`crate::SimBroker`]). After a real jump (a halt, an outage, or a market's close such as
+/// the FX weekend, that reopens past the limit) a venue would fill the limit at the reopening
+/// price, which is better, so this errs against the strategy. Stops the bar
 /// opens through still fill at the open, which errs against the strategy the other way. Upgrade
 /// with a trade-level fill model.
 #[derive(Debug, Clone, Copy, PartialEq)]
