@@ -121,6 +121,21 @@ export type Fill = { order_id: OrderId, instrument: InstrumentId, side: Side, ti
  */
 fee: number, liquidity: Liquidity, };
 
+/**
+ * The currency an account holds and reports money in, against the instrument it trades.
+ *
+ * - `Quote`: the instrument's quote currency, as a USDT account trading BTC/USDT. Every amount
+ *   the engine computes from prices is already in it, so nothing is converted.
+ * - `Base`: the instrument's base currency, as a dollar account trading USD/JPY. Profit, loss and
+ *   commission arise in the quote currency (yen) and are converted at the pair's own price: an
+ *   amount in the quote currency divided by the price is the amount in the base currency.
+ *
+ * shortcut: only the account's currency on either side of the pair it trades. A cross pair on a
+ * third-currency account (EUR/JPY on a dollar account) needs a second price series to convert
+ * at; add a conversion series when the desk trades crosses.
+ */
+export type AccountCurrency = "quote" | "base";
+
 export type ParamKind = "int" | "float" | "bool";
 
 export type ParamValue = boolean | number | number;
@@ -160,7 +175,7 @@ params: Params, instrument: Instrument, timeframe: Timeframe,
  */
 from: number, to: number, 
 /**
- * Starting balance in the quote asset.
+ * Starting balance in the account currency (`account_currency`).
  */
 starting_cash: number, 
 /**
@@ -197,7 +212,13 @@ warmup_from?: number | null,
  * The trade list then ends with a closed trade instead of an open one marked at the last
  * close. The strategy tester sets it on out-of-sample runs.
  */
-close_at_end?: boolean, };
+close_at_end?: boolean, 
+/**
+ * The currency the account holds and the result reports every amount in: the instrument's
+ * quote currency, the default, or its base currency, as a dollar account trading USD/JPY
+ * (FX only; see [`Session::new`]). Left out of the saved result when it is the default.
+ */
+account_currency?: AccountCurrency, };
 
 export type BacktestResult = { config: BacktestConfig, 
 /**
@@ -279,7 +300,7 @@ beta: number | null, };
 export type EquityPoint = { time: number, equity: number, };
 
 /**
- * The lowest and highest equity one bar reached, in the quote asset.
+ * The lowest and highest equity one bar reached, in the account currency.
  */
 export type EquityRange = { low: number, high: number, };
 
@@ -316,6 +337,9 @@ export type OrderStatus = { "status": "attached" } | { "status": "open" } | { "s
 
 /**
  * One round trip: the position leaves zero, then returns to it.
+ *
+ * Prices are in the quote currency; every money amount (P&L, fees, funding, excursions) is in the
+ * account currency, converted as [`build_trades`] describes.
  */
 export type Trade = { side: TradeSide, 
 /**
@@ -348,7 +372,9 @@ exit_price: number,
 /**
  * `sign * exit_qty * (exit_price - entry_price)`, before fees and funding. Over a closed
  * round trip this is the exit notional minus the entry notional (reversed for a short),
- * which is what the portfolio's average-cost realised P&L adds up to.
+ * which is what the portfolio's average-cost realised P&L adds up to. On a base account it is
+ * that realised P&L itself: each reducing fill's P&L against the average cost, converted at
+ * that fill's price (and an open trade's remainder at the mark).
  */
 gross_pnl: number, 
 /**
@@ -367,7 +393,8 @@ funding: number,
  */
 net_pnl: number, 
 /**
- * `net_pnl / (entry_price * qty)`: net P&L over the largest entry notional.
+ * `net_pnl / (entry_price * qty)`: net P&L over the largest entry notional, the notional
+ * converted to the account currency at `entry_price` on a base account.
  */
 return_on_notional: number, 
 /**
@@ -383,16 +410,17 @@ bars_held: number,
  */
 stop: number | null, 
 /**
- * `net_pnl` over the initial risk, `qty * |entry_price - stop|`: the trade's result in
- * multiples of what it risked at its stop; see [`attach_stops`]. `None` without a stop, with
- * a stop at or beyond the entry price (no risk), or when not finite.
+ * `net_pnl` over the initial risk, `qty * |entry_price - stop|` (converted at the stop on a
+ * base account): the trade's result in multiples of what it risked at its stop; see
+ * [`attach_stops`]. `None` without a stop, with a stop at or beyond the entry price (no
+ * risk), or when not finite.
  */
 r_multiple: number | null, 
 /**
  * Maximum adverse excursion: the largest unrealised loss of the open position at any price
- * it met, in the quote asset, before fees and funding; 0 if it never went against the
- * entry. See [`build_trades`] for the prices counted. `None` in a result saved before
- * trades had it.
+ * it met, in the account currency (converted at that price on a base account), before fees
+ * and funding; 0 if it never went against the entry. See [`build_trades`] for the prices
+ * counted. `None` in a result saved before trades had it.
  */
 mae: number | null, 
 /**
@@ -403,12 +431,26 @@ mfe: number | null,
  * Closed by the end-of-run close-out (see [`crate::BacktestConfig::close_at_end`]) rather
  * than by the strategy: in a walk-forward, at the end of its test window.
  */
-force_closed: boolean, };
+force_closed: boolean, 
+/**
+ * The price move in pips, on a market with quotes (see [`td_core::Instrument::pip_size`]):
+ * `sign * (exit_price - entry_price) / pip`. The spread is in it, since buys fill on the ask
+ * and sells on the bid; commission and funding are not. An open trade's is on its mark, as its
+ * P&L is. `None` without pips, and left out of saved JSON then.
+ */
+pips?: number | null, 
+/**
+ * `net_pnl` in pips: `net_pnl` over the value of one pip on the quantity the trade closed (its
+ * whole size for one entry and one exit), in the account currency, converted at `exit_price`
+ * on a base account. After commission, so `pips - net_pips` is the commission in pips.
+ */
+net_pips?: number | null, };
 
 export type TradeSide = "long" | "short";
 
 /**
- * The metrics report for one equity series and its trades.
+ * The metrics report for one equity series and its trades. Money amounts are in the run's account
+ * currency (see [`crate::BacktestConfig::account_currency`]).
  */
 export type MetricsReport = { start_equity: number, end_equity: number, 
 /**
@@ -534,7 +576,16 @@ longest_losing_streak: number,
  * Closed trades the end-of-run close-out closed (see [`Trade::force_closed`]): at most one
  * in a backtest with `close_at_end`, up to one per test window in a walk-forward.
  */
-force_closed_trades: number, };
+force_closed_trades: number, 
+/**
+ * Mean [`Trade::pips`] of the closed trades that have it, on a market with pips; `None`
+ * otherwise, and left out of saved JSON then.
+ */
+avg_trade_pips?: number | null, 
+/**
+ * Mean [`Trade::net_pips`], after commission, of the closed trades that have it.
+ */
+avg_trade_net_pips?: number | null, };
 
 /**
  * The values one parameter takes in a sweep.
@@ -872,7 +923,8 @@ export type Period = { from: number, to: number, };
  */
 export type BacktestSettings = { 
 /**
- * Starting balance in the quote asset.
+ * Starting balance in the quote asset: a plan's runs are on a quote-currency account (see
+ * [`TestPlan::backtest_config`]).
  */
 starting_cash: number, 
 /**
@@ -1058,7 +1110,8 @@ export type HighRiskLimits = {
  */
 min_trades: number, 
 /**
- * Mean net P&L per closed trade strictly above this, in the quote asset.
+ * Mean net P&L per closed trade strictly above this, in the run's account currency (the
+ * quote asset on a plan's runs).
  */
 min_expectancy: number, 
 /**
@@ -1623,7 +1676,9 @@ exit_price: number,
 /**
  * `sign * exit_qty * (exit_price - entry_price)`, before fees and funding. Over a closed
  * round trip this is the exit notional minus the entry notional (reversed for a short),
- * which is what the portfolio's average-cost realised P&L adds up to.
+ * which is what the portfolio's average-cost realised P&L adds up to. On a base account it is
+ * that realised P&L itself: each reducing fill's P&L against the average cost, converted at
+ * that fill's price (and an open trade's remainder at the mark).
  */
 gross_pnl: number, 
 /**
@@ -1642,7 +1697,8 @@ funding: number,
  */
 net_pnl: number, 
 /**
- * `net_pnl / (entry_price * qty)`: net P&L over the largest entry notional.
+ * `net_pnl / (entry_price * qty)`: net P&L over the largest entry notional, the notional
+ * converted to the account currency at `entry_price` on a base account.
  */
 return_on_notional: number, 
 /**
@@ -1658,16 +1714,17 @@ bars_held: number,
  */
 stop: number | null, 
 /**
- * `net_pnl` over the initial risk, `qty * |entry_price - stop|`: the trade's result in
- * multiples of what it risked at its stop; see [`attach_stops`]. `None` without a stop, with
- * a stop at or beyond the entry price (no risk), or when not finite.
+ * `net_pnl` over the initial risk, `qty * |entry_price - stop|` (converted at the stop on a
+ * base account): the trade's result in multiples of what it risked at its stop; see
+ * [`attach_stops`]. `None` without a stop, with a stop at or beyond the entry price (no
+ * risk), or when not finite.
  */
 r_multiple: number | null, 
 /**
  * Maximum adverse excursion: the largest unrealised loss of the open position at any price
- * it met, in the quote asset, before fees and funding; 0 if it never went against the
- * entry. See [`build_trades`] for the prices counted. `None` in a result saved before
- * trades had it.
+ * it met, in the account currency (converted at that price on a base account), before fees
+ * and funding; 0 if it never went against the entry. See [`build_trades`] for the prices
+ * counted. `None` in a result saved before trades had it.
  */
 mae: number | null, 
 /**
@@ -1678,7 +1735,20 @@ mfe: number | null,
  * Closed by the end-of-run close-out (see [`crate::BacktestConfig::close_at_end`]) rather
  * than by the strategy: in a walk-forward, at the end of its test window.
  */
-force_closed: boolean, };
+force_closed: boolean, 
+/**
+ * The price move in pips, on a market with quotes (see [`td_core::Instrument::pip_size`]):
+ * `sign * (exit_price - entry_price) / pip`. The spread is in it, since buys fill on the ask
+ * and sells on the bid; commission and funding are not. An open trade's is on its mark, as its
+ * P&L is. `None` without pips, and left out of saved JSON then.
+ */
+pips?: number | null, 
+/**
+ * `net_pnl` in pips: `net_pnl` over the value of one pip on the quantity the trade closed (its
+ * whole size for one entry and one exit), in the account currency, converted at `exit_price`
+ * on a base account. After commission, so `pips - net_pips` is the commission in pips.
+ */
+net_pips?: number | null, };
 
 /**
  * `POST /sessions/{id}/orders`: an order placed by hand. It goes through the same rounding,
