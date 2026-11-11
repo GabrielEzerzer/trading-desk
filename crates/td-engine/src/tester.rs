@@ -1720,6 +1720,7 @@ fn stitched_report(base: &BacktestConfig, runs: &[Segment]) -> Stitched {
         &trades,
         &fills,
         funding,
+        base.account_currency,
     );
     Stitched {
         series,
@@ -1789,6 +1790,7 @@ mod tests {
                     max_leverage: 1.0,
                     warmup_from: Some(0),
                     close_at_end: false,
+                    account_currency: td_core::AccountCurrency::Quote,
                 },
                 axes: vec![ParamAxis {
                     name: "slow".into(),
@@ -2095,6 +2097,7 @@ mod tests {
             max_leverage: 1.0,
             warmup_from: None,
             close_at_end: true,
+            account_currency: td_core::AccountCurrency::Quote,
         };
         let window = |from: i64, to: i64| {
             let config = BacktestConfig {

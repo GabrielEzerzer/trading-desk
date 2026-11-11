@@ -70,6 +70,7 @@ pub fn render() -> String {
         td_core::OrderRequest,
         td_core::Liquidity,
         td_core::Fill,
+        td_core::AccountCurrency,
         td_engine::ParamKind,
         td_engine::ParamValue,
         td_engine::ParamSpec,

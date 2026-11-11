@@ -80,6 +80,7 @@ fn funding_paid(plan: Vec<(usize, Side)>, funding: &[(Millis, f64)]) -> f64 {
             per_unit: 0.0,
         }),
         max_leverage: 1.0,
+        account_currency: td_core::AccountCurrency::Quote,
     };
     let s = run_backtest(
         Box::new(Plan(plan)),

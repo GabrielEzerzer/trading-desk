@@ -86,7 +86,8 @@ pub struct Fill {
     pub time: Millis,
     pub price: f64,
     pub qty: f64,
-    /// The fee paid, in the quote asset. Negative for a rebate.
+    /// The fee paid, in the account currency: the quote asset, or the base currency on a
+    /// base-currency account. Negative for a rebate.
     pub fee: f64,
     pub liquidity: Liquidity,
 }

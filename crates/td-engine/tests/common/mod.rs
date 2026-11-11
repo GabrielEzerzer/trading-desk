@@ -60,6 +60,7 @@ pub fn config(slippage_bps: f64) -> SessionConfig {
         slippage_bps,
         fees: None,
         max_leverage: 1.0,
+        account_currency: td_core::AccountCurrency::Quote,
     }
 }
 
