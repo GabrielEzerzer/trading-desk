@@ -236,6 +236,16 @@ struct Inner {
     jobs: BTreeMap<u64, Entry>,
 }
 
+impl Inner {
+    /// The id of the queued or running download job of `id`, if there is one.
+    fn download_of(&self, id: &InstrumentId) -> Option<u64> {
+        self.jobs
+            .values()
+            .find(|e| !e.info.status.is_finished() && e.info.request.downloads() == Some(id))
+            .map(|e| e.info.id)
+    }
+}
+
 /// The job registry.
 // shortcut: jobs stay in memory for the server's lifetime and are lost when it exits; persist
 // them (with their results) once runs are long enough that losing one on restart hurts.
@@ -310,17 +320,14 @@ impl Jobs {
                 Self::run_room(&inner)?;
             }
             if let Some(wanted) = request.downloads()
-                && let Some(running) = inner.jobs.values().find(|e| {
-                    !e.info.status.is_finished() && e.info.request.downloads() == Some(wanted)
-                })
+                && let Some(running) = inner.download_of(wanted)
             {
                 return Err(ApiError::new(
                     StatusCode::CONFLICT,
                     "conflict",
                     format!(
-                        "{wanted} already has a download in progress (job {}); wait for it or \
-                         cancel it",
-                        running.info.id
+                        "{wanted} already has a download in progress (job {running}); wait for it \
+                         or cancel it"
                     ),
                 ));
             }
@@ -387,6 +394,11 @@ impl Jobs {
             jobs.finish(id, outcome);
         });
         Ok(info)
+    }
+
+    /// The id of the queued or running download job of `id` in this server, if there is one.
+    pub fn download_in_progress(&self, id: &InstrumentId) -> Option<u64> {
+        self.lock().download_of(id)
     }
 
     pub fn list(&self) -> Vec<JobInfo> {

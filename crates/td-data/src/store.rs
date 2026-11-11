@@ -12,6 +12,11 @@
 //! an OS lock on a sidecar file beside the data file, `<name>.parquet.lock`, which stays on disk.
 //! Readers take no lock: the rename means they see the old file or the new one, never half of one.
 //! Missing minutes are reported, never filled.
+//!
+//! Deleting ([`Store::delete_months`], [`Store::delete_instrument`]) is the one way data leaves the
+//! store. A delete takes the same lock a writer takes, removes the data file and any temp files a
+//! crashed writer left beside it, and lets the lock go. It leaves the sidecar and the folders as
+//! they are, and never follows a link (a symlink or a junction) out of the data folder.
 
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
@@ -29,7 +34,7 @@ use parquet::arrow::ArrowWriter;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::WriterProperties;
-use td_core::{Candle, InstrumentId, InstrumentKind, Millis, Timeframe};
+use td_core::{Candle, InstrumentId, InstrumentKind, Millis, Timeframe, Venue};
 
 use crate::DataError;
 use crate::resample::{LoadedCandles, resample};
@@ -106,6 +111,49 @@ pub struct MonthCoverage {
     pub last: Millis,
     /// Missing minutes between `first` and `last`.
     pub gaps: Vec<Gap>,
+    /// The month file's size on disk.
+    pub bytes: u64,
+}
+
+/// One month file of an instrument's candles and its size on disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StoredMonth {
+    pub month: Month,
+    pub bytes: u64,
+}
+
+/// What the store holds for one instrument.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredInstrument {
+    pub id: InstrumentId,
+    /// The month files, in order; empty when only a funding file is stored.
+    pub months: Vec<StoredMonth>,
+    /// The funding file's size; `None` when there is none, which is always so for spot.
+    pub funding_bytes: Option<u64>,
+}
+
+impl StoredInstrument {
+    /// The month files and the funding file together.
+    pub fn bytes(&self) -> u64 {
+        self.months.iter().map(|m| m.bytes).sum::<u64>() + self.funding_bytes.unwrap_or(0)
+    }
+}
+
+/// Everything the store holds, from [`Store::stored`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StoredData {
+    /// Each instrument with at least one month file or a funding file, in instrument order.
+    pub instruments: Vec<StoredInstrument>,
+    /// Entries under `candles/` and `funding/` that name no venue, kind, symbol or month the store
+    /// writes, relative to the store root. They are left alone: nothing lists or deletes them.
+    pub unrecognised: Vec<PathBuf>,
+}
+
+/// What a delete removed: data files, and temp files a crashed writer left beside them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DeleteReport {
+    pub files: usize,
+    pub bytes: u64,
 }
 
 /// The data directory: `TD_DATA_DIR` if set, else `%LOCALAPPDATA%\trading-desk` on Windows and
@@ -321,6 +369,7 @@ impl Store {
                 first: first.open_time,
                 last: last.open_time,
                 gaps: missing_minutes(&candles, first.open_time, last.open_time + MINUTE),
+                bytes: file_bytes(&self.candle_path(id, month)?)?.unwrap_or(0),
             });
         }
         Ok(coverage)
@@ -439,6 +488,225 @@ impl Store {
         }
         Ok(rates)
     }
+
+    /// Every instrument the store holds, with each month file's size and the funding file's size.
+    /// Entries that name no venue, kind, symbol or month are reported in
+    /// [`StoredData::unrecognised`], not read.
+    pub fn stored(&self) -> Result<StoredData, DataError> {
+        let mut found: BTreeMap<InstrumentId, StoredInstrument> = BTreeMap::new();
+        let mut unrecognised = Vec::new();
+        for (venue, venue_dir) in self.venue_dirs("candles", &mut unrecognised)? {
+            let Some(venue) = parse_name::<Venue>(&venue) else {
+                unrecognised.push(self.relative(&venue_dir));
+                continue;
+            };
+            for (kind, kind_dir) in self.named_dirs(&venue_dir, &mut unrecognised)? {
+                let Some(kind) = parse_name::<InstrumentKind>(&kind) else {
+                    unrecognised.push(self.relative(&kind_dir));
+                    continue;
+                };
+                for (symbol, symbol_dir) in self.named_dirs(&kind_dir, &mut unrecognised)? {
+                    if check_symbol(&symbol).is_err() {
+                        unrecognised.push(self.relative(&symbol_dir));
+                        continue;
+                    }
+                    // Months are read only from a `1m` that is a real folder; `named_dirs` reports a
+                    // file or a link of that name.
+                    let mut months = Vec::new();
+                    for (name, dir) in self.named_dirs(&symbol_dir, &mut unrecognised)? {
+                        if name != "1m" {
+                            unrecognised.push(self.relative(&dir));
+                            continue;
+                        }
+                        for name in dir_names(&dir, &mut unrecognised, &self.root)? {
+                            match month_of_file(&name) {
+                                Some((month, true)) => {
+                                    if let Some(bytes) = file_bytes(&dir.join(&name))? {
+                                        months.push(StoredMonth { month, bytes });
+                                    }
+                                }
+                                Some((_, false)) => {} // a lock sidecar or a temp file
+                                None => unrecognised.push(self.relative(&dir.join(&name))),
+                            }
+                        }
+                    }
+                    months.sort_by_key(|m| m.month);
+                    if !months.is_empty() {
+                        let id = InstrumentId {
+                            venue,
+                            symbol,
+                            kind,
+                        };
+                        found.insert(
+                            id.clone(),
+                            StoredInstrument {
+                                id,
+                                months,
+                                funding_bytes: None,
+                            },
+                        );
+                    }
+                }
+            }
+        }
+        for (venue, venue_dir) in self.venue_dirs("funding", &mut unrecognised)? {
+            let Some(venue) = parse_name::<Venue>(&venue) else {
+                unrecognised.push(self.relative(&venue_dir));
+                continue;
+            };
+            for name in dir_names(&venue_dir, &mut unrecognised, &self.root)? {
+                let parsed = name
+                    .split_once(".parquet")
+                    .filter(|(symbol, rest)| check_symbol(symbol).is_ok() && is_store_suffix(rest));
+                let Some((symbol, rest)) = parsed else {
+                    unrecognised.push(self.relative(&venue_dir.join(&name)));
+                    continue;
+                };
+                if !rest.is_empty() {
+                    continue; // its lock sidecar or a temp file
+                }
+                let Some(bytes) = file_bytes(&venue_dir.join(&name))? else {
+                    continue;
+                };
+                let id = InstrumentId {
+                    venue,
+                    symbol: symbol.to_string(),
+                    kind: InstrumentKind::Perpetual,
+                };
+                found
+                    .entry(id.clone())
+                    .or_insert_with(|| StoredInstrument {
+                        id,
+                        months: Vec::new(),
+                        funding_bytes: None,
+                    })
+                    .funding_bytes = Some(bytes);
+            }
+        }
+        unrecognised.sort();
+        Ok(StoredData {
+            instruments: found.into_values().collect(),
+            unrecognised,
+        })
+    }
+
+    /// Deletes an instrument's candles for the months `from` to `to`, both included. Each month
+    /// file is removed under the same lock a writer takes for it, with any temp files a crashed
+    /// writer left beside it; its lock sidecar and the folders stay. Months not stored are skipped:
+    /// deleting nothing is not an error, and creates nothing. When a folder on the way to the
+    /// month files is missing or is a link, nothing is deleted. The funding file stays.
+    pub fn delete_months(
+        &self,
+        id: &InstrumentId,
+        from: Month,
+        to: Month,
+    ) -> Result<DeleteReport, DataError> {
+        let dir = self.candle_dir(id)?;
+        let mut report = DeleteReport::default();
+        if !self.real_dir(&dir)? {
+            return Ok(report);
+        }
+        for name in dir_names(&dir, &mut Vec::new(), &self.root)? {
+            if let Some((month, true)) = month_of_file(&name)
+                && (from..=to).contains(&month)
+            {
+                remove_locked(&dir.join(name), &mut report)?;
+            }
+        }
+        Ok(report)
+    }
+
+    /// Deletes every month of an instrument's candles and, for a perpetual, its funding file, as
+    /// [`Store::delete_months`] does.
+    pub fn delete_instrument(&self, id: &InstrumentId) -> Result<DeleteReport, DataError> {
+        let every_month = (
+            Month {
+                year: i64::MIN,
+                month: 1,
+            },
+            Month {
+                year: i64::MAX,
+                month: 12,
+            },
+        );
+        let mut report = self.delete_months(id, every_month.0, every_month.1)?;
+        if id.kind == InstrumentKind::Perpetual {
+            let path = self.funding_path(id)?;
+            if let Some(dir) = path.parent()
+                && self.real_dir(dir)?
+            {
+                remove_locked(&path, &mut report)?;
+            }
+        }
+        Ok(report)
+    }
+
+    /// The venue folders under the root's `candles` or `funding`. A link or a file of that name
+    /// is reported and not read, as [`Store::named_dirs`] does for everything below it, so the
+    /// listing never shows data a delete refuses to touch.
+    fn venue_dirs(
+        &self,
+        top: &str,
+        unrecognised: &mut Vec<PathBuf>,
+    ) -> Result<Vec<(String, PathBuf)>, DataError> {
+        let dir = self.root.join(top);
+        match fs::symlink_metadata(&dir) {
+            Ok(meta) if !meta.is_dir() => {
+                unrecognised.push(self.relative(&dir));
+                Ok(Vec::new())
+            }
+            _ => self.named_dirs(&dir, unrecognised),
+        }
+    }
+
+    /// The subfolders of `dir` with their names, sorted; a missing `dir` has none. A file, or a
+    /// folder whose name is not UTF-8, goes to `unrecognised`.
+    fn named_dirs(
+        &self,
+        dir: &Path,
+        unrecognised: &mut Vec<PathBuf>,
+    ) -> Result<Vec<(String, PathBuf)>, DataError> {
+        let mut dirs = Vec::new();
+        for entry in read_dir_or_empty(dir)? {
+            let entry = entry.map_err(DataError::io(dir))?;
+            let path = entry.path();
+            let is_dir = entry.file_type().map_err(DataError::io(&path))?.is_dir();
+            match entry.file_name().into_string() {
+                Ok(name) if is_dir => dirs.push((name, path)),
+                _ => unrecognised.push(self.relative(&path)),
+            }
+        }
+        dirs.sort();
+        Ok(dirs)
+    }
+
+    fn relative(&self, path: &Path) -> PathBuf {
+        relative_to(&self.root, path)
+    }
+
+    /// Whether `dir` and each folder between the store root and it are real folders, checked
+    /// without following links: `false` when one is missing, or is a file or a link (a symlink or
+    /// a junction), which could lead a delete out of the data folder. The root itself may be a
+    /// link.
+    // shortcut: checked once, before the delete lists anything, so a folder swapped for a link
+    // while the delete runs would be followed; only a program that can already write to the data
+    // folder can do that. Open each folder relative to its parent if that ever matters.
+    fn real_dir(&self, dir: &Path) -> Result<bool, DataError> {
+        let Ok(below_root) = dir.strip_prefix(&self.root) else {
+            return Ok(false);
+        };
+        let mut path = self.root.clone();
+        for part in below_root {
+            path.push(part);
+            match fs::symlink_metadata(&path) {
+                Ok(meta) if meta.is_dir() => {}
+                Ok(_) => return Ok(false),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+                Err(e) => return Err(DataError::io(&path)(e)),
+            }
+        }
+        Ok(true)
+    }
 }
 
 /// A candle must be valid and open on a minute.
@@ -533,6 +801,121 @@ fn lock_across_processes(path: &Path) -> Result<File, DataError> {
     Ok(file)
 }
 
+/// Removes the store file at `path` under its lock, taken as a writer takes it, with any temp files
+/// a crashed writer left beside it, and adds them to `report`; the lock sidecar stays as it is.
+/// While the lock is held no writer is part way through this file, in this process or another, so
+/// every temp file of it is a leftover. When `path` is not a regular file (nothing, or a link),
+/// there is nothing to delete and no lock is taken.
+fn remove_locked(path: &Path, report: &mut DeleteReport) -> Result<(), DataError> {
+    if file_bytes(path)?.is_none() {
+        return Ok(());
+    }
+    let lock = file_lock(path);
+    let _held = hold(&lock);
+    let _locked = lock_across_processes(path)?;
+    for file in std::iter::once(path.to_path_buf()).chain(temp_files(path)?) {
+        let Some(bytes) = file_bytes(&file)? else {
+            continue;
+        };
+        match retry_denied(|| fs::remove_file(&file)) {
+            Ok(()) => {
+                report.files += 1;
+                report.bytes += bytes;
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => {
+                let DeleteReport { files, bytes } = *report;
+                let stopped = format!(
+                    "{e} (the delete stopped; files removed before it: {files}, {bytes} bytes)"
+                );
+                return Err(DataError::io(&file)(io::Error::new(e.kind(), stopped)));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The temp files [`write_atomic`] names after the store file at `path` that are beside it.
+fn temp_files(path: &Path) -> Result<Vec<PathBuf>, DataError> {
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name().and_then(|n| n.to_str())) else {
+        return Ok(Vec::new());
+    };
+    let prefix = format!("{name}.");
+    Ok(dir_names(dir, &mut Vec::new(), dir)?
+        .into_iter()
+        .filter(|n| n.starts_with(&prefix) && n.ends_with(".tmp"))
+        .map(|n| dir.join(n))
+        .collect())
+}
+
+/// The names of the regular files in `dir`, sorted; a missing `dir` has none. Anything else (a
+/// subfolder, a link, or a file whose name is not UTF-8) goes to `unrecognised`, as a path
+/// relative to `root`.
+fn dir_names(
+    dir: &Path,
+    unrecognised: &mut Vec<PathBuf>,
+    root: &Path,
+) -> Result<Vec<String>, DataError> {
+    let mut names = Vec::new();
+    for entry in read_dir_or_empty(dir)? {
+        let entry = entry.map_err(DataError::io(dir))?;
+        let is_file = entry
+            .file_type()
+            .map_err(DataError::io(entry.path()))?
+            .is_file();
+        match entry.file_name().into_string() {
+            Ok(name) if is_file => names.push(name),
+            _ => unrecognised.push(relative_to(root, &entry.path())),
+        }
+    }
+    names.sort();
+    Ok(names)
+}
+
+/// The entries of `dir`; none when it does not exist.
+fn read_dir_or_empty(
+    dir: &Path,
+) -> Result<impl Iterator<Item = io::Result<fs::DirEntry>>, DataError> {
+    match fs::read_dir(dir) {
+        Ok(entries) => Ok(Some(entries).into_iter().flatten()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None.into_iter().flatten()),
+        Err(e) => Err(DataError::io(dir)(e)),
+    }
+}
+
+fn relative_to(root: &Path, path: &Path) -> PathBuf {
+    path.strip_prefix(root).unwrap_or(path).to_path_buf()
+}
+
+/// The size of the regular file at `path`, not following a link; `None` when there is none, or a
+/// folder or a link is there instead.
+fn file_bytes(path: &Path) -> Result<Option<u64>, DataError> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) => Ok(meta.is_file().then_some(meta.len())),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(DataError::io(path)(e)),
+    }
+}
+
+/// The month a file in an instrument's `1m` folder belongs to, and whether it is the month file
+/// itself rather than its lock sidecar or a temp file; `None` for any other name.
+fn month_of_file(name: &str) -> Option<(Month, bool)> {
+    let (month, rest) = name.split_once(".parquet")?;
+    let month = Month::parse(month).filter(|_| is_store_suffix(rest))?;
+    Some((month, rest.is_empty()))
+}
+
+/// Whether `rest`, what follows `.parquet` in a file name, is one the store writes: nothing (the
+/// data file), `.lock` (its sidecar) or `.<pid>.<n>.tmp` (a temp file).
+fn is_store_suffix(rest: &str) -> bool {
+    rest.is_empty() || rest == ".lock" || (rest.starts_with('.') && rest.ends_with(".tmp"))
+}
+
+/// A venue or kind from the folder name it is stored under, which is its serde name.
+fn parse_name<T: serde::de::DeserializeOwned>(name: &str) -> Option<T> {
+    serde_json::from_value(serde_json::Value::String(name.to_string())).ok()
+}
+
 /// Locks `mutex`, carrying on past a panic in another holder: the data behind these locks is a
 /// map of locks or nothing at all, so it cannot be left half-changed.
 fn hold<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -572,12 +955,17 @@ fn write_atomic(path: &Path, batch: &RecordBatch) -> Result<(), DataError> {
     result
 }
 
-/// `fs::rename`, retried briefly when Windows refuses it because another process (an indexer or a
-/// virus scanner) holds one of the files open.
+/// `fs::rename`, retried briefly as [`retry_denied`] does.
 fn rename_replacing(from: &Path, to: &Path) -> io::Result<()> {
+    retry_denied(|| fs::rename(from, to))
+}
+
+/// Runs `op`, retried briefly when Windows refuses it because another process (an indexer or a
+/// virus scanner) holds one of the files open.
+fn retry_denied<T>(mut op: impl FnMut() -> io::Result<T>) -> io::Result<T> {
     let mut wait = Duration::from_millis(25);
     for _ in 0..6 {
-        match fs::rename(from, to) {
+        match op() {
             Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
                 sleep(wait);
                 wait *= 2;
@@ -585,7 +973,7 @@ fn rename_replacing(from: &Path, to: &Path) -> io::Result<()> {
             done => return done,
         }
     }
-    fs::rename(from, to)
+    op()
 }
 
 /// Reads the named columns of a Parquet file, one array per column across all row groups. `None`
@@ -910,6 +1298,112 @@ mod tests {
                 Err(e) => panic!("the killed holder's lock was not released: {e}"),
             }
         }
+    }
+
+    fn spot_id() -> InstrumentId {
+        InstrumentId {
+            venue: td_core::Venue::Binance,
+            symbol: "BTCUSDT".into(),
+            kind: InstrumentKind::Spot,
+        }
+    }
+
+    fn flat_candle(open_time: Millis) -> Candle {
+        Candle {
+            open_time,
+            open: 100.0,
+            high: 101.0,
+            low: 99.0,
+            close: 100.5,
+            volume: 1.0,
+            quote_volume: 100.0,
+        }
+    }
+
+    #[test]
+    fn a_delete_waits_for_the_lock_a_writer_holds() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let store = Store::new(dir.path());
+        let id = spot_id();
+        let jan = Month::containing(1_704_067_200_000); // 2024-01-01
+        store
+            .write_candles(&id, &[flat_candle(jan.start())])
+            .expect("writes");
+        let path = store.candle_path(&id, jan).expect("a path");
+        // Hold the lock as a writer does, from another process's point of view: the OS lock only.
+        let held = lock_across_processes(&path).expect("locks");
+        std::thread::scope(|scope| {
+            let delete = scope.spawn(|| store.delete_months(&id, jan, jan));
+            sleep(Duration::from_millis(300));
+            assert!(!delete.is_finished(), "the delete waits for the lock");
+            assert!(path.exists(), "nothing is removed while the lock is held");
+            drop(held);
+            let report = delete.join().expect("no panic").expect("deletes");
+            assert_eq!(report.files, 1);
+        });
+        assert!(!path.exists());
+        let sidecar = fs::metadata(path.with_extension("parquet.lock")).expect("the sidecar stays");
+        assert_eq!(sidecar.len(), 0, "and the delete wrote nothing into it");
+    }
+
+    #[test]
+    fn a_writer_and_a_delete_on_one_month_leave_it_readable_and_whole() {
+        const WRITES: i64 = 60;
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let store = Store::new(dir.path());
+        let id = spot_id();
+        let jan = Month::containing(1_704_067_200_000); // 2024-01-01
+        let start = std::sync::Barrier::new(2);
+        let deletes = std::thread::scope(|scope| {
+            let writer = scope.spawn(|| {
+                start.wait();
+                for i in 0..WRITES {
+                    store
+                        .write_candles(&id, &[flat_candle(jan.start() + i * MINUTE)])
+                        .expect("every write succeeds");
+                }
+            });
+            start.wait();
+            let mut deletes = 0;
+            // Until the writer is done or has failed: a failed write must end the test, not leave
+            // this loop running.
+            while !writer.is_finished() {
+                let report = store.delete_months(&id, jan, jan).expect("deletes");
+                deletes += report.files;
+                // Between deletes, the file always reads whole.
+                let stored = store.read_month(&id, jan).expect("stays readable");
+                assert!(stored.windows(2).all(|w| w[0].open_time < w[1].open_time));
+            }
+            writer.join().expect("every write succeeds");
+            deletes
+        });
+        assert!(deletes > 0, "the delete ran while the writer did");
+        // Every write merged into what was there, so what is left is the minutes written since the
+        // last delete: an unbroken run ending at the last minute written, or nothing when the last
+        // delete came after the last write.
+        let stored: Vec<Millis> = store
+            .read_month(&id, jan)
+            .expect("the file stays readable")
+            .iter()
+            .map(|c| c.open_time)
+            .collect();
+        if let Some(&first) = stored.first() {
+            let last = jan.start() + (WRITES - 1) * MINUTE;
+            let expected: Vec<Millis> = (first..=last).step_by(MINUTE as usize).collect();
+            assert_eq!(stored, expected);
+        }
+        let folder = store
+            .candle_path(&id, jan)
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let leftovers: Vec<_> = read_dir_or_empty(&folder)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .filter(|name| name.to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert_eq!(leftovers, Vec::<OsString>::new(), "no temp files left");
     }
 
     #[test]
