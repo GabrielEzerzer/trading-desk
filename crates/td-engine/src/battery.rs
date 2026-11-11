@@ -19,7 +19,8 @@
 //! 5. **R4**, the walk-forward's chosen parameters run again on each test window at
 //!    `cost_stress` times the fees and slippage.
 //! 6. **R6**, the walk-forward again with its windows moved by `start_offsets` different offsets.
-//! 7. **R3**, the luck test, last: the sweep repeated on shuffled bars.
+//! 7. **R3**, the luck test, last: the sweep repeated on shuffled bars. It does not run on a kind
+//!    whose rules have quotes, since it cannot shuffle the asks with the bars yet.
 //!
 //! Steps 5 to 7 run only when their lines could still change the verdict. When the lines before
 //! them already decide it (a sample below the minimum, a failed evidence line, or a failed I5),
@@ -259,7 +260,10 @@ pub struct BatterySpec<'a> {
 }
 
 /// Runs the battery of `spec`. `bars` holds the plan's period and may hold warm-up bars before
-/// it; `funding` is `(time, rate)` in any order.
+/// it. `bars`, `asks` and `funding` are the data as [`crate::run`] takes it: `asks` is empty for a
+/// kind whose rules have no quotes, and every run, sweep and walk-forward gets them. The luck test
+/// (R3) cannot shuffle asks with the bars yet (see [`permutation_test`]), so on a kind with quotes
+/// it does not run and its line is inconclusive with a note.
 ///
 /// The instrument must be one of the plan's and the rule must pass its checks. The plan itself is
 /// not checked again with [`TestPlan::validate`]: the registry's test checks every registered
@@ -272,6 +276,7 @@ pub struct BatterySpec<'a> {
 pub fn run_battery(
     spec: &BatterySpec,
     bars: &[Candle],
+    asks: &[Candle],
     funding: &[(Millis, f64)],
     progress: Option<Progress>,
 ) -> Result<BatteryResult, TesterError> {
@@ -335,7 +340,7 @@ pub fn run_battery(
     // 1. Integrity: I1 to I3.
     let (open_buckets, dropped_buckets) = bucket_counts(&base, &traded);
     let split = (traded.len() >= 2).then(|| traded[traded.len() / 2].open_time);
-    let base_checks = repeat_and_prefix(&base, bars, funding, split, &mut meter)?;
+    let base_checks = repeat_and_prefix(&base, bars, asks, funding, split, &mut meter)?;
     let mut integrity_inputs = IntegrityInputs {
         dropped_share: (open_buckets > 0).then(|| dropped_buckets as f64 / open_buckets as f64),
         repeat_differences: Some(base_checks.0),
@@ -376,7 +381,7 @@ pub fn run_battery(
     }
 
     // 2. The sweep over the full period.
-    let swept = sweep(&sweep_spec, bars, funding, Some(&meter.step()))?;
+    let swept = sweep(&sweep_spec, bars, asks, funding, Some(&meter.step()))?;
     meter.base += per_sweep;
 
     // 3. R1: the rolling walk-forward, stitched.
@@ -387,7 +392,7 @@ pub fn run_battery(
         };
         (None, Some(error))
     } else {
-        match walk_forward(&wf_spec, bars, funding, Some(&meter.step())) {
+        match walk_forward(&wf_spec, bars, asks, funding, Some(&meter.step())) {
             Ok(wf) => (Some(wf), None),
             Err(e @ (TesterError::NoQualifyingRun { .. } | TesterError::InvalidSpec(_))) => {
                 (None, Some(e.to_string()))
@@ -413,7 +418,7 @@ pub fn run_battery(
                 params: w.params.clone(),
                 ..base.clone()
             };
-            let checks = repeat_and_prefix(&config, bars, funding, split, &mut meter)?;
+            let checks = repeat_and_prefix(&config, bars, asks, funding, split, &mut meter)?;
             checked.push((&w.params, checks));
         }
         meter.base += 3 * (windows - wf.windows.len());
@@ -580,10 +585,7 @@ pub fn run_battery(
     if let (Some(wf), false) = (&wf, decided) {
         // 5. R4: the chosen parameters on each test window at higher costs.
         let fees = base.fee_override.unwrap_or(instrument.fees);
-        let stressed_fees = FeeSchedule {
-            maker: fees.maker * ev.cost_stress,
-            taker: fees.taker * ev.cost_stress,
-        };
+        let stressed_fees = stressed(fees, ev.cost_stress);
         let mut window_returns = Vec::with_capacity(wf.windows.len());
         let mut level = 1.0f64;
         for w in &wf.windows {
@@ -592,7 +594,7 @@ pub fn run_battery(
                 slippage_bps: w.out_of_sample.config.slippage_bps * ev.cost_stress,
                 ..w.out_of_sample.config.clone()
             };
-            let r = run(&config, bars, funding)?;
+            let r = run(&config, bars, asks, funding)?;
             meter.tick()?;
             let growth = r.equity.last().map_or(1.0, |p| p.equity / cash);
             window_returns.push(growth - 1.0);
@@ -623,7 +625,7 @@ pub fn run_battery(
                 // it, so that bar exists.
                 let mut spec: WalkForwardSpec = wf_spec.clone();
                 spec.sweep.base.to = traded[traded.len() - shift].open_time;
-                match walk_forward(&spec, bars, funding, Some(&meter.step())) {
+                match walk_forward(&spec, bars, asks, funding, Some(&meter.step())) {
                     Ok(r) => offset.oos_return = r.metrics.total_return,
                     Err(
                         e @ (TesterError::NoQualifyingRun { .. } | TesterError::InvalidSpec(_)),
@@ -650,7 +652,18 @@ pub fn run_battery(
             permutations,
             seed: derive_seed(seed, SEED_LUCK),
         };
-        match permutation_test(&spec, bars, funding, Some(&meter.step())) {
+        let luck = if instrument.id.kind.rules().quotes {
+            Err(None)
+        } else {
+            permutation_test(&spec, bars, funding, Some(&meter.step())).map_err(Some)
+        };
+        match luck {
+            Err(None) => {
+                result.luck_note = Some(
+                    "The luck test does not run on a market with quotes yet: it shuffles the bars                      and cannot shuffle the asks with them."
+                        .into(),
+                );
+            }
             Ok(p) => {
                 evidence.luck_p = Some(p.p_value);
                 let smallest = 1.0 / (p.qualified_copies as f64 + 1.0);
@@ -663,17 +676,17 @@ pub fn run_battery(
                 }
                 result.permutation = Some(p);
             }
-            Err(TesterError::Cancelled) => {
+            Err(Some(TesterError::Cancelled)) => {
                 result.luck_note = Some(
                     "The luck test was cancelled, so it gave no p-value; run the battery again \
                      to complete it."
                         .into(),
                 );
             }
-            Err(e @ TesterError::NoQualifyingRun { .. }) => {
+            Err(Some(e @ TesterError::NoQualifyingRun { .. })) => {
                 result.luck_note = Some(format!("The luck test could not run: {e}."));
             }
-            Err(e) => return Err(e),
+            Err(Some(e)) => return Err(e),
         }
         meter.base += per_sweep * (permutations + 1);
     }
@@ -778,18 +791,28 @@ fn bucket_counts(config: &BacktestConfig, traded: &[Candle]) -> (usize, usize) {
     (open, dropped)
 }
 
+/// R4's fees: every fee of `fees`, the per-unit commission too, times `multiplier`.
+fn stressed(fees: FeeSchedule, multiplier: f64) -> FeeSchedule {
+    FeeSchedule {
+        maker: fees.maker * multiplier,
+        taker: fees.taker * multiplier,
+        per_unit: fees.per_unit * multiplier,
+    }
+}
+
 /// I2 and I3 on one backtest, in three counted runs: the backtest twice, then once on the bars
 /// before `split` alone. Returns I2's and I3's differences; I3's is `None` without a split.
 fn repeat_and_prefix(
     config: &BacktestConfig,
     bars: &[Candle],
+    asks: &[Candle],
     funding: &[(Millis, f64)],
     split: Option<Millis>,
     meter: &mut Meter,
 ) -> Result<(usize, Option<usize>), TesterError> {
-    let first = run(config, bars, funding)?;
+    let first = run(config, bars, asks, funding)?;
     meter.tick()?;
-    let again = run(config, bars, funding)?;
+    let again = run(config, bars, asks, funding)?;
     meter.tick()?;
     let prefix = match split {
         Some(at) => {
@@ -799,6 +822,7 @@ fn repeat_and_prefix(
                     ..config.clone()
                 },
                 bars,
+                asks,
                 funding,
             )?;
             Some(prefix_differences(&first.orders, &half.orders, at))
@@ -1116,6 +1140,7 @@ mod tests {
             fees: FeeSchedule {
                 maker: 0.001,
                 taker: 0.002,
+                per_unit: 0.0,
             },
         }
     }
@@ -1158,7 +1183,7 @@ mod tests {
             })
             .collect();
         let config = test_config();
-        let a = run(&config, &bars, &[]).unwrap();
+        let a = run(&config, &bars, &[], &[]).unwrap();
         assert!(!a.fills.is_empty());
         assert_eq!(repeat_differences(&a, &a.clone()), 0);
 
@@ -1209,7 +1234,7 @@ mod tests {
             calls.lock().unwrap().push((done, total));
             ControlFlow::Continue(())
         };
-        let r = run_battery(&spec, &bars, &[], Some(&progress)).unwrap();
+        let r = run_battery(&spec, &bars, &[], &[], Some(&progress)).unwrap();
 
         let wf = r.walk_forward.as_ref().unwrap();
         assert_eq!(wf.windows.len(), 4);
@@ -1349,6 +1374,23 @@ mod tests {
         // No qualified best: no plateau.
         let none = vec![row([0, 0], None, 0.1), row([0, 1], None, 0.1)];
         assert_eq!(plateau(&swept(none), Sharpe, Direction::Maximize), None);
+    }
+
+    #[test]
+    fn the_cost_stress_multiplies_every_fee_the_per_unit_commission_too() {
+        let fees = FeeSchedule {
+            maker: 0.001,
+            taker: 0.002,
+            per_unit: 0.000_035,
+        };
+        assert_eq!(
+            stressed(fees, 2.0),
+            FeeSchedule {
+                maker: 0.002,
+                taker: 0.004,
+                per_unit: 0.000_07,
+            }
+        );
     }
 
     #[test]
