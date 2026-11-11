@@ -1,0 +1,16 @@
+{
+  "name": "case02",
+  "title": "sma_cross long only, Binance spot ETHUSDT, 1h, the ranging half-year April to September 2023",
+  "exercises": "Many round trips, cash, lot rounding",
+  "strategy": "sma_cross",
+  "params": { "fast": 10, "slow": 30, "allow_short": false, "equity_fraction": 0.95 },
+  "venue": "binance",
+  "kind": "spot",
+  "symbol": "ETHUSDT",
+  "timeframe": "1h",
+  "from": "2023-04-01",
+  "to": "2023-10-01",
+  "starting_cash": 10000.0,
+  "fees": { "maker": 0.001, "taker": 0.001 },
+  "data": "data/export/case02"
+}

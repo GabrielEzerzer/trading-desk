@@ -1,0 +1,16 @@
+{
+  "name": "case01",
+  "title": "Buy and hold, Binance spot BTCUSDT, 1d, the trending year 2023",
+  "exercises": "Market fill, fee, marking, the benchmark",
+  "strategy": "crosscheck_buy_and_hold",
+  "params": { "fraction": 0.99 },
+  "venue": "binance",
+  "kind": "spot",
+  "symbol": "BTCUSDT",
+  "timeframe": "1d",
+  "from": "2023-01-01",
+  "to": "2024-01-01",
+  "starting_cash": 10000.0,
+  "fees": { "maker": 0.001, "taker": 0.001 },
+  "data": "data/export/case01"
+}

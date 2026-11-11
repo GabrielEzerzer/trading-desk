@@ -1,0 +1,355 @@
+"""The agreement rule of issue #29, applied to one case's two results.
+
+Both results have the same shape (see `README.md`): `fills` with `time`, `side`, `qty`, `price`
+and `fee`; `equity` with one `{time, equity}` per bar, stamped with the bar's open; `funding`.
+
+Fills are paired by the bar they were decided on. Nautilus fills a market order at the close of
+that bar, so its decision bar is the one that closes at the fill time; our engine fills it at the
+next bar's open, so its decision bar is the bar before the one that opens at the fill time. Across
+a gap in the data the two fill times differ, but the decision bar is the same.
+
+On the gapless bars (`open[t+1] = close[t]`) everything must match within the tolerances below. On
+the real bars the fills must pair one to one and each price difference must stay within bound 1,
+`|open[N+1] - close[N]|` per unit, and the final equity difference within the sum of the bounds.
+Lane 2's cases add the bars where the order inside a bar is ambiguous (left out of the exact
+comparison, with our P&L on them at most Nautilus's) and bound 3, limits through a gap: both enter
+here as arguments.
+"""
+
+from __future__ import annotations
+
+import bisect
+from dataclasses import dataclass, field
+
+PRICE_TICKS = 1.0
+FEE_REL = 1e-9
+FUNDING_REL = 1e-9
+EQUITY_REL = 1e-6
+QTY_REL = 1e-9
+# Float noise allowed on top of a bound: values pass through decimal text and fixed-point money.
+SLACK_REL = 1e-9
+
+
+@dataclass
+class Check:
+    """One line of a report: what was compared, the worst value, the limit, and the outcome."""
+
+    name: str
+    ok: bool
+    value: str
+    limit: str
+    note: str = ""
+
+
+@dataclass
+class Comparison:
+    series: str
+    checks: list[Check] = field(default_factory=list)
+    pairs: list[dict] = field(default_factory=list)
+    numbers: dict = field(default_factory=dict)
+
+    @property
+    def ok(self) -> bool:
+        return all(c.ok for c in self.checks)
+
+
+def rel(a: float, b: float) -> float:
+    """|a - b| relative to the larger magnitude; 0 when both are 0."""
+    scale = max(abs(a), abs(b))
+    return 0.0 if scale == 0.0 else abs(a - b) / scale
+
+
+class Bars:
+    """The case's bars, for finding decision bars and the open/close gap after each."""
+
+    def __init__(self, bars: list[dict], timeframe_ms: int) -> None:
+        self.bars = bars
+        self.tf = timeframe_ms
+        self.opens = [b["open_time"] for b in bars]
+        self.by_close = {b["open_time"] + timeframe_ms: i for i, b in enumerate(bars)}
+
+    def decided_at_next_open(self, fill_time: int) -> int | None:
+        """Our engine: the bar before the one that opens at `fill_time`."""
+        i = bisect.bisect_left(self.opens, fill_time)
+        if i >= len(self.opens) or self.opens[i] != fill_time or i == 0:
+            return None
+        return i - 1
+
+    def decided_at_close(self, fill_time: int) -> int | None:
+        """Nautilus: the bar that closes at `fill_time`."""
+        return self.by_close.get(fill_time)
+
+    def gap_after(self, n: int) -> float:
+        """|open[N+1] - close[N]|, the per-unit price bound of a market fill decided on bar N."""
+        return abs(self.bars[n + 1]["open"] - self.bars[n]["close"])
+
+
+def pair_fills(ours: list[dict], theirs: list[dict], bars: Bars) -> tuple[list[dict], list[str]]:
+    """Pairs fills by decision bar and side, in order. Returns the pairs and the problems: fills
+    left without a partner, or a decision bar that cannot be found."""
+    problems: list[str] = []
+
+    def keyed(fills: list[dict], decided, who: str) -> list[tuple[int, str, dict]]:
+        out = []
+        for f in fills:
+            n = decided(f["time"])
+            if n is None:
+                problems.append(f"{who} fill at {f['time']} has no decision bar")
+                continue
+            out.append((n, f["side"], f))
+        return out
+
+    a = keyed(ours, bars.decided_at_next_open, "our")
+    b = keyed(theirs, bars.decided_at_close, "Nautilus")
+    pairs = []
+    i = j = 0
+    while i < len(a) and j < len(b):
+        (na, sa, fa), (nb, sb, fb) = a[i], b[j]
+        if na == nb and sa == sb:
+            pairs.append({"bar": na, "side": sa, "ours": fa, "theirs": fb})
+            i += 1
+            j += 1
+        elif (na, sa) < (nb, sb):
+            problems.append(f"our {sa} fill decided on bar {na} has no Nautilus partner")
+            i += 1
+        else:
+            problems.append(f"Nautilus {sb} fill decided on bar {nb} has no partner of ours")
+            j += 1
+    for n, s, _ in a[i:]:
+        problems.append(f"our {s} fill decided on bar {n} has no Nautilus partner")
+    for n, s, _ in b[j:]:
+        problems.append(f"Nautilus {s} fill decided on bar {n} has no partner of ours")
+    return pairs, problems
+
+
+def funding_by_bar(ours: list[dict], theirs: list[dict]) -> list[dict]:
+    """Our funding per bar (`at_open`, `in_bar`) beside Nautilus's charges summed the same way."""
+    rows: dict[int, dict] = {}
+
+    def row(bar: int) -> dict:
+        return rows.setdefault(
+            bar, {"bar": bar, "ours_open": 0.0, "ours_in": 0.0, "theirs_open": 0.0, "theirs_in": 0.0}
+        )
+
+    for f in ours:
+        r = row(f["bar"])
+        r["ours_open"] += f["at_open"]
+        r["ours_in"] += f["in_bar"]
+    for f in theirs:
+        r = row(f["bar"])
+        r["theirs_open" if f["at"] == "open" else "theirs_in"] += f["payment"]
+    return [rows[k] for k in sorted(rows)]
+
+
+def fee_check(pairs: list[dict]) -> Check:
+    """Fees within 1e-9 relative, or within half a unit of the currency precision Nautilus rounds
+    its commission to (`Money`), which is the explained difference."""
+    worst = 0.0
+    worst_abs = 0.0
+    unexplained = 0
+    rounded = 0
+    for p in pairs:
+        fo, ft = p["ours"]["fee"], p["theirs"]["fee"]
+        r = rel(fo, ft)
+        worst = max(worst, r)
+        worst_abs = max(worst_abs, abs(fo - ft))
+        if r <= FEE_REL:
+            continue
+        half_unit = 0.5 * 10.0 ** -p["theirs"].get("fee_precision", 8)
+        if abs(fo - ft) <= half_unit * (1.0 + SLACK_REL):
+            rounded += 1
+        else:
+            unexplained += 1
+    note = ""
+    if rounded:
+        note = (
+            f"{rounded} fee(s) beyond 1e-9 relative differ by less than half a unit of the "
+            "8 decimals Nautilus rounds a commission to (its Money type): explained"
+        )
+    return Check(
+        "fees",
+        unexplained == 0,
+        f"max rel {worst:.2e}, max abs {worst_abs:.2e}",
+        f"rel {FEE_REL:.0e}",
+        note,
+    )
+
+
+def rejections_check(ours: dict, theirs: dict) -> Check:
+    """Both engines reject the same number of orders (our checks are mirrored on the Nautilus
+    side, so a rejection only one engine makes is a difference to explain)."""
+    a, b = len(ours.get("rejected_orders", [])), len(theirs.get("rejected_orders", []))
+    return Check("rejected orders", a == b, f"{a} ours, {b} Nautilus", "equal")
+
+
+def compare_gapless(
+    ours: dict,
+    theirs: dict,
+    bars: Bars,
+    tick: float,
+    ambiguous_bars: frozenset[int] = frozenset(),
+) -> Comparison:
+    """The exact comparison on the gapless bars, outside `ambiguous_bars` (decision bar indices)."""
+    cmp = Comparison("gapless")
+    of = [f for f in ours["fills"] if bars.decided_at_next_open(f["time"]) not in ambiguous_bars]
+    tf = [f for f in theirs["fills"] if bars.decided_at_close(f["time"]) not in ambiguous_bars]
+    pairs, problems = pair_fills(of, tf, bars)
+    cmp.pairs = pairs
+    cmp.checks.append(
+        Check(
+            "fills pair one to one (same decision bar and side)",
+            not problems,
+            f"{len(pairs)} paired of {len(of)} ours / {len(tf)} Nautilus",
+            "all",
+            "; ".join(problems[:5]),
+        )
+    )
+    qty_bad = [p for p in pairs if rel(p["ours"]["qty"], p["theirs"]["qty"]) > QTY_REL]
+    cmp.checks.append(
+        Check(
+            "same quantity",
+            not qty_bad,
+            f"{len(qty_bad)} differ",
+            f"rel {QTY_REL:.0e}",
+            "; ".join(
+                f"bar {p['bar']}: {p['ours']['qty']} vs {p['theirs']['qty']}" for p in qty_bad[:5]
+            ),
+        )
+    )
+    price_diffs = [abs(p["ours"]["price"] - p["theirs"]["price"]) for p in pairs]
+    max_price = max(price_diffs, default=0.0)
+    cmp.checks.append(
+        Check(
+            "prices within one tick",
+            max_price <= PRICE_TICKS * tick * (1.0 + SLACK_REL),
+            f"max {max_price:.10g}",
+            f"{PRICE_TICKS * tick:g}",
+        )
+    )
+    cmp.checks.append(fee_check(pairs))
+    cmp.checks.append(rejections_check(ours, theirs))
+
+    rows = funding_by_bar(ours["funding"], theirs["funding"])
+    worst_f = 0.0
+    for r in rows:
+        worst_f = max(worst_f, rel(r["ours_open"], r["theirs_open"]), rel(r["ours_in"], r["theirs_in"]))
+    total_o, total_t = ours["funding_paid"], theirs["funding_paid"]
+    cmp.checks.append(
+        Check(
+            "funding per bar",
+            worst_f <= FUNDING_REL,
+            f"{len(rows)} bars, max rel {worst_f:.2e}; total {total_o:.10g} vs {total_t:.10g}",
+            f"rel {FUNDING_REL:.0e}",
+        )
+    )
+    eq_o, eq_t = ours["equity"], theirs["equity"]
+    same_times = [p["time"] for p in eq_o] == [p["time"] for p in eq_t]
+    worst_point = max((rel(a["equity"], b["equity"]) for a, b in zip(eq_o, eq_t)), default=0.0)
+    cmp.checks.append(
+        Check(
+            "equity curve, every bar",
+            same_times and worst_point <= EQUITY_REL,
+            f"{len(eq_o)} vs {len(eq_t)} points, max rel {worst_point:.2e}",
+            f"rel {EQUITY_REL:.0e}",
+            "" if same_times else "the curves have different bar times",
+        )
+    )
+    final_o, final_t = eq_o[-1]["equity"], eq_t[-1]["equity"]
+    final_rel = rel(final_o, final_t)
+    cmp.checks.append(
+        Check(
+            "final equity",
+            final_rel <= EQUITY_REL,
+            f"{final_o:.8f} vs {final_t:.8f} (rel {final_rel:.2e})",
+            f"rel {EQUITY_REL:.0e}",
+        )
+    )
+    cmp.numbers = {
+        "fills_compared": len(pairs),
+        "max_price_diff": max_price,
+        "final_equity_ours": final_o,
+        "final_equity_nautilus": final_t,
+        "final_equity_rel": final_rel,
+        "max_point_rel": worst_point,
+        "funding_rows": len(rows),
+        "max_funding_rel": worst_f,
+    }
+    return cmp
+
+
+def compare_real(
+    ours: dict,
+    theirs: dict,
+    bars: Bars,
+    taker: float,
+    bound2: float = 0.0,
+    bound3: float = 0.0,
+) -> Comparison:
+    """The bounded comparison on the real bars.
+
+    Bound 1 per fill is `qty * |open[N+1] - close[N]| * (1 + taker)`: the price difference, and the
+    taker fee the engines charge on it. `bound2` and `bound3` are lane 2's totals (ambiguous bars,
+    limits through a gap); zero for market-order cases.
+    """
+    cmp = Comparison("real")
+    pairs, problems = pair_fills(ours["fills"], theirs["fills"], bars)
+    cmp.pairs = pairs
+    cmp.checks.append(
+        Check(
+            "fills pair one to one (same decision bar and side)",
+            not problems,
+            f"{len(pairs)} paired of {len(ours['fills'])} ours / {len(theirs['fills'])} Nautilus",
+            "all",
+            "; ".join(problems[:5]),
+        )
+    )
+    cmp.checks.append(rejections_check(ours, theirs))
+    over = []
+    bound1 = 0.0
+    max_price = 0.0
+    max_ratio = 0.0
+    for p in pairs:
+        gap = bars.gap_after(p["bar"])
+        diff = abs(p["ours"]["price"] - p["theirs"]["price"])
+        max_price = max(max_price, diff)
+        limit = gap + SLACK_REL * p["ours"]["price"]
+        if diff > limit:
+            over.append(f"bar {p['bar']}: diff {diff:.10g} > gap {gap:.10g}")
+        if gap > 0:
+            max_ratio = max(max_ratio, diff / gap)
+        qty = max(p["ours"]["qty"], p["theirs"]["qty"])
+        bound1 += qty * gap * (1.0 + taker)
+    cmp.checks.append(
+        Check(
+            "each price difference within |open[N+1] - close[N]|",
+            not over,
+            f"max diff {max_price:.10g}",
+            "per fill",
+            "; ".join(over[:5]),
+        )
+    )
+    final_o, final_t = ours["equity"][-1]["equity"], theirs["equity"][-1]["equity"]
+    diff = abs(final_o - final_t)
+    limit = bound1 + bound2 + bound3
+    cmp.checks.append(
+        Check(
+            "final equity difference within the sum of the bounds",
+            diff <= limit * (1.0 + SLACK_REL) + 1e-6,
+            f"{final_o:.8f} vs {final_t:.8f}, diff {diff:.6f}",
+            f"{limit:.6f}",
+        )
+    )
+    qty_diff = max((rel(p["ours"]["qty"], p["theirs"]["qty"]) for p in pairs), default=0.0)
+    cmp.numbers = {
+        "fills_compared": len(pairs),
+        "max_price_diff": max_price,
+        "final_equity_ours": final_o,
+        "final_equity_nautilus": final_t,
+        "final_equity_diff": diff,
+        "bound_sum": limit,
+        "bound1": bound1,
+        "max_qty_rel": qty_diff,
+        "funding_total_ours": ours["funding_paid"],
+        "funding_total_nautilus": theirs["funding_paid"],
+    }
+    return cmp
