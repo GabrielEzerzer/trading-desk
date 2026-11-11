@@ -160,7 +160,7 @@ pub struct HighRiskLimits {
     pub min_profit_factor: f64,
     /// The chance of losing `ruin_drawdown` of the account, at most this.
     pub max_risk_of_ruin: f64,
-    /// The drawdown from the peak that counts as ruin.
+    /// The drawdown from the running peak of equity that counts as ruin, above 0 and below 1.
     pub ruin_drawdown: f64,
     /// The out-of-sample return with the single best trade removed, strictly above this.
     pub min_return_without_best_trade: f64,
@@ -230,7 +230,13 @@ impl VerdictRule {
                 )?;
                 finite("limits.min_profit_factor", limits.min_profit_factor)?;
                 probability("limits.max_risk_of_ruin", limits.max_risk_of_ruin)?;
-                share("limits.ruin_drawdown", limits.ruin_drawdown)?;
+                if !(limits.ruin_drawdown > 0.0 && limits.ruin_drawdown < 1.0) {
+                    return Err(PlanError(format!(
+                        "limits.ruin_drawdown must be above 0 and below 1, got {}: ruin is a fall \
+                         from the peak of less than the whole account",
+                        limits.ruin_drawdown
+                    )));
+                }
                 finite(
                     "limits.min_return_without_best_trade",
                     limits.min_return_without_best_trade,
@@ -444,6 +450,15 @@ impl Criterion {
         }
         self
     }
+
+    /// The same line with `note` if it warns and has no note yet.
+    pub fn with_warning_note(self, note: impl Into<String>) -> Criterion {
+        if self.outcome == Outcome::Warn && self.note.is_none() {
+            self.with_note(note)
+        } else {
+            self
+        }
+    }
 }
 
 /// The lines that measure the sample's size, by layer and id: R2's three, and a kind's own
@@ -455,6 +470,173 @@ const SAMPLE_LINES: [(Layer, &str); 4] = [
     (Layer::Evidence, "windows"),
     (Layer::Kind, "trades"),
 ];
+
+// ---------------------------------------------------------------------------------------------
+// The integrity layer
+// ---------------------------------------------------------------------------------------------
+
+/// I1: the largest share of the period's open buckets the data may lack (#35).
+pub const MAX_DROPPED_SHARE: f64 = 0.01;
+
+/// I4: an out-of-sample Sharpe ratio above this is too good to be true (#35).
+pub const TOO_GOOD_SHARPE: f64 = 4.0;
+
+/// The integrity checks of the data and the engine (I1 to I3), computed by the battery on the
+/// plan's backtest before anything else runs. I2 and I3 then also run on each parameter set the
+/// walk-forward chose, and hold the worst result over every set checked. A check the battery
+/// could not make is `None` and fails, which makes the verdict `invalid`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct IntegrityInputs {
+    /// I1: the buckets of the period's open hours that have no bar, over all of them.
+    pub dropped_share: Option<f64>,
+    /// I2: 0 when two runs of each backtest checked gave identical fills and equity, 1
+    /// otherwise.
+    pub repeat_differences: Option<usize>,
+    /// I3: the orders decided on the first half of the period that differ between a run on
+    /// that half alone and the full run, counting an order only one of them has; the most over
+    /// the backtests checked.
+    pub prefix_differences: Option<usize>,
+}
+
+/// The integrity checks read on the stitched walk-forward out-of-sample curve (I4 and I5),
+/// computed once it exists.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct OosIntegrityInputs {
+    /// I4: the annualised Sharpe ratio of the curve's daily returns.
+    pub sharpe: Option<f64>,
+    /// I5: the highest notional over equity inside any bar.
+    pub peak_leverage: Option<f64>,
+    /// I5: the lowest equity inside any bar, over the starting cash. Zero is a bankrupt account:
+    /// a liquidation leaves the account at exactly zero.
+    pub lowest_equity: Option<f64>,
+    /// Whether the stitched out-of-sample curve exists. A curve can exist without the equity
+    /// ranges inside its bars that I5 reads (a test run that kept none), and the lines then say
+    /// so instead of blaming the sample.
+    #[serde(default)]
+    pub curve: bool,
+}
+
+/// Judges I1 to I3: one line each, and any line that fails makes the verdict `invalid`.
+pub fn evaluate_integrity(x: &IntegrityInputs) -> Vec<Criterion> {
+    let line = |id, name: &str, value, limit, unit| {
+        Criterion::new(
+            Layer::Integrity,
+            id,
+            name,
+            value,
+            Comparison::AtMost,
+            limit,
+            unit,
+        )
+    };
+    let count = |n: Option<usize>| n.map(|n| n as f64);
+    vec![
+        line(
+            "dropped_buckets",
+            "Dropped buckets",
+            x.dropped_share,
+            MAX_DROPPED_SHARE,
+            Unit::Percent,
+        ),
+        line(
+            "determinism",
+            "Repeat runs with different fills or equity",
+            count(x.repeat_differences),
+            0.0,
+            Unit::Count,
+        ),
+        line(
+            "prefix_consistency",
+            "Orders on the first half that differ from the full run's",
+            count(x.prefix_differences),
+            0.0,
+            Unit::Count,
+        ),
+    ]
+}
+
+/// Judges I4 and I5 on the out-of-sample curve against the plan's leverage cap.
+///
+/// - **I4**, a Sharpe ratio above [`TOO_GOOD_SHARPE`], warns: the user acknowledges it.
+/// - **I5** has two lines. Equity reaching zero inside a bar (a bankrupt or liquidated account)
+///   fails, so the verdict is `invalid`: a stitched curve that went through zero says nothing
+///   about the strategy's edge. Leverage above the cap warns: the engine refuses orders that would
+///   take the position over the cap, so leverage above it at the worst point inside a bar comes
+///   from the price moving against a position after its entry (a short in a rally), not from a
+///   broken run.
+///
+/// A value that could not be measured warns with a note instead of failing. With no
+/// out-of-sample curve, or one too short for a Sharpe ratio, the sample lines of the evidence
+/// layer already make that verdict `not_enough_evidence`, and the data behind it passed I1 to
+/// I3. A curve without equity ranges inside its bars leaves I5 unchecked, and its lines say that.
+pub fn evaluate_oos_integrity(x: &OosIntegrityInputs, max_leverage: f64) -> Vec<Criterion> {
+    let unmeasured = |c: Criterion, note: &str| {
+        if c.value.is_none() {
+            Criterion {
+                outcome: Outcome::Warn,
+                ..c
+            }
+            .with_note(note.to_string())
+        } else {
+            c
+        }
+    };
+    let small = |what: &str| {
+        format!("Not measured: {what}. The sample is too small for a verdict either way.")
+    };
+    let inside_bars = if x.curve {
+        "Not measured: the out-of-sample curve has no equity ranges inside its bars, which this \
+         check reads."
+            .to_string()
+    } else {
+        small("there is no out-of-sample curve")
+    };
+    vec![
+        unmeasured(
+            Criterion::new(
+                Layer::Integrity,
+                "too_good_to_be_true",
+                "Out-of-sample Sharpe",
+                x.sharpe,
+                Comparison::AtMost,
+                TOO_GOOD_SHARPE,
+                Unit::Ratio,
+            )
+            .warning_on_fail(),
+            &small("the out-of-sample curve is missing or too short for a Sharpe ratio"),
+        )
+        .with_warning_note("Check the strategy before trusting a Sharpe this high."),
+        unmeasured(
+            Criterion::new(
+                Layer::Integrity,
+                "lowest_equity",
+                "Lowest equity inside a bar",
+                x.lowest_equity,
+                Comparison::Above,
+                0.0,
+                Unit::Percent,
+            ),
+            &inside_bars,
+        ),
+        unmeasured(
+            Criterion::new(
+                Layer::Integrity,
+                "peak_leverage",
+                "Peak leverage inside a bar",
+                x.peak_leverage,
+                Comparison::AtMost,
+                max_leverage,
+                Unit::Ratio,
+            )
+            .warning_on_fail(),
+            &inside_bars,
+        )
+        .with_warning_note(
+            "Leverage rose above the plan's cap inside a bar, from the price moving against an \
+             open position.",
+        ),
+    ]
+}
 
 // ---------------------------------------------------------------------------------------------
 // Kind rules
@@ -485,7 +667,7 @@ pub struct KindInputs {
     /// The bootstrap's lower bound on the expectancy.
     pub expectancy_lower_bound: Option<f64>,
     pub profit_factor: Option<f64>,
-    /// The chance of a drawdown of the rule's `ruin_drawdown`.
+    /// The chance of a drawdown of the rule's `ruin_drawdown` from the running peak.
     pub risk_of_ruin: Option<f64>,
     /// The total return with the single best trade removed.
     pub return_without_best_trade: Option<f64>,
@@ -1324,6 +1506,32 @@ mod tests {
         }
     }
 
+    /// Ruin is a fall from the peak of less than the whole account: a drawdown of 1 can never be
+    /// simulated, so it would leave the risk-of-ruin line unmeasured and failing.
+    #[test]
+    fn a_ruin_drawdown_of_the_whole_account_is_refused() {
+        let rule = |ruin_drawdown| VerdictRule::HighRisk {
+            limits: HighRiskLimits {
+                ruin_drawdown,
+                ..HighRiskLimits::default()
+            },
+        };
+        assert_eq!(rule(0.5).validate(), Ok(()));
+        assert_eq!(rule(0.99).validate(), Ok(()));
+        for bad in [1.0, 1.5, 0.0, f64::NAN] {
+            let err = rule(bad).validate().unwrap_err();
+            assert!(
+                err.0.contains("ruin_drawdown must be above 0 and below 1"),
+                "{bad}: {err}"
+            );
+        }
+        assert_eq!(
+            rule(1.0).validate().unwrap_err().0,
+            "limits.ruin_drawdown must be above 0 and below 1, got 1: ruin is a fall from the \
+             peak of less than the whole account"
+        );
+    }
+
     #[test]
     fn rules_serialize_with_their_kind() {
         let rule = portfolio(PortfolioBenchmark::BuyAndHold);
@@ -1826,5 +2034,88 @@ mod tests {
             ..good_evidence()
         };
         assert_eq!(forty(losing).state, VerdictState::NotEnoughEvidence);
+    }
+
+    #[test]
+    fn integrity_lines_fail_on_bad_data_and_warn_on_suspicious_results() {
+        let clean = IntegrityInputs {
+            dropped_share: Some(0.01),
+            repeat_differences: Some(0),
+            prefix_differences: Some(0),
+        };
+        assert!(not_passing(&evaluate_integrity(&clean)).is_empty());
+        let bad = IntegrityInputs {
+            dropped_share: Some(0.011),
+            repeat_differences: Some(1),
+            prefix_differences: None,
+        };
+        assert_eq!(
+            not_passing(&evaluate_integrity(&bad)),
+            vec![
+                ("dropped_buckets", Outcome::Fail),
+                ("determinism", Outcome::Fail),
+                ("prefix_consistency", Outcome::Fail),
+            ]
+        );
+
+        let calm = OosIntegrityInputs {
+            sharpe: Some(2.0),
+            peak_leverage: Some(1.0),
+            lowest_equity: Some(0.8),
+            curve: true,
+        };
+        assert!(not_passing(&evaluate_oos_integrity(&calm, 1.0)).is_empty());
+        // A Sharpe above the limit and leverage above the cap warn; a bankrupt curve fails.
+        let wild = OosIntegrityInputs {
+            sharpe: Some(TOO_GOOD_SHARPE + 0.1),
+            peak_leverage: Some(1.2),
+            lowest_equity: Some(0.0),
+            curve: true,
+        };
+        let lines = evaluate_oos_integrity(&wild, 1.0);
+        assert_eq!(
+            not_passing(&lines),
+            vec![
+                ("too_good_to_be_true", Outcome::Warn),
+                ("lowest_equity", Outcome::Fail),
+                ("peak_leverage", Outcome::Warn),
+            ]
+        );
+        assert!(
+            lines
+                .iter()
+                .all(|l| l.outcome != Outcome::Warn || l.note.is_some())
+        );
+        // Nothing measured: the warnings stay warnings, with a note, and the bankruptcy check
+        // warns too rather than failing a run that never had a curve.
+        let lines = evaluate_oos_integrity(&OosIntegrityInputs::default(), 1.0);
+        assert!(
+            lines
+                .iter()
+                .all(|l| l.outcome == Outcome::Warn && l.note.is_some())
+        );
+        let note = |lines: &[Criterion], id: &str| {
+            let l = lines.iter().find(|l| l.id == id).unwrap();
+            assert_eq!(l.outcome, Outcome::Warn, "{id}");
+            l.note.clone().unwrap()
+        };
+        assert!(note(&lines, "lowest_equity").contains("no out-of-sample curve"));
+        // A curve with no ranges inside its bars: the lines read on those ranges say so, not
+        // that the sample is too small.
+        let no_ranges = OosIntegrityInputs {
+            sharpe: Some(1.0),
+            curve: true,
+            ..OosIntegrityInputs::default()
+        };
+        let lines = evaluate_oos_integrity(&no_ranges, 1.0);
+        for id in ["lowest_equity", "peak_leverage"] {
+            let n = note(&lines, id);
+            assert_eq!(
+                n,
+                "Not measured: the out-of-sample curve has no equity ranges inside its bars, \
+                 which this check reads.",
+                "{id}"
+            );
+        }
     }
 }

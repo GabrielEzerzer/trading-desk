@@ -9,11 +9,12 @@ use futures_util::{SinkExt, StreamExt};
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 use td_core::{
-    Candle, FeeSchedule, Instrument, InstrumentId, InstrumentKind, Millis, Timeframe, Venue,
+    Candle, FeeSchedule, Instrument, InstrumentId, InstrumentKind, Millis, Rounding, Side,
+    Timeframe, Venue,
 };
 use td_data::time::{DAY, MINUTE, Month, parse_date};
 use td_data::{DataError, DownloadReport, InstrumentList, Store};
-use td_engine::{BacktestConfig, Params, SavedRun};
+use td_engine::{BacktestConfig, BacktestResult, Params, SavedRun};
 use td_server::api::auth::Token;
 use td_server::api::data::GapInfo;
 use td_server::api::jobs::{JobInfo, JobRequest, JobResult, JobStatus};
@@ -191,6 +192,11 @@ impl TestServer {
         store
             .write_funding(&instrument(InstrumentKind::Perpetual).id, &rates)
             .expect("seeds");
+        TestServer::on(dir, store).await
+    }
+
+    /// A server on a store already seeded.
+    async fn on(dir: TempDir, store: Store) -> TestServer {
         let server = Server::start(ApiConfig {
             store: store.clone(),
             source: std::sync::Arc::new(NoSource),
@@ -952,4 +958,390 @@ fn an_fx_week_with_its_weekend_closed_passes_the_data_check_with_no_gap_or_dropp
         Err(e) => assert_eq!(e.body.code, "data_missing", "{e:?}"),
         Ok(()) => panic!("spot with the weekend missing must be refused"),
     }
+}
+
+/// Monday 8 January 2024. The FX tests run from it for [`FX_DAYS`] days, across the weekend of 12
+/// to 14 January, closed from Friday 22:00 to Sunday 22:00 UTC.
+fn fx_t0() -> Millis {
+    parse_date("2024-01-08").unwrap()
+}
+
+const FX_DAYS: i64 = 9;
+
+/// How far the ask is above the bid, on every price of every minute: five ticks.
+const SPREAD: f64 = 0.05;
+
+fn fx_instrument(symbol: &str) -> Instrument {
+    let mut fx = instrument(InstrumentKind::Fx);
+    fx.id.symbol = symbol.into();
+    fx
+}
+
+/// The bid minute at `t`: waves around 100.
+fn fx_bid(t: Millis) -> Candle {
+    let price = |i: i64| {
+        let x = i as f64;
+        100.0 + 2.0 * tri(x / 780.0) + 0.7 * tri(x / 97.0)
+    };
+    let i = (t - fx_t0()) / MINUTE;
+    let (open, close) = (price(i), price(i + 1));
+    Candle {
+        open_time: t,
+        open,
+        high: open.max(close) + 0.02,
+        low: open.min(close) - 0.02,
+        close,
+        volume: 1.0,
+        quote_volume: close,
+    }
+}
+
+/// The ask minute at `t`, `spread` above the bid, with no volume, as the store reads it back.
+fn fx_ask(t: Millis, spread: f64) -> Candle {
+    let bid = fx_bid(t);
+    Candle {
+        open: bid.open + spread,
+        high: bid.high + spread,
+        low: bid.low + spread,
+        close: bid.close + spread,
+        volume: 0.0,
+        quote_volume: 0.0,
+        ..bid
+    }
+}
+
+/// The open minutes of `[from, to)`: the FX weekend is absent.
+fn open_minutes(from: Millis, to: Millis) -> Vec<Millis> {
+    (from..to)
+        .step_by(MINUTE as usize)
+        .filter(|&t| InstrumentKind::Fx.is_open(t))
+        .collect()
+}
+
+/// Writes the bids and asks of `times` for `symbol`, the asks `spread` above the bids.
+fn write_fx(store: &Store, symbol: &str, times: &[Millis], spread: f64) {
+    let bids: Vec<Candle> = times.iter().map(|&t| fx_bid(t)).collect();
+    let asks: Vec<Candle> = times.iter().map(|&t| fx_ask(t, spread)).collect();
+    store
+        .write_quotes(&fx_instrument(symbol).id, &bids, &asks)
+        .expect("seeds");
+}
+
+/// Hourly bars from complete hours of minutes, built by hand: the first open, the highest high,
+/// the lowest low, the last close and the summed volumes.
+fn hourly(minutes: &[Candle]) -> Vec<Candle> {
+    minutes
+        .chunk_by(|a, b| a.open_time / HOUR == b.open_time / HOUR)
+        .map(|hour| {
+            let mut bar = hour[0];
+            for m in &hour[1..] {
+                bar.high = bar.high.max(m.high);
+                bar.low = bar.low.min(m.low);
+                bar.close = m.close;
+                bar.volume += m.volume;
+                bar.quote_volume += m.quote_volume;
+            }
+            bar
+        })
+        .collect()
+}
+
+/// A server whose store holds [`FX_DAYS`] days of FX minutes from [`fx_t0`], weekend absent:
+/// `EURUSD` with its asks [`SPREAD`] above the bids, and `EURUSDZ` with the same bids and asks
+/// equal to them.
+async fn fx_server() -> TestServer {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = Store::new(dir.path());
+    let times = open_minutes(fx_t0(), fx_t0() + FX_DAYS * DAY);
+    write_fx(&store, "EURUSD", &times, SPREAD);
+    write_fx(&store, "EURUSDZ", &times, 0.0);
+    TestServer::on(dir, store).await
+}
+
+fn fx_config(symbol: &str, timeframe: Timeframe) -> BacktestConfig {
+    BacktestConfig {
+        instrument: fx_instrument(symbol),
+        timeframe,
+        from: fx_t0(),
+        to: fx_t0() + FX_DAYS * DAY,
+        slippage_bps: 0.0,
+        ..config(InstrumentKind::Fx, FX_DAYS)
+    }
+}
+
+/// An hourly sweep over fast x slow on an FX symbol, with shorts: four backtests.
+fn fx_sweep(symbol: &str) -> Value {
+    let mut base = serde_json::to_value(fx_config(symbol, Timeframe::H1)).unwrap();
+    base["params"] = json!({ "allow_short": true });
+    json!({
+        "base": base,
+        "axes": [
+            { "name": "fast", "space": { "kind": "range", "from": 3, "to": 4, "step": 1 } },
+            { "name": "slow", "space": { "kind": "range", "from": 10, "to": 11, "step": 1 } },
+        ],
+        "mode": "grid",
+        "objective": { "metric": "total_return", "direction": "maximize" },
+        "min_trades": 0,
+    })
+}
+
+/// Starts a run through the API, waits for it and returns what it saved.
+async fn saved_run(t: &TestServer, path: &str, body: &Value) -> RunDetail {
+    let job = t.start(path, body).await;
+    let state = finished(t, job).await;
+    assert_eq!(state["status"], "done", "{state}");
+    t.result(job).await
+}
+
+async fn fx_backtest(t: &TestServer, config: &BacktestConfig) -> (RunDetail, BacktestResult) {
+    let detail = saved_run(t, "/runs/backtest", &serde_json::to_value(config).unwrap()).await;
+    let SavedRun::Backtest(result) = &detail.run else {
+        panic!("a saved backtest");
+    };
+    let result = (**result).clone();
+    (detail, result)
+}
+
+/// Asserts every fill of `result` is at its own side's open of the bar it fills in: a buy at the
+/// ask open rounded up to the tick, a sell at the bid open rounded down. Returns how many buys and
+/// sells there are.
+fn assert_fills_on_their_side(result: &BacktestResult, spread: f64) -> (usize, usize) {
+    let inst = &result.config.instrument;
+    let (mut buys, mut sells) = (0, 0);
+    for fill in &result.fills {
+        let expected = match fill.side {
+            Side::Buy => {
+                buys += 1;
+                inst.round_price(fx_ask(fill.time, spread).open, Rounding::Up)
+            }
+            Side::Sell => {
+                sells += 1;
+                inst.round_price(fx_bid(fill.time).open, Rounding::Down)
+            }
+        };
+        assert_eq!(fill.price, expected, "{fill:?}");
+    }
+    (buys, sells)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_fx_backtest_across_a_weekend_buys_at_the_ask_and_sells_at_the_bid_on_1m_and_1h() {
+    let t = fx_server().await;
+    let times = open_minutes(fx_t0(), fx_t0() + FX_DAYS * DAY);
+    let bids: Vec<Candle> = times.iter().map(|&t| fx_bid(t)).collect();
+    let asks: Vec<Candle> = times.iter().map(|&t| fx_ask(t, SPREAD)).collect();
+
+    // On 1m the bars are the stored minutes themselves.
+    let (detail, m1) = fx_backtest(&t, &fx_config("EURUSD", Timeframe::M1)).await;
+    let data = detail.data.expect("a data report");
+    assert_eq!(
+        (data.gaps.len(), data.dropped.len()),
+        (0, 0),
+        "the weekend is closed, not missing"
+    );
+    assert_eq!(data.bars, times.len());
+    let (buys, sells) = assert_fills_on_their_side(&m1, SPREAD);
+    assert!(buys > 0 && sells > 0, "{buys} buys and {sells} sells");
+    // One of each by hand: a buy is five ticks above the bid open of its minute, a sell on it.
+    let buy = m1.fills.iter().find(|f| f.side == Side::Buy).unwrap();
+    let bid_open = fx_bid(buy.time).open;
+    assert!(
+        buy.price >= bid_open + SPREAD && buy.price < bid_open + SPREAD + 0.01,
+        "{buy:?} against the bid open {bid_open}"
+    );
+    let sell = m1.fills.iter().find(|f| f.side == Side::Sell).unwrap();
+    let bid_open = fx_bid(sell.time).open;
+    assert!(
+        sell.price <= bid_open && sell.price > bid_open - 0.01,
+        "{sell:?} against the bid open {bid_open}"
+    );
+    assert_eq!(
+        m1.data_fingerprint,
+        td_engine::data_fingerprint(&bids, &asks, &[])
+    );
+
+    // On 1h the asks are resampled over the same minutes as the bids.
+    let (detail, h1) = fx_backtest(&t, &fx_config("EURUSD", Timeframe::H1)).await;
+    let (hourly_bids, hourly_asks) = (hourly(&bids), hourly(&asks));
+    assert_eq!(
+        hourly_bids.len(),
+        (FX_DAYS * 24 - 48) as usize,
+        "one weekend closed"
+    );
+    assert_eq!(detail.data.expect("a data report").bars, hourly_bids.len());
+    let (buys, sells) = assert_fills_on_their_side(&h1, SPREAD);
+    assert!(buys > 0 && sells > 0, "{buys} buys and {sells} sells");
+    // The fingerprint covers every bar and ask bar used, so it pins each resampled ask bar's OHLC.
+    assert_eq!(
+        h1.data_fingerprint,
+        td_engine::data_fingerprint(&hourly_bids, &hourly_asks, &[])
+    );
+    assert_ne!(
+        h1.data_fingerprint,
+        td_engine::data_fingerprint(&hourly_bids, &[], &[]),
+        "the asks are in the fingerprint"
+    );
+    let rerun = td_engine::rerun(&h1, &hourly_bids, &hourly_asks, &[]).unwrap();
+    assert!(rerun.fingerprint_matches && rerun.engine_matches);
+    assert_eq!(rerun.result, h1);
+
+    // Both saved runs reopen as matching today's data and engine.
+    let (_, list) = t.get("/runs").await;
+    assert_eq!(list.as_array().map(Vec::len), Some(2));
+    for row in list.as_array().unwrap() {
+        let (status, reopened) = t
+            .get(&format!("/runs/{}", row["id"].as_str().unwrap()))
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            reopened["check"],
+            json!({ "data_matches": true, "engine_matches": true })
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn fx_sweeps_out_of_sample_and_walk_forward_runs_trade_on_the_asks() {
+    let t = fx_server().await;
+
+    // Every row pays the spread: the same grid on the same bids with no spread does better.
+    let sweep = |detail: RunDetail| match detail.run {
+        SavedRun::Sweep(result) => result,
+        other => panic!("a sweep: {:?}", other.kind()),
+    };
+    let spread = sweep(saved_run(&t, "/runs/sweep", &fx_sweep("EURUSD")).await);
+    let none = sweep(saved_run(&t, "/runs/sweep", &fx_sweep("EURUSDZ")).await);
+    assert_eq!(spread.rows.len(), 4);
+    for (row, free) in spread.rows.iter().zip(&none.rows) {
+        assert_eq!(row.params, free.params);
+        let (m, f) = (
+            row.metrics.as_ref().unwrap(),
+            free.metrics.as_ref().unwrap(),
+        );
+        assert!(m.trades > 0, "{row:?}");
+        assert!(
+            m.total_return.unwrap() < f.total_return.unwrap(),
+            "{row:?} against {free:?}"
+        );
+    }
+    let best = spread.best.as_ref().expect("a best run");
+    assert_fills_on_their_side(best, SPREAD);
+
+    let oos = json!({ "sweep": fx_sweep("EURUSD"), "split": { "fraction": 0.7 } });
+    let SavedRun::Oos(oos) = saved_run(&t, "/runs/out-of-sample", &oos).await.run else {
+        panic!("an out-of-sample run");
+    };
+    assert_fills_on_their_side(&oos.out_of_sample, SPREAD);
+
+    let wf = json!({
+        "sweep": fx_sweep("EURUSD"),
+        "windows": { "train_bars": 72, "test_bars": 24, "step_bars": 24, "mode": "rolling" },
+    });
+    let SavedRun::WalkForward(wf) = saved_run(&t, "/runs/walk-forward", &wf).await.run else {
+        panic!("a walk-forward run");
+    };
+    // 168 hourly bars hold four windows.
+    assert_eq!(wf.windows.len(), 4);
+    let (mut buys, mut sells) = (0, 0);
+    for window in &wf.windows {
+        let (b, s) = assert_fills_on_their_side(&window.out_of_sample, SPREAD);
+        (buys, sells) = (buys + b, sells + s);
+    }
+    assert!(buys > 0 && sells > 0, "{buys} buys and {sells} sells");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_crossed_stored_quote_fails_the_run_as_data_missing() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = Store::new(dir.path());
+    let times = open_minutes(fx_t0(), fx_t0() + FX_DAYS * DAY);
+    let bids: Vec<Candle> = times.iter().map(|&t| fx_bid(t)).collect();
+    let mut asks: Vec<Candle> = times.iter().map(|&t| fx_ask(t, SPREAD)).collect();
+    // One minute's ask high below its bid high: the store checks only the open and the close, so
+    // it takes it, and the engine refuses the bar on 1m. (On 1h the other minutes' asks lift the
+    // hour's ask high back over its bid high.)
+    let crossed = fx_t0() + DAY + 10 * HOUR + 30 * MINUTE;
+    let i = times.iter().position(|&t| t == crossed).unwrap();
+    // The bid's open, low and close, a zero spread the store allows, and a high a tick under the
+    // bid's, which is still above the open and the close.
+    asks[i] = Candle {
+        high: bids[i].high - 0.01,
+        volume: 0.0,
+        quote_volume: 0.0,
+        ..bids[i]
+    };
+    store
+        .write_quotes(&fx_instrument("EURUSD").id, &bids, &asks)
+        .expect("the store takes it");
+    let t = TestServer::on(dir, store).await;
+
+    let config = fx_config("EURUSD", Timeframe::M1);
+    let job = t
+        .start("/runs/backtest", &serde_json::to_value(&config).unwrap())
+        .await;
+    let state = finished(&t, job).await;
+    assert_eq!(state["status"], "failed", "{state}");
+    assert_eq!(state["error"]["code"], "data_missing", "{state}");
+    assert_eq!(
+        state["error"]["message"],
+        format!(
+            "the store's bids and asks cannot be run: the ask for the bar at {crossed} is below \
+             the bid; delete the months and download them again"
+        )
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn coverage_expects_the_open_minutes_so_a_complete_fx_month_is_whole() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = Store::new(dir.path());
+    let (jan, feb) = (
+        parse_date("2024-01-01").unwrap(),
+        parse_date("2024-02-01").unwrap(),
+    );
+    let times = open_minutes(jan, feb);
+    // Four FX weekends lie wholly in January 2024, ending on the 7th, 14th, 21st and 28th, each 48
+    // hours: 31 days less 192 hours are open.
+    let open = (31 * 24 - 192) * 60;
+    assert_eq!(times.len(), open as usize);
+    write_fx(&store, "EURUSD", &times, SPREAD);
+    // The same month less the open hour from 10:00 on Wednesday 10 January.
+    let hole = parse_date("2024-01-10").unwrap() + 10 * HOUR;
+    let holed: Vec<Millis> = times
+        .iter()
+        .copied()
+        .filter(|t| !(hole..hole + HOUR).contains(t))
+        .collect();
+    write_fx(&store, "EURUSDH", &holed, SPREAD);
+    // A whole crypto month: March 2024.
+    let spot = instrument(InstrumentKind::Spot).id;
+    store
+        .write_candles(&spot, &minutes(31, 0..0))
+        .expect("seeds");
+    let t = &TestServer::on(dir, store).await;
+
+    let month = |instrument: &'static str| async move {
+        let (status, body) = t
+            .get(&format!("/data/coverage?instrument={instrument}"))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["months"].as_array().map(Vec::len), Some(1), "{body}");
+        let m = &body["months"][0];
+        (
+            m["minutes"].as_i64().unwrap(),
+            m["month_minutes"].as_i64().unwrap(),
+            m["gaps"].as_array().unwrap().len(),
+        )
+    };
+    assert_eq!(month("binance:EURUSD:fx").await, (open, open, 0), "100%");
+    assert_eq!(
+        month("binance:EURUSDH:fx").await,
+        (open - 60, open, 1),
+        "short by the hour"
+    );
+    assert_eq!(
+        month("binance:BTCUSDT:spot").await,
+        (31 * 1440, 31 * 1440, 0),
+        "crypto expects every minute"
+    );
 }
