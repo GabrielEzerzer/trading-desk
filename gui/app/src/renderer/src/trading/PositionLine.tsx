@@ -65,7 +65,10 @@ export function PositionLine({ session, instrumentId, instrument, timeframe, str
 
   // A dropped bucket or warning shows for half a minute, then the line is quiet again.
   useEffect(() => {
-    if (!session.notice) return
+    if (!session.notice) {
+      setNotice(null)
+      return
+    }
     setNotice(session.notice.text)
     const timer = setTimeout(() => setNotice(null), 30_000)
     return () => clearTimeout(timer)
