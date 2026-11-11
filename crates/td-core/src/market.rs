@@ -202,7 +202,10 @@ mod tests {
         // 1,500 yen at 150.00 yen a dollar is 10 dollars; a quote account keeps the yen.
         assert_eq!(AccountCurrency::Quote.from_quote(1500.0, 150.0), 1500.0);
         assert_eq!(AccountCurrency::Base.from_quote(1500.0, 150.0), 10.0);
-        assert_eq!(serde_json::to_string(&AccountCurrency::Base).unwrap(), "\"base\"");
+        assert_eq!(
+            serde_json::to_string(&AccountCurrency::Base).unwrap(),
+            "\"base\""
+        );
         assert_eq!(
             serde_json::from_str::<AccountCurrency>("\"quote\"").unwrap(),
             AccountCurrency::Quote
