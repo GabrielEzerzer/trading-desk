@@ -217,7 +217,9 @@ pub struct MonthCoverageInfo {
     pub month: String,
     /// Stored 1-minute candles.
     pub minutes: usize,
-    /// Minutes in the whole month.
+    /// The month's open minutes by the instrument's trading hours, which a complete month stores:
+    /// every minute of the month for a market that never closes, the minutes outside its weekends
+    /// for FX.
     pub month_minutes: i64,
     /// Open time of the first and last stored candle.
     pub first: Millis,
@@ -264,7 +266,7 @@ fn read_coverage(store: &Store, id: InstrumentId) -> Result<CoverageResponse, Ap
         .map(|m| MonthCoverageInfo {
             month: m.month.to_string(),
             minutes: m.minutes,
-            month_minutes: m.month.minutes(),
+            month_minutes: m.open_minutes,
             first: m.first,
             last: m.last,
             gaps: m.gaps.iter().map(GapInfo::from).collect(),
