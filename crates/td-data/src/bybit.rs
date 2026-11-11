@@ -1,17 +1,39 @@
-//! Bybit history from the v5 REST API: klines (`/v5/market/kline`) and funding rates
-//! (`/v5/market/funding/history`). Both return pages newest first, so they are read backwards from
-//! the end of the range.
+//! Bybit as a [`DataSource`], from the v5 REST API and public streams: spot and linear perpetual
+//! instruments (`/v5/market/instruments-info`), klines (`/v5/market/kline`), which serve the
+//! 1-minute history too, funding rates (`/v5/market/funding/history`) and the public kline streams.
+//! Klines and funding come in pages newest first, so they are read backwards from the end of the
+//! range.
 
 use std::time::Duration;
 
 use serde::Deserialize;
-use td_core::{Candle, InstrumentId, Millis, Timeframe};
+use td_core::{
+    Candle, FeeSchedule, Instrument, InstrumentId, InstrumentKind, Millis, Timeframe, Venue,
+};
 
-use crate::DataError;
 use crate::http::Http;
-use crate::instruments::{bybit_category, bybit_result};
+use crate::instruments::number;
+use crate::live::{Greeting, KlineUpdate, LiveStream, frame_number};
+use crate::source::{DataSource, MinuteHistory};
 use crate::time::{ROUNDING_PAD, funding_on_the_minute, now_ms, round_to_minute};
+use crate::{DataError, InstrumentList};
 
+// Base-tier fees: the non-VIP rates from Bybit's "Trading Fee Structure" help article. Written on
+// 2026-11-10 from the rates as known then; the page could not be fetched that day to re-check
+// them, so check before relying on them.
+
+/// Bybit spot: 0.1% maker, 0.1% taker.
+pub const BYBIT_SPOT_FEES: FeeSchedule = FeeSchedule {
+    maker: 0.001,
+    taker: 0.001,
+};
+/// Bybit linear perpetuals: 0.02% maker, 0.055% taker.
+pub const BYBIT_LINEAR_FEES: FeeSchedule = FeeSchedule {
+    maker: 0.0002,
+    taker: 0.00055,
+};
+
+const INSTRUMENTS_URL: &str = "https://api.bybit.com/v5/market/instruments-info";
 const KLINE_URL: &str = "https://api.bybit.com/v5/market/kline";
 const FUNDING_URL: &str = "https://api.bybit.com/v5/market/funding/history";
 /// The most rows a kline page holds.
@@ -20,6 +42,120 @@ const KLINE_LIMIT: usize = 1000;
 const FUNDING_LIMIT: usize = 200;
 /// A pause between requests, well inside Bybit's per-IP limit of 600 requests per 5 seconds.
 const DELAY: Duration = Duration::from_millis(100);
+/// Bybit closes a public connection that sends nothing for a while; it asks for a ping every 20 s.
+const PING_EVERY: Duration = Duration::from_secs(20);
+
+/// Bybit spot and linear perpetuals.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Bybit;
+
+impl DataSource for Bybit {
+    fn venue(&self) -> Venue {
+        Venue::Bybit
+    }
+
+    fn kinds(&self) -> &'static [InstrumentKind] {
+        &[InstrumentKind::Spot, InstrumentKind::Perpetual]
+    }
+
+    fn instruments(&self, http: &Http, kind: InstrumentKind) -> Result<InstrumentList, DataError> {
+        let mut list = InstrumentList::default();
+        let mut cursor = String::new();
+        loop {
+            let mut query = vec![
+                ("category", category(kind).to_string()),
+                ("limit", "1000".to_string()),
+            ];
+            if !cursor.is_empty() {
+                query.push(("cursor", cursor.clone()));
+            }
+            let body = http.get_text(INSTRUMENTS_URL, &query)?;
+            let page = bybit_page(INSTRUMENTS_URL, &body)?;
+            add_bybit(&mut list, kind, page.list);
+            if page.next_page_cursor.is_empty() {
+                return Ok(list);
+            }
+            cursor = page.next_page_cursor;
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    fn default_fees(&self, kind: InstrumentKind) -> FeeSchedule {
+        match kind {
+            InstrumentKind::Spot => BYBIT_SPOT_FEES,
+            InstrumentKind::Perpetual => BYBIT_LINEAR_FEES,
+        }
+    }
+
+    /// From the kline endpoint, which has the whole history.
+    fn minute_history(
+        &self,
+        http: &Http,
+        id: &InstrumentId,
+        from: Millis,
+        to: Millis,
+        _now: Millis,
+    ) -> Result<MinuteHistory, DataError> {
+        Ok(MinuteHistory {
+            candles: fetch_klines(http, id, Timeframe::M1, from, to)?,
+            missing_files: Vec::new(),
+        })
+    }
+
+    fn funding(
+        &self,
+        http: &Http,
+        id: &InstrumentId,
+        from: Millis,
+        to: Millis,
+    ) -> Result<Vec<(Millis, f64)>, DataError> {
+        fetch_funding(http, &id.symbol, from, to)
+    }
+
+    fn live(&self) -> Result<&dyn LiveStream, DataError> {
+        Ok(self)
+    }
+}
+
+impl LiveStream for Bybit {
+    fn url(&self, id: &InstrumentId) -> String {
+        format!("wss://stream.bybit.com/v5/public/{}", category(id.kind))
+    }
+
+    /// A subscription to the symbol's 1-minute klines, and a ping every 20 s.
+    fn greeting(&self, id: &InstrumentId) -> Greeting {
+        Greeting {
+            subscribe: Some(format!(
+                r#"{{"op":"subscribe","args":["kline.1.{}"]}}"#,
+                id.symbol
+            )),
+            heartbeat: Some((PING_EVERY, r#"{"op":"ping"}"#.into())),
+        }
+    }
+
+    fn parse(&self, text: &str) -> Result<Vec<KlineUpdate>, DataError> {
+        parse_stream_frame(text)
+    }
+
+    fn klines(
+        &self,
+        http: &Http,
+        id: &InstrumentId,
+        timeframe: Timeframe,
+        from: Millis,
+        to: Millis,
+    ) -> Result<Vec<Candle>, DataError> {
+        fetch_klines(http, id, timeframe, from, to)
+    }
+}
+
+/// Bybit's name for the market an instrument kind trades in.
+fn category(kind: InstrumentKind) -> &'static str {
+    match kind {
+        InstrumentKind::Spot => "spot",
+        InstrumentKind::Perpetual => "linear",
+    }
+}
 
 #[derive(Debug, Deserialize)]
 struct KlinePage {
@@ -88,7 +224,7 @@ pub fn fetch_klines(
     let open_time = |c: &Candle| c.open_time;
     page_backwards(from, end, KLINE_LIMIT, open_time, |page_end| {
         let query = [
-            ("category", bybit_category(id.kind).to_string()),
+            ("category", category(id.kind).to_string()),
             ("symbol", id.symbol.clone()),
             ("interval", interval(timeframe).to_string()),
             ("start", from.to_string()),
@@ -220,6 +356,191 @@ fn read_funding(
         fetch(lo, page_end)
     })?;
     Ok(funding_on_the_minute(stamped, from, to))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BybitResponse {
+    ret_code: i64,
+    ret_msg: String,
+    /// Read only once `ret_code` says the call succeeded: error responses carry `{}` here.
+    #[serde(default)]
+    result: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BybitInstrumentPage {
+    list: Vec<BybitInstrument>,
+    #[serde(default)]
+    next_page_cursor: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BybitInstrument {
+    symbol: String,
+    status: String,
+    base_coin: String,
+    quote_coin: String,
+    /// Linear only: `LinearPerpetual` or `LinearFutures`.
+    contract_type: Option<String>,
+    price_filter: BybitPriceFilter,
+    lot_size_filter: BybitLotFilter,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BybitPriceFilter {
+    tick_size: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BybitLotFilter {
+    min_order_qty: String,
+    /// Spot's quantity step.
+    base_precision: Option<String>,
+    /// Spot's minimum order value.
+    min_order_amt: Option<String>,
+    /// Linear's quantity step.
+    qty_step: Option<String>,
+    /// Linear's minimum order value.
+    min_notional_value: Option<String>,
+}
+
+/// Unwraps a Bybit v5 response, turning a non-zero `retCode` into an error.
+fn bybit_result<T: serde::de::DeserializeOwned>(url: &str, body: &str) -> Result<T, DataError> {
+    let response: BybitResponse =
+        serde_json::from_str(body).map_err(|e| DataError::parse(url, e))?;
+    if response.ret_code != 0 {
+        return Err(DataError::Api {
+            url: url.to_string(),
+            message: format!("retCode {}: {}", response.ret_code, response.ret_msg),
+        });
+    }
+    serde_json::from_value(response.result).map_err(|e| DataError::parse(url, e))
+}
+
+fn bybit_page(url: &str, body: &str) -> Result<BybitInstrumentPage, DataError> {
+    bybit_result(url, body)
+}
+
+/// Reads one page of `/v5/market/instruments-info`: every instrument with status `Trading`, and
+/// for linear only the `LinearPerpetual` contracts.
+pub fn parse_bybit_instruments(
+    body: &str,
+    kind: InstrumentKind,
+) -> Result<InstrumentList, DataError> {
+    let page = bybit_page("Bybit instruments-info", body)?;
+    let mut list = InstrumentList::default();
+    add_bybit(&mut list, kind, page.list);
+    Ok(list)
+}
+
+fn add_bybit(list: &mut InstrumentList, kind: InstrumentKind, page: Vec<BybitInstrument>) {
+    for s in page {
+        let listed = s.status == "Trading"
+            && match kind {
+                InstrumentKind::Spot => true,
+                InstrumentKind::Perpetual => s.contract_type.as_deref() == Some("LinearPerpetual"),
+            };
+        if listed {
+            list.push(&s.symbol, bybit_instrument(&s, kind));
+        }
+    }
+}
+
+fn bybit_instrument(s: &BybitInstrument, kind: InstrumentKind) -> Result<Instrument, String> {
+    let lot = &s.lot_size_filter;
+    let (step, min_value) = match kind {
+        InstrumentKind::Spot => (&lot.base_precision, &lot.min_order_amt),
+        InstrumentKind::Perpetual => (&lot.qty_step, &lot.min_notional_value),
+    };
+    let required = |name: &str, value: &Option<String>| -> Result<f64, String> {
+        number(name, value.as_deref().ok_or_else(|| format!("no {name}"))?)
+    };
+    Ok(Instrument {
+        id: InstrumentId {
+            venue: Venue::Bybit,
+            symbol: s.symbol.clone(),
+            kind,
+        },
+        base: s.base_coin.clone(),
+        quote: s.quote_coin.clone(),
+        tick_size: number("tickSize", &s.price_filter.tick_size)?,
+        lot_size: required("quantity step", step)?,
+        min_qty: number("minOrderQty", &lot.min_order_qty)?,
+        min_notional: required("minimum order value", min_value)?,
+        fees: Bybit.default_fees(kind),
+    })
+}
+
+#[derive(Debug, Deserialize)]
+struct BybitFrame {
+    topic: Option<String>,
+    data: Option<serde_json::Value>,
+    success: Option<bool>,
+    ret_msg: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BybitKline {
+    start: Millis,
+    interval: String,
+    open: String,
+    close: String,
+    high: String,
+    low: String,
+    volume: String,
+    turnover: String,
+    confirm: bool,
+}
+
+/// Reads a Bybit v5 public frame: `kline.1.<SYMBOL>` data, or an operation response, where
+/// `success: false` (a refused subscription) is an error.
+pub fn parse_stream_frame(text: &str) -> Result<Vec<KlineUpdate>, DataError> {
+    let what = "a Bybit kline frame";
+    let frame: BybitFrame = serde_json::from_str(text).map_err(|e| DataError::parse(what, e))?;
+    if frame.success == Some(false) {
+        return Err(DataError::Api {
+            url: "Bybit stream".into(),
+            message: frame.ret_msg.unwrap_or_default(),
+        });
+    }
+    let is_kline = frame
+        .topic
+        .as_deref()
+        .is_some_and(|t| t.starts_with("kline."));
+    let (true, Some(data)) = (is_kline, frame.data) else {
+        return Ok(Vec::new());
+    };
+    let klines: Vec<BybitKline> =
+        serde_json::from_value(data).map_err(|e| DataError::parse(what, e))?;
+    klines
+        .into_iter()
+        .map(|k| {
+            if k.interval != "1" {
+                return Err(DataError::parse(
+                    what,
+                    format!("interval {:?}, not 1", k.interval),
+                ));
+            }
+            let candle = Candle {
+                open_time: k.start,
+                open: frame_number(what, &k.open)?,
+                high: frame_number(what, &k.high)?,
+                low: frame_number(what, &k.low)?,
+                close: frame_number(what, &k.close)?,
+                volume: frame_number(what, &k.volume)?,
+                quote_volume: frame_number(what, &k.turnover)?,
+            };
+            Ok(KlineUpdate {
+                candle,
+                closed: k.confirm,
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
