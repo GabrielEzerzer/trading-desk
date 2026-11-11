@@ -309,6 +309,129 @@ fn an_open_shorts_intrabar_range_on_a_dollar_account_takes_each_extreme_at_its_o
 }
 
 #[test]
+fn a_dollar_accounts_intrabar_range_follows_the_average_entry_through_an_add_a_cut_and_a_flip() {
+    // On 100 000 dollars at 0.003 yen a unit, each order filling at the next bar's open:
+    // - bar 1 buys 50 000 at the ask open, 150.500: long 50 000 at 150.500;
+    // - bar 2 buys 30 000 at the ask open, 151.300: long 80 000 at (50 000 * 150.500 + 30 000 *
+    //   151.300) / 80 000 = 150.800;
+    // - bar 3 sells 40 000 at the bid open, 152.200, realising 40 000 * (152.200 - 150.800) =
+    //   56 000 yen: long 40 000, still at 150.800;
+    // - bar 4 sells 70 000 at the bid open, 151.400: 40 000 close the long, realising 40 000 *
+    //   (151.400 - 150.800) = 24 000 yen, and 30 000 open a short at 151.400, still open after
+    //   bar 5.
+    let quotes = [
+        flat(150.000),
+        spread([150.480, 151.200, 149.600, 151.000]),
+        spread([151.280, 152.400, 150.100, 152.000]),
+        spread([152.200, 153.000, 151.000, 151.500]),
+        spread([151.400, 152.900, 149.200, 150.000]),
+        spread([149.800, 151.600, 147.500, 148.000]),
+    ];
+    let plan = vec![
+        (0, market(Side::Buy, 50_000.0)),
+        (1, market(Side::Buy, 30_000.0)),
+        (2, market(Side::Sell, 40_000.0)),
+        (3, market(Side::Sell, 70_000.0)),
+    ];
+    let config = SessionConfig {
+        fees: Some(PER_UNIT),
+        ..dollars()
+    };
+    let s = run(plan, &quotes, config);
+    // Each fill as worked above: its bar, the signed quantity, the price, the yen it realises,
+    // and the position and average entry after it.
+    let steps = [
+        (1, 50_000.0, 150.500, 0.0, 50_000.0, 150.500),
+        (2, 30_000.0, 151.300, 0.0, 80_000.0, 150.800),
+        (3, -40_000.0, 152.200, 56_000.0, 40_000.0, 150.800),
+        (4, -70_000.0, 151.400, 24_000.0, -30_000.0, 151.400),
+    ];
+    let filled: Vec<(usize, f64, f64)> = s
+        .fills()
+        .iter()
+        .map(|f| ((f.time / MIN) as usize, f.side.sign() * f.qty, f.price))
+        .collect();
+    let planned: Vec<(usize, f64, f64)> =
+        steps.iter().map(|step| (step.0, step.1, step.2)).collect();
+    assert_eq!(filled, planned);
+
+    // The replay: the equity at a price `p` is the cash plus the position's yen P&L against its
+    // average entry, converted at `p`. Each bar is valued at the points the range is taken over:
+    // the open with the position held into the bar; each fill's price with the position before
+    // it, after which the fill's fee and realised yen, converted at its price, go into the cash;
+    // then the low, high and close with the position after the fills. A short is valued on the
+    // ask, anything else on the bid.
+    let equity_at = |cash: f64, pos: f64, avg: f64, p: f64| {
+        if pos == 0.0 {
+            cash
+        } else {
+            cash + pos * (p - avg) / p
+        }
+    };
+    let (mut cash, mut pos, mut avg) = (100_000.0, 0.0, 0.0);
+    let mut next = 0;
+    let mut replayed = Vec::new();
+    for (k, (bid, ask)) in quotes.iter().enumerate() {
+        let closing = |pos: f64| if pos < 0.0 { *ask } else { *bid };
+        let mut points = vec![equity_at(cash, pos, avg, closing(pos)[0])];
+        while let Some(&(_, qty, price, realised, after, after_avg)) =
+            steps.get(next).filter(|step| step.0 == k)
+        {
+            next += 1;
+            points.push(equity_at(cash, pos, avg, price));
+            cash += (realised - f64::abs(qty) * 0.003) / price;
+            (pos, avg) = (after, after_avg);
+        }
+        let [_, high, low, close] = closing(pos);
+        points.extend([low, high, close].map(|p| equity_at(cash, pos, avg, p)));
+        // The replay's close is the session's equity at the close.
+        approx(*points.last().unwrap(), s.equity()[k].equity);
+        let low = points.iter().copied().fold(f64::INFINITY, f64::min);
+        let high = points.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        replayed.push((low, high));
+    }
+    let x = td_engine::risk::intrabar(
+        100_000.0,
+        s.bars(),
+        &asks_of(&quotes),
+        s.equity(),
+        s.fills(),
+        s.bar_funding(),
+        AccountCurrency::Base,
+    );
+    assert_eq!(x.ranges.len(), replayed.len());
+    for (k, (range, &(low, high))) in x.ranges.iter().zip(&replayed).enumerate() {
+        assert!(
+            (range.low - low).abs() < 1e-9 && (range.high - high).abs() < 1e-9,
+            "bar {k}: the engine's range is {range:?}, the replay's [{low}, {high}]"
+        );
+    }
+
+    // The flip's fee, 70 000 * 0.003 = 210 yen at 151.400, splits 40:30 between the long it
+    // closes and the short it opens. The short is open, marked at the ask close, 148.020: its
+    // gross P&L is the open position's unrealised P&L, 30 000 * (151.400 - 148.020) = 101 400
+    // yen at 148.020.
+    let trades = trades_of(&s, &quotes);
+    assert_eq!(trades.len(), 2);
+    let (long, short) = (&trades[0], &trades[1]);
+    assert!(!long.open && short.open);
+    approx(short.fees, 90.0 / 151.400);
+    let unrealised = s.portfolio().unrealised_pnl();
+    approx(unrealised, 101_400.0 / 148.020);
+    approx(short.gross_pnl, unrealised);
+    approx(
+        s.portfolio().realised_pnl(),
+        56_000.0 / 152.200 + 24_000.0 / 151.400,
+    );
+    // End equity less the starting cash is the closed long's net P&L plus the open position's
+    // unrealised P&L, less the open short's share of the fee: the sum of both trades' net P&L.
+    // To 1e-9 dollars, against float noise of about 1e-11 on six-figure sums.
+    let gain = s.equity().last().unwrap().equity - 100_000.0;
+    approx(gain, long.net_pnl + unrealised - short.fees);
+    approx(gain, long.net_pnl + short.net_pnl);
+}
+
+#[test]
 fn a_stopped_trades_r_on_a_dollar_account_converts_the_risk_at_the_stop() {
     // A short of 7600 sold at bar 1's bid open, 150.000, with a buy stop at 152.000. The risk is
     // 7600 * (152.000 - 150.000) = 15 200 yen, converted at the stop, 152.000: 100 dollars.
