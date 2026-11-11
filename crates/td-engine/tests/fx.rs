@@ -92,6 +92,10 @@ fn limit(side: Side, qty: f64, price: f64) -> OrderRequest {
     req(&usdjpy(), side, qty, OrderType::Limit { price })
 }
 
+fn stop(side: Side, qty: f64, trigger: f64) -> OrderRequest {
+    req(&usdjpy(), side, qty, OrderType::Stop { trigger })
+}
+
 /// Runs `plan` on FX over `(bid, ask)` one-minute bars.
 fn run_fx(plan: Vec<(usize, Send)>, bars: &[([f64; 4], [f64; 4])]) -> Session {
     run_fx_with(plan, bars, fx_config())
@@ -347,6 +351,132 @@ fn an_attached_stop_after_a_limit_filled_inside_the_bar_starts_one_spread_from_t
     assert_eq!(
         fills(&s),
         [(Side::Buy, 149.900, 1000.0), (Side::Sell, 149.880, 1000.0)]
+    );
+}
+
+#[test]
+fn an_attached_stop_starts_inside_its_sides_candle_when_the_spread_narrows() {
+    // A sell limit at 150.000 with a stop at 150.080, sent at bar 0's close (bid 149.800, ask
+    // 149.900). Bar 1's bid opens at 149.800 and its high of 150.000 reaches the limit, which fills
+    // there, inside the bar. One spread at the open above that is 150.000 + 0.100 = 150.100, but
+    // the ask's high is 150.050: the spread narrowed to 0.050 at the top, so the ask was at most
+    // 150.050 when the entry filled. The stop starts there, short of its trigger, and rests.
+    // Bar 2's ask opens at 150.000 and its high of 150.120 reaches the trigger: the stop fills at
+    // max(150.000, 150.080) = 150.080. Started at 150.100 it would have filled on bar 1 at
+    // 150.100, a price the ask never reached.
+    let s = run_fx(
+        vec![(
+            0,
+            Send::WithStop(limit(Side::Sell, 1000.0, 150.000), 150.080),
+        )],
+        &[
+            (
+                [149.800, 149.800, 149.800, 149.800],
+                [149.900, 149.900, 149.900, 149.900],
+            ),
+            (
+                [149.800, 150.000, 149.800, 149.900],
+                [149.900, 150.050, 149.850, 149.950],
+            ),
+            (
+                [149.950, 150.100, 149.900, 150.000],
+                [150.000, 150.120, 149.950, 150.050],
+            ),
+        ],
+    );
+    assert_eq!(
+        fills(&s),
+        [(Side::Sell, 150.000, 1000.0), (Side::Buy, 150.080, 1000.0)]
+    );
+    assert_eq!(s.fills()[1].time, 2 * MIN);
+
+    // The mirror: a buy limit at 150.000 with a stop at 149.920, sent at bar 0's close (bid
+    // 150.100, ask 150.200). Bar 1's ask opens at 150.200 and its low of 150.000 reaches the limit,
+    // which fills there. One spread at the open below that is 150.000 - 0.100 = 149.900, but the
+    // bid's low is 149.950: the stop starts there, short of its trigger, and rests. Bar 2's bid
+    // opens at 150.000 and its low of 149.900 reaches the trigger: the stop fills at
+    // min(150.000, 149.920) = 149.920. Started at 149.900 it would have filled on bar 1 at
+    // 149.900, a price the bid never reached.
+    let s = run_fx(
+        vec![(
+            0,
+            Send::WithStop(limit(Side::Buy, 1000.0, 150.000), 149.920),
+        )],
+        &[
+            (
+                [150.100, 150.100, 150.100, 150.100],
+                [150.200, 150.200, 150.200, 150.200],
+            ),
+            (
+                [150.100, 150.150, 149.950, 150.050],
+                [150.200, 150.200, 150.000, 150.100],
+            ),
+            (
+                [150.000, 150.050, 149.900, 149.950],
+                [150.050, 150.100, 149.950, 150.000],
+            ),
+        ],
+    );
+    assert_eq!(
+        fills(&s),
+        [(Side::Buy, 150.000, 1000.0), (Side::Sell, 149.920, 1000.0)]
+    );
+    assert_eq!(s.fills()[1].time, 2 * MIN);
+}
+
+#[test]
+fn an_attached_stop_starts_no_lower_than_its_sides_low_when_the_spread_widens() {
+    // A sell stop at 149.850 with a protective stop at 149.880, sent at bar 0's close. Bar 1 opens
+    // at bid 150.000, ask 150.020, and the bid falls to 149.800: the entry triggers and sells at
+    // min(150.000, 149.850) = 149.850. One spread at the open above that is 149.850 + 0.020 =
+    // 149.870, but the ask's low is 149.900: the spread widened to 0.100 at the bottom, so the ask
+    // was at least 149.900 when the entry filled, already past the trigger. The stop fills at
+    // max(149.900, 149.880) = 149.900, 50 yen lost. Started at 149.870 it would have filled at its
+    // trigger, 149.880, a price the ask never traded at.
+    let s = run_fx(
+        vec![(
+            0,
+            Send::WithStop(stop(Side::Sell, 1000.0, 149.850), 149.880),
+        )],
+        &[
+            DECIDE,
+            (
+                [150.000, 150.050, 149.800, 149.900],
+                [150.020, 150.070, 149.900, 149.950],
+            ),
+        ],
+    );
+    assert_eq!(
+        fills(&s),
+        [(Side::Sell, 149.850, 1000.0), (Side::Buy, 149.900, 1000.0)]
+    );
+    assert!(s.fills().iter().all(|f| f.time == MIN));
+}
+
+#[test]
+fn an_attached_stop_after_a_limit_filled_between_the_bars_is_crossed_on_the_way_to_the_open() {
+    // A sell limit at 150.100 with a stop at 150.150, sent at bar 0's close. Bar 1's bid opens at
+    // 150.300, through the limit: the market rose through 150.100 between the bars, where the limit
+    // filled. The ask, one spread at the open above, was then at 150.100 + 0.020 = 150.120 and rose
+    // on to its open of 150.320, through the stop: it fills at its trigger, 150.150. That happened
+    // before the bar's ask candle began, so the candle's low of 150.250 does not hold the start up;
+    // held there, the stop would fill at 150.250.
+    let s = run_fx(
+        vec![(
+            0,
+            Send::WithStop(limit(Side::Sell, 1000.0, 150.100), 150.150),
+        )],
+        &[
+            DECIDE,
+            (
+                [150.300, 150.400, 150.230, 150.350],
+                [150.320, 150.420, 150.250, 150.370],
+            ),
+        ],
+    );
+    assert_eq!(
+        fills(&s),
+        [(Side::Sell, 150.100, 1000.0), (Side::Buy, 150.150, 1000.0)]
     );
 }
 

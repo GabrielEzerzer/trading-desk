@@ -148,10 +148,14 @@ pub trait Broker: Send {
 /// that was already through the trigger, as when the bar opens past the stop. An entry that filled
 /// between the bars met the market at its limit, and the market then went on to the open, so its
 /// stop is checked from the limit: a stop between the limit and the open is crossed on the way and
-/// fills at its trigger, before the open. Slippage applies as for any stop. The stop's fill is
-/// applied right after its entry's, except when the stop triggers inside the range after an entry
-/// that filled at or before the open: then it waits for the bar's fills at the open and takes its
-/// place among the fills inside the range.
+/// fills at its trigger, before the open. With an ask series the stop's side starts one spread from
+/// the price the entry met, the spread at the bar's open. The spread can change inside the bar, so
+/// for an entry filled at the open or inside the range that start is held inside the stop side's
+/// candle; for one filled between the bars it is not, since the stop side traded there before its
+/// candle began. Slippage applies as for any stop. The stop's fill is applied right after its
+/// entry's, except when the stop triggers inside the range after an entry that filled at or before
+/// the open: then it waits for the bar's fills at the open and takes its place among the fills
+/// inside the range.
 ///
 /// The liquidation check of [`Broker::on_bar`] follows the same path. On its way to the open the
 /// market reaches the limits it trades through, in order, and then the open. Before each of them
@@ -468,7 +472,14 @@ impl<M: FillModel> Broker for SimBroker<M> {
             // The rest of the bar on the stop's side, which starts as far from the entry's price as
             // its open is from the entry side's open: the spread at the open.
             let stop_bar = side_bar(stop.request.side);
-            let from = from + (stop_bar.open - own.open);
+            let mut from = from + (stop_bar.open - own.open);
+            // The spread can narrow or widen inside the bar, so on a market with quotes that start
+            // can land outside the stop side's candle. An entry filled at the open or inside the
+            // range met the stop side inside its candle, so the start is held there. One filled
+            // between the bars met it before the candle began, on the way to the open.
+            if self.instrument.id.kind.rules().quotes && !between {
+                from = from.max(stop_bar.low).min(stop_bar.high);
+            }
             let rest = Candle {
                 open: from,
                 high: stop_bar.high.max(from),
