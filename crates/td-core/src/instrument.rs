@@ -529,7 +529,10 @@ mod tests {
         assert!(!json.contains("per_unit"), "{json}");
         assert_eq!(serde_json::from_str::<FeeSchedule>(&json).unwrap(), fees);
         // Exactly the rate's fee, bit for bit.
-        assert_eq!(fees.fee(65_000.1, 0.003, fees.taker), 65_000.1 * 0.003 * fees.taker);
+        assert_eq!(
+            fees.fee(65_000.1, 0.003, fees.taker),
+            65_000.1 * 0.003 * fees.taker
+        );
 
         let fx = FeeSchedule {
             maker: 0.0,

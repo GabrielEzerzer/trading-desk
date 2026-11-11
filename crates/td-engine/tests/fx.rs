@@ -278,7 +278,11 @@ fn a_buy_limit_fills_on_the_ask_and_a_sell_limit_on_the_bid() {
         [(Side::Buy, 149.900, 1000.0), (Side::Sell, 150.200, 1000.0)]
     );
     assert!(s.fills().iter().all(|f| f.time == 2 * MIN));
-    assert!(s.fills().iter().all(|f| f.liquidity == td_core::Liquidity::Maker));
+    assert!(
+        s.fills()
+            .iter()
+            .all(|f| f.liquidity == td_core::Liquidity::Maker)
+    );
 }
 
 #[test]
@@ -357,7 +361,11 @@ fn a_bar_wholly_in_closed_hours_is_refused() {
     // Friday 21:00 UTC is the week's last open hour; 22:00 is the first closed one, and so is
     // Saturday noon. Sunday 21:00 is the last closed hour and 22:00 the first open one.
     assert_eq!(feed(Timeframe::H1, FRIDAY + 21 * HOUR), Ok(()));
-    for closed in [FRIDAY + 22 * HOUR, FRIDAY + DAY + 12 * HOUR, FRIDAY + 2 * DAY + 21 * HOUR] {
+    for closed in [
+        FRIDAY + 22 * HOUR,
+        FRIDAY + DAY + 12 * HOUR,
+        FRIDAY + 2 * DAY + 21 * HOUR,
+    ] {
         assert_eq!(
             feed(Timeframe::H1, closed),
             Err(EngineError::ClosedBar { time: closed })
@@ -369,9 +377,7 @@ fn a_bar_wholly_in_closed_hours_is_refused() {
     assert_eq!(feed(Timeframe::D1, FRIDAY + 2 * DAY), Ok(()));
     assert_eq!(
         feed(Timeframe::D1, FRIDAY + DAY),
-        Err(EngineError::ClosedBar {
-            time: FRIDAY + DAY
-        })
+        Err(EngineError::ClosedBar { time: FRIDAY + DAY })
     );
 }
 

@@ -440,9 +440,9 @@ impl<M: FillModel> Broker for SimBroker<M> {
                     if between && order.request.reduce_only {
                         let mut arriving = order.clone();
                         arriving.request.tif = TimeInForce::Ioc;
-                        let check = self
-                            .model
-                            .check(&arriving, false, false, own, &self.instrument);
+                        let check =
+                            self.model
+                                .check(&arriving, false, false, own, &self.instrument);
                         if let Some(waiting) = Pending::new(order.clone(), check, own.open) {
                             return After::Wait(waiting);
                         }
@@ -507,10 +507,7 @@ impl<M: FillModel> Broker for SimBroker<M> {
         // them in that order on its way to the open. They are all on one side, since a buy and a
         // sell limit can both rest unfilled only with the sell above the buy, and an open cannot
         // be through both. Then the fills at the open, by id.
-        let gap = |fill: &Pending| {
-            fill.between_bars()
-                .then(|| (fill.price - fill.open).abs())
-        };
+        let gap = |fill: &Pending| fill.between_bars().then(|| (fill.price - fill.open).abs());
         at_open.sort_by(|a, b| {
             match (gap(a), gap(b)) {
                 (Some(a), Some(b)) => b.total_cmp(&a),
