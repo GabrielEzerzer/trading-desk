@@ -70,7 +70,15 @@ fn instrument(kind: InstrumentKind) -> Instrument {
     }
 }
 
-/// Lists the two test instruments, as a venue's exchange info would; never downloads.
+/// An FX pair listed beside BTCUSDT, with its trading rules.
+fn fx_instrument(symbol: &str) -> Instrument {
+    let mut fx = instrument(InstrumentKind::Fx);
+    fx.id.symbol = symbol.into();
+    fx
+}
+
+/// Lists the two test instruments, and for FX the pairs of [`fx_store`], as a venue's exchange
+/// info would; never downloads.
 #[derive(Default)]
 struct ListOnly {
     /// Lists the perpetual with fees that are not numbers, which the engine refuses when its
@@ -85,8 +93,13 @@ impl MarketSource for ListOnly {
         if self.nan_perpetual_fees && kind == InstrumentKind::Perpetual {
             listed.fees.taker = f64::NAN;
         }
+        let instruments = if kind == InstrumentKind::Fx {
+            FX_PAIRS.iter().map(|&(s, _)| fx_instrument(s)).collect()
+        } else {
+            vec![listed]
+        };
         Ok(InstrumentList {
-            instruments: vec![listed],
+            instruments,
             rejected: Vec::new(),
         })
     }
@@ -1098,4 +1111,139 @@ async fn the_plan_routes_need_the_token() {
     let body: Value = serde_json::from_str(&response.text().await.unwrap()).unwrap();
     assert_eq!(body, json!([]));
     server.jobs().cancel_all();
+}
+
+/// The FX plan's period in days from Monday [`t0`]: long enough that its open hours, without the
+/// weekends, hold the plan's six walk-forward windows of H4 bars.
+const FX_DAYS: i64 = 301;
+
+/// The FX pairs of [`fx_store`] and how far each one's ask is above its bid on every price of
+/// every minute: the same bids, `EURUSD` at five ticks and `EURUSDZ` at none.
+const FX_PAIRS: [(&str, f64); 2] = [("EURUSD", 0.05), ("EURUSDZ", 0.0)];
+
+/// A store holding the bids and asks of [`FX_PAIRS`] over [`FX_DAYS`] days from [`t0`], weekends
+/// absent: the bids are the swing of [`minutes`] laid over the open minutes alone, so a weekend
+/// does not break it.
+fn fx_store(dir: &Path) -> Store {
+    let store = Store::new(dir);
+    let price = |i: usize| 100.0 + 4.0 * tri(i as f64 / (5.0 * 1440.0));
+    let bids: Vec<Candle> = (0..FX_DAYS * 1440)
+        .map(|i| t0() + i * MINUTE)
+        .filter(|&t| InstrumentKind::Fx.is_open(t))
+        .enumerate()
+        .map(|(i, open_time)| {
+            let (open, close) = (price(i), price(i + 1));
+            Candle {
+                open_time,
+                open,
+                high: open.max(close) + 0.02,
+                low: open.min(close) - 0.02,
+                close,
+                volume: 1.0,
+                quote_volume: close,
+            }
+        })
+        .collect();
+    for (symbol, spread) in FX_PAIRS {
+        let asks: Vec<Candle> = bids
+            .iter()
+            .map(|b| Candle {
+                open: b.open + spread,
+                high: b.high + spread,
+                low: b.low + spread,
+                close: b.close + spread,
+                volume: 0.0,
+                quote_volume: 0.0,
+                ..*b
+            })
+            .collect();
+        store
+            .write_quotes(&fx_instrument(symbol).id, &bids, &asks)
+            .expect("seeds");
+    }
+    store
+}
+
+/// [`entry`]'s plan on the pairs of [`fx_store`] over [`FX_DAYS`].
+fn fx_entry() -> StrategyEntry {
+    let mut entry = entry(49);
+    entry.plan.instruments = FX_PAIRS.iter().map(|&(s, _)| fx_instrument(s).id).collect();
+    entry.plan.period.to = t0() + FX_DAYS * DAY;
+    entry
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_plan_on_fx_trades_on_the_stored_asks_and_skips_only_the_luck_test() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().to_path_buf();
+    tokio::task::spawn_blocking(move || fx_store(&path))
+        .await
+        .unwrap();
+    let t = TestServer::start(Arc::new(dir), vec![fx_entry()], ListOnly::default()).await;
+    let mut ws = t.websocket().await;
+    let job = t.start_plan(&json!({ "strategy": "sma_cross" })).await;
+    let done = ws.follow(job).await.pop().unwrap();
+    assert_eq!(done.status, JobStatus::Done, "{:?}", done.error);
+    let kept = &plan_done(&done).instruments;
+    let pairs: Vec<&str> = kept
+        .iter()
+        .map(|k| k.verdict.instrument.symbol.as_str())
+        .collect();
+    assert_eq!(pairs, ["EURUSD", "EURUSDZ"]);
+
+    let mut sweeps = Vec::new();
+    for kept in kept {
+        // The battery got as far as the luck test and skipped it, as on any market with quotes.
+        let luck = kept
+            .verdict
+            .criteria
+            .iter()
+            .find(|c| c.id == "luck_p")
+            .expect("a luck line");
+        assert_eq!(luck.outcome, td_engine::Outcome::Inconclusive, "{luck:?}");
+        assert_eq!(
+            luck.note.as_deref(),
+            Some(
+                "The luck test does not run on a market with quotes yet: it shuffles the bars \
+                 and cannot shuffle the asks with them."
+            )
+        );
+        let (status, body) = t.get(&format!("/runs/{}", kept.run_id)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let detail: RunDetail = serde_json::from_value(body).unwrap();
+        let SavedRun::Plan(run) = detail.run else {
+            panic!("a plan run: {:?}", detail.run.kind());
+        };
+        assert_eq!(run.battery.verdict, kept.verdict);
+        assert!(run.battery.permutation.is_none() && !run.battery.luck_cancelled);
+        // The saved fingerprint covers the asks the store holds today.
+        let check = detail.check.unwrap();
+        assert!(check.data_matches);
+        assert_eq!(check.engine_matches, Some(true));
+        sweeps.push(run.battery.sweep.expect("a sweep"));
+    }
+
+    // Every parameter set pays the spread: on the same bids with no spread it does better.
+    let (spread, none) = (&sweeps[0], &sweeps[1]);
+    assert_eq!(spread.rows.len(), 4);
+    for (row, free) in spread.rows.iter().zip(&none.rows) {
+        assert_eq!(row.params, free.params);
+        let (m, f) = (
+            row.metrics.as_ref().unwrap(),
+            free.metrics.as_ref().unwrap(),
+        );
+        assert!(m.trades > 0, "{row:?}");
+        assert!(
+            m.total_return.unwrap() < f.total_return.unwrap(),
+            "{row:?} against {free:?}"
+        );
+    }
+
+    // A skipped luck test is not a cancelled one: both verdicts are complete.
+    let rows = t.verdicts("").await;
+    assert_eq!(rows.len(), 2);
+    assert!(
+        rows.iter().all(|r| r.complete && r.plan_matches),
+        "{rows:?}"
+    );
 }

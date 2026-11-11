@@ -9,9 +9,11 @@
 //! naming the instrument and the missing span, as for the other runs.
 //!
 //! Each instrument's data is loaded the way the other run jobs load theirs
-//! ([`super::runs::load_run_data`]) over the plan's backtest configuration. That configuration has
-//! no `warmup_from`: the engine reads no bars before the period, and the walk-forward warms each
-//! test window up from the bars before it inside the period.
+//! ([`super::runs::load_run_data`]) over the plan's backtest configuration: the bars, a market
+//! with quotes' ask bars beside them, and a perpetual's funding. Every run of the battery trades
+//! on those asks, except the luck test (R3), which the battery skips on a market with quotes. That
+//! configuration has no `warmup_from`: the engine reads no bars before the period, and the
+//! walk-forward warms each test window up from the bars before it inside the period.
 //!
 //! Progress is one count over every instrument: the sum of each battery's own total
 //! ([`td_engine::battery_runs`]), known once every instrument's data is loaded. Its message names
@@ -331,10 +333,16 @@ fn execute(
             }
             std::ops::ControlFlow::Continue(())
         };
-        // No asks, as the backtest and tester jobs pass none: the data check only refuses a month
-        // of a kind with quotes whose file has no ask prices.
+        // The asks are empty for a kind without quotes; for one with quotes the battery trades
+        // on them and skips the luck test.
         let outcome = own_pool(|| {
-            td_engine::run_battery(&spec, &data.bars, &[], &data.funding, Some(&progress))
+            td_engine::run_battery(
+                &spec,
+                &data.bars,
+                &data.asks,
+                &data.funding,
+                Some(&progress),
+            )
         });
         let battery = match outcome {
             Ok(Ok(battery)) => battery,
@@ -413,7 +421,7 @@ fn save_plan_run(
         &battery_spec(entry, instrument),
         battery,
         &data.bars,
-        &[],
+        &data.asks,
         &data.funding,
     )
     .map_err(|e| ApiError::internal(e.to_string()))?;
