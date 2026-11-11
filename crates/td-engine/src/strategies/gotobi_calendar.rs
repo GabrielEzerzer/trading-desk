@@ -243,6 +243,12 @@ mod tests {
     fn a_holiday_after_a_weekend_moves_back_several_days() {
         // 2021-07-25 was a Sunday after Marine Day and Sports Day on July 22 and 23.
         assert_eq!(month(2021, 7)[4], (2021, 7, 21));
+        // A query that ends before the nominal day still finds it, and so does a single day.
+        assert_eq!(
+            dates(&gotobi_days(d(2021, 7, 16), d(2021, 7, 21)).unwrap()),
+            [(2021, 7, 20), (2021, 7, 21)]
+        );
+        assert!(is_gotobi_at(midnight(d(2021, 7, 21))).unwrap());
         // 2019: April 30 and May 5 fall inside the Golden Week and both move back to Friday
         // April 26, which counts once.
         assert_eq!(
