@@ -95,6 +95,7 @@ fn plan() -> TestPlan {
             max_leverage: 1.0,
             slippage: Vec::new(),
             account_currency: AccountCurrency::Quote,
+            fee_override: None,
         },
         sweep: SweepPlan {
             fixed: Params::new(),

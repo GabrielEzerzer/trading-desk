@@ -47,8 +47,9 @@ mod verdict;
 mod private_strategies_build;
 
 pub use battery::{
-    BatteryResult, BatteryRuns, BatterySpec, Breakdown, CostStress, IntegrityReport, PlateauReport,
-    RegimeResult, SideResult, StartOffset, battery_runs, run_battery,
+    BatteryResult, BatteryRuns, BatterySpec, Breakdown, CostStress, IntegrityReport,
+    PlateauDirection, PlateauReport, RegimeResult, SideResult, StartOffset, battery_runs,
+    run_battery,
 };
 pub use broker::{AttachedStop, Broker, BrokerEvent, Order, OrderStatus, SimBroker};
 pub use error::{EngineError, OrderRejected};

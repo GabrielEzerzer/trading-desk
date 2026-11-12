@@ -40,11 +40,32 @@ use crate::rng::SplitMix64;
 /// Fewer than three bars leave nothing to shuffle and come back unchanged. Each input bar must
 /// pass [`Candle::validate`].
 pub fn permute_bars(bars: &[Candle], seed: u64) -> Result<Vec<Candle>, CoreError> {
-    for b in bars {
+    permute_quotes(bars, &[], seed).map(|(bars, _)| bars)
+}
+
+/// [`permute_bars`] for a market with quotes: `asks` is empty or holds each bar's ask, one per bar
+/// in the same order, and every ask moves with its bar. A rebuilt bar is its source bar scaled by
+/// the rebuilt open over the source open, and its ask is the source ask scaled by the same factor,
+/// written the same way (the rebuilt open times the ask's price over the source bar's open). So
+/// each bar keeps its spread as a share of its price, and because rounding is monotonic an ask at
+/// or above its bar stays at or above it. The bars come back exactly as [`permute_bars`] gives
+/// them for the same seed.
+///
+/// Panics if `asks` is neither empty nor as long as `bars`: the caller pairs them.
+pub(crate) fn permute_quotes(
+    bars: &[Candle],
+    asks: &[Candle],
+    seed: u64,
+) -> Result<(Vec<Candle>, Vec<Candle>), CoreError> {
+    assert!(
+        asks.is_empty() || asks.len() == bars.len(),
+        "one ask per bar, or none"
+    );
+    for b in bars.iter().chain(asks) {
         b.validate()?;
     }
     if bars.len() < 3 {
-        return Ok(bars.to_vec());
+        return Ok((bars.to_vec(), asks.to_vec()));
     }
     // order[k] is the source bar of rebuilt bar k + 1.
     let mut order: Vec<usize> = (1..bars.len()).collect();
@@ -53,26 +74,36 @@ pub fn permute_bars(bars: &[Candle], seed: u64) -> Result<Vec<Candle>, CoreError
         let j = rng.below(i as u64 + 1) as usize;
         order.swap(i, j);
     }
+    // `like` scaled as the source bar `b` is when it is rebuilt to open at `open`.
+    let scaled = |like: &Candle, b: &Candle, open: f64, open_time| Candle {
+        open_time,
+        open: open * (like.open / b.open),
+        high: open * (like.high / b.open),
+        low: open * (like.low / b.open),
+        close: open * (like.close / b.open),
+        volume: like.volume,
+        quote_volume: open * (like.quote_volume / b.open),
+    };
     let mut out = Vec::with_capacity(bars.len());
+    let mut out_asks = Vec::with_capacity(asks.len());
     out.push(bars[0]);
+    out_asks.extend(asks.first().copied());
     let mut prev_close = bars[0].close;
     for (slot, &src) in bars[1..].iter().zip(&order) {
-        let b = bars[src];
+        let b = &bars[src];
         let open = prev_close * (b.open / bars[src - 1].close);
-        let bar = Candle {
-            open_time: slot.open_time,
-            open,
-            high: open * (b.high / b.open),
-            low: open * (b.low / b.open),
-            close: open * (b.close / b.open),
-            volume: b.volume,
-            quote_volume: open * (b.quote_volume / b.open),
-        };
+        // `open * (b.open / b.open)` is `open` exactly.
+        let bar = scaled(b, b, open, slot.open_time);
         bar.validate()?;
+        if let Some(ask) = asks.get(src) {
+            let ask = scaled(ask, b, open, slot.open_time);
+            ask.validate()?;
+            out_asks.push(ask);
+        }
         prev_close = bar.close;
         out.push(bar);
     }
-    Ok(out)
+    Ok((out, out_asks))
 }
 
 #[cfg(test)]
@@ -193,5 +224,52 @@ mod tests {
             permute_bars(&bad, 5),
             Err(CoreError::InvalidCandle { .. })
         ));
+    }
+
+    /// On a market with quotes each ask moves with its bar: the bars are exactly the ones
+    /// `permute_bars` gives, each ask stays at or above its bar, and it keeps its spread as a share
+    /// of the bar's price.
+    #[test]
+    fn asks_move_with_their_bars_and_stay_at_or_above_them() {
+        let bars = path();
+        // Spreads that differ per bar and per price, from 0 to about 0.3%.
+        let asks: Vec<Candle> = bars
+            .iter()
+            .enumerate()
+            .map(|(i, b)| {
+                let s = (i % 5) as f64 * 0.0007;
+                Candle {
+                    open: b.open * (1.0 + s),
+                    high: b.high * (1.0 + 2.0 * s),
+                    low: b.low * (1.0 + s / 2.0),
+                    close: b.close * (1.0 + s),
+                    ..*b
+                }
+            })
+            .collect();
+        for seed in 0..20 {
+            let (p, pa) = permute_quotes(&bars, &asks, seed).unwrap();
+            assert_eq!(p, permute_bars(&bars, seed).unwrap(), "seed {seed}");
+            assert_eq!(pa.len(), p.len());
+            for (k, (b, a)) in p.iter().zip(&pa).enumerate() {
+                assert_eq!(a.open_time, b.open_time);
+                assert!(
+                    a.open >= b.open && a.high >= b.high && a.low >= b.low && a.close >= b.close,
+                    "seed {seed} bar {k}: {b:?} {a:?}"
+                );
+                a.validate().unwrap();
+                // The source bar, found by its volume, and the same spread share at the close.
+                let src = b.volume as usize - 1;
+                let share = |a: &Candle, b: &Candle| a.close / b.close;
+                assert!(
+                    rel_close(share(a, b), share(&asks[src], &bars[src])),
+                    "bar {k}"
+                );
+            }
+        }
+        assert_eq!(
+            permute_quotes(&bars, &[], 3).unwrap().1,
+            Vec::<Candle>::new()
+        );
     }
 }
