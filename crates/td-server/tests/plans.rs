@@ -189,23 +189,10 @@ fn minutes() -> Vec<Candle> {
 /// in a debug build. It is rebuilt by every process rather than kept between runs, because whether
 /// a store folder reads back depends on the store's code as well as the minutes, and a template
 /// kept from an older build (CI restores Cargo's scratch folder from its cache) read as empty.
-/// Templates left by earlier processes are deleted first.
 fn template_store() -> &'static Path {
     static TEMPLATE: OnceLock<PathBuf> = OnceLock::new();
     TEMPLATE.get_or_init(|| {
-        let scratch = Path::new(env!("CARGO_TARGET_TMPDIR"));
-        if let Ok(entries) = std::fs::read_dir(scratch) {
-            for entry in entries.flatten() {
-                if entry
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with("plans-store-")
-                {
-                    let _ = std::fs::remove_dir_all(entry.path());
-                }
-            }
-        }
-        let dir = scratch.join(format!("plans-store-{}", std::process::id()));
+        let dir = fresh_template_dir(Path::new(env!("CARGO_TARGET_TMPDIR")));
         let store = Store::new(&dir);
         let candles = minutes();
         for kind in [InstrumentKind::Spot, InstrumentKind::Perpetual] {
@@ -219,6 +206,30 @@ fn template_store() -> &'static Path {
             .expect("seeds");
         dir
     })
+}
+
+/// This process's template folder under `scratch`, emptied. Only this process's own folder is
+/// deleted: another test process sharing the target dir (two worktrees with one
+/// `CARGO_TARGET_DIR`) may be writing or copying its own template at the same moment.
+// shortcut: folders left by finished processes stay, a few MB each; `cargo clean` removes them.
+fn fresh_template_dir(scratch: &Path) -> PathBuf {
+    let dir = scratch.join(format!("plans-store-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    dir
+}
+
+#[test]
+fn the_template_folder_of_another_process_is_left_alone() {
+    let scratch = tempfile::tempdir().expect("temp dir");
+    let other = scratch.path().join("plans-store-0");
+    std::fs::create_dir_all(&other).unwrap();
+    let own = scratch
+        .path()
+        .join(format!("plans-store-{}", std::process::id()));
+    std::fs::create_dir_all(own.join("candles")).unwrap();
+    assert_eq!(fresh_template_dir(scratch.path()), own);
+    assert!(!own.exists(), "this process's old template is removed");
+    assert!(other.exists(), "another process's template stays");
 }
 
 fn copy_dir(from: &Path, to: &Path) {
