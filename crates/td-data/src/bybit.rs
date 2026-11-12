@@ -138,6 +138,7 @@ impl LiveStream for Bybit {
                 id.symbol
             )),
             heartbeat: Some((PING_EVERY, r#"{"op":"ping"}"#.into())),
+            pong: Some(is_pong),
         }
     }
 
@@ -501,6 +502,7 @@ struct BybitFrame {
     data: Option<serde_json::Value>,
     success: Option<bool>,
     ret_msg: Option<String>,
+    op: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -514,6 +516,15 @@ struct BybitKline {
     volume: String,
     turnover: String,
     confirm: bool,
+}
+
+/// Whether a frame is Bybit's answer to a ping: `"ret_msg":"pong"` on the public streams,
+/// `"op":"pong"` on others.
+pub fn is_pong(text: &str) -> bool {
+    text.contains("pong")
+        && serde_json::from_str::<BybitFrame>(text).is_ok_and(|frame| {
+            frame.ret_msg.as_deref() == Some("pong") || frame.op.as_deref() == Some("pong")
+        })
 }
 
 /// Reads a Bybit v5 public frame: `kline.1.<SYMBOL>` data, or an operation response, where
@@ -565,6 +576,16 @@ pub fn parse_stream_frame(text: &str) -> Result<Vec<KlineUpdate>, DataError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_answer_to_a_ping_is_a_pong() {
+        let public = r#"{"success":true,"ret_msg":"pong","conn_id":"x","op":"ping"}"#;
+        let other = r#"{"req_id":"","op":"pong","args":["1675418560633"],"conn_id":"x"}"#;
+        assert!(is_pong(public) && is_pong(other));
+        let ack = r#"{"success":true,"ret_msg":"","conn_id":"x","op":"subscribe"}"#;
+        let kline = r#"{"topic":"kline.1.PONGUSDT","data":[],"ts":1,"type":"snapshot"}"#;
+        assert!(!is_pong(ack) && !is_pong(kline));
+    }
 
     #[test]
     fn a_full_page_that_does_not_move_back_is_an_error() {

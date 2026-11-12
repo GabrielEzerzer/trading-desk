@@ -70,7 +70,7 @@ pub use results::{
 pub use risk::{DayRollover, EquityRange};
 pub use runner::{
     BacktestConfig, BacktestResult, Benchmark, ENGINE_REVISION, Rerun, config_fingerprint,
-    data_fingerprint, default_slippage_bps, rerun, run,
+    data_fingerprint, default_slippage_bps, rerun, run, run_strategy,
 };
 pub use session::{
     CLOSE_OUT_TAG, EquityPoint, LIQUIDATION_TAG, MAINTENANCE_MARGIN_RATE, Session, SessionConfig,

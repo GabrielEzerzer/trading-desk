@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
+license.workspace = true
 
 [dependencies]
 td-core.workspace = true
@@ -22,4 +23,12 @@ ts = ["dep:ts-rs", "td-core/ts"]
 
 [dev-dependencies]
 proptest.workspace = true
+# The cross-check harness's example downloads and exports its data through td-data.
+td-data.workspace = true
 tempfile.workspace = true
+
+# Our side of the NautilusTrader cross-check (harness/crosscheck/). Its unit tests run with the
+# crate's.
+[[example]]
+name = "crosscheck"
+test = true

@@ -2341,6 +2341,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "td-core",
+ "td-data",
  "tempfile",
  "thiserror",
  "ts-rs",
