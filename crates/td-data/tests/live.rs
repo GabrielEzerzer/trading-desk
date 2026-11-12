@@ -301,6 +301,106 @@ async fn a_dropped_connection_is_reconnected_and_the_missed_minutes_backfilled()
     );
 }
 
+/// A flat minute `i` minutes after 00:00.
+fn flat_minute(i: i64) -> Candle {
+    Candle {
+        open_time: T0 + i * MIN,
+        open: 100.0,
+        high: 101.0,
+        low: 99.0,
+        close: 100.0,
+        volume: 1.0,
+        quote_volume: 100.0,
+    }
+}
+
+/// A Binance stream frame for a minute, closed or in progress.
+fn binance_frame(c: &Candle, closed: bool) -> String {
+    format!(
+        r#"{{"e":"kline","E":1,"s":"BTCUSDT","k":{{"t":{},"i":"1m","o":"{}","h":"{}","l":"{}","c":"{}","v":"{}","q":"{}","x":{closed}}}}}"#,
+        c.open_time, c.open, c.high, c.low, c.close, c.volume, c.quote_volume
+    )
+}
+
+/// Runs a feed and collects its events until one matches `last`, or fails after 20 s.
+async fn collect_until(
+    spec: FeedSpec,
+    rest: Arc<FakeRest>,
+    last: impl Fn(&FeedEvent) -> bool,
+) -> Vec<FeedEvent> {
+    let (tx, mut rx) = mpsc::channel(64);
+    let feed = tokio::spawn(run_feed(spec, rest, tx));
+    let mut events = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while !events.last().is_some_and(&last) {
+        match tokio::time::timeout_at(deadline, rx.recv()).await {
+            Ok(Some(event)) => events.push(event),
+            other => panic!("feed stopped or stalled ({other:?}); events so far: {events:?}"),
+        }
+    }
+    feed.abort();
+    events
+}
+
+#[tokio::test]
+async fn a_bar_built_with_a_tolerated_minute_missing_is_reported_after_it() {
+    // A four-hour bucket may miss two of its 240 minutes; REST has all but minute 7.
+    let all: Vec<Candle> = (0..240).filter(|&i| i != 7).map(flat_minute).collect();
+    let url = serve(vec![vec![binance_frame(&flat_minute(240), true)]]).await;
+    let rest = FakeRest::new(all.clone(), 0);
+    let spec = FeedSpec {
+        url,
+        ..FeedSpec::new(btc(Venue::Binance), Timeframe::H4, Some(T0))
+    };
+    let events = collect_until(spec, rest, |e| {
+        matches!(e, FeedEvent::Tolerated { .. } | FeedEvent::Dropped(_))
+    })
+    .await;
+    let expected = resample(InstrumentKind::Spot, &all, Timeframe::H4, false);
+    assert_eq!(expected.tolerated, [(T0, 1)]);
+    let n = events.len();
+    assert_eq!(
+        events[n - 2],
+        FeedEvent::Bar(expected.candles[0]),
+        "{events:?}"
+    );
+    assert_eq!(
+        events[n - 1],
+        FeedEvent::Tolerated {
+            open_time: T0,
+            missing_minutes: 1
+        }
+    );
+}
+
+#[tokio::test]
+async fn frames_a_feed_falls_behind_on_are_counted_and_reported() {
+    // Minute 2 sends the feed back to backfill minutes 0 and 1, which fails once and waits a
+    // second; the stream sends more frames meanwhile than the feed's buffer holds.
+    let mut script = vec![binance_frame(&flat_minute(2), true)];
+    script.extend((0..1500).map(|_| binance_frame(&flat_minute(3), false)));
+    script.push(binance_frame(&flat_minute(3), true));
+    let url = serve(vec![script]).await;
+    let rest = FakeRest::new((0..4).map(flat_minute).collect(), 1);
+    let spec = FeedSpec {
+        url,
+        ..FeedSpec::new(btc(Venue::Binance), Timeframe::M1, Some(T0))
+    };
+    let events = collect(spec, rest, 4).await;
+    assert_eq!(bars(&events), (0..4).map(flat_minute).collect::<Vec<_>>());
+    let dropped: Vec<u64> = events
+        .iter()
+        .filter_map(|e| match e {
+            FeedEvent::FramesDropped { count } => Some(*count),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        matches!(dropped[..], [count] if count > 0),
+        "{dropped:?}: {events:?}"
+    );
+}
+
 /// The next bar a feed sends, or fails after 20 s.
 async fn next_bar(rx: &mut mpsc::Receiver<FeedEvent>) -> Candle {
     loop {
@@ -490,6 +590,7 @@ mod fake_sources {
             Greeting {
                 subscribe: Some("hello".into()),
                 heartbeat: None,
+                pong: None,
             }
         }
         fn parse(&self, text: &str) -> Result<Vec<KlineUpdate>, DataError> {
