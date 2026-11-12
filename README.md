@@ -1,6 +1,6 @@
 # Trading Desk
 
-Trading Desk is the workspace I use for my own trading: a desktop app that backtests trading strategies on historical market data and paper-trades the same strategy code on live prices. It is one Electron app with two sections on a shared Rust engine. Strategy Lab backtests and tests strategies on historical data; Trading shows live charts and paper-trades the same strategy code. It covers crypto spot and perpetual futures on Binance and Bybit. It grows out of Tipping Point's paper-trading view, but it is built for applied trading rather than for the paper.
+Trading Desk is the workspace I use for my own trading: a desktop app that backtests trading strategies on historical market data and paper-trades the same strategy code on live prices. It is one Electron app with two sections on a shared Rust engine. Strategy Lab backtests and tests strategies on historical data; Trading shows live charts and paper-trades the same strategy code. It covers crypto spot and perpetual futures on Binance and Bybit, and FX pairs from OANDA. It grows out of Tipping Point's paper-trading view, but it is built for applied trading rather than for the paper.
 
 ![Strategy Lab showing the result of an SMA cross backtest on BTCUSDT from January 2023 to October 2025: the return, CAGR, Sharpe and drawdown, the equity curve against buy and hold, and the metrics table](assets/lab-result.png)
 
@@ -45,11 +45,7 @@ The data folder is `TD_DATA_DIR` when that environment variable is set. Otherwis
 
 Crypto prices come from Binance and Bybit public market data, which needs no account: Binance's monthly archives on data.binance.vision, both venues' public REST APIs and their public live streams. FX pairs come from OANDA, which needs the API token of a free OANDA practice account in the `OANDA_API_TOKEN` environment variable. I keep mine in my secrets vault and start the tools through it, but any way of setting the environment variable works.
 
-## License
-
-Trading Desk is licensed under the GNU General Public License, version 3 only (GPL-3.0). See [LICENSE](LICENSE).
-
-## FX history from OANDA
+### FX history from OANDA
 
 FX pairs (`--venue oanda --kind fx`) download bid and ask minutes from OANDA's REST API on a free practice account, from 2007 on. The desk's FX market hours follow the US daylight-saving rule in force since 2007, so the app refuses an earlier start; the CLI does not check it, so keep `--from` at 2007-01-01 or later. The download reads the account's API token from `OANDA_API_TOKEN`, so it runs through hush. Build first and give hush the built program, so the token is not in the environment of the build scripts cargo runs:
 
@@ -71,3 +67,7 @@ A strategy is one Rust file with three parts. `crates/td-engine/src/strategies/s
 A private strategy goes in `crates/td-engine/src/strategies/private/`. That folder is a checkout of the private `trading-desk-strategies` repo, and git ignores it here. Clone it with `git clone <url> crates/td-engine/src/strategies/private`. Every `*.rs` file in it is compiled in by `crates/td-engine/build.rs` and listed after the examples. Nothing else needs editing, and the engine builds without the folder. A file name must be a Rust module name, such as `my_strategy.rs`, and not a Rust keyword such as `mod.rs` or a bare `_.rs`. An example strategy in this repo also needs a `pub mod` line in `strategies/mod.rs` and an entry in `registry.rs`.
 
 `cargo test -p td-engine` checks every registered strategy's plan and rule, including the private ones when the folder is present.
+
+## License
+
+Trading Desk is licensed under the GNU General Public License, version 3 only (GPL-3.0). See [LICENSE](LICENSE).
