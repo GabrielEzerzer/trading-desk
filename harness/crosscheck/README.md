@@ -48,6 +48,8 @@ Each report starts with the verdict, PASS or FAIL, then the setup (data, dropped
 
 A case with fills but no paired trades fails, as a case with no paired fills does.
 
+On both series every trade's exported net P&L must equal its `gross_pnl - fees - funding` (funding paid is positive) within 1e-6 relative or the money floor, in both engines' exports. The other trade checks compare P&L before funding, so they would not see a wrong net figure.
+
 Both sections end with the metrics computed with our formulas from each engine's equity curve. "Differences and their reasons" lists every difference the report found with its explanation; anything listed there as unexplained fails the case.
 
 ## How the two engines are lined up

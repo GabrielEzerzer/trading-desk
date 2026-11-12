@@ -224,6 +224,27 @@ def money_floor(trade: dict) -> float:
     return MONEY_UNITS * 10.0 ** -trade.get("fee_precision", 8)
 
 
+def net_pnl_check(ours: list[dict], theirs: list[dict]) -> Check:
+    """Every trade's exported `net_pnl` is its `gross_pnl - fees - funding` (funding paid is
+    positive), within PNL_REL relative or the money floor. The other trade checks compare P&L
+    before funding, so without this a wrong net P&L in either export would pass unnoticed."""
+    bad, worst = [], 0.0
+    for who, trades in (("our", ours), ("Nautilus", theirs)):
+        for t in trades:
+            want = t["gross_pnl"] - t["fees"] - t["funding"]
+            d = abs(t["net_pnl"] - want)
+            worst = max(worst, d)
+            if rel(t["net_pnl"], want) > PNL_REL and d > money_floor(t) * (1.0 + SLACK_REL):
+                bad.append(f"{who} trade {t['entry_time']}: {t['net_pnl']:.10g} vs {want:.10g}")
+    return Check(
+        "trades: net P&L is gross P&L - fees - funding",
+        not bad,
+        f"max abs {worst:.2e}",
+        f"rel {PNL_REL:.0e}, or {MONEY_UNITS} units of the last decimal",
+        "; ".join(bad[:5]),
+    )
+
+
 def pair_trades(ours: list[dict], theirs: list[dict], bars: Bars) -> tuple[list[dict], list[str]]:
     """Pairs round trips by the decision bar of their entry fill and their side, in order, as fills
     are paired. A pair must also close on the same decision bar, or both be open at the end; a pair
@@ -493,6 +514,7 @@ def compare_gapless(
     )
     trade_checks, trade_numbers = gapless_trade_checks(trade_pairs, tick)
     cmp.checks += trade_checks
+    cmp.checks.append(net_pnl_check(ours["trades"], theirs["trades"]))
 
     rows = funding_by_bar(ours["funding"], theirs["funding"])
     worst_f = 0.0
@@ -602,6 +624,7 @@ def compare_real(
     )
     trade_checks, trade_numbers = real_trade_checks(trade_pairs, bars, taker)
     cmp.checks += trade_checks
+    cmp.checks.append(net_pnl_check(ours["trades"], theirs["trades"]))
     final_o, final_t = ours["equity"][-1]["equity"], theirs["equity"][-1]["equity"]
     diff = abs(final_o - final_t)
     limit = bound1 + bound2 + bound3

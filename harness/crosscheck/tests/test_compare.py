@@ -279,6 +279,7 @@ def test_a_perpetual_case_with_no_funding_charged_fails():
 TRADES_PAIR = "trades pair one to one"
 TRADE_PNL = "trades: P&L net of fees, before funding"
 REAL_TRADE_PNL = "trades: each P&L difference within its fills' bound 1"
+NET_PNL = "trades: net P&L is gross P&L - fees - funding"
 
 
 def test_matching_trades_agree_on_gapless_bars():
@@ -327,6 +328,20 @@ def test_a_trade_fee_mismatch_fails_on_gapless_bars():
     ours, theirs = gapless_pair()
     theirs["trades"][0]["fees"] += 1e-4
     assert not by_name(compare_gapless(ours, theirs, bars(), TICK))["trades: fees"].ok
+
+
+def test_a_wrong_exported_net_pnl_fails_on_both_series():
+    # The P&L checks use gross_pnl - fees, so only this check sees a net_pnl that is off.
+    for pair, cmp_of in (
+        (gapless_pair, lambda o, t: compare_gapless(o, t, bars(), TICK)),
+        (real_pair, lambda o, t: compare_real(o, t, bars(), taker=0.001)),
+    ):
+        ours, theirs = pair()
+        assert by_name(cmp_of(ours, theirs))[NET_PNL].ok
+        ours["trades"][0]["net_pnl"] += 1000.0
+        cmp = cmp_of(ours, theirs)
+        assert not cmp.ok
+        assert not by_name(cmp)[NET_PNL].ok and "our trade" in by_name(cmp)[NET_PNL].note
 
 
 def flip_pair() -> tuple[dict, dict]:
