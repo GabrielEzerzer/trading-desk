@@ -3,7 +3,7 @@
 // saved runs read back for the result screen.
 
 import { ApiError } from '@td/shared'
-import type { BacktestConfig, InstrumentId, JobInfo, Params, StrategyInfo } from '@td/shared'
+import type { BacktestConfig, InstrumentId, JobInfo, Params, StrategyInfo, Venue } from '@td/shared'
 import { api } from '../api'
 import { datasetRange, instrumentKey, latestRuns, toFinished, toVerdict } from './runs'
 import { type LabJob, type LabSource, RunCancelled, readableName } from './source'
@@ -13,8 +13,34 @@ import { type LabJob, type LabSource, RunCancelled, readableName } from './sourc
 const STARTING_CASH = 10_000
 const SLIPPAGE_BPS = 2
 
-/** The earliest `from` a download accepts: 2017-01-01 UTC, before either venue has data. */
-const HISTORY_FROM = 1_483_228_800_000
+/**
+ * The earliest `from` a download of each venue accepts (`earliest_from` in td-server's data.rs):
+ * 2017-01-01 UTC for Binance and Bybit, before either has data, and 2007-01-01 UTC for OANDA, since
+ * the desk's FX market hours follow the US daylight-saving rule in force since 2007.
+ */
+export const HISTORY_FROM: Record<Venue, number> = {
+  binance: 1_483_228_800_000,
+  bybit: 1_483_228_800_000,
+  oanda: 1_167_609_600_000,
+}
+
+/** What the Lab says when a download fails because the engine has no OANDA token. */
+export const NO_OANDA_TOKEN =
+  'FX downloads from OANDA need an API token. Set OANDA_API_TOKEN in the environment and restart the app.'
+
+/** A job that ended failed, with the engine's error code. */
+class JobFailed extends Error {
+  constructor(
+    readonly code: string,
+    message: string,
+  ) {
+    super(message)
+  }
+}
+
+/** The engine's `bad_request` for a download without a token (td-data's `MissingOandaToken`). */
+const missingToken = (e: unknown) =>
+  e instanceof JobFailed && e.code === 'bad_request' && e.message.includes('needs an API token: set OANDA_API_TOKEN')
 
 // shortcut: the engine has no route that lists what the store holds, so the Lab asks for the
 // coverage of these instruments and of every instrument a saved run used. Ask the engine for its
@@ -54,7 +80,7 @@ function followJob(start: () => Promise<number>, onUpdate: (job: JobInfo) => voi
         off()
         resolve(job)
       } else if (job.status === 'failed') {
-        reject(new Error(job.error?.message ?? 'The job failed.'))
+        reject(job.error ? new JobFailed(job.error.code, job.error.message) : new Error('The job failed.'))
       } else if (job.status === 'cancelled') {
         reject(new RunCancelled())
       } else if (!cancelled) {
@@ -174,9 +200,15 @@ export const engineLabSource: LabSource = {
 
   download(instrument, onProgress) {
     const job = followJob(
-      async () => (await api.downloadData({ instrument, from: HISTORY_FROM, to: Date.now() })).job_id,
+      async () => (await api.downloadData({ instrument, from: HISTORY_FROM[instrument.venue], to: Date.now() })).job_id,
       (info) => onProgress({ fraction: info.progress }),
     )
-    return { result: job.result.then(() => {}), cancel: job.cancel }
+    const result = job.result.then(
+      () => {},
+      (e: unknown) => {
+        throw missingToken(e) ? new Error(NO_OANDA_TOKEN) : e
+      },
+    )
+    return { result, cancel: job.cancel }
   },
 }
