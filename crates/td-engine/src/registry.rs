@@ -1,4 +1,4 @@
-use crate::strategies::{donchian, private, sma_cross};
+use crate::strategies::{donchian, gotobi, private, sma_cross};
 use crate::{EngineError, ParamSpec, Params, Strategy, TestPlan, VerdictRule};
 
 /// A strategy the tester and the API can list and build from parameters, with the plan the
@@ -22,7 +22,7 @@ pub fn strategies() -> Vec<StrategyEntry> {
 
 /// The examples, then `private`. Registering an example is one line here.
 fn with_private(private: Vec<StrategyEntry>) -> Vec<StrategyEntry> {
-    let mut all = vec![sma_cross::entry(), donchian::entry()];
+    let mut all = vec![sma_cross::entry(), donchian::entry(), gotobi::entry()];
     all.extend(private);
     all
 }
@@ -90,15 +90,18 @@ mod tests {
     fn private_strategies_are_listed_after_the_examples() {
         let all = with_private(crate::strategies::fixture::entries());
         let names: Vec<&str> = all.iter().map(|e| e.name).collect();
-        assert_eq!(names, ["sma_cross", "donchian_breakout", "fixture_hold"]);
-        let fixture = &all[2];
+        assert_eq!(
+            names,
+            ["sma_cross", "donchian_breakout", "gotobi", "fixture_hold"]
+        );
+        let fixture = &all[3];
         assert!((fixture.build)(&Params::new().resolve(&fixture.params).unwrap()).is_ok());
         // The full plan check looks the strategy up in the registry, which the fixture is not in.
         assert_eq!(fixture.plan.evidence.validate(), Ok(()));
         assert_eq!(fixture.rule.validate(), Ok(()));
         assert_eq!(fixture.rule.kind(), crate::RuleKind::HighRisk);
         // Without a private folder, which is how CI builds, only the examples are listed.
-        assert_eq!(with_private(Vec::new()).len(), 2);
+        assert_eq!(with_private(Vec::new()).len(), 3);
     }
 
     #[test]
