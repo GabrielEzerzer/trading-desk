@@ -172,7 +172,9 @@ fn fx_weekend(sunday: i64) -> Range<Millis> {
 /// shortcut: this is the US rule since 2007. Before 2007 daylight saving ran from the first Sunday
 /// of April to the last Sunday of October, so FX weekends in the weeks between the two rules
 /// (mid-March to early April, and late October to early November) come out an hour off for data
-/// before 2007. Upgrade to a per-year rule when the desk backtests FX before 2007.
+/// before 2007. What keeps runs inside that limit is OANDA's earliest download date, 2007-01-01
+/// (td-server's `OANDA_EARLIEST_FROM`), which the app's downloads and charts keep to; the
+/// `td-data` CLI does not check it. Upgrade to a per-year rule before moving that date earlier.
 fn new_york_offset_hours(day: i64) -> i64 {
     let (year, _, _) = crate::civil_from_days(day);
     let first_sunday = |month: u32| {

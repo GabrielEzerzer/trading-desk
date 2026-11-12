@@ -25,7 +25,10 @@ tokio.workspace = true
 ts-rs.workspace = true
 
 [dev-dependencies]
+# runs.rs plants a crossed quote in a month file, past the store's checks.
+arrow.workspace = true
 futures-util.workspace = true
+parquet.workspace = true
 reqwest.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 tokio-tungstenite.workspace = true

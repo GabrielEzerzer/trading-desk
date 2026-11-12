@@ -59,6 +59,10 @@ pub enum EngineError {
 
     #[error("parameter {name:?}: {reason}")]
     InvalidParam { name: String, reason: String },
+
+    /// The strategy stopped the run with [`crate::Context::fail`], on the bar it was called on.
+    #[error("the strategy stopped the run: {0}")]
+    StrategyFailed(String),
 }
 
 /// An order the engine refused at submission. The order is still recorded, with status

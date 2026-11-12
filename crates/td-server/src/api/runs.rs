@@ -26,7 +26,7 @@ use axum::extract::rejection::{JsonRejection, PathRejection};
 use axum::extract::{Path as UrlPath, State};
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
-use td_core::{Candle, InstrumentId, InstrumentKind, Millis};
+use td_core::{Candle, Hours, InstrumentId, InstrumentKind, Millis};
 use td_data::time::{DAY, Month, format_minute};
 use td_data::{DataError, Gap, LoadedCandles, Store, missing_minutes, resample};
 use td_engine::{
@@ -46,16 +46,27 @@ pub const RUNS_DIR: &str = "runs";
 /// The file beside a saved run's `result.json` that holds its [`DataReport`].
 const DATA_REPORT_FILE: &str = "data.json";
 
-/// A stretch of missing minutes, or of time without a funding rate, this long or longer means the
-/// store lacks that part of a run's range, and the run is refused. Shorter gaps are venue outages:
-/// they and their buckets are listed in the result's [`DataReport`].
-// shortcut: one fixed limit for every timeframe and venue; make it relative to the timeframe if
+/// Missing open time, or time without a funding rate, this long or longer in one stretch means the
+/// store lacks that part of a run's range, and the run is refused: a day for a market that never
+/// closes, and two days for one with market hours (FX), whose venue is also closed for a day or a
+/// little more on holidays the hours do not know, such as 25 December and 1 January. Minutes
+/// missing up to the start of closed hours, such as the FX weekend, and from their end are one
+/// stretch, measured in the open time it holds, so the weekend inside it does not count. Shorter
+/// gaps are venue outages and closures: they and their buckets are listed in the result's
+/// [`DataReport`]. A month that was never downloaded is refused.
+// shortcut: one limit per kind for every timeframe and venue; make it relative to the timeframe if
 // daily or weekly runs over long outages get refused when they should not.
-// shortcut: gaps are cut at the market's closed hours and each piece is judged on its own, so
-// missing open time either side of the FX weekend counts as two shorter gaps, and a market holiday
-// the hours do not know (FX on 25 December or 1 January) is a whole day missing and refuses the
-// run. Join pieces across closed hours and add the holidays when real FX data shows either.
-pub const MAX_GAP: Millis = DAY;
+// shortcut: a holiday counts as missing open time rather than closed hours, so it shows as a gap
+// in the report and in coverage, and closures either side of one weekend (a Friday and the Monday
+// after) join and refuse the run once they hold two days of open time together; record at
+// download time the spans the venue returned nothing for (#100) if holidays should not show or
+// real data holds such a pair.
+pub fn max_gap(kind: InstrumentKind) -> Millis {
+    match kind.rules().hours {
+        Hours::Always => DAY,
+        Hours::FxWeek => 2 * DAY,
+    }
+}
 
 /// A bucket built although a few of its minutes are missing, within td-data's tolerance.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
@@ -73,7 +84,8 @@ pub struct DataReport {
     pub bars: usize,
     /// Every stretch of minutes in the range (warm-up included) the store has no candle for,
     /// oldest first, including any at the start or the end of the range, in the instrument's open
-    /// hours. Each is shorter than a day; a longer one refuses the run.
+    /// hours. Together with any next to it that only closed hours part it from, each holds less
+    /// than a day of open time, or two days for FX; more refuses the run.
     pub gaps: Vec<GapInfo>,
     /// Open times of every bucket in the range the run has no bar for: buckets with no minutes at
     /// all, and buckets left out because too many of their minutes are missing (td-data's rule: a
@@ -296,16 +308,15 @@ fn read_data(store: &Store, config: &BacktestConfig) -> Result<StoreData, ApiErr
 
 /// Checks that the store holds a configuration's range well enough to run it, by the rules of
 /// [`load_run_data`], without keeping the data: the months' 1-minute candles are read together
-/// ([`Store::read_months`]) and gone through a month at a time, and only the long gaps and whether
-/// any bar can be built are kept. A 400 for a bad range, a 422 `data_missing` where
+/// ([`Store::read_months`]) and gone through a month at a time, and only the missing minutes and
+/// whether any bar can be built are kept. A 400 for a bad range, a 422 `data_missing` where
 /// `load_run_data` would refuse.
 pub fn check_run_data(store: &Store, config: &BacktestConfig) -> Result<(), ApiError> {
     let id = &config.instrument.id;
     let (from, to) = data_range(config)?;
     let timeframe = config.timeframe;
-    let mut long = Vec::new();
-    // The latest gap, which may go on into the next month.
-    let mut open: Option<Gap> = None;
+    // Each month's missing minutes; a gap that a month's end cuts is joined again by `refusal`.
+    let mut gaps = Vec::new();
     let mut any_bar = false;
     // Minutes of a bucket that a month's end cuts, kept for the next month.
     let mut pending: Vec<Candle> = Vec::new();
@@ -320,12 +331,7 @@ pub fn check_run_data(store: &Store, config: &BacktestConfig) -> Result<(), ApiE
             .filter(|c| (start..end).contains(&c.open_time))
             .copied()
             .collect();
-        for gap in missing_minutes(id.kind, &minutes, start, end) {
-            match open.as_mut() {
-                Some(o) if o.to == gap.from => o.to = gap.to,
-                _ => long.extend(open.replace(gap).filter(is_long)),
-            }
-        }
+        gaps.extend(missing_minutes(id.kind, &minutes, start, end));
         if any_bar {
             continue;
         }
@@ -339,7 +345,6 @@ pub fn check_run_data(store: &Store, config: &BacktestConfig) -> Result<(), ApiE
             .is_empty();
         pending.drain(..split);
     }
-    long.extend(open.filter(is_long));
     any_bar = any_bar
         || !resample(id.kind, &pending, timeframe, false)
             .candles
@@ -349,7 +354,7 @@ pub fn check_run_data(store: &Store, config: &BacktestConfig) -> Result<(), ApiE
     } else {
         Vec::new()
     };
-    match refusal(config, &long, any_bar, &funding) {
+    match refusal(config, &gaps, any_bar, &funding) {
         Some(e) => Err(e),
         None => Ok(()),
     }
@@ -378,27 +383,43 @@ fn month_asks(
     }
 }
 
-/// Whether a gap is long enough to refuse a run.
-fn is_long(gap: &Gap) -> bool {
-    gap.to - gap.from >= MAX_GAP
+/// The stretches of missing minutes that refuse a run of a `kind`. `gaps` are oldest first and cut
+/// at the closed hours, as [`missing_minutes`] gives them, so each is open time only. A gap joins
+/// the one before it when no open minute lies between them: they meet, as at the end of a month
+/// the run check reads on its own, or only closed hours part them, as the FX weekend does. A
+/// stretch, from its first gap's start to its last gap's end, refuses the run when its gaps add up
+/// to [`max_gap`] or more; adding the gaps counts open time only, so a holiday on a Friday joined
+/// across the weekend does not gain two days.
+fn long_gaps(kind: InstrumentKind, gaps: &[Gap]) -> Vec<Gap> {
+    gaps.chunk_by(|a, b| {
+        a.to == b.from || kind.closed_spans(a.to, b.from).first() == Some(&(a.to..b.from))
+    })
+    .filter(|stretch| stretch.iter().map(|g| g.to - g.from).sum::<Millis>() >= max_gap(kind))
+    .map(|stretch| Gap {
+        from: stretch[0].from,
+        to: stretch[stretch.len() - 1].to,
+    })
+    .collect()
 }
 
-/// Why the store's data cannot run a configuration whose range is checked: a stretch of
-/// [`MAX_GAP`] or more without candles or, for a perpetual, without funding rates, or no bar at
-/// all. `None` when it can run.
+/// Why the store's data cannot run a configuration whose range is checked, given its missing
+/// minutes as [`missing_minutes`] gives them: a stretch of them holding [`max_gap`] or more of
+/// open time ([`long_gaps`]), [`max_gap`] or more without funding rates for a perpetual, or no
+/// bar at all. `None` when it can run.
 fn refusal(
     config: &BacktestConfig,
-    long_gaps: &[Gap],
+    gaps: &[Gap],
     any_bar: bool,
     funding: &[(Millis, f64)],
 ) -> Option<ApiError> {
     let id = &config.instrument.id;
     let (from, to) = (config.warmup_from.unwrap_or(config.from), config.to);
-    if !long_gaps.is_empty() || !any_bar {
-        let spans = if long_gaps.is_empty() {
+    let stretches = long_gaps(id.kind, gaps);
+    if !stretches.is_empty() || !any_bar {
+        let spans = if stretches.is_empty() {
             span(from, to)
         } else {
-            spans(&long_gaps.iter().collect::<Vec<_>>())
+            spans(&stretches.iter().collect::<Vec<_>>())
         };
         return Some(data_missing(format!(
             "the store has no {id} candles {spans}; download them first"
@@ -411,7 +432,7 @@ fn refusal(
             .collect();
         let long: Vec<Gap> = times
             .windows(2)
-            .filter(|w| w[1] - w[0] >= MAX_GAP)
+            .filter(|w| w[1] - w[0] >= max_gap(id.kind))
             .map(|w| Gap {
                 from: w[0],
                 to: w[1],
@@ -428,8 +449,8 @@ fn refusal(
 }
 
 /// Loads a run's data, refusing with 422 `data_missing` when the store lacks part of the range:
-/// a stretch of [`MAX_GAP`] or more without candles or, for a perpetual, without funding rates,
-/// or no bar at all.
+/// a stretch of missing minutes holding [`max_gap`] or more of open time or, for a perpetual,
+/// [`max_gap`] or more without funding rates, or no bar at all.
 pub fn load_run_data(store: &Store, config: &BacktestConfig) -> Result<RunData, ApiError> {
     let (from, to) = data_range(config)?;
     let StoreData {
@@ -438,8 +459,7 @@ pub fn load_run_data(store: &Store, config: &BacktestConfig) -> Result<RunData, 
         gaps,
         funding,
     } = read_data(store, config)?;
-    let long: Vec<Gap> = gaps.iter().copied().filter(is_long).collect();
-    if let Some(e) = refusal(config, &long, !loaded.candles.is_empty(), &funding) {
+    if let Some(e) = refusal(config, &gaps, !loaded.candles.is_empty(), &funding) {
         return Err(e);
     }
     // Every bucket in the range with no bar: td-data's `dropped` lists only the incomplete ones,
@@ -771,7 +791,8 @@ fn engine_error(e: EngineError) -> ApiError {
         | EngineError::UnknownStrategy(_)
         | EngineError::InvalidParam { .. }
         | EngineError::NoBarsInRange { .. }
-        | EngineError::FundingOnSpot => {
+        | EngineError::FundingOnSpot
+        | EngineError::StrategyFailed(_) => {
             ApiError::new(StatusCode::BAD_REQUEST, "invalid_config", e.to_string())
         }
         e => ApiError::internal(e.to_string()),
@@ -1038,6 +1059,64 @@ mod tests {
     }
 
     #[test]
+    fn fx_gaps_join_across_a_month_end_and_a_weekend_and_count_their_open_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path());
+        // Monday 26 February to Wednesday 6 March 2024. February ends at Friday 00:00 UTC, and
+        // that weekend is closed from Friday 22:00 to Sunday 22:00 UTC.
+        let from = parse_date("2024-02-26").unwrap();
+        let thursday = parse_date("2024-02-29").unwrap();
+        let monday = parse_date("2024-03-04").unwrap();
+        let with_hole = |symbol: &str, hole: std::ops::Range<Millis>| {
+            let mut fx = config(InstrumentKind::Fx, from, from + 9 * DAY);
+            fx.instrument.id.symbol = symbol.into();
+            let bids: Vec<Candle> = minutes(fx.from, fx.to)
+                .into_iter()
+                .filter(|c| InstrumentKind::Fx.is_open(c.open_time))
+                .filter(|c| !hole.contains(&c.open_time))
+                .collect();
+            let asks: Vec<Candle> = bids
+                .iter()
+                .map(|b| Candle {
+                    open: 100.5,
+                    high: 101.5,
+                    low: 99.5,
+                    close: 100.5,
+                    ..*b
+                })
+                .collect();
+            store.write_quotes(&fx.instrument.id, &bids, &asks).unwrap();
+            fx
+        };
+        // Thursday 12:00 to Monday 12:00: 12 hours of open time before the month's end, 22 after
+        // it and 14 after the weekend, two days in all. The check reads them a month at a time,
+        // as three gaps; the load as two.
+        let two_days = with_hole("EURUSD", thursday + 12 * HOUR..monday + 12 * HOUR);
+        let e = checked(&store, &two_days).err().expect("refused");
+        assert_eq!(e.body.code, "data_missing");
+        assert!(
+            e.body
+                .message
+                .contains("from 2024-02-29 12:00 to 2024-03-04 12:00 UTC"),
+            "{}",
+            e.body.message
+        );
+
+        // From 13:00 it is an hour under two days of open time, though four days less an hour
+        // from end to end: run, and its two gaps reported apart.
+        let under = with_hole("GBPUSD", thursday + 13 * HOUR..monday + 12 * HOUR);
+        let data = checked(&store, &under).unwrap();
+        let (close, reopen) = (thursday + DAY + 22 * HOUR, thursday + 3 * DAY + 22 * HOUR);
+        assert_eq!(
+            data.report.gaps,
+            vec![
+                span_of(thursday + 13 * HOUR, close),
+                span_of(reopen, monday + 12 * HOUR)
+            ]
+        );
+    }
+
+    #[test]
     fn minutes_that_build_no_bar_are_refused_by_the_check_and_the_load() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::new(dir.path());
@@ -1116,6 +1195,36 @@ mod tests {
 
     fn span_of(from: Millis, to: Millis) -> GapInfo {
         GapInfo::from(&Gap { from, to })
+    }
+
+    /// A strategy that stops the run over what was asked for answers 400 `invalid_config` with
+    /// its reason, from a backtest and from the tester alike.
+    #[test]
+    fn a_strategy_that_stops_the_run_is_400_invalid_config_with_its_reason() {
+        let t0 = parse_date("2024-03-01").unwrap();
+        // gotobi decides at 00:55 UTC, where no 15m bar closes.
+        let mut gotobi = config(InstrumentKind::Spot, t0, t0 + HOUR);
+        gotobi.strategy = "gotobi".into();
+        gotobi.timeframe = Timeframe::M15;
+        let bars: Vec<Candle> = minutes(t0, t0 + HOUR).into_iter().step_by(15).collect();
+        let failed = td_engine::run(&gotobi, &bars, &[], &[]).expect_err("gotobi refuses 15m bars");
+        assert!(matches!(failed, EngineError::StrategyFailed(_)), "{failed}");
+        for e in [
+            engine_error(failed.clone()),
+            tester_error(TesterError::Engine(failed)),
+        ] {
+            assert_eq!(
+                (e.status.as_u16(), e.body.code.as_str()),
+                (400, "invalid_config"),
+                "{}",
+                e.body.message
+            );
+            assert!(
+                e.body.message.contains("no 15m bar closes at both"),
+                "{}",
+                e.body.message
+            );
+        }
     }
 
     #[test]
