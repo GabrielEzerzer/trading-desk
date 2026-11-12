@@ -1,6 +1,7 @@
 {
   "name": "trading-desk-gui",
   "private": true,
+  "license": "GPL-3.0-only",
   "type": "module",
   "packageManager": "pnpm@10.28.2",
   "scripts": {
