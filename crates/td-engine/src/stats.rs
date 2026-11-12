@@ -1,6 +1,7 @@
 //! Seeded resampling statistics for the test battery (#35): a block bootstrap of the mean
-//! (R7, and the expectancy check of the `high_risk` kind rule), the risk of ruin, and the odds of
-//! passing or breaching a prop-firm challenge.
+//! (R7, and the expectancy check of the `high_risk` kind rule), a block bootstrap of the max
+//! drawdown (the `portfolio` kind rule), the risk of ruin, and the odds of passing or breaching a
+//! prop-firm challenge.
 //!
 //! Every function takes plain slices, so it does not depend on how the caller builds its daily
 //! returns or trade list, and a seed: the same inputs and seed give bit-identical output on every
@@ -23,7 +24,10 @@
 //! The default mean block length is the integer cube root of the number of returns, at least 1
 //! ([`default_block_len`]): 7 days for a year of returns, 9 for two. Block lengths growing like
 //! `n^(1/3)` are the rate-optimal choice for the variance of a mean (Hall, Horowitz and Jing,
-//! 1995), and the values land in the 5 to 10 day range commonly used for daily data.
+//! 1995), and the values land in the 5 to 10 day range commonly used for daily data. The
+//! drawdown bootstrap uses the same default: its blocks keep the runs of bad days a drawdown is
+//! made of, while the reordering of blocks shows how deep the drawdown could have been had those
+//! runs met.
 //!
 //! For the mean of trade results, trades are resampled one at a time (a mean block of 1, the
 //! plain bootstrap): the spread of a mean depends little on the order of separate trades. The
@@ -236,6 +240,69 @@ fn quantile(sorted: &[f64], p: f64) -> f64 {
         Some(&next) => sorted[lo] + (h - lo as f64) * (next - sorted[lo]),
         None => sorted[lo],
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Bootstrap of the max drawdown
+// ---------------------------------------------------------------------------------------------
+
+/// The distribution of the max drawdown of a series of daily returns under resampling.
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DrawdownBootstrap {
+    /// The max drawdown of the returns in the order they happened.
+    pub historical: f64,
+    /// The median of the resampled paths' max drawdowns.
+    pub p50: f64,
+    /// The 95th percentile of the resampled paths' max drawdowns. The `portfolio` kind rule asks
+    /// for it to be at most its `max_resampled_drawdown`.
+    pub p95: f64,
+    pub resamples: usize,
+    pub mean_block: usize,
+}
+
+/// Bootstraps the max drawdown of `daily_returns`, for the `portfolio` rule: each of `resamples`
+/// paths draws as many returns as the sample with the stationary bootstrap of mean block length
+/// `mean_block` and compounds them from an equity of 1. The historical order is one ordering of
+/// the returns; a strategy whose losses happened to fall between its wins shows a shallow
+/// drawdown there that most orderings of the same days would not.
+pub fn bootstrap_drawdown(
+    daily_returns: &[f64],
+    resamples: usize,
+    mean_block: usize,
+    seed: u64,
+) -> Result<DrawdownBootstrap, StatsError> {
+    check_values(daily_returns)?;
+    check_count(resamples, mean_block)?;
+    let n = daily_returns.len();
+    let mut draw = Resampler::new(n, mean_block, seed);
+    let mut drawdowns: Vec<f64> = (0..resamples)
+        .map(|_| {
+            draw.reset();
+            max_drawdown((0..n).map(|_| daily_returns[draw.next()]))
+        })
+        .collect();
+    drawdowns.sort_by(f64::total_cmp);
+    Ok(DrawdownBootstrap {
+        historical: max_drawdown(daily_returns.iter().copied()),
+        p50: quantile(&drawdowns, 0.50),
+        p95: quantile(&drawdowns, 0.95),
+        resamples,
+        mean_block,
+    })
+}
+
+/// The largest fall, as a fraction of the running peak, when `returns` are compounded from an
+/// equity of 1. The peak is the highest equity so far, the start included, so a path that only
+/// rises has a drawdown of 0.
+fn max_drawdown(returns: impl Iterator<Item = f64>) -> f64 {
+    let (mut equity, mut peak, mut worst) = (1.0f64, 1.0f64, 0.0f64);
+    for r in returns {
+        equity *= 1.0 + r;
+        peak = peak.max(equity);
+        worst = worst.max((peak - equity) / peak);
+    }
+    worst
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -604,6 +671,77 @@ mod tests {
         ] {
             assert!(matches!(
                 bootstrap_mean(&[1.0], &spec),
+                Err(StatsError::InvalidSpec(_))
+            ));
+        }
+    }
+
+    fn drawdowns(values: &[f64], seed: u64) -> DrawdownBootstrap {
+        let block = default_block_len(values.len());
+        bootstrap_drawdown(values, DEFAULT_RESAMPLES, block, seed).unwrap()
+    }
+
+    #[test]
+    fn returns_that_never_lose_have_no_drawdown() {
+        let b = drawdowns(&[0.01, 0.0, 0.02, 0.005, 0.03, 0.0, 0.01, 0.04], 1);
+        assert_eq!((b.historical, b.p50, b.p95), (0.0, 0.0, 0.0));
+        assert_eq!((b.resamples, b.mean_block), (DEFAULT_RESAMPLES, 2));
+    }
+
+    #[test]
+    fn the_drawdown_is_measured_from_the_running_peak_not_from_the_start() {
+        // +100% then -50%: equity 2, then 1. Back at the start, but half the peak.
+        assert_eq!(max_drawdown([1.0, -0.5].into_iter()), 0.5);
+        // The peak is the highest equity so far: 1.5, 0.75, 0.9375 is half of 1.5 at its worst.
+        assert_eq!(max_drawdown([0.5, -0.5, 0.25].into_iter()), 0.5);
+        // The start counts as a peak: a first day of -25% is a drawdown of 0.25.
+        assert_eq!(max_drawdown([-0.25, 0.1].into_iter()), 0.25);
+        // Two falls from the same peak compound: 1.0 * 0.5 * 0.5 is 0.25, a drawdown of 0.75.
+        assert_eq!(max_drawdown([-0.5, -0.5].into_iter()), 0.75);
+        // A single return gives that drawdown on every resample.
+        let b = drawdowns(&[-0.125], 4);
+        assert_eq!((b.historical, b.p50, b.p95), (0.125, 0.125, 0.125));
+    }
+
+    #[test]
+    fn the_drawdown_bootstrap_is_the_same_for_a_seed_and_differs_for_another() {
+        let x: Vec<f64> = symmetric().iter().map(|r| r * 4.0).collect();
+        let a = drawdowns(&x, 1);
+        assert_eq!(a, drawdowns(&x, 1));
+        let other = drawdowns(&x, 2);
+        assert_ne!((a.p50, a.p95), (other.p50, other.p95));
+        assert_eq!(a.historical, other.historical);
+        assert!(a.p50 <= a.p95, "{a:?}");
+    }
+
+    #[test]
+    fn a_lucky_order_of_losses_shows_a_much_deeper_resampled_drawdown() {
+        // Wins of +3% and losses of -2.5%, alternating, so no loss ever follows another: the
+        // historical drawdown is one loss, 0.025. Reordered in blocks, the losses meet.
+        let x: Vec<f64> = (0..60)
+            .map(|i| if i % 2 == 0 { 0.03 } else { -0.025 })
+            .collect();
+        let b = drawdowns(&x, 7);
+        assert!(close(b.historical, 0.025), "{b:?}");
+        assert!(b.p95 > 3.0 * b.historical, "{b:?}");
+        assert!(b.historical < b.p50 && b.p50 < b.p95, "{b:?}");
+        assert_eq!((b.p50, b.p95), PINNED_LUCKY_DRAWDOWN);
+    }
+
+    /// Seed 7, 2,000 resamples of 60 days in blocks of mean 3: a median of 0.073, three losses
+    /// in a row, and a 95th percentile of 0.137, more than five times the historical 0.025.
+    const PINNED_LUCKY_DRAWDOWN: (f64, f64) = (0.07314062500000014, 0.13705950234342723);
+
+    #[test]
+    fn bad_inputs_to_the_drawdown_bootstrap_are_errors() {
+        assert_eq!(bootstrap_drawdown(&[], 10, 1, 0), Err(StatsError::NoData));
+        assert_eq!(
+            bootstrap_drawdown(&[0.01, f64::INFINITY], 10, 1, 0),
+            Err(StatsError::NonFinite { index: 1 })
+        );
+        for (resamples, block) in [(0, 1), (10, 0)] {
+            assert!(matches!(
+                bootstrap_drawdown(&[0.01], resamples, block, 0),
                 Err(StatsError::InvalidSpec(_))
             ));
         }

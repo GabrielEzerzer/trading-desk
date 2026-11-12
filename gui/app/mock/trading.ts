@@ -618,6 +618,7 @@ const MOCK_RULE: VerdictRule = {
     max_drawdown_vs_benchmark: 0.75,
     min_alpha: 0,
     max_p_mean_not_positive: 0.1,
+    max_resampled_drawdown: 0.3,
   },
 }
 
