@@ -1,7 +1,7 @@
 // Types for harness.mjs, for the TypeScript specs in app/e2e.
 import type { Page } from '@playwright/test'
 import type { Server } from 'node:http'
-import type { Candle } from '@td/shared'
+import type { Candle, Instrument, SessionState } from '@td/shared'
 
 export interface Size {
   name: string
@@ -20,6 +20,14 @@ export interface StubConfig {
   backtest?: 'ok' | 'data_missing' | 'too_many_runs' | 'fails'
   /** Time between a job's steps, 700 ms by default. */
   stepMs?: number
+  /** GET /instruments answers from these, else from the engine.json fixtures. */
+  instruments?: Instrument[]
+  /** GET /instruments never answers. */
+  hangInstruments?: boolean
+  /** GET /instruments fails. */
+  failInstruments?: boolean
+  /** The paper session GET /sessions lists; POST /sessions replaces it. */
+  session?: SessionState | null
   /** GET /sessions fails this many times before it answers. */
   failSessions?: number
   /**
