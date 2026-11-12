@@ -33,6 +33,8 @@ pub struct Context<'a> {
     pub(crate) broker: &'a mut dyn Broker,
     pub(crate) orders: &'a mut Vec<Order>,
     pub(crate) warming_up: bool,
+    /// The reason the strategy gave to [`Context::fail`], if it did.
+    pub(crate) failure: &'a mut Option<String>,
 }
 
 /// The reason orders submitted on a warm-up bar are rejected with.
@@ -105,6 +107,19 @@ impl Context<'_> {
 
     pub fn open_orders(&self) -> &[Order] {
         self.broker.open_orders()
+    }
+
+    /// Stops the run: when this callback returns, the session's [`crate::Session::on_bar`] (or
+    /// [`crate::Session::warm_up`]) returns [`crate::EngineError::StrategyFailed`] with `reason`,
+    /// so a backtest ends with that error instead of a result. It is for a strategy that cannot
+    /// trade on what it is given, such as a timeframe or a date its rules do not cover, where
+    /// carrying on would give a run with no trades that looks like a real result. Orders submitted
+    /// in the same callback stay recorded but the run never reaches the bar they could fill on.
+    /// Only the first reason given on a bar is kept.
+    pub fn fail(&mut self, reason: impl Into<String>) {
+        if self.failure.is_none() {
+            *self.failure = Some(reason.into());
+        }
     }
 
     /// True on a warm-up bar ([`crate::Session::warm_up`]), where every order submitted is

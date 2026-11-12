@@ -269,6 +269,7 @@ fn entry(permutations: u32) -> StrategyEntry {
             starting_cash: 10_000.0,
             max_leverage: 1.0,
             slippage: Vec::new(),
+            account_currency: td_core::AccountCurrency::Quote,
         },
         sweep: SweepPlan {
             fixed: Params::new(),

@@ -14,7 +14,7 @@ use crate::risk::{self, EquityRange, Intrabar};
 use crate::session::{check_quote, funding_ranges, sorted_funding};
 use crate::{
     BarFunding, CLOSE_OUT_TAG, CandleFillModel, EngineError, EquityPoint, Order, Params, Portfolio,
-    Session, SessionConfig, Trade, attach_stops, build_strategy, build_trades,
+    Session, SessionConfig, Strategy, Trade, attach_stops, build_strategy, build_trades,
 };
 
 /// The slippage a backtest gets when its configuration leaves `slippage_bps` out, in basis
@@ -258,6 +258,34 @@ pub fn run(
     asks: &[Candle],
     funding: &[(Millis, f64)],
 ) -> Result<BacktestResult, EngineError> {
+    run_built(config, bars, asks, funding, || {
+        build_strategy(&config.strategy, &config.params)
+    })
+}
+
+/// [`run`] with a strategy built by the caller instead of from the registry, for a strategy that
+/// is not registered: the cross-check harness's (`examples/crosscheck.rs`) uses it. The
+/// configuration's `strategy` and `params` are then only labels in the result, so [`rerun`] cannot
+/// run such a result again.
+pub fn run_strategy(
+    config: &BacktestConfig,
+    strategy: Box<dyn Strategy>,
+    bars: &[Candle],
+    asks: &[Candle],
+    funding: &[(Millis, f64)],
+) -> Result<BacktestResult, EngineError> {
+    run_built(config, bars, asks, funding, || Ok(strategy))
+}
+
+/// The backtest of [`run`], building the strategy with `build` once the data has been checked, so
+/// a bad range or ask is reported before an unknown strategy, as it always was.
+fn run_built(
+    config: &BacktestConfig,
+    bars: &[Candle],
+    asks: &[Candle],
+    funding: &[(Millis, f64)],
+    build: impl FnOnce() -> Result<Box<dyn Strategy>, EngineError>,
+) -> Result<BacktestResult, EngineError> {
     let (warmup, traded) = select_bars(config, bars)?;
     let mut used_asks = match_asks(config.instrument.id.kind, bars, asks, &warmup)?;
     let traded_asks = match_asks(config.instrument.id.kind, bars, asks, &traded)?;
@@ -269,7 +297,7 @@ pub fn run(
     let funding = sorted_funding(funding);
     let ranges = funding_ranges(tf, &bars, &funding);
 
-    let strategy = build_strategy(&config.strategy, &config.params)?;
+    let strategy = build()?;
     let session_config = SessionConfig {
         starting_cash: config.starting_cash,
         slippage_bps: config.slippage_bps,
