@@ -447,6 +447,18 @@ export const STATES = [
     },
   },
   {
+    // The engine started without OANDA_API_TOKEN: the stub fails every download the way the engine
+    // fails an OANDA one.
+    name: 'lab-engine-download-no-token',
+    config: { engine: 'running', mock: false, noData: true, download: 'no_token' },
+    steps: async (page) => {
+      await chooseRow(page, /Donchian breakout/)
+      await page.getByRole('button', { name: 'Download BTCUSDT history' }).click()
+      await page.mouse.move(0, 0)
+      await page.getByText('FX downloads from OANDA need an API token.', { exact: false }).waitFor()
+    },
+  },
+  {
     name: 'lab-engine-data-missing',
     config: { engine: 'running', mock: false, backtest: 'data_missing' },
     steps: async (page) => {

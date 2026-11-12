@@ -7,7 +7,8 @@
 //
 // `config`: { engine: 'starting' | 'failed' | 'running', mock: boolean, hangStrategies: boolean,
 //             engineData: engine.json, noData?: boolean,
-//             backtest?: 'ok' | 'data_missing' | 'too_many_runs' | 'fails', stepMs?: number,
+//             backtest?: 'ok' | 'data_missing' | 'too_many_runs' | 'fails', download?: 'ok' | 'no_token',
+//             stepMs?: number,
 //             instruments?: Instrument[], hangInstruments?: boolean, failInstruments?: boolean,
 //             candles?: { start: Candle, everyMs: number } | null, session?: SessionState | null,
 //             failSessions?: number,
@@ -152,6 +153,13 @@ function installBridgeStub(config) {
   }
 
   function startDownload(body) {
+    if (config.download === 'no_token') {
+      // The engine's failed job when OANDA_API_TOKEN is not set (td-data's MissingOandaToken).
+      return startJob('download', body, [], () => ({
+        status: 'failed',
+        error: { code: 'bad_request', message: "oanda's history needs an API token: set OANDA_API_TOKEN to the token of an OANDA practice account" },
+      }))
+    }
     const steps = [0.25, 0.5, 0.75, 1].map((progress, i) => ({ progress, message: `${key(body.instrument)} month ${i + 1}` }))
     return startJob('download', body, steps, () => {
       stored.add(key(body.instrument))
