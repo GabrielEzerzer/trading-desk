@@ -1,6 +1,7 @@
 {
   "name": "@td/app",
   "private": true,
+  "license": "GPL-3.0-only",
   "description": "Trading Desk: Strategy Lab and Trading in one Electron app.",
   "main": "./out/main/index.js",
   "scripts": {

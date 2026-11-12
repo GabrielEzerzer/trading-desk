@@ -1,6 +1,7 @@
 {
   "name": "@td/shared",
   "private": true,
+  "license": "GPL-3.0-only",
   "exports": {
     ".": "./src/index.ts",
     "./theme.css": "./src/theme.css"
