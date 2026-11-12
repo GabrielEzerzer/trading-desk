@@ -228,9 +228,17 @@ const placeOrder = async (page, side, size) => {
   await page.getByRole('button', { name: side, exact: true }).click()
 }
 
-/** Starts a Manual session and buys 0.05 BTC at market; the mock fills it at the next bar's open. */
-const holdBtc = async (page) => {
+/** Starts a Manual session and waits out its two bars of warm-up; like the engine, it takes no order before. */
+const startLive = async (page) => {
   await startManual(page)
+  await nextBar(page)
+  await nextBar(page)
+  await page.locator('.position-summary').filter({ hasText: 'Manual · Live' }).waitFor()
+}
+
+/** A live Manual session that buys 0.05 BTC at market; the mock fills it at the next bar's open. */
+const holdBtc = async (page) => {
+  await startLive(page)
   await placeOrder(page, 'Buy', '0.05')
   await page.getByText('Buy 0.05000 BTC at market sent.').waitFor()
   await nextBar(page)
@@ -700,8 +708,6 @@ export const STATES = [
     clock: true,
     steps: async (page) => {
       await holdBtc(page)
-      // The second bar ends the warm-up.
-      await nextBar(page)
       await page.locator('.position-summary').filter({ hasText: 'Manual · Live' }).waitFor()
       await page.mouse.move(0, 0)
       await quiet(page)
@@ -730,7 +736,7 @@ export const STATES = [
     config: { engine: 'running', mock: true },
     clock: true,
     steps: async (page) => {
-      await startManual(page)
+      await startLive(page)
       await page.getByPlaceholder('Size').fill('0.05')
       await page.getByRole('button', { name: /^Order type:/ }).click()
       await page.getByRole('menuitemradio', { name: 'Limit' }).click()
@@ -747,10 +753,10 @@ export const STATES = [
     config: { engine: 'running', mock: true },
     clock: true,
     steps: async (page) => {
-      await startManual(page)
+      await startLive(page)
       await placeOrder(page, 'Sell', '0.05')
       await page.mouse.move(0, 0)
-      await page.getByText(/^Order rejected:/).waitFor()
+      await page.getByText(/^Spot sessions cannot sell more than they hold/).waitFor()
       await quiet(page)
     },
   },
@@ -773,11 +779,7 @@ export const STATES = [
     config: { engine: 'running', mock: true },
     clock: true,
     steps: async (page) => {
-      await startManual(page)
-      // Two bars of warm-up, then the session is live.
-      await nextBar(page)
-      await nextBar(page)
-      await page.locator('.position-summary').filter({ hasText: 'Manual · Live' }).waitFor()
+      await startLive(page)
       await page.evaluate(() => window.tdMockTrading?.dropBucket())
       await page.mouse.move(0, 0)
       await page.locator('.position-notice').waitFor()

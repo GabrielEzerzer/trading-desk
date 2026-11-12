@@ -13,10 +13,13 @@ import type {
   PaperFill as Fill,
   Instrument,
   InstrumentId,
+  OrderSource,
+  OrderType,
   PaperOrder as Order,
   SessionEvent,
   SessionState,
   SessionSummary,
+  Side,
   StartSessionRequest,
   Status,
   StrategyInfo,
@@ -234,6 +237,26 @@ interface OpenTrade {
   bars: number
 }
 
+/** td-server's refusal of a manual order before the session's first live bar (`ManualError::NotLive`). */
+const NOT_LIVE = 'the session has not fed its first live bar yet; orders can be placed once it has'
+
+/** An order as the mock session submits it: the engine's order type, not the API body. */
+interface Submitted {
+  side: Side
+  qty: number
+  order_type: OrderType
+}
+
+/** The engine's order type for a manual order, refused as td-server's `ManualOrder::request` refuses it. */
+function orderType(order: ManualOrder): OrderType {
+  if (order.type === 'market') {
+    if (order.limit_price !== undefined) throw new Error('a market order takes no limit_price')
+    return { type: 'market' }
+  }
+  if (order.limit_price === undefined) throw new Error('a limit order needs a limit_price')
+  return { type: 'limit', price: order.limit_price }
+}
+
 /** A simulated paper session with average-cost accounting. */
 class MockSession {
   status: Status = { status: 'warming_up' }
@@ -296,10 +319,22 @@ class MockSession {
     return () => this.feeds.delete(feed)
   }
 
+  /**
+   * A manual order, refused as td-server refuses one: it throws with the engine's reason, and a
+   * refused order records nothing, sends no event and leaves its id to the next order.
+   */
+  place(request: Submitted): void {
+    if (!this.running) throw new Error(`paper session "${this.id}" is not running`)
+    if (this.liveFrom === null) throw new Error(NOT_LIVE)
+    const reason = this.refuse(request)
+    if (reason) throw new Error(reason)
+    this.submit(request)
+  }
+
   /** Accepts or rejects an order now; an accepted one fills on a later bar. */
-  submit(request: ManualOrder): void {
+  submit(request: Submitted, source: OrderSource = 'manual'): void {
     const order: Order = {
-      source: 'manual',
+      source,
       id: this.nextOrderId++,
       request: {
         instrument: this.instrument.id,
@@ -319,6 +354,15 @@ class MockSession {
     const reason = this.refuse(request)
     if (reason) order.status = { status: 'rejected', reason }
     this.emit({ event: 'order', order: { ...order } })
+  }
+
+  /** Cancels an open manual order, with the engine's refusals. */
+  cancel(id: number): void {
+    const order = this.orders.find((o) => o.id === id)
+    if (!order) throw new Error(`no order ${id} in this session`)
+    if (order.source !== 'manual') throw new Error(`order ${id} was placed by the strategy; only manual orders can be cancelled`)
+    if (order.status.status !== 'open') throw new Error(`order ${id} is ${order.status.status}, so it cannot be cancelled`)
+    this.updateOrder(order, { status: 'cancelled', reason: 'cancelled manually' })
   }
 
   /** Simulated drop of the venue's stream for three bars. */
@@ -393,7 +437,7 @@ class MockSession {
     return this.request.starting_cash + this.realised + this.unrealised() - this.fees
   }
 
-  private refuse(request: ManualOrder): string | null {
+  private refuse(request: Submitted): string | null {
     if (!this.running) return 'the session is not running'
     const price = request.order_type.type === 'limit' ? request.order_type.price : this.mark
     const notional = request.qty * price
@@ -449,7 +493,7 @@ class MockSession {
     const target = want * unit
     const delta = roundTo(target - this.qty, this.instrument.lot_size)
     if (Math.abs(delta) < this.instrument.min_qty || this.orders.some((o) => o.status.status === 'open')) return
-    this.submit({ side: delta > 0 ? 'buy' : 'sell', qty: Math.abs(delta), order_type: { type: 'market' } })
+    this.submit({ side: delta > 0 ? 'buy' : 'sell', qty: Math.abs(delta), order_type: { type: 'market' } }, 'strategy')
   }
 
   private tryFill(order: Order, bar: Candle): void {
@@ -704,10 +748,13 @@ export function createMockTradingSource({ liveMs = 1500, listMs = 400 }: MockTra
       const lot = session.instrument.lot_size
       if (!onLot(order.qty, lot)) throw new Error(`the size must be a multiple of ${lot}`)
       const tick = session.instrument.tick_size
-      if (order.order_type.type === 'limit' && !onTick(order.order_type.price, tick)) {
+      if (order.limit_price !== undefined && !onTick(order.limit_price, tick)) {
         throw new Error(`the limit price must be a multiple of ${tick}`)
       }
-      session.submit(order)
+      session.place({ side: order.side, qty: order.qty, order_type: orderType(order) })
+    },
+    async cancelOrder(sessionId, orderId) {
+      sessionOf(sessionId).cancel(orderId)
     },
   }
 }

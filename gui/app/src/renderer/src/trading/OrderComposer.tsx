@@ -72,11 +72,10 @@ export function OrderComposer({ instrument, lastPrice, blocked, rejected, onPlac
     if (rejected) setSeenRejection(rejected.at)
     setSending(true)
     setNote(null)
-    const order: ManualOrder = {
-      side,
-      qty: check.qty,
-      order_type: check.price === null ? { type: 'market' } : { type: 'limit', price: check.price },
-    }
+    const order: ManualOrder =
+      check.price === null
+        ? { side, qty: check.qty, type: 'market' }
+        : { side, qty: check.qty, type: 'limit', limit_price: check.price }
     try {
       await onPlace(order)
       const what = `${side === 'buy' ? 'Buy' : 'Sell'} ${formatStep(check.qty, instrument.lot_size)} ${instrument.base}`

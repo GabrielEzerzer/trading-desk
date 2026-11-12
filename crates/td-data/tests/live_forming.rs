@@ -77,16 +77,22 @@ async fn serve(frames: Vec<String>) -> String {
     url
 }
 
-/// Serves closed minutes, and records each call.
+/// Serves closed minutes, failing the first `failures` calls, and records each call.
 struct FakeRest {
     minutes: Vec<Candle>,
+    failures: Mutex<u32>,
     calls: Mutex<Vec<(Millis, Millis)>>,
 }
 
 impl FakeRest {
     fn new(minutes: Vec<Candle>) -> Arc<Self> {
+        FakeRest::failing(minutes, 0)
+    }
+
+    fn failing(minutes: Vec<Candle>, failures: u32) -> Arc<Self> {
         Arc::new(FakeRest {
             minutes,
+            failures: Mutex::new(failures),
             calls: Mutex::new(Vec::new()),
         })
     }
@@ -106,6 +112,14 @@ impl Rest for FakeRest {
     ) -> Result<Vec<Candle>, DataError> {
         assert_eq!(timeframe, Timeframe::M1, "feeds fetch minutes");
         self.calls.lock().expect("lock").push((from, to));
+        let mut failures = self.failures.lock().expect("lock");
+        if *failures > 0 {
+            *failures -= 1;
+            return Err(DataError::Api {
+                url: "fake".into(),
+                message: "unavailable".into(),
+            });
+        }
         Ok(self
             .minutes
             .iter()
@@ -261,6 +275,99 @@ async fn a_five_minute_chart_joined_late_fetches_the_bucket_start_and_ends_the_b
         .iter()
         .position(|e| *e == ChartEvent::Forming(joined(T0, 0..5, None)))
         .expect("the whole first bucket");
+    assert_eq!(events[whole + 1], ChartEvent::Feed(FeedEvent::Dropped(T0)));
+}
+
+/// Runs a five-minute chart feed on `frames` until its first closed bar.
+async fn five_minute_chart(frames: Vec<String>, rest: Arc<FakeRest>) -> Vec<ChartEvent> {
+    let url = serve(frames).await;
+    let (tx, mut rx) = mpsc::channel(256);
+    let stream = Arc::new(SharedStream::open(btc(), url));
+    let _feed = tokio::spawn(run_chart_feed_on(stream, Timeframe::M5, None, rest, tx));
+    until(&mut rx, |e| {
+        matches!(e, ChartEvent::Feed(FeedEvent::Bar(_)))
+    })
+    .await
+}
+
+#[tokio::test]
+async fn a_bucket_joined_late_ends_whole_when_its_last_minute_closes_after_the_next_one_starts() {
+    // The stream sends 00:05's first update before 00:04's closed one.
+    let mut frames: Vec<String> = (2..4).flat_map(updates).collect();
+    frames.push(frame(&minute(4, 0), false));
+    frames.push(frame(&minute(5, 0), false));
+    frames.push(frame(&minute(4, 2), true));
+    frames.extend(updates(5).into_iter().skip(1));
+    frames.extend((6..10).flat_map(updates));
+    let events = five_minute_chart(frames, FakeRest::new(vec![minute(0, 2), minute(1, 2)])).await;
+
+    let next = events
+        .iter()
+        .position(|e| *e == ChartEvent::Forming(joined(T0 + 5 * MIN, 5..5, Some((5, 0)))))
+        .expect("the next bucket starts");
+    assert_eq!(
+        events[next + 1..next + 3],
+        [
+            ChartEvent::Forming(joined(T0, 0..5, None)),
+            ChartEvent::Feed(FeedEvent::Dropped(T0)),
+        ],
+        "the first bucket, whole, after the next one started: {events:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_failed_fetch_of_a_joined_buckets_start_is_tried_again_when_the_bucket_ends() {
+    let frames: Vec<String> = (2..10).flat_map(updates).collect();
+    let rest = FakeRest::failing(vec![minute(0, 2), minute(1, 2)], 1);
+    let events = five_minute_chart(frames, rest.clone()).await;
+
+    assert_eq!(
+        rest.calls(),
+        [(T0, T0 + 2 * MIN), (T0, T0 + 2 * MIN)],
+        "once when joined, once more when the bucket ends"
+    );
+    let forming: Vec<Candle> = events
+        .iter()
+        .filter_map(|e| match e {
+            ChartEvent::Forming(bar) => Some(*bar),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        forming[0],
+        joined(T0, 2..2, Some((2, 0))),
+        "without its start"
+    );
+    assert_eq!(
+        forming[6],
+        joined(T0, 0..5, None),
+        "the first bucket, whole"
+    );
+}
+
+#[tokio::test]
+async fn a_bucket_whose_last_minute_comes_through_a_backfill_retries_its_start_and_ends_whole() {
+    // Joined during 00:02, the fetch of 00:00 and 00:01 fails; 00:04's closed frame is lost, so
+    // it comes from the backfill before 00:05's close.
+    let mut frames: Vec<String> = (2..4).flat_map(updates).collect();
+    frames.extend(updates(4).into_iter().take(2));
+    frames.extend((5..10).flat_map(updates));
+    let rest = FakeRest::failing(vec![minute(0, 2), minute(1, 2), minute(4, 2)], 1);
+    let events = five_minute_chart(frames, rest.clone()).await;
+
+    assert_eq!(
+        rest.calls(),
+        [
+            (T0, T0 + 2 * MIN),
+            (T0 + 4 * MIN, T0 + 5 * MIN),
+            (T0, T0 + 2 * MIN)
+        ],
+        "the start, the backfill, then the start once more"
+    );
+    let whole = events
+        .iter()
+        .position(|e| *e == ChartEvent::Forming(joined(T0, 0..5, None)))
+        .unwrap_or_else(|| panic!("the first bucket, whole: {events:?}"));
     assert_eq!(events[whole + 1], ChartEvent::Feed(FeedEvent::Dropped(T0)));
 }
 

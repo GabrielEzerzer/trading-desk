@@ -118,6 +118,19 @@ describe('the live series', () => {
     expect(withForming(s, bar(120, 13))).toBe(s)
   })
 
+  it('lets the history replace an earlier forming bar that never got its closed bar', () => {
+    const live = withForming(withForming(withClosed(EMPTY_SERIES, bar(60, 6)), bar(120, 11)), bar(180, 17))
+    const s = withHistory(live, [bar(60, 5), bar(120, 12)])
+    expect(s.candles).toEqual([bar(60, 6), bar(120, 12), bar(180, 17)])
+    expect(s.closed).toBe(120)
+  })
+
+  it('keeps a forming bar that history has no bar for', () => {
+    const live = withForming(withForming(EMPTY_SERIES, bar(120, 11)), bar(180, 17))
+    const s = withHistory(live, [bar(60, 6), bar(180, 18)])
+    expect(s.candles).toEqual([bar(60, 6), bar(120, 11), bar(180, 18)])
+  })
+
   it('changes nothing for an empty history', () => {
     const s = withClosed(EMPTY_SERIES, bar(60))
     expect(withHistory(s, [])).toBe(s)
