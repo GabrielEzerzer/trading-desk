@@ -86,7 +86,8 @@ export function withHistory<S extends CandleSeries>(series: S, history: readonly
   const end = history.at(-1)?.open_time
   if (end === undefined) return series
   const { closed } = series
-  const live = series.candles.filter((c) => (closed !== null && c.open_time <= closed) || c.open_time > end)
+  const held = new Set(history.map((c) => c.open_time))
+  const live = series.candles.filter((c) => (closed !== null && c.open_time <= closed) || !held.has(c.open_time))
   return {
     ...series,
     candles: mergeCandles(history, live),

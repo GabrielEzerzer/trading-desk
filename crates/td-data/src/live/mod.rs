@@ -211,9 +211,9 @@ pub enum ChartEvent {
     /// joined it after it started). The closed [`FeedEvent::Bar`] of the same open time, when it
     /// comes, comes after it and replaces it. Display only.
     ///
-    /// shortcut: a bucket whose closed bar never comes (the one joined late, or one the builder
-    /// dropped for a missing minute) keeps its last forming bar on the chart; send a correction
-    /// when the bucket ends if a chart is seen holding a wrong bar.
+    /// shortcut: a bucket with no closed bar whose last minute the venue never delivers, on the
+    /// stream or over REST, keeps its last forming bar on the chart, which may show that minute in
+    /// progress; send a correction when a later bucket starts if a chart is seen holding one.
     Forming(Candle),
 }
 
@@ -458,20 +458,26 @@ impl Feed {
             Placement::Next => {}
         }
         let built = self.builder.push(minute);
-        // A chart's bucket that ends without a closed bar (joined late, so the builder drops it)
-        // gets its forming bar once more, now whole, so the chart does not keep a stale one. It is
-        // the closing minute's own bucket, even when the stream has already started the next.
-        let unclosed = match &mut self.out {
-            Out::Chart { forming, .. } => forming.push(minute, true).filter(|&bucket| {
-                forming.ends_bucket(minute.open_time)
-                    && !built.candles.iter().any(|bar| bar.open_time == bucket)
-            }),
-            Out::Feed(_) => None,
-        };
-        if let Some(bucket) = unclosed {
-            self.send_forming(bucket).await?;
-        }
+        self.forming_closed(minute, &built).await?;
         self.emit(built).await
+    }
+
+    /// Takes a closed minute, which the builder has taken and from which it built `built`, into a
+    /// chart's forming bar. A bucket that ends without a closed bar (joined late, or dropped for a
+    /// missing minute) gets its forming bar once more, now whole, so the chart does not keep a
+    /// stale one. It is the minute's own bucket, even when the stream has already started the next.
+    async fn forming_closed(&mut self, minute: Candle, built: &LoadedCandles) -> Result<(), Gone> {
+        let Out::Chart { forming, .. } = &mut self.out else {
+            return Ok(());
+        };
+        let unclosed = forming.push(minute, true).filter(|&bucket| {
+            forming.ends_bucket(minute.open_time)
+                && !built.candles.iter().any(|bar| bar.open_time == bucket)
+        });
+        match unclosed {
+            Some(bucket) => self.send_forming(bucket).await,
+            None => Ok(()),
+        }
     }
 
     /// Takes an update of the minute in progress. Only a chart feed uses it: it updates the bar
@@ -542,9 +548,7 @@ impl Feed {
                 self.emit(built).await?;
             }
             let built = self.builder.push(minute);
-            if let Out::Chart { forming, .. } = &mut self.out {
-                forming.push(minute, true);
-            }
+            self.forming_closed(minute, &built).await?;
             self.emit(built).await?;
         }
         let built = self.builder.settle(to);

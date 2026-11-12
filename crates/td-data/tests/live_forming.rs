@@ -346,6 +346,32 @@ async fn a_failed_fetch_of_a_joined_buckets_start_is_tried_again_when_the_bucket
 }
 
 #[tokio::test]
+async fn a_bucket_whose_last_minute_comes_through_a_backfill_retries_its_start_and_ends_whole() {
+    // Joined during 00:02, the fetch of 00:00 and 00:01 fails; 00:04's closed frame is lost, so
+    // it comes from the backfill before 00:05's close.
+    let mut frames: Vec<String> = (2..4).flat_map(updates).collect();
+    frames.extend(updates(4).into_iter().take(2));
+    frames.extend((5..10).flat_map(updates));
+    let rest = FakeRest::failing(vec![minute(0, 2), minute(1, 2), minute(4, 2)], 1);
+    let events = five_minute_chart(frames, rest.clone()).await;
+
+    assert_eq!(
+        rest.calls(),
+        [
+            (T0, T0 + 2 * MIN),
+            (T0 + 4 * MIN, T0 + 5 * MIN),
+            (T0, T0 + 2 * MIN)
+        ],
+        "the start, the backfill, then the start once more"
+    );
+    let whole = events
+        .iter()
+        .position(|e| *e == ChartEvent::Forming(joined(T0, 0..5, None)))
+        .unwrap_or_else(|| panic!("the first bucket, whole: {events:?}"));
+    assert_eq!(events[whole + 1], ChartEvent::Feed(FeedEvent::Dropped(T0)));
+}
+
+#[tokio::test]
 async fn a_plain_feed_ignores_updates_in_progress_and_never_fetches_for_them() {
     let frames: Vec<String> = (2..10).flat_map(updates).collect();
     let url = serve(frames).await;
