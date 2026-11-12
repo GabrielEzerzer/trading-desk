@@ -3,7 +3,7 @@
 // saved runs read back for the result screen.
 
 import { ApiError } from '@td/shared'
-import type { BacktestConfig, InstrumentId, JobInfo, Params, StrategyInfo } from '@td/shared'
+import type { BacktestConfig, InstrumentId, JobInfo, Params, StrategyInfo, Venue } from '@td/shared'
 import { api } from '../api'
 import { datasetRange, instrumentKey, latestRuns, toFinished, toVerdict } from './runs'
 import { type LabJob, type LabSource, RunCancelled, readableName } from './source'
@@ -13,8 +13,16 @@ import { type LabJob, type LabSource, RunCancelled, readableName } from './sourc
 const STARTING_CASH = 10_000
 const SLIPPAGE_BPS = 2
 
-/** The earliest `from` a download accepts: 2017-01-01 UTC, before either venue has data. */
-const HISTORY_FROM = 1_483_228_800_000
+/**
+ * The earliest `from` a download of each venue accepts (`earliest_from` in td-server's data.rs):
+ * 2017-01-01 UTC for Binance and Bybit, before either has data, and 2007-01-01 UTC for OANDA, since
+ * the desk's FX market hours follow the US daylight-saving rule in force since 2007.
+ */
+export const HISTORY_FROM: Record<Venue, number> = {
+  binance: 1_483_228_800_000,
+  bybit: 1_483_228_800_000,
+  oanda: 1_167_609_600_000,
+}
 
 // shortcut: the engine has no route that lists what the store holds, so the Lab asks for the
 // coverage of these instruments and of every instrument a saved run used. Ask the engine for its
@@ -174,7 +182,7 @@ export const engineLabSource: LabSource = {
 
   download(instrument, onProgress) {
     const job = followJob(
-      async () => (await api.downloadData({ instrument, from: HISTORY_FROM, to: Date.now() })).job_id,
+      async () => (await api.downloadData({ instrument, from: HISTORY_FROM[instrument.venue], to: Date.now() })).job_id,
       (info) => onProgress({ fraction: info.progress }),
     )
     return { result: job.result.then(() => {}), cancel: job.cancel }
