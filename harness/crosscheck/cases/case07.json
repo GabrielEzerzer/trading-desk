@@ -1,0 +1,17 @@
+{
+  "name": "case07",
+  "title": "crosscheck_limit_revert, a limit entry and a limit exit each cancelled after 6 bars, Binance spot BTCUSDT, 5m, the ranging month of July 2023",
+  "about": "Resting limits, fills on touch, the maker fee, cancels and replacements",
+  "exercises": ["resting_limits", "touch_fills", "maker_fee", "cancels"],
+  "strategy": "crosscheck_limit_revert",
+  "params": { "offset": 0.002, "cancel_after": 6, "fraction": 0.95 },
+  "venue": "binance",
+  "kind": "spot",
+  "symbol": "BTCUSDT",
+  "timeframe": "5m",
+  "from": "2023-07-01",
+  "to": "2023-08-01",
+  "starting_cash": 10000.0,
+  "fees": { "maker": 0.0009, "taker": 0.001 },
+  "data": "data/export/case07"
+}
