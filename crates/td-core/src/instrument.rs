@@ -228,7 +228,9 @@ fn positive(field: &'static str, value: f64) -> Result<f64, CoreError> {
 /// is scaled to an integer number of units first, a small epsilon absorbs the remaining error, and
 /// the result is built from integers so it is the float nearest the decimal value. The epsilon is
 /// a few units of float error in the step count, so it stays far below one step even for large
-/// counts.
+/// counts. For `Nearest` it pushes away from zero, so a value a half step off the grid in decimal
+/// rounds away from zero whichever side of the half its float lands on (1.005 and 2.675 at tick
+/// 0.01 are 100.49999999999999 and 267.5 ticks in f64).
 fn round_to_step(value: f64, step: f64, rounding: Rounding) -> f64 {
     let scale = 10f64.powi(step_decimals(step));
     let step_units = (step * scale).round();
@@ -237,7 +239,7 @@ fn round_to_step(value: f64, step: f64, rounding: Rounding) -> f64 {
     let n = match rounding {
         Rounding::Down => (steps + eps).floor(),
         Rounding::Up => (steps - eps).ceil(),
-        Rounding::Nearest => steps.round(),
+        Rounding::Nearest => (steps + eps.copysign(steps)).round(),
     };
     n * step_units / scale
 }
@@ -377,6 +379,16 @@ mod tests {
             9999999999.0
         );
         assert_eq!(round_to_step(9999999999.995, 1.0, Rounding::Up), 1e10);
+    }
+
+    #[test]
+    fn half_ticks_round_away_from_zero() {
+        // In f64, 1.005 / 0.01 lands just under 100.5 and 2.675 / 0.01 exactly on 267.5.
+        let i = with_steps(0.01, 0.01);
+        assert_eq!(i.round_price(1.005, Rounding::Nearest), 1.01);
+        assert_eq!(i.round_price(2.675, Rounding::Nearest), 2.68);
+        assert_eq!(round_to_step(-1.005, 0.01, Rounding::Nearest), -1.01);
+        assert_eq!(i.round_price(1.0049, Rounding::Nearest), 1.0);
     }
 
     #[test]
