@@ -34,8 +34,8 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use td_core::{
-    Candle, FeeSchedule, Instrument, InstrumentId, InstrumentKind, Liquidity, Millis, OrderId,
-    OrderRequest, OrderType, Side, TimeInForce, Timeframe, Venue,
+    AccountCurrency, Candle, FeeSchedule, Instrument, InstrumentId, InstrumentKind, Liquidity,
+    Millis, OrderId, OrderRequest, OrderType, Side, TimeInForce, Timeframe, Venue,
 };
 use td_data::{Http, Store, download_candles, download_funding, fetch_instruments};
 use td_engine::metrics::{self, EquitySeries};
@@ -744,6 +744,7 @@ fn run_case(case_path: &Path, dir: &Path, series: &str, out: &Path) -> Res<()> {
         max_leverage: case.max_leverage,
         warmup_from: None,
         close_at_end: false,
+        account_currency: AccountCurrency::Quote,
     };
     let result = match harness_strategy(&case.strategy, &case.params)? {
         Some(strategy) => run_strategy(&config, strategy, &bars, &[], &funding)?,
@@ -769,6 +770,7 @@ fn run_case(case_path: &Path, dir: &Path, series: &str, out: &Path) -> Res<()> {
             slippage_bps: 0.0,
             fees: Some(case.fees()),
             max_leverage: case.max_leverage,
+            account_currency: AccountCurrency::Quote,
         },
     )?;
     let mut resting = Vec::new();
@@ -868,7 +870,7 @@ struct Curve {
 fn curve_metrics(curve_path: &Path, out: &Path) -> Res<()> {
     let curve: Curve = serde_json::from_str(&fs::read_to_string(curve_path)?)?;
     let series = EquitySeries::new(curve.starting_cash, &curve.equity, curve.timeframe);
-    let report = metrics::report(&series, &[], &[], &[], 0.0);
+    let report = metrics::report(&series, &[], &[], &[], 0.0, AccountCurrency::Quote);
     // Only what the curve alone decides: the trade, fee and exposure figures need the fills.
     let full = serde_json::to_value(&report)?;
     let keep = [
