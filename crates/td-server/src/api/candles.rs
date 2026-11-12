@@ -5,7 +5,8 @@
 //! rule ([`td_data::resample`]). The bar slots the store does not cover are fetched from the
 //! venue's REST API at the timeframe itself, the way a paper session warms up, and are not written
 //! to the store: only download jobs fill it. A venue with no live stream (oanda) has no such REST
-//! bars, so there those slots are reported missing.
+//! bars, so there those slots are reported missing. A slot wholly inside the market's closed hours
+//! (an FX weekend) has no bar to find, so it is neither fetched nor reported missing.
 
 use std::sync::Arc;
 
@@ -65,7 +66,8 @@ pub struct CandlesResponse {
     pub candles: Vec<Candle>,
     /// The bars fetched from the venue rather than read from the store.
     pub from_venue: Vec<BarSpan>,
-    /// Slots in `[from, to)` with no bar in the store or at the venue.
+    /// Slots in `[from, to)` with no bar in the store or at the venue, apart from those wholly
+    /// inside the market's closed hours (an FX weekend), which have no bar to miss.
     pub missing: Vec<BarSpan>,
 }
 
@@ -125,6 +127,11 @@ fn read_candles(
         ((from..end).contains(&t) && timeframe.floor(t) == t).then(|| ((t - from) / dur) as usize)
     };
     let mut slots: Vec<Slot> = vec![None; ((end - from) / dur) as usize];
+    let kind = id.kind;
+    let closed = |i: usize| {
+        let t = from + i as i64 * dur;
+        kind.closed_spans(t, t + dur).first() == Some(&(t..t + dur))
+    };
     // The stored minutes are read about a month at a time, so a daily or weekly chart over years
     // never holds years of minutes at once, and every piece ends on a bar boundary. Up to 1d a
     // piece ends at the next month start, which is a whole day, so it reads one month file; weeks
@@ -147,10 +154,11 @@ fn read_candles(
         }
         start = stop;
     }
-    // One request over every slot the store lacks: at most `limit` bars, a few pages at most.
+    // One request over every open slot the store lacks: at most `limit` bars, a few pages at most.
+    let lacking = |(i, slot): (usize, &Slot)| slot.is_none() && !closed(i);
     if let (Some(first), Some(last)) = (
-        slots.iter().position(Option::is_none),
-        slots.iter().rposition(Option::is_none),
+        slots.iter().enumerate().position(lacking),
+        slots.iter().enumerate().rposition(lacking),
     ) {
         let (span_from, span_to) = (from + first as i64 * dur, from + (last as i64 + 1) * dur);
         let fetched = match rest.klines(&id, timeframe, span_from, span_to) {
@@ -187,6 +195,7 @@ fn read_candles(
                     extend(&mut response.from_venue, open_time, dur);
                 }
             }
+            None if closed(i) => {}
             None => extend(&mut response.missing, open_time, dur),
         }
     }
