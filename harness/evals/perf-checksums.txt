@@ -1,7 +1,8 @@
 # td-bench's results checksum for each split CI runs: the checksum= on its BENCH line, measured
 # with `cargo run --release -p td-server --bin td-bench -- --split <split> --reps 1`.
-# CI fails when a run gives another value. A change that means to move results updates these
-# values in the same PR, beside the ENGINE_REVISION bump in crates/td-engine/src/runner.rs
-# (results carry the revision, so the bump alone moves them).
-dev 39b3283358506109
-test bd55f7199165cd92
+# CI fails when a run gives another value. The checksum leaves out engine_revision, so a revision
+# bump alone does not move it: a bump that moves a value here moved a result. A change that means
+# to move results updates these values in the same PR, beside the ENGINE_REVISION bump in
+# crates/td-engine/src/runner.rs.
+dev f04dfffdc660f965
+test a1b60a9cf3baa2a5
