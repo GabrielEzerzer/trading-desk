@@ -88,7 +88,7 @@ const LISTS: [Venue, InstrumentKind][] = [
   ['bybit', 'perpetual'],
 ]
 
-const VENUE_NAMES: Record<Venue, string> = { binance: 'Binance', bybit: 'Bybit' }
+const VENUE_NAMES: Record<Venue, string> = { binance: 'Binance', bybit: 'Bybit', oanda: 'OANDA' }
 
 /** Loads the four venue lists; one that fails is named in `problems`, and only all failing throws. */
 export async function loadInstrumentLists(

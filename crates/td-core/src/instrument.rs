@@ -11,6 +11,8 @@ use crate::{CoreError, OrderRequest, OrderType};
 pub enum Venue {
     Binance,
     Bybit,
+    /// OANDA's v20 REST API on a practice account: FX bid and ask candles, no trading.
+    Oanda,
 }
 
 impl fmt::Display for Venue {
@@ -18,6 +20,7 @@ impl fmt::Display for Venue {
         f.write_str(match self {
             Venue::Binance => "binance",
             Venue::Bybit => "bybit",
+            Venue::Oanda => "oanda",
         })
     }
 }

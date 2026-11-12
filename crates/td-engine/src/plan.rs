@@ -92,8 +92,7 @@ pub struct Period {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BacktestSettings {
-    /// Starting balance in the quote asset: a plan's runs are on a quote-currency account (see
-    /// [`TestPlan::backtest_config`]).
+    /// Starting balance in the account currency (`account_currency`).
     pub starting_cash: f64,
     /// The perpetual leverage cap, as in [`BacktestConfig::max_leverage`]; 1.0 is 1x.
     pub max_leverage: f64,
@@ -101,6 +100,11 @@ pub struct BacktestSettings {
     /// backtest config's default slippage for that instrument (#35: 2 bps on BTC and ETH, 5 bps
     /// on other large caps); an empty list uses the default everywhere.
     pub slippage: Vec<SlippageOverride>,
+    /// The currency the plan's runs hold and report in, as in
+    /// [`BacktestConfig::account_currency`]: the quote currency, the default, or the base
+    /// currency, as a dollar account trading USD/JPY. Left out of JSON when it is the default.
+    #[serde(default, skip_serializing_if = "AccountCurrency::is_quote")]
+    pub account_currency: AccountCurrency,
 }
 
 /// One instrument's slippage, overriding the backtest config's default for it.
@@ -341,9 +345,7 @@ impl TestPlan {
             max_leverage: self.backtest.max_leverage,
             warmup_from: None,
             close_at_end: false,
-            // shortcut: a plan's runs are on a quote-currency account; add the account currency
-            // to `BacktestSettings` when the first plan for an FX pair on a base account is written.
-            account_currency: AccountCurrency::Quote,
+            account_currency: self.backtest.account_currency,
         }
     }
 

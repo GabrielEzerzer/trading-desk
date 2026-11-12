@@ -4,7 +4,7 @@
 /**
  * An exchange the desk reads data from and simulates orders against.
  */
-export type Venue = "binance" | "bybit";
+export type Venue = "binance" | "bybit" | "oanda";
 
 export type InstrumentKind = "spot" | "perpetual" | "fx";
 
@@ -927,8 +927,7 @@ export type Period = { from: number, to: number, };
  */
 export type BacktestSettings = { 
 /**
- * Starting balance in the quote asset: a plan's runs are on a quote-currency account (see
- * [`TestPlan::backtest_config`]).
+ * Starting balance in the account currency (`account_currency`).
  */
 starting_cash: number, 
 /**
@@ -940,7 +939,13 @@ max_leverage: number,
  * backtest config's default slippage for that instrument (#35: 2 bps on BTC and ETH, 5 bps
  * on other large caps); an empty list uses the default everywhere.
  */
-slippage: Array<SlippageOverride>, };
+slippage: Array<SlippageOverride>, 
+/**
+ * The currency the plan's runs hold and report in, as in
+ * [`BacktestConfig::account_currency`]: the quote currency, the default, or the base
+ * currency, as a dollar account trading USD/JPY. Left out of JSON when it is the default.
+ */
+account_currency?: AccountCurrency, };
 
 /**
  * One instrument's slippage, overriding the backtest config's default for it.
@@ -1123,8 +1128,8 @@ export type HighRiskLimits = {
  */
 min_trades: number, 
 /**
- * Mean net P&L per closed trade strictly above this, in the run's account currency (the
- * quote asset on a plan's runs).
+ * Mean net P&L per closed trade strictly above this, in the run's account currency (on a
+ * plan's runs, the one its backtest settings name).
  */
 min_expectancy: number, 
 /**
@@ -1566,8 +1571,10 @@ export type Breakdown = { long: SideResult, short: SideResult,
  */
 funding_paid: number, 
 /**
- * Windows where buy and hold rose over the test window, and the strategy's return in them,
- * compounded.
+ * Windows where the instrument's price rose over the test window, and the strategy's return
+ * in them, compounded. The price is the quote currency per unit of the base, so a long
+ * position gained in those windows in either currency: on a dollar account trading USD/JPY,
+ * a rising window is one where the dollar strengthened against the yen.
  */
 rising: RegimeResult, 
 /**
@@ -1589,7 +1596,7 @@ export type SideResult = {
  */
 trades: number, 
 /**
- * Their net P&L, in the quote asset.
+ * Their net P&L, in the account currency.
  */
 net_pnl: number, };
 
@@ -1713,7 +1720,8 @@ export type RejectedInstrument = { symbol: string, reason: string, };
  */
 export type DownloadRequest = { instrument: InstrumentId, 
 /**
- * Not before 2017-01-01 00:00 UTC (1483228800000); earlier is a 400.
+ * Not before 2017-01-01 00:00 UTC (1483228800000) for binance and bybit, or before
+ * 2007-01-01 00:00 UTC (1167609600000) for oanda; earlier is a 400.
  */
 from: number, to: number, };
 
@@ -1852,7 +1860,7 @@ export type CandlesResponse = { instrument: InstrumentId, timeframe: Timeframe,
  * The bar slots the response covers: open times in `[from, to)`, each on a bar boundary. `to`
  * is the asked `to` rounded up to a boundary, but no later than the open time of the bar
  * still forming; `from` is later than asked when the limit cut the range, and never before
- * 2017-01-01.
+ * the venue's earliest download date (2017-01-01, or 2007-01-01 for oanda).
  */
 from: number, to: number, 
 /**
@@ -2073,7 +2081,8 @@ bars: number,
 /**
  * Every stretch of minutes in the range (warm-up included) the store has no candle for,
  * oldest first, including any at the start or the end of the range, in the instrument's open
- * hours. Each is shorter than a day; a longer one refuses the run.
+ * hours. Together with any next to it that only closed hours part it from, each holds less
+ * than a day of open time, or two days for FX; more refuses the run.
  */
 gaps: Array<GapInfo>, 
 /**

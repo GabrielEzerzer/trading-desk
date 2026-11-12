@@ -165,8 +165,8 @@ impl Default for PortfolioLimits {
 pub struct HighRiskLimits {
     /// Closed out-of-sample trades, at least this many.
     pub min_trades: u32,
-    /// Mean net P&L per closed trade strictly above this, in the run's account currency (the
-    /// quote asset on a plan's runs).
+    /// Mean net P&L per closed trade strictly above this, in the run's account currency (on a
+    /// plan's runs, the one its backtest settings name).
     pub min_expectancy: f64,
     /// The bootstrap's lower bound on that mean strictly above this.
     pub min_expectancy_lower_bound: f64,

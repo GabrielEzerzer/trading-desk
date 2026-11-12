@@ -1,8 +1,9 @@
-//! Downloads from the real venues. Ignored by default; run with
-//! `cargo test -p td-data --test network -- --ignored`.
+//! Downloads from the real venues and data feeds. Ignored by default; run with
+//! `cargo test -p td-data --test network -- --ignored`. The OANDA test needs the token of an
+//! OANDA practice account in OANDA_API_TOKEN.
 
 use td_core::{InstrumentId, InstrumentKind, Timeframe, Venue};
-use td_data::time::{DAY, parse_date};
+use td_data::time::{DAY, Month, format_minute, parse_date};
 use td_data::{Http, Store, download_candles, download_funding, fetch_instruments};
 
 #[test]
@@ -44,6 +45,63 @@ fn one_day_of_btcusdt_from_each_source() {
             }
         }
     }
+}
+
+#[test]
+#[ignore = "downloads from OANDA's practice API, with the token in OANDA_API_TOKEN"]
+fn one_day_of_usdjpy_from_oanda_has_bids_and_asks_on_the_same_minutes() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let store = Store::new(dir.path());
+    let http = Http::new().expect("an HTTP client");
+    // A Wednesday, open all day, in the first year the desk's FX history needs.
+    let from = parse_date("2016-01-06").expect("a date");
+    let id = InstrumentId {
+        venue: Venue::Oanda,
+        symbol: "USDJPY".into(),
+        kind: InstrumentKind::Fx,
+    };
+    let started = std::time::Instant::now();
+    let report = download_candles(&http, &store, &id, from, from + DAY, &mut |_| {})
+        .unwrap_or_else(|e| panic!("{id}: {e}"));
+    let month = Month::containing(from);
+    let bids = store.read_month(&id, month).expect("bids");
+    let asks = store.read_month_asks(&id, month).expect("asks");
+    assert!(
+        report.missing_files.is_empty(),
+        "{:?}",
+        report.missing_files
+    );
+    // Every minute of an open day: a quiet one is filled at the last close, and only the minutes
+    // before the day's first candle can be missing.
+    assert!(bids.len() > 1_400, "{} minutes", bids.len());
+    assert_eq!(asks.len(), bids.len());
+    for (bid, ask) in bids.iter().zip(&asks) {
+        assert_eq!(bid.open_time, ask.open_time);
+        assert!(
+            ask.open >= bid.open
+                && ask.high >= bid.high
+                && ask.low >= bid.low
+                && ask.close >= bid.close,
+            "{bid:?} {ask:?}"
+        );
+        // A USDJPY price, not one scaled by the wrong power of ten.
+        assert!((50.0..500.0).contains(&bid.close), "{bid:?}");
+    }
+    // A pip of a JPY-quoted pair is 0.01.
+    let spread = bids
+        .iter()
+        .zip(&asks)
+        .map(|(bid, ask)| (ask.close - bid.close) / 0.01)
+        .sum::<f64>()
+        / bids.len() as f64;
+    eprintln!(
+        "{id}: {} minutes from {} to {}, mean close spread {spread:.3} pips, gaps {:?}, {:.0?}",
+        bids.len(),
+        format_minute(bids[0].open_time),
+        format_minute(bids[bids.len() - 1].open_time),
+        report.gaps,
+        started.elapsed()
+    );
 }
 
 #[test]

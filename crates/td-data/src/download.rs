@@ -39,7 +39,7 @@ pub fn download_candles(
 }
 
 /// [`download_candles`] from a given source.
-fn download_candles_from(
+pub(crate) fn download_candles_from(
     source: &dyn DataSource,
     http: &Http,
     store: &Store,
