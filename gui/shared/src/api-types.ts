@@ -1106,7 +1106,16 @@ min_alpha: number,
 /**
  * The bootstrap chance that the mean daily return is zero or less, at most this.
  */
-max_p_mean_not_positive: number, };
+max_p_mean_not_positive: number, 
+/**
+ * The 95th percentile of the max drawdown over resampled paths of the daily returns (days
+ * drawn with replacement in blocks, as R7 does), at most this. The default is above `max_drawdown`'s because the 95th percentile of
+ * resampled paths sits well above the drawdown of the one path that happened, and grows with
+ * the length of the out-of-sample period; at 0.45 the line fails a strategy whose drawdown was
+ * small only because its losing days happened not to cluster, not every strategy near the
+ * historical limit. A rule saved before this limit existed reads with the default.
+ */
+max_resampled_drawdown: number, };
 
 export type HighRiskLimits = { 
 /**
@@ -1255,6 +1264,11 @@ plateau: PlateauReport | null,
  */
 daily_bootstrap: MeanBootstrap | null, 
 /**
+ * The block bootstrap of the max drawdown over the same daily returns, for a `portfolio`
+ * rule. `None` for the other kinds, without a curve, and in a result saved before it existed.
+ */
+drawdown_bootstrap: DrawdownBootstrap | null, 
+/**
  * The bootstrap of the closed out-of-sample trades' net P&L, for `high_risk`'s lower bound.
  */
 trade_bootstrap: MeanBootstrap | null, 
@@ -1400,6 +1414,11 @@ alpha: number | null,
  */
 p_mean_not_positive: number | null, 
 /**
+ * The 95th percentile of the max drawdown over resampled paths of the daily returns (days
+ * drawn with replacement in blocks, as R7 does).
+ */
+resampled_drawdown: number | null, 
+/**
  * Closed trades.
  */
 trades: number, 
@@ -1498,6 +1517,24 @@ p_mean_at_most_zero: number,
  * zero on the trade P&Ls; that rule asks a one-sided question, so the bound is one-sided.
  */
 lower_bound: number, quantiles: Quantiles, resamples: number, mean_block: number, };
+
+/**
+ * The distribution of the max drawdown of a series of daily returns under resampling.
+ */
+export type DrawdownBootstrap = { 
+/**
+ * The max drawdown of the returns in the order they happened.
+ */
+historical: number, 
+/**
+ * The median of the resampled paths' max drawdowns.
+ */
+p50: number, 
+/**
+ * The 95th percentile of the resampled paths' max drawdowns. The `portfolio` kind rule asks
+ * for it to be at most its `max_resampled_drawdown`.
+ */
+p95: number, resamples: number, mean_block: number, };
 
 /**
  * Quantiles of the resampled means.

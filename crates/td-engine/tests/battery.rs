@@ -1,8 +1,8 @@
 //! The strategy test battery end to end on synthetic four-hour bars: a planted edge reaches
 //! `trade`, noise does not, a short range gives `not_enough_evidence`, missing bars give
 //! `invalid`, a cancel in the luck test gives an inconclusive luck line, the same seed gives the
-//! same result at any thread count, the progress count adds up, and on a market with quotes the
-//! asks reach the runs.
+//! same result at any thread count, the progress count adds up, on a market with quotes the
+//! asks reach the runs, and a result saved before the drawdown bootstrap existed still reads.
 
 mod common;
 
@@ -271,6 +271,23 @@ fn a_planted_edge_reaches_trade_with_every_input_from_the_runs() {
         r.kind.expectancy_lower_bound,
         r.trade_bootstrap.as_ref().map(|b| b.lower_bound)
     );
+    // The drawdown bootstrap runs on the same daily returns as R7, in the same blocks, and its
+    // 95th percentile is the resampled drawdown line's value. Daily closes are a subset of the
+    // bar closes, so the historical order's drawdown is at most the bar-close drawdown.
+    let dd = r.drawdown_bootstrap.as_ref().unwrap();
+    let daily = r.daily_bootstrap.as_ref().unwrap();
+    assert_eq!(
+        (dd.resamples, dd.mean_block),
+        (daily.resamples, daily.mean_block)
+    );
+    assert!(dd.historical <= m.max_drawdown.unwrap() + 1e-12, "{dd:?}");
+    assert!(dd.historical <= dd.p95 && dd.p50 <= dd.p95, "{dd:?}");
+    assert_eq!(r.kind.resampled_drawdown, Some(dd.p95));
+    let resampled = line(&r, "resampled_drawdown");
+    assert_eq!(
+        (resampled.value, resampled.limit, resampled.outcome),
+        (Some(dd.p95), Some(0.45), Outcome::Pass)
+    );
     assert_eq!(
         r.kind.return_without_best_trade,
         r.breakdown.as_ref().unwrap().return_without_best_trade
@@ -317,6 +334,8 @@ fn the_other_kinds_get_their_inputs_from_the_same_runs() {
     assert_eq!(line(&high, "risk_of_ruin").value, Some(ruin));
     assert_eq!(line(&high, "trades").value, Some(wf.metrics.trades as f64));
     assert!(high.prop_firm_odds.is_none());
+    // The drawdown bootstrap is the portfolio kind's alone.
+    assert!(high.drawdown_bootstrap.is_none() && high.kind.resampled_drawdown.is_none());
 
     // Alpha against buy and hold is the stitched benchmark's.
     let held = VerdictRule::Portfolio {
@@ -520,6 +539,43 @@ fn the_same_seed_gives_the_same_result_at_any_thread_count() {
         .install(|| battery(&plan, &cash_rule(), &bars, 11, None).unwrap());
     assert_eq!(two, many);
     assert!(two.permutation.is_some());
+}
+
+/// The drawdown bootstrap draws from its own seed stream: the same battery seed gives the same
+/// percentiles, another seed other ones, on the same returns.
+#[test]
+fn the_drawdown_bootstrap_is_fixed_by_the_battery_seed() {
+    let bars = edge_bars(DAYS);
+    let plan = plan(DAYS);
+    let run = |seed| battery(&plan, &cash_rule(), &bars, seed, None).unwrap();
+    let (a, again, other) = (run(7), run(7), run(8));
+    let dd = |r: &BatteryResult| r.drawdown_bootstrap.clone().unwrap();
+    assert_eq!(dd(&a), dd(&again));
+    assert_eq!(dd(&a).historical, dd(&other).historical);
+    assert_ne!((dd(&a).p50, dd(&a).p95), (dd(&other).p50, dd(&other).p95));
+    assert_eq!(
+        line(&other, "resampled_drawdown").value,
+        Some(dd(&other).p95)
+    );
+}
+
+/// A battery result saved before the drawdown bootstrap existed, without it and without the
+/// kind input it feeds, still reads, with both missing.
+#[test]
+fn a_result_saved_before_the_drawdown_bootstrap_still_reads() {
+    let bars = edge_bars(DAYS);
+    let plan = plan(DAYS);
+    let r = battery(&plan, &cash_rule(), &bars, 7, None).unwrap();
+    let mut json = serde_json::to_value(&r).unwrap();
+    let fields = json.as_object_mut().unwrap();
+    assert!(fields.remove("drawdown_bootstrap").is_some());
+    let kind = fields["kind"].as_object_mut().unwrap();
+    assert!(kind.remove("resampled_drawdown").is_some());
+    let old: BatteryResult = serde_json::from_value(json).unwrap();
+    assert!(old.drawdown_bootstrap.is_none() && old.kind.resampled_drawdown.is_none());
+    // The saved verdict keeps the lines it was saved with.
+    assert_eq!(old.verdict, r.verdict);
+    assert_eq!(old.daily_bootstrap, r.daily_bootstrap);
 }
 
 #[test]
