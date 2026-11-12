@@ -33,6 +33,8 @@ const ROUTES: readonly Route[] = [
   { method: 'POST', path: /^\/sessions$/, body: true },
   { method: 'GET', path: /^\/sessions\/[A-Za-z0-9_-]{1,64}$/ },
   { method: 'POST', path: /^\/sessions\/[A-Za-z0-9_-]{1,64}\/(?:stop|resume)$/ },
+  { method: 'POST', path: /^\/sessions\/[A-Za-z0-9_-]{1,64}\/orders$/, body: true },
+  { method: 'POST', path: /^\/sessions\/[A-Za-z0-9_-]{1,64}\/orders\/\d{1,15}\/cancel$/ },
 ]
 
 // The WebSocket topics the engine serves (crates/td-server/src/api/ws.rs). Symbols follow the

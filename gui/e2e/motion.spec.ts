@@ -109,7 +109,8 @@ test('reduced motion: nothing moves or loops through Trading', async ({ page, op
   await page.getByRole('dialog').waitFor()
   await check('start panel open')
   await page.getByRole('button', { name: 'Start', exact: true }).click()
-  await page.locator('.position-summary').waitFor()
+  // Like the engine, the session takes orders once its warm-up is over.
+  await page.locator('.position-summary').filter({ hasText: 'Manual · Live' }).waitFor({ timeout: 10_000 })
   await page.getByPlaceholder('Size').fill('0.05')
   await page.getByRole('button', { name: 'Buy', exact: true }).click()
   await page.locator('.position-summary').filter({ hasText: /0\.05000 BTC/ }).waitFor({ timeout: 10_000 })
