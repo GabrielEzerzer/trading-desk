@@ -116,6 +116,16 @@ describe('paper session routes', () => {
       method: 'POST',
       path: '/sessions/abc/resume',
     })
+    const order = { side: 'buy', qty: 0.5, type: 'market' }
+    expect(validateRequest({ method: 'POST', path: '/sessions/abc/orders', body: order })).toEqual({
+      method: 'POST',
+      path: '/sessions/abc/orders',
+      body: order,
+    })
+    expect(validateRequest({ method: 'POST', path: '/sessions/abc/orders/12/cancel' })).toEqual({
+      method: 'POST',
+      path: '/sessions/abc/orders/12/cancel',
+    })
   })
 
   it.each([
@@ -131,7 +141,10 @@ describe('paper session routes', () => {
     ['a start without a body', { method: 'POST', path: '/sessions' }],
     ['a start with an array body', { method: 'POST', path: '/sessions', body: [start] }],
     ['a query on the session list', { method: 'GET', path: '/sessions', query: { status: 'live' } }],
-    ['manual orders, which do not exist yet (#36)', { method: 'POST', path: '/sessions/abc/orders', body: {} }],
+    ['an order without a body', { method: 'POST', path: '/sessions/abc/orders' }],
+    ['GET on the orders', { method: 'GET', path: '/sessions/abc/orders' }],
+    ['a cancel of an order id that is not a number', { method: 'POST', path: '/sessions/abc/orders/x/cancel' }],
+    ['a body on cancel', { method: 'POST', path: '/sessions/abc/orders/1/cancel', body: {} }],
     ['candle history without its query', { method: 'GET', path: '/candles' }],
     [
       'candle history with a range',

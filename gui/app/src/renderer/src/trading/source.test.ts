@@ -1,6 +1,6 @@
 import type { ApiRequest, ApiResult, Candle, InstrumentId, ServerMessage, SessionEvent, SessionState } from '@td/shared'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { HISTORY_BARS, engineTradingSource } from './source'
+import { HISTORY_BARS, MANUAL, engineTradingSource } from './source'
 
 // A stand-in for the preload's `window.td`: the parts a subscription uses.
 function fakeBridge() {
@@ -107,5 +107,36 @@ describe('engine session feed', () => {
     expect(bridge.listeners.size).toBe(0)
     bridge.emit({ type: 'session', id: 'a', event: bar })
     expect(onEvent).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('engine manual orders', () => {
+  const placed = { source: 'manual', id: 4, status: { status: 'open' } }
+
+  it('names a manual session the way td-server does', () => {
+    expect(MANUAL).toBe('none')
+  })
+
+  it('offers orders and manual sessions, and places and cancels through the order routes', async () => {
+    expect(engineTradingSource.orders).toEqual({ available: true })
+    expect(engineTradingSource.manualSessions).toEqual({ available: true })
+    const request = vi.fn(async (_r: ApiRequest): Promise<ApiResult> => ({ ok: true, status: 201, body: placed }))
+    vi.stubGlobal('window', { td: { ...bridge.td, request } })
+
+    await expect(
+      engineTradingSource.placeOrder('s-1', { side: 'buy', qty: 0.05, type: 'limit', limit_price: 60_000 }),
+    ).resolves.toBeUndefined()
+    await expect(engineTradingSource.cancelOrder('s-1', 4)).resolves.toBeUndefined()
+    expect(request.mock.calls.map(([r]) => r)).toEqual([
+      { method: 'POST', path: '/sessions/s-1/orders', body: { side: 'buy', qty: 0.05, type: 'limit', limit_price: 60_000 } },
+      { method: 'POST', path: '/sessions/s-1/orders/4/cancel' },
+    ])
+  })
+
+  it("rejects with the engine's reason when it refuses the order", async () => {
+    const message = 'the session has not fed its first live bar yet; orders can be placed once it has'
+    const request = vi.fn(async (): Promise<ApiResult> => ({ ok: false, status: 409, error: { code: 'not_live', message } }))
+    vi.stubGlobal('window', { td: { ...bridge.td, request } })
+    await expect(engineTradingSource.placeOrder('s-1', { side: 'sell', qty: 1, type: 'market' })).rejects.toThrow(message)
   })
 })
