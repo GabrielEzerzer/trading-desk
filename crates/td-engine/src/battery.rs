@@ -15,7 +15,8 @@
 //!    line keeps the worst result over every set checked, and a failure there makes the verdict
 //!    `invalid` too; the steps after the statistics are then skipped.
 //! 4. **The statistics that need no further runs:** R2, R5, R7 (a block bootstrap of the daily
-//!    returns), R8 (where the profit came from), I4, I5 and the kind rule's inputs.
+//!    returns), R8 (where the profit came from), I4, I5 and the kind rule's inputs, among them a
+//!    block bootstrap of the max drawdown over the same daily returns for the `portfolio` kind.
 //! 5. **R4**, the walk-forward's chosen parameters run again on each test window at
 //!    `cost_stress` times the fees and slippage.
 //! 6. **R6**, the walk-forward again with its windows moved by `start_offsets` different offsets.
@@ -62,7 +63,8 @@ use crate::risk::{self, DayRollover};
 use crate::rng::derive_seed;
 use crate::runner::select_bars;
 use crate::stats::{
-    self, BootstrapSpec, DEFAULT_RESAMPLES, MeanBootstrap, PropFirmOdds, PropFirmSpec, RuinSpec,
+    self, BootstrapSpec, DEFAULT_RESAMPLES, DrawdownBootstrap, MeanBootstrap, PropFirmOdds,
+    PropFirmSpec, RuinSpec,
 };
 use crate::verdict::{
     IntegrityInputs, OosIntegrityInputs, evaluate_integrity, evaluate_oos_integrity,
@@ -81,6 +83,7 @@ const SEED_TRADE_BOOTSTRAP: u64 = 2;
 const SEED_RUIN: u64 = 3;
 const SEED_PROP_FIRM: u64 = 4;
 const SEED_LUCK: u64 = 5;
+const SEED_DRAWDOWN_BOOTSTRAP: u64 = 6;
 
 /// The evidence lines of the runs that come after the statistics (R3, R4, R6).
 const LATER_LINES: [&str; 3] = ["luck_p", "stressed_return", "start_offsets"];
@@ -110,6 +113,9 @@ pub struct BatteryResult {
     pub plateau: Option<PlateauReport>,
     /// R7: the block bootstrap of the out-of-sample daily returns.
     pub daily_bootstrap: Option<MeanBootstrap>,
+    /// The block bootstrap of the max drawdown over the same daily returns, for a `portfolio`
+    /// rule. `None` for the other kinds, without a curve, and in a result saved before it existed.
+    pub drawdown_bootstrap: Option<DrawdownBootstrap>,
     /// The bootstrap of the closed out-of-sample trades' net P&L, for `high_risk`'s lower bound.
     pub trade_bootstrap: Option<MeanBootstrap>,
     /// The prop-firm challenge odds, for a `prop_firm` rule.
@@ -364,6 +370,7 @@ pub fn run_battery(
         oos_integrity: OosIntegrityInputs::default(),
         plateau: None,
         daily_bootstrap: None,
+        drawdown_bootstrap: None,
         trade_bootstrap: None,
         prop_firm_odds: None,
         breakdown: None,
@@ -490,6 +497,15 @@ pub fn run_battery(
             &BootstrapSpec::daily(daily.len(), derive_seed(seed, SEED_DAILY_BOOTSTRAP)),
         )
         .ok();
+        if let VerdictRule::Portfolio { .. } = rule {
+            result.drawdown_bootstrap = stats::bootstrap_drawdown(
+                &daily,
+                DEFAULT_RESAMPLES,
+                stats::default_block_len(daily.len()),
+                derive_seed(seed, SEED_DRAWDOWN_BOOTSTRAP),
+            )
+            .ok();
+        }
         let closed: Vec<f64> = wf
             .trades
             .iter()
@@ -530,6 +546,7 @@ pub fn run_battery(
                 .daily_bootstrap
                 .as_ref()
                 .map(|b| b.p_mean_at_most_zero),
+            resampled_drawdown: result.drawdown_bootstrap.as_ref().map(|b| b.p95),
             trades: m.trades,
             expectancy: m.avg_trade_pnl,
             expectancy_lower_bound: result.trade_bootstrap.as_ref().map(|b| b.lower_bound),
