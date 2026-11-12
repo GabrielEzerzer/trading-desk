@@ -1,0 +1,18 @@
+[project]
+name = "crosscheck"
+version = "0.1.0"
+description = "Cross-check of the trading-desk engine against NautilusTrader (issue #29)."
+requires-python = ">=3.12,<3.14"
+dependencies = [
+    "nautilus_trader==1.231.0",
+]
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

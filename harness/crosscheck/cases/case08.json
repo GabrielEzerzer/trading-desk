@@ -1,0 +1,17 @@
+{
+  "name": "case08",
+  "title": "crosscheck_bracket, a market entry with an attached stop and a take-profit limit, Binance perpetual ETHUSDT, 1h, the volatile quarter April to June 2022",
+  "about": "Stop against target on one bar (expected difference 2), reduce-only exits, funding",
+  "exercises": ["ambiguous_bars"],
+  "strategy": "crosscheck_bracket",
+  "params": { "fast": 10, "slow": 30, "atr_period": 14, "stop_atr": 1.0, "target_atr": 1.0, "qty": 1.0 },
+  "venue": "binance",
+  "kind": "perpetual",
+  "symbol": "ETHUSDT",
+  "timeframe": "1h",
+  "from": "2022-04-01",
+  "to": "2022-07-01",
+  "starting_cash": 10000.0,
+  "fees": { "maker": 0.0002, "taker": 0.0005 },
+  "data": "data/export/case08"
+}
