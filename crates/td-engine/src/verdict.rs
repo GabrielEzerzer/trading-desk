@@ -132,8 +132,8 @@ pub struct PortfolioLimits {
     pub min_alpha: f64,
     /// The bootstrap chance that the mean daily return is zero or less, at most this.
     pub max_p_mean_not_positive: f64,
-    /// The 95th percentile of the max drawdown over block-bootstrapped orderings of the daily
-    /// returns, at most this. The default is above `max_drawdown`'s because the 95th percentile of
+    /// The 95th percentile of the max drawdown over resampled paths of the daily returns (days
+    /// drawn with replacement in blocks, as R7 does), at most this. The default is above `max_drawdown`'s because the 95th percentile of
     /// resampled paths sits well above the drawdown of the one path that happened, and grows with
     /// the length of the out-of-sample period; at 0.45 the line fails a strategy whose drawdown was
     /// small only because its losing days happened not to cluster, not every strategy near the
@@ -681,8 +681,8 @@ pub struct KindInputs {
     pub alpha: Option<f64>,
     /// The block bootstrap's chance that the mean daily return is zero or less (R7).
     pub p_mean_not_positive: Option<f64>,
-    /// The 95th percentile of the max drawdown over block-bootstrapped orderings of the daily
-    /// returns.
+    /// The 95th percentile of the max drawdown over resampled paths of the daily returns (days
+    /// drawn with replacement in blocks, as R7 does).
     pub resampled_drawdown: Option<f64>,
     // high_risk
     /// Closed trades.
@@ -1216,8 +1216,8 @@ mod tests {
                 x.max_drawdown = Some(0.35);
             }),
             ("drawdown_vs_benchmark", |x| x.max_drawdown = Some(0.19)),
-            // The historical drawdown passes both its lines; most orderings of the same days
-            // would have fallen further.
+            // The historical drawdown passes both its lines; more than 5% of resampled paths
+            // fell past the limit.
             ("resampled_drawdown", |x| x.resampled_drawdown = Some(0.46)),
             // Like the other bootstrap line, a missing value fails with no value.
             ("resampled_drawdown", |x| x.resampled_drawdown = None),

@@ -25,9 +25,10 @@
 //! ([`default_block_len`]): 7 days for a year of returns, 9 for two. Block lengths growing like
 //! `n^(1/3)` are the rate-optimal choice for the variance of a mean (Hall, Horowitz and Jing,
 //! 1995), and the values land in the 5 to 10 day range commonly used for daily data. The
-//! drawdown bootstrap uses the same default: its blocks keep the runs of bad days a drawdown is
-//! made of, while the reordering of blocks shows how deep the drawdown could have been had those
-//! runs met.
+//! drawdown bootstrap uses the same default: its blocks keep short runs of bad days together, and
+//! drawing blocks in a new mix shows how deep the drawdown could have been had such runs met. A
+//! losing run much longer than a block is broken up, so the resampled drawdown can come out below
+//! the historical one; the historical drawdown line still judges that case.
 //!
 //! For the mean of trade results, trades are resampled one at a time (a mean block of 1, the
 //! plain bootstrap): the spread of a mean depends little on the order of separate trades. The
@@ -263,9 +264,10 @@ pub struct DrawdownBootstrap {
 
 /// Bootstraps the max drawdown of `daily_returns`, for the `portfolio` rule: each of `resamples`
 /// paths draws as many returns as the sample with the stationary bootstrap of mean block length
-/// `mean_block` and compounds them from an equity of 1. The historical order is one ordering of
-/// the returns; a strategy whose losses happened to fall between its wins shows a shallow
-/// drawdown there that most orderings of the same days would not.
+/// `mean_block` and compounds them from an equity of 1. Days are drawn with replacement, so each
+/// path has its own mix of days as well as its own order: the spread reflects both the luck of
+/// the order and the uncertainty in the returns themselves. A strategy whose losses happened to
+/// fall between its wins shows a shallow historical drawdown that many resampled paths do not.
 pub fn bootstrap_drawdown(
     daily_returns: &[f64],
     resamples: usize,
