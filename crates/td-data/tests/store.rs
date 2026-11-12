@@ -1130,6 +1130,30 @@ fn a_temp_file_from_a_crashed_first_write_of_a_month_is_listed_and_deleted() {
 }
 
 #[test]
+fn a_write_of_a_month_removes_a_crashed_writers_temp_file() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let store = Store::new(dir.path());
+    let id = btc(InstrumentKind::Spot);
+    // A writer killed before its first rename of April left its lock file and its temp file.
+    let april = store.candle_path(&id, month("2024-04")).unwrap();
+    std::fs::create_dir_all(april.parent().unwrap()).expect("a folder");
+    std::fs::write(april.with_extension("parquet.lock"), b"").expect("writes");
+    std::fs::write(april.with_extension("parquet.999.0.tmp"), b"half").expect("writes");
+    // The next download of April writes the month, and the leftover goes with it.
+    let written = flat_minutes(month("2024-04").start(), 0..10);
+    store.write_candles(&id, &written).expect("writes");
+    let left: Vec<String> = tree(dir.path())
+        .into_iter()
+        .filter(|f| f.ends_with(".tmp"))
+        .collect();
+    assert_eq!(left, Vec::<String>::new());
+    assert_eq!(
+        store.read_month(&id, month("2024-04")).expect("reads"),
+        written
+    );
+}
+
+#[test]
 fn a_write_over_two_months_with_a_later_month_unreadable_writes_neither() {
     let dir = tempfile::tempdir().expect("a temp dir");
     let store = Store::new(dir.path());

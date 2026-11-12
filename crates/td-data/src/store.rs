@@ -223,7 +223,8 @@ pub struct StoredData {
     /// Entries under `candles/` and `funding/` that name no venue, kind, symbol or month the store
     /// writes, and temp files of a month whose month file is absent, relative to the store root.
     /// Such a temp file is left by a writer killed before its first rename of the month (or, for
-    /// the moment it lasts, is a first write in progress), and a delete of its month removes it.
+    /// the moment it lasts, is a first write in progress), and the next write or delete of its
+    /// month removes it.
     /// Nothing reads these entries, and nothing deletes the others.
     pub unrecognised: Vec<PathBuf>,
 }
@@ -454,6 +455,14 @@ impl Store {
             );
         }
         for (month, path, batch) in batches {
+            // While the lock is held no writer is part way through this file, so a temp file of
+            // it is a leftover from a writer that crashed (as `remove_locked` reasons); once the
+            // month file is written beside it, nothing would list or remove it until the month is
+            // deleted. This write's own temp file is made only by `write_atomic` below. A leftover
+            // that cannot be removed is left for the month's delete rather than failing the write.
+            for leftover in temp_files(path)? {
+                let _ = retry_denied(|| fs::remove_file(&leftover));
+            }
             let written = write_atomic(path, &batch);
             // Even a failed write may have replaced the file, so its decoded rows are dropped
             // either way.
