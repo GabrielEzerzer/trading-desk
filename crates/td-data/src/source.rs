@@ -9,13 +9,14 @@
 use td_core::{Candle, FeeSchedule, InstrumentId, InstrumentKind, Millis, Timeframe, Venue};
 
 use crate::live::{Greeting, KlineUpdate};
-use crate::{DataError, Http, InstrumentList, binance, bybit};
+use crate::{DataError, Http, InstrumentList, binance, bybit, oanda};
 
 /// The source that serves `venue`.
 pub fn source(venue: Venue) -> &'static dyn DataSource {
     match venue {
         Venue::Binance => &binance::Binance,
         Venue::Bybit => &bybit::Bybit,
+        Venue::Oanda => &oanda::Oanda,
     }
 }
 
@@ -334,6 +335,7 @@ mod tests {
                     let ping = (Duration::from_secs(20), r#"{"op":"ping"}"#.to_string());
                     assert_eq!(greeting.heartbeat, Some(ping));
                 }
+                Venue::Oanda => unreachable!("not among the cases"),
             }
         }
     }

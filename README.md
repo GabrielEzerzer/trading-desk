@@ -2,6 +2,17 @@
 
 A trading workspace for my own trading, in two desktop apps on one shared Rust engine. Strategy Lab backtests and tests strategies on historical data; Trading View shows live charts and paper-trades the same strategy code. It grows out of Tipping Point's paper-trading view, but it is built for applied trading rather than for the paper.
 
+## FX history from OANDA
+
+FX pairs (`--venue oanda --kind fx`) download bid and ask minutes from OANDA's REST API on a free practice account, from 2007 on. The desk's FX market hours follow the US daylight-saving rule in force since 2007, so the app refuses an earlier start; the CLI does not check it, so keep `--from` at 2007-01-01 or later. The download reads the account's API token from `OANDA_API_TOKEN`, so it runs through hush. Build first and give hush the built program, so the token is not in the environment of the build scripts cargo runs:
+
+```
+cargo build --release -p td-data
+hush run -- target/release/td-data download --venue oanda --kind fx --symbol USDJPY --from 2016-01-01 --to 2026-11-01
+```
+
+A request returns at most 5,000 minutes, so a month of one pair takes six or seven requests. A minute with no price is filled at the last close, with volume 0; most such minutes fall around the New York close. A run of an hour or more with no price, such as a market holiday, is left missing and shows as a gap, and nothing is stored for the weekend, when the market is closed.
+
 ## Writing a strategy
 
 A strategy is one Rust file with three parts. `crates/td-engine/src/strategies/sma_cross.rs` is the example to copy.
