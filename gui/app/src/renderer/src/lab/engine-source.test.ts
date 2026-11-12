@@ -1,6 +1,6 @@
 import type { ApiRequest, ApiResult, DownloadRequest, InstrumentId, JobInfo, ServerMessage } from '@td/shared'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { HISTORY_FROM, engineLabSource } from './engine-source'
+import { HISTORY_FROM, NO_OANDA_TOKEN, engineLabSource } from './engine-source'
 
 // A stand-in for the preload's `window.td`: POST /data/download answers with job 1, and `end`
 // publishes how that job ended on the `jobs` topic.
@@ -65,5 +65,28 @@ describe('engine download', () => {
     expect(bridge.downloads[0]).toMatchObject({ instrument: btc, from: Date.UTC(2017, 0, 1) })
     bridge.end({ status: 'done' })
     await crypto.result
+  })
+
+  it('says the OANDA token is missing when the engine fails the download for it', async () => {
+    const job = await download(usdjpy)
+    // The engine's failed job (td-data's MissingOandaToken, td-server's bad_request).
+    bridge.end({
+      status: 'failed',
+      error: {
+        code: 'bad_request',
+        message: "oanda's history needs an API token: set OANDA_API_TOKEN to the token of an OANDA practice account",
+      },
+    })
+    await expect(job.result).rejects.toThrow(NO_OANDA_TOKEN)
+  })
+
+  it("passes on any other failure in the engine's own words", async () => {
+    const job = await download(usdjpy)
+    const message =
+      'https://api-fxpractice.oanda.com/v3/instruments/USD_JPY/candles was refused (401: Insufficient ' +
+      'authorization to perform request.): the token in OANDA_API_TOKEN is not valid, or is not a ' +
+      "practice account's token"
+    bridge.end({ status: 'failed', error: { code: 'bad_request', message } })
+    await expect(job.result).rejects.toThrow(message)
   })
 })

@@ -24,6 +24,24 @@ export const HISTORY_FROM: Record<Venue, number> = {
   oanda: 1_167_609_600_000,
 }
 
+/** What the Lab says when a download fails because the engine has no OANDA token. */
+export const NO_OANDA_TOKEN =
+  'FX downloads from OANDA need an API token. Set OANDA_API_TOKEN in the environment and restart the app.'
+
+/** A job that ended failed, with the engine's error code. */
+class JobFailed extends Error {
+  constructor(
+    readonly code: string,
+    message: string,
+  ) {
+    super(message)
+  }
+}
+
+/** The engine's `bad_request` for a download without a token (td-data's `MissingOandaToken`). */
+const missingToken = (e: unknown) =>
+  e instanceof JobFailed && e.code === 'bad_request' && e.message.includes('needs an API token: set OANDA_API_TOKEN')
+
 // shortcut: the engine has no route that lists what the store holds, so the Lab asks for the
 // coverage of these instruments and of every instrument a saved run used. Ask the engine for its
 // stored instruments once it has a route for them.
@@ -62,7 +80,7 @@ function followJob(start: () => Promise<number>, onUpdate: (job: JobInfo) => voi
         off()
         resolve(job)
       } else if (job.status === 'failed') {
-        reject(new Error(job.error?.message ?? 'The job failed.'))
+        reject(job.error ? new JobFailed(job.error.code, job.error.message) : new Error('The job failed.'))
       } else if (job.status === 'cancelled') {
         reject(new RunCancelled())
       } else if (!cancelled) {
@@ -185,6 +203,12 @@ export const engineLabSource: LabSource = {
       async () => (await api.downloadData({ instrument, from: HISTORY_FROM[instrument.venue], to: Date.now() })).job_id,
       (info) => onProgress({ fraction: info.progress }),
     )
-    return { result: job.result.then(() => {}), cancel: job.cancel }
+    const result = job.result.then(
+      () => {},
+      (e: unknown) => {
+        throw missingToken(e) ? new Error(NO_OANDA_TOKEN) : e
+      },
+    )
+    return { result, cancel: job.cancel }
   },
 }

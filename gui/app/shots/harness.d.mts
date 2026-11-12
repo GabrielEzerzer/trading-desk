@@ -18,6 +18,8 @@ export interface StubConfig {
   noData?: boolean
   /** How POST /runs/backtest answers. */
   backtest?: 'ok' | 'data_missing' | 'too_many_runs' | 'fails'
+  /** How POST /data/download's job ends: done, or failed for a missing OANDA token. */
+  download?: 'ok' | 'no_token'
   /** Time between a job's steps, 700 ms by default. */
   stepMs?: number
   /** GET /instruments answers from these, else from the engine.json fixtures. */
