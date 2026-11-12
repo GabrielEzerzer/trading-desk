@@ -117,9 +117,25 @@ export type Liquidity = "maker" | "taker";
  */
 export type Fill = { order_id: OrderId, instrument: InstrumentId, side: Side, time: number, price: number, qty: number, 
 /**
- * The fee paid, in the quote asset. Negative for a rebate.
+ * The fee paid, in the account currency: the quote asset, or the base currency on a
+ * base-currency account. Negative for a rebate.
  */
 fee: number, liquidity: Liquidity, };
+
+/**
+ * The currency an account holds and reports money in, against the instrument it trades.
+ *
+ * - `Quote`: the instrument's quote currency, as a USDT account trading BTC/USDT. Every amount
+ *   the engine computes from prices is already in it, so nothing is converted.
+ * - `Base`: the instrument's base currency, as a dollar account trading USD/JPY. Profit, loss and
+ *   commission arise in the quote currency (yen) and are converted at the pair's own price: an
+ *   amount in the quote currency divided by the price is the amount in the base currency.
+ *
+ * shortcut: only the account's currency on either side of the pair it trades. A cross pair on a
+ * third-currency account (EUR/JPY on a dollar account) needs a second price series to convert
+ * at; add a conversion series when the desk trades crosses.
+ */
+export type AccountCurrency = "quote" | "base";
 
 export type ParamKind = "int" | "float" | "bool";
 
@@ -160,7 +176,7 @@ params: Params, instrument: Instrument, timeframe: Timeframe,
  */
 from: number, to: number, 
 /**
- * Starting balance in the quote asset.
+ * Starting balance in the account currency (`account_currency`).
  */
 starting_cash: number, 
 /**
@@ -197,7 +213,13 @@ warmup_from?: number | null,
  * The trade list then ends with a closed trade instead of an open one marked at the last
  * close. The strategy tester sets it on out-of-sample runs.
  */
-close_at_end?: boolean, };
+close_at_end?: boolean, 
+/**
+ * The currency the account holds and the result reports every amount in: the instrument's
+ * quote currency, the default, or its base currency, as a dollar account trading USD/JPY
+ * (FX only; see [`Session::new`]). Left out of the saved result when it is the default.
+ */
+account_currency?: AccountCurrency, };
 
 export type BacktestResult = { config: BacktestConfig, 
 /**
@@ -279,7 +301,7 @@ beta: number | null, };
 export type EquityPoint = { time: number, equity: number, };
 
 /**
- * The lowest and highest equity one bar reached, in the quote asset.
+ * The lowest and highest equity one bar reached, in the account currency.
  */
 export type EquityRange = { low: number, high: number, };
 
@@ -316,6 +338,9 @@ export type OrderStatus = { "status": "attached" } | { "status": "open" } | { "s
 
 /**
  * One round trip: the position leaves zero, then returns to it.
+ *
+ * Prices are in the quote currency; every money amount (P&L, fees, funding, excursions) is in the
+ * account currency, converted as [`build_trades`] describes.
  */
 export type Trade = { side: TradeSide, 
 /**
@@ -348,7 +373,9 @@ exit_price: number,
 /**
  * `sign * exit_qty * (exit_price - entry_price)`, before fees and funding. Over a closed
  * round trip this is the exit notional minus the entry notional (reversed for a short),
- * which is what the portfolio's average-cost realised P&L adds up to.
+ * which is what the portfolio's average-cost realised P&L adds up to. On a base account it is
+ * that realised P&L itself: each reducing fill's P&L against the average cost, converted at
+ * that fill's price (and an open trade's remainder at the mark).
  */
 gross_pnl: number, 
 /**
@@ -367,7 +394,8 @@ funding: number,
  */
 net_pnl: number, 
 /**
- * `net_pnl / (entry_price * qty)`: net P&L over the largest entry notional.
+ * `net_pnl / (entry_price * qty)`: net P&L over the largest entry notional, the notional
+ * converted to the account currency at `entry_price` on a base account.
  */
 return_on_notional: number, 
 /**
@@ -383,16 +411,17 @@ bars_held: number,
  */
 stop: number | null, 
 /**
- * `net_pnl` over the initial risk, `qty * |entry_price - stop|`: the trade's result in
- * multiples of what it risked at its stop; see [`attach_stops`]. `None` without a stop, with
- * a stop at or beyond the entry price (no risk), or when not finite.
+ * `net_pnl` over the initial risk, `qty * |entry_price - stop|` (converted at the stop on a
+ * base account): the trade's result in multiples of what it risked at its stop; see
+ * [`attach_stops`]. `None` without a stop, with a stop at or beyond the entry price (no
+ * risk), or when not finite.
  */
 r_multiple: number | null, 
 /**
  * Maximum adverse excursion: the largest unrealised loss of the open position at any price
- * it met, in the quote asset, before fees and funding; 0 if it never went against the
- * entry. See [`build_trades`] for the prices counted. `None` in a result saved before
- * trades had it.
+ * it met, in the account currency (converted at that price on a base account), before fees
+ * and funding; 0 if it never went against the entry. See [`build_trades`] for the prices
+ * counted. `None` in a result saved before trades had it.
  */
 mae: number | null, 
 /**
@@ -403,12 +432,28 @@ mfe: number | null,
  * Closed by the end-of-run close-out (see [`crate::BacktestConfig::close_at_end`]) rather
  * than by the strategy: in a walk-forward, at the end of its test window.
  */
-force_closed: boolean, };
+force_closed: boolean, 
+/**
+ * The price move in pips, on a market with quotes (see [`td_core::Instrument::pip_size`]):
+ * `sign * (exit_price - entry_price) / pip`. The spread is in it, since buys fill on the ask
+ * and sells on the bid; commission and funding are not. An open trade's is on its mark, as its
+ * P&L is. `None` without pips, and left out of saved JSON then.
+ */
+pips?: number | null, 
+/**
+ * `net_pnl` in pips: `net_pnl` over the value of one pip on the quantity the trade closed (its
+ * whole size for one entry and one exit), in the account currency, converted at `exit_price`
+ * on a base account. It is after commission. On a quote account, or when the trade exits at
+ * one price, `pips - net_pips` is the commission in pips; on a base account with exits at
+ * different prices it is not, since each exit's P&L is converted at its own price.
+ */
+net_pips?: number | null, };
 
 export type TradeSide = "long" | "short";
 
 /**
- * The metrics report for one equity series and its trades.
+ * The metrics report for one equity series and its trades. Money amounts are in the run's account
+ * currency (see [`crate::BacktestConfig::account_currency`]).
  */
 export type MetricsReport = { start_equity: number, end_equity: number, 
 /**
@@ -534,7 +579,16 @@ longest_losing_streak: number,
  * Closed trades the end-of-run close-out closed (see [`Trade::force_closed`]): at most one
  * in a backtest with `close_at_end`, up to one per test window in a walk-forward.
  */
-force_closed_trades: number, };
+force_closed_trades: number, 
+/**
+ * Mean [`Trade::pips`] of the closed trades that have it, on a market with pips; `None`
+ * otherwise, and left out of saved JSON then.
+ */
+avg_trade_pips?: number | null, 
+/**
+ * Mean [`Trade::net_pips`], after commission, of the closed trades that have it.
+ */
+avg_trade_net_pips?: number | null, };
 
 /**
  * The values one parameter takes in a sweep.
@@ -835,17 +889,18 @@ export type RunId = string;
 /**
  * What a saved run is.
  */
-export type RunKind = "backtest" | "sweep" | "oos" | "walk_forward";
+export type RunKind = "backtest" | "sweep" | "oos" | "walk_forward" | "plan";
 
 /**
  * A result as saved, tagged with its kind: `{"kind": "...", "result": {...}}`.
  */
-export type SavedRun = { "kind": "backtest", "result": BacktestResult } | { "kind": "sweep", "result": SweepResult } | { "kind": "oos", "result": OosResult } | { "kind": "walk_forward", "result": WalkForwardResult };
+export type SavedRun = { "kind": "backtest", "result": BacktestResult } | { "kind": "sweep", "result": SweepResult } | { "kind": "oos", "result": OosResult } | { "kind": "walk_forward", "result": WalkForwardResult } | { "kind": "plan", "result": PlanRun };
 
 /**
  * One row of the run list. The strategy and range are the base configuration's. The metrics
  * are the backtest's, the sweep's best run's (none if no run qualified), the out-of-sample
- * segment's, or the stitched walk-forward curve's.
+ * segment's, or the stitched walk-forward curve's (for a plan run, its battery's walk-forward,
+ * none when that did not run).
  */
 export type RunSummary = { id: RunId, created_at: number, kind: RunKind, strategy: string, instrument: InstrumentId, timeframe: Timeframe, from: number, to: number, total_return: number | null, cagr: number | null, sharpe: number | null, max_drawdown: number | null, trades: number, };
 
@@ -872,7 +927,8 @@ export type Period = { from: number, to: number, };
  */
 export type BacktestSettings = { 
 /**
- * Starting balance in the quote asset.
+ * Starting balance in the quote asset: a plan's runs are on a quote-currency account (see
+ * [`TestPlan::backtest_config`]).
  */
 starting_cash: number, 
 /**
@@ -1050,7 +1106,16 @@ min_alpha: number,
 /**
  * The bootstrap chance that the mean daily return is zero or less, at most this.
  */
-max_p_mean_not_positive: number, };
+max_p_mean_not_positive: number, 
+/**
+ * The 95th percentile of the max drawdown over resampled paths of the daily returns (days
+ * drawn with replacement in blocks, as R7 does), at most this. The default is above `max_drawdown`'s because the 95th percentile of
+ * resampled paths sits well above the drawdown of the one path that happened, and grows with
+ * the length of the out-of-sample period; at 0.45 the line fails a strategy whose drawdown was
+ * small only because its losing days happened not to cluster, not every strategy near the
+ * historical limit. A rule saved before this limit existed reads with the default.
+ */
+max_resampled_drawdown: number, };
 
 export type HighRiskLimits = { 
 /**
@@ -1058,7 +1123,8 @@ export type HighRiskLimits = {
  */
 min_trades: number, 
 /**
- * Mean net P&L per closed trade strictly above this, in the quote asset.
+ * Mean net P&L per closed trade strictly above this, in the run's account currency (the
+ * quote asset on a plan's runs).
  */
 min_expectancy: number, 
 /**
@@ -1133,6 +1199,489 @@ export type Verdict = { instrument: InstrumentId, state: VerdictState,
  * Every line of every layer that was judged, integrity first.
  */
 criteria: Array<Criterion>, };
+
+/**
+ * One instrument's test battery (#35) under a strategy's plan, as saved: what was tested, the
+ * engine that tested it and everything the battery produced, its verdict and seed included.
+ */
+export type PlanRun = { strategy: string, 
+/**
+ * The plan's backtest on the instrument ([`TestPlan::backtest_config`]): the period, the
+ * fixed parameters, the starting cash, the slippage and the instrument's trading rules.
+ */
+config: BacktestConfig, 
+/**
+ * The plan and the rule as they were when the battery ran.
+ */
+plan: TestPlan, rule: VerdictRule, 
+/**
+ * The td-engine crate version that produced the run.
+ */
+engine_version: string, 
+/**
+ * The [`ENGINE_REVISION`] that produced the run. A verdict from another revision may differ
+ * from what this engine would give on the same data.
+ */
+engine_revision: number, 
+/**
+ * The fingerprint of the data the battery was given, over `config`'s range; see
+ * [`config_fingerprint`].
+ */
+data_fingerprint: string, battery: BatteryResult, };
+
+/**
+ * Everything one battery produced: the verdict, and the runs and numbers behind it for saving
+ * and showing.
+ */
+export type BatteryResult = { verdict: Verdict, seed: number, 
+/**
+ * The runs the progress counted, its total.
+ */
+runs: number, integrity: IntegrityReport, 
+/**
+ * The sweep over the full period. `None` when integrity failed.
+ */
+sweep: SweepResult | null, 
+/**
+ * R1. `None` when integrity failed, no window fits the data, or a train window had no
+ * qualifying run (`walk_forward_error` says which).
+ */
+walk_forward: WalkForwardResult | null, walk_forward_error: string | null, 
+/**
+ * The inputs of the evidence lines.
+ */
+evidence: EvidenceInputs, 
+/**
+ * The inputs of the kind lines.
+ */
+kind: KindInputs, oos_integrity: OosIntegrityInputs, 
+/**
+ * R5's neighbours of the best parameter set on the grid.
+ */
+plateau: PlateauReport | null, 
+/**
+ * R7: the block bootstrap of the out-of-sample daily returns.
+ */
+daily_bootstrap: MeanBootstrap | null, 
+/**
+ * The block bootstrap of the max drawdown over the same daily returns, for a `portfolio`
+ * rule. `None` for the other kinds, without a curve, and in a result saved before it existed.
+ */
+drawdown_bootstrap: DrawdownBootstrap | null, 
+/**
+ * The bootstrap of the closed out-of-sample trades' net P&L, for `high_risk`'s lower bound.
+ */
+trade_bootstrap: MeanBootstrap | null, 
+/**
+ * The prop-firm challenge odds, for a `prop_firm` rule.
+ */
+prop_firm_odds: PropFirmOdds | null, 
+/**
+ * R8.
+ */
+breakdown: Breakdown | null, 
+/**
+ * R4. `None` when it did not run.
+ */
+cost_stress: CostStress | null, 
+/**
+ * R6, one per offset. Empty when it did not run.
+ */
+start_offsets: Array<StartOffset>, 
+/**
+ * R3. `None` when it did not run, was cancelled or had no qualifying real sweep
+ * (`luck_note` says which).
+ */
+permutation: PermutationResult | null, luck_note: string | null, 
+/**
+ * True when a cancel stopped R3, so the luck line lacks its p-value. False when R3 finished,
+ * was skipped or did not run; a result saved before this field existed reads as false.
+ */
+luck_cancelled: boolean, };
+
+/**
+ * The counts behind I1 to I3.
+ */
+export type IntegrityReport = { 
+/**
+ * Buckets of the period's open hours: those not wholly inside the market's closed hours.
+ */
+open_buckets: number, 
+/**
+ * Open buckets with no bar.
+ */
+dropped_buckets: number, inputs: IntegrityInputs, 
+/**
+ * I3's split: the first half is the bars that open before it.
+ */
+prefix_split: number | null, };
+
+/**
+ * The integrity checks of the data and the engine (I1 to I3), computed by the battery on the
+ * plan's backtest before anything else runs. I2 and I3 then also run on each parameter set the
+ * walk-forward chose, and hold the worst result over every set checked. A check the battery
+ * could not make is `None` and fails, which makes the verdict `invalid`.
+ */
+export type IntegrityInputs = { 
+/**
+ * I1: the buckets of the period's open hours that have no bar, over all of them.
+ */
+dropped_share: number | null, 
+/**
+ * I2: 0 when two runs of each backtest checked gave identical fills and equity, 1
+ * otherwise.
+ */
+repeat_differences: number | null, 
+/**
+ * I3: the orders decided on the first half of the period that differ between a run on
+ * that half alone and the full run, counting an order only one of them has; the most over
+ * the backtests checked.
+ */
+prefix_differences: number | null, };
+
+/**
+ * The statistics the evidence layer reads (#35, R1 to R6), computed by the battery.
+ */
+export type EvidenceInputs = { 
+/**
+ * R1: total return of the stitched out-of-sample curve.
+ */
+oos_return: number | null, 
+/**
+ * R1: the share of walk-forward windows with a positive return.
+ */
+profitable_windows: number | null, 
+/**
+ * R2: closed out-of-sample trades.
+ */
+oos_trades: number, 
+/**
+ * R2: days of bars covered by the stitched out-of-sample curve, as in
+ * [`MinSample`](crate::MinSample): 24 hours of the market's open bars, so the days it is
+ * closed do not count. On data with no gaps this is the windows times `test_days`.
+ */
+oos_days: number, 
+/**
+ * R2: walk-forward windows.
+ */
+windows: number, 
+/**
+ * R3: the luck test's p. `None` when it was cancelled or not run.
+ */
+luck_p: number | null, 
+/**
+ * R4: the out-of-sample return with fees and slippage multiplied by the cost stress.
+ */
+stressed_return: number | null, 
+/**
+ * R5: the neighbours' median objective over the best set's.
+ */
+plateau_median_ratio: number | null, 
+/**
+ * R5: the share of neighbours with a positive return.
+ */
+plateau_positive_share: number | null, 
+/**
+ * R6: how many start offsets gave a result of the same sign as the main run.
+ */
+start_offsets_same_sign: number, };
+
+/**
+ * The out-of-sample statistics the kind rules read, computed by the battery on the stitched
+ * walk-forward out-of-sample curve. Fractions are of equity unless said otherwise. A statistic
+ * the battery could not compute is `None` and fails its criterion. Each kind reads only its own
+ * fields.
+ */
+export type KindInputs = { 
+/**
+ * Annualised Sharpe ratio of daily returns.
+ */
+sharpe: number | null, 
+/**
+ * Max drawdown from the running peak, at bar closes.
+ */
+max_drawdown: number | null, 
+/**
+ * The buy-and-hold benchmark's max drawdown over the same bars.
+ */
+benchmark_max_drawdown: number | null, 
+/**
+ * Annualised alpha against the rule's benchmark.
+ */
+alpha: number | null, 
+/**
+ * The block bootstrap's chance that the mean daily return is zero or less (R7).
+ */
+p_mean_not_positive: number | null, 
+/**
+ * The 95th percentile of the max drawdown over resampled paths of the daily returns (days
+ * drawn with replacement in blocks, as R7 does).
+ */
+resampled_drawdown: number | null, 
+/**
+ * Closed trades.
+ */
+trades: number, 
+/**
+ * Mean net P&L per closed trade, in the run's account currency.
+ */
+expectancy: number | null, 
+/**
+ * The bootstrap's lower bound on the expectancy.
+ */
+expectancy_lower_bound: number | null, profit_factor: number | null, 
+/**
+ * The chance of a drawdown of the rule's `ruin_drawdown` from the running peak.
+ */
+risk_of_ruin: number | null, 
+/**
+ * The total return with the single best trade removed.
+ */
+return_without_best_trade: number | null, 
+/**
+ * The worst loss within one day.
+ */
+worst_daily_loss: number | null, 
+/**
+ * Max drawdown from the starting balance.
+ */
+intrabar_drawdown_static: number | null, 
+/**
+ * Max drawdown from the running peak.
+ */
+intrabar_drawdown_trailing: number | null, 
+/**
+ * The chance of reaching the firm's profit target before breaching a limit.
+ */
+pass_probability: number | null, 
+/**
+ * The chance of breaching a limit within the rule's horizon.
+ */
+breach_probability: number | null, };
+
+/**
+ * The integrity checks read on the stitched walk-forward out-of-sample curve (I4 and I5),
+ * computed once it exists.
+ */
+export type OosIntegrityInputs = { 
+/**
+ * I4: the annualised Sharpe ratio of the curve's daily returns.
+ */
+sharpe: number | null, 
+/**
+ * I5: the highest notional over equity inside any bar.
+ */
+peak_leverage: number | null, 
+/**
+ * I5: the lowest equity inside any bar, over the starting cash. Zero is a bankrupt account:
+ * a liquidation leaves the account at exactly zero.
+ */
+lowest_equity: number | null, 
+/**
+ * Whether the stitched out-of-sample curve exists. A curve can exist without the equity
+ * ranges inside its bars that I5 reads (a test run that kept none), and the lines then say
+ * so instead of blaming the sample.
+ */
+curve: boolean, };
+
+/**
+ * R5: the best parameter set and its neighbours on the grid.
+ */
+export type PlateauReport = { 
+/**
+ * The best row's grid coordinates.
+ */
+best: Array<number>, best_objective: number, 
+/**
+ * The neighbours' grid coordinates and objective values, `None` where the objective is
+ * undefined (it counts as the worst value).
+ */
+neighbours: Array<[Array<number>, number | null]>, median_ratio: number | null, positive_share: number | null, };
+
+/**
+ * The distribution of a sample's mean under resampling.
+ */
+export type MeanBootstrap = { 
+/**
+ * The mean of the sample itself.
+ */
+mean: number, 
+/**
+ * The fraction of resampled means at or below zero. The `portfolio` kind rule asks for at
+ * most 0.10 on the daily returns.
+ */
+p_mean_at_most_zero: number, 
+/**
+ * The one-sided lower confidence bound on the mean: the `1 - confidence` quantile of the
+ * resampled means (the percentile method). The `high_risk` kind rule asks for it to be above
+ * zero on the trade P&Ls; that rule asks a one-sided question, so the bound is one-sided.
+ */
+lower_bound: number, quantiles: Quantiles, resamples: number, mean_block: number, };
+
+/**
+ * The distribution of the max drawdown of a series of daily returns under resampling.
+ */
+export type DrawdownBootstrap = { 
+/**
+ * The max drawdown of the returns in the order they happened.
+ */
+historical: number, 
+/**
+ * The median of the resampled paths' max drawdowns.
+ */
+p50: number, 
+/**
+ * The 95th percentile of the resampled paths' max drawdowns. The `portfolio` kind rule asks
+ * for it to be at most its `max_resampled_drawdown`.
+ */
+p95: number, resamples: number, mean_block: number, };
+
+/**
+ * Quantiles of the resampled means.
+ */
+export type Quantiles = { p05: number, p25: number, p50: number, p75: number, p95: number, };
+
+/**
+ * The odds of a prop-firm challenge over simulated paths.
+ */
+export type PropFirmOdds = { 
+/**
+ * The fraction of paths that reach the target within the horizon before breaching any
+ * limit. The `prop_firm` kind rule asks for at least 0.60.
+ */
+pass: number, 
+/**
+ * The fraction of paths that breach a limit within the horizon, trading on after reaching
+ * the target as a funded account would. The `prop_firm` kind rule asks for at most 0.10
+ * over 90 days.
+ */
+breach: number, paths: number, };
+
+/**
+ * R8: where the out-of-sample profit came from. Reported only.
+ */
+export type Breakdown = { long: SideResult, short: SideResult, 
+/**
+ * Net funding paid on the stitched curve; negative when it was received.
+ */
+funding_paid: number, 
+/**
+ * Windows where buy and hold rose over the test window, and the strategy's return in them,
+ * compounded.
+ */
+rising: RegimeResult, 
+/**
+ * Windows where it fell or stayed flat.
+ */
+falling: RegimeResult, 
+/**
+ * The best closed trade's net P&L.
+ */
+best_trade_pnl: number | null, 
+/**
+ * The out-of-sample return without it.
+ */
+return_without_best_trade: number | null, };
+
+export type SideResult = { 
+/**
+ * Closed trades.
+ */
+trades: number, 
+/**
+ * Their net P&L, in the quote asset.
+ */
+net_pnl: number, };
+
+export type RegimeResult = { windows: number, strategy_return: number, };
+
+/**
+ * R4: each test window's chosen parameters run again at higher costs.
+ */
+export type CostStress = { multiplier: number, 
+/**
+ * Each window's return at the stressed costs.
+ */
+window_returns: Array<number>, 
+/**
+ * The windows compounded, as the stitched curve compounds them.
+ */
+total_return: number, };
+
+/**
+ * R6: one walk-forward with its windows moved.
+ */
+export type StartOffset = { 
+/**
+ * How many of the period's last bars this run leaves out, which moves every window boundary
+ * back by as many bars.
+ */
+shift_bars: number, 
+/**
+ * The windows that fit.
+ */
+windows: number, 
+/**
+ * The stitched out-of-sample return; `None` when the walk-forward could not run.
+ */
+oos_return: number | null, error: string | null, };
+
+/**
+ * A luck test by bar permutation (R3 in #35): the same sweep on the real bars and on
+ * `permutations` shuffled copies of them.
+ */
+export type PermutationSpec = { sweep: SweepSpec, 
+/**
+ * Shuffled copies to sweep; #35 uses 199, so the smallest possible p-value is 0.005 when
+ * every copy has a qualifying run.
+ */
+permutations: number, 
+/**
+ * Copy k is shuffled with a seed derived from this one and k, so the same seed shuffles the
+ * same copies.
+ */
+seed: number, };
+
+/**
+ * The result of a luck test by bar permutation.
+ */
+export type PermutationResult = { spec: PermutationSpec, engine_version: string, 
+/**
+ * The fingerprint of the real data in the base range; see [`crate::data_fingerprint`].
+ */
+data_fingerprint: string, 
+/**
+ * The best objective value of the sweep on the real bars.
+ */
+real_best: number, 
+/**
+ * The best objective value of each shuffled copy's sweep, in copy order; `None` when no run
+ * on that copy qualified.
+ */
+permuted_best: Array<number | null>, 
+/**
+ * Copies with a qualifying run: the entries of `permuted_best` that are not `None`.
+ */
+qualified_copies: number, 
+/**
+ * Qualifying copies whose best is at least as good as the real best: at or above it when
+ * maximising, at or below it when minimising, ties included.
+ */
+at_least_as_good: number, 
+/**
+ * `(1 + at_least_as_good) / (1 + qualified_copies)`: the chance of a best this good if the
+ * bars' order carried no information, given that the real sweep qualified. The test runs
+ * only when it did, so the real bars are compared with the copies that qualified too; if
+ * the order carried nothing, the real best is then equally likely to rank anywhere among
+ * those `1 + qualified_copies` bests, which makes this the exact permutation p-value
+ * (counting the real sweep as one of the draws keeps it above zero; Phipson and Smyth,
+ * 2010). Dividing by all the copies instead would count the ones with no qualifying run as
+ * worse than the real best and bias the p-value low.
+ *
+ * The smallest it can be is `1 / (1 + qualified_copies)`. When that is above a pass
+ * threshold, the test cannot pass however good the real best is: too few copies qualified.
+ */
+p_value: number, };
 
 /**
  * The line the binary prints to stdout once it listens, for the app that started it.
@@ -1357,7 +1906,8 @@ progress: number,
  */
 message: string, request: JobRequest, 
 /**
- * Set when `status` is `done`.
+ * Set when `status` is `done`, and on a `cancelled` or `failed` plan job that kept some
+ * instruments.
  */
 result: JobResult | null, 
 /**
@@ -1369,19 +1919,19 @@ error: ErrorBody | null,
  */
 cancel_requested: boolean, created_at: number, started_at: number | null, finished_at: number | null, };
 
-export type JobKind = "download" | "backtest" | "sweep" | "oos" | "walk_forward";
+export type JobKind = "download" | "backtest" | "sweep" | "oos" | "walk_forward" | "plan";
 
 export type JobStatus = "queued" | "running" | "done" | "failed" | "cancelled";
 
 /**
  * What a job was asked to do, tagged by `kind`.
  */
-export type JobRequest = { "kind": "download" } & DownloadRequest | { "kind": "backtest" } & BacktestConfig | { "kind": "sweep" } & SweepSpec | { "kind": "oos" } & OosSpec | { "kind": "walk_forward" } & WalkForwardSpec;
+export type JobRequest = { "kind": "download" } & DownloadRequest | { "kind": "backtest" } & BacktestConfig | { "kind": "sweep" } & SweepSpec | { "kind": "oos" } & OosSpec | { "kind": "walk_forward" } & WalkForwardSpec | { "kind": "plan" } & PlanRequest;
 
 /**
  * What a finished job produced, tagged by `kind`.
  */
-export type JobResult = { "kind": "download" } & DownloadResult | { "kind": "backtest" } & RunDone | { "kind": "sweep" } & RunDone | { "kind": "oos" } & RunDone | { "kind": "walk_forward" } & RunDone;
+export type JobResult = { "kind": "download" } & DownloadResult | { "kind": "backtest" } & RunDone | { "kind": "sweep" } & RunDone | { "kind": "oos" } & RunDone | { "kind": "walk_forward" } & RunDone | { "kind": "plan" } & PlanDone;
 
 /**
  * What a finished run job produced: the saved run's id and its row in the run list. The whole
@@ -1393,6 +1943,86 @@ export type RunDone = { run_id: RunId, summary: RunSummary,
  * `data.dropped`, and the missing minutes are its `data.gaps`.
  */
 dropped_buckets: number, };
+
+/**
+ * `POST /runs/plan`: run a strategy's test plan.
+ */
+export type PlanRequest = { 
+/**
+ * A registered strategy's name.
+ */
+strategy: string, 
+/**
+ * Some of the plan's instruments, run in the plan's order; every one of them when left out.
+ * Each must be one of the plan's.
+ */
+instruments?: Array<InstrumentId>, };
+
+/**
+ * What a plan job kept: one entry per instrument whose battery finished or reached the luck test
+ * before a cancel, in the plan's order. A failed plan job holds the instruments it saved before
+ * the error.
+ */
+export type PlanDone = { strategy: string, instruments: Array<PlanInstrumentDone>, };
+
+/**
+ * One instrument's saved battery.
+ */
+export type PlanInstrumentDone = { 
+/**
+ * The saved run, at `GET /runs/{run_id}`, kind `plan`.
+ */
+run_id: RunId, 
+/**
+ * The instrument is `verdict.instrument`.
+ */
+verdict: Verdict, 
+/**
+ * The seed of the battery's luck test and bootstraps.
+ */
+seed: number, 
+/**
+ * Buckets in the period with no bar; the list is the saved run's `data.dropped`.
+ */
+dropped_buckets: number, };
+
+/**
+ * One row of `GET /verdicts`: the latest verdict of a strategy on an instrument, the newest
+ * complete one when the pair has any.
+ */
+export type VerdictSummary = { strategy: string, instrument: InstrumentId, 
+/**
+ * The state and every criterion line; the runs behind it are at `GET /runs/{run_id}`.
+ */
+verdict: Verdict, 
+/**
+ * The newest complete battery of this strategy on this instrument, or the newest battery when
+ * none is complete.
+ */
+run_id: RunId, created_at: number, 
+/**
+ * The engine revision that produced the verdict.
+ */
+engine_revision: number, 
+/**
+ * False when another engine revision produced it: this engine may judge the same data
+ * differently, so run the plan again.
+ */
+engine_matches: boolean, 
+/**
+ * False when the strategy is no longer registered, its plan or rule has changed since the
+ * battery ran, or the plan no longer tests the instrument: run the plan again.
+ */
+plan_matches: boolean, 
+/**
+ * False when a cancel stopped the battery's luck test, so its luck line is inconclusive.
+ */
+complete: boolean, seed: number, 
+/**
+ * How many batteries have been saved for this strategy on this instrument, this one included.
+ * An instrument a cancel stopped before the luck test saved none and is not counted.
+ */
+runs: number, };
 
 /**
  * A saved run in full.
@@ -1581,7 +2211,8 @@ attached_stop: AttachedStop | null, status: OrderStatus, };
  */
 export type PaperFill = { source: OrderSource, order_id: OrderId, instrument: InstrumentId, side: Side, time: number, price: number, qty: number, 
 /**
- * The fee paid, in the quote asset. Negative for a rebate.
+ * The fee paid, in the account currency: the quote asset, or the base currency on a
+ * base-currency account. Negative for a rebate.
  */
 fee: number, liquidity: Liquidity, };
 
@@ -1625,7 +2256,9 @@ exit_price: number,
 /**
  * `sign * exit_qty * (exit_price - entry_price)`, before fees and funding. Over a closed
  * round trip this is the exit notional minus the entry notional (reversed for a short),
- * which is what the portfolio's average-cost realised P&L adds up to.
+ * which is what the portfolio's average-cost realised P&L adds up to. On a base account it is
+ * that realised P&L itself: each reducing fill's P&L against the average cost, converted at
+ * that fill's price (and an open trade's remainder at the mark).
  */
 gross_pnl: number, 
 /**
@@ -1644,7 +2277,8 @@ funding: number,
  */
 net_pnl: number, 
 /**
- * `net_pnl / (entry_price * qty)`: net P&L over the largest entry notional.
+ * `net_pnl / (entry_price * qty)`: net P&L over the largest entry notional, the notional
+ * converted to the account currency at `entry_price` on a base account.
  */
 return_on_notional: number, 
 /**
@@ -1660,16 +2294,17 @@ bars_held: number,
  */
 stop: number | null, 
 /**
- * `net_pnl` over the initial risk, `qty * |entry_price - stop|`: the trade's result in
- * multiples of what it risked at its stop; see [`attach_stops`]. `None` without a stop, with
- * a stop at or beyond the entry price (no risk), or when not finite.
+ * `net_pnl` over the initial risk, `qty * |entry_price - stop|` (converted at the stop on a
+ * base account): the trade's result in multiples of what it risked at its stop; see
+ * [`attach_stops`]. `None` without a stop, with a stop at or beyond the entry price (no
+ * risk), or when not finite.
  */
 r_multiple: number | null, 
 /**
  * Maximum adverse excursion: the largest unrealised loss of the open position at any price
- * it met, in the quote asset, before fees and funding; 0 if it never went against the
- * entry. See [`build_trades`] for the prices counted. `None` in a result saved before
- * trades had it.
+ * it met, in the account currency (converted at that price on a base account), before fees
+ * and funding; 0 if it never went against the entry. See [`build_trades`] for the prices
+ * counted. `None` in a result saved before trades had it.
  */
 mae: number | null, 
 /**
@@ -1680,7 +2315,22 @@ mfe: number | null,
  * Closed by the end-of-run close-out (see [`crate::BacktestConfig::close_at_end`]) rather
  * than by the strategy: in a walk-forward, at the end of its test window.
  */
-force_closed: boolean, };
+force_closed: boolean, 
+/**
+ * The price move in pips, on a market with quotes (see [`td_core::Instrument::pip_size`]):
+ * `sign * (exit_price - entry_price) / pip`. The spread is in it, since buys fill on the ask
+ * and sells on the bid; commission and funding are not. An open trade's is on its mark, as its
+ * P&L is. `None` without pips, and left out of saved JSON then.
+ */
+pips?: number | null, 
+/**
+ * `net_pnl` in pips: `net_pnl` over the value of one pip on the quantity the trade closed (its
+ * whole size for one entry and one exit), in the account currency, converted at `exit_price`
+ * on a base account. It is after commission. On a quote account, or when the trade exits at
+ * one price, `pips - net_pips` is the commission in pips; on a base account with exits at
+ * different prices it is not, since each exit's P&L is converted at its own price.
+ */
+net_pips?: number | null, };
 
 /**
  * `POST /sessions/{id}/orders`: an order placed by hand. It goes through the same rounding,

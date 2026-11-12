@@ -888,13 +888,20 @@ impl PaperSession {
         let bars = session.bars();
         let live = &bars[bars.len().saturating_sub(session.bar_funding().len())..];
         let fills = session.fills();
-        build_trades_with_fills(fills, live, &[], session.bar_funding())
-            .into_iter()
-            .map(|(trade, range)| PaperTrade {
-                trade,
-                source: TradeSource::of(fills[range].iter().map(|f| self.source(f.order_id))),
-            })
-            .collect()
+        build_trades_with_fills(
+            fills,
+            live,
+            &[],
+            session.bar_funding(),
+            session.portfolio().account(),
+            session.instrument().pip_size(),
+        )
+        .into_iter()
+        .map(|(trade, range)| PaperTrade {
+            trade,
+            source: TradeSource::of(fills[range].iter().map(|f| self.source(f.order_id))),
+        })
+        .collect()
     }
 
     /// Equity at each live bar's close. Warm-up bars record none, so the series starts at
@@ -994,6 +1001,9 @@ fn build_session(config: &PaperConfig) -> Result<Session, PaperError> {
         slippage_bps: config.slippage_bps,
         fees: config.fees,
         max_leverage: config.max_leverage,
+        // shortcut: paper sessions are on a quote-currency account; add the account currency to
+        // `PaperConfig` when paper trading takes a market with quotes.
+        account_currency: td_core::AccountCurrency::Quote,
     };
     Ok(Session::new(
         strategy,
@@ -1100,6 +1110,7 @@ mod tests {
                 slippage_bps: config.slippage_bps,
                 fees: config.fees,
                 max_leverage: config.max_leverage,
+                account_currency: td_core::AccountCurrency::Quote,
             },
         )
         .expect("session");

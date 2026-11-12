@@ -74,7 +74,14 @@ fn a_10x_short_through_a_30_percent_wick_is_liquidated_at_the_maintenance_price(
     approx(s.portfolio().shortfall_written_off(), 0.0);
 
     // The liquidation closes the trade in the trade list: -9,250 gross, 750 of fees.
-    let trades = build_trades(s.fills(), s.bars(), &[], s.bar_funding());
+    let trades = build_trades(
+        s.fills(),
+        s.bars(),
+        &[],
+        s.bar_funding(),
+        td_core::AccountCurrency::Quote,
+        None,
+    );
     assert_eq!(trades.len(), 1);
     assert_eq!(trades[0].side, TradeSide::Short);
     assert!(!trades[0].open);

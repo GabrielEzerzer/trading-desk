@@ -134,6 +134,7 @@ fn a_paper_session_fed_the_backtest_bars_matches_the_backtest() {
                 slippage_bps: cfg.slippage_bps,
                 fees: cfg.fees,
                 max_leverage: cfg.max_leverage,
+                account_currency: td_core::AccountCurrency::Quote,
             },
         )
         .expect("runs");
@@ -213,6 +214,7 @@ fn paper_matches_backtest(cfg: PaperConfig, bars: &[Candle], funding: &[(Millis,
             slippage_bps: cfg.slippage_bps,
             fees: cfg.fees,
             max_leverage: cfg.max_leverage,
+            account_currency: td_core::AccountCurrency::Quote,
         },
     )
     .expect("runs");
@@ -1037,6 +1039,7 @@ fn manual_orders_take_the_strategy_orders_path_and_fill_by_the_engines_rules() {
             slippage_bps: cfg.slippage_bps,
             fees: cfg.fees,
             max_leverage: cfg.max_leverage,
+            account_currency: td_core::AccountCurrency::Quote,
         };
         let mut reference = Session::new(
             Box::new(scripted),

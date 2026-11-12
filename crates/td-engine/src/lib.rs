@@ -47,8 +47,8 @@ mod verdict;
 mod private_strategies_build;
 
 pub use battery::{
-    BatteryResult, BatterySpec, Breakdown, CostStress, IntegrityReport, PlateauReport,
-    RegimeResult, SideResult, StartOffset, run_battery,
+    BatteryResult, BatteryRuns, BatterySpec, Breakdown, CostStress, IntegrityReport, PlateauReport,
+    RegimeResult, SideResult, StartOffset, battery_runs, run_battery,
 };
 pub use broker::{AttachedStop, Broker, BrokerEvent, Order, OrderStatus, SimBroker};
 pub use error::{EngineError, OrderRejected};
@@ -64,7 +64,7 @@ pub use plan::{
 pub use portfolio::Portfolio;
 pub use registry::{StrategyEntry, build_strategy, find_strategy, strategies};
 pub use results::{
-    RunId, RunKind, RunSummary, SavedRun, StoreError, list, load, save, save_with_files,
+    PlanRun, RunId, RunKind, RunSummary, SavedRun, StoreError, list, load, save, save_with_files,
 };
 pub use risk::{DayRollover, EquityRange};
 pub use runner::{

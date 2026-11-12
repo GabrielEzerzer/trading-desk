@@ -14,7 +14,9 @@
 //! the permutation count can go down to [`MIN_PERMUTATIONS`] for a quicker luck test.
 
 use serde::{Deserialize, Serialize};
-use td_core::{FeeSchedule, Instrument, InstrumentId, Millis, Timeframe, days_from_civil};
+use td_core::{
+    AccountCurrency, FeeSchedule, Instrument, InstrumentId, Millis, Timeframe, days_from_civil,
+};
 
 use crate::metrics::DAY_MS;
 use crate::{
@@ -90,7 +92,8 @@ pub struct Period {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BacktestSettings {
-    /// Starting balance in the quote asset.
+    /// Starting balance in the quote asset: a plan's runs are on a quote-currency account (see
+    /// [`TestPlan::backtest_config`]).
     pub starting_cash: f64,
     /// The perpetual leverage cap, as in [`BacktestConfig::max_leverage`]; 1.0 is 1x.
     pub max_leverage: f64,
@@ -338,6 +341,9 @@ impl TestPlan {
             max_leverage: self.backtest.max_leverage,
             warmup_from: None,
             close_at_end: false,
+            // shortcut: a plan's runs are on a quote-currency account; add the account currency
+            // to `BacktestSettings` when the first plan for an FX pair on a base account is written.
+            account_currency: AccountCurrency::Quote,
         }
     }
 

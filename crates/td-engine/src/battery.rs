@@ -15,7 +15,8 @@
 //!    line keeps the worst result over every set checked, and a failure there makes the verdict
 //!    `invalid` too; the steps after the statistics are then skipped.
 //! 4. **The statistics that need no further runs:** R2, R5, R7 (a block bootstrap of the daily
-//!    returns), R8 (where the profit came from), I4, I5 and the kind rule's inputs.
+//!    returns), R8 (where the profit came from), I4, I5 and the kind rule's inputs, among them a
+//!    block bootstrap of the max drawdown over the same daily returns for the `portfolio` kind.
 //! 5. **R4**, the walk-forward's chosen parameters run again on each test window at
 //!    `cost_stress` times the fees and slippage.
 //! 6. **R6**, the walk-forward again with its windows moved by `start_offsets` different offsets.
@@ -62,7 +63,8 @@ use crate::risk::{self, DayRollover};
 use crate::rng::derive_seed;
 use crate::runner::select_bars;
 use crate::stats::{
-    self, BootstrapSpec, DEFAULT_RESAMPLES, MeanBootstrap, PropFirmOdds, PropFirmSpec, RuinSpec,
+    self, BootstrapSpec, DEFAULT_RESAMPLES, DrawdownBootstrap, MeanBootstrap, PropFirmOdds,
+    PropFirmSpec, RuinSpec,
 };
 use crate::verdict::{
     IntegrityInputs, OosIntegrityInputs, evaluate_integrity, evaluate_oos_integrity,
@@ -70,9 +72,9 @@ use crate::verdict::{
 use crate::{
     BacktestConfig, BacktestResult, Criterion, Direction, DrawdownMode, EquityPoint,
     EvidenceInputs, KindInputs, MAX_RUNS, Order, Outcome, Params, PermutationResult,
-    PermutationSpec, PortfolioBenchmark, Progress, SweepResult, SweepRow, TestPlan, TesterError,
-    Trade, TradeSide, Verdict, VerdictRule, WalkForwardResult, WalkForwardSpec, combine, evaluate,
-    evaluate_evidence, permutation_test, run, sweep, walk_forward,
+    PermutationSpec, PortfolioBenchmark, Progress, SweepResult, SweepRow, SweepSpec, TestPlan,
+    TesterError, Trade, TradeSide, Verdict, VerdictRule, WalkForwardResult, WalkForwardSpec,
+    combine, evaluate, evaluate_evidence, permutation_test, run, sweep, walk_forward,
 };
 
 /// The seed streams of the battery's seeded steps, derived from its seed.
@@ -81,12 +83,14 @@ const SEED_TRADE_BOOTSTRAP: u64 = 2;
 const SEED_RUIN: u64 = 3;
 const SEED_PROP_FIRM: u64 = 4;
 const SEED_LUCK: u64 = 5;
+const SEED_DRAWDOWN_BOOTSTRAP: u64 = 6;
 
 /// The evidence lines of the runs that come after the statistics (R3, R4, R6).
 const LATER_LINES: [&str; 3] = ["luck_p", "stressed_return", "start_offsets"];
 
 /// Everything one battery produced: the verdict, and the runs and numbers behind it for saving
 /// and showing.
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BatteryResult {
     pub verdict: Verdict,
@@ -109,6 +113,9 @@ pub struct BatteryResult {
     pub plateau: Option<PlateauReport>,
     /// R7: the block bootstrap of the out-of-sample daily returns.
     pub daily_bootstrap: Option<MeanBootstrap>,
+    /// The block bootstrap of the max drawdown over the same daily returns, for a `portfolio`
+    /// rule. `None` for the other kinds, without a curve, and in a result saved before it existed.
+    pub drawdown_bootstrap: Option<DrawdownBootstrap>,
     /// The bootstrap of the closed out-of-sample trades' net P&L, for `high_risk`'s lower bound.
     pub trade_bootstrap: Option<MeanBootstrap>,
     /// The prop-firm challenge odds, for a `prop_firm` rule.
@@ -123,9 +130,14 @@ pub struct BatteryResult {
     /// (`luck_note` says which).
     pub permutation: Option<PermutationResult>,
     pub luck_note: Option<String>,
+    /// True when a cancel stopped R3, so the luck line lacks its p-value. False when R3 finished,
+    /// was skipped or did not run; a result saved before this field existed reads as false.
+    #[serde(default)]
+    pub luck_cancelled: bool,
 }
 
 /// The counts behind I1 to I3.
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct IntegrityReport {
     /// Buckets of the period's open hours: those not wholly inside the market's closed hours.
@@ -138,6 +150,7 @@ pub struct IntegrityReport {
 }
 
 /// R5: the best parameter set and its neighbours on the grid.
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PlateauReport {
     /// The best row's grid coordinates.
@@ -151,6 +164,7 @@ pub struct PlateauReport {
 }
 
 /// R4: each test window's chosen parameters run again at higher costs.
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CostStress {
     pub multiplier: f64,
@@ -161,6 +175,7 @@ pub struct CostStress {
 }
 
 /// R6: one walk-forward with its windows moved.
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StartOffset {
     /// How many of the period's last bars this run leaves out, which moves every window boundary
@@ -174,6 +189,7 @@ pub struct StartOffset {
 }
 
 /// R8: where the out-of-sample profit came from. Reported only.
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Breakdown {
     pub long: SideResult,
@@ -191,6 +207,7 @@ pub struct Breakdown {
     pub return_without_best_trade: Option<f64>,
 }
 
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct SideResult {
     /// Closed trades.
@@ -199,6 +216,7 @@ pub struct SideResult {
     pub net_pnl: f64,
 }
 
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct RegimeResult {
     pub windows: usize,
@@ -306,30 +324,14 @@ pub fn run_battery(
     let (_, traded) = select_bars(&base, bars)?;
 
     // The total before anything runs.
-    let per_sweep = sweep_spec.runs()?;
-    let window_count = |bars: usize| wf_spec.windows.windows(bars).map_or(0, |w| w.len());
-    let windows = window_count(traded.len());
-    let offsets = start_offset_shifts(wf_spec.windows.test_bars, ev.start_offsets as usize);
-    let offset_windows: Vec<usize> = offsets
-        .iter()
-        .map(|&s| window_count(traded.len().saturating_sub(s)))
-        .collect();
-    let permutations = ev.luck.permutations as usize;
-    // R3 runs last but is refused up front, before the hours of runs ahead of it.
-    let luck_runs = per_sweep as u128 * (permutations as u128 + 1);
-    if luck_runs > MAX_RUNS as u128 {
-        return Err(TesterError::TooManyRuns {
-            runs: luck_runs,
-            limit: MAX_RUNS,
-        });
-    }
-    let total = 3
-        + per_sweep
-        + windows * per_sweep
-        + 3 * windows
-        + windows
-        + offset_windows.iter().sum::<usize>() * per_sweep
-        + per_sweep * (permutations + 1);
+    let Layout {
+        per_sweep,
+        windows,
+        offsets,
+        offset_windows,
+        permutations,
+        total,
+    } = layout(&sweep_spec, &wf_spec, plan, traded.len())?;
     let mut meter = Meter {
         progress,
         total,
@@ -366,6 +368,7 @@ pub fn run_battery(
         oos_integrity: OosIntegrityInputs::default(),
         plateau: None,
         daily_bootstrap: None,
+        drawdown_bootstrap: None,
         trade_bootstrap: None,
         prop_firm_odds: None,
         breakdown: None,
@@ -373,6 +376,7 @@ pub fn run_battery(
         start_offsets: Vec::new(),
         permutation: None,
         luck_note: None,
+        luck_cancelled: false,
     };
     if criteria.iter().any(|c| c.outcome == Outcome::Fail) {
         meter.finish();
@@ -491,6 +495,15 @@ pub fn run_battery(
             &BootstrapSpec::daily(daily.len(), derive_seed(seed, SEED_DAILY_BOOTSTRAP)),
         )
         .ok();
+        if let VerdictRule::Portfolio { .. } = rule {
+            result.drawdown_bootstrap = stats::bootstrap_drawdown(
+                &daily,
+                DEFAULT_RESAMPLES,
+                stats::default_block_len(daily.len()),
+                derive_seed(seed, SEED_DRAWDOWN_BOOTSTRAP),
+            )
+            .ok();
+        }
         let closed: Vec<f64> = wf
             .trades
             .iter()
@@ -531,6 +544,7 @@ pub fn run_battery(
                 .daily_bootstrap
                 .as_ref()
                 .map(|b| b.p_mean_at_most_zero),
+            resampled_drawdown: result.drawdown_bootstrap.as_ref().map(|b| b.p95),
             trades: m.trades,
             expectancy: m.avg_trade_pnl,
             expectancy_lower_bound: result.trade_bootstrap.as_ref().map(|b| b.lower_bound),
@@ -678,6 +692,7 @@ pub fn run_battery(
                 result.permutation = Some(p);
             }
             Err(Some(TesterError::Cancelled)) => {
+                result.luck_cancelled = true;
                 result.luck_note = Some(
                     "The luck test was cancelled, so it gave no p-value; run the battery again \
                      to complete it."
@@ -720,6 +735,84 @@ pub fn run_battery(
     result.oos_integrity = oos_integrity;
     result.plateau = plateau;
     Ok(result)
+}
+
+/// The runs a battery counts, known before it runs, for a caller that reports one progress total
+/// over several batteries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BatteryRuns {
+    /// The total [`run_battery`] reports progress against.
+    pub total: usize,
+    /// The count after which the luck test (R3), the last step, runs: the counts above it are
+    /// R3's, and a cancel there keeps the verdict with the luck line inconclusive.
+    pub luck_from: usize,
+}
+
+/// The progress total of [`run_battery`] for `spec` on `bars`, without running anything. Errors
+/// as `run_battery` would on a refused spec or a period with no bars.
+pub fn battery_runs(spec: &BatterySpec, bars: &[Candle]) -> Result<BatteryRuns, TesterError> {
+    let instrument = spec.instrument.clone();
+    let base = spec.plan.backtest_config(spec.strategy, instrument.clone());
+    let sweep_spec = spec.plan.sweep_spec(spec.strategy, instrument.clone());
+    let wf_spec = spec.plan.walk_forward_spec(spec.strategy, instrument);
+    wf_spec.check()?;
+    let (_, traded) = select_bars(&base, bars)?;
+    let l = layout(&sweep_spec, &wf_spec, spec.plan, traded.len())?;
+    Ok(BatteryRuns {
+        total: l.total,
+        luck_from: l.total - l.per_sweep * (l.permutations + 1),
+    })
+}
+
+/// How a battery's runs are laid out: the counts its progress total is made of.
+struct Layout {
+    per_sweep: usize,
+    windows: usize,
+    offsets: Vec<usize>,
+    offset_windows: Vec<usize>,
+    permutations: usize,
+    total: usize,
+}
+
+fn layout(
+    sweep_spec: &SweepSpec,
+    wf_spec: &WalkForwardSpec,
+    plan: &TestPlan,
+    traded: usize,
+) -> Result<Layout, TesterError> {
+    let ev = &plan.evidence;
+    let per_sweep = sweep_spec.runs()?;
+    let window_count = |bars: usize| wf_spec.windows.windows(bars).map_or(0, |w| w.len());
+    let windows = window_count(traded);
+    let offsets = start_offset_shifts(wf_spec.windows.test_bars, ev.start_offsets as usize);
+    let offset_windows: Vec<usize> = offsets
+        .iter()
+        .map(|&s| window_count(traded.saturating_sub(s)))
+        .collect();
+    let permutations = ev.luck.permutations as usize;
+    // R3 runs last but is refused up front, before the hours of runs ahead of it.
+    let luck_runs = per_sweep as u128 * (permutations as u128 + 1);
+    if luck_runs > MAX_RUNS as u128 {
+        return Err(TesterError::TooManyRuns {
+            runs: luck_runs,
+            limit: MAX_RUNS,
+        });
+    }
+    let total = 3
+        + per_sweep
+        + windows * per_sweep
+        + 3 * windows
+        + windows
+        + offset_windows.iter().sum::<usize>() * per_sweep
+        + per_sweep * (permutations + 1);
+    Ok(Layout {
+        per_sweep,
+        windows,
+        offsets,
+        offset_windows,
+        permutations,
+        total,
+    })
 }
 
 /// Whether R3, R4 and R6 can no longer change the verdict: the state comes out the same whatever
@@ -1164,6 +1257,7 @@ mod tests {
             max_leverage: 1.0,
             warmup_from: None,
             close_at_end: false,
+            account_currency: td_core::AccountCurrency::Quote,
         }
     }
 
@@ -1426,6 +1520,8 @@ mod tests {
             mae: None,
             mfe: None,
             force_closed: false,
+            net_pips: None,
+            pips: None,
         }
     }
 
