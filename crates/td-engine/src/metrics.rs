@@ -27,7 +27,7 @@
 //! first and last equity and sums of fill fees and funding, finite for finite inputs.
 
 use serde::{Deserialize, Serialize};
-use td_core::{Fill, Millis, Timeframe};
+use td_core::{AccountCurrency, Fill, Millis, Timeframe};
 
 use crate::risk::{self, DayRollover, Intrabar};
 use crate::{EquityPoint, Trade};
@@ -61,7 +61,8 @@ pub const MIN_DAILY_RETURNS: usize = 30;
 /// at about 4 or below.
 pub const MIN_CAGR_DAYS: i64 = 90;
 
-/// The metrics report for one equity series and its trades.
+/// The metrics report for one equity series and its trades. Money amounts are in the run's account
+/// currency (see [`crate::BacktestConfig::account_currency`]).
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MetricsReport {
@@ -146,6 +147,13 @@ pub struct MetricsReport {
     /// in a backtest with `close_at_end`, up to one per test window in a walk-forward.
     #[serde(default)]
     pub force_closed_trades: usize,
+    /// Mean [`Trade::pips`] of the closed trades that have it, on a market with pips; `None`
+    /// otherwise, and left out of saved JSON then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avg_trade_pips: Option<f64>,
+    /// Mean [`Trade::net_pips`], after commission, of the closed trades that have it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avg_trade_net_pips: Option<f64>,
 }
 
 /// An equity series in the form the metrics read: the starting value, then one value per bar
@@ -180,8 +188,17 @@ pub fn report(
     trades: &[Trade],
     fills: &[Fill],
     funding_paid: f64,
+    account: AccountCurrency,
 ) -> MetricsReport {
-    report_with(series, None, positions, trades, fills, funding_paid)
+    report_with(
+        series,
+        None,
+        positions,
+        trades,
+        fills,
+        funding_paid,
+        account,
+    )
 }
 
 /// Builds the full report, with the floors [`MIN_DAILY_RETURNS`] and [`MIN_CAGR_DAYS`].
@@ -190,7 +207,8 @@ pub fn report(
 /// range per bar; without it, or with the wrong number of ranges, the measures inside bars are
 /// `None`. `positions` is the position after each bar's fills, one per bar. `trades` may include
 /// an open trade at the end; the trade statistics skip it. `funding_paid` is the run's net
-/// funding.
+/// funding. `account` is the currency the series, trades, fees and funding are in, for the
+/// turnover's traded notional (see [`turnover`]).
 pub fn report_with(
     series: &EquitySeries,
     intrabar: Option<&Intrabar>,
@@ -198,6 +216,7 @@ pub fn report_with(
     trades: &[Trade],
     fills: &[Fill],
     funding_paid: f64,
+    account: AccountCurrency,
 ) -> MetricsReport {
     let values = &series.values;
     let elapsed = match (series.times.first(), series.times.last()) {
@@ -219,6 +238,8 @@ pub fn report_with(
     let pnls: Vec<f64> = closed.iter().map(|t| t.net_pnl).collect();
     let held: Vec<f64> = closed.iter().map(|t| t.bars_held as f64).collect();
     let rs: Vec<f64> = closed.iter().filter_map(|t| t.r_multiple).collect();
+    let pips: Vec<f64> = closed.iter().filter_map(|t| t.pips).collect();
+    let net_pips: Vec<f64> = closed.iter().filter_map(|t| t.net_pips).collect();
     let start = values.first().copied().unwrap_or(0.0);
     let ranges = intrabar
         .map(|x| x.ranges.as_slice())
@@ -245,7 +266,7 @@ pub fn report_with(
         median_trade_pnl: median(&pnls),
         avg_bars_held: mean(&held),
         exposure: exposure(positions),
-        turnover: turnover(fills, values.get(1..).unwrap_or(&[])),
+        turnover: turnover(fills, values.get(1..).unwrap_or(&[]), account),
         fees_paid: fills.iter().map(|f| f.fee).sum(),
         funding_paid,
         max_drawdown_intrabar: ranges
@@ -262,6 +283,8 @@ pub fn report_with(
         payoff_ratio: payoff_ratio(&pnls),
         longest_losing_streak: longest_losing_streak(&pnls),
         force_closed_trades: closed.iter().filter(|t| t.force_closed).count(),
+        avg_trade_pips: mean(&pips),
+        avg_trade_net_pips: mean(&net_pips),
     }
 }
 
@@ -545,11 +568,15 @@ pub fn exposure(positions: &[f64]) -> Option<f64> {
 }
 
 /// Traded notional over average equity: `sum(qty * price) / mean(equity)`, with the equity at
-/// each bar's close. `None` with no bars, an average equity at or below zero or a result that is
-/// not finite.
-pub fn turnover(fills: &[Fill], equity: &[f64]) -> Option<f64> {
+/// each bar's close. On a base account each fill's notional is converted to the account currency
+/// at its own price, as the equity is in it. `None` with no bars, an average equity at or below
+/// zero or a result that is not finite.
+pub fn turnover(fills: &[Fill], equity: &[f64], account: AccountCurrency) -> Option<f64> {
     let avg = mean(equity)?;
-    let traded: f64 = fills.iter().map(|f| f.qty * f.price).sum();
+    let traded: f64 = fills
+        .iter()
+        .map(|f| account.from_quote(f.qty * f.price, f.price))
+        .sum();
     if avg > 0.0 {
         finite(traded / avg)
     } else {
@@ -776,8 +803,11 @@ mod tests {
         };
         // Traded 1000 + 1100 over an average equity of 1050.
         let fills = [fill(10.0, 100.0), fill(10.0, 110.0)];
-        some(turnover(&fills, &[1000.0, 1100.0]), 2.0);
-        assert_eq!(turnover(&fills, &[]), None);
+        some(
+            turnover(&fills, &[1000.0, 1100.0], AccountCurrency::Quote),
+            2.0,
+        );
+        assert_eq!(turnover(&fills, &[], AccountCurrency::Quote), None);
     }
 
     #[test]
@@ -819,7 +849,7 @@ mod tests {
             fee: 0.0,
             liquidity: td_core::Liquidity::Taker,
         };
-        assert_eq!(turnover(&[fill], &[1.0]), None);
+        assert_eq!(turnover(&[fill], &[1.0], AccountCurrency::Quote), None);
     }
 
     const HOUR: Millis = 3_600_000;
@@ -846,7 +876,7 @@ mod tests {
             })
             .collect();
         let series = EquitySeries::new(100.0, &curve, Timeframe::H1);
-        report(&series, &[], &[], &[], 0.0)
+        report(&series, &[], &[], &[], 0.0, AccountCurrency::Quote)
     }
 
     #[test]
@@ -955,7 +985,7 @@ mod tests {
         }
         assert_eq!(daily_equity(&s.times, &s.values), daily);
         assert_eq!(observed_daily_returns(&s.times), 30);
-        let r = report(&s, &[], &[], &[], 0.0);
+        let r = report(&s, &[], &[], &[], 0.0, AccountCurrency::Quote);
         let returns = per_bar_returns(&daily).unwrap();
         assert_eq!(returns.len(), 31);
         assert_eq!(returns[2], 0.0);
@@ -964,14 +994,21 @@ mod tests {
             times: s.times[..s.times.len() - 1].to_vec(),
             values: s.values[..s.values.len() - 1].to_vec(),
         };
-        let rs = report(&short, &[], &[], &[], 0.0);
+        let rs = report(&short, &[], &[], &[], 0.0, AccountCurrency::Quote);
         assert_eq!((rs.volatility, rs.sharpe, rs.sortino), (None, None, None));
         assert_eq!(r.volatility, volatility(&returns, 365.0));
         assert_eq!(r.sharpe, sharpe(&returns, 365.0));
         assert_eq!(r.sortino, sortino(&returns, 365.0));
         assert!(r.sharpe.is_some() && r.sortino.is_some());
         // The first four days alone are below the floor.
-        let r4 = report(&multi_day_series(), &[], &[], &[], 0.0);
+        let r4 = report(
+            &multi_day_series(),
+            &[],
+            &[],
+            &[],
+            0.0,
+            AccountCurrency::Quote,
+        );
         assert_eq!((r4.volatility, r4.sharpe, r4.sortino), (None, None, None));
         // The drawdown stays on the per-bar series: 110 at 00:00 on day 1 to 99 at 20:00,
         // recovered at 120 three values after the peak.
@@ -989,7 +1026,7 @@ mod tests {
             })
             .collect();
         let series = EquitySeries::new(100.0, &curve, Timeframe::H1);
-        let r = report(&series, &[], &[], &[], 0.0);
+        let r = report(&series, &[], &[], &[], 0.0, AccountCurrency::Quote);
         assert_eq!((r.volatility, r.sharpe, r.sortino), (None, None, None));
         assert!(r.max_drawdown.is_some());
     }
@@ -1013,6 +1050,7 @@ mod tests {
             &[],
             &[],
             0.0,
+            AccountCurrency::Quote,
         )
     }
 
@@ -1031,6 +1069,7 @@ mod tests {
             &[],
             &[],
             0.0,
+            AccountCurrency::Quote,
         );
         assert_eq!(
             (r.volatility, r.sharpe, r.sortino, r.cagr, r.calmar),
@@ -1088,14 +1127,24 @@ mod tests {
         // zeros: the ratios would come from five weekly moves.
         let five = weekly_series(5);
         assert_eq!(daily_equity(&five.times, &five.values).len() - 1, 35);
-        assert_eq!(risk(&report(&five, &[], &[], &[], 0.0)), (None, None, None));
         assert_eq!(
-            risk(&report(&weekly_series(29), &[], &[], &[], 0.0)),
+            risk(&report(&five, &[], &[], &[], 0.0, AccountCurrency::Quote)),
+            (None, None, None)
+        );
+        assert_eq!(
+            risk(&report(
+                &weekly_series(29),
+                &[],
+                &[],
+                &[],
+                0.0,
+                AccountCurrency::Quote
+            )),
             (None, None, None)
         );
         // Thirty weekly bars are 30 bar returns over 210 daily returns.
         let thirty = weekly_series(30);
-        let r = report(&thirty, &[], &[], &[], 0.0);
+        let r = report(&thirty, &[], &[], &[], 0.0, AccountCurrency::Quote);
         let daily = per_bar_returns(&daily_equity(&thirty.times, &thirty.values)).unwrap();
         assert_eq!(daily.len(), 210);
         assert_eq!(r.volatility, volatility(&daily, DAYS_PER_YEAR));
@@ -1189,6 +1238,8 @@ mod tests {
             mae: None,
             mfe: None,
             force_closed,
+            net_pips: None,
+            pips: None,
         }
     }
 
@@ -1221,7 +1272,15 @@ mod tests {
             // Open trades count in none of the trade statistics.
             trade(-50.0, Some(9.0), true, true),
         ];
-        let r = report_with(&series, Some(&intrabar), &[0.0; 4], &trades, &[], 0.0);
+        let r = report_with(
+            &series,
+            Some(&intrabar),
+            &[0.0; 4],
+            &trades,
+            &[],
+            0.0,
+            AccountCurrency::Quote,
+        );
 
         // On closes the peak is 104 and the trough 96.
         some(r.max_drawdown, 1.0 - 96.0 / 104.0);
@@ -1250,9 +1309,32 @@ mod tests {
             peak_leverage: Some(2.5),
         };
         for without in [
-            report_with(&series, None, &[0.0; 4], &trades, &[], 0.0),
-            report_with(&series, Some(&short), &[0.0; 4], &trades, &[], 0.0),
-            report(&series, &[0.0; 4], &trades, &[], 0.0),
+            report_with(
+                &series,
+                None,
+                &[0.0; 4],
+                &trades,
+                &[],
+                0.0,
+                AccountCurrency::Quote,
+            ),
+            report_with(
+                &series,
+                Some(&short),
+                &[0.0; 4],
+                &trades,
+                &[],
+                0.0,
+                AccountCurrency::Quote,
+            ),
+            report(
+                &series,
+                &[0.0; 4],
+                &trades,
+                &[],
+                0.0,
+                AccountCurrency::Quote,
+            ),
         ] {
             assert_eq!(without.max_drawdown_intrabar, None);
             assert_eq!(without.static_drawdown_intrabar, None);

@@ -80,6 +80,7 @@ fn config() -> BacktestConfig {
         max_leverage: 1.0,
         warmup_from: None,
         close_at_end: false,
+        account_currency: td_core::AccountCurrency::Quote,
     }
 }
 

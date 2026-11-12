@@ -132,6 +132,18 @@ pub struct PortfolioLimits {
     pub min_alpha: f64,
     /// The bootstrap chance that the mean daily return is zero or less, at most this.
     pub max_p_mean_not_positive: f64,
+    /// The 95th percentile of the max drawdown over resampled paths of the daily returns (days
+    /// drawn with replacement in blocks, as R7 does), at most this. The default is above `max_drawdown`'s because the 95th percentile of
+    /// resampled paths sits well above the drawdown of the one path that happened, and grows with
+    /// the length of the out-of-sample period; at 0.45 the line fails a strategy whose drawdown was
+    /// small only because its losing days happened not to cluster, not every strategy near the
+    /// historical limit. A rule saved before this limit existed reads with the default.
+    #[serde(default = "default_max_resampled_drawdown")]
+    pub max_resampled_drawdown: f64,
+}
+
+fn default_max_resampled_drawdown() -> f64 {
+    PortfolioLimits::default().max_resampled_drawdown
 }
 
 impl Default for PortfolioLimits {
@@ -142,6 +154,7 @@ impl Default for PortfolioLimits {
             max_drawdown_vs_benchmark: 0.75,
             min_alpha: 0.0,
             max_p_mean_not_positive: 0.10,
+            max_resampled_drawdown: 0.45,
         }
     }
 }
@@ -152,7 +165,8 @@ impl Default for PortfolioLimits {
 pub struct HighRiskLimits {
     /// Closed out-of-sample trades, at least this many.
     pub min_trades: u32,
-    /// Mean net P&L per closed trade strictly above this, in the quote asset.
+    /// Mean net P&L per closed trade strictly above this, in the run's account currency (the
+    /// quote asset on a plan's runs).
     pub min_expectancy: f64,
     /// The bootstrap's lower bound on that mean strictly above this.
     pub min_expectancy_lower_bound: f64,
@@ -220,6 +234,10 @@ impl VerdictRule {
                 probability(
                     "limits.max_p_mean_not_positive",
                     limits.max_p_mean_not_positive,
+                )?;
+                share(
+                    "limits.max_resampled_drawdown",
+                    limits.max_resampled_drawdown,
                 )?;
             }
             VerdictRule::HighRisk { limits } => {
@@ -334,7 +352,8 @@ pub enum Unit {
     Ratio,
     Count,
     Days,
-    /// An amount in the instrument's quote asset.
+    /// An amount of money in the run's account currency: the instrument's quote asset unless the
+    /// run is on a base-currency account. The name is kept so saved verdicts still load.
     Quote,
 }
 
@@ -485,6 +504,7 @@ pub const TOO_GOOD_SHARPE: f64 = 4.0;
 /// plan's backtest before anything else runs. I2 and I3 then also run on each parameter set the
 /// walk-forward chose, and hold the worst result over every set checked. A check the battery
 /// could not make is `None` and fails, which makes the verdict `invalid`.
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct IntegrityInputs {
     /// I1: the buckets of the period's open hours that have no bar, over all of them.
@@ -500,6 +520,7 @@ pub struct IntegrityInputs {
 
 /// The integrity checks read on the stitched walk-forward out-of-sample curve (I4 and I5),
 /// computed once it exists.
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct OosIntegrityInputs {
     /// I4: the annualised Sharpe ratio of the curve's daily returns.
@@ -646,6 +667,7 @@ pub fn evaluate_oos_integrity(x: &OosIntegrityInputs, max_leverage: f64) -> Vec<
 /// walk-forward out-of-sample curve. Fractions are of equity unless said otherwise. A statistic
 /// the battery could not compute is `None` and fails its criterion. Each kind reads only its own
 /// fields.
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct KindInputs {
     // portfolio
@@ -659,10 +681,13 @@ pub struct KindInputs {
     pub alpha: Option<f64>,
     /// The block bootstrap's chance that the mean daily return is zero or less (R7).
     pub p_mean_not_positive: Option<f64>,
+    /// The 95th percentile of the max drawdown over resampled paths of the daily returns (days
+    /// drawn with replacement in blocks, as R7 does).
+    pub resampled_drawdown: Option<f64>,
     // high_risk
     /// Closed trades.
     pub trades: usize,
-    /// Mean net P&L per closed trade, in the quote asset.
+    /// Mean net P&L per closed trade, in the run's account currency.
     pub expectancy: Option<f64>,
     /// The bootstrap's lower bound on the expectancy.
     pub expectancy_lower_bound: Option<f64>,
@@ -783,6 +808,14 @@ pub fn evaluate(rule: &VerdictRule, x: &KindInputs) -> Vec<Criterion> {
                 });
             }
             lines.push(line(
+                "resampled_drawdown",
+                "Resampled max drawdown (95th percentile)",
+                x.resampled_drawdown,
+                AtMost,
+                limits.max_resampled_drawdown,
+                Unit::Percent,
+            ));
+            lines.push(line(
                 "alpha",
                 "Alpha",
                 x.alpha,
@@ -861,6 +894,7 @@ pub fn evaluate(rule: &VerdictRule, x: &KindInputs) -> Vec<Criterion> {
 // ---------------------------------------------------------------------------------------------
 
 /// The statistics the evidence layer reads (#35, R1 to R6), computed by the battery.
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct EvidenceInputs {
     /// R1: total return of the stitched out-of-sample curve.
@@ -1114,6 +1148,7 @@ mod tests {
             benchmark_max_drawdown: Some(0.25),
             alpha: Some(0.05),
             p_mean_not_positive: Some(0.02),
+            resampled_drawdown: Some(0.18),
             ..KindInputs::default()
         }
     }
@@ -1130,6 +1165,7 @@ mod tests {
                 "sharpe",
                 "max_drawdown",
                 "drawdown_vs_benchmark",
+                "resampled_drawdown",
                 "alpha",
                 "p_mean_not_positive"
             ]
@@ -1147,6 +1183,23 @@ mod tests {
         );
         // The benchmark line's limit is 75% of the benchmark's drawdown.
         assert_eq!(lines[2].limit, Some(0.1875));
+        let resampled = &lines[3];
+        assert_eq!(
+            (
+                resampled.name.as_str(),
+                resampled.value,
+                resampled.limit,
+                resampled.comparison,
+                resampled.unit,
+            ),
+            (
+                "Resampled max drawdown (95th percentile)",
+                Some(0.18),
+                Some(0.45),
+                Comparison::AtMost,
+                Unit::Percent,
+            )
+        );
         assert!(lines.iter().all(|c| c.note.is_none()));
     }
 
@@ -1154,7 +1207,7 @@ mod tests {
     fn portfolio_fails_on_each_criterion() {
         type Tweak = fn(&mut KindInputs);
         let rule = portfolio(PortfolioBenchmark::BuyAndHold);
-        let cases: [(&str, Tweak); 6] = [
+        let cases: [(&str, Tweak); 9] = [
             ("sharpe", |x| x.sharpe = Some(0.99)),
             ("sharpe", |x| x.sharpe = None),
             ("max_drawdown", |x| {
@@ -1163,10 +1216,16 @@ mod tests {
                 x.max_drawdown = Some(0.35);
             }),
             ("drawdown_vs_benchmark", |x| x.max_drawdown = Some(0.19)),
+            // The historical drawdown passes both its lines; more than 5% of resampled paths
+            // fell past the limit.
+            ("resampled_drawdown", |x| x.resampled_drawdown = Some(0.46)),
+            // Like the other bootstrap line, a missing value fails with no value.
+            ("resampled_drawdown", |x| x.resampled_drawdown = None),
             ("alpha", |x| x.alpha = Some(-0.01)),
             ("p_mean_not_positive", |x| {
                 x.p_mean_not_positive = Some(0.11);
             }),
+            ("p_mean_not_positive", |x| x.p_mean_not_positive = None),
         ];
         for (id, tweak) in cases {
             let mut x = good_portfolio();
@@ -1188,6 +1247,7 @@ mod tests {
             benchmark_max_drawdown: Some(0.25),
             alpha: Some(0.0),
             p_mean_not_positive: Some(0.10),
+            resampled_drawdown: Some(0.45),
             ..KindInputs::default()
         };
         assert_eq!(
@@ -1238,7 +1298,13 @@ mod tests {
         let lines = evaluate(&portfolio(PortfolioBenchmark::Cash), &x);
         assert_eq!(
             ids(&lines),
-            ["sharpe", "max_drawdown", "alpha", "p_mean_not_positive"]
+            [
+                "sharpe",
+                "max_drawdown",
+                "resampled_drawdown",
+                "alpha",
+                "p_mean_not_positive"
+            ]
         );
         assert_eq!(not_passing(&lines), []);
     }
@@ -1255,6 +1321,112 @@ mod tests {
         let lines = evaluate(&rule, &good_portfolio());
         assert_eq!(not_passing(&lines), [("sharpe", Outcome::Fail)]);
         assert_eq!(lines[0].limit, Some(2.0));
+
+        let rule = VerdictRule::Portfolio {
+            benchmark: PortfolioBenchmark::Cash,
+            limits: PortfolioLimits {
+                max_resampled_drawdown: 0.15,
+                ..PortfolioLimits::default()
+            },
+        };
+        let lines = evaluate(&rule, &good_portfolio());
+        assert_eq!(not_passing(&lines), [("resampled_drawdown", Outcome::Fail)]);
+        assert_eq!(lines[2].limit, Some(0.15));
+    }
+
+    /// A resampled drawdown above the limit makes the verdict no_trade even when the historical
+    /// drawdown passes.
+    #[test]
+    fn a_resampled_drawdown_above_its_limit_gives_no_trade() {
+        let integrity = vec![Criterion::new(
+            Layer::Integrity,
+            "dropped_buckets",
+            "Dropped buckets",
+            Some(0.0),
+            Comparison::AtMost,
+            0.01,
+            Unit::Percent,
+        )];
+        let rule = portfolio(PortfolioBenchmark::BuyAndHold);
+        let verdict = |kind: KindInputs| {
+            let mut criteria = integrity.clone();
+            criteria.extend(evaluate_evidence(
+                &EvidenceSettings::default(),
+                &good_evidence(),
+            ));
+            criteria.extend(evaluate(&rule, &kind));
+            let id = InstrumentId {
+                venue: Venue::Binance,
+                symbol: "BTCUSDT".into(),
+                kind: InstrumentKind::Spot,
+            };
+            Verdict::new(id, criteria)
+        };
+        assert_eq!(verdict(good_portfolio()).state, VerdictState::Trade);
+        let unlucky = KindInputs {
+            resampled_drawdown: Some(0.50),
+            ..good_portfolio()
+        };
+        let v = verdict(unlucky);
+        assert_eq!(v.state, VerdictState::NoTrade);
+        let line = v
+            .criteria
+            .iter()
+            .find(|c| c.id == "resampled_drawdown")
+            .unwrap();
+        assert_eq!(
+            (line.value, line.limit, line.outcome),
+            (Some(0.50), Some(0.45), Outcome::Fail)
+        );
+    }
+
+    /// A rule saved before the resampled drawdown limit existed still reads, with the default
+    /// limit; an unknown field is still refused.
+    #[test]
+    fn portfolio_limits_saved_without_the_resampled_drawdown_read_with_its_default() {
+        let old = serde_json::json!({
+            "kind": "portfolio",
+            "benchmark": "cash",
+            "limits": {
+                "min_sharpe": 1.5,
+                "max_drawdown": 0.2,
+                "max_drawdown_vs_benchmark": 0.75,
+                "min_alpha": 0.0,
+                "max_p_mean_not_positive": 0.1
+            }
+        });
+        let rule: VerdictRule = serde_json::from_value(old.clone()).unwrap();
+        let VerdictRule::Portfolio { limits, .. } = rule else {
+            panic!("{rule:?}");
+        };
+        assert_eq!(limits.max_resampled_drawdown, 0.45);
+        assert_eq!((limits.min_sharpe, limits.max_drawdown), (1.5, 0.2));
+        let mut unknown = old;
+        unknown["limits"]["max_drawdown_typo"] = serde_json::json!(0.1);
+        assert!(serde_json::from_value::<VerdictRule>(unknown).is_err());
+
+        // Kind inputs saved before the field existed read it as missing.
+        let kind: KindInputs = serde_json::from_value(serde_json::json!({
+            "sharpe": 1.2,
+            "max_drawdown": 0.1,
+            "benchmark_max_drawdown": null,
+            "alpha": 0.05,
+            "p_mean_not_positive": 0.02,
+            "trades": 40,
+            "expectancy": null,
+            "expectancy_lower_bound": null,
+            "profit_factor": null,
+            "risk_of_ruin": null,
+            "return_without_best_trade": null,
+            "worst_daily_loss": null,
+            "intrabar_drawdown_static": null,
+            "intrabar_drawdown_trailing": null,
+            "pass_probability": null,
+            "breach_probability": null
+        }))
+        .unwrap();
+        assert_eq!(kind.resampled_drawdown, None);
+        assert_eq!(kind.sharpe, Some(1.2));
     }
 
     // Prop firm
@@ -1491,6 +1663,20 @@ mod tests {
                 benchmark: PortfolioBenchmark::BuyAndHold,
                 limits: PortfolioLimits {
                     min_sharpe: f64::NAN,
+                    ..PortfolioLimits::default()
+                },
+            },
+            VerdictRule::Portfolio {
+                benchmark: PortfolioBenchmark::BuyAndHold,
+                limits: PortfolioLimits {
+                    max_resampled_drawdown: 0.0,
+                    ..PortfolioLimits::default()
+                },
+            },
+            VerdictRule::Portfolio {
+                benchmark: PortfolioBenchmark::BuyAndHold,
+                limits: PortfolioLimits {
+                    max_resampled_drawdown: 1.5,
                     ..PortfolioLimits::default()
                 },
             },

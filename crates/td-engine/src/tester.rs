@@ -695,6 +695,7 @@ fn refuse_base_warmup(spec: &SweepSpec) -> Result<(), TesterError> {
 
 /// A luck test by bar permutation (R3 in #35): the same sweep on the real bars and on
 /// `permutations` shuffled copies of them.
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PermutationSpec {
     pub sweep: SweepSpec,
@@ -707,6 +708,7 @@ pub struct PermutationSpec {
 }
 
 /// The result of a luck test by bar permutation.
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PermutationResult {
     pub spec: PermutationSpec,
@@ -1720,6 +1722,7 @@ fn stitched_report(base: &BacktestConfig, runs: &[Segment]) -> Stitched {
         &trades,
         &fills,
         funding,
+        base.account_currency,
     );
     Stitched {
         series,
@@ -1789,6 +1792,7 @@ mod tests {
                     max_leverage: 1.0,
                     warmup_from: Some(0),
                     close_at_end: false,
+                    account_currency: td_core::AccountCurrency::Quote,
                 },
                 axes: vec![ParamAxis {
                     name: "slow".into(),
@@ -2095,6 +2099,7 @@ mod tests {
             max_leverage: 1.0,
             warmup_from: None,
             close_at_end: true,
+            account_currency: td_core::AccountCurrency::Quote,
         };
         let window = |from: i64, to: i64| {
             let config = BacktestConfig {

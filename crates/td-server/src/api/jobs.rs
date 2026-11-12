@@ -5,7 +5,8 @@
 //! holds.
 //!
 //! Kinds: downloads ([`super::data`]) and runs: backtests, sweeps, out-of-sample splits and
-//! walk-forwards ([`super::runs`]). A new kind plugs in by adding a variant to [`JobKind`],
+//! walk-forwards ([`super::runs`]), and a strategy's test plan ([`super::plans`]), which may end
+//! cancelled with a result: the instruments it kept. A new kind plugs in by adding a variant to [`JobKind`],
 //! [`JobRequest`] and [`JobResult`] and a route that calls [`Jobs::submit`] with its work.
 
 use std::collections::BTreeMap;
@@ -23,6 +24,7 @@ use td_engine::{BacktestConfig, OosSpec, SweepSpec, WalkForwardSpec};
 
 use super::data::{DownloadRequest, DownloadResult};
 use super::error::{ApiError, ErrorBody};
+use super::plans::{PlanDone, PlanRequest};
 use super::runs::RunDone;
 
 /// How many downloads run at once, for the venues' rate limits; the rest wait as `queued`.
@@ -50,6 +52,7 @@ pub enum JobKind {
     Sweep,
     Oos,
     WalkForward,
+    Plan,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -80,6 +83,8 @@ pub enum JobRequest {
     Sweep(SweepSpec),
     Oos(OosSpec),
     WalkForward(WalkForwardSpec),
+    /// The strategy and the instruments the job runs, every one listed.
+    Plan(PlanRequest),
 }
 
 impl JobRequest {
@@ -90,6 +95,7 @@ impl JobRequest {
             JobRequest::Sweep(_) => JobKind::Sweep,
             JobRequest::Oos(_) => JobKind::Oos,
             JobRequest::WalkForward(_) => JobKind::WalkForward,
+            JobRequest::Plan(_) => JobKind::Plan,
         }
     }
 
@@ -111,13 +117,15 @@ pub enum JobResult {
     Sweep(RunDone),
     Oos(RunDone),
     WalkForward(RunDone),
+    /// One saved run per instrument; see [`PlanDone`].
+    Plan(PlanDone),
 }
 
 impl JobResult {
-    /// The saved run, for a run job.
+    /// The saved run, for a run job that saves one (a plan job saves one per instrument).
     pub fn run(&self) -> Option<&RunDone> {
         match self {
-            JobResult::Download(_) => None,
+            JobResult::Download(_) | JobResult::Plan(_) => None,
             JobResult::Backtest(r)
             | JobResult::Sweep(r)
             | JobResult::Oos(r)
@@ -137,7 +145,8 @@ pub struct JobInfo {
     /// The latest progress line, for people.
     pub message: String,
     pub request: JobRequest,
-    /// Set when `status` is `done`.
+    /// Set when `status` is `done`, and on a `cancelled` or `failed` plan job that kept some
+    /// instruments.
     pub result: Option<JobResult>,
     /// Set when `status` is `failed`.
     pub error: Option<ErrorBody>,
@@ -158,7 +167,11 @@ pub struct JobCreated {
 #[derive(Debug, Clone, PartialEq)]
 pub enum JobError {
     Cancelled,
+    /// Cancelled, keeping what was done before the cancel.
+    CancelledWith(Box<JobResult>),
     Failed(ErrorBody),
+    /// Failed, keeping what was saved before the error.
+    FailedWith(ErrorBody, Box<JobResult>),
 }
 
 impl From<ApiError> for JobError {
@@ -486,10 +499,21 @@ impl Jobs {
                     job.status = JobStatus::Cancelled;
                     job.message = "cancelled".into();
                 }
+                Err(JobError::CancelledWith(result)) => {
+                    job.status = JobStatus::Cancelled;
+                    job.message = "cancelled".into();
+                    job.result = Some(*result);
+                }
                 Err(JobError::Failed(error)) => {
                     job.status = JobStatus::Failed;
                     job.message = error.message.clone();
                     job.error = Some(error);
+                }
+                Err(JobError::FailedWith(error, result)) => {
+                    job.status = JobStatus::Failed;
+                    job.message = error.message.clone();
+                    job.error = Some(error);
+                    job.result = Some(*result);
                 }
             }
         });

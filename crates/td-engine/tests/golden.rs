@@ -1531,6 +1531,7 @@ fn bad_configs_are_rejected() {
             slippage_bps: slip,
             fees: None,
             max_leverage,
+            account_currency: td_core::AccountCurrency::Quote,
         };
         assert!(matches!(
             Session::new(script, spot(), Timeframe::M1, cfg),

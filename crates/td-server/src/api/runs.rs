@@ -6,7 +6,7 @@
 //! Missing minutes are counted in the instrument's open hours only ([`missing_minutes`]), so the FX
 //! weekend is not a gap, and a market with bid and ask prices whose stored month lacks its asks is
 //! refused the same way. The
-//! check streams the range a month at a time and keeps nothing: a queued job holds only its
+//! check reads the range and keeps nothing: a queued job holds only its
 //! request, and loads its candles and funding once it has a run slot. If the store changed in
 //! between so that the run would now be refused, the job fails with that refusal. The job runs on
 //! a blocking thread (a tester run spreads its backtests over a rayon pool of its own), reports
@@ -179,7 +179,7 @@ pub(super) async fn walk_forward(
 /// The base configuration of a run request: the backtest's own or the tester spec's base.
 fn base_config(request: &JobRequest) -> Option<&BacktestConfig> {
     match request {
-        JobRequest::Download(_) => None,
+        JobRequest::Download(_) | JobRequest::Plan(_) => None,
         JobRequest::Backtest(c) => Some(c),
         JobRequest::Sweep(s) => Some(&s.base),
         JobRequest::Oos(s) => Some(&s.sweep.base),
@@ -266,14 +266,15 @@ fn read_data(store: &Store, config: &BacktestConfig) -> Result<StoreData, ApiErr
     let (from, to) = data_range(config)?;
     let in_range = |c: &Candle| (from..to).contains(&c.open_time);
     let (mut minutes, mut ask_minutes) = (Vec::new(), Vec::new());
-    for month in Month::range(from, to) {
-        let stored = store.read_month(id, month)?;
+    let months = Month::range(from, to);
+    for (&month, stored) in months.iter().zip(store.read_months(id, &months)) {
+        let stored = stored?;
         ask_minutes.extend(
             month_asks(store, id, month, &stored)?
                 .into_iter()
                 .filter(in_range),
         );
-        minutes.extend(stored.into_iter().filter(in_range));
+        minutes.extend(stored.iter().copied().filter(in_range));
     }
     let gaps = missing_minutes(id.kind, &minutes, from, to);
     let loaded = resample(id.kind, &minutes, config.timeframe, false);
@@ -294,9 +295,10 @@ fn read_data(store: &Store, config: &BacktestConfig) -> Result<StoreData, ApiErr
 }
 
 /// Checks that the store holds a configuration's range well enough to run it, by the rules of
-/// [`load_run_data`], without keeping the data: the 1-minute candles are read a month at a time,
-/// and only the long gaps and whether any bar can be built are kept. A 400 for a bad range, a 422
-/// `data_missing` where `load_run_data` would refuse.
+/// [`load_run_data`], without keeping the data: the months' 1-minute candles are read together
+/// ([`Store::read_months`]) and gone through a month at a time, and only the long gaps and whether
+/// any bar can be built are kept. A 400 for a bad range, a 422 `data_missing` where
+/// `load_run_data` would refuse.
 pub fn check_run_data(store: &Store, config: &BacktestConfig) -> Result<(), ApiError> {
     let id = &config.instrument.id;
     let (from, to) = data_range(config)?;
@@ -307,14 +309,16 @@ pub fn check_run_data(store: &Store, config: &BacktestConfig) -> Result<(), ApiE
     let mut any_bar = false;
     // Minutes of a bucket that a month's end cuts, kept for the next month.
     let mut pending: Vec<Candle> = Vec::new();
-    for month in Month::range(from, to) {
+    let months = Month::range(from, to);
+    for (&month, stored) in months.iter().zip(store.read_months(id, &months)) {
         let (start, end) = (month.start().max(from), month.end().min(to));
-        let stored = store.read_month(id, month)?;
+        let stored = stored?;
         // Read only to check the month has them; the load reads them again with the bids.
         month_asks(store, id, month, &stored)?;
         let minutes: Vec<Candle> = stored
-            .into_iter()
+            .iter()
             .filter(|c| (start..end).contains(&c.open_time))
+            .copied()
             .collect();
         for gap in missing_minutes(id.kind, &minutes, start, end) {
             match open.as_mut() {
@@ -473,7 +477,7 @@ pub fn load_run_data(store: &Store, config: &BacktestConfig) -> Result<RunData, 
 
 /// A refusal at load time of a run whose data passed the check when it was accepted: the store
 /// changed while the run waited for a slot.
-fn changed_since_accepted(e: ApiError) -> ApiError {
+pub(super) fn changed_since_accepted(e: ApiError) -> ApiError {
     if e.body.code != "data_missing" {
         return e;
     }
@@ -527,8 +531,8 @@ fn execute(
     ctx.checkpoint()?;
     let progress = |done: usize, total: usize| report_progress(ctx, done, total);
     let saved = match request {
-        JobRequest::Download(_) => {
-            return Err(ApiError::internal("a download is not a run").into());
+        JobRequest::Download(_) | JobRequest::Plan(_) => {
+            return Err(ApiError::internal("not a single run").into());
         }
         JobRequest::Backtest(config) => {
             ctx.progress(0.0, "running the backtest");
@@ -556,7 +560,7 @@ fn execute(
     // A cancel that came in during the last steps still wins: nothing is saved.
     ctx.checkpoint()?;
     ctx.progress(1.0, "saving the result");
-    let id = save_run(&saved, &report, runs_dir)?;
+    let id = save_run(&saved, &report, &[], runs_dir)?;
     let done = RunDone {
         summary: saved.summary(id.clone()),
         run_id: id,
@@ -575,7 +579,7 @@ fn execute(
 /// run has already split off, so a second run would make no progress, and not see its cancel,
 /// until the first finished. With a pool each, two runs share the cores through the operating
 /// system, and a cancel stops a run after the backtest each of its threads has in hand.
-fn own_pool<T: Send>(work: impl FnOnce() -> T + Send) -> Result<T, JobError> {
+pub(super) fn own_pool<T: Send>(work: impl FnOnce() -> T + Send) -> Result<T, JobError> {
     let pool = rayon::ThreadPoolBuilder::new()
         .build()
         .map_err(|e| ApiError::internal(format!("cannot start the run's threads: {e}")))?;
@@ -600,11 +604,17 @@ fn report_progress(ctx: &JobCtx, done: usize, total: usize) -> ControlFlow<()> {
     ControlFlow::Continue(())
 }
 
-/// Saves a run with its data report, both in one atomic save.
-pub fn save_run(saved: &SavedRun, report: &DataReport, runs_dir: &Path) -> Result<RunId, JobError> {
+/// Saves a run with its data report and any `extra` files, all in one atomic save.
+pub fn save_run(
+    saved: &SavedRun,
+    report: &DataReport,
+    extra: &[(&str, &[u8])],
+    runs_dir: &Path,
+) -> Result<RunId, JobError> {
     let json = serde_json::to_vec_pretty(report)
         .map_err(|e| ApiError::internal(format!("cannot write the data report: {e}")))?;
-    let files = [(DATA_REPORT_FILE, json.as_slice())];
+    let mut files = vec![(DATA_REPORT_FILE, json.as_slice())];
+    files.extend_from_slice(extra);
     // Two identical results saved in the same millisecond get the same id; the retry lands in a
     // later millisecond.
     let mut attempt = td_engine::save_with_files(saved, runs_dir, &files);
@@ -709,6 +719,12 @@ pub(super) async fn job_result(
                 format!("job {id} is {:?}, not done yet", job.status).to_lowercase(),
             ));
         }
+        _ if matches!(job.result, Some(JobResult::Plan(_))) => {
+            return Err(no_result(format!(
+                "job {id} ran a test plan, which saves one run per instrument; their ids are in \
+                 GET /jobs/{id} (`result.instruments`), each at GET /runs/{{run_id}}"
+            )));
+        }
         JobStatus::Failed => {
             let why = job.error.map(|e| e.message).unwrap_or_default();
             return Err(no_result(format!(
@@ -764,7 +780,7 @@ fn engine_error(e: EngineError) -> ApiError {
 
 /// Tester errors from what the client asked for are 400s: `invalid_spec` for the spec and
 /// `no_qualifying_run` when no parameter set made enough trades.
-fn tester_error(e: TesterError) -> ApiError {
+pub(super) fn tester_error(e: TesterError) -> ApiError {
     match e {
         TesterError::Engine(e) => engine_error(e),
         TesterError::InvalidSpace { .. }
@@ -834,6 +850,7 @@ mod tests {
             warmup_from: None,
             close_at_end: false,
             max_leverage: 1.0,
+            account_currency: td_core::AccountCurrency::Quote,
         }
     }
 

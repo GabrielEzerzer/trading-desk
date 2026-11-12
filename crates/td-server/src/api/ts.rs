@@ -17,6 +17,7 @@ use super::data::{
 };
 use super::error::{ErrorBody, ErrorResponse};
 use super::jobs::{JobCreated, JobInfo, JobKind, JobRequest, JobResult, JobStatus};
+use super::plans::{PlanDone, PlanInstrumentDone, PlanRequest, VerdictSummary};
 use super::runs::{DataReport, RunCheck, RunDetail, RunDone, ToleratedBucket};
 use super::sessions::{PositionInfo, SessionState, SessionSummary, StartSessionRequest};
 use super::ws::{ClientMessage, ServerMessage};
@@ -70,6 +71,7 @@ pub fn render() -> String {
         td_core::OrderRequest,
         td_core::Liquidity,
         td_core::Fill,
+        td_core::AccountCurrency,
         td_engine::ParamKind,
         td_engine::ParamValue,
         td_engine::ParamSpec,
@@ -132,6 +134,25 @@ pub fn render() -> String {
         td_engine::Criterion,
         td_engine::VerdictState,
         td_engine::Verdict,
+        td_engine::PlanRun,
+        td_engine::BatteryResult,
+        td_engine::IntegrityReport,
+        td_engine::IntegrityInputs,
+        td_engine::EvidenceInputs,
+        td_engine::KindInputs,
+        td_engine::OosIntegrityInputs,
+        td_engine::PlateauReport,
+        td_engine::stats::MeanBootstrap,
+        td_engine::stats::DrawdownBootstrap,
+        td_engine::stats::Quantiles,
+        td_engine::stats::PropFirmOdds,
+        td_engine::Breakdown,
+        td_engine::SideResult,
+        td_engine::RegimeResult,
+        td_engine::CostStress,
+        td_engine::StartOffset,
+        td_engine::PermutationSpec,
+        td_engine::PermutationResult,
         // the API
         Handshake,
         ErrorResponse,
@@ -161,6 +182,10 @@ pub fn render() -> String {
         JobRequest,
         JobResult,
         RunDone,
+        PlanRequest,
+        PlanDone,
+        PlanInstrumentDone,
+        VerdictSummary,
         RunDetail,
         RunCheck,
         DataReport,

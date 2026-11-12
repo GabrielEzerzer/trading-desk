@@ -57,6 +57,8 @@ Each report starts with the verdict, then the setup (data, dropped buckets, fund
 
 A case with fills but no paired trades fails, as a case with no paired fills does.
 
+On both series every trade's exported net P&L must equal its `gross_pnl - fees - funding` (funding paid is positive) within 1e-6 relative or the money floor, in both engines' exports. The other trade checks compare P&L before funding, so they would not see a wrong net figure.
+
 Both sections end with the metrics computed with our formulas from each engine's equity curve. "Differences and their reasons" lists every difference the report found with its explanation; anything listed there as unexplained fails the case. A failure whose cause is known still fails, and the list names the cause and the checks that fail from it. Two causes are named so far: a stop-limit that Nautilus's bar walk fills on a later bar than ours (case 9), and fills our broker rounds to the instrument's current tick where the bars carry prices off it, found when every differing price is our model's price rounded to the tick against the order (case 6): on the gapless bars Nautilus's price rounded, on the real bars the price our fill model gives before the rounding, where the bars' prices are off the tick. Only the price-derived checks (prices, quantities, fees, trade amounts, equity and their bounds) are put on either cause; any other failing check is listed as unexplained.
 
 ## How the two engines are lined up
