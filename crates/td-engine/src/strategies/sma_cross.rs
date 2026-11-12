@@ -9,7 +9,9 @@
 //! To add a strategy, copy this file and edit it. In `src/strategies/private/` it is found on its
 //! own; here, as an example, it also needs `pub mod` in `mod.rs` and a line in the registry.
 
-use td_core::{Candle, InstrumentId, InstrumentKind, OrderType, Side, Timeframe, Venue};
+use td_core::{
+    AccountCurrency, Candle, InstrumentId, InstrumentKind, OrderType, Side, Timeframe, Venue,
+};
 
 use crate::strategies::{affordable_qty, direction, order};
 use crate::{
@@ -160,6 +162,7 @@ fn plan() -> TestPlan {
             // Each instrument takes the backtest config's default slippage; list a
             // SlippageOverride here to set one.
             slippage: Vec::new(),
+            account_currency: AccountCurrency::Quote,
         },
         sweep: SweepPlan {
             fixed: Params::new(),

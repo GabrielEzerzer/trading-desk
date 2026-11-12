@@ -15,10 +15,12 @@ use tokio_tungstenite::{WebSocketStream, connect_async};
 pub(crate) const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 pub(crate) const MAX_BACKOFF: Duration = Duration::from_secs(30);
 
-/// Binance pushes a kline update every two seconds and Bybit answers a ping every 20 seconds, so
-/// this long with no frame at all means the connection is dead even if TCP never said so (a
-/// half-open socket after a Wi-Fi drop or NAT expiry): treat it as a disconnect.
-const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+/// Binance pushes a kline update every two seconds and Bybit at least once a minute, so this long
+/// with no frame but heartbeats (the venue's pings, or answers to ours) means the connection is dead even if TCP never said so (a
+/// half-open socket after a Wi-Fi drop or NAT expiry), or that the venue is not sending the topic
+/// (a refused subscription, a topic that went quiet): treat it as a disconnect, so the reader
+/// reconnects and subscribes again.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// A drop mid-handshake leaves the peer silent rather than closed, so a connect (TCP, TLS and the
 /// WebSocket upgrade) still unfinished after this long is given up and retried.
@@ -32,6 +34,9 @@ const STABLE_CONNECTION: Duration = Duration::from_secs(60);
 pub struct Greeting {
     pub subscribe: Option<String>,
     pub heartbeat: Option<(Duration, String)>,
+    /// Tells the venue's answer to the heartbeat from other text frames. Answers do not count as
+    /// traffic for the idle timeout: a connection that only answers heartbeats carries no bars.
+    pub pong: Option<fn(&str) -> bool>,
 }
 
 /// What the reader sends down its channel.
@@ -43,6 +48,9 @@ pub(crate) enum Inbound {
         error: String,
     },
     Text(String),
+    /// This many text frames were dropped on a full channel since the last report. Sent ahead of
+    /// the next frame that fits.
+    Dropped(u64),
     /// The connection ended; the reader will reconnect.
     Disconnected {
         reason: String,
@@ -53,9 +61,11 @@ pub(crate) enum Inbound {
 ///
 /// Frames go out with `try_send`: when the channel is full the frame is dropped rather than waited
 /// on, because a reader stuck on a full channel stops answering pings and loses the connection. A
-/// dropped closed bar shows up later as a gap, which the feed backfills.
+/// dropped closed bar shows up later as a gap, which the feed backfills. The drops are counted and
+/// reported as [`Inbound::Dropped`] once a frame fits again.
 pub(crate) async fn run_reader(url: String, greeting: Greeting, tx: mpsc::Sender<Inbound>) {
     let mut backoff = INITIAL_BACKOFF;
+    let mut dropped = 0;
     loop {
         let connected = match timeout(CONNECT_TIMEOUT, connect_async(&url)).await {
             Ok(result) => result.map_err(|error| error.to_string()),
@@ -79,7 +89,7 @@ pub(crate) async fn run_reader(url: String, greeting: Greeting, tx: mpsc::Sender
             return;
         }
         let opened = Instant::now();
-        let Some(reason) = read_until_closed(socket, &greeting, &tx).await else {
+        let Some(reason) = read_until_closed(socket, &greeting, &tx, &mut dropped).await else {
             return;
         };
         if tx.send(Inbound::Disconnected { reason }).await.is_err() {
@@ -95,11 +105,13 @@ pub(crate) async fn run_reader(url: String, greeting: Greeting, tx: mpsc::Sender
     }
 }
 
-/// Pumps one connection. Returns how it ended, or `None` when the receiver is gone.
+/// Pumps one connection, adding the text frames it drops to `dropped` until they are reported.
+/// Returns how it ended, or `None` when the receiver is gone.
 async fn read_until_closed<S>(
     mut socket: WebSocketStream<S>,
     greeting: &Greeting,
     tx: &mpsc::Sender<Inbound>,
+    dropped: &mut u64,
 ) -> Option<String>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -120,7 +132,7 @@ where
         let message = tokio::select! {
             message = socket.next() => message,
             () = sleep_until(last_frame + IDLE_TIMEOUT) => {
-                return Some(format!("no frames for {}s", IDLE_TIMEOUT.as_secs()));
+                return Some(format!("no data for {}s", IDLE_TIMEOUT.as_secs()));
             }
             _ = heartbeat.tick(), if greeting.heartbeat.is_some() => {
                 if let Some((_, text)) = &greeting.heartbeat
@@ -131,12 +143,27 @@ where
                 continue;
             }
         };
-        last_frame = Instant::now();
+        // Heartbeats (the venue's pings, and answers to ours) say nothing about the topic.
+        let heartbeat = match (&message, greeting.pong) {
+            (Some(Ok(Message::Ping(_))), _) => true,
+            (Some(Ok(Message::Text(text))), Some(is_pong)) => is_pong(text),
+            _ => false,
+        };
+        if !heartbeat {
+            last_frame = Instant::now();
+        }
         match message {
-            Some(Ok(Message::Text(text))) => match tx.try_send(Inbound::Text(text.to_string())) {
-                Ok(()) | Err(TrySendError::Full(_)) => {}
-                Err(TrySendError::Closed(_)) => return None,
-            },
+            Some(Ok(Message::Text(text))) => {
+                // The count goes ahead of the frame; when it does not fit, neither does the frame.
+                if *dropped > 0 && tx.try_send(Inbound::Dropped(*dropped)).is_ok() {
+                    *dropped = 0;
+                }
+                match tx.try_send(Inbound::Text(text.to_string())) {
+                    Ok(()) => {}
+                    Err(TrySendError::Full(_)) => *dropped += 1,
+                    Err(TrySendError::Closed(_)) => return None,
+                }
+            }
             Some(Ok(Message::Ping(payload))) => {
                 if let Err(error) = socket.send(Message::Pong(payload)).await {
                     return Some(format!("pong failed: {error}"));
@@ -173,9 +200,11 @@ mod tests {
         let greeting = Greeting {
             subscribe: Some("sub".into()),
             heartbeat: Some((Duration::from_secs(25), "ping".into())),
+            pong: None,
         };
         let start = Instant::now();
-        let reader = tokio::spawn(async move { read_until_closed(socket, &greeting, &tx).await });
+        let reader =
+            tokio::spawn(async move { read_until_closed(socket, &greeting, &tx, &mut 0).await });
 
         let mut sent = Vec::new();
         // The exchange never answers: heartbeats go out, but they are not frames received.
@@ -187,14 +216,109 @@ mod tests {
                 break;
             }
         }
-        // Pings at 25 s and 50 s; the exchange's silence ends the connection at 60 s.
+        // Pings go out every 25 s; the exchange's silence ends the connection at 90 s.
         assert_eq!(sent, ["sub", "ping", "ping"]);
         let ended = timeout(Duration::from_secs(120), reader)
             .await
             .expect("still reading long after the idle timeout")
             .expect("reader task");
-        assert_eq!(ended.as_deref(), Some("no frames for 60s"));
-        assert_eq!(start.elapsed().as_secs(), 60);
+        assert_eq!(ended.as_deref(), Some("no data for 90s"));
+        assert_eq!(start.elapsed().as_secs(), 90);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_connection_that_only_answers_heartbeats_still_times_out() {
+        let (socket, mut exchange) = socket_pair().await;
+        let (tx, mut rx) = mpsc::channel(16);
+        let greeting = Greeting {
+            subscribe: None,
+            heartbeat: Some((Duration::from_secs(20), "ping".into())),
+            pong: Some(|text| text == "pong"),
+        };
+        let start = Instant::now();
+        let reader =
+            tokio::spawn(async move { read_until_closed(socket, &greeting, &tx, &mut 0).await });
+        // The exchange answers every ping, and sends one bar, at 10 s, but nothing else.
+        let exchange = tokio::spawn(async move {
+            sleep(Duration::from_secs(10)).await;
+            exchange.send(Message::text("bar")).await.expect("send");
+            while let Some(Ok(Message::Text(ping))) = exchange.next().await {
+                assert_eq!(ping.as_str(), "ping");
+                if exchange.send(Message::text("pong")).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let ended = timeout(Duration::from_secs(300), reader)
+            .await
+            .expect("the pongs kept the connection open")
+            .expect("reader task");
+        assert_eq!(ended.as_deref(), Some("no data for 90s"));
+        // Ninety seconds after the bar. The pongs are still handed on.
+        assert_eq!(start.elapsed().as_secs(), 100);
+        assert_eq!(rx.recv().await, Some(Inbound::Text("bar".into())));
+        assert_eq!(rx.recv().await, Some(Inbound::Text("pong".into())));
+        exchange.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_connection_the_venue_only_pings_still_times_out() {
+        let (socket, mut exchange) = socket_pair().await;
+        let (tx, _rx) = mpsc::channel(16);
+        let greeting = Greeting {
+            subscribe: None,
+            heartbeat: None,
+            pong: None,
+        };
+        let start = Instant::now();
+        let reader =
+            tokio::spawn(async move { read_until_closed(socket, &greeting, &tx, &mut 0).await });
+        // The venue pings every 20 s, as Binance does, and sends nothing else.
+        let exchange = tokio::spawn(async move {
+            loop {
+                sleep(Duration::from_secs(20)).await;
+                if exchange
+                    .send(Message::Ping(Vec::new().into()))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                let _ = exchange.next().await;
+            }
+        });
+        let ended = timeout(Duration::from_secs(300), reader)
+            .await
+            .expect("the pings kept the connection open")
+            .expect("reader task");
+        assert_eq!(ended.as_deref(), Some("no data for 90s"));
+        assert_eq!(start.elapsed().as_secs(), 90);
+        exchange.abort();
+    }
+
+    #[tokio::test]
+    async fn frames_dropped_on_a_full_channel_are_counted_and_reported_ahead_of_the_next_one() {
+        let (socket, mut exchange) = socket_pair().await;
+        let (tx, mut rx) = mpsc::channel(2);
+        let reader = tokio::spawn(async move {
+            read_until_closed(socket, &Greeting::default(), &tx, &mut 0).await
+        });
+        for text in ["a", "b", "c", "d"] {
+            exchange.send(Message::text(text)).await.expect("send");
+        }
+        // The reader answers the ping after it has handled every frame before it.
+        exchange
+            .send(Message::Ping(vec![1].into()))
+            .await
+            .expect("ping");
+        assert!(matches!(exchange.next().await, Some(Ok(Message::Pong(_)))));
+        assert_eq!(rx.recv().await, Some(Inbound::Text("a".into())));
+        assert_eq!(rx.recv().await, Some(Inbound::Text("b".into())));
+        // "c" and "d" found the channel full.
+        exchange.send(Message::text("e")).await.expect("send");
+        assert_eq!(rx.recv().await, Some(Inbound::Dropped(2)));
+        assert_eq!(rx.recv().await, Some(Inbound::Text("e".into())));
+        reader.abort();
     }
 
     #[tokio::test]

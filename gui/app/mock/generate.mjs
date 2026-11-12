@@ -272,6 +272,17 @@ function metricsReport(curve, list, short) {
     turnover: list.length ? 3.1 : null,
     fees_paid: round(list.reduce((a, t) => a + t.fees, 0), 2),
     funding_paid: 0,
+    // No intrabar ranges, stops or leverage figures, as in a result saved before the engine had them.
+    max_drawdown_intrabar: null,
+    static_drawdown: null,
+    static_drawdown_intrabar: null,
+    worst_daily_loss: null,
+    worst_daily_loss_intrabar: null,
+    peak_leverage: null,
+    expectancy_r: null,
+    payoff_ratio: wins.length && losses.length ? round(wins.reduce((a, b) => a + b, 0) / wins.length / (grossLoss / losses.length), 2) : null,
+    longest_losing_streak: pnl.reduce(([run, best], x) => (x <= 0 ? [run + 1, Math.max(best, run + 1)] : [0, best]), [0, 0])[1],
+    force_closed_trades: 0,
   }
 }
 
@@ -305,6 +316,12 @@ function savedBacktest({ id, strategy, params, instrument, from, days, walk, tra
       net_pnl: round(gross - fees, 2),
       return_on_notional: round((gross - fees) / (t.entryPrice * qty), 4),
       bars_held: Math.max(1, Math.round((exitTime - t.entryTime) / DAY)),
+      // No stops or excursions, as in a result saved before trades had them.
+      stop: null,
+      r_multiple: null,
+      mae: null,
+      mfe: null,
+      force_closed: false,
     }
   })
   const to = from + days * DAY
@@ -319,9 +336,12 @@ function savedBacktest({ id, strategy, params, instrument, from, days, walk, tra
     metrics: metricsReport(relative, [], short),
     excess_return: null,
     correlation: null,
+    alpha: null,
+    beta: null,
   }
   const metrics = metricsReport(s.equity, list, short)
-  const result = { config, engine_version: '0.1.0', engine_revision: 3, data_fingerprint: 'f'.repeat(64), equity, orders: [], fills: [], trades: list, metrics, benchmark }
+  // No intrabar ranges: the engine leaves `equity_extremes` empty in results saved before it had them.
+  const result = { config, engine_version: '0.1.0', engine_revision: 3, data_fingerprint: 'f'.repeat(64), equity, orders: [], fills: [], trades: list, metrics, benchmark, equity_extremes: [] }
   const detail = {
     id,
     run: { kind: 'backtest', result },
@@ -399,7 +419,7 @@ const donchianRun = savedBacktest({
   openLast: true,
 })
 
-/** GET /data/coverage's months for a stored range, one entry per calendar month. */
+/** GET /data/coverage's months for a stored range, one entry per calendar month, at about 40 bytes a stored minute. */
 function coverageMonths(from, to) {
   const months = []
   for (let t = from; t < to; ) {
@@ -408,7 +428,8 @@ function coverageMonths(from, to) {
     const next = Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 1)
     const end = Math.min(to, next)
     const month = `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`
-    months.push({ month, minutes: (end - t) / 60_000, month_minutes: (next - monthStart) / 60_000, first: t, last: end - 60_000, gaps: [] })
+    const minutes = (end - t) / 60_000
+    months.push({ month, minutes, month_minutes: (next - monthStart) / 60_000, first: t, last: end - 60_000, gaps: [], bytes: minutes * 40 })
     t = end
   }
   return months
@@ -417,12 +438,37 @@ function coverageMonths(from, to) {
 const paramSpecs = (...specs) =>
   specs.map(([name, kind, value, min, max, description]) => ({ name, kind, default: value, min, max, description }))
 
+// The test plan and verdict rule every engine strategy carries, shaped like sma_cross's own. The Lab
+// does not read them yet.
+const plan = {
+  instruments: [BTC_PERP.id],
+  timeframe: '1d',
+  period: { from: ENGINE_FROM, to: Date.UTC(2025, 6, 1) },
+  backtest: { starting_cash: STARTING_CASH, max_leverage: 1, slippage: [] },
+  sweep: { fixed: {}, axes: [], objective: { metric: 'sharpe', direction: 'maximize' }, min_trades: 10 },
+  walk_forward: { train_days: 180, test_days: 60 },
+  out_of_sample: { fraction: 0.7 },
+  evidence: {
+    min_sample: { trades: 30, days: 180, windows: 4 },
+    luck: { permutations: 199, pass_p: 0.05, inconclusive_p: 0.1 },
+    cost_stress: 2,
+    plateau: { min_median_ratio: 0.6, min_positive_share: 0.8 },
+    start_offsets: 8,
+  },
+}
+const rule = {
+  kind: 'portfolio',
+  benchmark: 'buy_and_hold',
+  limits: { min_sharpe: 1, max_drawdown: 0.3, max_drawdown_vs_benchmark: 0.75, min_alpha: 0, max_p_mean_not_positive: 0.1, max_resampled_drawdown: 0.45 },
+}
+const strategy = (name, description, params) => ({ name, description, params, kind: rule.kind, plan, rule })
+
 const engine = {
   strategies: [
-    { name: 'sma_cross', description: fixtures.strategies[0].description, params: paramSpecs(['fast', 'int', 10, 2, 200, 'Fast average length, in bars.'], ['slow', 'int', 30, 3, 400, 'Slow average length, in bars.']) },
-    { name: 'rsi_reversion', description: fixtures.strategies[1].description, params: paramSpecs(['period', 'int', 14, 2, 100, 'RSI length, in bars.'], ['oversold', 'float', 30, 1, 50, 'The RSI level to buy below.']) },
-    { name: 'donchian_breakout', description: fixtures.strategies[2].description, params: paramSpecs(['channel', 'int', 20, 5, 200, 'Channel length, in bars.']) },
-    { name: 'funding_carry', description: fixtures.strategies[3].description, params: [] },
+    strategy('sma_cross', fixtures.strategies[0].description, paramSpecs(['fast', 'int', 10, 2, 200, 'Fast average length, in bars.'], ['slow', 'int', 30, 3, 400, 'Slow average length, in bars.'])),
+    strategy('rsi_reversion', fixtures.strategies[1].description, paramSpecs(['period', 'int', 14, 2, 100, 'RSI length, in bars.'], ['oversold', 'float', 30, 1, 50, 'The RSI level to buy below.'])),
+    strategy('donchian_breakout', fixtures.strategies[2].description, paramSpecs(['channel', 'int', 20, 5, 200, 'Channel length, in bars.'])),
+    strategy('funding_carry', fixtures.strategies[3].description, []),
   ],
   instruments: [BTC_PERP, ETH_SPOT, BTC_SPOT],
   // Stored minutes per instrument, keyed `venue:symbol:kind`.

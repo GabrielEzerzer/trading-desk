@@ -791,7 +791,8 @@ fn engine_error(e: EngineError) -> ApiError {
         | EngineError::UnknownStrategy(_)
         | EngineError::InvalidParam { .. }
         | EngineError::NoBarsInRange { .. }
-        | EngineError::FundingOnSpot => {
+        | EngineError::FundingOnSpot
+        | EngineError::StrategyFailed(_) => {
             ApiError::new(StatusCode::BAD_REQUEST, "invalid_config", e.to_string())
         }
         e => ApiError::internal(e.to_string()),
@@ -1194,6 +1195,36 @@ mod tests {
 
     fn span_of(from: Millis, to: Millis) -> GapInfo {
         GapInfo::from(&Gap { from, to })
+    }
+
+    /// A strategy that stops the run over what was asked for answers 400 `invalid_config` with
+    /// its reason, from a backtest and from the tester alike.
+    #[test]
+    fn a_strategy_that_stops_the_run_is_400_invalid_config_with_its_reason() {
+        let t0 = parse_date("2024-03-01").unwrap();
+        // gotobi decides at 00:55 UTC, where no 15m bar closes.
+        let mut gotobi = config(InstrumentKind::Spot, t0, t0 + HOUR);
+        gotobi.strategy = "gotobi".into();
+        gotobi.timeframe = Timeframe::M15;
+        let bars: Vec<Candle> = minutes(t0, t0 + HOUR).into_iter().step_by(15).collect();
+        let failed = td_engine::run(&gotobi, &bars, &[], &[]).expect_err("gotobi refuses 15m bars");
+        assert!(matches!(failed, EngineError::StrategyFailed(_)), "{failed}");
+        for e in [
+            engine_error(failed.clone()),
+            tester_error(TesterError::Engine(failed)),
+        ] {
+            assert_eq!(
+                (e.status.as_u16(), e.body.code.as_str()),
+                (400, "invalid_config"),
+                "{}",
+                e.body.message
+            );
+            assert!(
+                e.body.message.contains("no 15m bar closes at both"),
+                "{}",
+                e.body.message
+            );
+        }
     }
 
     #[test]

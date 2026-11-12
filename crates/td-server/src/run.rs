@@ -12,7 +12,9 @@
 //! A session that has not fed a live bar yet (it stopped or crashed during warm-up, or after it
 //! but before its first live bar) warms up again instead: it is fed, as warm-up, the bars from the
 //! end of its log up to the last closed bar, at most [`WARM_UP_BARS`] of them, and goes live from
-//! the time it restarts. One restarted long after its log ends skips the bars in between, which the
+//! the time it restarts. A warm-up request that fails is retried; the bars that close while it
+//! retries arrive afterwards as backfilled live bars, and the strategy trades them, as on a
+//! resume. One restarted long after its log ends skips the bars in between, which the
 //! engine allows. It holds no position or orders then, so nothing is lost, but one stopped right
 //! after warm-up goes live at the restart rather than backfilling the bars it missed.
 
@@ -20,7 +22,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use td_core::{Candle, InstrumentId, Millis, Timeframe};
-use td_data::live::{FeedEvent, Rest, SharedStream, run_feed_on, stream_url};
+use td_data::live::{FeedEvent, Rest, SharedStream, retry_rest, run_feed_on, stream_url};
 use td_data::time::round_to_minute;
 use td_data::{DataError, Store};
 use tokio::sync::{mpsc, watch};
@@ -207,12 +209,8 @@ async fn drive(
             // From the end of the log, but never more than a full warm-up back.
             let earliest = end - WARM_UP_BARS * timeframe.duration_ms();
             let from = next.map_or(earliest, |n| n.max(earliest));
-            let (store, history_rest, history_id) =
-                (Store::new(data_dir), rest.clone(), id.clone());
-            let bars = blocking(move || {
-                warm_up_bars(&store, &*history_rest, &history_id, timeframe, from, end)
-            })
-            .await?;
+            let store = Store::new(data_dir);
+            let bars = warm_up_bars(shared, store, &rest, &id, timeframe, from, end).await?;
             let mut s = lock(shared);
             for bar in bars {
                 s.feed(bar, Vec::new(), true)?;
@@ -234,9 +232,12 @@ async fn drive(
     while let Some(event) = rx.recv().await {
         match event {
             FeedEvent::Connected => lock(shared).set_status(Status::Live),
-            FeedEvent::Disconnected { .. } | FeedEvent::ConnectFailed { .. } => {
-                lock(shared).set_status(Status::Reconnecting);
+            FeedEvent::Disconnected { reason } => {
+                let mut s = lock(shared);
+                s.set_status(Status::Reconnecting);
+                s.warn(format!("disconnected: {reason}"));
             }
+            FeedEvent::ConnectFailed { .. } => lock(shared).set_status(Status::Reconnecting),
             FeedEvent::BackfillFailed { error } => {
                 let mut s = lock(shared);
                 s.set_status(Status::Reconnecting);
@@ -244,6 +245,16 @@ async fn drive(
             }
             FeedEvent::BadMessage { error } => lock(shared).warn(error),
             FeedEvent::Dropped(open_time) => lock(shared).push_dropped(open_time),
+            FeedEvent::Tolerated {
+                open_time,
+                missing_minutes,
+            } => lock(shared).warn(format!(
+                "the bar at {open_time} was built with {missing_minutes} of its minutes missing"
+            )),
+            FeedEvent::FramesDropped { count } => lock(shared).warn(format!(
+                "{count} stream frames were dropped while the feed was behind; \
+                 the closed minutes among them are backfilled"
+            )),
             FeedEvent::Bar(bar) => {
                 let charged = match &mut funding {
                     Some(clock) => {
@@ -264,21 +275,34 @@ async fn drive(
 
 /// The bars of `timeframe` to warm up on, opening in `[from, end)`: from the local store as far as
 /// it has them, the rest over REST at the timeframe itself (one request rather than hundreds of
-/// pages of minutes).
-fn warm_up_bars(
-    store: &Store,
-    rest: &dyn Rest,
+/// pages of minutes). A failed request is retried with backoff, as a feed's backfill is, with a
+/// warning on the session each time.
+async fn warm_up_bars(
+    shared: &Mutex<PaperSession>,
+    store: Store,
+    rest: &Arc<dyn Rest>,
     id: &InstrumentId,
     timeframe: Timeframe,
     from: Millis,
     end: Millis,
-) -> Result<Vec<Candle>, DataError> {
-    let mut bars = store.load_candles(id, timeframe, from, end, false)?.candles;
+) -> Result<Vec<Candle>, PaperError> {
+    let stored_id = id.clone();
+    let mut bars = blocking(move || store.load_candles(&stored_id, timeframe, from, end, false))
+        .await?
+        .candles;
     let rest_from = bars
         .last()
         .map_or(from, |b| b.open_time + timeframe.duration_ms());
     if rest_from < end {
-        let fetched = rest.klines(id, timeframe, rest_from, end)?;
+        let (rest, id) = (Arc::clone(rest), id.clone());
+        let fetched = retry_rest(
+            move || rest.klines(&id, timeframe, rest_from, end),
+            |error| {
+                lock(shared).warn(format!("warm-up failed, retrying: {error}"));
+                std::future::ready(Ok::<(), PaperError>(()))
+            },
+        )
+        .await?;
         bars.extend(
             fetched
                 .into_iter()

@@ -184,6 +184,15 @@ pub enum FeedEvent {
     Bar(Candle),
     /// The bucket opening at this time had too many minutes missing and gives no bar.
     Dropped(Millis),
+    /// The bar of the bucket opening at `open_time`, sent just before, was built with this many
+    /// minutes missing, within the resampling rule's tolerance.
+    Tolerated {
+        open_time: Millis,
+        missing_minutes: u32,
+    },
+    /// This many stream frames were dropped because the feed fell behind the stream. A closed
+    /// minute among them shows up as a gap, which is backfilled.
+    FramesDropped { count: u64 },
     /// A REST backfill failed; the feed retries it after a backoff and emits nothing newer
     /// meanwhile.
     BackfillFailed { error: String },
@@ -270,7 +279,7 @@ impl SharedStream {
                     Inbound::Disconnected { .. } | Inbound::ConnectFailed { .. } => {
                         flag.store(false, Ordering::SeqCst);
                     }
-                    Inbound::Text(_) => {}
+                    Inbound::Text(_) | Inbound::Dropped(_) => {}
                 }
                 // No feed listening is fine; one that falls behind loses frames, recovered as a gap.
                 let _ = out.send(inbound);
@@ -371,7 +380,7 @@ fn run_on(
                 Ok(inbound) => inbound,
                 // The frames it missed show up as a gap at the next closed minute, which is
                 // backfilled.
-                Err(RecvError::Lagged(_)) => continue,
+                Err(RecvError::Lagged(count)) => Inbound::Dropped(count),
                 Err(RecvError::Closed) => break,
             };
             if feed.handle(inbound).await.is_err() {
@@ -418,6 +427,7 @@ impl Feed {
             Inbound::Connected => self.send(FeedEvent::Connected).await,
             Inbound::ConnectFailed { error } => self.send(FeedEvent::ConnectFailed { error }).await,
             Inbound::Disconnected { reason } => self.send(FeedEvent::Disconnected { reason }).await,
+            Inbound::Dropped(count) => self.send(FeedEvent::FramesDropped { count }).await,
             Inbound::Text(text) => match self.source.live().and_then(|live| live.parse(&text)) {
                 Err(e) => {
                     let error = e.to_string();
@@ -509,22 +519,12 @@ impl Feed {
     /// Fetches the minutes `[from, to)` over REST and takes them, retrying with backoff until the
     /// venue answers. Minutes the venue does not have are treated as missing.
     async fn backfill(&mut self, from: Millis, to: Millis) -> Result<(), Gone> {
-        let mut backoff = INITIAL_BACKOFF;
-        let minutes = loop {
-            let rest = Arc::clone(&self.rest);
-            let id = self.id.clone();
-            let fetched =
-                tokio::task::spawn_blocking(move || rest.klines(&id, Timeframe::M1, from, to))
-                    .await;
-            let error = match fetched {
-                Ok(Ok(minutes)) => break minutes,
-                Ok(Err(e)) => e.to_string(),
-                Err(e) => format!("the backfill task failed: {e}"),
-            };
-            self.send(FeedEvent::BackfillFailed { error }).await?;
-            tokio::time::sleep(backoff).await;
-            backoff = (backoff * 2).min(MAX_BACKOFF);
-        };
+        let (rest, id) = (Arc::clone(&self.rest), self.id.clone());
+        let minutes = retry_rest(
+            move || rest.klines(&id, Timeframe::M1, from, to),
+            |error| self.send(FeedEvent::BackfillFailed { error }),
+        )
+        .await?;
         let mut minutes: Vec<Candle> = minutes
             .into_iter()
             .filter(|m| (from..to).contains(&m.open_time))
@@ -550,7 +550,7 @@ impl Feed {
         self.emit(built).await
     }
 
-    /// Sends the bars and dropped buckets in time order.
+    /// Sends the bars and dropped buckets in time order, each tolerated bucket after its bar.
     async fn emit(&self, built: LoadedCandles) -> Result<(), Gone> {
         let mut events: Vec<(Millis, FeedEvent)> = built
             .candles
@@ -562,7 +562,15 @@ impl Feed {
                     .into_iter()
                     .map(|t| (t, FeedEvent::Dropped(t))),
             )
+            .chain(built.tolerated.into_iter().map(|(open_time, missing)| {
+                let event = FeedEvent::Tolerated {
+                    open_time,
+                    missing_minutes: missing,
+                };
+                (open_time, event)
+            }))
             .collect();
+        // Stable, so a tolerated bucket stays after its bar.
         events.sort_by_key(|(t, _)| *t);
         for (_, event) in events {
             self.send(event).await?;
@@ -576,6 +584,31 @@ impl Feed {
             Out::Chart { tx, .. } => tx.send(ChartEvent::Feed(event)).await.is_ok(),
         };
         if sent { Ok(()) } else { Err(Gone) }
+    }
+}
+
+/// Runs a blocking REST call off the async threads until it succeeds, waiting from 1 s up to 30 s
+/// between tries. Each failure is first handed to `failed`, whose error stops the retries.
+pub async fn retry_rest<T, E, Fut>(
+    call: impl Fn() -> Result<T, DataError> + Send + Sync + 'static,
+    mut failed: impl FnMut(String) -> Fut,
+) -> Result<T, E>
+where
+    T: Send + 'static,
+    Fut: Future<Output = Result<(), E>>,
+{
+    let call = Arc::new(call);
+    let mut backoff = INITIAL_BACKOFF;
+    loop {
+        let attempt = Arc::clone(&call);
+        let error = match tokio::task::spawn_blocking(move || attempt()).await {
+            Ok(Ok(value)) => return Ok(value),
+            Ok(Err(e)) => e.to_string(),
+            Err(e) => format!("the REST task failed: {e}"),
+        };
+        failed(error).await?;
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(MAX_BACKOFF);
     }
 }
 
