@@ -1870,7 +1870,8 @@ candles: Array<Candle>,
  */
 from_venue: Array<BarSpan>, 
 /**
- * Slots in `[from, to)` with no bar in the store or at the venue.
+ * Slots in `[from, to)` with no bar in the store or at the venue, apart from those wholly
+ * inside the market's closed hours (an FX weekend), which have no bar to miss.
  */
 missing: Array<BarSpan>, };
 

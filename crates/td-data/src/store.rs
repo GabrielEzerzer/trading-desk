@@ -18,13 +18,15 @@
 //! `ask_open`, `ask_high`, `ask_low` and `ask_close`, written together by [`Store::write_quotes`]
 //! under one lock and one rename, so a minute is never stored on one side only. Readers select
 //! columns by name, so [`Store::read_month`] reads the bids of such a file as it reads a crypto
-//! file, and the listing and delete treat it as any other month file. A kind without quotes is
-//! written by [`Store::write_candles`], with no ask columns.
+//! file, [`Store::read_quote_months`] reads the bids and asks together in one read of the file, and
+//! the listing and delete treat it as any other month file. A kind without quotes is written by
+//! [`Store::write_candles`], with no ask columns.
 //!
 //! Deleting ([`Store::delete_months`], [`Store::delete_instrument`]) is the one way data leaves the
 //! store. A delete takes the same lock a writer takes, removes the data file and any temp files a
-//! crashed writer left beside it, and lets the lock go. It leaves the sidecar and the folders as
-//! they are, and never follows a link (a symlink or a junction) out of the data folder.
+//! crashed writer left beside it or in its place, and lets the lock go. It leaves the sidecar and
+//! the folders as they are, and never follows a link (a symlink or a junction) out of the data
+//! folder.
 //!
 //! A [`Store`] keeps the month files it has decoded in memory, so the coverage, the check before a
 //! run and the run's load, which read the same months seconds apart, decode each file once. An
@@ -68,8 +70,20 @@ const CANDLE_COLUMNS: [&str; 7] = [
 /// The ask candle's prices beside the bid candle, in the month file of a kind with quotes. The ask
 /// series has no volume of its own.
 const ASK_COLUMNS: [&str; 4] = ["ask_open", "ask_high", "ask_low", "ask_close"];
-/// What [`Store::read_month_asks`] reads.
-const ASK_READ_COLUMNS: [&str; 5] = ["open_time", "ask_open", "ask_high", "ask_low", "ask_close"];
+/// What a read of a month's bids and asks together reads: the candle columns, then the ask prices.
+const QUOTE_COLUMNS: [&str; 11] = [
+    "open_time",
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "quote_volume",
+    "ask_open",
+    "ask_high",
+    "ask_low",
+    "ask_close",
+];
 const FUNDING_COLUMNS: [&str; 2] = ["time", "rate"];
 /// The most decoded candles one [`Store`] keeps in memory, in bytes: five years of one instrument's
 /// 1-minute candles is about 147 MB, and BTCUSDT since 2017 about 272 MB. A range larger than
@@ -144,6 +158,9 @@ fn missing_among(
     gaps
 }
 
+/// A month's bid candles and its ask candles, one ask per bid with the same open time.
+pub type MonthQuotes = (Arc<Vec<Candle>>, Arc<Vec<Candle>>);
+
 /// What one write did.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct WriteReport {
@@ -204,7 +221,10 @@ pub struct StoredData {
     /// Each instrument with at least one month file or a funding file, in instrument order.
     pub instruments: Vec<StoredInstrument>,
     /// Entries under `candles/` and `funding/` that name no venue, kind, symbol or month the store
-    /// writes, relative to the store root. They are left alone: nothing lists or deletes them.
+    /// writes, and temp files of a month whose month file is absent, relative to the store root.
+    /// Such a temp file is left by a writer killed before its first rename of the month (or, for
+    /// the moment it lasts, is a first write in progress), and a delete of its month removes it.
+    /// Nothing reads these entries, and nothing deletes the others.
     pub unrecognised: Vec<PathBuf>,
 }
 
@@ -370,9 +390,10 @@ impl Store {
         )
     }
 
-    /// Merges rows, already checked, into their month files: for each month, under its lock, reads
-    /// what is stored, lets each new row replace a stored one with the same open time, and writes
-    /// the month back atomically.
+    /// Merges rows, already checked, into their month files: takes every month's lock, reads what
+    /// each month stores, lets each new row replace a stored one with the same open time, and only
+    /// then writes each month back atomically, so a month that cannot be read (a bad file, or an
+    /// FX file without its asks) refuses the batch before any month is written.
     fn merge_months<T: Copy>(
         &self,
         id: &InstrumentId,
@@ -395,15 +416,25 @@ impl Store {
         ) else {
             return Ok(report);
         };
+        let paths = by_month
+            .keys()
+            .map(|&month| self.candle_path(id, month))
+            .collect::<Result<Vec<_>, _>>()?;
+        // Taken month by month, oldest first, each in-process lock before its OS lock: every
+        // writer takes them in that order, so two writers of overlapping months never each hold
+        // one the other waits for.
+        let locks: Vec<_> = paths.iter().map(|path| file_lock(path)).collect();
+        let mut held = Vec::with_capacity(paths.len());
+        for (path, lock) in paths.iter().zip(&locks) {
+            let guard = hold(lock);
+            held.push((guard, lock_across_processes(path)?));
+        }
         let mut merged_span = Vec::new();
-        for (month, new) in by_month {
-            let path = self.candle_path(id, month)?;
-            let lock = file_lock(&path);
-            let _held = hold(&lock);
-            let _locked = lock_across_processes(&path)?;
+        let mut batches = Vec::with_capacity(paths.len());
+        for ((month, new), path) in by_month.into_iter().zip(&paths) {
             // The rows merged into are decoded under the lock, never taken from memory: a stale
             // entry here would be written back over another process's rows.
-            self.months.forget(&path);
+            self.months.forget(path);
             let mut merged: BTreeMap<Millis, T> = read(month)?
                 .into_iter()
                 .map(|r| (open_time(&r), r))
@@ -414,12 +445,7 @@ impl Store {
                 }
             }
             let merged: Vec<T> = merged.into_values().collect();
-            let written = write_atomic(&path, &batch(&merged)?);
-            // Even a failed write may have replaced the file, so its decoded rows are dropped
-            // either way.
-            self.months.forget(&path);
-            written?;
-            report.months.push(month);
+            batches.push((month, path, batch(&merged)?));
             merged_span.extend(
                 merged
                     .iter()
@@ -427,6 +453,15 @@ impl Store {
                     .filter(|t| (first..=last).contains(t)),
             );
         }
+        for (month, path, batch) in batches {
+            let written = write_atomic(path, &batch);
+            // Even a failed write may have replaced the file, so its decoded rows are dropped
+            // either way.
+            self.months.forget(path);
+            written?;
+            report.months.push(month);
+        }
+        drop(held);
         report.gaps = missing_among(id.kind, merged_span, first, last + MINUTE);
         Ok(report)
     }
@@ -457,6 +492,7 @@ impl Store {
     /// [`Store::read_month`], shared with the cache instead of copied.
     fn month_rows(&self, id: &InstrumentId, month: Month) -> Result<Arc<Vec<Candle>>, DataError> {
         self.read_rows(id, month, &CANDLE_COLUMNS, |_| Ok(()))
+            .map(|rows| rows.candles)
     }
 
     /// One month of the 1-minute ask candles of a kind whose rules require quotes, sorted, with the
@@ -468,28 +504,42 @@ impl Store {
         id: &InstrumentId,
         month: Month,
     ) -> Result<Vec<Candle>, DataError> {
-        self.month_ask_rows(id, month).map(Arc::unwrap_or_clone)
+        self.quote_rows(id, month)
+            .map(|(_, asks)| Arc::unwrap_or_clone(asks))
     }
 
-    /// [`Store::read_month_asks`], shared with the cache instead of copied.
-    fn month_ask_rows(
+    /// The bids and asks of each of `months` of a kind whose rules require quotes, in their order:
+    /// what [`Store::read_month`] and [`Store::read_month_asks`] return for the month, one ask per
+    /// bid, both from one read of its file, so a write landing between two reads cannot give asks
+    /// for other minutes than the bids. Shared with the store's memory and decoded in parallel, as
+    /// [`Store::read_months`] does; refused as [`Store::read_month_asks`] refuses.
+    pub fn read_quote_months(
         &self,
         id: &InstrumentId,
-        month: Month,
-    ) -> Result<Arc<Vec<Candle>>, DataError> {
+        months: &[Month],
+    ) -> Vec<Result<MonthQuotes, DataError>> {
+        months
+            .par_iter()
+            .map(|&month| self.quote_rows(id, month))
+            .collect()
+    }
+
+    /// One month of [`Store::read_quote_months`].
+    fn quote_rows(&self, id: &InstrumentId, month: Month) -> Result<MonthQuotes, DataError> {
         if !id.kind.rules().quotes {
             return Err(DataError::NoQuotes(id.to_string()));
         }
         // A cached entry was decoded from these columns of this very file, so the check runs only
         // when the file is decoded.
-        self.read_rows(id, month, &ASK_READ_COLUMNS, |path| {
+        let rows = self.read_rows(id, month, &QUOTE_COLUMNS, |path| {
             if has_columns(path, &ASK_COLUMNS)? == Some(false) {
                 return Err(DataError::NoAskColumns {
                     path: path.to_path_buf(),
                 });
             }
             Ok(())
-        })
+        })?;
+        Ok((rows.candles, rows.asks))
     }
 
     /// One month's stored bids and asks, paired by minute.
@@ -498,14 +548,13 @@ impl Store {
         id: &InstrumentId,
         month: Month,
     ) -> Result<Vec<(Candle, Candle)>, DataError> {
-        let asks = self.read_month_asks(id, month)?;
+        let (bids, asks) = self.quote_rows(id, month)?;
         // Both come from the one file's rows, so they pair up row by row.
-        Ok(self.read_month(id, month)?.into_iter().zip(asks).collect())
+        Ok(bids.iter().copied().zip(asks.iter().copied()).collect())
     }
 
-    /// The candles of one month file, sorted, from the columns `names`: the open time, the open,
-    /// high, low and close, and optionally the two volumes, which are 0 when not named. Empty when
-    /// the file does not exist.
+    /// The rows of one month file, sorted, from the columns `names`: [`CANDLE_COLUMNS`], or
+    /// [`QUOTE_COLUMNS`] for the asks too. Empty when the file does not exist.
     ///
     /// They come from the cache while the file is the one decoded; otherwise `check` runs on the
     /// path and the file is decoded, and cached if it decodes and every row is valid.
@@ -515,7 +564,7 @@ impl Store {
         month: Month,
         names: &'static [&'static str],
         check: impl FnOnce(&Path) -> Result<(), DataError>,
-    ) -> Result<Arc<Vec<Candle>>, DataError> {
+    ) -> Result<MonthRows, DataError> {
         let path = self.candle_path(id, month)?;
         let generation = match self.months.get(&path, names) {
             Ok(rows) => return Ok(rows),
@@ -524,14 +573,14 @@ impl Store {
         check(&path)?;
         let file = match File::open(&path) {
             Ok(file) => file,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Arc::default()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(MonthRows::default()),
             Err(e) => return Err(DataError::io(&path)(e)),
         };
         // Taken from the handle before decoding, so the stamp is the decoded file's even if the
         // path is replaced meanwhile. Without one the rows are returned but not cached.
         let stamp = file.metadata().ok().and_then(|m| file_stamp(&m));
         self.months.decodes.fetch_add(1, Ordering::Relaxed);
-        let rows = Arc::new(decode_rows(id, month, &path, file, names)?);
+        let rows = decode_rows(id, month, &path, file, names)?;
         if let Some(stamp) = stamp {
             self.months
                 .insert(path, names, stamp, generation, rows.clone());
@@ -622,13 +671,10 @@ impl Store {
         to: Millis,
         include_incomplete: bool,
     ) -> Result<LoadedCandles, DataError> {
-        let asks: Vec<_> = Month::range(from, to)
-            .into_par_iter()
-            .map(|month| self.month_ask_rows(id, month))
-            .collect();
         let mut minutes = Vec::new();
-        for stored in asks {
-            minutes.extend(stored?.iter().filter(|c| (from..to).contains(&c.open_time)));
+        for stored in self.read_quote_months(id, &Month::range(from, to)) {
+            let (_, asks) = stored?;
+            minutes.extend(asks.iter().filter(|c| (from..to).contains(&c.open_time)));
         }
         Ok(resample(id.kind, &minutes, timeframe, include_incomplete))
     }
@@ -751,6 +797,7 @@ impl Store {
                             unrecognised.push(self.relative(&dir));
                             continue;
                         }
+                        let mut temps = Vec::new();
                         for name in dir_names(&dir, &mut unrecognised, &self.root)? {
                             match month_of_file(&name) {
                                 Some((month, true)) => {
@@ -758,8 +805,19 @@ impl Store {
                                         months.push(StoredMonth { month, bytes });
                                     }
                                 }
-                                Some((_, false)) => {} // a lock sidecar or a temp file
+                                Some((month, false)) if name.ends_with(".tmp") => {
+                                    temps.push((month, name));
+                                }
+                                Some((_, false)) => {} // a lock sidecar
                                 None => unrecognised.push(self.relative(&dir.join(&name))),
+                            }
+                        }
+                        // A temp file beside its month file is a write in progress or a leftover
+                        // the month's delete removes with it; one with no month file is shown,
+                        // or nothing would.
+                        for (month, name) in temps {
+                            if !months.iter().any(|m| m.month == month) {
+                                unrecognised.push(self.relative(&dir.join(&name)));
                             }
                         }
                     }
@@ -825,9 +883,10 @@ impl Store {
 
     /// Deletes an instrument's candles for the months `from` to `to`, both included. Each month
     /// file is removed under the same lock a writer takes for it, with any temp files a crashed
-    /// writer left beside it; its lock sidecar and the folders stay. Months not stored are skipped:
-    /// deleting nothing is not an error, and creates nothing. When a folder on the way to the
-    /// month files is missing or is a link, nothing is deleted. The funding file stays.
+    /// writer left beside it, or in its place when it was killed before its first rename of the
+    /// month; its lock sidecar and the folders stay. Months with neither are skipped: deleting
+    /// nothing is not an error, and creates nothing. When a folder on the way to the month files is
+    /// missing or is a link, nothing is deleted. The funding file stays.
     pub fn delete_months(
         &self,
         id: &InstrumentId,
@@ -839,15 +898,20 @@ impl Store {
         if !self.real_dir(&dir)? {
             return Ok(report);
         }
+        let mut months = std::collections::BTreeSet::new();
         for name in dir_names(&dir, &mut Vec::new(), &self.root)? {
-            if let Some((month, true)) = month_of_file(&name)
+            if let Some((month, data)) = month_of_file(&name)
+                && (data || name.ends_with(".tmp"))
                 && (from..=to).contains(&month)
             {
-                let path = dir.join(name);
-                let removed = remove_locked(&path, &mut report);
-                self.months.forget(&path);
-                removed?;
+                months.insert(month);
             }
+        }
+        for month in months {
+            let path = dir.join(format!("{month}.parquet"));
+            let removed = remove_locked(&path, &mut report);
+            self.months.forget(&path);
+            removed?;
         }
         Ok(report)
     }
@@ -945,24 +1009,58 @@ impl Store {
     }
 }
 
-/// Decodes the columns `names` of one month file, opened as `file`, into candles, checking each
-/// row as [`Store::read_rows`] describes.
+/// The rows decoded from one month file: its candles (the bids, for a kind with quotes) and, when
+/// its ask columns were read, its asks, one per candle; otherwise no asks.
+#[derive(Debug, Clone, Default)]
+struct MonthRows {
+    candles: Arc<Vec<Candle>>,
+    asks: Arc<Vec<Candle>>,
+}
+
+impl MonthRows {
+    fn bytes(&self) -> usize {
+        (self.candles.len() + self.asks.len()) * size_of::<Candle>()
+    }
+}
+
+/// Decodes the columns `names` ([`CANDLE_COLUMNS`] or [`QUOTE_COLUMNS`]) of one month file,
+/// opened as `file`, checking each row as [`Store::read_rows`] describes.
 fn decode_rows(
     id: &InstrumentId,
     month: Month,
     path: &Path,
     file: File,
     names: &[&str],
-) -> Result<Vec<Candle>, DataError> {
+) -> Result<MonthRows, DataError> {
     let columns = decode_columns(path, file, names)?;
     let [open_time, rest @ ..] = &columns[..] else {
-        return Ok(Vec::new());
+        return Ok(MonthRows::default());
     };
     let open_time = int_column(path, open_time)?;
     let values = rest
         .iter()
         .map(|c| float_column(path, c))
         .collect::<Result<Vec<_>, _>>()?;
+    let (candles, asks) = values.split_at(CANDLE_COLUMNS.len() - 1);
+    Ok(MonthRows {
+        candles: Arc::new(candles_of(id, month, path, open_time, candles)?),
+        asks: Arc::new(if asks.is_empty() {
+            Vec::new()
+        } else {
+            candles_of(id, month, path, open_time, asks)?
+        }),
+    })
+}
+
+/// The candles of a month file from its open times and `values`: the open, high, low and close,
+/// and optionally the two volumes, which are 0 when absent.
+fn candles_of(
+    id: &InstrumentId,
+    month: Month,
+    path: &Path,
+    open_time: &[i64],
+    values: &[&[f64]],
+) -> Result<Vec<Candle>, DataError> {
     let volume = |i: usize, row: usize| values.get(i).map_or(0.0, |v| v[row]);
     let mut candles = Vec::with_capacity(open_time.len());
     let mut previous = Millis::MIN;
@@ -1145,10 +1243,11 @@ fn lock_across_processes(path: &Path) -> Result<File, DataError> {
 /// Removes the store file at `path` under its lock, taken as a writer takes it, with any temp files
 /// a crashed writer left beside it, and adds them to `report`; the lock sidecar stays as it is.
 /// While the lock is held no writer is part way through this file, in this process or another, so
-/// every temp file of it is a leftover. When `path` is not a regular file (nothing, or a link),
-/// there is nothing to delete and no lock is taken.
+/// every temp file of it is a leftover, even one with no data file beside it. When `path` is not a
+/// regular file (nothing, or a link) and has no temp file, there is nothing to delete and no lock
+/// is taken.
 fn remove_locked(path: &Path, report: &mut DeleteReport) -> Result<(), DataError> {
-    if file_bytes(path)?.is_none() {
+    if file_bytes(path)?.is_none() && temp_files(path)?.is_empty() {
         return Ok(());
     }
     let lock = file_lock(path);
@@ -1427,13 +1526,13 @@ type CacheKey = (PathBuf, &'static [&'static str]);
 
 struct CacheEntry {
     stamp: FileStamp,
-    rows: Arc<Vec<Candle>>,
+    rows: MonthRows,
     used: u64,
 }
 
 impl CacheEntry {
     fn bytes(&self) -> usize {
-        self.rows.len() * size_of::<Candle>()
+        self.rows.bytes()
     }
 }
 
@@ -1448,7 +1547,7 @@ impl MonthCache {
 
     /// The cached rows of `path` from the columns `names` when the file there is still the one
     /// decoded; otherwise the generation to pass to [`MonthCache::insert`] after decoding it.
-    fn get(&self, path: &Path, names: &'static [&'static str]) -> Result<Arc<Vec<Candle>>, u64> {
+    fn get(&self, path: &Path, names: &'static [&'static str]) -> Result<MonthRows, u64> {
         let now = fs::metadata(path).ok().and_then(|m| file_stamp(&m));
         let key = (path.to_path_buf(), names);
         let mut state = hold(&self.state);
@@ -1477,7 +1576,7 @@ impl MonthCache {
         names: &'static [&'static str],
         stamp: FileStamp,
         generation: u64,
-        rows: Arc<Vec<Candle>>,
+        rows: MonthRows,
     ) {
         let mut state = hold(&self.state);
         if state.generation != generation {
@@ -2141,6 +2240,66 @@ mod tests {
     }
 
     #[test]
+    fn a_months_bids_and_asks_come_from_one_decode_of_its_file() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let store = Store::new(dir.path());
+        let id = InstrumentId {
+            venue: td_core::Venue::Binance,
+            symbol: "USDJPY".into(),
+            kind: InstrumentKind::Fx,
+        };
+        let jan = Month::containing(JAN_2024);
+        // Tuesday 2 January and Thursday 1 February, when the FX market is open.
+        let days = [JAN_2024 + 24 * 60 * MINUTE, jan.next().start()];
+        let mut expected = Vec::new();
+        for day in days {
+            let bids: Vec<Candle> = (0..10).map(|i| flat_candle(day + i * MINUTE)).collect();
+            let asks: Vec<Candle> = bids
+                .iter()
+                .map(|b| Candle {
+                    open: b.open + 0.5,
+                    high: b.high + 0.5,
+                    low: b.low + 0.5,
+                    close: b.close + 0.5,
+                    volume: 0.0,
+                    quote_volume: 0.0,
+                    ..*b
+                })
+                .collect();
+            store.write_quotes(&id, &bids, &asks).expect("writes");
+            expected.push((bids, asks));
+        }
+        let months = [jan, jan.next()];
+        for _ in 0..2 {
+            let read: Vec<(Vec<Candle>, Vec<Candle>)> = store
+                .read_quote_months(&id, &months)
+                .into_iter()
+                .map(|q| {
+                    let (bids, asks) = q.expect("reads");
+                    (bids.to_vec(), asks.to_vec())
+                })
+                .collect();
+            assert_eq!(read, expected);
+        }
+        assert_eq!(
+            decodes(&store),
+            2,
+            "each month file decoded once, bids and asks together"
+        );
+        // The asks of one month come from the same entry.
+        assert_eq!(
+            store.read_month_asks(&id, jan).expect("asks"),
+            expected[0].1
+        );
+        assert_eq!(decodes(&store), 2);
+        // A market without quotes is refused.
+        assert!(matches!(
+            store.read_quote_months(&spot_id(), &months)[0],
+            Err(DataError::NoQuotes(_))
+        ));
+    }
+
+    #[test]
     fn a_write_through_this_store_or_another_is_read_back() {
         let dir = tempfile::tempdir().expect("a temp dir");
         let store = Store::new(dir.path());
@@ -2241,7 +2400,10 @@ mod tests {
         let cache = MonthCache::new(1 << 20);
         let path = Path::new("2024-01.parquet");
         let stamp = (1, SystemTime::UNIX_EPOCH);
-        let rows = Arc::new(vec![flat_candle(JAN_2024)]);
+        let rows = MonthRows {
+            candles: Arc::new(vec![flat_candle(JAN_2024)]),
+            asks: Arc::default(),
+        };
         let generation = cache
             .get(path, &CANDLE_COLUMNS)
             .expect_err("nothing cached");

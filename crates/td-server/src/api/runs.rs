@@ -28,7 +28,7 @@ use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 use td_core::{Candle, Hours, InstrumentId, InstrumentKind, Millis};
 use td_data::time::{DAY, Month, format_minute};
-use td_data::{DataError, Gap, LoadedCandles, Store, missing_minutes, resample};
+use td_data::{DataError, Gap, LoadedCandles, MonthQuotes, Store, missing_minutes, resample};
 use td_engine::{
     BacktestConfig, ENGINE_REVISION, EngineError, RunId, RunSummary, SavedRun, StoreError,
     TesterError, config_fingerprint,
@@ -278,15 +278,10 @@ fn read_data(store: &Store, config: &BacktestConfig) -> Result<StoreData, ApiErr
     let (from, to) = data_range(config)?;
     let in_range = |c: &Candle| (from..to).contains(&c.open_time);
     let (mut minutes, mut ask_minutes) = (Vec::new(), Vec::new());
-    let months = Month::range(from, to);
-    for (&month, stored) in months.iter().zip(store.read_months(id, &months)) {
-        let stored = stored?;
-        ask_minutes.extend(
-            month_asks(store, id, month, &stored)?
-                .into_iter()
-                .filter(in_range),
-        );
-        minutes.extend(stored.iter().copied().filter(in_range));
+    for stored in read_months(store, id, &Month::range(from, to)) {
+        let (bids, asks) = stored?;
+        ask_minutes.extend(asks.iter().copied().filter(in_range));
+        minutes.extend(bids.iter().copied().filter(in_range));
     }
     let gaps = missing_minutes(id.kind, &minutes, from, to);
     let loaded = resample(id.kind, &minutes, config.timeframe, false);
@@ -307,10 +302,10 @@ fn read_data(store: &Store, config: &BacktestConfig) -> Result<StoreData, ApiErr
 }
 
 /// Checks that the store holds a configuration's range well enough to run it, by the rules of
-/// [`load_run_data`], without keeping the data: the months' 1-minute candles are read together
-/// ([`Store::read_months`]) and gone through a month at a time, and only the missing minutes and
-/// whether any bar can be built are kept. A 400 for a bad range, a 422 `data_missing` where
-/// `load_run_data` would refuse.
+/// [`load_run_data`], without keeping the data: the months' 1-minute candles, and a quoted
+/// market's asks, are read together ([`read_months`]) and gone through a month at a time, and only
+/// the missing minutes and whether any bar can be built are kept. A 400 for a bad range, a 422
+/// `data_missing` where `load_run_data` would refuse.
 pub fn check_run_data(store: &Store, config: &BacktestConfig) -> Result<(), ApiError> {
     let id = &config.instrument.id;
     let (from, to) = data_range(config)?;
@@ -321,11 +316,11 @@ pub fn check_run_data(store: &Store, config: &BacktestConfig) -> Result<(), ApiE
     // Minutes of a bucket that a month's end cuts, kept for the next month.
     let mut pending: Vec<Candle> = Vec::new();
     let months = Month::range(from, to);
-    for (&month, stored) in months.iter().zip(store.read_months(id, &months)) {
+    for (&month, stored) in months.iter().zip(read_months(store, id, &months)) {
         let (start, end) = (month.start().max(from), month.end().min(to));
-        let stored = stored?;
-        // Read only to check the month has them; the load reads them again with the bids.
-        month_asks(store, id, month, &stored)?;
+        // The asks are read only to check the month has them; the load takes them from the
+        // store's memory with the bids.
+        let (stored, _) = stored?;
         let minutes: Vec<Candle> = stored
             .iter()
             .filter(|c| (start..end).contains(&c.open_time))
@@ -360,27 +355,35 @@ pub fn check_run_data(store: &Store, config: &BacktestConfig) -> Result<(), ApiE
     }
 }
 
-/// The stored 1-minute asks of a month of a kind whose rules require quotes, one per bid in
-/// `stored` (the month's bids); empty, with no file read, for a kind without quotes or a month
-/// with no bids. Refuses with 422 `data_missing` a month whose file has no ask prices: a run on
-/// its bids alone would trade at no spread.
-fn month_asks(
+/// The stored 1-minute bids of each of `months`, in order, and for a kind whose rules require
+/// quotes their asks, one per bid, from the same read of the month's file
+/// ([`Store::read_quote_months`]), so a download landing between two reads cannot pair them
+/// wrongly; no asks for a kind without quotes. The months are read together, from the store's
+/// memory where it can, and decoded in parallel. Refuses with 422 `data_missing` a month whose file
+/// has no ask prices: a run on its bids alone would trade at no spread.
+fn read_months(
     store: &Store,
     id: &InstrumentId,
-    month: Month,
-    stored: &[Candle],
-) -> Result<Vec<Candle>, ApiError> {
-    if !id.kind.rules().quotes || stored.is_empty() {
-        return Ok(Vec::new());
+    months: &[Month],
+) -> Vec<Result<MonthQuotes, ApiError>> {
+    if !id.kind.rules().quotes {
+        return store
+            .read_months(id, months)
+            .into_iter()
+            .map(|bids| Ok((bids?, Arc::default())))
+            .collect();
     }
-    match store.read_month_asks(id, month) {
-        Ok(asks) => Ok(asks),
-        Err(DataError::NoAskColumns { .. }) => Err(data_missing(format!(
-            "the store's {id} candles for {month} have no ask prices; delete the month and \
-             download it again"
-        ))),
-        Err(e) => Err(e.into()),
-    }
+    months
+        .iter()
+        .zip(store.read_quote_months(id, months))
+        .map(|(month, quotes)| match quotes {
+            Err(DataError::NoAskColumns { .. }) => Err(data_missing(format!(
+                "the store's {id} candles for {month} have no ask prices; delete the month and \
+                 download it again"
+            ))),
+            quotes => quotes.map_err(ApiError::from),
+        })
+        .collect()
 }
 
 /// The stretches of missing minutes that refuse a run of a `kind`. `gaps` are oldest first and cut

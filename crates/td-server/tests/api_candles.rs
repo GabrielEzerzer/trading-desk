@@ -547,14 +547,17 @@ async fn the_earliest_bar_is_the_venues_earliest_download_date() {
 }
 
 /// OANDA has no live stream, so the venue has no bars for the slots the store lacks: they are
-/// reported missing, across a weekend and up to the latest bar, and the stored bars come back.
+/// reported missing up to the latest bar, and the stored bars come back. The weekend's closed
+/// hours have no bar to miss, so they are neither reported nor asked of the venue.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_oanda_chart_reports_the_slots_the_store_lacks_as_missing() {
     const DAY: Millis = 24 * HOUR;
     let api = Api::start(&[], FakeRest::new(Vec::new(), T0)).await;
     let bids = store_usdjpy_hour(&api.store);
     // From Saturday 2 January to Monday 02:00: the weekend, the stored hour and the one after it.
+    // The weekend ends at 22:00 UTC on Sunday, New York's 17:00 in standard time.
     let (saturday, to) = (MONDAY_2016 - 2 * DAY, MONDAY_2016 + 2 * HOUR);
+    let sunday_open = MONDAY_2016 - 2 * HOUR;
     let (status, body) = api
         .get(&format!(
             "/candles?instrument=oanda:USDJPY:fx&timeframe=1h&from={saturday}&to={to}"
@@ -572,12 +575,13 @@ async fn an_oanda_chart_reports_the_slots_the_store_lacks_as_missing() {
     assert_eq!(
         got.missing,
         [
-            span(saturday, MONDAY_2016, tf),
+            span(sunday_open, MONDAY_2016, tf),
             span(MONDAY_2016 + HOUR, to, tf)
         ]
     );
-    // The venue was asked, and its refusal kept nothing out of the response.
-    assert_eq!(api.rest.calls(), [(tf, saturday, to)]);
+    // The venue was asked for the open hours only, and its refusal kept nothing out of the
+    // response.
+    assert_eq!(api.rest.calls(), [(tf, sunday_open, to)]);
     api.shutdown().await;
 }
 
