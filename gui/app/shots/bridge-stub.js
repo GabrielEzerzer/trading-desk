@@ -27,7 +27,9 @@
 // milliseconds, never (`hang`), or with the engine's 502 (`fail`); without an entry it answers at
 // once. GET /sessions fails the first `config.failSessions` times. POST /sessions answers after
 // 300 ms with a new warming-up session, which GET /sessions then lists; `window.__stubStarts`
-// counts the requests.
+// counts the requests. POST /sessions/{id}/orders adds an open manual order to that session and
+// POST /sessions/{id}/orders/{n}/cancel cancels one, each reported on its `session:` topic like the
+// engine's; neither fills.
 
 function installBridgeStub(config) {
   const listeners = new Set()
@@ -310,6 +312,43 @@ function installBridgeStub(config) {
     })
   }
 
+  let nextOrder = 1
+  const emitOrder = (order) => emit({ type: 'session', id: config.session.id, event: { event: 'order', order: structuredClone(order) } })
+
+  function placeOrder(body) {
+    const session = config.session
+    const order = {
+      source: 'manual',
+      id: nextOrder++,
+      request: {
+        instrument: session.config.instrument.id,
+        side: body.side,
+        qty: body.qty,
+        order_type: body.type === 'limit' ? { type: 'limit', price: body.limit_price } : { type: 'market' },
+        tif: 'gtc',
+        reduce_only: body.reduce_only ?? false,
+        client_tag: null,
+      },
+      submitted_at: session.last_bar?.open_time ?? 0,
+      decision_close: session.last_bar?.close ?? 0,
+      attached_stop: null,
+      status: { status: 'open' },
+    }
+    session.open_orders = [...session.open_orders, order]
+    emitOrder(order)
+    return { ok: true, status: 201, body: structuredClone(order) }
+  }
+
+  function cancelOrder(id) {
+    const session = config.session
+    const order = session.open_orders.find((o) => o.id === id)
+    if (!order) return fail(404, 'not_found', `no order ${id} in this session`)
+    const cancelled = { ...order, status: { status: 'cancelled', reason: 'cancelled manually' } }
+    session.open_orders = session.open_orders.filter((o) => o.id !== id)
+    emitOrder(cancelled)
+    return ok(structuredClone(cancelled))
+  }
+
   window.td = {
     mock: config.mock,
     async request(request) {
@@ -356,6 +395,10 @@ function installBridgeStub(config) {
         return ok(summary(config.session))
       }
       if (method === 'GET' && config.session && path === `/sessions/${config.session.id}`) return ok(config.session)
+      const order = /^\/sessions\/([\w-]+)\/orders(?:\/(\d+)\/cancel)?$/.exec(path)
+      if (method === 'POST' && order && order[1] === config.session?.id) {
+        return order[2] === undefined ? placeOrder(request.body) : cancelOrder(Number(order[2]))
+      }
       if (method === 'GET' && path === '/candles') return candles(request.query)
       return route(request)
     },

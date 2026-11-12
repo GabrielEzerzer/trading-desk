@@ -96,7 +96,7 @@ describe('mock paper session', () => {
 
   it('fills a manual market order at the next bar open', async () => {
     const { source, id, events } = await manualSession()
-    await source.placeOrder(id, { side: 'buy', qty: 0.01, order_type: { type: 'market' } })
+    await source.placeOrder(id, { side: 'buy', qty: 0.01, type: 'market' })
     await vi.advanceTimersByTimeAsync(100)
     const fill = events.find((e) => e.event === 'fill')
     const bar = events.find((e) => e.event === 'bar')
@@ -109,16 +109,16 @@ describe('mock paper session', () => {
 
   it('rejects selling more than a spot session holds, with a reason', async () => {
     const { source, id, events } = await manualSession()
-    await source.placeOrder(id, { side: 'sell', qty: 0.01, order_type: { type: 'market' } })
+    await source.placeOrder(id, { side: 'sell', qty: 0.01, type: 'market' })
     const order = events.find((e) => e.event === 'order')
     expect(order?.event === 'order' && order.order.status).toMatchObject({ status: 'rejected' })
   })
 
   it('realises P&L on a round trip and goes flat', async () => {
     const { source, id } = await manualSession()
-    await source.placeOrder(id, { side: 'buy', qty: 0.01, order_type: { type: 'market' } })
+    await source.placeOrder(id, { side: 'buy', qty: 0.01, type: 'market' })
     await vi.advanceTimersByTimeAsync(100)
-    await source.placeOrder(id, { side: 'sell', qty: 0.01, order_type: { type: 'market' } })
+    await source.placeOrder(id, { side: 'sell', qty: 0.01, type: 'market' })
     await vi.advanceTimersByTimeAsync(100)
     const state = await source.session(id)
     expect(state.position.qty).toBe(0)
@@ -126,6 +126,15 @@ describe('mock paper session', () => {
     expect(state.trades[0]?.open).toBe(false)
     const [buy, sell] = state.fills
     expect(state.position.realised_pnl).toBeCloseTo(0.01 * (sell!.price - buy!.price), 8)
+  })
+
+  it('cancels an open limit order once, as the engine does', async () => {
+    const { source, id } = await manualSession()
+    await source.placeOrder(id, { side: 'buy', qty: 0.01, type: 'limit', limit_price: 1000 })
+    const [order] = (await source.session(id)).open_orders
+    await source.cancelOrder(id, order!.id)
+    expect((await source.session(id)).open_orders).toEqual([])
+    await expect(source.cancelOrder(id, order!.id)).rejects.toThrow('cannot be cancelled')
   })
 
   it('stops and resumes', async () => {

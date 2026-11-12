@@ -7,12 +7,12 @@ import type {
   Instrument,
   InstrumentId,
   InstrumentKind,
-  OrderType,
+  ManualOrder,
+  OrderId,
   ServerMessage,
   SessionEvent,
   SessionState,
   SessionSummary,
-  Side,
   StartSessionRequest,
   StrategyInfo,
   Timeframe,
@@ -20,15 +20,11 @@ import type {
 } from '@td/shared'
 import { api } from '../api'
 
-/** The strategy name of a session where you place every order yourself. */
-export const MANUAL = 'manual'
+/** The strategy name of a session where you place every order yourself (td-server's `MANUAL_STRATEGY`). */
+export const MANUAL = 'none'
 
-// shortcut: the body of a manual order is decided with its endpoint (#36); align this then.
-export interface ManualOrder {
-  side: Side
-  qty: number
-  order_type: OrderType
-}
+/** The body of `POST /sessions/{id}/orders`. */
+export type { ManualOrder }
 
 export interface InstrumentList {
   instruments: Instrument[]
@@ -75,6 +71,8 @@ export interface TradingSource {
   /** Follows one session. Returns a function that stops it. */
   watchSession(id: string, feed: SessionFeed): () => void
   placeOrder(sessionId: string, order: ManualOrder): Promise<void>
+  /** Cancels an open manual order. */
+  cancelOrder(sessionId: string, orderId: OrderId): Promise<void>
 }
 
 export function candleTopic(id: InstrumentId, timeframe: Timeframe): string {
@@ -109,8 +107,6 @@ export async function loadInstrumentLists(
   return { instruments, problems }
 }
 
-const UNTIL_36 = 'Manual orders arrive with the order endpoint (#36).'
-
 /** Subscribes to a topic and passes on its messages; returns the function that ends it. */
 function follow(topic: string, onMessage: (message: ServerMessage) => void): () => void {
   const off = window.td.onMessage(onMessage)
@@ -121,13 +117,10 @@ function follow(topic: string, onMessage: (message: ServerMessage) => void): () 
   }
 }
 
-/**
- * The real engine. It has no manual orders yet (#36), so the composer says orders are not
- * available.
- */
+/** The real engine. */
 export const engineTradingSource: TradingSource = {
-  orders: { available: false, reason: UNTIL_36 },
-  manualSessions: { available: false, reason: 'Manual sessions arrive with the order endpoint (#36).' },
+  orders: { available: true },
+  manualSessions: { available: true },
   instruments: () => loadInstrumentLists(async (venue, kind) => (await api.instruments(venue, kind)).instruments),
   strategies: () => api.strategies(),
   history: async (id, timeframe) => (await api.candles(id, timeframe, HISTORY_BARS)).candles,
@@ -149,7 +142,12 @@ export const engineTradingSource: TradingSource = {
       else if (m.type === 'session' && m.id === id) feed.onEvent(m.event)
     })
   },
-  placeOrder: () => Promise.reject(new Error(UNTIL_36)),
+  async placeOrder(sessionId, order) {
+    await api.placeOrder(sessionId, order)
+  },
+  async cancelOrder(sessionId, orderId) {
+    await api.cancelOrder(sessionId, orderId)
+  },
 }
 
 /** The engine, or the fixtures in app/mock/ when the app was started with TD_MOCK=1. */

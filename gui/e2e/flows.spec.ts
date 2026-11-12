@@ -507,6 +507,41 @@ test.describe('trading on the engine', () => {
     expect(await page.evaluate(() => (window as { __stubStarts?: number }).__stubStarts)).toBe(1)
   })
 
+  test('a manual session sends a limit order to the engine, lists it and cancels it', async ({ page, open }) => {
+    await openTrading(page, open, engineTrading)
+    await page.getByRole('button', { name: 'Start a session' }).click()
+    const start = page.getByRole('dialog')
+    await expect(start.getByRole('button', { name: 'Strategy: Manual' })).toBeVisible()
+    await start.getByRole('button', { name: 'Start', exact: true }).click()
+    await expect(start).toBeHidden()
+    await expect(page.locator('.position-summary')).toContainText('Manual · Warming up')
+
+    await page.getByPlaceholder('Size').fill('0.05')
+    await page.getByRole('button', { name: 'Order type: Market' }).click()
+    await page.getByRole('menuitemradio', { name: 'Limit' }).click()
+    await page.getByPlaceholder('Price').fill('60000')
+    await page.getByRole('button', { name: 'Buy', exact: true }).click()
+    await expect(page.getByRole('status').filter({ hasText: 'Buy 0.05000 BTC at 60,000.00 sent.' })).toBeVisible()
+
+    await page.locator('.position-summary').click()
+    const panel = page.getByRole('dialog')
+    const row = panel.getByRole('row').nth(1)
+    await expect(row).toContainText('Limit')
+    await expect(row).toContainText('60,000.00')
+    await panel.getByRole('button', { name: 'Cancel the buy order of 0.05000 BTC' }).click()
+    await expect(panel.getByText('No open orders.')).toBeVisible()
+
+    const sent = await page.evaluate(() =>
+      ((window as { __tdCalls?: { method: string; path: string; body?: unknown }[] }).__tdCalls ?? []).filter((c) =>
+        c.path.includes('/orders'),
+      ),
+    )
+    expect(sent).toEqual([
+      { method: 'POST', path: '/sessions/stub-1/orders', body: { side: 'buy', qty: 0.05, type: 'limit', limit_price: 60000 } },
+      { method: 'POST', path: '/sessions/stub-1/orders/1/cancel' },
+    ])
+  })
+
   const subscribed = (page: Page) => page.evaluate(() => (window as { __stubSubscribed?: string[] }).__stubSubscribed ?? [])
   const candleCalls = (page: Page) =>
     page.evaluate(() =>

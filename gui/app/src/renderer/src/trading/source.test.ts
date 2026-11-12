@@ -109,3 +109,30 @@ describe('engine session feed', () => {
     expect(onEvent).toHaveBeenCalledTimes(1)
   })
 })
+
+describe('engine manual orders', () => {
+  const placed = { source: 'manual', id: 4, status: { status: 'open' } }
+
+  it('offers orders and manual sessions, and places and cancels through the order routes', async () => {
+    expect(engineTradingSource.orders).toEqual({ available: true })
+    expect(engineTradingSource.manualSessions).toEqual({ available: true })
+    const request = vi.fn(async (_r: ApiRequest): Promise<ApiResult> => ({ ok: true, status: 201, body: placed }))
+    vi.stubGlobal('window', { td: { ...bridge.td, request } })
+
+    await expect(
+      engineTradingSource.placeOrder('s-1', { side: 'buy', qty: 0.05, type: 'limit', limit_price: 60_000 }),
+    ).resolves.toBeUndefined()
+    await expect(engineTradingSource.cancelOrder('s-1', 4)).resolves.toBeUndefined()
+    expect(request.mock.calls.map(([r]) => r)).toEqual([
+      { method: 'POST', path: '/sessions/s-1/orders', body: { side: 'buy', qty: 0.05, type: 'limit', limit_price: 60_000 } },
+      { method: 'POST', path: '/sessions/s-1/orders/4/cancel' },
+    ])
+  })
+
+  it("rejects with the engine's reason when it refuses the order", async () => {
+    const message = 'the session has not fed its first live bar yet; orders can be placed once it has'
+    const request = vi.fn(async (): Promise<ApiResult> => ({ ok: false, status: 409, error: { code: 'not_live', message } }))
+    vi.stubGlobal('window', { td: { ...bridge.td, request } })
+    await expect(engineTradingSource.placeOrder('s-1', { side: 'sell', qty: 1, type: 'market' })).rejects.toThrow(message)
+  })
+})
