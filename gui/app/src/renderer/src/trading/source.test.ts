@@ -1,6 +1,6 @@
 import type { ApiRequest, ApiResult, Candle, InstrumentId, ServerMessage, SessionEvent, SessionState } from '@td/shared'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { HISTORY_BARS, engineTradingSource } from './source'
+import { HISTORY_BARS, MANUAL, engineTradingSource } from './source'
 
 // A stand-in for the preload's `window.td`: the parts a subscription uses.
 function fakeBridge() {
@@ -112,6 +112,10 @@ describe('engine session feed', () => {
 
 describe('engine manual orders', () => {
   const placed = { source: 'manual', id: 4, status: { status: 'open' } }
+
+  it('names a manual session the way td-server does', () => {
+    expect(MANUAL).toBe('none')
+  })
 
   it('offers orders and manual sessions, and places and cancels through the order routes', async () => {
     expect(engineTradingSource.orders).toEqual({ available: true })

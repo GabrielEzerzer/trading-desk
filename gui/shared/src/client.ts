@@ -98,7 +98,11 @@ export function createClient(send: Send) {
     /** Replays a stopped session and starts it again. */
     resumeSession: (id: string) =>
       call<SessionSummary>({ method: 'POST', path: `/sessions/${encodeURIComponent(id)}/resume` }),
-    /** Places a manual order; 409 `not_live` or `catching_up`, 422 with the engine's reason when refused. */
+    /**
+     * Places a manual order: 400 `invalid_order` with the engine's reason when it fails its checks,
+     * 409 `not_live`, `catching_up` or `not_running`, 404 `not_found` for no such session, and 422
+     * only for a body that does not parse.
+     */
     placeOrder: (id: string, order: ManualOrder) =>
       call<PaperOrder>({ method: 'POST', path: `/sessions/${encodeURIComponent(id)}/orders`, body: order }),
     /** Cancels an open manual order; 409 `not_manual` or `order_done` when it cannot be. */

@@ -237,6 +237,9 @@ interface OpenTrade {
   bars: number
 }
 
+/** td-server's refusal of a manual order before the session's first live bar (`ManualError::NotLive`). */
+const NOT_LIVE = 'the session has not fed its first live bar yet; orders can be placed once it has'
+
 /** An order as the mock session submits it: the engine's order type, not the API body. */
 interface Submitted {
   side: Side
@@ -314,6 +317,18 @@ class MockSession {
     this.feeds.add(feed)
     feed.onState(this.state())
     return () => this.feeds.delete(feed)
+  }
+
+  /**
+   * A manual order, refused as td-server refuses one: it throws with the engine's reason, and a
+   * refused order records nothing, sends no event and leaves its id to the next order.
+   */
+  place(request: Submitted): void {
+    if (!this.running) throw new Error(`paper session "${this.id}" is not running`)
+    if (this.liveFrom === null) throw new Error(NOT_LIVE)
+    const reason = this.refuse(request)
+    if (reason) throw new Error(reason)
+    this.submit(request)
   }
 
   /** Accepts or rejects an order now; an accepted one fills on a later bar. */
@@ -736,7 +751,7 @@ export function createMockTradingSource({ liveMs = 1500, listMs = 400 }: MockTra
       if (order.limit_price !== undefined && !onTick(order.limit_price, tick)) {
         throw new Error(`the limit price must be a multiple of ${tick}`)
       }
-      session.submit({ side: order.side, qty: order.qty, order_type: orderType(order) })
+      session.place({ side: order.side, qty: order.qty, order_type: orderType(order) })
     },
     async cancelOrder(sessionId, orderId) {
       sessionOf(sessionId).cancel(orderId)

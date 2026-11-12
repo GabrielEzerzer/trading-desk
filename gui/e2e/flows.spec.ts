@@ -332,6 +332,12 @@ test.describe('trading', () => {
     await expect(page.locator('.position-summary')).toContainText('Manual · Warming up')
   }
 
+  /** A Manual session past its two bars of warm-up, so it takes orders, as the engine's does. */
+  const startLive = async (page: Page) => {
+    await startManual(page)
+    await expect(page.locator('.position-summary')).toContainText('Manual · Live', BARS)
+  }
+
   test('switches instrument from the menu and with Ctrl+K search', async ({ page, open }) => {
     await openTrading(page, open)
     const ticker = page.locator('.ticker')
@@ -431,7 +437,7 @@ test.describe('trading', () => {
 
   test('a limit order is sent and rests in the open orders', async ({ page, open }) => {
     await openTrading(page, open)
-    await startManual(page)
+    await startLive(page)
     await page.getByPlaceholder('Size').fill('0.05')
     await page.getByRole('button', { name: 'Order type: Market' }).click()
     await page.getByRole('menuitemradio', { name: 'Limit' }).click()
@@ -454,12 +460,17 @@ test.describe('trading', () => {
     await expect(page.locator('.position-summary')).toContainText('Flat')
   })
 
-  test('a rejected order says why', async ({ page, open }) => {
+  test('a refused order says why in the engine’s words', async ({ page, open }) => {
     await openTrading(page, open)
     await startManual(page)
     await page.getByPlaceholder('Size').fill('0.05')
     await page.getByRole('button', { name: 'Sell', exact: true }).click()
-    await expect(page.getByRole('alert')).toHaveText(/^Order rejected: Spot sessions cannot sell more than they hold \(0 BTC\)/)
+    await expect(page.getByRole('alert')).toHaveText(
+      'The session has not fed its first live bar yet; orders can be placed once it has.',
+    )
+    await expect(page.locator('.position-summary')).toContainText('Manual · Live', BARS)
+    await page.getByRole('button', { name: 'Sell', exact: true }).click()
+    await expect(page.getByRole('alert')).toHaveText('Spot sessions cannot sell more than they hold (0 BTC).')
     // The rejection shows until the next edit.
     await page.getByPlaceholder('Size').fill('0.04')
     await expect(page.getByRole('alert')).toHaveCount(0)
@@ -520,7 +531,16 @@ test.describe('trading on the engine', () => {
     await page.getByRole('button', { name: 'Order type: Market' }).click()
     await page.getByRole('menuitemradio', { name: 'Limit' }).click()
     await page.getByPlaceholder('Price').fill('60000')
-    await page.getByRole('button', { name: 'Buy', exact: true }).click()
+    const buy = page.getByRole('button', { name: 'Buy', exact: true })
+    // The engine takes no order before the session's first live bar, and says so.
+    await buy.click()
+    await expect(page.getByRole('alert')).toHaveText(
+      'The session has not fed its first live bar yet; orders can be placed once it has.',
+    )
+
+    await page.evaluate(() => (window as { __stubGoLive?: () => void }).__stubGoLive?.())
+    await expect(page.locator('.position-summary')).toContainText('Manual · Live')
+    await buy.click()
     await expect(page.getByRole('status').filter({ hasText: 'Buy 0.05000 BTC at 60,000.00 sent.' })).toBeVisible()
 
     await page.locator('.position-summary').click()
@@ -531,13 +551,15 @@ test.describe('trading on the engine', () => {
     await panel.getByRole('button', { name: 'Cancel the buy order of 0.05000 BTC' }).click()
     await expect(panel.getByText('No open orders.')).toBeVisible()
 
-    const sent = await page.evaluate(() =>
-      ((window as { __tdCalls?: { method: string; path: string; body?: unknown }[] }).__tdCalls ?? []).filter((c) =>
-        c.path.includes('/orders'),
-      ),
+    const calls = await page.evaluate(
+      () => (window as { __tdCalls?: { method: string; path: string; body?: Record<string, unknown> }[] }).__tdCalls ?? [],
     )
-    expect(sent).toEqual([
-      { method: 'POST', path: '/sessions/stub-1/orders', body: { side: 'buy', qty: 0.05, type: 'limit', limit_price: 60000 } },
+    // td-server runs no strategy for "none"; any other name is looked up as a strategy.
+    expect(calls.find((c) => c.method === 'POST' && c.path === '/sessions')?.body?.strategy).toBe('none')
+    const order = { side: 'buy', qty: 0.05, type: 'limit', limit_price: 60000 }
+    expect(calls.filter((c) => c.path.includes('/orders'))).toEqual([
+      { method: 'POST', path: '/sessions/stub-1/orders', body: order },
+      { method: 'POST', path: '/sessions/stub-1/orders', body: order },
       { method: 'POST', path: '/sessions/stub-1/orders/1/cancel' },
     ])
   })

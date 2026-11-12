@@ -29,7 +29,8 @@
 // 300 ms with a new warming-up session, which GET /sessions then lists; `window.__stubStarts`
 // counts the requests. POST /sessions/{id}/orders adds an open manual order to that session and
 // POST /sessions/{id}/orders/{n}/cancel cancels one, each reported on its `session:` topic like the
-// engine's; neither fills.
+// engine's; neither fills. Like the engine, an order before the session's first live bar gets 409
+// `not_live`; `window.__stubGoLive()` makes the session live and reports it on its topic.
 
 function installBridgeStub(config) {
   const listeners = new Set()
@@ -315,8 +316,19 @@ function installBridgeStub(config) {
   let nextOrder = 1
   const emitOrder = (order) => emit({ type: 'session', id: config.session.id, event: { event: 'order', order: structuredClone(order) } })
 
+  window.__stubGoLive = () => {
+    const session = config.session
+    session.status = { status: 'live' }
+    session.live_from = session.last_bar?.open_time ?? Date.now()
+    emit({ type: 'session', id: session.id, event: { event: 'status', status: session.status } })
+  }
+
   function placeOrder(body) {
     const session = config.session
+    if (session.live_from === null) {
+      // The engine's words (td-server error.rs, ManualError::NotLive).
+      return fail(409, 'not_live', 'the session has not fed its first live bar yet; orders can be placed once it has')
+    }
     const order = {
       source: 'manual',
       id: nextOrder++,
