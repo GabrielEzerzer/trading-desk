@@ -286,7 +286,7 @@ fn a_planted_edge_reaches_trade_with_every_input_from_the_runs() {
     let resampled = line(&r, "resampled_drawdown");
     assert_eq!(
         (resampled.value, resampled.limit, resampled.outcome),
-        (Some(dd.p95), Some(0.30), Outcome::Pass)
+        (Some(dd.p95), Some(0.45), Outcome::Pass)
     );
     assert_eq!(
         r.kind.return_without_best_trade,

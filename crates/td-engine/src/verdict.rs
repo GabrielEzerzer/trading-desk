@@ -133,7 +133,11 @@ pub struct PortfolioLimits {
     /// The bootstrap chance that the mean daily return is zero or less, at most this.
     pub max_p_mean_not_positive: f64,
     /// The 95th percentile of the max drawdown over block-bootstrapped orderings of the daily
-    /// returns, at most this. A rule saved before this limit existed reads with the default.
+    /// returns, at most this. The default is above `max_drawdown`'s because the 95th percentile of
+    /// resampled paths sits well above the drawdown of the one path that happened, and grows with
+    /// the length of the out-of-sample period; at 0.45 the line fails a strategy whose drawdown was
+    /// small only because its losing days happened not to cluster, not every strategy near the
+    /// historical limit. A rule saved before this limit existed reads with the default.
     #[serde(default = "default_max_resampled_drawdown")]
     pub max_resampled_drawdown: f64,
 }
@@ -150,7 +154,7 @@ impl Default for PortfolioLimits {
             max_drawdown_vs_benchmark: 0.75,
             min_alpha: 0.0,
             max_p_mean_not_positive: 0.10,
-            max_resampled_drawdown: 0.30,
+            max_resampled_drawdown: 0.45,
         }
     }
 }
@@ -1191,7 +1195,7 @@ mod tests {
             (
                 "Resampled max drawdown (95th percentile)",
                 Some(0.18),
-                Some(0.30),
+                Some(0.45),
                 Comparison::AtMost,
                 Unit::Percent,
             )
@@ -1214,7 +1218,7 @@ mod tests {
             ("drawdown_vs_benchmark", |x| x.max_drawdown = Some(0.19)),
             // The historical drawdown passes both its lines; most orderings of the same days
             // would have fallen further.
-            ("resampled_drawdown", |x| x.resampled_drawdown = Some(0.31)),
+            ("resampled_drawdown", |x| x.resampled_drawdown = Some(0.46)),
             // Like the other bootstrap line, a missing value fails with no value.
             ("resampled_drawdown", |x| x.resampled_drawdown = None),
             ("alpha", |x| x.alpha = Some(-0.01)),
@@ -1243,7 +1247,7 @@ mod tests {
             benchmark_max_drawdown: Some(0.25),
             alpha: Some(0.0),
             p_mean_not_positive: Some(0.10),
-            resampled_drawdown: Some(0.30),
+            resampled_drawdown: Some(0.45),
             ..KindInputs::default()
         };
         assert_eq!(
@@ -1360,7 +1364,7 @@ mod tests {
         };
         assert_eq!(verdict(good_portfolio()).state, VerdictState::Trade);
         let unlucky = KindInputs {
-            resampled_drawdown: Some(0.42),
+            resampled_drawdown: Some(0.50),
             ..good_portfolio()
         };
         let v = verdict(unlucky);
@@ -1372,7 +1376,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             (line.value, line.limit, line.outcome),
-            (Some(0.42), Some(0.30), Outcome::Fail)
+            (Some(0.50), Some(0.45), Outcome::Fail)
         );
     }
 
@@ -1395,7 +1399,7 @@ mod tests {
         let VerdictRule::Portfolio { limits, .. } = rule else {
             panic!("{rule:?}");
         };
-        assert_eq!(limits.max_resampled_drawdown, 0.30);
+        assert_eq!(limits.max_resampled_drawdown, 0.45);
         assert_eq!((limits.min_sharpe, limits.max_drawdown), (1.5, 0.2));
         let mut unknown = old;
         unknown["limits"]["max_drawdown_typo"] = serde_json::json!(0.1);

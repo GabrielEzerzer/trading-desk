@@ -1109,7 +1109,11 @@ min_alpha: number,
 max_p_mean_not_positive: number, 
 /**
  * The 95th percentile of the max drawdown over block-bootstrapped orderings of the daily
- * returns, at most this. A rule saved before this limit existed reads with the default.
+ * returns, at most this. The default is above `max_drawdown`'s because the 95th percentile of
+ * resampled paths sits well above the drawdown of the one path that happened, and grows with
+ * the length of the out-of-sample period; at 0.45 the line fails a strategy whose drawdown was
+ * small only because its losing days happened not to cluster, not every strategy near the
+ * historical limit. A rule saved before this limit existed reads with the default.
  */
 max_resampled_drawdown: number, };
 
