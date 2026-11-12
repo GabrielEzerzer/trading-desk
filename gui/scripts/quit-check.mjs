@@ -1,8 +1,9 @@
 // Proves the app quits: launches the built app (run `pnpm build` first) with the real engine,
-// waits for the engine to run, closes the window the way the user does, and checks that Electron,
-// its helper processes and td-server are all gone within a few seconds. Exits 1 if any is left.
+// waits for the engine to run, opens a section, closes the window the way the user does, and checks
+// that Electron, its helper processes and td-server are all gone within a few seconds. Exits 1 if
+// any is left. Check both sections: Trading, with its live chart open, is the case that hangs in #71.
 //
-//   node scripts/quit-check.mjs            from gui/
+//   node scripts/quit-check.mjs [lab|trading]     from gui/; the Lab when no section is given
 //
 // Needs target/release/td-server(.exe), or TD_SERVER_BIN.
 
@@ -20,6 +21,11 @@ if (!existsSync(bin)) {
   console.error(`quit-check: no engine binary at ${bin}; run cargo build --release -p td-server --bin td-server`)
   process.exit(2)
 }
+const section = process.argv[2] ?? 'lab'
+if (section !== 'lab' && section !== 'trading') {
+  console.error(`quit-check: unknown section ${section}; pass lab or trading`)
+  process.exit(2)
+}
 const QUIT_WITHIN_MS = 5_000
 const dataDir = mkdtempSync(join(tmpdir(), 'td-quit-'))
 
@@ -29,9 +35,15 @@ const app = await electron.launch({
 })
 const page = await app.firstWindow()
 await page.waitForFunction(async () => (await window.td.status()).state === 'running', null, { timeout: 20_000 })
+if (section === 'trading') {
+  await page.getByRole('radio', { name: 'Trading' }).click()
+  await page.locator('canvas').first().waitFor({ timeout: 20_000 })
+  // Long enough for the history to load and the live stream to deliver bars.
+  await page.waitForTimeout(6_000)
+}
 const tree = processTree(app.process().pid)
 const engine = tree.filter((p) => p.name.toLowerCase().startsWith('td-server'))
-console.log(`quit-check: ${tree.length} processes under Electron, td-server pid ${engine.map((p) => p.pid).join(',') || 'none'}`)
+console.log(`quit-check: ${section}, ${tree.length} processes under Electron, td-server pid ${engine.map((p) => p.pid).join(',') || 'none'}`)
 if (engine.length !== 1) {
   killAll(tree)
   console.error('quit-check: FAIL, expected exactly one td-server under Electron')
