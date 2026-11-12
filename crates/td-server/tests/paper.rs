@@ -427,6 +427,8 @@ struct FakeRest {
     now: Millis,
     /// How many more requests for minutes fail.
     failures: Mutex<u32>,
+    /// How many more requests for warm-up bars fail.
+    warm_up_failures: Mutex<u32>,
     calls: Mutex<Vec<(Timeframe, Millis, Millis)>>,
 }
 
@@ -438,6 +440,7 @@ impl FakeRest {
             funding: Vec::new(),
             now,
             failures: Mutex::new(0),
+            warm_up_failures: Mutex::new(0),
             calls: Mutex::new(Vec::new()),
         }
     }
@@ -452,8 +455,13 @@ impl Rest for FakeRest {
         to: Millis,
     ) -> Result<Vec<Candle>, DataError> {
         self.calls.lock().expect("lock").push((timeframe, from, to));
-        let source = if timeframe == Timeframe::M1 {
-            let mut failures = self.failures.lock().expect("lock");
+        let failures = if timeframe == Timeframe::M1 {
+            &self.failures
+        } else {
+            &self.warm_up_failures
+        };
+        let source = {
+            let mut failures = failures.lock().expect("lock");
             if *failures > 0 {
                 *failures -= 1;
                 return Err(DataError::Api {
@@ -461,9 +469,11 @@ impl Rest for FakeRest {
                     message: "unavailable".into(),
                 });
             }
-            &self.minutes
-        } else {
-            &self.history
+            if timeframe == Timeframe::M1 {
+                &self.minutes
+            } else {
+                &self.history
+            }
         };
         Ok(source
             .iter()
@@ -838,6 +848,65 @@ async fn a_session_is_live_again_once_a_failed_backfill_succeeds() {
         assert_eq!(*s.status(), Status::Live);
     }
     handle.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_warm_up_request_is_retried_with_a_warning() {
+    let tf = Timeframe::M5;
+    let history = resample(InstrumentKind::Spot, &minutes(-60..0), tf, false).candles;
+    let rest = Arc::new(FakeRest {
+        warm_up_failures: Mutex::new(1),
+        ..FakeRest::new(minutes(0..10), history.clone(), T0 + 30_000)
+    });
+    let dir = tempfile::tempdir().expect("temp dir");
+    let paper = PaperSession::create(dir.path(), "warm", config(InstrumentKind::Spot, tf))
+        .expect("creates");
+    let stream: Vec<String> = minutes(0..10).iter().map(frame).collect();
+    let handle = td_server::start_with_stream(paper, rest.clone(), serve(stream).await);
+    wait_for_bar(&handle, T0 + 5 * MIN).await;
+    let resumed = unwrap_session(handle.stop().await);
+    assert!(
+        resumed
+            .warnings()
+            .iter()
+            .any(|w| w.starts_with("warm-up failed, retrying:")),
+        "{:?}",
+        resumed.warnings()
+    );
+    assert_eq!(resumed.live_from(), Some(T0));
+    assert_eq!(resumed.session().bars().len(), history.len() + 2);
+    let warm_up = (tf, T0 - 500 * tf.duration_ms(), T0);
+    assert_eq!(rest.calls.lock().expect("lock")[..2], [warm_up, warm_up]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_live_bar_built_with_a_tolerated_minute_missing_is_noted_on_the_session() {
+    // A four-hour bucket may miss two of its 240 minutes; REST has all but minute 7.
+    let tf = Timeframe::H4;
+    let all: Vec<Candle> = minutes(0..240)
+        .into_iter()
+        .filter(|m| m.open_time != T0 + 7 * MIN)
+        .collect();
+    let rest = Arc::new(FakeRest::new(all, Vec::new(), T0 + 30_000));
+    let dir = tempfile::tempdir().expect("temp dir");
+    let paper =
+        PaperSession::create(dir.path(), "gap", config(InstrumentKind::Spot, tf)).expect("creates");
+    // The stream's first closed minute is the next bucket's, so the whole bucket is backfilled.
+    let handle = td_server::start_with_stream(paper, rest, serve(vec![frame(&minute(240))]).await);
+    wait_for_bar(&handle, T0).await;
+    // The note follows its bar.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while handle.session().lock().expect("lock").warnings().is_empty() {
+        assert!(tokio::time::Instant::now() < deadline, "no warning in 20 s");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let session = unwrap_session(handle.stop().await);
+    assert_eq!(
+        session.warnings(),
+        [format!(
+            "the bar at {T0} was built with 1 of its minutes missing"
+        )]
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
