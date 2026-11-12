@@ -79,14 +79,14 @@ export function withForming<S extends CandleSeries>(series: S, candle: Candle): 
 
 /**
  * The history under the live bars. A live bar wins over history at the same open time, except a
- * forming bar that history already holds closed, which history replaces.
+ * forming one (any after `closed`, the last or an earlier one whose closed bar never came) that
+ * history already holds closed, which history replaces.
  */
 export function withHistory<S extends CandleSeries>(series: S, history: readonly Candle[]): S {
   const end = history.at(-1)?.open_time
   if (end === undefined) return series
-  const last = series.candles.at(-1)
-  const forming = last && (series.closed === null || last.open_time > series.closed) ? last : undefined
-  const live = forming && forming.open_time <= end ? series.candles.slice(0, -1) : series.candles
+  const { closed } = series
+  const live = series.candles.filter((c) => (closed !== null && c.open_time <= closed) || c.open_time > end)
   return {
     ...series,
     candles: mergeCandles(history, live),

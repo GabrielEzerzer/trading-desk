@@ -330,8 +330,8 @@ pub fn run_feed_on(
 
 /// [`run_feed_on`] for a chart: the same events, wrapped in [`ChartEvent::Feed`], and the bar still
 /// forming as [`ChartEvent::Forming`]. When the stream was joined after the current bucket started,
-/// the bucket's earlier minutes are fetched over REST once, so the forming bar covers the whole
-/// bucket.
+/// the bucket's earlier minutes are fetched over REST, so the forming bar covers the whole bucket;
+/// a failed fetch is tried once more when the bucket ends.
 pub fn run_chart_feed_on(
     stream: Arc<SharedStream>,
     timeframe: Timeframe,
@@ -339,7 +339,7 @@ pub fn run_chart_feed_on(
     rest: Arc<dyn Rest>,
     tx: mpsc::Sender<ChartEvent>,
 ) -> impl Future<Output = ()> + Send + 'static {
-    let forming = FormingBar::new(timeframe);
+    let forming = Box::new(FormingBar::new(timeframe));
     run_on(stream, timeframe, start, rest, Out::Chart { tx, forming })
 }
 
@@ -409,7 +409,7 @@ enum Out {
     /// A chart feed: the same events and the bar still forming.
     Chart {
         tx: mpsc::Sender<ChartEvent>,
-        forming: FormingBar,
+        forming: Box<FormingBar>,
     },
 }
 
@@ -459,19 +459,17 @@ impl Feed {
         }
         let built = self.builder.push(minute);
         // A chart's bucket that ends without a closed bar (joined late, so the builder drops it)
-        // gets its forming bar once more, now whole, so the chart does not keep a stale one.
+        // gets its forming bar once more, now whole, so the chart does not keep a stale one. It is
+        // the closing minute's own bucket, even when the stream has already started the next.
         let unclosed = match &mut self.out {
-            Out::Chart { forming, .. } => {
-                forming.push(minute, true)
-                    && forming.ends_bucket(minute.open_time)
-                    && forming
-                        .bucket()
-                        .is_some_and(|b| !built.candles.iter().any(|bar| bar.open_time == b))
-            }
-            Out::Feed(_) => false,
+            Out::Chart { forming, .. } => forming.push(minute, true).filter(|&bucket| {
+                forming.ends_bucket(minute.open_time)
+                    && !built.candles.iter().any(|bar| bar.open_time == bucket)
+            }),
+            Out::Feed(_) => None,
         };
-        if unclosed {
-            self.send_forming().await?;
+        if let Some(bucket) = unclosed {
+            self.send_forming(bucket).await?;
         }
         self.emit(built).await
     }
@@ -483,34 +481,37 @@ impl Feed {
         let Out::Chart { forming, .. } = &mut self.out else {
             return Ok(());
         };
-        if check_minute(&minute).is_err() || !forming.push(minute, false) {
+        if check_minute(&minute).is_err() {
             return Ok(());
         }
-        self.send_forming().await
+        match forming.push(minute, false) {
+            Some(bucket) => self.send_forming(bucket).await,
+            None => Ok(()),
+        }
     }
 
-    /// Sends a chart feed's bar still forming, first fetching the bucket's minutes before the first
-    /// one seen when it was joined after it started.
-    async fn send_forming(&mut self) -> Result<(), Gone> {
+    /// Sends a chart feed's bar of the bucket opening at `bucket`, first fetching the bucket's
+    /// minutes before the first one seen when it was joined after it started. A failed fetch is
+    /// tried once more when the bucket's last minute closes.
+    async fn send_forming(&mut self, bucket: Millis) -> Result<(), Gone> {
         let Out::Chart { tx, forming } = &mut self.out else {
             return Ok(());
         };
-        if let Some((from, to)) = forming.missing_start() {
+        if let Some((from, to)) = forming.missing_start(bucket) {
             let rest = Arc::clone(&self.rest);
             let id = self.id.clone();
             let fetched =
                 tokio::task::spawn_blocking(move || rest.klines(&id, Timeframe::M1, from, to))
                     .await;
-            // shortcut: one try per bucket. The bucket a chart joins late gets no closed bar, so
-            // after a failed fetch its bar lacks its first minutes for as long as the chart stays
-            // open; retry at the end of the bucket if that shows on the charts.
-            let minutes = match fetched {
-                Ok(Ok(minutes)) => minutes,
-                _ => Vec::new(),
-            };
-            forming.fill(minutes.into_iter().filter(|m| check_minute(m).is_ok()));
+            match fetched {
+                Ok(Ok(minutes)) => {
+                    let minutes = minutes.into_iter().filter(|m| check_minute(m).is_ok());
+                    forming.fill(bucket, minutes);
+                }
+                _ => forming.fetch_failed(bucket),
+            }
         }
-        match forming.bar() {
+        match forming.bar(bucket) {
             Some(bar) => tx.send(ChartEvent::Forming(bar)).await.map_err(|_| Gone),
             None => Ok(()),
         }
