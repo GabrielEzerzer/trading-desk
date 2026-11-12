@@ -16,7 +16,7 @@ pub(crate) const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 pub(crate) const MAX_BACKOFF: Duration = Duration::from_secs(30);
 
 /// Binance pushes a kline update every two seconds and Bybit at least once a minute, so this long
-/// with no frame but heartbeat answers means the connection is dead even if TCP never said so (a
+/// with no frame but heartbeats (the venue's pings, or answers to ours) means the connection is dead even if TCP never said so (a
 /// half-open socket after a Wi-Fi drop or NAT expiry), or that the venue is not sending the topic
 /// (a refused subscription, a topic that went quiet): treat it as a disconnect, so the reader
 /// reconnects and subscribes again.
@@ -143,11 +143,13 @@ where
                 continue;
             }
         };
-        let pong = match (&message, greeting.pong) {
+        // Heartbeats (the venue's pings, and answers to ours) say nothing about the topic.
+        let heartbeat = match (&message, greeting.pong) {
+            (Some(Ok(Message::Ping(_))), _) => true,
             (Some(Ok(Message::Text(text))), Some(is_pong)) => is_pong(text),
             _ => false,
         };
-        if !pong {
+        if !heartbeat {
             last_frame = Instant::now();
         }
         match message {
@@ -256,6 +258,41 @@ mod tests {
         assert_eq!(start.elapsed().as_secs(), 100);
         assert_eq!(rx.recv().await, Some(Inbound::Text("bar".into())));
         assert_eq!(rx.recv().await, Some(Inbound::Text("pong".into())));
+        exchange.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_connection_the_venue_only_pings_still_times_out() {
+        let (socket, mut exchange) = socket_pair().await;
+        let (tx, _rx) = mpsc::channel(16);
+        let greeting = Greeting {
+            subscribe: None,
+            heartbeat: None,
+            pong: None,
+        };
+        let start = Instant::now();
+        let reader =
+            tokio::spawn(async move { read_until_closed(socket, &greeting, &tx, &mut 0).await });
+        // The venue pings every 20 s, as Binance does, and sends nothing else.
+        let exchange = tokio::spawn(async move {
+            loop {
+                sleep(Duration::from_secs(20)).await;
+                if exchange
+                    .send(Message::Ping(Vec::new().into()))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                let _ = exchange.next().await;
+            }
+        });
+        let ended = timeout(Duration::from_secs(300), reader)
+            .await
+            .expect("the pings kept the connection open")
+            .expect("reader task");
+        assert_eq!(ended.as_deref(), Some("no data for 90s"));
+        assert_eq!(start.elapsed().as_secs(), 90);
         exchange.abort();
     }
 

@@ -12,7 +12,9 @@
 //! A session that has not fed a live bar yet (it stopped or crashed during warm-up, or after it
 //! but before its first live bar) warms up again instead: it is fed, as warm-up, the bars from the
 //! end of its log up to the last closed bar, at most [`WARM_UP_BARS`] of them, and goes live from
-//! the time it restarts. One restarted long after its log ends skips the bars in between, which the
+//! the time it restarts. A warm-up request that fails is retried; the bars that close while it
+//! retries arrive afterwards as backfilled live bars, and the strategy trades them, as on a
+//! resume. One restarted long after its log ends skips the bars in between, which the
 //! engine allows. It holds no position or orders then, so nothing is lost, but one stopped right
 //! after warm-up goes live at the restart rather than backfilling the bars it missed.
 
@@ -230,9 +232,12 @@ async fn drive(
     while let Some(event) = rx.recv().await {
         match event {
             FeedEvent::Connected => lock(shared).set_status(Status::Live),
-            FeedEvent::Disconnected { .. } | FeedEvent::ConnectFailed { .. } => {
-                lock(shared).set_status(Status::Reconnecting);
+            FeedEvent::Disconnected { reason } => {
+                let mut s = lock(shared);
+                s.set_status(Status::Reconnecting);
+                s.warn(format!("disconnected: {reason}"));
             }
+            FeedEvent::ConnectFailed { .. } => lock(shared).set_status(Status::Reconnecting),
             FeedEvent::BackfillFailed { error } => {
                 let mut s = lock(shared);
                 s.set_status(Status::Reconnecting);
