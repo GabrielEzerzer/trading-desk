@@ -125,6 +125,25 @@ pub enum DataError {
 
     #[error("no data directory: set TD_DATA_DIR")]
     NoDataDir,
+
+    /// Names the variable, never a value.
+    #[error(
+        "oanda's history needs an API token: set OANDA_API_TOKEN to the token of an OANDA \
+         practice account"
+    )]
+    MissingOandaToken,
+
+    /// OANDA answered 401 or 403. `message` is OANDA's `errorMessage` alone, with any copy of the
+    /// token taken out; nothing of the request is kept.
+    #[error(
+        "{url} was refused ({status}: {message}): the token in OANDA_API_TOKEN is not valid, or \
+         is not a practice account's token"
+    )]
+    OandaRefused {
+        url: String,
+        status: u16,
+        message: String,
+    },
 }
 
 impl DataError {

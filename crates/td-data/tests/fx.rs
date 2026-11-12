@@ -519,6 +519,37 @@ fn bad_quote_batches_are_refused_and_write_nothing() {
         &before,
     );
 
+    // A crossed high: the ask's high below the bid's, with its open, low and close at the bid's.
+    let b = bid(february);
+    let crossed = Candle {
+        high: b.high - 0.001,
+        volume: 0.0,
+        quote_volume: 0.0,
+        ..b
+    };
+    let (b, a) = batch(b, crossed);
+    let result = store.write_quotes(&id, &b, &a);
+    assert_refused(
+        &store,
+        &id,
+        result,
+        |e| matches!(e, DataError::CrossedQuote { field: "high", .. }),
+        &before,
+    );
+
+    // A crossed low: the ask's low below the bid's, with the rest above the bid's.
+    let mut crossed = ask(february);
+    crossed.low = bid(february).low - 0.001;
+    let (b, a) = batch(bid(february), crossed);
+    let result = store.write_quotes(&id, &b, &a);
+    assert_refused(
+        &store,
+        &id,
+        result,
+        |e| matches!(e, DataError::CrossedQuote { field: "low", .. }),
+        &before,
+    );
+
     // A minute in closed hours: Saturday 3 February, noon.
     let saturday = february + 2 * DAY;
     assert!(!InstrumentKind::Fx.is_open(saturday));

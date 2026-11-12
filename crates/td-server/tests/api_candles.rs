@@ -86,7 +86,8 @@ type Failure = fn() -> DataError;
 
 /// The venue's REST klines: its minutes, or bars resampled from them, from `from` on. It serves
 /// the bar still open at `now`, as a venue serves the forming bar, and ignores `to`, so the server
-/// must keep to its own range. Records every call.
+/// must keep to its own range. A venue whose source has no live stream (oanda) is refused as the
+/// real one refuses it. Records every call.
 struct FakeRest {
     minutes: Vec<Candle>,
     now: Millis,
@@ -113,7 +114,7 @@ impl FakeRest {
 impl Rest for FakeRest {
     fn klines(
         &self,
-        _: &InstrumentId,
+        id: &InstrumentId,
         timeframe: Timeframe,
         from: Millis,
         to: Millis,
@@ -122,6 +123,7 @@ impl Rest for FakeRest {
         if let Some(fail) = self.fail {
             return Err(fail());
         }
+        td_data::source(id.venue).live()?;
         let bars = if timeframe == Timeframe::M1 {
             self.minutes.clone()
         } else {
@@ -472,6 +474,110 @@ async fn the_bar_still_open_is_never_returned() {
         resample(InstrumentKind::Spot, &stored(0..60), Timeframe::H1, false).candles
     );
     assert_eq!(got.missing, [span(T0 - HOUR, T0, Timeframe::H1)]);
+    api.shutdown().await;
+}
+
+/// Monday 4 January 2016, 00:00 UTC.
+const MONDAY_2016: Millis = 1_451_865_600_000;
+
+/// Writes an hour of USDJPY bids and asks from [`MONDAY_2016`] to `store`, and answers the bids.
+fn store_usdjpy_hour(store: &Store) -> Vec<Candle> {
+    let usdjpy = InstrumentId {
+        venue: Venue::Oanda,
+        symbol: "USDJPY".into(),
+        kind: InstrumentKind::Fx,
+    };
+    let bids: Vec<Candle> = (0..60)
+        .map(|i| Candle {
+            open_time: MONDAY_2016 + i * MIN,
+            open: 119.0,
+            high: 119.01,
+            low: 118.99,
+            close: 119.0,
+            volume: 25.0,
+            quote_volume: 0.0,
+        })
+        .collect();
+    let asks: Vec<Candle> = bids
+        .iter()
+        .map(|b| Candle {
+            open: b.open + 0.007,
+            high: b.high + 0.007,
+            low: b.low + 0.007,
+            close: b.close + 0.007,
+            ..*b
+        })
+        .collect();
+    store
+        .write_quotes(&usdjpy, &bids, &asks)
+        .expect("writes the fixture");
+    bids
+}
+
+/// A chart starts no earlier than the venue's earliest download date: OANDA's stored FX minutes
+/// from 2016 are served, back to 2007-01-01, while Binance keeps 2017-01-01.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_earliest_bar_is_the_venues_earliest_download_date() {
+    let api = Api::start(&[], FakeRest::new(Vec::new(), T0)).await;
+    let monday = MONDAY_2016;
+    let bids = store_usdjpy_hour(&api.store);
+
+    let path = |instrument: &str, timeframe: &str, from: Millis, to: Millis| {
+        format!("/candles?instrument={instrument}&timeframe={timeframe}&from={from}&to={to}")
+    };
+    let server = &api;
+    let get = |path: String| async move {
+        let (status, body) = server.get(&path).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        serde_json::from_value::<CandlesResponse>(body).expect("a candles response")
+    };
+    let got = get(path("oanda:USDJPY:fx", "1m", monday, monday + HOUR)).await;
+    assert_eq!(got.from, monday);
+    assert_eq!(got.candles, bids);
+
+    // 2006-06-01 to 2007-03-01: OANDA's range starts at 2007-01-01, Binance's is empty at
+    // 2017-01-01.
+    let (june_2006, march_2007) = (1_149_120_000_000, 1_172_707_200_000);
+    let got = get(path("oanda:USDJPY:fx", "1d", june_2006, march_2007)).await;
+    assert_eq!((got.from, got.to), (1_167_609_600_000, march_2007));
+    let got = get(path(INSTRUMENT, "1d", june_2006, march_2007)).await;
+    assert_eq!((got.from, got.to), (1_483_228_800_000, 1_483_228_800_000));
+    assert!(got.candles.is_empty());
+    api.shutdown().await;
+}
+
+/// OANDA has no live stream, so the venue has no bars for the slots the store lacks: they are
+/// reported missing, across a weekend and up to the latest bar, and the stored bars come back.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_oanda_chart_reports_the_slots_the_store_lacks_as_missing() {
+    const DAY: Millis = 24 * HOUR;
+    let api = Api::start(&[], FakeRest::new(Vec::new(), T0)).await;
+    let bids = store_usdjpy_hour(&api.store);
+    // From Saturday 2 January to Monday 02:00: the weekend, the stored hour and the one after it.
+    let (saturday, to) = (MONDAY_2016 - 2 * DAY, MONDAY_2016 + 2 * HOUR);
+    let (status, body) = api
+        .get(&format!(
+            "/candles?instrument=oanda:USDJPY:fx&timeframe=1h&from={saturday}&to={to}"
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let got: CandlesResponse = serde_json::from_value(body).expect("a candles response");
+    let tf = Timeframe::H1;
+    assert_eq!(
+        got.candles,
+        resample(InstrumentKind::Fx, &bids, tf, false).candles
+    );
+    assert_eq!(got.candles.len(), 1);
+    assert!(got.from_venue.is_empty(), "{got:?}");
+    assert_eq!(
+        got.missing,
+        [
+            span(saturday, MONDAY_2016, tf),
+            span(MONDAY_2016 + HOUR, to, tf)
+        ]
+    );
+    // The venue was asked, and its refusal kept nothing out of the response.
+    assert_eq!(api.rest.calls(), [(tf, saturday, to)]);
     api.shutdown().await;
 }
 

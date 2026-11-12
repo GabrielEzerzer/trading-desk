@@ -1252,28 +1252,219 @@ async fn fx_sweeps_out_of_sample_and_walk_forward_runs_trade_on_the_asks() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn an_fx_run_goes_over_a_holiday_but_two_days_missing_or_a_spot_day_is_refused() {
+    // FX_DAYS days of FX minutes from Monday 8 January 2024. EURUSD lacks 25 hours of open time
+    // from Tuesday 22:00 UTC, as OANDA's minutes lack a holiday such as 25 to 26 December 2016.
+    // USDJPY lacks the hour before the weekend's close, Friday 22:00 UTC, and the 25 hours from
+    // its open, Sunday 22:00 UTC: 26 hours of open time, three days and two hours from end to end.
+    // GBPUSD lacks two days from Tuesday 00:00 UTC.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = Store::new(dir.path());
+    let (from, to) = (fx_t0(), fx_t0() + FX_DAYS * DAY);
+    let holiday = from + DAY + 22 * HOUR..from + 2 * DAY + 23 * HOUR;
+    let (close, reopen) = (from + 4 * DAY + 22 * HOUR, from + 6 * DAY + 22 * HOUR);
+    let two_days = from + DAY..from + 3 * DAY;
+    let without = |hole: std::ops::Range<Millis>| -> Vec<Millis> {
+        let open = open_minutes(from, to).into_iter();
+        open.filter(|t| !hole.contains(t)).collect()
+    };
+    write_fx(&store, "EURUSD", &without(holiday.clone()), SPREAD);
+    write_fx(
+        &store,
+        "USDJPY",
+        &without(close - HOUR..reopen + 25 * HOUR),
+        SPREAD,
+    );
+    write_fx(&store, "GBPUSD", &without(two_days), SPREAD);
+    // Three days of spot minutes from 1 March 2024, the second day missing.
+    let spot = config(InstrumentKind::Spot, 3);
+    store
+        .write_candles(&spot.instrument.id, &minutes(3, t0() + DAY..t0() + 2 * DAY))
+        .expect("seeds");
+    let t = TestServer::on(dir, store).await;
+
+    // The holiday is run through, and listed in the run's data report with its hours.
+    let (detail, _) = fx_backtest(&t, &fx_config("EURUSD", Timeframe::H1)).await;
+    let data = detail.data.expect("a data report");
+    let gap = GapInfo {
+        from: holiday.start,
+        to: holiday.end,
+        minutes: 25 * 60,
+    };
+    assert_eq!(data.gaps, [gap]);
+    assert_eq!(data.dropped.len(), 25);
+    // USDJPY's two gaps hold under two days of open time together, as the weekend between them
+    // does not count: run, and listed apart. The Friday hour is a bucket dropped as well.
+    let (detail, _) = fx_backtest(&t, &fx_config("USDJPY", Timeframe::H1)).await;
+    let data = detail.data.expect("a data report");
+    let gaps = [
+        GapInfo {
+            from: close - HOUR,
+            to: close,
+            minutes: 60,
+        },
+        GapInfo {
+            from: reopen,
+            to: reopen + 25 * HOUR,
+            minutes: 25 * 60,
+        },
+    ];
+    assert_eq!(data.gaps, gaps);
+    assert_eq!(data.dropped.len(), 26);
+
+    // Two days missing for FX, and a day for spot, are refused: only the EURUSD and USDJPY runs
+    // started a job.
+    let refused = [
+        (
+            serde_json::to_value(fx_config("GBPUSD", Timeframe::H1)).unwrap(),
+            "the store has no binance:GBPUSD:fx candles from 2024-01-09 00:00 to 2024-01-11 \
+             00:00 UTC; download them first",
+        ),
+        (
+            serde_json::to_value(&spot).unwrap(),
+            "the store has no binance:BTCUSDT:spot candles from 2024-03-02 00:00 to 2024-03-03 \
+             00:00 UTC; download them first",
+        ),
+    ];
+    for (body, message) in refused {
+        let (status, body) = t.post("/runs/backtest", &body).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["error"]["code"], "data_missing");
+        assert_eq!(body["error"]["message"], message);
+    }
+    let (_, jobs) = t.get("/jobs").await;
+    assert_eq!(jobs.as_array().map(Vec::len), Some(2));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn fx_minutes_missing_either_side_of_a_weekend_are_judged_together_and_refused() {
+    // The weekend of 12 to 14 January 2024 is closed from Friday 22:00 to Sunday 22:00 UTC.
+    // EURUSD is stored from Monday 8 January to Wednesday 10 January 12:00 UTC, and USDJPY from
+    // Tuesday 16 January 12:00 to Wednesday 17 January 12:00 UTC.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = Store::new(dir.path());
+    let wednesday = fx_t0() + 2 * DAY + 12 * HOUR;
+    let tuesday = fx_t0() + 8 * DAY + 12 * HOUR;
+    let next_wednesday = fx_t0() + 9 * DAY + 12 * HOUR;
+    write_fx(&store, "EURUSD", &open_minutes(fx_t0(), wednesday), SPREAD);
+    write_fx(
+        &store,
+        "USDJPY",
+        &open_minutes(tuesday, next_wednesday),
+        SPREAD,
+    );
+    let t = TestServer::on(dir, store).await;
+
+    let refused = [
+        // To the next Wednesday 12:00: five days of open time missing from Wednesday 12:00, two
+        // days and 10 hours before the weekend and two days and 14 hours after it.
+        (
+            "EURUSD",
+            fx_t0(),
+            "the store has no binance:EURUSD:fx candles from 2024-01-10 12:00 to 2024-01-17 \
+             12:00 UTC; download them first",
+        ),
+        // From Thursday 11 January, five days and 12 hours before the stored minutes: three and
+        // a half days of open time missing, 46 hours before the weekend and 38 after it, each
+        // under two days on its own.
+        (
+            "USDJPY",
+            fx_t0() + 3 * DAY,
+            "the store has no binance:USDJPY:fx candles from 2024-01-11 00:00 to 2024-01-16 \
+             12:00 UTC; download them first",
+        ),
+    ];
+    for (symbol, from, message) in refused {
+        let config = BacktestConfig {
+            from,
+            to: next_wednesday,
+            ..fx_config(symbol, Timeframe::H1)
+        };
+        let (status, body) = t
+            .post("/runs/backtest", &serde_json::to_value(&config).unwrap())
+            .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{symbol}: {body}");
+        assert_eq!(body["error"]["code"], "data_missing");
+        assert_eq!(body["error"]["message"], message);
+    }
+    let (_, jobs) = t.get("/jobs").await;
+    assert_eq!(jobs.as_array().map(Vec::len), Some(0));
+}
+
+/// Sets the ask high of the minute at `open_time` in its stored month file to `high`, past the
+/// store's checks.
+fn plant_ask_high(store: &Store, id: &InstrumentId, open_time: Millis, high: f64) {
+    use arrow::array::{Array, ArrayRef, Float64Array, Int64Array};
+    use arrow::record_batch::RecordBatch;
+    use parquet::arrow::ArrowWriter;
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+    let path = store
+        .candle_path(id, Month::containing(open_time))
+        .expect("a path");
+    let file = std::fs::File::open(&path).expect("the month file");
+    let batches: Vec<RecordBatch> = ParquetRecordBatchReaderBuilder::try_new(file)
+        .expect("parquet")
+        .build()
+        .expect("a reader")
+        .collect::<Result<_, _>>()
+        .expect("reads");
+    let mut planted = 0;
+    let batches: Vec<RecordBatch> = batches
+        .into_iter()
+        .map(|batch| {
+            let column = |name: &str| batch.column_by_name(name).expect(name).clone();
+            let times = column("open_time");
+            let times = times.as_any().downcast_ref::<Int64Array>().expect("i64");
+            let highs = column("ask_high");
+            let highs = highs.as_any().downcast_ref::<Float64Array>().expect("f64");
+            let highs: Float64Array = times
+                .values()
+                .iter()
+                .zip(highs.values())
+                .map(|(&t, &h)| {
+                    planted += usize::from(t == open_time);
+                    if t == open_time { high } else { h }
+                })
+                .collect();
+            let mut columns = batch.columns().to_vec();
+            let index = batch.schema().index_of("ask_high").expect("ask_high");
+            columns[index] = std::sync::Arc::new(highs) as ArrayRef;
+            RecordBatch::try_new(batch.schema(), columns).expect("a batch")
+        })
+        .collect();
+    assert_eq!(planted, 1);
+    let file = std::fs::File::create(&path).expect("rewrites");
+    let mut writer = ArrowWriter::try_new(file, batches[0].schema(), None).expect("a writer");
+    for batch in &batches {
+        writer.write(batch).expect("writes");
+    }
+    writer.close().expect("closes");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_crossed_stored_quote_fails_the_run_as_data_missing() {
     let dir = tempfile::tempdir().expect("temp dir");
     let store = Store::new(dir.path());
     let times = open_minutes(fx_t0(), fx_t0() + FX_DAYS * DAY);
     let bids: Vec<Candle> = times.iter().map(|&t| fx_bid(t)).collect();
     let mut asks: Vec<Candle> = times.iter().map(|&t| fx_ask(t, SPREAD)).collect();
-    // One minute's ask high below its bid high: the store checks only the open and the close, so
-    // it takes it, and the engine refuses the bar on 1m. (On 1h the other minutes' asks lift the
-    // hour's ask high back over its bid high.)
+    // One minute's ask high below its bid high. The store refuses that, so it is planted in the
+    // month file after the write, as a month written before the store checked the high would hold
+    // it; the engine refuses the bar on 1m. (On 1h the other minutes' asks lift the hour's ask
+    // high back over its bid high.)
     let crossed = fx_t0() + DAY + 10 * HOUR + 30 * MINUTE;
     let i = times.iter().position(|&t| t == crossed).unwrap();
     // The bid's open, low and close, a zero spread the store allows, and a high a tick under the
     // bid's, which is still above the open and the close.
     asks[i] = Candle {
-        high: bids[i].high - 0.01,
         volume: 0.0,
         quote_volume: 0.0,
         ..bids[i]
     };
-    store
-        .write_quotes(&fx_instrument("EURUSD").id, &bids, &asks)
-        .expect("the store takes it");
+    let id = fx_instrument("EURUSD").id;
+    store.write_quotes(&id, &bids, &asks).expect("writes");
+    plant_ask_high(&store, &id, crossed, bids[i].high - 0.01);
     let t = TestServer::on(dir, store).await;
 
     let config = fx_config("EURUSD", Timeframe::M1);

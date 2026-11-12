@@ -4,7 +4,9 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use td_core::{Candle, InstrumentId, InstrumentKind, OrderType, Side, Timeframe, Venue};
+use td_core::{
+    AccountCurrency, Candle, InstrumentId, InstrumentKind, OrderType, Side, Timeframe, Venue,
+};
 
 use crate::strategies::{affordable_qty, order};
 use crate::{
@@ -92,6 +94,7 @@ fn plan() -> TestPlan {
             starting_cash: 10_000.0,
             max_leverage: 1.0,
             slippage: Vec::new(),
+            account_currency: AccountCurrency::Quote,
         },
         sweep: SweepPlan {
             fixed: Params::new(),

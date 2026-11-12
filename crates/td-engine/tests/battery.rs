@@ -9,7 +9,7 @@ mod common;
 use std::ops::ControlFlow;
 use std::sync::Mutex;
 
-use td_core::{Candle, Instrument, InstrumentKind, Millis, Timeframe};
+use td_core::{AccountCurrency, Candle, Instrument, InstrumentKind, Millis, Timeframe};
 use td_engine::{
     BatteryResult, BatterySpec, Direction, DrawdownMode, EvidenceSettings, FirmLimits,
     HighRiskLimits, Layer, MAX_RUNS, Metric, Objective, Outcome, ParamAxis, ParamSpace, ParamValue,
@@ -126,6 +126,7 @@ fn plan(days: i64) -> TestPlan {
             starting_cash: 10_000.0,
             max_leverage: 1.0,
             slippage: Vec::new(),
+            account_currency: AccountCurrency::Quote,
         },
         sweep: SweepPlan {
             fixed: Params::new().with("allow_short", ParamValue::Bool(true)),
