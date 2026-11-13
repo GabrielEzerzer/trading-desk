@@ -42,7 +42,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
 use std::fmt;
 use std::fs::{self, File};
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
@@ -1393,6 +1393,24 @@ pub(crate) fn hold<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 /// Writes `batch` to a temp file beside `path`, then renames it over `path`. The temp name holds
 /// the process id and a per-process counter, so no two writes share one.
 fn write_atomic(path: &Path, batch: &RecordBatch) -> Result<(), DataError> {
+    let parquet_error = |source| DataError::Parquet {
+        path: path.to_path_buf(),
+        source,
+    };
+    let props = WriterProperties::builder()
+        .set_compression(Compression::ZSTD(ZstdLevel::default()))
+        .build();
+    let mut writer =
+        ArrowWriter::try_new(Vec::new(), batch.schema(), Some(props)).map_err(parquet_error)?;
+    writer.write(batch).map_err(parquet_error)?;
+    let bytes = writer.into_inner().map_err(parquet_error)?;
+    write_bytes_atomic(path, &bytes)
+}
+
+/// Writes `bytes` to a temp file beside `path`, named for this process and write so concurrent
+/// writers never share one, then renames it over `path`, making the folder first. The temp file
+/// is removed if any step fails.
+pub(crate) fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<(), DataError> {
     static WRITES: AtomicU64 = AtomicU64::new(0);
     let dir = path.parent().unwrap_or(Path::new("."));
     fs::create_dir_all(dir).map_err(DataError::io(dir))?;
@@ -1400,19 +1418,9 @@ fn write_atomic(path: &Path, batch: &RecordBatch) -> Result<(), DataError> {
     let write = WRITES.fetch_add(1, Ordering::Relaxed);
     temp_name.push(format!(".{}.{write}.tmp", std::process::id()));
     let temp = dir.join(temp_name);
-    let parquet_error = |source| DataError::Parquet {
-        path: temp.clone(),
-        source,
-    };
     let result = (|| {
-        let file = File::create(&temp).map_err(DataError::io(&temp))?;
-        let props = WriterProperties::builder()
-            .set_compression(Compression::ZSTD(ZstdLevel::default()))
-            .build();
-        let mut writer =
-            ArrowWriter::try_new(file, batch.schema(), Some(props)).map_err(parquet_error)?;
-        writer.write(batch).map_err(parquet_error)?;
-        let file = writer.into_inner().map_err(parquet_error)?;
+        let mut file = File::create(&temp).map_err(DataError::io(&temp))?;
+        file.write_all(bytes).map_err(DataError::io(&temp))?;
         file.sync_all().map_err(DataError::io(&temp))?;
         drop(file);
         rename_replacing(&temp, path).map_err(DataError::io(path))
@@ -1424,7 +1432,7 @@ fn write_atomic(path: &Path, batch: &RecordBatch) -> Result<(), DataError> {
 }
 
 /// `fs::rename`, retried briefly as [`retry_denied`] does.
-pub(crate) fn rename_replacing(from: &Path, to: &Path) -> io::Result<()> {
+fn rename_replacing(from: &Path, to: &Path) -> io::Result<()> {
     retry_denied(|| fs::rename(from, to))
 }
 

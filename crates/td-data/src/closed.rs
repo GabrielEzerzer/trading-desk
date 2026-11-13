@@ -1,6 +1,6 @@
 //! Closures a market with trading hours has that its weekly hours do not know: for FX on OANDA,
-//! 24 December 22:00 to 25 December 22:00 UTC, from 22:00 UTC on 31 December, and the minutes of a
-//! slow Sunday open. They are recorded when a month is downloaded, and coverage and the run check
+//! about 24 December 22:00 to 25 December 22:00 UTC, from about 22:00 UTC on 31 December, and the
+//! minutes of a slow Sunday open. They are recorded when a month is downloaded, and coverage and the run check
 //! read them.
 //!
 //! A download of a kind with closed hours records, beside the month file, the spans of open time in
@@ -24,21 +24,24 @@
 
 use std::collections::BTreeSet;
 use std::fs;
-use std::io::{self, Write};
+use std::io;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use td_core::{Hours, InstrumentId, InstrumentKind, Millis};
 
 use crate::DataError;
 use crate::store::{
-    Gap, Store, bad_file, file_lock, hold, lock_across_processes, rename_replacing,
+    Gap, Store, bad_file, file_lock, hold, lock_across_processes, write_bytes_atomic,
 };
-use crate::time::{DAY, Month};
+use crate::time::{DAY, MINUTE, Month};
 
-/// The longest stretch of open time without a candle that counts as a closure: OANDA's holiday
-/// closures last a day (24 to 25 December, and 31 December to 1 January).
-pub const LONGEST_CLOSURE: Millis = DAY;
+/// The longest stretch of open time without a candle that counts as a closure: 27 hours. OANDA's
+/// holiday closures run a little past a day. Stored USD/JPY shows Christmas closures of 1441 to
+/// 1500 minutes (2024: 24 December 21:55 to 25 December 22:04, 1449 minutes; 2016: 1500) and New
+/// Year closures of 1444. A holiday on a Friday joins across the weekend's closed hours to the
+/// Sunday open, which can come up to 175 minutes late, so a day plus three hours covers both with a
+/// few minutes to spare. A stretch longer than that is an outage.
+pub const LONGEST_CLOSURE: Millis = DAY + 3 * 60 * MINUTE;
 
 /// What follows `.parquet` in the name of a month's record.
 pub(crate) const RECORD_SUFFIX: &str = ".closed.json";
@@ -90,12 +93,21 @@ impl Closures {
         open
     }
 
-    /// The closed time in `[from, to)`.
-    pub fn closed_in(&self, from: Millis, to: Millis) -> Millis {
+    /// The closed spans, oldest first, cut to `[from, to)`.
+    pub fn spans_in(&self, from: Millis, to: Millis) -> Vec<Gap> {
         self.spans
             .iter()
-            .map(|s| (s.to.min(to) - s.from.max(from)).max(0))
-            .sum()
+            .map(|s| Gap {
+                from: s.from.max(from),
+                to: s.to.min(to),
+            })
+            .filter(|s| s.from < s.to)
+            .collect()
+    }
+
+    /// The closed time in `[from, to)`.
+    pub fn closed_in(&self, from: Millis, to: Millis) -> Millis {
+        self.spans_in(from, to).iter().map(|s| s.to - s.from).sum()
     }
 }
 
@@ -170,7 +182,7 @@ impl Store {
             }
         }
         let json = serde_json::to_vec(&merged).map_err(|e| bad_file(&data, e.to_string()))?;
-        write_atomic(&self.record_path(id, month)?, &json)
+        write_bytes_atomic(&self.record_path(id, month)?, &json)
     }
 
     /// The closures recorded over `[from, to)`: each stretch of recorded spans, joined where they
@@ -216,26 +228,6 @@ impl Store {
 /// Whether span `b`, after `a`, starts where `a` ends or only closed hours part them.
 fn meet(kind: InstrumentKind, a: &Gap, b: &Gap) -> bool {
     a.to == b.from || kind.closed_spans(a.to, b.from).first() == Some(&(a.to..b.from))
-}
-
-/// Writes `bytes` to a temp file beside `path` and renames it over `path`.
-fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> Result<(), DataError> {
-    static WRITES: AtomicU64 = AtomicU64::new(0);
-    let mut temp = path.as_os_str().to_owned();
-    let write = WRITES.fetch_add(1, Ordering::Relaxed);
-    temp.push(format!(".{}.{write}.tmp", std::process::id()));
-    let temp = PathBuf::from(temp);
-    let result = (|| {
-        let mut file = fs::File::create(&temp).map_err(DataError::io(&temp))?;
-        file.write_all(bytes).map_err(DataError::io(&temp))?;
-        file.sync_all().map_err(DataError::io(&temp))?;
-        drop(file);
-        rename_replacing(&temp, path).map_err(DataError::io(path))
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temp);
-    }
-    result
 }
 
 #[cfg(test)]
@@ -307,7 +299,7 @@ mod tests {
     }
 
     #[test]
-    fn spans_joined_across_a_month_end_count_as_closed_only_up_to_a_day() {
+    fn spans_joined_across_a_month_end_count_as_closed_only_up_to_the_longest_closure() {
         let dir = tempfile::tempdir().expect("a temp dir");
         let store = Store::new(dir.path());
         let jan = parse_date("2025-01-01").expect("a date"); // a Wednesday
@@ -349,10 +341,10 @@ mod tests {
             ]
         );
 
-        // Two hours more in January make the stretch longer than a day: an outage, not closed.
+        // Four hours more in January make the stretch 28 hours: an outage, not closed.
         let longer = Gap {
             from: jan,
-            to: jan + 24 * HOUR,
+            to: jan + 26 * HOUR,
         };
         store
             .record_closures(&fx(), january, jan, january.end(), &[longer])
@@ -367,9 +359,11 @@ mod tests {
         let dir = tempfile::tempdir().expect("a temp dir");
         let store = Store::new(dir.path());
         let dec = Month::parse("2024-12").expect("a month");
+        // OANDA's 2024 Christmas closure as stored USD/JPY has it: 24 December 21:55 to
+        // 25 December 22:04 UTC, 1449 minutes, longer than a day.
         let christmas = Gap {
-            from: parse_date("2024-12-24").expect("a date") + 22 * HOUR,
-            to: parse_date("2024-12-25").expect("a date") + 22 * HOUR,
+            from: parse_date("2024-12-24").expect("a date") + 21 * HOUR + 55 * MINUTE,
+            to: parse_date("2024-12-25").expect("a date") + 22 * HOUR + 4 * MINUTE,
         };
         let open: Vec<Millis> = (dec.start()..dec.end())
             .step_by(MINUTE as usize)

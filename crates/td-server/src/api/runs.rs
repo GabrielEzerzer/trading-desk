@@ -107,6 +107,11 @@ pub struct DataReport {
     /// part it from, each holds less than a day of open time, or two days for FX in a month
     /// downloaded before closures were recorded; more refuses the run.
     pub gaps: Vec<GapInfo>,
+    /// The spans in the range (warm-up included), oldest first, that downloads recorded the venue
+    /// had nothing for and that count as closed, such as 25 December for FX: neither gaps nor
+    /// dropped buckets. Empty in a run saved before closures were reported.
+    #[serde(default)]
+    pub closures: Vec<GapInfo>,
     /// Open times of every bucket in the range the run has no bar for: buckets with no minutes at
     /// all, and buckets left out because too many of their minutes are missing (td-data's rule: a
     /// bucket needs its first and last open minute and at most 1% of its open minutes missing). A
@@ -617,6 +622,11 @@ fn load_or_shortfall(
     let report = DataReport {
         bars: loaded.candles.len(),
         gaps: gaps.iter().map(GapInfo::from).collect(),
+        closures: closures
+            .spans_in(from, to)
+            .iter()
+            .map(GapInfo::from)
+            .collect(),
         dropped,
         tolerated: loaded
             .tolerated
@@ -1339,10 +1349,16 @@ mod tests {
             vec![span_of(christmas.start, christmas.end)]
         );
         assert_eq!(data.report.dropped.len(), 24);
-        // Recorded at download time, it is closed: no gap, no dropped bucket.
+        assert_eq!(data.report.closures, vec![]);
+        // Recorded at download time, it is closed: no gap, no dropped bucket, and listed as
+        // closed.
         record(&fx, &christmas);
         let data = checked(&store, &fx).unwrap();
         assert_eq!(data.report.gaps, vec![]);
+        assert_eq!(
+            data.report.closures,
+            vec![span_of(christmas.start, christmas.end)]
+        );
         assert_eq!(data.report.dropped, Vec::<Millis>::new());
 
         // 36 hours missing from Tuesday 10 December: under the two days a month without a record

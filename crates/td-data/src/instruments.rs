@@ -97,8 +97,9 @@ fn list_instruments(
 
 /// [`fetch_instruments`], kept on disk in the store's data directory, at
 /// `instruments/<venue>-<kind>.json`, and read from there while it is less than
-/// [`INSTRUMENT_CACHE_AGE`] old. A cache that cannot be read is fetched again, and one that cannot
-/// be written is left: the listing is still returned.
+/// [`INSTRUMENT_CACHE_AGE`] old. A cache that cannot be read, or that lists an instrument
+/// [`validate_instrument`] refuses, is fetched again, and one that cannot be written is left: the
+/// listing is still returned.
 pub fn cached_instruments(
     http: &Http,
     store: &Store,
@@ -129,7 +130,16 @@ fn list_cached(
         let cached = fs::read(&path)
             .ok()
             .and_then(|bytes| serde_json::from_slice::<CachedList>(&bytes).ok())
-            .filter(|c| (0..INSTRUMENT_CACHE_AGE).contains(&(now - c.fetched_at)));
+            .filter(|c| (0..INSTRUMENT_CACHE_AGE).contains(&(now - c.fetched_at)))
+            // The file is outside the program, so its listing is checked as a fetched one is.
+            // shortcut: a venue's change to an instrument's rules within the day is picked up
+            // only once the cache expires; key the cache to the rules too if that starts to matter.
+            .filter(|c| {
+                c.list
+                    .instruments
+                    .iter()
+                    .all(|i| validate_instrument(i).is_ok())
+            });
         if let Some(cached) = cached {
             return Ok(cached.list);
         }
@@ -220,6 +230,31 @@ mod tests {
         // A file that cannot be read is fetched again.
         fs::write(dir.path().join("instruments/binance-spot.json"), "{").expect("writes");
         assert_eq!(marker(list(t + DAY + 2).expect("fetches")), "FETCH2");
+        // Nor is one with an instrument that breaks a rule a fetched one is checked for.
+        let broken = Instrument {
+            id: td_core::InstrumentId {
+                venue: Venue::Binance,
+                symbol: "BTCUSDT".into(),
+                kind: InstrumentKind::Spot,
+            },
+            base: "BTC".into(),
+            quote: "USDT".into(),
+            tick_size: 0.0,
+            lot_size: 0.001,
+            min_qty: 0.001,
+            min_notional: 5.0,
+            fees: source.default_fees(InstrumentKind::Spot).expect("fees"),
+        };
+        let cached = CachedList {
+            fetched_at: t + DAY + 2,
+            list: InstrumentList {
+                instruments: vec![broken],
+                rejected: vec![("ON DISK".into(), "a marker".into())],
+            },
+        };
+        let json = serde_json::to_vec(&cached).expect("serialises");
+        fs::write(dir.path().join("instruments/binance-spot.json"), json).expect("writes");
+        assert_eq!(marker(list(t + DAY + 3).expect("fetches")), "FETCH3");
         // A kind the source does not list is refused before the cache.
         let perp = list_cached(&source, &http, dir.path(), InstrumentKind::Perpetual, t);
         assert!(

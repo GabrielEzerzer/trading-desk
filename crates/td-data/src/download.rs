@@ -31,7 +31,8 @@ pub struct DownloadReport {
 ///
 /// A month whose part of the range is already stored with no minute missing, apart from recorded
 /// closures, is skipped. For a kind with closed hours, the open time the source returned nothing
-/// for is recorded beside the month ([`Store::record_closures`]).
+/// for is recorded beside the month ([`Store::record_closures`]), and a month with no record yet is
+/// fetched whole, up to now, so its first record covers all of it.
 pub fn download_candles(
     http: &Http,
     store: &Store,
@@ -71,6 +72,14 @@ pub(crate) fn download_candles_from(
             report.months.push((month, 0));
             continue;
         }
+        let closes = id.kind.rules().hours != Hours::Always;
+        // A record makes the run check hold the month to a day missing, so it must not cover only
+        // the part this download asked for while the month's other closures go unrecorded.
+        let (lo, hi) = if closes && store.closure_record(id, month)?.is_none() {
+            (month.start(), month.end().min(now))
+        } else {
+            (lo, hi)
+        };
         let MinuteHistory {
             mut candles,
             mut asks,
@@ -92,11 +101,11 @@ pub(crate) fn download_candles_from(
         } else {
             store.write_candles(id, &candles)?;
         }
-        if id.kind.rules().hours != Hours::Always {
+        if closes {
             candles.sort_by_key(|c| c.open_time);
             let mut empty = missing_minutes(id.kind, &candles, lo, hi);
             // Minutes up to now may only not be published yet.
-            if hi < to.min(month.end()) && empty.last().is_some_and(|g| g.to == hi) {
+            if hi == now && empty.last().is_some_and(|g| g.to == hi) {
                 empty.pop();
             }
             store.record_closures(id, month, lo, hi, &empty)?;
@@ -215,15 +224,17 @@ mod tests {
         let dir = tempfile::tempdir().expect("a temp dir");
         let store = Store::new(dir.path());
         let id = id(InstrumentKind::Fx);
-        // Monday 8 January 2024 to the Monday after: one FX week, with its weekend closed.
-        let from = parse_date("2024-01-08").expect("a date");
-        let to = from + 7 * DAY;
+        // January 2024, with its weekends closed.
+        let jan = Month::parse("2024-01").expect("a month");
+        let (from, to) = (jan.start(), jan.end());
         let source = DailyFiles::fx(true);
         let http = Http::new().expect("an HTTP client");
         let report = download_candles_from(&source, &http, &store, &id, from, to, &mut |_| {})
             .expect("downloads");
-        let open_minutes = (5 * DAY / MINUTE) as usize;
-        let jan = Month::containing(from);
+        let open_minutes = (from..to)
+            .step_by(MINUTE as usize)
+            .filter(|&t| id.kind.is_open(t))
+            .count();
         assert_eq!(report.months, [(jan, open_minutes)]);
         assert_eq!(report.gaps, [], "the weekend is closed, not missing");
 
@@ -312,6 +323,66 @@ mod tests {
         )
         .expect("downloads");
         assert_eq!(*again.asked.lock().expect("lock"), []);
+    }
+
+    #[test]
+    fn the_first_fx_download_of_part_of_a_month_fetches_and_records_the_whole_month() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let store = Store::new(dir.path());
+        let id = id(InstrumentKind::Fx);
+        let dec = Month::parse("2024-12").expect("a month");
+        let christmas = parse_date("2024-12-25").expect("a date");
+        let source = DailyFiles {
+            missing_days: vec![christmas],
+            ..DailyFiles::fx(true)
+        };
+        let http = Http::new().expect("an HTTP client");
+        // Two days in the middle of a month with no record yet.
+        let tuesday = parse_date("2024-12-10").expect("a date");
+        download_candles_from(
+            &source,
+            &http,
+            &store,
+            &id,
+            tuesday,
+            tuesday + 2 * DAY,
+            &mut |_| {},
+        )
+        .expect("downloads");
+        assert_eq!(
+            *source.asked.lock().expect("lock"),
+            [(dec.start(), dec.end())]
+        );
+        // So the record covers Christmas too, and the month is whole.
+        let closed = Gap {
+            from: christmas,
+            to: christmas + DAY,
+        };
+        assert_eq!(
+            store.closure_record(&id, dec).expect("reads"),
+            Some(vec![closed])
+        );
+        let coverage = store.coverage(&id).expect("covers");
+        assert_eq!(coverage[0].gaps, []);
+
+        // A delete keeps the record, so a later download of part of the month asks for that part
+        // only.
+        store.delete_months(&id, dec, dec).expect("deletes");
+        let again = DailyFiles::fx(true);
+        download_candles_from(
+            &again,
+            &http,
+            &store,
+            &id,
+            tuesday,
+            tuesday + 2 * DAY,
+            &mut |_| {},
+        )
+        .expect("downloads");
+        assert_eq!(
+            *again.asked.lock().expect("lock"),
+            [(tuesday, tuesday + 2 * DAY)]
+        );
     }
 
     #[test]

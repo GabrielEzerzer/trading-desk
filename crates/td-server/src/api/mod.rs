@@ -52,7 +52,8 @@
 //!   job with the source's error, and one that does not fill the range fails it with a
 //!   `data_missing` naming the missing spans. A range nothing can be downloaded for (after now,
 //!   or before the venue's earliest data) is a 422 `data_missing` when it is requested. Shorter
-//!   gaps are run and listed in the result's data report (`gaps`, `dropped`). A bad spec is a 400
+//!   gaps are run and listed in the result's data report (`gaps`, `dropped`), with the recorded
+//!   closures in its `closures`. A bad spec is a 400
 //!   (`invalid_config`, which includes an unknown strategy and range edges off a bar boundary, or
 //!   `invalid_spec`). At most
 //!   [`jobs::MAX_RUN_JOBS`] run jobs are queued or running at once; one more is a 429

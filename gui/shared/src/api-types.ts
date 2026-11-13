@@ -2156,6 +2156,12 @@ bars: number,
  */
 gaps: Array<GapInfo>, 
 /**
+ * The spans in the range (warm-up included), oldest first, that downloads recorded the venue
+ * had nothing for and that count as closed, such as 25 December for FX: neither gaps nor
+ * dropped buckets. Empty in a run saved before closures were reported.
+ */
+closures: Array<GapInfo>, 
+/**
  * Open times of every bucket in the range the run has no bar for: buckets with no minutes at
  * all, and buckets left out because too many of their minutes are missing (td-data's rule: a
  * bucket needs its first and last open minute and at most 1% of its open minutes missing). A
