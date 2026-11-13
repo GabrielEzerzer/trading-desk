@@ -5,6 +5,8 @@ import engine from '../../../../mock/engine.json'
 import { cutoffEnd, datasetRange, laterRun, latestRuns, runFailure, storedDatasets, toFinished, toVerdict } from './runs'
 import { RunCancelled } from './source'
 
+// A JSON import's strings are not the types' literal unions, hence the casts; the Rust test
+// crates/td-server/tests/gui_fixtures.rs checks engine.json against the engine's real types instead.
 const details = engine.details as unknown as Record<string, RunDetail>
 const runs = engine.runs as unknown as RunSummary[]
 const detail = (id: string) => {
