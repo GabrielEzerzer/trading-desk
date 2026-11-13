@@ -196,10 +196,10 @@ impl Instrument {
                 min: self.min_qty,
             });
         }
-        // Venues exempt reduce-only perpetual orders from the minimum notional, so a position that
-        // has shrunk below it in value can still be closed. Whether the order really reduces a
-        // position is the broker's check.
-        let exempt = order.reduce_only && self.id.kind == InstrumentKind::Perpetual;
+        // Venues exempt reduce-only orders on margined markets (perpetuals, FX) from the minimum
+        // notional, so a position that has shrunk below it in value can still be closed. Whether
+        // the order really reduces a position is the broker's check.
+        let exempt = order.reduce_only && self.id.kind.rules().margin;
         let notional = qty * price;
         if !exempt && notional < self.min_notional * (1.0 - TOLERANCE) {
             return Err(CoreError::NotionalBelowMin {
@@ -475,12 +475,24 @@ mod tests {
     }
 
     #[test]
-    fn reduce_only_perpetual_order_is_exempt_from_min_notional() {
+    fn reduce_only_margined_orders_are_exempt_from_min_notional() {
         let i = btc_perp();
         let limit = OrderType::Limit { price: 4000.0 };
         let mut o = order(0.001, limit);
         o.reduce_only = true;
         assert!(i.validate_order(&o, 65000.0).is_ok());
+
+        // FX is margined too, so a reduce-only order there is exempt as well.
+        let fx = Instrument {
+            id: InstrumentId {
+                kind: InstrumentKind::Fx,
+                ..i.id.clone()
+            },
+            ..i.clone()
+        };
+        let mut on_fx = o.clone();
+        on_fx.instrument = fx.id.clone();
+        assert!(fx.validate_order(&on_fx, 65000.0).is_ok());
 
         let spot = Instrument {
             id: InstrumentId {

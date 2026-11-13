@@ -85,7 +85,7 @@ pub use tester::{
     WindowSpec, out_of_sample, permutation_test, stitch, sweep, walk_forward,
 };
 pub use trades::{
-    BarFunding, BarStops, Trade, TradeSide, attach_stops, build_trades, build_trades_with_fills,
+    BarFunding, Trade, TradeSide, TradeStops, attach_stops, build_trades, build_trades_with_fills,
 };
 pub use verdict::{
     Comparison, Criterion, DrawdownMode, EvidenceInputs, FirmLimits, HighRiskLimits,
