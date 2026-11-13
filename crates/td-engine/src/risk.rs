@@ -9,16 +9,12 @@
 use serde::{Deserialize, Serialize};
 use td_core::{AccountCurrency, Candle, Fill, Liquidity, Millis, civil_from_days, days_from_civil};
 
-use crate::metrics::{DAY_MS, EquitySeries};
+use crate::metrics::{DAY_MS, EquitySeries, finite};
+use crate::portfolio::next_position;
 use crate::trades::{closing_side, fill_side};
 use crate::{BarFunding, EquityPoint};
 
 const HOUR_MS: Millis = 3_600_000;
-
-/// `Some(x)` if `x` is finite.
-fn finite(x: f64) -> Option<f64> {
-    x.is_finite().then_some(x)
-}
 
 // ---------------------------------------------------------------------------------------------
 // Equity inside each bar
@@ -156,21 +152,7 @@ pub fn intrabar(
                 see(pos, adverse, shift(e, pos, avg, p, adverse));
             }
             (e, p) = (at_fill - f.fee, f.price);
-            let mut new = pos + dq;
-            // The portfolio's rule for float residue.
-            if new.abs() <= 1e-9 * (f64::abs(pos) + f.qty) {
-                new = 0.0;
-            }
-            avg = if new == 0.0 {
-                0.0
-            } else if pos == 0.0 || pos.signum() != new.signum() {
-                f.price
-            } else if new.abs() > pos.abs() {
-                (pos.abs() * avg + f.qty * f.price) / new.abs()
-            } else {
-                avg
-            };
-            pos = new;
+            (pos, avg) = next_position(pos, avg, dq, f.price);
         }
         let close = point.equity;
         // The range is priced before the funding due later in the bar, which the session
