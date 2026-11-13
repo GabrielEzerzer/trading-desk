@@ -159,9 +159,9 @@ impl Context<'_> {
     /// them: if the close fills first, they open a fresh position the check did not count. That
     /// position is no larger than the plain orders, and they passed the check while the position
     /// stood, so they open past the cap by at most the size of the position the close takes away:
-    /// the account is then about as levered as it was before the close, which, being still open,
-    /// was short of its maintenance margin. Check a plain order's leverage when it fills, against
-    /// the equity then, if strategies combine orders that way.
+    /// the leverage reached is at most the cap plus the position's leverage before the close, up
+    /// to twice the cap. Check a plain order's leverage when it fills, against the equity then, if
+    /// strategies combine orders that way.
     ///
     /// Every order is rejected on a warm-up bar. A rejected order is recorded with its reason and
     /// returned as an error.
