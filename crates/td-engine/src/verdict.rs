@@ -83,7 +83,8 @@ pub struct FirmLimits {
     /// one-phase challenge.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub second_target: Option<f64>,
-    /// The fewest days each phase must run before its target can pass it. 0 sets no minimum.
+    /// The fewest trading days each phase must hold before its target can pass it: days on
+    /// which the strategy filled an order, counted within the phase. 0 sets no minimum.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub min_trading_days: u32,
     /// The best-day rule: a phase passes only once its largest single day's profit is at most
@@ -116,9 +117,11 @@ pub struct AttemptTerms {
     pub refund_fee_with_first_payout: bool,
     /// The trader's share of each payout's profit, above 0 and at most 1.
     pub profit_split: f64,
-    /// The funded account's day, counted from 1, on whose close the first payout may be asked for.
+    /// The trading days the funded account must hold before its first payout: the first payout
+    /// may be asked for at the close of the day on which the account has filled an order on this
+    /// many days.
     pub days_to_first_payout: u32,
-    /// The days from one payout to the earliest next one.
+    /// The days from one payout to the earliest next one, traded or not.
     pub payout_interval_days: u32,
     /// The smallest payout the firm makes, after the split.
     #[serde(default)]

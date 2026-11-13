@@ -1095,7 +1095,8 @@ profit_target: number,
  */
 second_target?: number | null, 
 /**
- * The fewest days each phase must run before its target can pass it. 0 sets no minimum.
+ * The fewest trading days each phase must hold before its target can pass it: days on
+ * which the strategy filled an order, counted within the phase. 0 sets no minimum.
  */
 min_trading_days?: number, 
 /**
@@ -1137,11 +1138,13 @@ refund_fee_with_first_payout: boolean,
  */
 profit_split: number, 
 /**
- * The funded account's day, counted from 1, on whose close the first payout may be asked for.
+ * The trading days the funded account must hold before its first payout: the first payout
+ * may be asked for at the close of the day on which the account has filled an order on this
+ * many days.
  */
 days_to_first_payout: number, 
 /**
- * The days from one payout to the earliest next one.
+ * The days from one payout to the earliest next one, traded or not.
  */
 payout_interval_days: number, 
 /**
