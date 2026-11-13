@@ -44,7 +44,9 @@ pub fn default_slippage_bps(instrument: &Instrument) -> f64 {
 /// regenerated `tests/fixtures/backtest_expected.json` always needs a bump, but an unchanged
 /// fixture does not mean the behaviour is unchanged. A change that moves a result also moves
 /// td-bench's checksums, which leave the revision out: update `harness/evals/perf-checksums.txt`
-/// in the same change.
+/// in the same change. `tests/revision.rs` records the checksums and the fixture each revision
+/// gave, and fails when either moves without a new row there; a row at a new revision needs this
+/// bump.
 pub const ENGINE_REVISION: u32 = 7;
 
 /// Everything that defines a backtest apart from the data itself.
