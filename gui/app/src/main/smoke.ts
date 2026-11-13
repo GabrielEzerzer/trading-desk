@@ -20,7 +20,7 @@ export interface Smoke {
   loadFailed(reason: string): void
 }
 
-export const SMOKE_TIMEOUT_MS = 30_000
+const SMOKE_TIMEOUT_MS = 30_000
 /** The smoke's failure exit code, apart from the 1 the quit watchdog's kill gives on Windows. */
 export const SMOKE_FAIL_CODE = 2
 

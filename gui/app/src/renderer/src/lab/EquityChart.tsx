@@ -6,7 +6,7 @@ const H = 220
 const PAD = 6
 
 /** The SVG path for one series on a log scale, so equal percentage moves look equal. */
-export function linePath(
+function linePath(
   points: EquityPoint[],
   pick: (p: EquityPoint) => number | null,
   lo: number,

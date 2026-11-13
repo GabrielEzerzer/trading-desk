@@ -39,7 +39,7 @@ export function storedDatasets(stored: StoredResponse, first: InstrumentId): Ins
 }
 
 /** When a run was saved: its id starts with the save time in milliseconds (td_engine::RunId). */
-export function runSavedAt(id: string): Millis {
+function runSavedAt(id: string): Millis {
   return Number(id.slice(0, 13))
 }
 
