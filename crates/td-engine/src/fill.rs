@@ -27,8 +27,8 @@ pub enum FillCheck {
 /// attached stop it also calls it on its entry's fill bar, with the bar's open replaced by the
 /// price the entry met the market at: its market price, or its limit when it filled between the
 /// bars, with the range stretched to include that limit. For a reduce-only limit that waits for
-/// the open, it calls it with the order's time in force set to IOC, to price it as a limit arriving
-/// at the open.
+/// the open, it calls it with the order's time in force set to IOC, and a triggered stop-limit
+/// turned into its limit, to price it as a limit arriving at the open.
 pub trait FillModel: Send {
     /// `first` says whether this is the first bar the order can fill on. `triggered` says whether
     /// a stop-limit was triggered on an earlier bar.

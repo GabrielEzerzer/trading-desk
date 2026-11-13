@@ -45,7 +45,7 @@ pub fn default_slippage_bps(instrument: &Instrument) -> f64 {
 /// fixture does not mean the behaviour is unchanged. A change that moves a result also moves
 /// td-bench's checksums, which leave the revision out: update `harness/evals/perf-checksums.txt`
 /// in the same change.
-pub const ENGINE_REVISION: u32 = 6;
+pub const ENGINE_REVISION: u32 = 7;
 
 /// Everything that defines a backtest apart from the data itself.
 ///
@@ -336,7 +336,7 @@ fn run_built(
         account,
         pip,
     );
-    attach_stops(&mut trades, &bars, session.bar_stops(), account);
+    attach_stops(&mut trades, session.trade_stops(), account);
     mark_forced_closes(&mut trades, &fills, session.orders());
     let series = EquitySeries::new(config.starting_cash, session.equity(), tf);
     let intrabar = risk::intrabar(
