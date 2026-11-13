@@ -66,4 +66,29 @@ describe('mock Lab source', () => {
     await vi.advanceTimersByTimeAsync(10_000)
     expect(seen).toHaveLength(count)
   })
+
+  it('deletes stored data by instrument, by month range and all of it, as the engine does', async () => {
+    const source = createMockLabSource()
+    const before = await source.stored()
+    const perp = before.instruments[0]
+    if (!perp?.funding_bytes) throw new Error('the first dataset is a perpetual with funding')
+    const [first, second] = perp.months
+    if (!first || !second) throw new Error('it holds months')
+
+    // A range takes those months only; the funding file stays.
+    const range = await source.deleteData({ instrument: perp.instrument, from: first.month, to: second.month })
+    expect(range).toEqual({ files: 2, bytes: first.bytes + second.bytes })
+    const afterRange = await source.stored()
+    expect(afterRange.instruments[0]?.months).toHaveLength(perp.months.length - 2)
+    expect(afterRange.instruments[0]?.bytes).toBe(perp.bytes - range.bytes)
+
+    // The whole instrument takes the rest, funding included.
+    const whole = await source.deleteData({ instrument: perp.instrument })
+    expect(whole).toEqual({ files: perp.months.length - 2 + 1, bytes: perp.bytes - range.bytes })
+    expect((await source.stored()).instruments).toHaveLength(before.instruments.length - 1)
+
+    const rest = before.instruments.slice(1).reduce((sum, i) => sum + i.bytes, 0)
+    expect((await source.deleteData('all')).bytes).toBe(rest)
+    expect((await source.stored()).instruments).toEqual([])
+  })
 })

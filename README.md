@@ -49,6 +49,8 @@ cargo run --release -p td-data -- download --venue binance --kind spot --symbol 
 
 A download skips a month that is already stored with no minute missing, so running it again over the same range fetches only what is missing. The `instruments` subcommand lists what a venue has open for trading, and keeps the list in the data folder for a day; `stored` lists what you have downloaded and how much space it takes, and `delete` removes it. Strategy Lab can also download the history a strategy needs from inside the app, and a backtest whose range is not all stored downloads the missing part first, as a step of the same run.
 
+In the app, Strategy Lab's "Stored data" view, at the foot of the strategy list, shows the data folder, its size and each instrument's months, and deletes one instrument, a range of its months or all market data; saved runs and paper sessions stay.
+
 The data folder is `TD_DATA_DIR` when that environment variable is set. Otherwise it is `%LOCALAPPDATA%\trading-desk` on Windows, and `$XDG_DATA_HOME/trading-desk` or `~/.local/share/trading-desk` elsewhere. It lives outside the repository, and market data is never committed.
 
 ### Data sources

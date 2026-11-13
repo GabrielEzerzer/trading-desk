@@ -30,7 +30,9 @@
 //! store. A delete takes the same lock a writer takes, removes the data file and any temp files a
 //! crashed writer left beside it or in its place, and lets the lock go. It leaves the sidecar and
 //! the folders as they are, and never follows a link (a symlink or a junction) out of the data
-//! folder.
+//! folder. A download holds its instrument across processes for its whole run, and a delete holds
+//! it alone for its whole run, so a delete is refused while the instrument downloads
+//! ([`Store::hold_for_download`]).
 //!
 //! A [`Store`] keeps the month files it has decoded in memory, so the coverage, the check before a
 //! run and the run's load, which read the same months seconds apart, decode each file once. An
@@ -240,6 +242,24 @@ pub struct StoredData {
 pub struct DeleteReport {
     pub files: usize,
     pub bytes: u64,
+}
+
+/// Every month a [`Month`] can name, for a delete of a whole instrument.
+const EVERY_MONTH: (Month, Month) = (
+    Month {
+        year: i64::MIN,
+        month: 1,
+    },
+    Month {
+        year: i64::MAX,
+        month: 12,
+    },
+);
+
+/// An instrument held across processes, from [`Store::hold_for_download`], until it is dropped.
+#[derive(Debug)]
+pub struct InstrumentHold {
+    _file: File,
 }
 
 /// The data directory: `TD_DATA_DIR` if set, else `%LOCALAPPDATA%\trading-desk` on Windows and
@@ -910,58 +930,151 @@ impl Store {
     /// month; its lock sidecar and the folders stay. Months with neither are skipped: deleting
     /// nothing is not an error, and creates nothing. When a folder on the way to the month files is
     /// missing or is a link, nothing is deleted. The funding file stays.
+    ///
+    /// The delete holds the instrument for its whole run ([`Store::hold_for_download`]), and is
+    /// refused with [`DataError::InstrumentBusy`] while a download or another delete holds it, in
+    /// this process or another.
     pub fn delete_months(
         &self,
         id: &InstrumentId,
         from: Month,
         to: Month,
     ) -> Result<DeleteReport, DataError> {
-        let dir = self.candle_dir(id)?;
-        let mut report = DeleteReport::default();
-        if !self.real_dir(&dir)? {
-            return Ok(report);
-        }
-        let mut months = std::collections::BTreeSet::new();
-        for name in dir_names(&dir, &mut Vec::new(), &self.root)? {
-            if let Some((month, data)) = month_of_file(&name)
-                && (data || name.ends_with(".tmp"))
-                && (from..=to).contains(&month)
-            {
-                months.insert(month);
-            }
-        }
-        for month in months {
-            let path = dir.join(format!("{month}.parquet"));
-            let removed = remove_locked(&path, &mut report);
-            self.months.forget(&path);
-            removed?;
-        }
-        Ok(report)
+        self.delete_held(id, (from, to), false)
     }
 
     /// Deletes every month of an instrument's candles and, for a perpetual, its funding file, as
     /// [`Store::delete_months`] does.
     pub fn delete_instrument(&self, id: &InstrumentId) -> Result<DeleteReport, DataError> {
-        let every_month = (
-            Month {
-                year: i64::MIN,
-                month: 1,
-            },
-            Month {
-                year: i64::MAX,
-                month: 12,
-            },
-        );
-        let mut report = self.delete_months(id, every_month.0, every_month.1)?;
-        if id.kind == InstrumentKind::Perpetual {
+        self.delete_held(id, EVERY_MONTH, true)
+    }
+
+    /// Deletes every instrument [`Store::stored`] lists, as [`Store::delete_instrument`] does. It
+    /// holds every one of them first, and deletes nothing when a download or another delete holds
+    /// any. Only the store's own files under `candles/` and `funding/` go: the rest of the data
+    /// folder (saved runs, paper sessions) and the entries [`StoredData::unrecognised`] lists stay.
+    pub fn delete_all(&self) -> Result<DeleteReport, DataError> {
+        let ids: Vec<InstrumentId> = self
+            .stored()?
+            .instruments
+            .into_iter()
+            .map(|i| i.id)
+            .collect();
+        let _holds = ids
+            .iter()
+            .map(|id| self.hold_for_delete(id))
+            .collect::<Result<Vec<_>, _>>()?;
+        // One report across every instrument, so a delete that stops part-way counts all it removed.
+        let mut report = DeleteReport::default();
+        for id in &ids {
+            self.remove(&self.doomed(id, EVERY_MONTH, true)?, &mut report)?;
+        }
+        Ok(report)
+    }
+
+    /// Holds `id` for a download, across processes, for as long as the returned value lives. A
+    /// download holds its instrument for its whole run, so a delete of it is refused meanwhile.
+    /// Downloads share the hold, so two of one instrument can still run at once (each file stays
+    /// whole under its own lock). A download that finds a delete holding the instrument waits for
+    /// the delete to finish. The hold is an OS lock on `locks/<venue>/<kind>/<SYMBOL>.lock` in the
+    /// data folder, which the OS releases if the holder dies; the file stays on disk.
+    pub fn hold_for_download(&self, id: &InstrumentId) -> Result<InstrumentHold, DataError> {
+        let (file, path) = self.instrument_lock(id)?;
+        file.lock_shared().map_err(DataError::io(&path))?;
+        Ok(InstrumentHold { _file: file })
+    }
+
+    /// Holds `id` for a delete, alone, or refuses at once with [`DataError::InstrumentBusy`] when
+    /// a download or another delete holds it.
+    fn hold_for_delete(&self, id: &InstrumentId) -> Result<InstrumentHold, DataError> {
+        let (file, path) = self.instrument_lock(id)?;
+        match file.try_lock() {
+            Ok(()) => Ok(InstrumentHold { _file: file }),
+            Err(fs::TryLockError::WouldBlock) => Err(DataError::InstrumentBusy(id.to_string())),
+            Err(fs::TryLockError::Error(e)) => Err(DataError::io(&path)(e)),
+        }
+    }
+
+    /// Opens, creating it if needed, the file whose OS lock holds `id` across processes.
+    fn instrument_lock(&self, id: &InstrumentId) -> Result<(File, PathBuf), DataError> {
+        check_symbol(&id.symbol)?;
+        let dir = self
+            .root
+            .join("locks")
+            .join(id.venue.to_string())
+            .join(id.kind.to_string());
+        fs::create_dir_all(&dir).map_err(DataError::io(&dir))?;
+        let path = dir.join(format!("{}.lock", id.symbol));
+        let file = File::options()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(DataError::io(&path))?;
+        Ok((file, path))
+    }
+
+    /// Deletes what [`Store::doomed`] names while holding `id`. With nothing to delete it takes no
+    /// hold, so it creates no lock file; otherwise it looks again once it holds `id`.
+    fn delete_held(
+        &self,
+        id: &InstrumentId,
+        months: (Month, Month),
+        funding: bool,
+    ) -> Result<DeleteReport, DataError> {
+        if self.doomed(id, months, funding)?.is_empty() {
+            return Ok(DeleteReport::default());
+        }
+        let _hold = self.hold_for_delete(id)?;
+        let mut report = DeleteReport::default();
+        self.remove(&self.doomed(id, months, funding)?, &mut report)?;
+        Ok(report)
+    }
+
+    /// The store files of `id` a delete removes: each month file from `from` to `to` that is there
+    /// or has a temp file, and with `funding` a perpetual's funding file when it or a temp file of
+    /// it is there. Nothing below a folder that is missing or is a link is named.
+    fn doomed(
+        &self,
+        id: &InstrumentId,
+        (from, to): (Month, Month),
+        funding: bool,
+    ) -> Result<Vec<PathBuf>, DataError> {
+        let dir = self.candle_dir(id)?;
+        let mut paths = Vec::new();
+        if self.real_dir(&dir)? {
+            let mut months = std::collections::BTreeSet::new();
+            for name in dir_names(&dir, &mut Vec::new(), &self.root)? {
+                if let Some((month, data)) = month_of_file(&name)
+                    && (data || name.ends_with(".tmp"))
+                    && (from..=to).contains(&month)
+                {
+                    months.insert(month);
+                }
+            }
+            paths.extend(months.iter().map(|m| dir.join(format!("{m}.parquet"))));
+        }
+        if funding && id.kind == InstrumentKind::Perpetual {
             let path = self.funding_path(id)?;
             if let Some(dir) = path.parent()
                 && self.real_dir(dir)?
+                && (file_bytes(&path)?.is_some() || !temp_files(&path)?.is_empty())
             {
-                remove_locked(&path, &mut report)?;
+                paths.push(path);
             }
         }
-        Ok(report)
+        Ok(paths)
+    }
+
+    /// Removes each store file in `paths` with [`remove_locked`], adding it to `report`, and drops
+    /// it from the month cache.
+    fn remove(&self, paths: &[PathBuf], report: &mut DeleteReport) -> Result<(), DataError> {
+        for path in paths {
+            let removed = remove_locked(path, report);
+            self.months.forget(path);
+            removed?;
+        }
+        Ok(())
     }
 
     /// The venue folders under the root's `candles` or `funding`. A link or a file of that name
@@ -1991,6 +2104,24 @@ mod tests {
         assert!(!path.exists());
         let sidecar = fs::metadata(path.with_extension("parquet.lock")).expect("the sidecar stays");
         assert_eq!(sidecar.len(), 0, "and the delete wrote nothing into it");
+    }
+
+    #[test]
+    fn a_download_waits_for_a_delete_that_holds_the_instrument() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let store = Store::new(dir.path());
+        let held = store.hold_for_delete(&spot_id()).expect("holds");
+        let download = std::thread::spawn({
+            let store = Store::new(dir.path());
+            move || store.hold_for_download(&spot_id()).map(drop)
+        });
+        sleep(Duration::from_millis(300));
+        assert!(!download.is_finished(), "the download waits for the delete");
+        drop(held);
+        download
+            .join()
+            .expect("joins")
+            .expect("holds once the delete ends");
     }
 
     #[test]

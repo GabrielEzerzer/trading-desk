@@ -30,6 +30,6 @@ pub use instruments::{
 pub use resample::{LoadedCandles, resample};
 pub use source::{DataSource, LiveStream, MinuteHistory, source};
 pub use store::{
-    DeleteReport, Gap, MonthCoverage, MonthQuotes, Store, StoredData, StoredInstrument,
-    StoredMonth, WriteReport, data_dir, missing_minutes,
+    DeleteReport, Gap, InstrumentHold, MonthCoverage, MonthQuotes, Store, StoredData,
+    StoredInstrument, StoredMonth, WriteReport, data_dir, missing_minutes,
 };

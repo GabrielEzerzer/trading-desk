@@ -5,6 +5,8 @@ import type {
   BacktestConfig,
   CandlesResponse,
   CoverageResponse,
+  DeleteRequest,
+  DeleteResult,
   DownloadRequest,
   HealthResponse,
   InstrumentId,
@@ -20,6 +22,7 @@ import type {
   SessionState,
   SessionSummary,
   StartSessionRequest,
+  StoredResponse,
   StrategyInfo,
   Timeframe,
   Venue,
@@ -65,6 +68,15 @@ export function createClient(send: Send) {
         path: '/data/coverage',
         query: { instrument: `${instrument.venue}:${instrument.symbol}:${instrument.kind}` },
       }),
+    /** The data folder and every instrument the store holds, with the size of each file. */
+    stored: () => call<StoredResponse>({ method: 'GET', path: '/data/stored' }),
+    /**
+     * Deletes an instrument's months `from` to `to` (`YYYY-MM`, both included), or with neither the
+     * whole instrument; 409 `conflict` while a download of it runs.
+     */
+    deleteData: (request: DeleteRequest) => call<DeleteResult>({ method: 'POST', path: '/data/delete', body: request }),
+    /** Deletes every stored instrument; saved runs and paper sessions stay. 409 `conflict` while any downloads. */
+    deleteAllData: () => call<DeleteResult>({ method: 'POST', path: '/data/delete-all' }),
     /** The last `limit` closed bars, oldest first; the engine caps `limit` at 5000. */
     candles: (instrument: InstrumentId, timeframe: Timeframe, limit: number) =>
       call<CandlesResponse>({

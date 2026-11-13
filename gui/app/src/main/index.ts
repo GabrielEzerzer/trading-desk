@@ -4,6 +4,7 @@ import {
   type ApiResult,
   type EngineStatus,
   type ServerMessage,
+  type StoredResponse,
   GROUND,
   INK,
   IPC,
@@ -121,6 +122,19 @@ function registerIpc(): void {
     checkSender(event)
     if (args.length > 0) throw new Error('restartEngine takes no arguments')
     await engine.restart()
+  })
+  // The folder comes from the engine, never from the renderer, so the page cannot open any other path.
+  ipcMain.handle(IPC.openDataFolder, async (event, ...args: unknown[]): Promise<string | null> => {
+    checkSender(event)
+    if (args.length > 0) throw new Error('openDataFolder takes no arguments')
+    const connection = engine.connection
+    if (!connection || quit.quitting) return 'The engine is not running.'
+    const result = await sendRequest(connection, { method: 'GET', path: '/data/stored' }, requests.signal)
+    if (!result.ok) return result.error.message
+    const folder = (result.body as StoredResponse).data_dir
+    if (typeof folder !== 'string' || folder === '') return 'The engine did not say where its data folder is.'
+    // openPath answers an empty string once the folder is open, else why it did not open.
+    return (await shell.openPath(folder)) || null
   })
 }
 

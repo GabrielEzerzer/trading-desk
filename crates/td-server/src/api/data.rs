@@ -188,6 +188,9 @@ pub fn run_download(
     ctx: &JobCtx,
 ) -> Result<DownloadResult, JobError> {
     let id = &request.instrument;
+    // Held for the whole download, so a delete of the instrument is refused until it ends; this
+    // waits while a delete of it runs.
+    let _hold = store.hold_for_download(id)?;
     let (from, to) = (request.from, request.to.min(now_ms()));
     let months = Month::range(from, to);
     let perpetual = id.kind == InstrumentKind::Perpetual;
@@ -336,6 +339,9 @@ pub struct StoredInstrumentInfo {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 pub struct StoredResponse {
+    /// The data folder, as an absolute path. It also holds saved runs and paper sessions, which
+    /// are not market data.
+    pub data_dir: String,
     /// Every instrument with at least one month file or a funding file, in instrument order.
     pub instruments: Vec<StoredInstrumentInfo>,
     /// Paths in the data folder, relative to it, that name no venue, kind, symbol or month the
@@ -351,7 +357,12 @@ pub(super) async fn stored(
     let stored = tokio::task::spawn_blocking(move || store.stored())
         .await
         .map_err(|e| ApiError::internal(format!("the listing stopped: {e}")))??;
+    let data_dir = std::path::absolute(state.store.root())
+        .unwrap_or_else(|_| state.store.root().to_path_buf())
+        .to_string_lossy()
+        .into_owned();
     Ok(Json(StoredResponse {
+        data_dir,
         instruments: stored
             .instruments
             .iter()
@@ -400,8 +411,9 @@ pub struct DeleteResult {
 }
 
 /// `POST /data/delete`: deletes stored data now and answers what it removed. Nothing stored is
-/// not an error. A queued or running download of the instrument in this server is a 409
-/// `conflict`: the delete would race the files it is writing.
+/// not an error. A 409 `conflict` while a download of the instrument is queued in this server, or
+/// runs here or in another process on the same data folder, or another delete of it runs: the
+/// delete would race the files it is writing.
 pub(super) async fn delete(
     State(state): State<Arc<AppState>>,
     body: Result<Json<DeleteRequest>, JsonRejection>,
@@ -430,12 +442,9 @@ pub(super) async fn delete(
             ));
         }
     };
-    // shortcut: checked once, before the delete, and only against this server's own jobs. A
-    // download started while the delete runs, or one running in another process on the same data
-    // folder (the `td-data` CLI; the app runs one engine), is not refused. Each file is safe, since
-    // both take its lock, but a month the download had already stored can be deleted under it and
-    // its report then names a month that is gone; a run on that range is refused as data missing.
-    // Hold the instrument across processes for a whole download and delete if that ever matters.
+    // A queued download holds nothing yet, so this server's own queue is checked first; the store
+    // refuses the delete while a running download, here or in another process, holds the
+    // instrument.
     if let Some(job) = state.jobs.download_in_progress(&id) {
         return Err(ApiError::new(
             StatusCode::CONFLICT,
@@ -450,6 +459,32 @@ pub(super) async fn delete(
     })
     .await
     .map_err(|e| ApiError::internal(format!("the delete stopped: {e}")))??;
+    Ok(Json(DeleteResult {
+        files: report.files,
+        bytes: report.bytes,
+    }))
+}
+
+/// `POST /data/delete-all`: deletes every instrument's candles and funding, and answers what it
+/// removed. Saved runs, paper sessions and anything else in the data folder stay. A 409 `conflict`,
+/// deleting nothing, while this server has a download queued or running, or while a download or
+/// another delete holds any stored instrument.
+pub(super) async fn delete_all(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<DeleteResult>, ApiError> {
+    // As for one instrument: a queued download holds nothing yet, so this server's queue is
+    // checked first.
+    if let Some((job, id)) = state.jobs.any_download_in_progress() {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "conflict",
+            format!("{id} has a download in progress (job {job}); wait for it or cancel it"),
+        ));
+    }
+    let store = state.store.clone();
+    let report = tokio::task::spawn_blocking(move || store.delete_all())
+        .await
+        .map_err(|e| ApiError::internal(format!("the delete stopped: {e}")))??;
     Ok(Json(DeleteResult {
         files: report.files,
         bytes: report.bytes,
