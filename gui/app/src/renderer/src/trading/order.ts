@@ -36,7 +36,7 @@ export function stepDecimals(step: number): number {
 }
 
 /** td-core's round_to_step: a value rounded to a multiple of `step`, down or to the nearest. */
-export function roundToStep(value: number, step: number, rounding: 'down' | 'nearest'): number {
+function roundToStep(value: number, step: number, rounding: 'down' | 'nearest'): number {
   const scale = 10 ** stepDecimals(step)
   const stepUnits = roundHalfAway(step * scale)
   const steps = (value * scale) / stepUnits
