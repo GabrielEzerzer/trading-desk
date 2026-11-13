@@ -1408,6 +1408,48 @@ fn an_fx_shorts_excursions_and_open_mark_are_on_the_ask() {
     approx(x.ranges[2].low, 999_700.0);
 }
 
+#[test]
+fn an_adds_shifted_price_is_held_within_the_ask_range() {
+    // Short 1000 from bar 1's bid open of 150.000. Bar 2 opens with the ask 0.100 above the bid,
+    // and the spread narrows to 0.010 at the high, where a sell limit adds 1000 at 150.140. One
+    // spread at the open above the add's price is 150.240, past the ask's high of 150.160, which
+    // is as high as the ask went: the 1000 short before the add is valued there, at
+    // 1 000 000 - 1000 * 0.160 = 999 840, not at 999 760.
+    let narrowing = (
+        [150.000, 150.150, 149.950, 150.050],
+        [150.100, 150.160, 149.960, 150.060],
+    );
+    let quotes = [DECIDE, SPIKE, narrowing];
+    let plan = vec![
+        (0, Send::Plain(market(Side::Sell, 1000.0))),
+        (1, Send::Plain(limit(Side::Sell, 1000.0, 150.140))),
+    ];
+    let s = run_fx(plan, &quotes);
+    assert_eq!(s.fills().len(), 2);
+    approx(s.fills()[1].price, 150.140);
+    let x = intrabar_of(&s, &quotes);
+    // After the add, short 2000 from 150.070, the ask's high of 150.160 is 2000 * 0.090 = 180
+    // down: 999 820, the lowest the equity went.
+    approx(x.ranges[2].low, 999_820.0);
+
+    // A sell limit at 150.300 that bar 2 opens through fills between the bars, before the candle
+    // began, so its shifted price of 150.320 stands below the ask's low of 150.370: on the way up
+    // to the open the 1000 short was worth 1 000 000 - 1000 * 0.320 = 999 680, the highest the
+    // equity was in bar 2 (the ask open of 150.420 gives 999 580).
+    let gap = (
+        [150.400, 150.410, 150.350, 150.380],
+        [150.420, 150.430, 150.370, 150.400],
+    );
+    let quotes = [DECIDE, SPIKE, gap];
+    let plan = vec![
+        (0, Send::Plain(market(Side::Sell, 1000.0))),
+        (1, Send::Plain(limit(Side::Sell, 1000.0, 150.300))),
+    ];
+    let s = run_fx(plan, &quotes);
+    approx(s.fills()[1].price, 150.300);
+    approx(intrabar_of(&s, &quotes).ranges[2].high, 999_680.0);
+}
+
 /// A short of 1000 sold at bar 1's bid open and 1000 more sold at bar 2's.
 fn plan_add() -> Vec<(usize, Send)> {
     vec![

@@ -137,23 +137,31 @@ impl Context<'_> {
     /// commission. A spot buy is checked
     /// again when it fills and cut to the cash then (see [`crate::SimBroker`]).
     ///
-    /// On a margined kind (perpetual, FX), an order is rejected if the position it could build is
-    /// worth more than [`Context::max_leverage`] times the equity. With no position, or on the side
-    /// of the position, that is the position plus this order and the open orders on its side that
-    /// are not reduce-only; a reduce-only order there is not checked, since it adds nothing.
-    /// Against the position, this order and the open orders on its side, reduce-only or not, are
-    /// always allowed when together they are no larger than the position, since they can then only
-    /// shrink it, so a strategy can always reduce or close, even when losses have taken it over the
-    /// cap. When they are larger they could flip it: the worst case is that the reduce-only orders
-    /// close what they can first and the others open a fresh position on the other side, and that
-    /// fresh position is what is capped, whichever of the orders is submitted last. So a
-    /// reduce-only close sent after a plain order that flips is refused when it would make room
-    /// for that order to open past the cap. The position is valued at this bar's close, and each
+    /// On a margined kind (perpetual, FX), an order that is not reduce-only is rejected if the
+    /// position it could build is worth more than [`Context::max_leverage`] times the equity. A
+    /// reduce-only order is never checked, as on a venue, so a strategy can always reduce or close,
+    /// even when losses have taken it over the cap. With no position, or on the side of the
+    /// position, the position checked is the position plus this order and the open orders on its
+    /// side that are not reduce-only. Against the position, this order and the open orders on its
+    /// side, reduce-only or not, are always allowed when together they are no larger than the
+    /// position, since they can then only shrink it. When they are larger they could flip it: the
+    /// worst case is that the reduce-only orders close what they can first and the others open a
+    /// fresh position on the other side, and that fresh position is what is capped. The position
+    /// is valued at this bar's close, and each
     /// order at its limit price, its trigger, or this bar's close on its side for a market order
     /// (the ask close for a buy on a market with quotes), without the fee. On a base account each
     /// of those values is converted to the account currency at the price it is valued at, so a
     /// position of `q` units of USD/JPY is worth `q` dollars, before it is compared with the
     /// equity.
+    ///
+    /// shortcut: since a reduce-only order is never checked, one sent after plain orders against
+    /// the position (a reduce-only market close after a plain take-profit limit) makes room for
+    /// them: if the close fills first, they open a fresh position the check did not count. That
+    /// position is no larger than the plain orders, and they passed the check while the position
+    /// stood, so they open past the cap by at most the size of the position the close takes away:
+    /// the account is then about as levered as it was before the close, which, being still open,
+    /// was short of its maintenance margin. Check a plain order's leverage when it fills, against
+    /// the equity then, if strategies combine orders that way.
     ///
     /// Every order is rejected on a warm-up bar. A rejected order is recorded with its reason and
     /// returned as an error.
@@ -379,10 +387,9 @@ impl Context<'_> {
                 return (req, Err(reason));
             }
         }
-        let position = self.position();
-        let against = req.side.sign() * position < 0.0;
-        if rules.margin && (!req.reduce_only || against) {
+        if rules.margin && !req.reduce_only {
             let close = self.bar().close;
+            let position = self.position();
             // Every order here is on this order's side, and a market order is valued at its side's
             // close.
             let last = self.close_on(req.side);

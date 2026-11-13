@@ -133,13 +133,19 @@ pub fn intrabar(
             // A fill that reduces the position is on the side the position closes on. One that
             // adds to it is on the other side on a market with quotes, so the position before it
             // is valued one spread from the fill's price, the spread at the bar's open, as the
-            // broker starts an attached stop.
+            // broker starts an attached stop. A fill inside its side's candle met the closing side
+            // inside that side's candle, so the price is held there, as `build_trades` holds the
+            // add's excursion; one filled between the bars met it on the way to the open.
             // shortcut: the spread at the fill itself is not in the candles, so a spread that
             // changed between the open and the fill still misstates the equity there by the change
             // on that position. Take the closing side's price at the fill when the fill model
             // records it.
-            let offset = closing_side(bar, ask, pos).open - fill_side(bar, ask, f.side).open;
-            let before = f.price + offset;
+            let c = closing_side(bar, ask, pos);
+            let own = fill_side(bar, ask, f.side);
+            let mut before = f.price + (c.open - own.open);
+            if (own.low..=own.high).contains(&f.price) {
+                before = before.clamp(c.low, c.high);
+            }
             see(pos, before, shift(e, pos, avg, p, before));
             let at_fill = shift(e, pos, avg, p, f.price);
             let dq = f.side.sign() * f.qty;

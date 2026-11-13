@@ -334,33 +334,32 @@ fn a_reduce_only_close_cannot_clear_the_way_for_a_reversal_past_the_cap() {
 }
 
 #[test]
-fn a_reduce_only_close_sent_after_a_flip_cannot_clear_the_way_past_the_cap() {
+fn a_reduce_only_close_is_accepted_behind_a_resting_plain_exit() {
     let i = perp();
     let bars = [
         bar(0, 100.0, 101.0, 99.0, 100.0),
         bar(1, 100.0, 101.0, 99.0, 100.0),
-        bar(2, 100.0, 101.0, 99.0, 100.0),
+        bar(2, 100.0, 100.5, 99.0, 100.0),
     ];
     let (script, log) = Script::new(vec![
         // Long 99 at 100, fee 19.8: equity 9,980.2 at bar 1's close, and 9,980.2 allowed at 1x.
         (0, req(&i, Side::Buy, 99.0, OrderType::Market)),
-        // A sell limit of 198 at 100.5 flips the long: the fresh short is 99, 9,949.5, within.
+        // A plain take-profit: a sell limit of 99 at 101, no larger than the long.
         (
             1,
-            req(&i, Side::Sell, 198.0, OrderType::Limit { price: 100.5 }),
+            req(&i, Side::Sell, 99.0, OrderType::Limit { price: 101.0 }),
         ),
-        // A reduce-only market close of the 99, sent after it, would close the long at bar 2's
-        // open and leave the limit to open a fresh short of all 198 inside the range: 19,899,
-        // over the cap.
+        // A reduce-only market close of the 99 behind it. If it were checked, the limit could
+        // then open a fresh short of 99 at 101, 9,999, over the 9,980.2; but a reduce-only order
+        // is never checked, so the close goes through.
         (1, reduce_only(req(&i, Side::Sell, 99.0, OrderType::Market))),
     ]);
     let s = run(i, lev(1.0), &bars, script);
     let log = log.lock().unwrap();
-    assert!(log[0].is_ok() && log[1].is_ok());
-    let err = log[2].as_ref().unwrap_err();
-    assert!(err.reason.contains("leverage"), "{}", err.reason);
-    // Bar 2 reaches 100.5 and the limit sells 198: long 99 becomes short 99.
-    approx(s.portfolio().position(), -99.0);
+    assert!(log.iter().all(Result::is_ok), "{log:?}");
+    // The close fills at bar 2's open; the take-profit, not reached, still rests.
+    approx(s.portfolio().position(), 0.0);
+    assert_eq!(s.open_orders().len(), 1);
 }
 
 #[test]
