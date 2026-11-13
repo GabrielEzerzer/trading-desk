@@ -29,6 +29,16 @@ Then, from `gui/`:
 
 The engine's own tests run with `cargo test --workspace` from the repository root. `gui/README.md` has the rest of the GUI commands, including the screenshot and UI checks.
 
+### Installing
+
+There is an installer for Windows. A GitHub release will attach it later; until then, build it from `gui/` with `pnpm dist`, which builds the engine, the app and the installer and writes `gui/app/dist/Trading Desk Setup <version>.exe`.
+
+The installer installs the app for the current Windows user only, so it needs no administrator rights. It puts the app, with the engine beside it, in `%LOCALAPPDATA%\Programs\trading-desk`, and adds a Start menu entry and a desktop shortcut. The installer is not signed, so the first time it runs Windows SmartScreen says it protected your PC; choose "More info", then "Run anyway". The app does not update itself: to update, run a newer installer.
+
+The installed app keeps downloaded market data and saved runs in the data folder described under "Market data" below, `%LOCALAPPDATA%\trading-desk` unless `TD_DATA_DIR` is set, and creates what it needs there on first use. Its browser profile (caches and local storage) is in `%APPDATA%\Trading Desk`. For FX downloads, set `OANDA_API_TOKEN` as a user environment variable before starting the app.
+
+Uninstall it from Settings > Apps > Installed apps. Uninstalling removes the app but leaves both folders, so your data is still there after a reinstall. To remove the data as well, delete `%LOCALAPPDATA%\trading-desk` and `%APPDATA%\Trading Desk` after uninstalling.
+
 ### Market data
 
 The app needs candles before it can backtest. Download them with the `td-data` command line tool, for example two years of one-minute BTCUSDT spot candles from Binance:
