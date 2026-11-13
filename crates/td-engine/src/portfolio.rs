@@ -153,22 +153,7 @@ impl Portfolio {
                 self.cash += pnl;
             }
         }
-        let mut new = pos + dq;
-        // Closing 0.3 that was bought as 0.1 + 0.2 leaves 5.6e-17 behind; that is flat.
-        if new.abs() <= 1e-9 * (pos.abs() + qty) {
-            new = 0.0;
-        }
-        self.avg_entry = if new == 0.0 {
-            0.0
-        } else if pos == 0.0 || pos.signum() != new.signum() {
-            // Opened from flat, or flipped through zero: the remainder was all bought at `price`.
-            price
-        } else if new.abs() > pos.abs() {
-            (pos.abs() * self.avg_entry + qty * price) / new.abs()
-        } else {
-            self.avg_entry
-        };
-        self.position = new;
+        (self.position, self.avg_entry) = next_position(pos, self.avg_entry, dq, price);
     }
 
     /// Charges one funding payment of `position * price * rate`: longs pay a positive rate and
@@ -199,6 +184,29 @@ impl Portfolio {
     pub(crate) fn mark(&mut self, price: f64) {
         self.mark_price = price;
     }
+}
+
+/// The position and average entry after a fill of signed quantity `dq` at `price`, from a
+/// position of `pos` entered at an average of `avg`. The one rule for both, which the trade list
+/// and the intrabar risk measures replay so they agree with the portfolio.
+pub(crate) fn next_position(pos: f64, avg: f64, dq: f64, price: f64) -> (f64, f64) {
+    let qty = dq.abs();
+    let mut new = pos + dq;
+    // Closing 0.3 that was bought as 0.1 + 0.2 leaves 5.6e-17 behind; that is flat.
+    if new.abs() <= 1e-9 * (pos.abs() + qty) {
+        new = 0.0;
+    }
+    let avg = if new == 0.0 {
+        0.0
+    } else if pos == 0.0 || pos.signum() != new.signum() {
+        // Opened from flat, or flipped through zero: the remainder was all bought at `price`.
+        price
+    } else if new.abs() > pos.abs() {
+        (pos.abs() * avg + qty * price) / new.abs()
+    } else {
+        avg
+    };
+    (new, avg)
 }
 
 #[cfg(test)]

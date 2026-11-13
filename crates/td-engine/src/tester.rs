@@ -21,7 +21,7 @@ use crate::metrics::{self, EquitySeries, MetricsReport};
 use crate::permute::permute_quotes;
 use crate::risk::{EquityRange, Intrabar};
 use crate::rng::{SplitMix64, derive_seed};
-use crate::runner::{compare, config_fingerprint, hold_over, match_asks, select_bars};
+use crate::runner::{compare, config_fingerprint, hold_over, match_asks, run_metrics, select_bars};
 use crate::{
     BacktestConfig, BacktestResult, Benchmark, EngineError, EquityPoint, ParamKind, ParamSpec,
     ParamValue, Params, Trade, find_strategy, run,
@@ -724,9 +724,9 @@ fn run_row(
     funding: &[(Millis, f64)],
 ) -> Result<SweepRow, EngineError> {
     let params = plan.params(&spec.base.params, index).resolve(&plan.specs)?;
-    match run(&with_params(&spec.base, &params), bars, asks, funding) {
-        Ok(result) => {
-            let h = Headline::new(&result.metrics);
+    match run_metrics(&with_params(&spec.base, &params), bars, asks, funding) {
+        Ok(metrics) => {
+            let h = Headline::new(&metrics);
             let qualified = h.trades >= spec.min_trades && h.value(spec.objective.metric).is_some();
             Ok(SweepRow {
                 index,

@@ -866,10 +866,15 @@ fn execute(
     let data = match load_or_shortfall(store, base, cutoff)? {
         Ok(data) => data,
         Err(_) => {
-            // Held from here through the read, so a delete cannot remove a month between the
-            // download and the read. What is missing is looked at again under the hold, as a
-            // delete may have landed since the first look.
+            // The download takes a download slot and waits for any other download of the
+            // instrument, a download job's or another run's, so the same months are never fetched
+            // twice at once. The turn and the hold last from here through the read, so a delete
+            // cannot remove a month between the download and the read. What is missing is looked
+            // at again under them, as another download or a delete may have landed since the
+            // first look.
+            let _turn = ctx.download_turn(id)?;
             let _hold = store.hold_for_download(id)?;
+            ctx.progress(0.0, "loading the data");
             match load_or_shortfall(store, base, cutoff)? {
                 Ok(data) => data,
                 Err(shortfall) => {

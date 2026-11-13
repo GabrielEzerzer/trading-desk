@@ -5,6 +5,9 @@ use std::ops::Range;
 use serde::{Deserialize, Serialize};
 use td_core::{AccountCurrency, Candle, Fill, Liquidity, Millis, Side};
 
+use crate::metrics::finite;
+use crate::portfolio::next_position;
+
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -263,11 +266,6 @@ impl Building {
     }
 }
 
-/// `Some(x)` if `x` is finite.
-fn finite(x: f64) -> Option<f64> {
-    x.is_finite().then_some(x)
-}
-
 /// The candle a position of `pos` would close on, as the session marks it: on a market with
 /// quotes, the ask for a short and the bar, which holds the bid, for a long; without an ask, the
 /// bar.
@@ -369,10 +367,8 @@ pub fn build_trades_with_fills(
             next += 1;
             let qty = fill.qty;
             let dq = fill.side.sign() * qty;
-            let mut new = pos + dq;
-            if new.abs() <= 1e-9 * (f64::abs(pos) + qty) {
-                new = 0.0;
-            }
+            let held_avg = current.as_ref().map_or(0.0, |t| t.avg_cost);
+            let (new, avg_after) = next_position(pos, held_avg, dq, fill.price);
             let reducing = pos != 0.0 && f64::signum(pos) != dq.signum();
             if reducing {
                 let t = current.as_mut().expect("a non-zero position has a trade");
@@ -427,8 +423,7 @@ pub fn build_trades_with_fills(
                 let c = closing_side(bar, ask, pos);
                 let offset = c.open - fill_side(bar, ask, fill.side).open;
                 t.excursion((fill.price + offset).clamp(c.low, c.high), f64::abs(pos));
-                // The portfolio's average cost after the add.
-                t.avg_cost = (f64::abs(pos) * t.avg_cost + qty * fill.price) / new.abs();
+                t.avg_cost = avg_after;
                 t.entry_qty += qty;
                 t.entry_notional += qty * fill.price;
                 t.fees += fill.fee;
