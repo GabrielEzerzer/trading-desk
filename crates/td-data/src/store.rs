@@ -1403,7 +1403,9 @@ fn remove_locked(path: &Path, report: &mut DeleteReport) -> Result<(), DataError
     let lock = file_lock(path);
     let _held = hold(&lock);
     let _locked = lock_across_processes(path)?;
-    let files = [path.to_path_buf(), record];
+    // The record first: a delete that stops part way leaves a month file without a record, which a
+    // download treats as a month never recorded, never a record the listing cannot see.
+    let files = [record, path.to_path_buf()];
     for file in files.into_iter().chain(temp_files(path)?) {
         let Some(bytes) = file_bytes(&file)? else {
             continue;

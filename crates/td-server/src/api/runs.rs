@@ -861,19 +861,27 @@ fn execute(
     let base = base_config(request).ok_or_else(|| ApiError::internal("a download is not a run"))?;
     let id = &base.instrument.id;
     ctx.progress(0.0, "loading the data");
+    // A run whose data is all stored takes no hold: the hold waits for a running delete, and such
+    // a run should not.
     let data = match load_or_shortfall(store, base, cutoff)? {
         Ok(data) => data,
-        Err(shortfall) => {
-            let steps = download_steps(id, &shortfall, now_ms());
-            if steps.is_empty() {
-                return Err(changed_since_accepted(shortfall.refusal(id)).into());
-            }
-            // Held from the download through the read, so a delete cannot remove a month between
-            // them.
+        Err(_) => {
+            // Held from here through the read, so a delete cannot remove a month between the
+            // download and the read. What is missing is looked at again under the hold, as a
+            // delete may have landed since the first look.
             let _hold = store.hold_for_download(id)?;
-            download(source, store, id, &steps, ctx)?;
-            ctx.progress(0.0, "loading the data");
-            load_run_data(store, base, cutoff).map_err(not_filled)?
+            match load_or_shortfall(store, base, cutoff)? {
+                Ok(data) => data,
+                Err(shortfall) => {
+                    let steps = download_steps(id, &shortfall, now_ms());
+                    if steps.is_empty() {
+                        return Err(changed_since_accepted(shortfall.refusal(id)).into());
+                    }
+                    download(source, store, id, &steps, ctx)?;
+                    ctx.progress(0.0, "loading the data");
+                    load_run_data(store, base, cutoff).map_err(not_filled)?
+                }
+            }
         }
     };
     let RunData {
