@@ -19,6 +19,7 @@ import type {
   Venue,
 } from '@td/shared'
 import { api } from '../api'
+import { formatVenue } from '../lab/format'
 
 /** The strategy name of a session where you place every order yourself (td-server's `MANUAL_STRATEGY`). */
 export const MANUAL = 'none'
@@ -86,8 +87,6 @@ const LISTS: [Venue, InstrumentKind][] = [
   ['bybit', 'perpetual'],
 ]
 
-const VENUE_NAMES: Record<Venue, string> = { binance: 'Binance', bybit: 'Bybit', oanda: 'OANDA' }
-
 /** Loads the four venue lists; one that fails is named in `problems`, and only all failing throws. */
 export async function loadInstrumentLists(
   load: (venue: Venue, kind: InstrumentKind) => Promise<Instrument[]>,
@@ -98,7 +97,7 @@ export async function loadInstrumentLists(
   results.forEach((result, i) => {
     const [venue, kind] = LISTS[i] as [Venue, InstrumentKind]
     if (result.status === 'fulfilled') instruments.push(...result.value)
-    else problems.push(`The ${VENUE_NAMES[venue]} ${kind} list did not load.`)
+    else problems.push(`The ${formatVenue(venue)} ${kind} list did not load.`)
   })
   if (instruments.length === 0 && problems.length === LISTS.length) {
     const first = results.find((r) => r.status === 'rejected')
