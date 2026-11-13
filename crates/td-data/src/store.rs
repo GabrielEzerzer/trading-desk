@@ -13,6 +13,10 @@
 //! Readers take no lock: the rename means they see the old file or the new one, never half of one.
 //! Missing minutes are reported, never filled.
 //!
+//! A month of a kind with closed hours (FX) may also have a record of the closures its downloads
+//! found, `<YYYY-MM>.parquet.closed.json` beside the month file ([`crate::closed`]); coverage and
+//! the run check count a recorded closure as closed time.
+//!
 //! A kind whose rules require quotes ([`td_core::MarketRules::quotes`], FX) has a bid and an ask
 //! price. Its month file holds the bid candle in the candle columns and the ask candle in four more,
 //! `ask_open`, `ask_high`, `ask_low` and `ask_close`, written together by [`Store::write_quotes`]
@@ -40,7 +44,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
 use std::fmt;
 use std::fs::{self, File};
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
@@ -183,17 +187,20 @@ pub struct MonthCoverage {
     /// Stored 1-minute candles.
     pub minutes: usize,
     /// The month's open minutes by the instrument's trading hours, which a complete month stores:
-    /// every minute for a market that never closes, the minutes outside its weekends for FX.
+    /// every minute for a market that never closes, the minutes outside its weekends and its
+    /// recorded closures ([`Store::closures`]) for FX.
     pub open_minutes: i64,
     pub first: Millis,
     pub last: Millis,
-    /// Missing minutes between `first` and `last`, by the instrument's trading hours.
+    /// Missing minutes between `first` and `last`, by the instrument's trading hours, less its
+    /// recorded closures.
     pub gaps: Vec<Gap>,
     /// The month file's size on disk.
     pub bytes: u64,
 }
 
-/// One month file of an instrument's candles and its size on disk.
+/// One month file of an instrument's candles and its size on disk, with its closure record's
+/// ([`crate::closed`]), which a delete of the month removes with it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StoredMonth {
     pub month: Month,
@@ -639,7 +646,8 @@ impl Store {
     }
 
     /// Which months and minutes are stored for an instrument, with gaps by its kind's trading hours
-    /// ([`missing_minutes`]).
+    /// ([`missing_minutes`]). A closure the month's downloads recorded ([`Store::closures`]) is
+    /// closed time: it is neither a gap nor among the open minutes.
     pub fn coverage(&self, id: &InstrumentId) -> Result<Vec<MonthCoverage>, DataError> {
         let mut coverage = Vec::new();
         let months = self.months(id)?;
@@ -648,19 +656,26 @@ impl Store {
             let (Some(first), Some(last)) = (candles.first(), candles.last()) else {
                 continue;
             };
+            let closures = self.closures(id, month.start(), month.end())?;
             let closed: Millis = id
                 .kind
                 .closed_spans(month.start(), month.end())
                 .iter()
                 .map(|s| s.end - s.start)
-                .sum();
+                .sum::<Millis>()
+                + closures.closed_in(month.start(), month.end());
             coverage.push(MonthCoverage {
                 month,
                 minutes: candles.len(),
                 open_minutes: month.minutes() - closed / MINUTE,
                 first: first.open_time,
                 last: last.open_time,
-                gaps: missing_minutes(id.kind, &candles, first.open_time, last.open_time + MINUTE),
+                gaps: closures.remove(missing_minutes(
+                    id.kind,
+                    &candles,
+                    first.open_time,
+                    last.open_time + MINUTE,
+                )),
                 bytes: file_bytes(&self.candle_path(id, month)?)?.unwrap_or(0),
             });
         }
@@ -831,13 +846,19 @@ impl Store {
                             match month_of_file(&name) {
                                 Some((month, true)) => {
                                     if let Some(bytes) = file_bytes(&dir.join(&name))? {
-                                        months.push(StoredMonth { month, bytes });
+                                        let record =
+                                            format!("{name}{}", crate::closed::RECORD_SUFFIX);
+                                        let record = file_bytes(&dir.join(record))?.unwrap_or(0);
+                                        months.push(StoredMonth {
+                                            month,
+                                            bytes: bytes + record,
+                                        });
                                     }
                                 }
                                 Some((month, false)) if name.ends_with(".tmp") => {
                                     temps.push((month, name));
                                 }
-                                Some((_, false)) => {} // a lock sidecar
+                                Some((_, false)) => {} // a lock sidecar or a closure record
                                 None => unrecognised.push(self.relative(&dir.join(&name))),
                             }
                         }
@@ -1032,7 +1053,9 @@ impl Store {
             let mut months = std::collections::BTreeSet::new();
             for name in dir_names(&dir, &mut Vec::new(), &self.root)? {
                 if let Some((month, data)) = month_of_file(&name)
-                    && (data || name.ends_with(".tmp"))
+                    && (data
+                        || name.ends_with(".tmp")
+                        || name.ends_with(crate::closed::RECORD_SUFFIX))
                     && (from..=to).contains(&month)
                 {
                     months.insert(month);
@@ -1267,7 +1290,7 @@ fn check_quote(id: &InstrumentId, bid: &Candle, ask: &Candle) -> Result<(), Data
     Ok(())
 }
 
-fn bad_file(path: &Path, reason: impl Into<String>) -> DataError {
+pub(crate) fn bad_file(path: &Path, reason: impl Into<String>) -> DataError {
     DataError::BadFile {
         path: path.to_path_buf(),
         reason: reason.into(),
@@ -1330,7 +1353,7 @@ fn quote_batch(quotes: &[(Candle, Candle)]) -> Result<RecordBatch, DataError> {
 // differently (relative and absolute) do not share this mutex, and entries are never removed (one
 // per file written, a few hundred bytes each); canonicalise and evict if either ever matters. The
 // OS lock taken next still serialises such writers, since it is keyed by the file itself.
-fn file_lock(path: &Path) -> Arc<Mutex<()>> {
+pub(crate) fn file_lock(path: &Path) -> Arc<Mutex<()>> {
     static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
     let mut locks = hold(LOCKS.get_or_init(Mutex::default));
     locks.entry(path.to_path_buf()).or_default().clone()
@@ -1346,7 +1369,7 @@ fn file_lock(path: &Path) -> Arc<Mutex<()>> {
 /// would proceed. It is an OS lock (`flock` on Unix, `LockFileEx` on Windows) bound to the open
 /// handle, so the OS releases it when the holder exits or is killed: a crash cannot leave a file
 /// locked, as a create-exclusive marker file would.
-fn lock_across_processes(path: &Path) -> Result<File, DataError> {
+pub(crate) fn lock_across_processes(path: &Path) -> Result<File, DataError> {
     let dir = path.parent().unwrap_or(Path::new("."));
     fs::create_dir_all(dir).map_err(DataError::io(dir))?;
     let mut name = path.file_name().unwrap_or_default().to_owned();
@@ -1362,20 +1385,28 @@ fn lock_across_processes(path: &Path) -> Result<File, DataError> {
     Ok(file)
 }
 
-/// Removes the store file at `path` under its lock, taken as a writer takes it, with any temp files
-/// a crashed writer left beside it, and adds them to `report`; the lock sidecar stays as it is.
+/// Removes the store file at `path` under its lock, taken as a writer takes it, with a month's
+/// closure record ([`crate::closed`]) and any temp files a crashed writer left beside it, and adds
+/// them to `report`; the lock sidecar stays as it is.
 /// While the lock is held no writer is part way through this file, in this process or another, so
 /// every temp file of it is a leftover, even one with no data file beside it. When `path` is not a
-/// regular file (nothing, or a link) and has no temp file, there is nothing to delete and no lock
-/// is taken.
+/// regular file (nothing, or a link) and has no record or temp file, there is nothing to delete
+/// and no lock is taken.
 fn remove_locked(path: &Path, report: &mut DeleteReport) -> Result<(), DataError> {
-    if file_bytes(path)?.is_none() && temp_files(path)?.is_empty() {
+    let mut record = path.as_os_str().to_owned();
+    record.push(crate::closed::RECORD_SUFFIX);
+    let record = PathBuf::from(record);
+    if file_bytes(path)?.is_none() && file_bytes(&record)?.is_none() && temp_files(path)?.is_empty()
+    {
         return Ok(());
     }
     let lock = file_lock(path);
     let _held = hold(&lock);
     let _locked = lock_across_processes(path)?;
-    for file in std::iter::once(path.to_path_buf()).chain(temp_files(path)?) {
+    // The record first: a delete that stops part way leaves a month file without a record, which a
+    // download treats as a month never recorded, never a record the listing cannot see.
+    let files = [record, path.to_path_buf()];
+    for file in files.into_iter().chain(temp_files(path)?) {
         let Some(bytes) = file_bytes(&file)? else {
             continue;
         };
@@ -1468,9 +1499,13 @@ fn month_of_file(name: &str) -> Option<(Month, bool)> {
 }
 
 /// Whether `rest`, what follows `.parquet` in a file name, is one the store writes: nothing (the
-/// data file), `.lock` (its sidecar) or `.<pid>.<n>.tmp` (a temp file).
+/// data file), `.lock` (its sidecar), `.closed.json` (a month's record of closures, see
+/// [`crate::closed`]) or `.<pid>.<n>.tmp` (a temp file).
 fn is_store_suffix(rest: &str) -> bool {
-    rest.is_empty() || rest == ".lock" || (rest.starts_with('.') && rest.ends_with(".tmp"))
+    rest.is_empty()
+        || rest == ".lock"
+        || rest == crate::closed::RECORD_SUFFIX
+        || (rest.starts_with('.') && rest.ends_with(".tmp"))
 }
 
 /// A venue or kind from the folder name it is stored under, which is its serde name.
@@ -1481,13 +1516,31 @@ fn parse_name<T: serde::de::DeserializeOwned>(name: &str) -> Option<T> {
 /// Locks `mutex`, carrying on past a panic in another holder: the data behind these locks is a
 /// map of locks, a month cache whose updates cannot panic part way, or nothing at all, so it cannot
 /// be left half-changed.
-fn hold<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+pub(crate) fn hold<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Writes `batch` to a temp file beside `path`, then renames it over `path`. The temp name holds
 /// the process id and a per-process counter, so no two writes share one.
 fn write_atomic(path: &Path, batch: &RecordBatch) -> Result<(), DataError> {
+    let parquet_error = |source| DataError::Parquet {
+        path: path.to_path_buf(),
+        source,
+    };
+    let props = WriterProperties::builder()
+        .set_compression(Compression::ZSTD(ZstdLevel::default()))
+        .build();
+    let mut writer =
+        ArrowWriter::try_new(Vec::new(), batch.schema(), Some(props)).map_err(parquet_error)?;
+    writer.write(batch).map_err(parquet_error)?;
+    let bytes = writer.into_inner().map_err(parquet_error)?;
+    write_bytes_atomic(path, &bytes)
+}
+
+/// Writes `bytes` to a temp file beside `path`, named for this process and write so concurrent
+/// writers never share one, then renames it over `path`, making the folder first. The temp file
+/// is removed if any step fails.
+pub(crate) fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<(), DataError> {
     static WRITES: AtomicU64 = AtomicU64::new(0);
     let dir = path.parent().unwrap_or(Path::new("."));
     fs::create_dir_all(dir).map_err(DataError::io(dir))?;
@@ -1495,19 +1548,9 @@ fn write_atomic(path: &Path, batch: &RecordBatch) -> Result<(), DataError> {
     let write = WRITES.fetch_add(1, Ordering::Relaxed);
     temp_name.push(format!(".{}.{write}.tmp", std::process::id()));
     let temp = dir.join(temp_name);
-    let parquet_error = |source| DataError::Parquet {
-        path: temp.clone(),
-        source,
-    };
     let result = (|| {
-        let file = File::create(&temp).map_err(DataError::io(&temp))?;
-        let props = WriterProperties::builder()
-            .set_compression(Compression::ZSTD(ZstdLevel::default()))
-            .build();
-        let mut writer =
-            ArrowWriter::try_new(file, batch.schema(), Some(props)).map_err(parquet_error)?;
-        writer.write(batch).map_err(parquet_error)?;
-        let file = writer.into_inner().map_err(parquet_error)?;
+        let mut file = File::create(&temp).map_err(DataError::io(&temp))?;
+        file.write_all(bytes).map_err(DataError::io(&temp))?;
         file.sync_all().map_err(DataError::io(&temp))?;
         drop(file);
         rename_replacing(&temp, path).map_err(DataError::io(path))

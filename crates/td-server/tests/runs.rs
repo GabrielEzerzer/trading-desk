@@ -61,6 +61,86 @@ impl MarketSource for NoSource {
     }
 }
 
+/// What [`Filling`] does when a run asks it for candles.
+#[derive(Clone, Copy)]
+enum Fill {
+    /// Writes the minutes of [`minutes`] in the range asked for.
+    Minutes,
+    /// Writes nothing, as a venue that has nothing there.
+    Nothing,
+    /// Fails, as a source with no OANDA token does.
+    Fails,
+    /// Tries to delete the instrument, then writes as [`Fill::Minutes`] does; fails unless the
+    /// delete was refused because the instrument is held.
+    TriesDelete,
+}
+
+/// A source for runs that download: it records each candle range asked of it.
+struct Filling {
+    fill: Fill,
+    asked: Mutex<Vec<(Millis, Millis)>>,
+}
+
+impl Filling {
+    fn new(fill: Fill) -> Arc<Filling> {
+        Arc::new(Filling {
+            fill,
+            asked: Mutex::new(Vec::new()),
+        })
+    }
+}
+
+impl MarketSource for Filling {
+    fn instruments(&self, _: Venue, _: InstrumentKind) -> Result<InstrumentList, DataError> {
+        Err(DataError::NoDataDir)
+    }
+    fn candles(
+        &self,
+        store: &Store,
+        id: &InstrumentId,
+        from: Millis,
+        to: Millis,
+    ) -> Result<DownloadReport, DataError> {
+        self.asked.lock().unwrap().push((from, to));
+        let candles: Vec<Candle> = match self.fill {
+            Fill::Minutes => minutes(40, 0..0)
+                .into_iter()
+                .filter(|c| (from..to).contains(&c.open_time))
+                .collect(),
+            Fill::Nothing => Vec::new(),
+            Fill::Fails => return Err(DataError::MissingOandaToken),
+            Fill::TriesDelete => match store.delete_instrument(id) {
+                Err(DataError::InstrumentBusy(_)) => minutes(40, 0..0)
+                    .into_iter()
+                    .filter(|c| (from..to).contains(&c.open_time))
+                    .collect(),
+                other => {
+                    return Err(DataError::InvalidInstrument {
+                        symbol: id.symbol.clone(),
+                        reason: format!(
+                            "the delete during the download was not refused: {other:?}"
+                        ),
+                    });
+                }
+            },
+        };
+        store.write_candles(id, &candles)?;
+        Ok(DownloadReport {
+            months: vec![(Month::containing(from), candles.len())],
+            ..DownloadReport::default()
+        })
+    }
+    fn funding(
+        &self,
+        _: &Store,
+        _: &InstrumentId,
+        _: Millis,
+        _: Millis,
+    ) -> Result<usize, DataError> {
+        Err(DataError::NoDataDir)
+    }
+}
+
 /// Live data that is never there: no run streams. A stream would only try a closed local port.
 struct NoLive;
 
@@ -202,14 +282,30 @@ impl TestServer {
 
     /// A server on a store already seeded.
     async fn on(dir: TempDir, store: Store) -> TestServer {
-        TestServer::on_with(dir, store, None).await
+        TestServer::serve(dir, store, Arc::new(NoSource), None).await
     }
 
     /// [`TestServer::on`], started with `TD_DATA_CUTOFF` set to `cutoff` when one is given.
     async fn on_with(dir: TempDir, store: Store, cutoff: Option<&str>) -> TestServer {
+        TestServer::serve(dir, store, Arc::new(NoSource), cutoff).await
+    }
+
+    /// A server on a store already seeded, downloading through `source`.
+    async fn with_source(dir: TempDir, store: Store, source: Arc<dyn MarketSource>) -> TestServer {
+        TestServer::serve(dir, store, source, None).await
+    }
+
+    /// A server on a store already seeded, downloading through `source`, with the data cutoff
+    /// `cutoff` when one is given.
+    async fn serve(
+        dir: TempDir,
+        store: Store,
+        source: Arc<dyn MarketSource>,
+        cutoff: Option<&str>,
+    ) -> TestServer {
         let server = Server::start(ApiConfig {
             store: store.clone(),
-            source: std::sync::Arc::new(NoSource),
+            source,
             live: std::sync::Arc::new(NoLive),
             token: Token::generate().expect("rng"),
             port: 0,
@@ -562,27 +658,37 @@ async fn sweep_out_of_sample_and_walk_forward_jobs_report_progress_and_save_thei
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_range_the_store_lacks_is_422_data_missing_and_starts_no_job() {
+async fn a_range_nothing_can_be_downloaded_for_is_422_data_missing_and_starts_no_job() {
     let t = TestServer::seeded(3).await;
-    let mut beyond = serde_json::to_value(config(InstrumentKind::Spot, 5)).unwrap();
+    // Days after now, which no venue has yet.
+    let future = parse_date("2100-01-01").unwrap();
+    let mut beyond = serde_json::to_value(BacktestConfig {
+        from: future,
+        to: future + 2 * DAY,
+        ..config(InstrumentKind::Spot, 3)
+    })
+    .unwrap();
     let (status, body) = t.post("/runs/backtest", &beyond).await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
     assert_eq!(body["error"]["code"], "data_missing");
     let message = body["error"]["message"].as_str().unwrap();
     assert!(
         message.contains("binance:BTCUSDT:spot")
-            && message.contains("from 2024-03-04 00:00 to 2024-03-06 00:00 UTC"),
+            && message.contains("from 2100-01-01 00:00 to 2100-01-03 00:00 UTC"),
         "{message}"
     );
-    // An instrument with nothing stored.
+    // An instrument with nothing stored, before the venue's earliest data.
+    let early = parse_date("2016-01-01").unwrap();
     beyond["instrument"]["id"]["symbol"] = json!("ETHUSDT");
-    beyond["to"] = json!(t0() + 3_600_000 * 5);
+    beyond["from"] = json!(early);
+    beyond["to"] = json!(early + 5 * HOUR);
     let (status, body) = t.post("/runs/backtest", &beyond).await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     assert_eq!(body["error"]["code"], "data_missing");
-    let (status, body) = t
-        .post("/runs/sweep", &sweep_spec(4, (3, 4), (10, 11)))
-        .await;
+    let mut sweep = sweep_spec(4, (3, 4), (10, 11));
+    sweep["base"]["from"] = json!(future);
+    sweep["base"]["to"] = json!(future + 4 * DAY);
+    let (status, body) = t.post("/runs/sweep", &sweep).await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     assert_eq!(body["error"]["code"], "data_missing");
 
@@ -960,19 +1066,134 @@ async fn a_queued_run_loads_its_data_only_when_it_starts() {
     std::fs::remove_file(file).unwrap();
     // One slot frees, and the queued run starts on it while the other is still held.
     cancel(&t, busy[0]).await;
-    let last = ws.follow(job).await.pop().unwrap();
+    let states = ws.follow(job).await;
     let (_, held) = t.get(&format!("/jobs/{}", busy[1])).await;
     assert_eq!(held["status"], "running", "{held}");
     cancel(&t, busy[1]).await;
-    assert_eq!(last.status, JobStatus::Failed, "{last:?}");
-    let error = last.error.expect("an error");
-    assert_eq!(error.code, "data_missing");
+    // The run finds the month gone and goes to download it, which this source refuses.
     assert!(
-        error.message.contains("changed after the run was accepted")
-            && error.message.contains("binance:BTCUSDT:spot"),
-        "{}",
-        error.message
+        states
+            .iter()
+            .any(|s| s.message == "downloading the data: binance:BTCUSDT:spot 2024-03"),
+        "{states:?}"
     );
+    let last = states.last().unwrap();
+    assert_eq!(last.status, JobStatus::Failed, "{last:?}");
+    let error = last.error.as_ref().expect("an error");
+    assert_eq!(error.message, DataError::NoDataDir.to_string());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_run_on_a_range_the_store_lacks_downloads_it_first_then_runs() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = Store::new(dir.path());
+    let id = instrument(InstrumentKind::Spot).id;
+    store.write_candles(&id, &minutes(3, 0..0)).expect("seeds");
+    let source = Filling::new(Fill::Minutes);
+    let t = TestServer::with_source(dir, store, source.clone()).await;
+    let mut ws = t.websocket().await;
+
+    // Five days, two of them not stored: accepted, as the job downloads them.
+    let body = serde_json::to_value(config(InstrumentKind::Spot, 5)).unwrap();
+    let job = t.start("/runs/backtest", &body).await;
+    let states = ws.follow(job).await;
+    let messages: Vec<&str> = states.iter().map(|s| s.message.as_str()).collect();
+    let downloading = "downloading the data: binance:BTCUSDT:spot 2024-03";
+    let at = messages.iter().position(|m| *m == downloading);
+    let ran = messages.iter().position(|m| *m == "running the backtest");
+    assert!(at.is_some() && at < ran, "{messages:?}");
+    let last = states.last().unwrap();
+    assert_eq!(last.status, JobStatus::Done, "{last:?}");
+    assert_eq!(
+        *source.asked.lock().unwrap(),
+        [(t0() + 3 * DAY, t0() + 5 * DAY)]
+    );
+    let data = t.result(job).await.data.expect("a data report");
+    assert_eq!((data.bars, data.gaps.len()), (5 * 24, 0));
+
+    // The range is stored now: a second run downloads nothing.
+    let again = t.start("/runs/backtest", &body).await;
+    assert_eq!(
+        ws.follow(again).await.last().unwrap().status,
+        JobStatus::Done
+    );
+    assert_eq!(source.asked.lock().unwrap().len(), 1);
+}
+
+/// With a data cutoff and nothing stored, a run ending after the cutoff is refused as past it
+/// when it is requested, and nothing is downloaded for it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_run_past_the_cutoff_is_refused_before_anything_is_downloaded() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = Store::new(dir.path());
+    let source = Filling::new(Fill::Minutes);
+    let t = TestServer::serve(dir, store, source.clone(), Some("2024-03-05")).await;
+    let body = serde_json::to_value(config(InstrumentKind::Spot, 7)).unwrap();
+    let (status, body) = t.post("/runs/backtest", &body).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["error"]["code"], "after_cutoff");
+    let (_, jobs) = t.get("/jobs").await;
+    assert_eq!(jobs, json!([]), "no job was created");
+    assert_eq!(*source.asked.lock().unwrap(), []);
+}
+
+/// A run's download holds its instrument, so a delete of it meanwhile is refused and the stored
+/// days the run reads stay.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_delete_is_refused_while_a_run_downloads_the_instrument() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = Store::new(dir.path());
+    let id = instrument(InstrumentKind::Spot).id;
+    store.write_candles(&id, &minutes(3, 0..0)).expect("seeds");
+    let source = Filling::new(Fill::TriesDelete);
+    let t = TestServer::with_source(dir, store, source.clone()).await;
+    let mut ws = t.websocket().await;
+    let body = serde_json::to_value(config(InstrumentKind::Spot, 5)).unwrap();
+    let job = t.start("/runs/backtest", &body).await;
+    let last = ws.follow(job).await.pop().unwrap();
+    assert_eq!(last.status, JobStatus::Done, "{last:?}");
+    assert_eq!(source.asked.lock().unwrap().len(), 1);
+    let data = t.result(job).await.data.expect("a data report");
+    assert_eq!((data.bars, data.gaps.len()), (5 * 24, 0));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_or_short_download_fails_the_run_and_nothing_is_run() {
+    for (fill, code, message) in [
+        (
+            Fill::Fails,
+            "bad_request",
+            DataError::MissingOandaToken.to_string(),
+        ),
+        (
+            Fill::Nothing,
+            "data_missing",
+            "the download did not fill the range, so it was not run: the store has no \
+             binance:BTCUSDT:spot candles from 2024-03-04 00:00 to 2024-03-06 00:00 UTC; download \
+             them first"
+                .to_string(),
+        ),
+    ] {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = Store::new(dir.path());
+        let id = instrument(InstrumentKind::Spot).id;
+        store.write_candles(&id, &minutes(3, 0..0)).expect("seeds");
+        let t = TestServer::with_source(dir, store, Filling::new(fill)).await;
+        let mut ws = t.websocket().await;
+        let body = serde_json::to_value(config(InstrumentKind::Spot, 5)).unwrap();
+        let job = t.start("/runs/backtest", &body).await;
+        let states = ws.follow(job).await;
+        assert!(
+            states.iter().all(|s| s.message != "running the backtest"),
+            "{states:?}"
+        );
+        let last = states.last().unwrap();
+        assert_eq!(last.status, JobStatus::Failed, "{last:?}");
+        let error = last.error.as_ref().expect("an error");
+        assert_eq!((error.code.as_str(), &error.message), (code, &message));
+        let (_, runs) = t.get("/runs").await;
+        assert_eq!(runs, json!([]), "a failed run is not saved");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1415,28 +1636,25 @@ async fn an_fx_run_goes_over_a_holiday_but_two_days_missing_or_a_spot_day_is_ref
     assert_eq!(data.gaps, gaps);
     assert_eq!(data.dropped.len(), 26);
 
-    // Two days missing for FX, and a day for spot, are refused: only the EURUSD and USDJPY runs
-    // started a job.
+    // Two days missing for FX, and a day for spot, are refused by the check: a run job would
+    // download them first.
     let refused = [
         (
-            serde_json::to_value(fx_config("GBPUSD", Timeframe::H1)).unwrap(),
+            fx_config("GBPUSD", Timeframe::H1),
             "the store has no binance:GBPUSD:fx candles from 2024-01-09 00:00 to 2024-01-11 \
              00:00 UTC; download them first",
         ),
         (
-            serde_json::to_value(&spot).unwrap(),
+            spot,
             "the store has no binance:BTCUSDT:spot candles from 2024-03-02 00:00 to 2024-03-03 \
              00:00 UTC; download them first",
         ),
     ];
-    for (body, message) in refused {
-        let (status, body) = t.post("/runs/backtest", &body).await;
-        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
-        assert_eq!(body["error"]["code"], "data_missing");
-        assert_eq!(body["error"]["message"], message);
+    for (config, message) in refused {
+        let e = check_run_data(&t.store, &config, None).expect_err("refused");
+        assert_eq!(e.body.code, "data_missing");
+        assert_eq!(e.body.message, message);
     }
-    let (_, jobs) = t.get("/jobs").await;
-    assert_eq!(jobs.as_array().map(Vec::len), Some(2));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1483,15 +1701,10 @@ async fn fx_minutes_missing_either_side_of_a_weekend_are_judged_together_and_ref
             to: next_wednesday,
             ..fx_config(symbol, Timeframe::H1)
         };
-        let (status, body) = t
-            .post("/runs/backtest", &serde_json::to_value(&config).unwrap())
-            .await;
-        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{symbol}: {body}");
-        assert_eq!(body["error"]["code"], "data_missing");
-        assert_eq!(body["error"]["message"], message);
+        let e = check_run_data(&t.store, &config, None).expect_err("refused");
+        assert_eq!(e.body.code, "data_missing", "{symbol}");
+        assert_eq!(e.body.message, message);
     }
-    let (_, jobs) = t.get("/jobs").await;
-    assert_eq!(jobs.as_array().map(Vec::len), Some(0));
 }
 
 /// Sets the ask high of the minute at `open_time` in its stored month file to `high`, past the

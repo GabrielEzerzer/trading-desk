@@ -18,9 +18,10 @@ use crate::source::{DataSource, MinuteHistory};
 use crate::time::{ROUNDING_PAD, funding_on_the_minute, now_ms, round_to_minute};
 use crate::{DataError, InstrumentList};
 
-// Base-tier fees: the non-VIP rates from Bybit's "Trading Fee Structure" help article. Written on
-// 2026-11-10 from the rates as known then; the page could not be fetched that day to re-check
-// them, so check before relying on them.
+// Base-tier fees: the VIP 0 rates from Bybit's "Trading Fee Structure" help article,
+// https://www.bybit.com/en/help-center/article/Trading-Fee-Structure (last updated 2026-11-05),
+// read on 2026-11-13: spot 0.1000% maker and taker; perpetuals and futures 0.0200% maker, 0.0550%
+// taker.
 
 /// Bybit spot: 0.1% maker, 0.1% taker.
 pub const BYBIT_SPOT_FEES: FeeSchedule = FeeSchedule {

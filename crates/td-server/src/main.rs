@@ -65,8 +65,8 @@ async fn run(cli: Cli) -> Result<(), String> {
     let store = Store::open_default().map_err(|e| e.to_string())?;
     let data_dir = store.root().to_path_buf();
     let server = Server::start(ApiConfig {
+        source: Arc::new(VenueSource::new(store.clone())),
         store,
-        source: Arc::new(VenueSource),
         live: Arc::new(VenueLive),
         token,
         port: cli.port,

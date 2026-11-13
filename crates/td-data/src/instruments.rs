@@ -1,11 +1,21 @@
 //! Instrument metadata: the instruments a source lists, as [`td_core::Instrument`]s with default
 //! fees, validated on load. Each source reads its own listing ([`crate::DataSource::instruments`]).
+//! [`cached_instruments`] keeps each listing on disk for a day.
 
-use td_core::{FeeSchedule, Instrument, InstrumentKind, Venue};
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
+use td_core::{FeeSchedule, Instrument, InstrumentKind, Millis, Venue};
 
 use crate::http::Http;
 use crate::source::{DataSource, source};
-use crate::{DataError, store};
+use crate::time::{DAY, now_ms};
+use crate::{DataError, Store, store};
+
+/// How long a listing kept on disk by [`cached_instruments`] is used before it is fetched again.
+/// Venues change tick and lot sizes rarely, and list new symbols a few times a month.
+pub const INSTRUMENT_CACHE_AGE: Millis = DAY;
 
 /// The default fee schedule for a venue and kind, or [`DataError::KindNotListed`] for a kind the
 /// venue does not list.
@@ -14,7 +24,7 @@ pub fn default_fees(venue: Venue, kind: InstrumentKind) -> Result<FeeSchedule, D
 }
 
 /// The instruments a venue lists, and those it lists that failed validation.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct InstrumentList {
     pub instruments: Vec<Instrument>,
     /// `(symbol, reason)` for each listed instrument that was left out.
@@ -85,6 +95,72 @@ fn list_instruments(
     source.instruments(http, kind)
 }
 
+/// [`fetch_instruments`], kept on disk in the store's data directory, at
+/// `instruments/<venue>-<kind>.json`, and read from there while it is less than
+/// [`INSTRUMENT_CACHE_AGE`] old. A cache that cannot be read, or that lists an instrument
+/// [`validate_instrument`] refuses, is fetched again, and one that cannot be written is left: the
+/// listing is still returned.
+pub fn cached_instruments(
+    http: &Http,
+    store: &Store,
+    venue: Venue,
+    kind: InstrumentKind,
+) -> Result<InstrumentList, DataError> {
+    list_cached(source(venue), http, store.root(), kind, now_ms())
+}
+
+/// What [`cached_instruments`] keeps in its file.
+#[derive(Serialize, Deserialize)]
+struct CachedList {
+    /// When the listing was fetched, in milliseconds since the Unix epoch.
+    fetched_at: Millis,
+    list: InstrumentList,
+}
+
+/// [`cached_instruments`] from a given source, at `now`.
+fn list_cached(
+    source: &dyn DataSource,
+    http: &Http,
+    root: &Path,
+    kind: InstrumentKind,
+    now: Millis,
+) -> Result<InstrumentList, DataError> {
+    let path = cache_path(root, source.venue(), kind);
+    if source.kinds().contains(&kind) {
+        let cached = fs::read(&path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<CachedList>(&bytes).ok())
+            .filter(|c| (0..INSTRUMENT_CACHE_AGE).contains(&(now - c.fetched_at)))
+            // The file is outside the program, so its listing is checked as a fetched one is.
+            // shortcut: a venue's change to an instrument's rules within the day is picked up
+            // only once the cache expires; key the cache to the rules too if that starts to matter.
+            .filter(|c| {
+                c.list
+                    .instruments
+                    .iter()
+                    .all(|i| validate_instrument(i).is_ok())
+            });
+        if let Some(cached) = cached {
+            return Ok(cached.list);
+        }
+    }
+    let list = list_instruments(source, http, kind)?;
+    let cached = CachedList {
+        fetched_at: now,
+        list,
+    };
+    if let Ok(json) = serde_json::to_vec(&cached) {
+        // A failed write only means the next call fetches again; a torn file reads as no cache.
+        let _ = fs::create_dir_all(root.join("instruments")).and_then(|()| fs::write(&path, json));
+    }
+    Ok(cached.list)
+}
+
+fn cache_path(root: &Path, venue: Venue, kind: InstrumentKind) -> PathBuf {
+    root.join("instruments")
+        .join(format!("{venue}-{kind}.json"))
+}
+
 /// Reads a trading rule given as text.
 pub(crate) fn number(name: &str, text: &str) -> Result<f64, String> {
     text.parse::<f64>()
@@ -95,6 +171,97 @@ pub(crate) fn number(name: &str, text: &str) -> Result<f64, String> {
 mod tests {
     use super::*;
     use crate::source::fake::DailyFiles;
+
+    /// A source that lists one instrument and counts how often it is asked.
+    struct Counting {
+        files: DailyFiles,
+        asked: std::sync::atomic::AtomicUsize,
+    }
+
+    impl DataSource for Counting {
+        fn venue(&self) -> Venue {
+            self.files.venue()
+        }
+        fn kinds(&self) -> &'static [InstrumentKind] {
+            self.files.kinds()
+        }
+        fn instruments(&self, _: &Http, _: InstrumentKind) -> Result<InstrumentList, DataError> {
+            let n = self
+                .asked
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(InstrumentList {
+                instruments: Vec::new(),
+                rejected: vec![(format!("FETCH{n}"), "a marker".into())],
+            })
+        }
+        fn default_fees(&self, kind: InstrumentKind) -> Result<FeeSchedule, DataError> {
+            self.files.default_fees(kind)
+        }
+        fn minute_history(
+            &self,
+            http: &Http,
+            id: &td_core::InstrumentId,
+            from: Millis,
+            to: Millis,
+            now: Millis,
+        ) -> Result<crate::MinuteHistory, DataError> {
+            self.files.minute_history(http, id, from, to, now)
+        }
+    }
+
+    #[test]
+    fn a_listing_is_read_from_disk_until_it_is_a_day_old() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let http = Http::new().expect("an HTTP client");
+        let source = Counting {
+            files: DailyFiles::new(Vec::new()),
+            asked: Default::default(),
+        };
+        let marker = |list: InstrumentList| list.rejected[0].0.clone();
+        let list = |now| list_cached(&source, &http, dir.path(), InstrumentKind::Spot, now);
+        let t = 1_700_000_000_000;
+        assert_eq!(marker(list(t).expect("fetches")), "FETCH0");
+        assert!(dir.path().join("instruments/binance-spot.json").is_file());
+        // Read from the file, not fetched, up to just under a day later.
+        assert_eq!(marker(list(t + DAY - 1).expect("reads")), "FETCH0");
+        // A day old: fetched again, and the new listing replaces the file.
+        assert_eq!(marker(list(t + DAY).expect("fetches")), "FETCH1");
+        assert_eq!(marker(list(t + DAY + 1).expect("reads")), "FETCH1");
+        // A file that cannot be read is fetched again.
+        fs::write(dir.path().join("instruments/binance-spot.json"), "{").expect("writes");
+        assert_eq!(marker(list(t + DAY + 2).expect("fetches")), "FETCH2");
+        // Nor is one with an instrument that breaks a rule a fetched one is checked for.
+        let broken = Instrument {
+            id: td_core::InstrumentId {
+                venue: Venue::Binance,
+                symbol: "BTCUSDT".into(),
+                kind: InstrumentKind::Spot,
+            },
+            base: "BTC".into(),
+            quote: "USDT".into(),
+            tick_size: 0.0,
+            lot_size: 0.001,
+            min_qty: 0.001,
+            min_notional: 5.0,
+            fees: source.default_fees(InstrumentKind::Spot).expect("fees"),
+        };
+        let cached = CachedList {
+            fetched_at: t + DAY + 2,
+            list: InstrumentList {
+                instruments: vec![broken],
+                rejected: vec![("ON DISK".into(), "a marker".into())],
+            },
+        };
+        let json = serde_json::to_vec(&cached).expect("serialises");
+        fs::write(dir.path().join("instruments/binance-spot.json"), json).expect("writes");
+        assert_eq!(marker(list(t + DAY + 3).expect("fetches")), "FETCH3");
+        // A kind the source does not list is refused before the cache.
+        let perp = list_cached(&source, &http, dir.path(), InstrumentKind::Perpetual, t);
+        assert!(
+            matches!(perp, Err(DataError::KindNotListed { .. })),
+            "{perp:?}"
+        );
+    }
 
     #[test]
     fn a_kind_the_source_does_not_list_is_an_error() {

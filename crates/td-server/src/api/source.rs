@@ -34,16 +34,25 @@ pub trait MarketSource: Send + Sync + 'static {
     ) -> Result<usize, DataError>;
 }
 
-/// The real venues, through td-data.
+/// The real venues, through td-data. Instrument listings are kept on disk in the store's data
+/// directory for a day ([`td_data::cached_instruments`]).
 ///
 /// Each call builds its own blocking HTTP client on the calling (blocking) thread and drops it
 /// there: a reqwest blocking client must never be dropped inside the async runtime.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct VenueSource;
+#[derive(Debug, Clone)]
+pub struct VenueSource {
+    store: Store,
+}
+
+impl VenueSource {
+    pub fn new(store: Store) -> Self {
+        VenueSource { store }
+    }
+}
 
 impl MarketSource for VenueSource {
     fn instruments(&self, venue: Venue, kind: InstrumentKind) -> Result<InstrumentList, DataError> {
-        td_data::fetch_instruments(&Http::new()?, venue, kind)
+        td_data::cached_instruments(&Http::new()?, &self.store, venue, kind)
     }
 
     fn candles(
@@ -105,7 +114,8 @@ mod tests {
             assert_eq!(id.kind, InstrumentKind::Fx);
             let message = format!("{venue} does not list fx instruments");
 
-            let listed = VenueSource.instruments(venue, id.kind);
+            let dir = tempfile::tempdir().expect("a temp dir");
+            let listed = VenueSource::new(Store::new(dir.path())).instruments(venue, id.kind);
             let Err(e @ DataError::KindNotListed { .. }) = listed else {
                 panic!("{venue}: {listed:?}");
             };

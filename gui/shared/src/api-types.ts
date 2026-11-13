@@ -1922,7 +1922,8 @@ funding_bytes: number | null,
 bytes: number, };
 
 /**
- * One month file of an instrument's candles and its size on disk.
+ * One month file of an instrument's candles and its size on disk, with its closure record's,
+ * which a delete of the month removes with it.
  */
 export type StoredMonthInfo = { 
 /**
@@ -2220,10 +2221,17 @@ bars: number,
 /**
  * Every stretch of minutes in the range (warm-up included) the store has no candle for,
  * oldest first, including any at the start or the end of the range, in the instrument's open
- * hours. Together with any next to it that only closed hours part it from, each holds less
- * than a day of open time, or two days for FX; more refuses the run.
+ * hours, apart from recorded closures. Together with any next to it that only closed hours
+ * part it from, each holds less than a day of open time, or two days for FX in a month
+ * downloaded before closures were recorded; more refuses the run.
  */
 gaps: Array<GapInfo>, 
+/**
+ * The spans in the range (warm-up included), oldest first, that downloads recorded the venue
+ * had nothing for and that count as closed, such as 25 December for FX: neither gaps nor
+ * dropped buckets. Empty in a run saved before closures were reported.
+ */
+closures: Array<GapInfo>, 
 /**
  * Open times of every bucket in the range the run has no bar for: buckets with no minutes at
  * all, and buckets left out because too many of their minutes are missing (td-data's rule: a

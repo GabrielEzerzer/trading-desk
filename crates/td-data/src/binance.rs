@@ -52,8 +52,9 @@ const FUNDING_DELAY: Duration = Duration::from_millis(600);
 const MICROS_FROM: i64 = 100_000_000_000_000;
 
 // Base-tier fees: the regular user (VIP 0) rates without the BNB discount, from
-// binance.com/en/fee/schedule. Written on 2026-11-10 from the rates as known then; the page could
-// not be fetched that day to re-check them, so check before relying on them.
+// binance.com/en/fee/schedule. Written on 2026-11-10 from the rates as known then. On 2026-11-13
+// that page, /en/fee/futureFee and /en/fee/trading still could not be read (each answered 202 with
+// an empty body, a bot check), so check them in a browser before relying on these.
 
 /// Binance spot: 0.1% maker, 0.1% taker.
 pub const BINANCE_SPOT_FEES: FeeSchedule = FeeSchedule {

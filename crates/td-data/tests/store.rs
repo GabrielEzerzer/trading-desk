@@ -1243,6 +1243,43 @@ fn holding_an_instrument_that_was_never_stored_lists_nothing() {
     );
 }
 
+/// A closure record left with no month file beside it, as an older delete that stopped part way
+/// could leave, is deleted with the month.
+#[test]
+fn a_month_delete_removes_a_closure_record_left_without_its_month_file() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let store = Store::new(dir.path());
+    let fx = InstrumentId {
+        venue: Venue::Oanda,
+        symbol: "USDJPY".into(),
+        kind: InstrumentKind::Fx,
+    };
+    let january = month("2024-01");
+    let tuesday = day("2024-01-02");
+    let closed = Gap {
+        from: tuesday + HOUR,
+        to: tuesday + 2 * HOUR,
+    };
+    store
+        .record_closures(&fx, january, january.start(), january.end(), &[closed])
+        .expect("records");
+    let record = dir
+        .path()
+        .join("candles/oanda/fx/USDJPY/1m/2024-01.parquet.closed.json");
+    let bytes = std::fs::metadata(&record).expect("written").len();
+    assert!(
+        !dir.path()
+            .join("candles/oanda/fx/USDJPY/1m/2024-01.parquet")
+            .exists()
+    );
+    assert_eq!(
+        store.delete_months(&fx, january, january).expect("deletes"),
+        DeleteReport { files: 1, bytes }
+    );
+    assert!(!record.exists());
+    assert_eq!(store.closure_record(&fx, january).expect("reads"), None);
+}
+
 #[test]
 fn deleting_all_market_data_leaves_saved_runs_paper_sessions_and_unrecognised_files() {
     let dir = tempfile::tempdir().expect("a temp dir");
@@ -1258,6 +1295,27 @@ fn deleting_all_market_data_leaves_saved_runs_paper_sessions_and_unrecognised_fi
     ] {
         store_three_months(&store, id);
     }
+    // An FX month with the closure record its download wrote beside it.
+    let fx = InstrumentId {
+        venue: Venue::Oanda,
+        symbol: "USDJPY".into(),
+        kind: InstrumentKind::Fx,
+    };
+    let tuesday = day("2024-01-02");
+    let quotes = flat_minutes(tuesday, 0..60);
+    store.write_quotes(&fx, &quotes, &quotes).expect("writes");
+    let january = month("2024-01");
+    let closed = Gap {
+        from: tuesday + HOUR,
+        to: tuesday + 2 * HOUR,
+    };
+    store
+        .record_closures(&fx, january, january.start(), january.end(), &[closed])
+        .expect("records");
+    let record = dir
+        .path()
+        .join("candles/oanda/fx/USDJPY/1m/2024-01.parquet.closed.json");
+    assert!(record.is_file());
     let total: u64 = store
         .stored()
         .expect("lists")
@@ -1277,13 +1335,15 @@ fn deleting_all_market_data_leaves_saved_runs_paper_sessions_and_unrecognised_fi
     }
 
     let report = store.delete_all().expect("deletes");
+    // The FX month's record goes with it, and its bytes were in the listing's total.
     assert_eq!(
         report,
         DeleteReport {
-            files: 10,
+            files: 12,
             bytes: total
         }
     );
+    assert!(!record.exists());
     let stored = store.stored().expect("lists");
     assert!(stored.instruments.is_empty());
     assert_eq!(

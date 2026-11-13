@@ -47,7 +47,7 @@ The app needs candles before it can backtest. Download them with the `td-data` c
 cargo run --release -p td-data -- download --venue binance --kind spot --symbol BTCUSDT --from 2023-01-01 --to 2025-01-01
 ```
 
-The `instruments` subcommand lists what a venue has open for trading, `stored` lists what you have downloaded and how much space it takes, and `delete` removes it. Strategy Lab can also download the history a strategy needs from inside the app.
+A download skips a month that is already stored with no minute missing, so running it again over the same range fetches only what is missing. The `instruments` subcommand lists what a venue has open for trading, and keeps the list in the data folder for a day; `stored` lists what you have downloaded and how much space it takes, and `delete` removes it. Strategy Lab can also download the history a strategy needs from inside the app, and a backtest whose range is not all stored downloads the missing part first, as a step of the same run.
 
 In the app, Strategy Lab's "Stored data" view, at the foot of the strategy list, shows the data folder, its size and each instrument's months, and deletes one instrument, a range of its months or all market data; saved runs and paper sessions stay.
 
@@ -66,7 +66,7 @@ cargo build --release -p td-data
 OANDA_API_TOKEN=<your token> target/release/td-data download --venue oanda --kind fx --symbol USDJPY --from 2016-01-01 --to 2026-11-01
 ```
 
-A request returns at most 5,000 minutes, so a month of one pair takes six or seven requests. A minute with no price is filled at the last close, with volume 0; most such minutes fall around the New York close. A run of an hour or more with no price, such as a market holiday, is left missing and shows as a gap, and nothing is stored for the weekend, when the market is closed.
+A request returns at most 5,000 minutes, so a month of one pair takes six or seven requests. A minute with no price is filled at the last close, with volume 0; most such minutes fall around the New York close. A run of an hour or more with no price is left missing, and nothing is stored for the weekend, when the market is closed. The download records the spans OANDA returned nothing for in a `.closed.json` file beside the month; the first download of a month fetches all of it, so its record covers the whole month. A recorded span counts as closed if it holds at most 4 hours of open time, such as a late Sunday open, or at most 27 hours and overlaps the year-end holidays, 24 December to 2 January UTC, such as the 24 to 25 December closure, which runs a little over a day. A closed span is not a gap in coverage or in a run's data report, which lists it under `closures`. Any other recorded span is an outage. It stays a gap, and the month is not complete, so the next download over it fetches it again. A backtest is refused over a day or more of missing open time in a month with a record. A month downloaded before these records existed has none, so its holidays still show as gaps, and a backtest is refused only at two days of missing open time there. Download the month again to record its closures.
 
 ### Holding back recent data
 
