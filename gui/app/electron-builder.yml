@@ -1,0 +1,22 @@
+# The Windows installer: `pnpm dist` from gui/ builds the engine and the app first, then this.
+# vite bundles every dependency into out/, so the package holds out/ and package.json, no
+# node_modules. The engine goes beside app.asar in resources/, where sidecar.ts looks for it.
+appId: trading-desk
+# The install folder and Electron's app name come from this, not from the workspace name @td/app.
+extraMetadata:
+  name: trading-desk
+directories:
+  output: dist
+files:
+  - out/**
+  - package.json
+extraResources:
+  - from: ../../target/release/td-server.exe
+    to: td-server.exe
+npmRebuild: false
+win:
+  target: nsis
+# A one-click install for the current user only, so it needs no admin rights.
+nsis:
+  oneClick: true
+  perMachine: false

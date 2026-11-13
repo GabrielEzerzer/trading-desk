@@ -6,7 +6,9 @@
 // keeps a reused pid from being killed after a normal quit.
 //
 // shortcut: Windows could still hand the pid to a new process within one 100 ms check. A packaged
-// build must keep Electron's RunAsNode fuse on, or this spawn does nothing; revisit with packaging.
+// build must keep Electron's RunAsNode fuse on, or this spawn does nothing. electron-builder leaves
+// that fuse at its default (on), so the watchdog works in the installed build; the install check saw
+// it end the installed app once.
 
 import { type ChildProcess, spawn } from 'node:child_process'
 
