@@ -1256,6 +1256,35 @@ async fn a_delete_while_the_instrument_downloads_is_409() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn delete_all_is_409_while_this_server_has_a_download_in_progress() {
+    let t = TestServer::start(FakeSource::gated()).await;
+    let body = json!({
+        "instrument": { "venue": "binance", "symbol": "BTCUSDT", "kind": "spot" },
+        "from": day("2024-01-01"),
+        "to": day("2024-02-01"),
+    });
+    let (status, created) = t.post("/data/download", &body.to_string()).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let job = created["job_id"].as_u64().unwrap();
+    // Nothing is stored yet, so no stored instrument is held: only the queue says a download is on.
+    let (status, answer) = t.post("/data/delete-all", "").await;
+    assert_eq!(status, StatusCode::CONFLICT, "{answer}");
+    assert_eq!(answer["error"]["code"], "conflict");
+    assert_eq!(
+        answer["error"]["message"],
+        format!(
+            "binance:BTCUSDT:spot has a download in progress (job {job}); wait for it or cancel it"
+        )
+    );
+
+    t.source.release(1);
+    t.until_status(job, "done").await;
+    let (status, removed) = t.post("/data/delete-all", "").await;
+    assert_eq!(status, StatusCode::OK, "{removed}");
+    assert_eq!(removed["files"], 1, "the one month the download stored");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_delete_is_refused_while_another_process_downloads_the_instrument() {
     let t = TestServer::start(FakeSource::default()).await;
     download_two_months(&t, "BTCUSDT").await;

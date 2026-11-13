@@ -950,11 +950,10 @@ impl Store {
             .iter()
             .map(|id| self.hold_for_delete(id))
             .collect::<Result<Vec<_>, _>>()?;
+        // One report across every instrument, so a delete that stops part-way counts all it removed.
         let mut report = DeleteReport::default();
         for id in &ids {
-            let removed = self.remove(&self.doomed(id, EVERY_MONTH, true)?)?;
-            report.files += removed.files;
-            report.bytes += removed.bytes;
+            self.remove(&self.doomed(id, EVERY_MONTH, true)?, &mut report)?;
         }
         Ok(report)
     }
@@ -1013,7 +1012,9 @@ impl Store {
             return Ok(DeleteReport::default());
         }
         let _hold = self.hold_for_delete(id)?;
-        self.remove(&self.doomed(id, months, funding)?)
+        let mut report = DeleteReport::default();
+        self.remove(&self.doomed(id, months, funding)?, &mut report)?;
+        Ok(report)
     }
 
     /// The store files of `id` a delete removes: each month file from `from` to `to` that is there
@@ -1051,15 +1052,15 @@ impl Store {
         Ok(paths)
     }
 
-    /// Removes each store file in `paths` with [`remove_locked`] and drops it from the month cache.
-    fn remove(&self, paths: &[PathBuf]) -> Result<DeleteReport, DataError> {
-        let mut report = DeleteReport::default();
+    /// Removes each store file in `paths` with [`remove_locked`], adding it to `report`, and drops
+    /// it from the month cache.
+    fn remove(&self, paths: &[PathBuf], report: &mut DeleteReport) -> Result<(), DataError> {
         for path in paths {
-            let removed = remove_locked(path, &mut report);
+            let removed = remove_locked(path, report);
             self.months.forget(path);
             removed?;
         }
-        Ok(report)
+        Ok(())
     }
 
     /// The venue folders under the root's `candles` or `funding`. A link or a file of that name

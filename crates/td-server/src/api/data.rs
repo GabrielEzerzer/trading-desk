@@ -467,10 +467,20 @@ pub(super) async fn delete(
 
 /// `POST /data/delete-all`: deletes every instrument's candles and funding, and answers what it
 /// removed. Saved runs, paper sessions and anything else in the data folder stay. A 409 `conflict`,
-/// deleting nothing, while a download or another delete holds any stored instrument.
+/// deleting nothing, while this server has a download queued or running, or while a download or
+/// another delete holds any stored instrument.
 pub(super) async fn delete_all(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<DeleteResult>, ApiError> {
+    // As for one instrument: a queued download holds nothing yet, so this server's queue is
+    // checked first.
+    if let Some((job, id)) = state.jobs.any_download_in_progress() {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "conflict",
+            format!("{id} has a download in progress (job {job}); wait for it or cancel it"),
+        ));
+    }
     let store = state.store.clone();
     let report = tokio::task::spawn_blocking(move || store.delete_all())
         .await

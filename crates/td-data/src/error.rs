@@ -124,7 +124,7 @@ pub enum DataError {
     EmptyRange { from: String, to: String },
 
     #[error(
-        "{0} is being downloaded or deleted right now, in this app or another program on the same          data folder; delete it again once that has finished"
+        "{0} is being downloaded or deleted right now, in this app or another program on the same data folder; delete it again once that has finished"
     )]
     InstrumentBusy(String),
 
