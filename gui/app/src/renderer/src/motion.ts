@@ -3,19 +3,19 @@
 import { useEffect, useState } from 'react'
 
 /** Reads a duration token such as `--duration-count` in milliseconds. */
-export function durationToken(name: string, fallbackMs: number): number {
+function durationToken(name: string, fallbackMs: number): number {
   const raw = getComputedStyle(document.documentElement).getPropertyValue(name).trim()
   const match = /^([\d.]+)(ms|s)$/.exec(raw)
   if (!match) return fallbackMs
   return Number(match[1]) * (match[2] === 's' ? 1000 : 1)
 }
 
-export function prefersReducedMotion(): boolean {
+function prefersReducedMotion(): boolean {
   return window.matchMedia('(prefers-reduced-motion: reduce)').matches
 }
 
 /** Ease-out cubic: quick to start, gentle to land, so the count settles on the true figure. */
-export function easeOut(t: number): number {
+function easeOut(t: number): number {
   const c = Math.min(1, Math.max(0, t))
   return 1 - (1 - c) ** 3
 }

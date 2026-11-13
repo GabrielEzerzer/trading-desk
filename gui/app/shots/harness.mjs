@@ -46,7 +46,7 @@ export function serve() {
 }
 
 /** The init script that installs the bridge stub with this config before the page loads. */
-export function stubScript(config) {
+function stubScript(config) {
   const full = { hangStrategies: false, engineData, ...config }
   return `${stubSource}\ninstallBridgeStub(${JSON.stringify(full)})`
 }

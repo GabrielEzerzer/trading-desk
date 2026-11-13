@@ -24,11 +24,11 @@ export function moneyTone(value: number): 'gain' | 'loss' | undefined {
   return value > 0 ? 'gain' : 'loss'
 }
 
-export function strategyLabel(name: string): string {
+function strategyLabel(name: string): string {
   return name === MANUAL ? 'Manual' : readableName(name)
 }
 
-export function statusText(status: Status): string {
+function statusText(status: Status): string {
   switch (status.status) {
     case 'warming_up':
       return 'Warming up'
