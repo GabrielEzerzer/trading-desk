@@ -1,4 +1,5 @@
 use std::cmp::Ordering;
+use std::collections::VecDeque;
 
 use serde::{Deserialize, Serialize};
 use td_core::{
@@ -135,7 +136,8 @@ pub trait Broker: Send {
 /// on the same close.
 ///
 /// A reduce-only limit the bar opens through that has nothing to reduce between the bars, such as
-/// a take-profit sent on the same close as its market entry, is not cancelled then. It waits for
+/// a take-profit sent on the same close as its market entry, is not cancelled then; nor is a
+/// reduce-only stop-limit triggered on an earlier bar, which rests as its limit. It waits for
 /// the open, and after the other fills at the open it takes liquidity there like a limit arriving
 /// at the open: at the open with slippage, never past its limit, as a taker, for at most the
 /// position it can reduce. If there is still nothing to reduce, it is cancelled. One that has part
@@ -153,9 +155,12 @@ pub trait Broker: Send {
 /// for an entry filled at the open or inside the range that start is held inside the stop side's
 /// candle; for one filled between the bars it is not, since the stop side traded there before its
 /// candle began. Slippage applies as for any stop. The stop's fill is applied right after its
-/// entry's, except when the stop triggers inside the range after an entry that filled at or before
-/// the open: then it waits for the bar's fills at the open and takes its place among the fills
-/// inside the range.
+/// entry's when the entry filled at the open or inside the range and the stop is reached by then.
+/// The stop of an entry filled between the bars that the market crossed on its way to the open
+/// takes its place among the other fills between the bars, in the order the market reached them
+/// (farthest from the open first), so a limit the market passed before the stop fills before it.
+/// A stop that triggers inside the range after an entry that filled at or before the open waits
+/// for the bar's fills at the open and takes its place among the fills inside the range.
 ///
 /// The liquidation check of [`Broker::on_bar`] follows the same path. On its way to the open the
 /// market reaches the limits it trades through, in order, and then the open. Before each of them
@@ -167,12 +172,9 @@ pub trait Broker: Send {
 /// market reached them, at the open as any stop the bar opens through. After the fills at the
 /// open, the account is checked against the bar's range: the stops inside the range that the
 /// market crosses on its way from the open to the liquidation price fill first, nearest the open
-/// first. Whenever the account is still liquidated, the rest of the bar's fills are skipped.
-///
-/// shortcut: an attached stop of an entry filled between the bars is applied right after its
-/// entry even when the market reached the new position's liquidation price first on the way to
-/// the open. If equity at the stop's trigger is still above zero, the account keeps up to the
-/// maintenance margin (0.5% of notional) that a venue would have kept on liquidating first.
+/// first. Whenever the account is still liquidated, the rest of the bar's fills are skipped. An
+/// attached stop crossed on the way to the open is one of the points on that way, so a position
+/// whose liquidation price the market reaches before the stop's trigger is liquidated first.
 ///
 /// A spot buy is cut at fill time to the largest quantity, on the lot grid, whose value at the
 /// fill price plus its fee fits in the cash left at that point in the bar. The cash check at
@@ -308,6 +310,21 @@ impl Pending {
     fn between_bars(&self) -> bool {
         self.liquidity == Liquidity::Maker && self.market == self.open
     }
+
+    /// Where the market reached the order: its limit for a fill between the bars, and otherwise
+    /// the market price it met.
+    fn reached(&self) -> f64 {
+        if self.between_bars() {
+            self.price
+        } else {
+            self.market
+        }
+    }
+
+    /// How far before its side's open the market reached the order.
+    fn before_open(&self) -> f64 {
+        (self.reached() - self.open).abs()
+    }
 }
 
 /// What follows from applying one fill on the bar being processed.
@@ -432,7 +449,7 @@ impl<M: FillModel> Broker for SimBroker<M> {
             let between = fill.between_bars();
             // The rest of this bar, from the entry's fill on. An entry that filled between the bars
             // met the market at its limit, and the market went on from there to the open.
-            let from = if between { fill.price } else { fill.market };
+            let from = fill.reached();
             let own = side_bar(fill.order.request.side);
             let order = fill.order;
             done.push(order.id);
@@ -443,10 +460,14 @@ impl<M: FillModel> Broker for SimBroker<M> {
                     // to reduce waits for the open, where the fills at the open can give it a
                     // position. There it takes liquidity like a limit arriving at the open, which
                     // the model prices as an IOC limit: the open with slippage, never past the
-                    // limit, as a taker.
+                    // limit, as a taker. A stop-limit that filled between the bars was triggered
+                    // on an earlier bar and rests as its limit, so it arrives as that limit.
                     if between && order.request.reduce_only {
                         let mut arriving = order.clone();
                         arriving.request.tif = TimeInForce::Ioc;
+                        if let OrderType::StopLimit { price, .. } = arriving.request.order_type {
+                            arriving.request.order_type = OrderType::Limit { price };
+                        }
                         let check =
                             self.model
                                 .check(&arriving, false, false, own, &self.instrument);
@@ -480,6 +501,13 @@ impl<M: FillModel> Broker for SimBroker<M> {
             // can land outside the stop side's candle. An entry filled at the open or inside the
             // range met the stop side inside its candle, so the start is held there. One filled
             // between the bars met it before the candle began, on the way to the open.
+            //
+            // shortcut: an entry filled between the bars takes the spread at the open for the stop
+            // side's start, but the spread can have been wider during the gap, when a buy stop's
+            // ask may already have passed its trigger as the entry filled; it then still fills at
+            // its trigger, which is optimistic by up to that extra spread. The broker does not see
+            // the previous candle. Give it the previous bar's ask and take the wider of the
+            // previous close's spread and the open's if FX strategies rest limits with tight stops.
             if self.instrument.id.kind.rules().quotes && !between {
                 from = from.max(stop_bar.low).min(stop_bar.high);
             }
@@ -507,21 +535,24 @@ impl<M: FillModel> Broker for SimBroker<M> {
             Side::Buy => stop.market <= stop.open,
         };
         // Applies one fill, and its attached stop when that fills now: straight after it for a fill
-        // inside the range, or when the market reached the stop by the open for a fill at or before
-        // the open. Returns what waits for later: a stop for the range, or an order for the open.
-        let mut settle =
-            |fill: Pending, book: &mut Portfolio, in_range: bool| match apply(fill, book) {
-                After::Stop(stop) if in_range || by_open(&stop) => {
+        // inside the range, or when the market reached the stop by the open for a fill at the
+        // open. Returns what waits for later: a stop for the range, a stop crossed on the way to
+        // the open after a fill between the bars, or an order for the open.
+        let mut settle = |fill: Pending, book: &mut Portfolio, in_range: bool| {
+            let between = fill.between_bars();
+            match apply(fill, book) {
+                After::Stop(stop) if in_range || (!between && by_open(&stop)) => {
                     apply(stop, book);
                     After::Nothing
                 }
                 after => after,
-            };
+            }
+        };
         // Limits filled between the bars first, farthest from the open first: the market passed
         // them in that order on its way to the open. They are all on one side, since a buy and a
         // sell limit can both rest unfilled only with the sell above the buy, and an open cannot
         // be through both. Then the fills at the open, by id.
-        let gap = |fill: &Pending| fill.between_bars().then(|| (fill.price - fill.open).abs());
+        let gap = |fill: &Pending| fill.between_bars().then(|| fill.before_open());
         at_open.sort_by(|a, b| {
             match (gap(a), gap(b)) {
                 (Some(a), Some(b)) => b.total_cmp(&a),
@@ -533,20 +564,24 @@ impl<M: FillModel> Broker for SimBroker<M> {
         });
         let (between, mut opens): (Vec<_>, Vec<_>) =
             at_open.into_iter().partition(|fill| fill.between_bars());
-        let mut between = between.into_iter();
+        // The fills on the market's way to the open, in the order it reaches them. The attached
+        // stops it crosses after an entry filled on the way join them: the market moves one way to
+        // the open, so it reaches the limits it passes and those stops in order of distance.
+        let mut between = VecDeque::from(between);
         // Reduce-only limits that waited for the open fill after the other fills at the open, which
         // can give them a position to reduce; with still nothing to reduce they are cancelled.
         let mut waiting = Vec::new();
         // Fills skipped because the liquidation came first; their orders stay open for it.
         let mut skipped = Vec::new();
         let mut liquidated = false;
-        // The market's way to the open: each limit it trades through between the bars, then the
-        // open. The walk is on the bid, since no kind that is liquidated has an ask series. Before each, the position held then is liquidated if the market reaches its
-        // liquidation price first, after the stops the bar opens through that the market triggered
-        // before that price, in the order it reached them.
+        // The market's way to the open: each limit it trades through between the bars and each
+        // attached stop it crosses after them, then the open. The walk is on the bid, since no kind
+        // that is liquidated has an ask series. Before each, the position held then is liquidated
+        // if the market reaches its liquidation price first, after the stops the bar opens through
+        // that the market triggered before that price, in the order it reached them.
         loop {
-            let next = between.next();
-            let point = next.as_ref().map_or(bar.open, |fill| fill.price);
+            let next = between.pop_front();
+            let point = next.as_ref().map_or(bar.open, Pending::reached);
             while let Some(at) = breached(&book) {
                 let long = book.position() > 0.0;
                 if (long && at <= point) || (!long && at >= point) {
@@ -580,6 +615,14 @@ impl<M: FillModel> Broker for SimBroker<M> {
                 break;
             };
             match settle(fill, &mut book, false) {
+                After::Stop(stop) if by_open(&stop) => {
+                    let gap = stop.before_open();
+                    let at = between
+                        .iter()
+                        .position(|fill| fill.before_open() < gap)
+                        .unwrap_or(between.len());
+                    between.insert(at, stop);
+                }
                 After::Stop(stop) => inside.push((0, stop)),
                 After::Wait(fill) => waiting.push(fill),
                 After::Nothing => {}

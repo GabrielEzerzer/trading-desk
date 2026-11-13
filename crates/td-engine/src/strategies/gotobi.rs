@@ -202,6 +202,11 @@ impl Strategy for Gotobi {
                     Side::Buy
                 };
                 let exit = order(ctx, side, position.abs(), OrderType::Market, true);
+                // Defensive only: no order check rejects this exit now. It is reduce-only, so the
+                // leverage cap does not check it and, on FX, the minimum notional exempts it, and
+                // its quantity is the position's, which passed the lot and minimum checks as the
+                // entry. Failing the run beats holding the position without its stop if a new check
+                // ever does reject it.
                 if let Err(e) = ctx.submit(exit) {
                     ctx.fail(format!(
                         "gotobi's exit at 01:30 UTC was rejected after its stop was cancelled, \
