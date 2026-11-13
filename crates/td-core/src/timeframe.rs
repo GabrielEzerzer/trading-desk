@@ -142,6 +142,11 @@ mod tests {
             assert!(start <= T && T < start + tf.duration_ms());
         }
         assert_eq!(Timeframe::M1.floor(-1), -60_000);
+        // The epoch is a Thursday; its week opened on Monday 1969-12-29.
+        assert_eq!(Timeframe::W1.floor(0), -259_200_000);
+        assert_eq!(Timeframe::W1.floor(-1), -259_200_000);
+        assert_eq!(Timeframe::W1.floor(-259_200_000), -259_200_000);
+        assert_eq!(Timeframe::W1.floor(-259_200_001), -864_000_000); // Monday 1969-12-22
     }
 
     #[test]

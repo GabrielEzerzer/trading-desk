@@ -795,12 +795,7 @@ test_from: number, test_to: number,
 /**
  * The best parameters on the train segment.
  */
-params: Params, 
-/**
- * Their place on the grid: the train sweep's best row's [`SweepRow::coords`]. Empty in a
- * result saved before windows had them.
- */
-coords: Array<number>, in_sample: Headline, 
+params: Params, in_sample: Headline, 
 /**
  * The chosen parameters on the test segment, warmed up with the train bars and closed out
  * at its end; see [`WalkForwardResult`].
@@ -1950,7 +1945,8 @@ candles: Array<Candle>,
  */
 from_venue: Array<BarSpan>, 
 /**
- * Slots in `[from, to)` with no bar in the store or at the venue.
+ * Slots in `[from, to)` with no bar in the store or at the venue, apart from those wholly
+ * inside the market's closed hours (an FX weekend), which have no bar to miss.
  */
 missing: Array<BarSpan>, };
 

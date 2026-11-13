@@ -198,19 +198,35 @@ impl SweepSpec {
             - 1)
     }
 
-    /// The grid neighbours of the set at `coords` on this spec's grid, such as a walk-forward
-    /// window's choice ([`WindowResult::coords`]): every set at most one step from it on every
-    /// axis, itself left out, in grid order. Each comes with its step on each axis (-1, 0 or 1)
-    /// and its parameters as a sweep row of the spec would hold them. Errors when `coords` is not
-    /// a place on the grid.
-    pub(crate) fn neighbours(&self, coords: &[u64]) -> Result<Vec<(Vec<i8>, Params)>, TesterError> {
+    /// The grid neighbours of `params`, a set on this spec's grid as a sweep row holds it, such as
+    /// a walk-forward window's choice: every set at most one step from it on every axis, itself
+    /// left out, in grid order. Each comes with its step on each axis (-1, 0 or 1) and its
+    /// parameters as a sweep row of the spec would hold them. A row's values are resolved against
+    /// the strategy's parameters (a whole number listed for a decimal parameter becomes a
+    /// decimal), so each axis value is resolved the same way before it is compared. Errors when
+    /// `params` is not on the grid.
+    pub(crate) fn neighbours(
+        &self,
+        params: &Params,
+    ) -> Result<Vec<(Vec<i8>, Params)>, TesterError> {
         let plan = Plan::new(self)?;
-        if coords.len() != plan.axes.len()
-            || plan.axes.iter().zip(coords).any(|(a, &k)| k >= a.count)
-        {
-            return Err(TesterError::InvalidSpec(format!(
-                "{coords:?} is not a place on the grid"
-            )));
+        let mut coords = Vec::with_capacity(plan.axes.len());
+        for a in &plan.axes {
+            let value = params.get(&a.name);
+            let resolved = |k: u64| {
+                let mut p = self.base.params.clone();
+                p.set(&a.name, a.value(k));
+                p.resolve(&plan.specs).ok()?.get(&a.name)
+            };
+            let k = (0..a.count)
+                .find(|&k| resolved(k).is_some() && resolved(k) == value)
+                .ok_or_else(|| {
+                    TesterError::InvalidSpec(format!(
+                        "parameter {:?} is not on the grid at {value:?}",
+                        a.name
+                    ))
+                })?;
+            coords.push(k);
         }
         let mut out = Vec::new();
         // Every step vector in grid order: the first axis changes slowest.
@@ -225,7 +241,7 @@ impl SweepSpec {
             }
             let mut index = 0u64;
             let mut on_grid = true;
-            for ((a, &k), &d) in plan.axes.iter().zip(coords).zip(&steps) {
+            for ((a, &k), &d) in plan.axes.iter().zip(&coords).zip(&steps) {
                 match k.checked_add_signed(i64::from(d)) {
                     Some(at) if at < a.count => index = index * a.count + at,
                     _ => on_grid = false,
@@ -1212,10 +1228,6 @@ pub struct WindowResult {
     pub test_to: Millis,
     /// The best parameters on the train segment.
     pub params: Params,
-    /// Their place on the grid: the train sweep's best row's [`SweepRow::coords`]. Empty in a
-    /// result saved before windows had them.
-    #[serde(default)]
-    pub coords: Vec<u64>,
     pub in_sample: Headline,
     /// The chosen parameters on the test segment, warmed up with the train bars and closed out
     /// at its end; see [`WalkForwardResult`].
@@ -1339,11 +1351,6 @@ pub fn walk_forward(
             None => ControlFlow::Continue(()),
         };
         let swept = sweep_planned(&train, &plan, bars, asks, funding, Some(&window_progress))?;
-        let coords = swept
-            .rows
-            .first()
-            .map(|r| r.coords.clone())
-            .unwrap_or_default();
         let best = swept.best.ok_or(TesterError::NoQualifyingRun {
             min_trades: spec.sweep.min_trades,
             window: Some(k),
@@ -1361,7 +1368,6 @@ pub fn walk_forward(
             test_from,
             test_to,
             params: best.config.params,
-            coords,
             in_sample: Headline::new(&best.metrics),
             out_of_sample: run(&test_config, bars, asks, funding)?,
         });
@@ -2323,7 +2329,6 @@ mod tests {
                 test_from: config.from,
                 test_to: config.to,
                 params: base.params.clone(),
-                coords: Vec::new(),
                 in_sample: Headline::new(&out_of_sample.metrics),
                 out_of_sample,
             }

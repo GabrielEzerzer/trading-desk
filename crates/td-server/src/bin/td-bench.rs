@@ -129,7 +129,8 @@ struct Measured {
     /// something the first one had to make.
     first_ms: f64,
     median_ms: f64,
-    /// SHA-256 of the result's JSON, in hex; the same on every repetition.
+    /// SHA-256 of the result's JSON without `engine_revision`, in hex; the same on every
+    /// repetition.
     checksum: String,
     /// For `lab_backtest`, each phase's time in the fastest repetition.
     phases: Option<Phases>,
@@ -301,7 +302,7 @@ fn bench(
                 );
                 (
                     ms,
-                    to_json(&(&loaded.bars, &loaded.funding, &loaded.report))?,
+                    result_json(&(&loaded.bars, &loaded.funding, &loaded.report))?,
                 )
             }
             (Mode::Backtest, Some(data)) => {
@@ -309,7 +310,7 @@ fn bench(
                 let result = engine_run(&config, data).map_err(|e| e.to_string())?;
                 let ms = elapsed_ms(start);
                 eprintln!("  rep {rep}: {} trades", result.trades.len());
-                (ms, to_json(&result)?)
+                (ms, result_json(&result)?)
             }
             (Mode::Sweep { sweep }, Some(data)) => {
                 let spec = sweep_spec(&config, sweep);
@@ -329,7 +330,7 @@ fn bench(
                     "  rep {rep}: {} runs, {trading} with trades, {errors} refused",
                     result.rows.len()
                 );
-                (ms, to_json(&result)?)
+                (ms, result_json(&result)?)
             }
             (Mode::WalkForward { sweep, windows }, Some(data)) => {
                 let spec = WalkForwardSpec {
@@ -355,7 +356,7 @@ fn bench(
                     result.windows.len(),
                     result.trades.len()
                 );
-                (ms, to_json(&result)?)
+                (ms, result_json(&result)?)
             }
             (_, None) => unreachable!("data is loaded for every engine-only mode"),
         };
@@ -465,7 +466,7 @@ fn lab_backtest(
     }
     Ok((
         p,
-        to_json(&(
+        result_json(&(
             &coverage,
             &detail.run,
             &detail.data,
@@ -484,6 +485,26 @@ fn elapsed_ms(start: Instant) -> f64 {
 
 fn to_json(value: &impl Serialize) -> Result<Vec<u8>, String> {
     serde_json::to_vec(value).map_err(|e| format!("cannot serialise the result: {e}"))
+}
+
+/// The JSON a workload's checksum is taken over: the result without any `engine_revision` field,
+/// so a revision bump alone does not move the checksum and the check shows whether a bump moved
+/// a number.
+fn result_json(value: &impl Serialize) -> Result<Vec<u8>, String> {
+    fn strip(v: &mut serde_json::Value) {
+        match v {
+            serde_json::Value::Object(map) => {
+                map.remove("engine_revision");
+                map.values_mut().for_each(strip);
+            }
+            serde_json::Value::Array(items) => items.iter_mut().for_each(strip),
+            _ => {}
+        }
+    }
+    let mut v =
+        serde_json::to_value(value).map_err(|e| format!("cannot serialise the result: {e}"))?;
+    strip(&mut v);
+    to_json(&v)
 }
 
 fn api_error(e: ApiError) -> String {
@@ -813,6 +834,13 @@ mod tests {
             assert!(hashed[data]["bars"].as_u64().unwrap() > 0);
             assert!(hashed[error].is_null());
         }
+    }
+
+    #[test]
+    fn the_checksummed_json_leaves_out_the_engine_revision() {
+        let value = serde_json::json!([{ "engine_revision": 4, "run": { "engine_revision": 4, "x": 1.5 } }]);
+        let json = result_json(&value).unwrap();
+        assert_eq!(json, br#"[{"run":{"x":1.5}}]"#);
     }
 
     #[test]

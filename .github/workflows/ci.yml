@@ -2,7 +2,8 @@
 # It runs on pushes to branches other than the default and on manual dispatch, so each push starts one run
 # and a branch has results before its PR exists.
 # It runs the Rust suite: rustfmt, clippy with warnings denied, the workspace tests, and a check that
-# the generated TypeScript API types are up to date.
+# the generated TypeScript API types are up to date, and td-bench's results checksum against
+# harness/evals/perf-checksums.txt.
 # Never give this workflow production URLs, real secrets, .env.local or a service_role key.
 name: ci
 
@@ -21,13 +22,13 @@ permissions:
 jobs:
   suite:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       # With no arguments, rustup installs the toolchain and components named in rust-toolchain.toml.
       - name: Install toolchain
         run: rustup toolchain install
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Format
         run: cargo fmt --all --check
       - name: Clippy
@@ -40,3 +41,17 @@ jobs:
         run: |
           cargo run -p td-server --bin gen-api-types --locked
           git diff --exit-code -- gui/shared/src/api-types.ts
+      # td-bench's results checksum must equal the committed value; its timings are not judged.
+      - name: Benchmark results are unchanged
+        run: |
+          cargo build --release -p td-server --bin td-bench --locked
+          for split in dev test; do
+            want=$(awk -v s="$split" '$1 == s { print $2 }' harness/evals/perf-checksums.txt)
+            out=$(target/release/td-bench --split "$split" --reps 1)
+            echo "$out"
+            got=$(echo "$out" | sed -n 's/^BENCH .*checksum=//p')
+            if [ -z "$want" ] || [ "$got" != "$want" ]; then
+              echo "::error::td-bench $split checksum is $got, harness/evals/perf-checksums.txt expects ${want:-nothing}"
+              exit 1
+            fi
+          done

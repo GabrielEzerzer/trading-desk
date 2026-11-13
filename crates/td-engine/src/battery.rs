@@ -508,7 +508,7 @@ pub fn run_battery(
         Some(wf) => {
             let mut runs = Vec::with_capacity(wf.windows.len());
             for w in &wf.windows {
-                let found = sweep_spec.neighbours(&w.coords)?;
+                let found = sweep_spec.neighbours(&w.params)?;
                 meter.base += neighbours - found.len();
                 let mut window = Vec::with_capacity(found.len());
                 for (steps, params) in found {
@@ -1845,8 +1845,8 @@ mod tests {
     }
 
     /// A decimal parameter swept over whole numbers: the chosen sets hold `equity_fraction` as the
-    /// decimal 1.0, not the listed 1, and R5 still finds their neighbours, by the chosen row's
-    /// place on the grid.
+    /// decimal 1.0, not the listed 1, and R5 still finds them on the grid and runs their
+    /// neighbours.
     #[test]
     fn r5_runs_on_a_decimal_parameter_swept_over_whole_numbers() {
         let mut axes = sma_axes();
@@ -1863,7 +1863,6 @@ mod tests {
                 w.params.get("equity_fraction"),
                 Some(crate::ParamValue::Float(1.0))
             );
-            assert_eq!(w.coords.last(), Some(&1));
         }
         let plateau = r.plateau.as_ref().unwrap();
         assert!(!plateau.directions.is_empty());
@@ -1886,7 +1885,7 @@ mod tests {
         for d in &plateau.directions {
             let (mut moved, mut own) = (Vec::new(), Vec::new());
             for w in &wf.windows {
-                let found = wf.spec.sweep.neighbours(&w.coords).unwrap();
+                let found = wf.spec.sweep.neighbours(&w.params).unwrap();
                 let Some((_, params)) = found.into_iter().find(|(s, _)| *s == d.steps) else {
                     continue;
                 };

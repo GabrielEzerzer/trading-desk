@@ -46,7 +46,7 @@ jobs:
             echo "::notice::Nothing under gui/ or in this workflow differs from main, so the GUI suite was skipped."
           fi
       - if: steps.changes.outputs.gui == 'true'
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
         with:
           package_json_file: gui/package.json
       - if: steps.changes.outputs.gui == 'true'

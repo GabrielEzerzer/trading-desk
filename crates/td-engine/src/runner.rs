@@ -42,8 +42,10 @@ pub fn default_slippage_bps(instrument: &Instrument) -> f64 {
 /// example). Order ids, and which orders are accepted or rejected, count as behaviour too: paper
 /// sessions save manual orders by id, so a change there shifts those ids in saved sessions. A
 /// regenerated `tests/fixtures/backtest_expected.json` always needs a bump, but an unchanged
-/// fixture does not mean the behaviour is unchanged.
-pub const ENGINE_REVISION: u32 = 5;
+/// fixture does not mean the behaviour is unchanged. A change that moves a result also moves
+/// td-bench's checksums, which leave the revision out: update `harness/evals/perf-checksums.txt`
+/// in the same change.
+pub const ENGINE_REVISION: u32 = 6;
 
 /// Everything that defines a backtest apart from the data itself.
 ///

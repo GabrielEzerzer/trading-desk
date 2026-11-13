@@ -1072,3 +1072,109 @@ fn a_hostile_symbol_cannot_make_a_delete_leave_the_store() {
     }
     assert_eq!(tree(dir.path()), before, "nothing was touched");
 }
+
+#[test]
+fn a_temp_file_from_a_crashed_first_write_of_a_month_is_listed_and_deleted() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let store = Store::new(dir.path());
+    let id = btc(InstrumentKind::Spot);
+    store_three_months(&store, &id);
+    // A writer killed before its first rename of April leaves its lock file and its temp file, and
+    // no April file. A temp file beside a month file is a writer's business and is not listed.
+    let april = store.candle_path(&id, month("2024-04")).unwrap();
+    std::fs::write(april.with_extension("parquet.lock"), b"").expect("writes");
+    std::fs::write(april.with_extension("parquet.999.0.tmp"), b"half").expect("writes");
+    let feb = store.candle_path(&id, month("2024-02")).unwrap();
+    std::fs::write(feb.with_extension("parquet.999.1.tmp"), b"half").expect("writes");
+
+    let stored = store.stored().expect("lists");
+    assert_eq!(
+        strays(&stored),
+        ["candles/binance/spot/BTCUSDT/1m/2024-04.parquet.999.0.tmp"]
+    );
+    let months: Vec<Month> = stored.instruments[0]
+        .months
+        .iter()
+        .map(|m| m.month)
+        .collect();
+    assert_eq!(
+        months,
+        [month("2024-01"), month("2024-02"), month("2024-03")]
+    );
+
+    // A delete of April removes the leftover, and leaves the lock file.
+    let report = store
+        .delete_months(&id, month("2024-04"), month("2024-04"))
+        .expect("deletes");
+    assert_eq!(report, DeleteReport { files: 1, bytes: 4 });
+    assert!(!april.with_extension("parquet.999.0.tmp").exists());
+    assert!(april.with_extension("parquet.lock").exists());
+    assert_eq!(
+        strays(&store.stored().expect("lists")),
+        Vec::<String>::new()
+    );
+
+    // And a delete of the whole instrument removes one too.
+    std::fs::write(april.with_extension("parquet.999.2.tmp"), b"half").expect("writes");
+    let report = store.delete_instrument(&id).expect("deletes");
+    assert_eq!(
+        report.files,
+        3 + 2,
+        "three month files, the February and April temp files"
+    );
+    let left: Vec<String> = tree(dir.path())
+        .into_iter()
+        .filter(|f| f.ends_with(".tmp") || f.ends_with(".parquet"))
+        .collect();
+    assert_eq!(left, Vec::<String>::new());
+}
+
+#[test]
+fn a_write_of_a_month_removes_a_crashed_writers_temp_file() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let store = Store::new(dir.path());
+    let id = btc(InstrumentKind::Spot);
+    // A writer killed before its first rename of April left its lock file and its temp file.
+    let april = store.candle_path(&id, month("2024-04")).unwrap();
+    std::fs::create_dir_all(april.parent().unwrap()).expect("a folder");
+    std::fs::write(april.with_extension("parquet.lock"), b"").expect("writes");
+    std::fs::write(april.with_extension("parquet.999.0.tmp"), b"half").expect("writes");
+    // The next download of April writes the month, and the leftover goes with it.
+    let written = flat_minutes(month("2024-04").start(), 0..10);
+    store.write_candles(&id, &written).expect("writes");
+    let left: Vec<String> = tree(dir.path())
+        .into_iter()
+        .filter(|f| f.ends_with(".tmp"))
+        .collect();
+    assert_eq!(left, Vec::<String>::new());
+    assert_eq!(
+        store.read_month(&id, month("2024-04")).expect("reads"),
+        written
+    );
+}
+
+#[test]
+fn a_write_over_two_months_with_a_later_month_unreadable_writes_neither() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let store = Store::new(dir.path());
+    let id = btc(InstrumentKind::Spot);
+    let jan = month("2024-01");
+    store
+        .write_candles(&id, &flat_minutes(jan.start(), 0..60))
+        .expect("writes");
+    let january = store.candle_path(&id, jan).unwrap();
+    let before = std::fs::read(&january).expect("the file");
+    // February's file is not Parquet.
+    let february = store.candle_path(&id, jan.next()).unwrap();
+    std::fs::write(&february, b"not parquet").expect("writes");
+
+    let mut batch = flat_minutes(jan.start(), 60..70);
+    batch.extend(flat_minutes(jan.next().start(), 0..10));
+    let result = store.write_candles(&id, &batch);
+    assert!(result.is_err(), "{result:?}");
+    assert!(
+        std::fs::read(&january).expect("the file") == before,
+        "January is untouched"
+    );
+    assert_eq!(std::fs::read(&february).expect("the file"), b"not parquet");
+}
