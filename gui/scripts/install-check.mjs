@@ -153,14 +153,14 @@ function leftovers(dir) {
 async function uninstall() {
   const uninstaller = readdirSync(installDir).find((name) => /^Uninstall .*\.exe$/.test(name))
   if (!uninstaller) throw new Error(`no uninstaller in ${installDir}`)
-  // The uninstaller copies itself to a temporary folder and returns at once; wait for the folder.
+  // The uninstaller copies itself to a temporary folder and returns at once. It deletes the folder
+  // first and its registry entries after, so wait for both.
   spawnSync(join(installDir, uninstaller), ['/S'], { stdio: 'ignore' })
   const deadline = Date.now() + UNINSTALL_LIMIT_MS
-  while (existsSync(installDir) && Date.now() < deadline) await delay(500)
-  if (existsSync(installDir)) {
-    throw new Error(`the install folder is still there ${UNINSTALL_LIMIT_MS / 1000} s after uninstalling, holding: ${leftovers(installDir)}`)
-  }
-  if (registeredInstalls()) throw new Error('the uninstall entry is still in the registry')
+  while ((existsSync(installDir) || registeredInstalls()) && Date.now() < deadline) await delay(500)
+  const after = `${UNINSTALL_LIMIT_MS / 1000} s after uninstalling`
+  if (existsSync(installDir)) throw new Error(`the install folder is still there ${after}, holding: ${leftovers(installDir)}`)
+  if (registeredInstalls()) throw new Error(`the uninstall entry is still in the registry ${after}`)
   step('uninstalled; the install folder and the uninstall entry are gone')
 }
 
