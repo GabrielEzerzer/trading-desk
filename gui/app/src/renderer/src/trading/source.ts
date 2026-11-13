@@ -76,7 +76,7 @@ export interface TradingSource {
   cancelOrder(sessionId: string, orderId: OrderId): Promise<void>
 }
 
-export function candleTopic(id: InstrumentId, timeframe: Timeframe): string {
+function candleTopic(id: InstrumentId, timeframe: Timeframe): string {
   return `candles:${id.venue}:${id.symbol}:${id.kind}:${timeframe}`
 }
 
