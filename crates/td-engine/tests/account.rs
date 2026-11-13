@@ -142,7 +142,7 @@ fn trades_of(s: &Session, quotes: &[Quote]) -> Vec<td_engine::Trade> {
         account,
         usdjpy().pip_size(),
     );
-    td_engine::attach_stops(&mut trades, s.bars(), s.bar_stops(), account);
+    td_engine::attach_stops(&mut trades, s.trade_stops(), account);
     trades
 }
 

@@ -137,25 +137,23 @@ impl Context<'_> {
     /// commission. A spot buy is checked
     /// again when it fills and cut to the cash then (see [`crate::SimBroker`]).
     ///
-    /// On a margined kind (perpetual, FX), an order that is not reduce-only is rejected if the
-    /// position it could
-    /// build is worth more than [`Context::max_leverage`] times the equity. With no position, or
-    /// on the side of the position, that is the position plus this order and the open orders on
-    /// its side that are not reduce-only. Against the position, this order and the open orders on
-    /// its side, reduce-only or not, are always allowed when together they are no larger than the
-    /// position, since they can then only shrink it, so a strategy can always reduce or close,
-    /// even when losses have taken it over the cap. When they are larger they could flip it: the
-    /// worst case is that the reduce-only orders close what they can first and the others open a
-    /// fresh position on the other side, and that fresh position is what is capped. The position
-    /// is valued at this bar's close, and each order at its limit price, its trigger, or this
-    /// bar's close for a market order, without the fee. On a base account each of those values is
-    /// converted to the account currency at the price it is valued at, so a position of `q` units
-    /// of USD/JPY is worth `q` dollars, before it is compared with the equity.
-    ///
-    /// shortcut: a reduce-only order is never checked, so one submitted after a plain order on
-    /// the same side that it would make room for (a reduce-only market close after a plain limit
-    /// that flips) can still let that order open past the cap. Check at fill time, against the
-    /// equity then, if strategies combine orders that way.
+    /// On a margined kind (perpetual, FX), an order is rejected if the position it could build is
+    /// worth more than [`Context::max_leverage`] times the equity. With no position, or on the side
+    /// of the position, that is the position plus this order and the open orders on its side that
+    /// are not reduce-only; a reduce-only order there is not checked, since it adds nothing.
+    /// Against the position, this order and the open orders on its side, reduce-only or not, are
+    /// always allowed when together they are no larger than the position, since they can then only
+    /// shrink it, so a strategy can always reduce or close, even when losses have taken it over the
+    /// cap. When they are larger they could flip it: the worst case is that the reduce-only orders
+    /// close what they can first and the others open a fresh position on the other side, and that
+    /// fresh position is what is capped, whichever of the orders is submitted last. So a
+    /// reduce-only close sent after a plain order that flips is refused when it would make room
+    /// for that order to open past the cap. The position is valued at this bar's close, and each
+    /// order at its limit price, its trigger, or this bar's close on its side for a market order
+    /// (the ask close for a buy on a market with quotes), without the fee. On a base account each
+    /// of those values is converted to the account currency at the price it is valued at, so a
+    /// position of `q` units of USD/JPY is worth `q` dollars, before it is compared with the
+    /// equity.
     ///
     /// Every order is rejected on a warm-up bar. A rejected order is recorded with its reason and
     /// returned as an error.
@@ -185,7 +183,8 @@ impl Context<'_> {
     ///
     /// The entry is checked as in [`Context::submit`]. The trigger rounds to the nearest tick and
     /// must be below the entry's price for a buy and above it for a sell, where the entry is
-    /// valued at its limit price, its trigger, or this bar's close for a market order. A
+    /// valued at its limit price, its trigger, or this bar's close on its side for a market order
+    /// (the ask close for a buy on a market with quotes). A
     /// reduce-only entry or a spot sell cannot have a stop attached.
     ///
     /// Returns the entry's id and the stop's. The stop is recorded as [`OrderStatus::Attached`]
@@ -212,11 +211,7 @@ impl Context<'_> {
         submitted_at: Millis,
     ) -> Result<(OrderId, Option<OrderId>), OrderRejected> {
         let id = OrderId(self.orders.len() as u64 + 1);
-        // A buy is decided against the ask, a sell against the bid.
-        let decision_close = match (request.side, self.ask) {
-            (Side::Buy, Some(ask)) => ask.close,
-            _ => self.bar().close,
-        };
+        let decision_close = self.close_on(request.side);
         let (request, mut check) = self.prepare(request);
         if self.warming_up {
             check = Err(WARM_UP.into());
@@ -286,6 +281,14 @@ impl Context<'_> {
         true
     }
 
+    /// This bar's close on `side`: a buy is decided against the ask, a sell against the bid.
+    fn close_on(&self, side: Side) -> f64 {
+        match (side, self.ask) {
+            (Side::Buy, Some(ask)) => ask.close,
+            _ => self.bar().close,
+        }
+    }
+
     /// Checks a protective stop for `entry`, which has passed its own checks.
     fn check_stop(&self, entry: &OrderRequest, stop: AttachedStop) -> Result<(), String> {
         let inst = self.instrument;
@@ -298,7 +301,7 @@ impl Context<'_> {
         let close = self.bar().close;
         inst.validate_order(&stop.request(entry, entry.qty), close)
             .map_err(|e| format!("protective stop: {e}"))?;
-        let price = reference_price(entry.order_type, close);
+        let price = reference_price(entry.order_type, self.close_on(entry.side));
         let (wrong_side, side) = match entry.side {
             Side::Buy => (stop.trigger >= price, "below"),
             Side::Sell => (stop.trigger <= price, "above"),
@@ -376,9 +379,13 @@ impl Context<'_> {
                 return (req, Err(reason));
             }
         }
-        if rules.margin && !req.reduce_only {
+        let position = self.position();
+        let against = req.side.sign() * position < 0.0;
+        if rules.margin && (!req.reduce_only || against) {
             let close = self.bar().close;
-            let position = self.position();
+            // Every order here is on this order's side, and a market order is valued at its side's
+            // close.
+            let last = self.close_on(req.side);
             let account = self.portfolio.account();
             // The value of `qty` at `price`, in the account currency.
             let value = |qty: f64, price: f64| account.from_quote(qty * price, price);
@@ -396,7 +403,7 @@ impl Context<'_> {
             let mut plain: Vec<(f64, f64)> = side
                 .iter()
                 .filter(|r| !r.reduce_only)
-                .map(|r| (r.qty, reference_price(r.order_type, close)))
+                .map(|r| (r.qty, reference_price(r.order_type, last)))
                 .collect();
             plain.sort_by(|a, b| b.1.total_cmp(&a.1));
             let plain_qty: f64 = plain.iter().map(|(q, _)| q).sum();

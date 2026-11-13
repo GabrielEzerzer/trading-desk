@@ -334,6 +334,36 @@ fn a_reduce_only_close_cannot_clear_the_way_for_a_reversal_past_the_cap() {
 }
 
 #[test]
+fn a_reduce_only_close_sent_after_a_flip_cannot_clear_the_way_past_the_cap() {
+    let i = perp();
+    let bars = [
+        bar(0, 100.0, 101.0, 99.0, 100.0),
+        bar(1, 100.0, 101.0, 99.0, 100.0),
+        bar(2, 100.0, 101.0, 99.0, 100.0),
+    ];
+    let (script, log) = Script::new(vec![
+        // Long 99 at 100, fee 19.8: equity 9,980.2 at bar 1's close, and 9,980.2 allowed at 1x.
+        (0, req(&i, Side::Buy, 99.0, OrderType::Market)),
+        // A sell limit of 198 at 100.5 flips the long: the fresh short is 99, 9,949.5, within.
+        (
+            1,
+            req(&i, Side::Sell, 198.0, OrderType::Limit { price: 100.5 }),
+        ),
+        // A reduce-only market close of the 99, sent after it, would close the long at bar 2's
+        // open and leave the limit to open a fresh short of all 198 inside the range: 19,899,
+        // over the cap.
+        (1, reduce_only(req(&i, Side::Sell, 99.0, OrderType::Market))),
+    ]);
+    let s = run(i, lev(1.0), &bars, script);
+    let log = log.lock().unwrap();
+    assert!(log[0].is_ok() && log[1].is_ok());
+    let err = log[2].as_ref().unwrap_err();
+    assert!(err.reason.contains("leverage"), "{}", err.reason);
+    // Bar 2 reaches 100.5 and the limit sells 198: long 99 becomes short 99.
+    approx(s.portfolio().position(), -99.0);
+}
+
+#[test]
 fn a_flip_is_capped_on_the_fresh_position_it_opens() {
     let i = perp();
     let bars = [
@@ -530,6 +560,47 @@ fn an_attached_stop_above_the_liquidation_price_fills_before_the_liquidation() {
     approx(e[1], 4_610.0);
     approx(e[2], 4_610.0);
     approx(s.portfolio().shortfall_written_off(), 0.0);
+}
+
+#[test]
+fn an_entry_filled_between_the_bars_is_liquidated_before_a_stop_beyond_its_price() {
+    let i = perp();
+    let bars = [
+        bar(0, 105.0, 106.0, 104.0, 105.0),
+        bar(1, 90.2, 90.5, 90.0, 90.2),
+    ];
+    let steps = Steps(|ctx: &mut td_engine::Context, index: usize| {
+        if index == 0 {
+            let r = req(
+                ctx.instrument(),
+                Side::Buy,
+                1000.0,
+                OrderType::Limit { price: 100.0 },
+            );
+            ctx.submit_with_stop(r, 90.3).unwrap();
+        }
+    });
+    let s = run(i, lev(10.0), &bars, Box::new(steps));
+
+    // Bar 1 opens at 90.2: between the bars the market fell through 100, where the entry bought
+    // 1,000 as a maker, fee 100, so cash is 9,900. Equity at price p is 9,900 + 1,000 * (p - 100)
+    // and maintenance 0.005 * 1,000 * p: they meet at 90,100 / 995 = 90.5527..., rounded up to
+    // 90.56. The market went on down and reached that price before the stop at 90.3, so the long
+    // is liquidated first, at the open of 90.2 as for any gap past the price, and the stop never
+    // fills. Filling the stop at 90.3 would have left 9,900 - 9,700 - 180.6 = 19.4.
+    let f = s.fills();
+    assert_eq!(f.len(), 2, "the entry and the liquidation");
+    approx(f[0].price, 100.0);
+    assert_eq!(f[1].side, Side::Sell);
+    approx(f[1].price, 90.2);
+    let order = &s.orders()[f[1].order_id.0 as usize - 1];
+    assert_eq!(order.request.client_tag.as_deref(), Some("liquidation"));
+    match &s.orders()[1].status {
+        OrderStatus::Cancelled(reason) => assert!(reason.contains("liquidation"), "{reason}"),
+        other => panic!("expected the stop cancelled, got {other:?}"),
+    }
+    assert_eq!(s.portfolio().position(), 0.0);
+    approx(equity(&s)[1], 0.0);
 }
 
 #[test]
