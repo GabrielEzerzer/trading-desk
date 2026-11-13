@@ -2082,8 +2082,9 @@ bars: number,
 /**
  * Every stretch of minutes in the range (warm-up included) the store has no candle for,
  * oldest first, including any at the start or the end of the range, in the instrument's open
- * hours. Together with any next to it that only closed hours part it from, each holds less
- * than a day of open time, or two days for FX; more refuses the run.
+ * hours, apart from recorded closures. Together with any next to it that only closed hours
+ * part it from, each holds less than a day of open time, or two days for FX in a month
+ * downloaded before closures were recorded; more refuses the run.
  */
 gaps: Array<GapInfo>, 
 /**

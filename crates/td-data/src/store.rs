@@ -13,6 +13,10 @@
 //! Readers take no lock: the rename means they see the old file or the new one, never half of one.
 //! Missing minutes are reported, never filled.
 //!
+//! A month of a kind with closed hours (FX) may also have a record of the closures its downloads
+//! found, `<YYYY-MM>.parquet.closed.json` beside the month file ([`crate::closed`]); coverage and
+//! the run check count a recorded closure as closed time.
+//!
 //! A kind whose rules require quotes ([`td_core::MarketRules::quotes`], FX) has a bid and an ask
 //! price. Its month file holds the bid candle in the candle columns and the ask candle in four more,
 //! `ask_open`, `ask_high`, `ask_low` and `ask_close`, written together by [`Store::write_quotes`]
@@ -181,11 +185,13 @@ pub struct MonthCoverage {
     /// Stored 1-minute candles.
     pub minutes: usize,
     /// The month's open minutes by the instrument's trading hours, which a complete month stores:
-    /// every minute for a market that never closes, the minutes outside its weekends for FX.
+    /// every minute for a market that never closes, the minutes outside its weekends and its
+    /// recorded closures ([`Store::closures`]) for FX.
     pub open_minutes: i64,
     pub first: Millis,
     pub last: Millis,
-    /// Missing minutes between `first` and `last`, by the instrument's trading hours.
+    /// Missing minutes between `first` and `last`, by the instrument's trading hours, less its
+    /// recorded closures.
     pub gaps: Vec<Gap>,
     /// The month file's size on disk.
     pub bytes: u64,
@@ -619,7 +625,8 @@ impl Store {
     }
 
     /// Which months and minutes are stored for an instrument, with gaps by its kind's trading hours
-    /// ([`missing_minutes`]).
+    /// ([`missing_minutes`]). A closure the month's downloads recorded ([`Store::closures`]) is
+    /// closed time: it is neither a gap nor among the open minutes.
     pub fn coverage(&self, id: &InstrumentId) -> Result<Vec<MonthCoverage>, DataError> {
         let mut coverage = Vec::new();
         let months = self.months(id)?;
@@ -628,19 +635,26 @@ impl Store {
             let (Some(first), Some(last)) = (candles.first(), candles.last()) else {
                 continue;
             };
+            let closures = self.closures(id, month.start(), month.end())?;
             let closed: Millis = id
                 .kind
                 .closed_spans(month.start(), month.end())
                 .iter()
                 .map(|s| s.end - s.start)
-                .sum();
+                .sum::<Millis>()
+                + closures.closed_in(month.start(), month.end());
             coverage.push(MonthCoverage {
                 month,
                 minutes: candles.len(),
                 open_minutes: month.minutes() - closed / MINUTE,
                 first: first.open_time,
                 last: last.open_time,
-                gaps: missing_minutes(id.kind, &candles, first.open_time, last.open_time + MINUTE),
+                gaps: closures.remove(missing_minutes(
+                    id.kind,
+                    &candles,
+                    first.open_time,
+                    last.open_time + MINUTE,
+                )),
                 bytes: file_bytes(&self.candle_path(id, month)?)?.unwrap_or(0),
             });
         }
@@ -817,7 +831,7 @@ impl Store {
                                 Some((month, false)) if name.ends_with(".tmp") => {
                                     temps.push((month, name));
                                 }
-                                Some((_, false)) => {} // a lock sidecar
+                                Some((_, false)) => {} // a lock sidecar or a closure record
                                 None => unrecognised.push(self.relative(&dir.join(&name))),
                             }
                         }
@@ -1154,7 +1168,7 @@ fn check_quote(id: &InstrumentId, bid: &Candle, ask: &Candle) -> Result<(), Data
     Ok(())
 }
 
-fn bad_file(path: &Path, reason: impl Into<String>) -> DataError {
+pub(crate) fn bad_file(path: &Path, reason: impl Into<String>) -> DataError {
     DataError::BadFile {
         path: path.to_path_buf(),
         reason: reason.into(),
@@ -1217,7 +1231,7 @@ fn quote_batch(quotes: &[(Candle, Candle)]) -> Result<RecordBatch, DataError> {
 // differently (relative and absolute) do not share this mutex, and entries are never removed (one
 // per file written, a few hundred bytes each); canonicalise and evict if either ever matters. The
 // OS lock taken next still serialises such writers, since it is keyed by the file itself.
-fn file_lock(path: &Path) -> Arc<Mutex<()>> {
+pub(crate) fn file_lock(path: &Path) -> Arc<Mutex<()>> {
     static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
     let mut locks = hold(LOCKS.get_or_init(Mutex::default));
     locks.entry(path.to_path_buf()).or_default().clone()
@@ -1233,7 +1247,7 @@ fn file_lock(path: &Path) -> Arc<Mutex<()>> {
 /// would proceed. It is an OS lock (`flock` on Unix, `LockFileEx` on Windows) bound to the open
 /// handle, so the OS releases it when the holder exits or is killed: a crash cannot leave a file
 /// locked, as a create-exclusive marker file would.
-fn lock_across_processes(path: &Path) -> Result<File, DataError> {
+pub(crate) fn lock_across_processes(path: &Path) -> Result<File, DataError> {
     let dir = path.parent().unwrap_or(Path::new("."));
     fs::create_dir_all(dir).map_err(DataError::io(dir))?;
     let mut name = path.file_name().unwrap_or_default().to_owned();
@@ -1355,9 +1369,13 @@ fn month_of_file(name: &str) -> Option<(Month, bool)> {
 }
 
 /// Whether `rest`, what follows `.parquet` in a file name, is one the store writes: nothing (the
-/// data file), `.lock` (its sidecar) or `.<pid>.<n>.tmp` (a temp file).
+/// data file), `.lock` (its sidecar), `.closed.json` (a month's record of closures, see
+/// [`crate::closed`]) or `.<pid>.<n>.tmp` (a temp file).
 fn is_store_suffix(rest: &str) -> bool {
-    rest.is_empty() || rest == ".lock" || (rest.starts_with('.') && rest.ends_with(".tmp"))
+    rest.is_empty()
+        || rest == ".lock"
+        || rest == crate::closed::RECORD_SUFFIX
+        || (rest.starts_with('.') && rest.ends_with(".tmp"))
 }
 
 /// A venue or kind from the folder name it is stored under, which is its serde name.
@@ -1368,7 +1386,7 @@ fn parse_name<T: serde::de::DeserializeOwned>(name: &str) -> Option<T> {
 /// Locks `mutex`, carrying on past a panic in another holder: the data behind these locks is a
 /// map of locks, a month cache whose updates cannot panic part way, or nothing at all, so it cannot
 /// be left half-changed.
-fn hold<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+pub(crate) fn hold<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -1406,7 +1424,7 @@ fn write_atomic(path: &Path, batch: &RecordBatch) -> Result<(), DataError> {
 }
 
 /// `fs::rename`, retried briefly as [`retry_denied`] does.
-fn rename_replacing(from: &Path, to: &Path) -> io::Result<()> {
+pub(crate) fn rename_replacing(from: &Path, to: &Path) -> io::Result<()> {
     retry_denied(|| fs::rename(from, to))
 }
 

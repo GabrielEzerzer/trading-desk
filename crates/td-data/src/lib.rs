@@ -7,6 +7,7 @@
 
 pub mod binance;
 pub mod bybit;
+mod closed;
 mod download;
 mod error;
 mod http;
@@ -18,10 +19,14 @@ mod source;
 mod store;
 pub mod time;
 
+pub use closed::{Closures, LONGEST_CLOSURE};
 pub use download::{DownloadReport, download_candles, download_funding};
 pub use error::DataError;
 pub use http::Http;
-pub use instruments::{InstrumentList, default_fees, fetch_instruments, validate_instrument};
+pub use instruments::{
+    INSTRUMENT_CACHE_AGE, InstrumentList, cached_instruments, default_fees, fetch_instruments,
+    validate_instrument,
+};
 pub use resample::{LoadedCandles, resample};
 pub use source::{DataSource, LiveStream, MinuteHistory, source};
 pub use store::{

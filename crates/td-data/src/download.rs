@@ -1,7 +1,7 @@
 //! Downloading a range of history into the store, one month at a time so a long download keeps
-//! what it has fetched if it stops part way.
+//! what it has fetched if it stops part way. A month already stored whole is not fetched again.
 
-use td_core::{InstrumentId, InstrumentKind, Millis, Timeframe};
+use td_core::{Hours, InstrumentId, InstrumentKind, Millis, Timeframe};
 
 use crate::DataError;
 use crate::http::Http;
@@ -12,12 +12,13 @@ use crate::time::{MINUTE, Month, now_ms};
 /// What a candle download did.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct DownloadReport {
-    /// Candles fetched per month.
+    /// Candles fetched per month: none for a month already stored whole.
     pub months: Vec<(Month, usize)>,
     /// History files the source does not have (before the symbol listed, or not yet published),
     /// as [`MinuteHistory::missing_files`] names them.
     pub missing_files: Vec<String>,
-    /// Minutes in the range, up to now, that are still not stored after the download.
+    /// Minutes in the range, up to now, that are still not stored after the download, apart from
+    /// the closures recorded ([`Store::closures`]).
     pub gaps: Vec<Gap>,
 }
 
@@ -27,6 +28,10 @@ pub struct DownloadReport {
 /// [`Store::write_candles`]. A month whose source returns candles without asks for such a kind,
 /// or asks for a kind without quotes, is an error, and nothing of it is written. `progress` is
 /// called with a line of text after each month.
+///
+/// A month whose part of the range is already stored with no minute missing, apart from recorded
+/// closures, is skipped. For a kind with closed hours, the open time the source returned nothing
+/// for is recorded beside the month ([`Store::record_closures`]).
 pub fn download_candles(
     http: &Http,
     store: &Store,
@@ -53,6 +58,19 @@ pub(crate) fn download_candles_from(
     for month in Month::range(from, to.min(now)) {
         let lo = from.max(month.start());
         let hi = to.min(month.end()).min(now);
+        // shortcut: a crypto month with an outage in it is never whole, so it is fetched again on
+        // every download that covers it; record crypto outages too if that gets slow.
+        let stored = store.read_month(id, month)?;
+        if !stored.is_empty()
+            && store
+                .closures(id, lo, hi)?
+                .remove(missing_minutes(id.kind, &stored, lo, hi))
+                .is_empty()
+        {
+            progress(format!("{id} {month}: already stored"));
+            report.months.push((month, 0));
+            continue;
+        }
         let MinuteHistory {
             mut candles,
             mut asks,
@@ -74,13 +92,27 @@ pub(crate) fn download_candles_from(
         } else {
             store.write_candles(id, &candles)?;
         }
+        if id.kind.rules().hours != Hours::Always {
+            candles.sort_by_key(|c| c.open_time);
+            let mut empty = missing_minutes(id.kind, &candles, lo, hi);
+            // Minutes up to now may only not be published yet.
+            if hi < to.min(month.end()) && empty.last().is_some_and(|g| g.to == hi) {
+                empty.pop();
+            }
+            store.record_closures(id, month, lo, hi, &empty)?;
+        }
         progress(format!("{id} {month}: {} candles", candles.len()));
         report.months.push((month, candles.len()));
     }
     let end = to.min(now - now.rem_euclid(MINUTE));
     if from < end {
         let stored = store.load_candles(id, Timeframe::M1, from, end, true)?;
-        report.gaps = missing_minutes(id.kind, &stored.candles, from, end);
+        report.gaps = store.closures(id, from, end)?.remove(missing_minutes(
+            id.kind,
+            &stored.candles,
+            from,
+            end,
+        ));
     }
     Ok(report)
 }
@@ -203,6 +235,129 @@ mod tests {
         assert_eq!(times(&asks), times(&bids));
         assert!(asks.iter().all(|a| *a == fake::ask(a.open_time)));
         assert!(bids.iter().all(|b| *b == fake::candle(b.open_time)));
+    }
+
+    #[test]
+    fn a_month_stored_whole_is_not_fetched_again() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let store = Store::new(dir.path());
+        let id = id(InstrumentKind::Spot);
+        let feb = parse_date("2024-02-01").expect("a date");
+        let (from, to) = (feb - 2 * DAY, feb + 2 * DAY);
+        let http = Http::new().expect("an HTTP client");
+        // 2 February is missing the first time, so February is not whole.
+        let first = DailyFiles::new(vec![feb + DAY]);
+        download_candles_from(&first, &http, &store, &id, from, to, &mut |_| {})
+            .expect("downloads");
+        let again = DailyFiles::new(Vec::new());
+        let mut lines = Vec::new();
+        let report = download_candles_from(&again, &http, &store, &id, from, to, &mut |line| {
+            lines.push(line)
+        })
+        .expect("downloads");
+        // January is whole, so only February is asked for.
+        assert_eq!(*again.asked.lock().expect("lock"), [(feb, to)]);
+        let jan = Month::containing(from);
+        assert_eq!(report.months[0], (jan, 0));
+        assert_eq!(lines[0], format!("{id} {jan}: already stored"));
+        assert_eq!(report.gaps, []);
+        // Now both are whole: nothing is asked for.
+        let third = DailyFiles::new(Vec::new());
+        download_candles_from(&third, &http, &store, &id, from, to, &mut |_| {})
+            .expect("downloads");
+        assert_eq!(*third.asked.lock().expect("lock"), []);
+    }
+
+    #[test]
+    fn an_fx_day_the_source_has_nothing_for_is_recorded_as_closed() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let store = Store::new(dir.path());
+        let id = id(InstrumentKind::Fx);
+        let dec = Month::parse("2024-12").expect("a month");
+        let christmas = parse_date("2024-12-25").expect("a date"); // a Wednesday
+        let source = DailyFiles {
+            missing_days: vec![christmas],
+            ..DailyFiles::fx(true)
+        };
+        let http = Http::new().expect("an HTTP client");
+        let report = download_candles_from(
+            &source,
+            &http,
+            &store,
+            &id,
+            dec.start(),
+            dec.end(),
+            &mut |_| {},
+        )
+        .expect("downloads");
+        let closed = Gap {
+            from: christmas,
+            to: christmas + DAY,
+        };
+        assert_eq!(
+            store.closure_record(&id, dec).expect("reads"),
+            Some(vec![closed])
+        );
+        assert_eq!(report.gaps, [], "a recorded day is closed, not missing");
+        // The month is whole now, so it is not fetched again.
+        let again = DailyFiles::fx(true);
+        download_candles_from(
+            &again,
+            &http,
+            &store,
+            &id,
+            dec.start(),
+            dec.end(),
+            &mut |_| {},
+        )
+        .expect("downloads");
+        assert_eq!(*again.asked.lock().expect("lock"), []);
+    }
+
+    #[test]
+    fn an_fx_hole_longer_than_a_day_stays_missing_and_is_fetched_again() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let store = Store::new(dir.path());
+        let id = id(InstrumentKind::Fx);
+        let dec = Month::parse("2024-12").expect("a month");
+        let tuesday = parse_date("2024-12-10").expect("a date");
+        let source = DailyFiles {
+            missing_days: vec![tuesday, tuesday + DAY],
+            ..DailyFiles::fx(true)
+        };
+        let http = Http::new().expect("an HTTP client");
+        let report = download_candles_from(
+            &source,
+            &http,
+            &store,
+            &id,
+            dec.start(),
+            dec.end(),
+            &mut |_| {},
+        )
+        .expect("downloads");
+        let hole = Gap {
+            from: tuesday,
+            to: tuesday + 2 * DAY,
+        };
+        assert_eq!(report.gaps, [hole]);
+        let again = DailyFiles::fx(true);
+        let report = download_candles_from(
+            &again,
+            &http,
+            &store,
+            &id,
+            dec.start(),
+            dec.end(),
+            &mut |_| {},
+        )
+        .expect("downloads");
+        assert_eq!(
+            *again.asked.lock().expect("lock"),
+            [(dec.start(), dec.end())]
+        );
+        assert_eq!(report.gaps, []);
+        assert_eq!(store.closure_record(&id, dec).expect("reads"), Some(vec![]));
     }
 
     #[test]

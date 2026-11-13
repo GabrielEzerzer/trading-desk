@@ -6,7 +6,9 @@ use std::process::ExitCode;
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use td_core::{InstrumentId, InstrumentKind, Venue};
 use td_data::time::{Month, format_minute, parse_date};
-use td_data::{DataError, Gap, Http, Store, download_candles, download_funding, fetch_instruments};
+use td_data::{
+    DataError, Gap, Http, Store, cached_instruments, download_candles, download_funding,
+};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -132,7 +134,8 @@ fn main() -> ExitCode {
 fn run(cli: Cli) -> Result<(), DataError> {
     match cli.command {
         Command::Instruments { venue, kind } => {
-            let list = fetch_instruments(&Http::new()?, venue.into(), kind.into())?;
+            let store = Store::open_default()?;
+            let list = cached_instruments(&Http::new()?, &store, venue.into(), kind.into())?;
             println!("symbol\tbase\tquote\ttick\tlot\tmin_qty\tmin_notional\tmaker\ttaker");
             for i in &list.instruments {
                 println!(

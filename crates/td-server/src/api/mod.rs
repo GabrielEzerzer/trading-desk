@@ -12,7 +12,8 @@
 //!   another server on the same data folder is safe, since the store locks across processes, just
 //!   redundant).
 //! - `GET /data/coverage?instrument=venue:symbol:kind`: which months and minutes the store holds,
-//!   and each month file's bytes.
+//!   and each month file's bytes. A closure recorded at download time is closed time, neither a
+//!   gap nor counted in `month_minutes`.
 //! - `GET /data/stored`: every instrument the store holds, with each month file's bytes and the
 //!   funding file's, and any paths in the data folder the store did not write.
 //! - `POST /data/delete` `{instrument, from?, to?}`: deletes the candles of the months `from` to
@@ -43,16 +44,21 @@
 //!   `POST /runs/out-of-sample` (an `OosSpec`), `POST /runs/walk-forward` (a `WalkForwardSpec`):
 //!   start a run job, answer `{job_id}`. An out-of-sample run's job kind is `oos`, the same as its
 //!   saved run's kind; only the route spells it out. `from`, `to` and `warmup_from` must each be
-//!   where a bar of the timeframe opens. The range is checked against the store first: a gap of a
-//!   day or more, or for FX, whose venue closes on holidays, two days or more of open time counted
-//!   across the weekends inside it, is a 422 `data_missing` naming the missing spans; shorter gaps
-//!   are run and listed in the result's data report (`gaps`, `dropped`). A bad spec is a 400
+//!   where a bar of the timeframe opens. The store lacks part of the range when it is missing a
+//!   day or more of open time in one stretch, counted across the weekends inside it, apart from
+//!   closures recorded at download time; for FX in a month downloaded before closures were
+//!   recorded, two days. The job then downloads that part first, reporting
+//!   `downloading the data: ...`, and runs once the store holds it; a failed download fails the
+//!   job with the source's error, and one that does not fill the range fails it with a
+//!   `data_missing` naming the missing spans. A range nothing can be downloaded for (after now,
+//!   or before the venue's earliest data) is a 422 `data_missing` when it is requested. Shorter
+//!   gaps are run and listed in the result's data report (`gaps`, `dropped`). A bad spec is a 400
 //!   (`invalid_config`, which includes an unknown strategy and range edges off a bar boundary, or
 //!   `invalid_spec`). At most
 //!   [`jobs::MAX_RUN_JOBS`] run jobs are queued or running at once; one more is a 429
 //!   `too_many_runs`. A queued run holds only its request and loads its data when it gets one of
-//!   the run slots; if the store changed meanwhile so that the run would be refused, the job fails
-//!   with that `data_missing` error. Each finished run is saved (see [`runs`]).
+//!   the run slots, downloading then what the store lacks. Each finished run is saved (see
+//!   [`runs`]).
 //! - `GET /jobs/{id}/result`: the saved run of a finished run job (`RunDetail`); 409
 //!   `job_not_done` while it is queued or running (ask again later), 409 `no_result` once it has
 //!   finished without a saved run (failed, cancelled, or not a run job).

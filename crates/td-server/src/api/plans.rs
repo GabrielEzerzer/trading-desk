@@ -6,7 +6,7 @@
 //! [`td_engine::VerdictRule::validate`]), the subset, each instrument's trading rules and the
 //! store's data for each instrument over the plan's period, so a refusal is an HTTP error, not a
 //! job that fails later. The store is never filled in: a range it lacks is a 422 `data_missing`
-//! naming the instrument and the missing span, as for the other runs.
+//! naming the instrument and the missing span, where a single run's job downloads it first.
 //!
 //! Each instrument's data is loaded the way the other run jobs load theirs
 //! ([`super::runs::load_run_data`]) over the plan's backtest configuration: the bars, a market

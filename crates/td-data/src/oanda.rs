@@ -319,8 +319,10 @@ struct Quote {
 ///   its first candle: a fill never reaches across closed hours;
 /// - a run of [`CLOSURE_MINUTES`] or more open minutes with no candle, up to the next candle or
 ///   closed hours, is a closure or an outage, such as a market holiday: it is left missing whole,
-///   so it shows in the download's gaps and in coverage, and nothing is filled again until the
-///   next candle that is kept. A crossed candle still ends such a run, as OANDA was quoting then.
+///   and nothing is filled again until the next candle that is kept. The download records it
+///   beside the month ([`crate::Store::record_closures`]); one of at most a day of open time then
+///   counts as closed, and a longer one shows in the download's gaps and in coverage. A crossed
+///   candle still ends such a run, as OANDA was quoting then.
 ///
 /// The minutes are open by [`InstrumentKind::is_open`], which agrees with the closed spans the
 /// store's coverage counts open minutes by.
