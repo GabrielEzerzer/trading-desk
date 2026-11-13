@@ -11,7 +11,7 @@
 //! Each instrument's data is loaded the way the other run jobs load theirs
 //! ([`super::runs::load_run_data`]) over the plan's backtest configuration: the bars, a market
 //! with quotes' ask bars beside them, and a perpetual's funding. Every run of the battery trades
-//! on those asks, except the luck test (R3), which the battery skips on a market with quotes. That
+//! on those asks, the luck test's (R3) shuffled copies too. That
 //! configuration has no `warmup_from`: the engine reads no bars before the period, and the
 //! walk-forward warms each test window up from the bars before it inside the period.
 //!
@@ -333,8 +333,8 @@ fn execute(
             }
             std::ops::ControlFlow::Continue(())
         };
-        // The asks are empty for a kind without quotes; for one with quotes the battery trades
-        // on them and skips the luck test.
+        // The asks are empty for a kind without quotes; for one with quotes every run of the
+        // battery trades on them.
         let outcome = own_pool(|| {
             td_engine::run_battery(
                 &spec,
@@ -413,8 +413,7 @@ fn save_plan_run(
         verdict: battery.verdict.clone(),
         plan: to_json(&entry.plan)?,
         rule: to_json(&entry.rule)?,
-        // Only a cancel during the luck test leaves a battery incomplete; a luck test skipped on a
-        // market with quotes is not one.
+        // Only a cancel during the luck test leaves a battery incomplete.
         complete: !battery.luck_cancelled,
     };
     let run = PlanRun::new(

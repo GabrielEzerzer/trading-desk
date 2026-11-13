@@ -16,7 +16,7 @@ use crate::{
 };
 
 pub(crate) fn entries() -> Vec<StrategyEntry> {
-    vec![unrepeatable()]
+    vec![unrepeatable(), one_hour()]
 }
 
 /// How many `Unrepeatable` strategies have been built in this process.
@@ -76,6 +76,68 @@ impl Strategy for Unrepeatable {
     }
 }
 
+const HOUR: i64 = 3_600_000;
+
+/// In the market one hour a day and nothing else, so it has no edge of its own: at the close of
+/// the bar that opens at `hour` UTC it buys with half its cash, filled at the next bar's open,
+/// and at that bar's close it sells, filled at the open of the bar after. On a market with quotes
+/// it pays the ask at the open of the hour after `hour` and no other spread.
+#[derive(Debug, Clone)]
+pub struct OneHour {
+    pub hour: i64,
+}
+
+fn one_hour() -> StrategyEntry {
+    let mut plan = plan();
+    plan.sweep.axes = vec![ParamAxis {
+        name: "hour".into(),
+        space: ParamSpace::Values {
+            values: vec![ParamValue::Int(0)],
+        },
+    }];
+    StrategyEntry {
+        name: "test_one_hour",
+        description: "In the market one hour a day.",
+        params: vec![ParamSpec {
+            name: "hour",
+            kind: ParamKind::Int,
+            default: ParamValue::Int(0),
+            min: Some(0.0),
+            max: Some(23.0),
+            description: "The UTC hour whose bar's close sends the buy.",
+        }],
+        build: |p| {
+            Ok(Box::new(OneHour {
+                hour: p.int("hour")?,
+            }))
+        },
+        plan,
+        rule: VerdictRule::Portfolio {
+            benchmark: PortfolioBenchmark::Cash,
+            limits: PortfolioLimits::default(),
+        },
+    }
+}
+
+impl Strategy for OneHour {
+    fn on_bar(&mut self, ctx: &mut Context, bar: &Candle) {
+        if ctx.is_warming_up() {
+            return;
+        }
+        let hour = bar.open_time / HOUR % 24;
+        let position = ctx.position();
+        let request = if position == 0.0 && hour == self.hour {
+            let qty = affordable_qty(ctx, ctx.cash() * 0.5, bar.close);
+            order(ctx, Side::Buy, qty, OrderType::Market, false)
+        } else if position > 0.0 && hour == (self.hour + 1) % 24 {
+            order(ctx, Side::Sell, position, OrderType::Market, true)
+        } else {
+            return;
+        };
+        let _ = ctx.submit(request);
+    }
+}
+
 /// Four-hour bars of a perpetual over 250 days from time 0, `trade` swept over the one value that
 /// trades: four 45-day test windows after a 60-day train window, every one choosing it.
 fn plan() -> TestPlan {
@@ -95,6 +157,7 @@ fn plan() -> TestPlan {
             max_leverage: 1.0,
             slippage: Vec::new(),
             account_currency: AccountCurrency::Quote,
+            fee_override: None,
         },
         sweep: SweepPlan {
             fixed: Params::new(),
