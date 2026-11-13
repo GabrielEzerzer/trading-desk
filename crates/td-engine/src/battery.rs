@@ -70,8 +70,8 @@ use crate::risk::{self, DayRollover};
 use crate::rng::derive_seed;
 use crate::runner::select_bars;
 use crate::stats::{
-    self, BootstrapSpec, DEFAULT_RESAMPLES, DrawdownBootstrap, MeanBootstrap, PropFirmOdds,
-    PropFirmSpec, RuinSpec,
+    self, BootstrapSpec, DEFAULT_RESAMPLES, DrawdownBootstrap, MeanBootstrap, PropFirmAttempt,
+    PropFirmOdds, PropFirmSpec, RuinSpec,
 };
 use crate::strategies::direction;
 use crate::tester::stitched_headline;
@@ -94,6 +94,7 @@ const SEED_RUIN: u64 = 3;
 const SEED_PROP_FIRM: u64 = 4;
 const SEED_LUCK: u64 = 5;
 const SEED_DRAWDOWN_BOOTSTRAP: u64 = 6;
+const SEED_PROP_ATTEMPT: u64 = 7;
 
 /// The evidence lines of the runs that come after the statistics (R3, R4, R6).
 const LATER_LINES: [&str; 3] = ["luck_p", "stressed_return", "start_offsets"];
@@ -132,6 +133,10 @@ pub struct BatteryResult {
     /// The prop-firm challenge odds, for a `prop_firm` rule: passing within the rule's
     /// `pass_horizon_days`, breaching within its `breach_horizon_days`.
     pub prop_firm_odds: Option<PropFirmOdds>,
+    /// The value of one attempt, for a `prop_firm` rule with attempt terms: the evaluation to the
+    /// rule's `pass_horizon_days`, then the funded account. `None` otherwise, and in a result
+    /// saved before it existed.
+    pub prop_firm_attempt: Option<PropFirmAttempt>,
     /// R8.
     pub breakdown: Option<Breakdown>,
     /// R4. `None` when it did not run.
@@ -421,6 +426,7 @@ pub fn run_battery(
         drawdown_bootstrap: None,
         trade_bootstrap: None,
         prop_firm_odds: None,
+        prop_firm_attempt: None,
         breakdown: None,
         cost_stress: None,
         start_offsets: Vec::new(),
@@ -640,10 +646,20 @@ pub fn run_battery(
                 .map(|d| d.amount / cash),
             pass_probability: None,
             breach_probability: None,
+            attempt_value: None,
         };
-        if let VerdictRule::PropFirm { firm, limits } = rule {
+        if let VerdictRule::PropFirm {
+            firm,
+            limits,
+            attempt,
+        } = rule
+        {
             let spec = PropFirmSpec {
                 target: firm.profit_target,
+                second_target: firm.second_target,
+                min_days: firm.min_trading_days as usize,
+                best_day_share: firm.best_day_share,
+                trailing_lock: firm.trailing_floor_lock,
                 daily_loss_limit: firm.daily_loss,
                 max_drawdown: firm.max_drawdown,
                 drawdown: match firm.drawdown {
@@ -675,6 +691,15 @@ pub fn run_battery(
             });
             kind.pass_probability = result.prop_firm_odds.map(|o| o.pass);
             kind.breach_probability = result.prop_firm_odds.map(|o| o.breach);
+            if let Some(terms) = attempt {
+                let spec = PropFirmSpec {
+                    horizon_days: limits.pass_horizon_days as usize,
+                    seed: derive_seed(seed, SEED_PROP_ATTEMPT),
+                    ..spec
+                };
+                result.prop_firm_attempt = stats::prop_firm_attempt(&daily, &spec, terms).ok();
+                kind.attempt_value = result.prop_firm_attempt.map(|a| a.reduced.value);
+            }
         }
         result.breakdown = Some(breakdown);
     }

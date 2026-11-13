@@ -88,7 +88,7 @@ pub use trades::{
     BarFunding, Trade, TradeSide, TradeStops, attach_stops, build_trades, build_trades_with_fills,
 };
 pub use verdict::{
-    Comparison, Criterion, DrawdownMode, EvidenceInputs, FirmLimits, HighRiskLimits,
+    AttemptTerms, Comparison, Criterion, DrawdownMode, EvidenceInputs, FirmLimits, HighRiskLimits,
     IntegrityInputs, KindInputs, Layer, LoosenedLimit, MAX_DROPPED_SHARE, OosIntegrityInputs,
     Outcome, PortfolioBenchmark, PortfolioLimits, PropFirmLimits, RuleKind, TOO_GOOD_SHARPE, Unit,
     Verdict, VerdictRule, VerdictState, combine, evaluate, evaluate_evidence, evaluate_integrity,

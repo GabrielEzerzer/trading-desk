@@ -45,6 +45,11 @@ pub enum VerdictRule {
     PropFirm {
         firm: FirmLimits,
         limits: PropFirmLimits,
+        /// What one attempt costs and what a funded account pays, so the battery can price an
+        /// attempt in money and the kind gains its value line. `None`, and absent from a rule
+        /// saved before the field existed, prices nothing.
+        #[serde(default)]
+        attempt: Option<AttemptTerms>,
     },
     /// Held as part of a portfolio, judged on risk-adjusted return against a benchmark. Long/short
     /// and funding-carry strategies on perpetuals use `cash`.
@@ -68,8 +73,113 @@ pub struct FirmLimits {
     /// The largest drawdown allowed, measured as `drawdown` says.
     pub max_drawdown: f64,
     pub drawdown: DrawdownMode,
-    /// The profit that passes the challenge.
+    /// The profit that passes the challenge, or its first phase when `second_target` is set.
     pub profit_target: f64,
+    /// The profit target of a second phase, which starts from a fresh balance on the day after
+    /// the first phase passes. Both phases share the rule's `pass_horizon_days`. `None` is a
+    /// one-phase challenge.
+    #[serde(default)]
+    pub second_target: Option<f64>,
+    /// The fewest days each phase must run before its target can pass it. 0 sets no minimum.
+    #[serde(default)]
+    pub min_trading_days: u32,
+    /// The best-day rule: a phase passes only once its largest single day's profit is at most
+    /// this share of the phase's total profit. `None` sets no such rule.
+    #[serde(default)]
+    pub best_day_share: Option<f64>,
+    /// For a trailing drawdown, the level the floor stops rising at, as a fraction of the starting
+    /// balance above the start: 0 stops it at the starting balance. `None` lets it trail for ever.
+    #[serde(default)]
+    pub trailing_floor_lock: Option<f64>,
+}
+
+/// The terms of one attempt at a prop-firm challenge: its fees, the funded account it leads to
+/// and the size traded in each. Money is in the account currency; fractions are of the starting
+/// balance. A firm's numbers are plan input; none are built in.
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AttemptTerms {
+    /// The starting balance of the evaluation and of the funded account, which turns fractions
+    /// into money.
+    pub account_size: f64,
+    /// The fee paid to start the evaluation.
+    pub evaluation_fee: f64,
+    /// A fee charged on passing the evaluation.
+    #[serde(default)]
+    pub pass_fee: f64,
+    /// Whether the evaluation fee is paid back with the first payout.
+    #[serde(default)]
+    pub refund_fee_with_first_payout: bool,
+    /// The trader's share of each payout's profit, above 0 and at most 1.
+    pub profit_split: f64,
+    /// The funded account's day, counted from 1, on whose close the first payout may be asked for.
+    pub days_to_first_payout: u32,
+    /// The days from one payout to the earliest next one.
+    pub payout_interval_days: u32,
+    /// The smallest payout the firm makes, after the split.
+    #[serde(default)]
+    pub min_payout: f64,
+    /// The most profit one payout may count, as a fraction of the starting balance. `None` sets
+    /// no cap.
+    #[serde(default)]
+    pub payout_cap: Option<f64>,
+    /// The most payouts one funded account makes. `None` sets no limit.
+    #[serde(default)]
+    pub max_payouts: Option<u32>,
+    /// Whether the first payout locks the floor at the starting balance for the rest of the
+    /// account.
+    #[serde(default)]
+    pub payout_locks_floor: bool,
+    /// Days the funded account is simulated for after a pass.
+    pub funded_horizon_days: u32,
+    /// The size traded in the evaluation, as a multiple of the size the strategy was tested at:
+    /// each daily return is multiplied by it.
+    #[serde(default = "one")]
+    pub evaluation_size: f64,
+    /// The same for the funded account.
+    #[serde(default = "one")]
+    pub funded_size: f64,
+    /// The factor the mean daily return is scaled by for the second set of figures, between 0
+    /// and 1: 0.5 asks what an attempt is worth if the edge is half what the test shows.
+    #[serde(default = "default_reduced_edge_factor")]
+    pub reduced_edge_factor: f64,
+}
+
+fn one() -> f64 {
+    1.0
+}
+
+fn default_reduced_edge_factor() -> f64 {
+    0.5
+}
+
+impl AttemptTerms {
+    /// Refuses terms that are not numbers or out of their range, naming the field.
+    pub fn validate(&self) -> Result<(), PlanError> {
+        positive("attempt.account_size", self.account_size)?;
+        non_negative("attempt.evaluation_fee", self.evaluation_fee)?;
+        non_negative("attempt.pass_fee", self.pass_fee)?;
+        share("attempt.profit_split", self.profit_split)?;
+        non_negative("attempt.min_payout", self.min_payout)?;
+        if let Some(cap) = self.payout_cap {
+            positive("attempt.payout_cap", cap)?;
+        }
+        for (name, days) in [
+            ("days_to_first_payout", Some(self.days_to_first_payout)),
+            ("payout_interval_days", Some(self.payout_interval_days)),
+            ("funded_horizon_days", Some(self.funded_horizon_days)),
+            ("max_payouts", self.max_payouts),
+        ] {
+            if days == Some(0) {
+                return Err(PlanError(format!("attempt.{name} must be at least 1")));
+            }
+        }
+        positive("attempt.evaluation_size", self.evaluation_size)?;
+        positive("attempt.funded_size", self.funded_size)?;
+        probability("attempt.reduced_edge_factor", self.reduced_edge_factor)?;
+        Ok(())
+    }
 }
 
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -219,10 +329,33 @@ impl VerdictRule {
     /// tighten its kind's limits; only the evidence layer has floors.
     pub fn validate(&self) -> Result<(), PlanError> {
         match self {
-            VerdictRule::PropFirm { firm, limits } => {
+            VerdictRule::PropFirm {
+                firm,
+                limits,
+                attempt,
+            } => {
                 share("firm.daily_loss", firm.daily_loss)?;
                 share("firm.max_drawdown", firm.max_drawdown)?;
                 positive("firm.profit_target", firm.profit_target)?;
+                if let Some(target) = firm.second_target {
+                    positive("firm.second_target", target)?;
+                }
+                if let Some(best) = firm.best_day_share {
+                    share("firm.best_day_share", best)?;
+                }
+                if let Some(lock) = firm.trailing_floor_lock {
+                    if firm.drawdown != DrawdownMode::Trailing {
+                        return Err(PlanError(
+                            "firm.trailing_floor_lock needs a trailing drawdown: a static floor \
+                             never rises"
+                                .to_string(),
+                        ));
+                    }
+                    non_negative("firm.trailing_floor_lock", lock)?;
+                }
+                if let Some(terms) = attempt {
+                    terms.validate()?;
+                }
                 share("limits.share_of_firm_limits", limits.share_of_firm_limits)?;
                 probability("limits.min_pass_probability", limits.min_pass_probability)?;
                 probability(
@@ -441,6 +574,16 @@ fn positive(name: &str, v: f64) -> Result<(), PlanError> {
         Ok(())
     } else {
         Err(PlanError(format!("{name} must be above 0, got {v}")))
+    }
+}
+
+fn non_negative(name: &str, v: f64) -> Result<(), PlanError> {
+    if v >= 0.0 && v.is_finite() {
+        Ok(())
+    } else {
+        Err(PlanError(format!(
+            "{name} must be a finite number of at least 0, got {v}"
+        )))
     }
 }
 
@@ -868,6 +1011,10 @@ pub struct KindInputs {
     pub pass_probability: Option<f64>,
     /// The chance of breaching a limit within the rule's horizon.
     pub breach_probability: Option<f64>,
+    /// The value of one attempt in the account currency with the edge reduced by the rule's
+    /// `reduced_edge_factor`, for a rule with attempt terms.
+    #[serde(default)]
+    pub attempt_value: Option<f64>,
 }
 
 /// Judges `inputs` against `rule`: one line per criterion of the rule's kind.
@@ -877,13 +1024,17 @@ pub fn evaluate(rule: &VerdictRule, x: &KindInputs) -> Vec<Criterion> {
         Criterion::new(Layer::Kind, id, name, value, cmp, limit, unit)
     };
     match rule {
-        VerdictRule::PropFirm { firm, limits } => {
+        VerdictRule::PropFirm {
+            firm,
+            limits,
+            attempt,
+        } => {
             let share = limits.share_of_firm_limits;
             let (drawdown, measured) = match firm.drawdown {
                 DrawdownMode::Static => (x.intrabar_drawdown_static, "from the starting balance"),
                 DrawdownMode::Trailing => (x.intrabar_drawdown_trailing, "from the peak"),
             };
-            vec![
+            let mut lines = vec![
                 line(
                     "worst_daily_loss",
                     "Worst daily loss",
@@ -922,7 +1073,21 @@ pub fn evaluate(rule: &VerdictRule, x: &KindInputs) -> Vec<Criterion> {
                     limits.max_breach_probability,
                     Unit::Percent,
                 ),
-            ]
+            ];
+            if let Some(terms) = attempt {
+                lines.push(line(
+                    "attempt_value",
+                    &format!(
+                        "Value of one attempt with the mean daily return scaled by {}",
+                        terms.reduced_edge_factor
+                    ),
+                    x.attempt_value,
+                    Above,
+                    0.0,
+                    Unit::Quote,
+                ));
+            }
+            lines
         }
         VerdictRule::Portfolio { benchmark, limits } => {
             let mut lines = vec![
@@ -1362,8 +1527,16 @@ mod tests {
             max_drawdown: 0.1,
             drawdown: DrawdownMode::Static,
             profit_target: 0.08,
+            second_target: None,
+            min_trading_days: 0,
+            best_day_share: None,
+            trailing_floor_lock: None,
         };
-        let prop = |limits| VerdictRule::PropFirm { firm, limits };
+        let prop = |limits| VerdictRule::PropFirm {
+            firm,
+            limits,
+            attempt: None,
+        };
         let longer = prop(PropFirmLimits {
             pass_horizon_days: 180,
             breach_horizon_days: 180,
@@ -1684,8 +1857,13 @@ mod tests {
                 max_drawdown: 0.10,
                 drawdown,
                 profit_target: 0.08,
+                second_target: None,
+                min_trading_days: 0,
+                best_day_share: None,
+                trailing_floor_lock: None,
             },
             limits: PropFirmLimits::default(),
+            attempt: None,
         }
     }
 
@@ -1882,6 +2060,10 @@ mod tests {
             max_drawdown: 0.1,
             drawdown: DrawdownMode::Static,
             profit_target: 0.1,
+            second_target: None,
+            min_trading_days: 0,
+            best_day_share: None,
+            trailing_floor_lock: None,
         };
         let bad = [
             VerdictRule::PropFirm {
@@ -1890,6 +2072,7 @@ mod tests {
                     ..firm
                 },
                 limits: PropFirmLimits::default(),
+                attempt: None,
             },
             VerdictRule::PropFirm {
                 firm,
@@ -1897,6 +2080,7 @@ mod tests {
                     min_pass_probability: 1.5,
                     ..PropFirmLimits::default()
                 },
+                attempt: None,
             },
             VerdictRule::PropFirm {
                 firm,
@@ -1904,6 +2088,7 @@ mod tests {
                     breach_horizon_days: 0,
                     ..PropFirmLimits::default()
                 },
+                attempt: None,
             },
             VerdictRule::PropFirm {
                 firm,
@@ -1911,6 +2096,7 @@ mod tests {
                     pass_horizon_days: 0,
                     ..PropFirmLimits::default()
                 },
+                attempt: None,
             },
             VerdictRule::Portfolio {
                 benchmark: PortfolioBenchmark::BuyAndHold,
@@ -2555,6 +2741,206 @@ mod tests {
                  which this check reads.",
                 "{id}"
             );
+        }
+    }
+
+    // Prop-firm attempts
+
+    /// Neutral attempt terms that validate.
+    fn attempt_terms() -> AttemptTerms {
+        AttemptTerms {
+            account_size: 100_000.0,
+            evaluation_fee: 500.0,
+            pass_fee: 0.0,
+            refund_fee_with_first_payout: false,
+            profit_split: 0.8,
+            days_to_first_payout: 14,
+            payout_interval_days: 14,
+            min_payout: 100.0,
+            payout_cap: None,
+            max_payouts: None,
+            payout_locks_floor: false,
+            funded_horizon_days: 180,
+            evaluation_size: 1.0,
+            funded_size: 1.0,
+            reduced_edge_factor: 0.5,
+        }
+    }
+
+    fn with_attempt(terms: AttemptTerms) -> VerdictRule {
+        let VerdictRule::PropFirm { firm, limits, .. } = prop(DrawdownMode::Trailing) else {
+            unreachable!()
+        };
+        VerdictRule::PropFirm {
+            firm,
+            limits,
+            attempt: Some(terms),
+        }
+    }
+
+    #[test]
+    fn a_prop_firm_rule_saved_before_the_new_fields_reads_and_is_judged_as_before() {
+        let saved = r#"{"kind":"prop_firm","firm":{"daily_loss":0.05,"max_drawdown":0.1,
+            "drawdown":"trailing","profit_target":0.08},"limits":{"share_of_firm_limits":0.5,
+            "min_pass_probability":0.6,"pass_horizon_days":90,"max_breach_probability":0.1,
+            "breach_horizon_days":90}}"#;
+        let rule: VerdictRule = serde_json::from_str(saved).unwrap();
+        // Every new field reads as off: one phase, no minimum days, no best-day rule, a floor
+        // that trails for ever, and no attempt terms.
+        assert_eq!(rule, prop(DrawdownMode::Trailing));
+        assert_eq!(rule.validate(), Ok(()));
+        let lines = evaluate(&rule, &good_prop());
+        assert_eq!(
+            ids(&lines),
+            [
+                "worst_daily_loss",
+                "max_drawdown",
+                "pass_probability",
+                "breach_probability"
+            ]
+        );
+        // Half the firm's 5% and 10%, and the rule's 0.6 and 0.1, as on main.
+        let limits: Vec<Option<f64>> = lines.iter().map(|c| c.limit).collect();
+        assert_eq!(limits, [Some(0.025), Some(0.05), Some(0.6), Some(0.1)]);
+        // good_prop's trailing drawdown is 0.20, over the 0.05 limit; the rest pass.
+        assert_eq!(not_passing(&lines), [("max_drawdown", Outcome::Fail)]);
+        // A second target cannot stand without the first: a firm without `profit_target` does
+        // not read.
+        let no_first = r#"{"daily_loss":0.05,"max_drawdown":0.1,"drawdown":"static",
+            "second_target":0.05}"#;
+        assert!(serde_json::from_str::<FirmLimits>(no_first).is_err());
+    }
+
+    #[test]
+    fn attempt_terms_read_with_their_defaults() {
+        let saved = r#"{"account_size":100000,"evaluation_fee":500,"profit_split":0.8,
+            "days_to_first_payout":14,"payout_interval_days":14,"min_payout":100,
+            "funded_horizon_days":180}"#;
+        let terms: AttemptTerms = serde_json::from_str(saved).unwrap();
+        assert_eq!(terms, attempt_terms());
+        assert_eq!(with_attempt(terms).validate(), Ok(()));
+    }
+
+    #[test]
+    fn each_new_field_out_of_range_is_refused_by_name() {
+        type Tweak = fn(&mut FirmLimits, &mut AttemptTerms);
+        let cases: [(&str, Tweak); 22] = [
+            ("firm.second_target", |f, _| f.second_target = Some(0.0)),
+            ("firm.second_target", |f, _| {
+                f.second_target = Some(f64::NAN)
+            }),
+            ("firm.best_day_share", |f, _| f.best_day_share = Some(0.0)),
+            ("firm.best_day_share", |f, _| f.best_day_share = Some(1.5)),
+            ("firm.trailing_floor_lock", |f, _| {
+                f.trailing_floor_lock = Some(-0.01)
+            }),
+            ("firm.trailing_floor_lock", |f, _| {
+                f.trailing_floor_lock = Some(f64::INFINITY)
+            }),
+            ("firm.trailing_floor_lock", |f, _| {
+                f.drawdown = DrawdownMode::Static;
+                f.trailing_floor_lock = Some(0.0);
+            }),
+            ("attempt.account_size", |_, t| t.account_size = 0.0),
+            ("attempt.evaluation_fee", |_, t| t.evaluation_fee = -1.0),
+            ("attempt.pass_fee", |_, t| t.pass_fee = f64::NAN),
+            ("attempt.profit_split", |_, t| t.profit_split = 0.0),
+            ("attempt.profit_split", |_, t| t.profit_split = 1.5),
+            ("attempt.min_payout", |_, t| t.min_payout = f64::INFINITY),
+            ("attempt.payout_cap", |_, t| t.payout_cap = Some(0.0)),
+            ("attempt.days_to_first_payout", |_, t| {
+                t.days_to_first_payout = 0
+            }),
+            ("attempt.payout_interval_days", |_, t| {
+                t.payout_interval_days = 0
+            }),
+            ("attempt.funded_horizon_days", |_, t| {
+                t.funded_horizon_days = 0
+            }),
+            ("attempt.max_payouts", |_, t| t.max_payouts = Some(0)),
+            ("attempt.evaluation_size", |_, t| t.evaluation_size = 0.0),
+            ("attempt.funded_size", |_, t| t.funded_size = f64::INFINITY),
+            ("attempt.reduced_edge_factor", |_, t| {
+                t.reduced_edge_factor = 1.5
+            }),
+            ("attempt.reduced_edge_factor", |_, t| {
+                t.reduced_edge_factor = f64::NAN
+            }),
+        ];
+        for (name, tweak) in cases {
+            let VerdictRule::PropFirm {
+                mut firm, limits, ..
+            } = prop(DrawdownMode::Trailing)
+            else {
+                unreachable!()
+            };
+            let mut terms = attempt_terms();
+            tweak(&mut firm, &mut terms);
+            let rule = VerdictRule::PropFirm {
+                firm,
+                limits,
+                attempt: Some(terms),
+            };
+            match rule.validate() {
+                Err(PlanError(message)) => assert!(message.contains(name), "{name}: {message}"),
+                Ok(()) => panic!("{name} was accepted: {rule:?}"),
+            }
+        }
+        // The edges of each range are allowed: a floor locked at the start, a best day of the
+        // whole profit, a full split, no fees, a factor of 0 or 1.
+        let mut terms = attempt_terms();
+        terms.profit_split = 1.0;
+        terms.evaluation_fee = 0.0;
+        for factor in [0.0, 1.0] {
+            terms.reduced_edge_factor = factor;
+            let VerdictRule::PropFirm {
+                mut firm, limits, ..
+            } = with_attempt(terms)
+            else {
+                unreachable!()
+            };
+            firm.trailing_floor_lock = Some(0.0);
+            firm.best_day_share = Some(1.0);
+            let rule = VerdictRule::PropFirm {
+                firm,
+                limits,
+                attempt: Some(terms),
+            };
+            assert_eq!(rule.validate(), Ok(()));
+        }
+    }
+
+    #[test]
+    fn the_attempt_value_line_needs_attempt_terms_and_a_value_above_zero() {
+        // Without attempt terms there is no fifth line, whatever the inputs hold.
+        let inputs = KindInputs {
+            attempt_value: Some(1_000.0),
+            ..good_prop()
+        };
+        let plain = evaluate(&prop(DrawdownMode::Static), &inputs);
+        assert!(!ids(&plain).contains(&"attempt_value"), "{plain:?}");
+        let rule = with_attempt(attempt_terms());
+        let line = |value| {
+            let lines = evaluate(
+                &rule,
+                &KindInputs {
+                    attempt_value: value,
+                    ..good_prop()
+                },
+            );
+            assert_eq!(lines.len(), 5);
+            lines[4].clone()
+        };
+        let pass = line(Some(0.01));
+        assert_eq!(pass.id, "attempt_value");
+        assert_eq!(
+            pass.name,
+            "Value of one attempt with the mean daily return scaled by 0.5"
+        );
+        assert_eq!((pass.limit, pass.unit), (Some(0.0), Unit::Quote));
+        assert_eq!(pass.outcome, Outcome::Pass);
+        for value in [Some(0.0), Some(-500.0), None] {
+            assert_eq!(line(value).outcome, Outcome::Fail, "{value:?}");
         }
     }
 }

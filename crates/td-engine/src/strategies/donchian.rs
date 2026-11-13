@@ -268,7 +268,12 @@ fn rule() -> VerdictRule {
             max_drawdown: 0.10,
             drawdown: DrawdownMode::Static,
             profit_target: 0.10,
+            second_target: None,
+            min_trading_days: 0,
+            best_day_share: None,
+            trailing_floor_lock: None,
         },
         limits: PropFirmLimits::default(),
+        attempt: None,
     }
 }

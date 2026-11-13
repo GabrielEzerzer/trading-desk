@@ -1,7 +1,7 @@
 //! Seeded resampling statistics for the test battery (#35): a block bootstrap of the mean
 //! (R7, and the expectancy check of the `high_risk` kind rule), a block bootstrap of the max
-//! drawdown (the `portfolio` kind rule), the risk of ruin, and the odds of passing or breaching a
-//! prop-firm challenge.
+//! drawdown (the `portfolio` kind rule), the risk of ruin, the odds of passing or breaching a
+//! prop-firm challenge, and the value of one attempt at it (#172).
 //!
 //! Every function takes plain slices, so it does not depend on how the caller builds its daily
 //! returns or trade list, and a seed: the same inputs and seed give bit-identical output on every
@@ -38,6 +38,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::rng::SplitMix64;
+use crate::verdict::AttemptTerms;
 
 /// Resamples, or paths, per call unless the caller sets another count. With 2,000 the standard
 /// error of an estimated probability is at most `sqrt(0.25 / 2000)`, about 1.1 percentage points,
@@ -396,18 +397,33 @@ pub enum DrawdownMode {
     Static,
     /// From the highest daily close so far, by the same amount: breached at
     /// `peak - max_drawdown * start`, the usual trailing rule, whose amount is set by the
-    /// starting balance.
+    /// starting balance. [`PropFirmSpec::trailing_lock`] stops the floor rising at a level.
     ///
-    /// shortcut: the floor keeps trailing above the starting balance; firms that stop it there
-    /// would need a cap.
+    /// shortcut: limits are checked at daily closes, so a floor that trails equity inside the
+    /// day is not modelled; add it once the walks read each day's high and low.
     Trailing,
 }
 
 /// A prop-firm challenge, in fractions of the starting balance.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct PropFirmSpec {
-    /// The profit target: passed once equity reaches `start * (1 + target)`.
+    /// The profit target: passed once equity reaches `start * (1 + target)`. With
+    /// `second_target`, the target of the first phase.
     pub target: f64,
+    /// The target of a second phase, which starts from a fresh balance on the day after the
+    /// first phase passes. `None` is a one-phase challenge.
+    pub second_target: Option<f64>,
+    /// The fewest days each phase runs before its target can pass it; 0 and 1 set no minimum.
+    ///
+    /// shortcut: every day of the series counts as a trading day, though a firm counts only days
+    /// with a trade; count those once the daily returns carry whether the day traded.
+    pub min_days: usize,
+    /// A phase passes only once its largest single day's profit is at most this share of the
+    /// phase's total profit. `None` sets no such rule.
+    pub best_day_share: Option<f64>,
+    /// For a trailing drawdown, the level the floor stops rising at, as a fraction of the start
+    /// above the start: the floor is at most `start * (1 + trailing_lock)`. `None` lets it trail.
+    pub trailing_lock: Option<f64>,
     /// The daily loss limit: breached when one day loses at least `daily_loss_limit * start`
     /// from the previous day's close. Infinity turns it off.
     pub daily_loss_limit: f64,
@@ -416,7 +432,7 @@ pub struct PropFirmSpec {
     pub drawdown: DrawdownMode,
     /// Days per path. The battery runs the paths once per horizon of the `prop_firm` rule: to its
     /// `pass_horizon_days` for the pass odds and its `breach_horizon_days` for the breach odds,
-    /// both 90 by default.
+    /// both 90 by default. Both phases of a two-phase challenge share it.
     pub horizon_days: usize,
     pub paths: usize,
     /// The mean block length; [`default_block_len`] of the number of returns is the default.
@@ -424,12 +440,64 @@ pub struct PropFirmSpec {
     pub seed: u64,
 }
 
+impl PropFirmSpec {
+    /// The floor on a day whose highest close before it is `peak`, the start included.
+    fn floor(&self, peak: f64) -> f64 {
+        match self.drawdown {
+            DrawdownMode::Static => 1.0 - self.max_drawdown,
+            DrawdownMode::Trailing => {
+                let trailing = peak - self.max_drawdown;
+                self.trailing_lock
+                    .map_or(trailing, |lock| trailing.min(1.0 + lock))
+            }
+        }
+    }
+
+    /// Whether a day that closed at `equity` after `prev` breached the daily loss limit or fell
+    /// to `floor`.
+    fn breached(&self, prev: f64, equity: f64, floor: f64) -> bool {
+        prev - equity >= self.daily_loss_limit || equity <= floor
+    }
+
+    fn check(&self) -> Result<(), StatsError> {
+        check_count(self.paths, self.mean_block)?;
+        let positive = |x: f64| x > 0.0; // false for NaN; infinity allowed
+        let target = |x: f64| positive(x) && x.is_finite();
+        if !(target(self.target) && self.second_target.is_none_or(target)) {
+            return Err(StatsError::InvalidSpec(
+                "the profit targets must be positive numbers",
+            ));
+        }
+        if !(positive(self.daily_loss_limit) && positive(self.max_drawdown)) {
+            return Err(StatsError::InvalidSpec(
+                "the loss limits must be positive (infinity turns one off)",
+            ));
+        }
+        if !self.best_day_share.is_none_or(|s| s > 0.0 && s <= 1.0) {
+            return Err(StatsError::InvalidSpec(
+                "the best-day share must be above 0 and at most 1",
+            ));
+        }
+        if !self.trailing_lock.is_none_or(|l| l >= 0.0 && l.is_finite()) {
+            return Err(StatsError::InvalidSpec(
+                "the trailing floor's lock must be a finite number of at least 0",
+            ));
+        }
+        if self.horizon_days == 0 {
+            return Err(StatsError::InvalidSpec(
+                "the horizon must be at least 1 day",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// The odds of a prop-firm challenge over simulated paths. The battery takes `pass` and `breach`
 /// from runs to their own horizons, and the same run when the horizons are equal.
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct PropFirmOdds {
-    /// The fraction of paths that reach the target within the horizon before breaching any
+    /// The fraction of paths that pass every phase within the horizon before breaching any
     /// limit. The `prop_firm` kind rule asks for at least 0.60.
     pub pass: f64,
     /// The fraction of paths that breach a limit within the horizon, trading on after reaching
@@ -439,52 +507,62 @@ pub struct PropFirmOdds {
     pub paths: usize,
 }
 
-/// What one path did: the day (counted from 1) it first reached the target and first breached a
-/// limit, if it did within the horizon.
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct PathOutcome {
-    target_day: Option<usize>,
-    breach_day: Option<usize>,
-}
-
-impl PathOutcome {
-    /// Reached the target before any breach.
-    fn passed(&self) -> bool {
-        match (self.target_day, self.breach_day) {
-            (Some(t), Some(b)) => t < b,
-            (target, _) => target.is_some(),
-        }
-    }
-}
-
-/// Walks one path of daily returns from a balance of 1, checking the limits before the target on
-/// each day. No day can do both from daily closes: a breach needs a losing day, and a losing day
-/// before the target is reached ends below it.
-fn walk_path(spec: &PropFirmSpec, returns: impl Iterator<Item = f64>) -> PathOutcome {
-    let target = 1.0 + spec.target;
-    let static_floor = 1.0 - spec.max_drawdown;
-    let mut out = PathOutcome {
-        target_day: None,
-        breach_day: None,
-    };
+/// Walks one path of daily returns on one balance from 1, trading on after the target as a
+/// funded account would, and returns the day (counted from 1) it first breached a limit, if it
+/// did within the horizon.
+fn walk_path(spec: &PropFirmSpec, returns: impl Iterator<Item = f64>) -> Option<usize> {
     let (mut equity, mut peak) = (1.0f64, 1.0f64);
     for (day, r) in (1..=spec.horizon_days).zip(returns) {
         let prev = equity;
         equity *= 1.0 + r;
-        let floor = match spec.drawdown {
-            DrawdownMode::Static => static_floor,
-            DrawdownMode::Trailing => peak - spec.max_drawdown,
-        };
+        let breached = spec.breached(prev, equity, spec.floor(peak));
         peak = peak.max(equity);
-        if prev - equity >= spec.daily_loss_limit || equity <= floor {
-            out.breach_day = Some(day);
-            return out;
-        }
-        if out.target_day.is_none() && equity >= target {
-            out.target_day = Some(day);
+        if breached {
+            return Some(day);
         }
     }
-    out
+    None
+}
+
+/// Walks the evaluation along one path: the first phase, then the second if the spec has one,
+/// each from a fresh balance of 1, with each day's return multiplied by `size`. Returns the day
+/// (counted from 1 along `returns`) the last phase passed, or `None` after a breach or once
+/// `returns` run out.
+///
+/// The limits are checked before the target each day. No day can do both from daily closes: a
+/// breach needs a losing day, and a losing day before the target is reached ends below it.
+///
+/// shortcut: the size depends only on the phase, not on the balance or the distance to the
+/// target or the floor (returns compound on the balance, as in [`walk_path`]); add a sizing
+/// plan once a plan needs one.
+fn walk_evaluation(spec: &PropFirmSpec, returns: &[f64], size: f64) -> Option<usize> {
+    let mut later = spec.second_target;
+    let mut target = spec.target;
+    let (mut equity, mut peak, mut best, mut phase_day) = (1.0f64, 1.0f64, 0.0f64, 0usize);
+    for (day, &r) in (1..).zip(returns) {
+        let prev = equity;
+        equity *= 1.0 + size * r;
+        phase_day += 1;
+        let breached = spec.breached(prev, equity, spec.floor(peak));
+        peak = peak.max(equity);
+        if breached {
+            return None;
+        }
+        best = best.max(equity - prev);
+        let consistent = spec
+            .best_day_share
+            .is_none_or(|share| best <= share * (equity - 1.0));
+        if equity >= 1.0 + target && phase_day >= spec.min_days && consistent {
+            match later.take() {
+                Some(next) => {
+                    target = next;
+                    (equity, peak, best, phase_day) = (1.0, 1.0, 0.0, 0);
+                }
+                None => return Some(day),
+            }
+        }
+    }
+    None
 }
 
 /// The odds of passing and of breaching a prop-firm challenge, from `paths` paths of
@@ -498,23 +576,7 @@ pub fn prop_firm_odds(
     spec: &PropFirmSpec,
 ) -> Result<PropFirmOdds, StatsError> {
     check_values(daily_returns)?;
-    check_count(spec.paths, spec.mean_block)?;
-    let positive = |x: f64| x > 0.0; // false for NaN; infinity allowed
-    if !(positive(spec.target) && spec.target.is_finite()) {
-        return Err(StatsError::InvalidSpec(
-            "the profit target must be a positive number",
-        ));
-    }
-    if !(positive(spec.daily_loss_limit) && positive(spec.max_drawdown)) {
-        return Err(StatsError::InvalidSpec(
-            "the loss limits must be positive (infinity turns one off)",
-        ));
-    }
-    if spec.horizon_days == 0 {
-        return Err(StatsError::InvalidSpec(
-            "the horizon must be at least 1 day",
-        ));
-    }
+    spec.check()?;
     let mut draw = Resampler::new(daily_returns.len(), spec.mean_block, spec.seed);
     let (mut passed, mut breached) = (0usize, 0usize);
     for _ in 0..spec.paths {
@@ -524,13 +586,205 @@ pub fn prop_firm_odds(
         let path: Vec<f64> = (0..spec.horizon_days)
             .map(|_| daily_returns[draw.next()])
             .collect();
-        let o = walk_path(spec, path.into_iter());
-        passed += usize::from(o.passed());
-        breached += usize::from(o.breach_day.is_some());
+        passed += usize::from(walk_evaluation(spec, &path, 1.0).is_some());
+        breached += usize::from(walk_path(spec, path.into_iter()).is_some());
     }
     Ok(PropFirmOdds {
         pass: passed as f64 / spec.paths as f64,
         breach: breached as f64 / spec.paths as f64,
+        paths: spec.paths,
+    })
+}
+
+// ---------------------------------------------------------------------------------------------
+// The value of a prop-firm attempt
+// ---------------------------------------------------------------------------------------------
+
+/// What one attempt is worth, from one series of daily returns.
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct AttemptFigures {
+    /// The fraction of attempts that pass the evaluation at the terms' evaluation size.
+    pub pass: f64,
+    /// The mean paid to the trader per funded account, after the split, in the account currency.
+    /// `None` when no attempt passed.
+    pub payouts_per_funded: Option<f64>,
+    /// The fraction of attempts that end with at least one payout.
+    pub payout_chance: f64,
+    /// The value of one attempt in the account currency: the mean over attempts of the payouts
+    /// received plus any refunded fee, less the fees paid.
+    pub value: f64,
+}
+
+/// The value of a prop-firm attempt at the edge the test shows and at a reduced one.
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct PropFirmAttempt {
+    /// From the daily returns as they are.
+    pub full: AttemptFigures,
+    /// From the daily returns with their mean scaled by `reduced_edge_factor` and their shape
+    /// unchanged. The `prop_firm` kind rule asks for its `value` to be above zero.
+    pub reduced: AttemptFigures,
+    pub reduced_edge_factor: f64,
+    pub paths: usize,
+}
+
+/// What one funded account did.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Funded {
+    /// The profit paid out, before the split, as a fraction of the starting balance.
+    gross: f64,
+    payouts: usize,
+    /// The balance the account ended on: at its breach, or at the horizon.
+    balance: f64,
+}
+
+/// Walks a funded account along `returns`, from a fresh balance of 1 under the challenge's loss
+/// limits, with each day's return multiplied by the terms' funded size. A payout is asked for at
+/// the close of every day the terms allow one, for all the profit above the starting balance up
+/// to the cap, and is made when the trader's share reaches the smallest payout. The amount
+/// leaves the balance and lowers the trailing floor's peak by as much, since a withdrawal is not
+/// a trading loss. The account ends at a breach or when `returns` run out.
+///
+/// shortcut: the funded account keeps the evaluation's loss limits; give it its own once a firm
+/// in a plan sets different ones.
+///
+/// shortcut: payouts are always asked for as early and as large as allowed, so with a floor
+/// locked at the starting balance an uncapped payout leaves the account on its floor, and its
+/// next day at or below the start ends it; add a payout plan once a plan needs to keep a buffer.
+fn walk_funded(spec: &PropFirmSpec, terms: &AttemptTerms, returns: &[f64]) -> Funded {
+    let first = terms.days_to_first_payout as usize;
+    let interval = terms.payout_interval_days as usize;
+    let most = terms.max_payouts.map_or(usize::MAX, |m| m as usize);
+    let mut out = Funded {
+        gross: 0.0,
+        payouts: 0,
+        balance: 1.0,
+    };
+    let (mut peak, mut locked, mut last) = (1.0f64, false, None::<usize>);
+    for (day, &r) in (1..).zip(returns) {
+        let prev = out.balance;
+        out.balance *= 1.0 + terms.funded_size * r;
+        let floor = if locked { 1.0 } else { spec.floor(peak) };
+        peak = peak.max(out.balance);
+        if spec.breached(prev, out.balance, floor) {
+            break;
+        }
+        let due = match last {
+            None => day >= first,
+            Some(last) => day - last >= interval,
+        };
+        if !due || out.payouts >= most {
+            continue;
+        }
+        let profit = out.balance - 1.0;
+        let amount = terms.payout_cap.map_or(profit, |cap| profit.min(cap));
+        if amount > 0.0 && terms.profit_split * amount * terms.account_size >= terms.min_payout {
+            out.balance -= amount;
+            peak -= amount;
+            out.gross += amount;
+            out.payouts += 1;
+            last = Some(day);
+            locked |= terms.payout_locks_floor;
+        }
+    }
+    out
+}
+
+/// One attempt along one path: the evaluation over the first `spec.horizon_days` returns, then,
+/// after a pass, the funded account over the `funded_horizon_days` returns from the day after.
+/// `returns` holds both horizons. `None` when the evaluation did not pass.
+fn walk_attempt(spec: &PropFirmSpec, terms: &AttemptTerms, returns: &[f64]) -> Option<Funded> {
+    let day = walk_evaluation(spec, &returns[..spec.horizon_days], terms.evaluation_size)?;
+    let funded = &returns[day..day + terms.funded_horizon_days as usize];
+    Some(walk_funded(spec, terms, funded))
+}
+
+/// Running sums over attempts, in the account currency.
+#[derive(Debug, Default)]
+struct Tally {
+    attempts: usize,
+    passed: usize,
+    paid_out: usize,
+    /// Paid to the trader, after the split.
+    payouts: f64,
+    value: f64,
+}
+
+impl Tally {
+    fn add(&mut self, terms: &AttemptTerms, attempt: Option<Funded>) {
+        self.attempts += 1;
+        let mut value = -terms.evaluation_fee;
+        if let Some(funded) = attempt {
+            self.passed += 1;
+            let paid = terms.profit_split * funded.gross * terms.account_size;
+            self.payouts += paid;
+            value += paid - terms.pass_fee;
+            if funded.payouts > 0 {
+                self.paid_out += 1;
+                if terms.refund_fee_with_first_payout {
+                    value += terms.evaluation_fee;
+                }
+            }
+        }
+        self.value += value;
+    }
+
+    fn figures(&self) -> AttemptFigures {
+        let n = self.attempts as f64;
+        AttemptFigures {
+            pass: self.passed as f64 / n,
+            payouts_per_funded: (self.passed > 0).then(|| self.payouts / self.passed as f64),
+            payout_chance: self.paid_out as f64 / n,
+            value: self.value / n,
+        }
+    }
+}
+
+/// The value of one attempt at a prop-firm challenge, over `spec.paths` paths drawn from
+/// `daily_returns` with the stationary bootstrap of [`prop_firm_odds`]: the evaluation under
+/// `spec` (to its `horizon_days`), then a funded account under `terms` after a pass.
+///
+/// The second set of figures subtracts `(1 - reduced_edge_factor) * mean` from every daily
+/// return before the size multiplier, so the mean becomes `reduced_edge_factor * mean` and the
+/// days keep their shape. Both sets use the same draws, so they differ by the edge alone.
+pub fn prop_firm_attempt(
+    daily_returns: &[f64],
+    spec: &PropFirmSpec,
+    terms: &AttemptTerms,
+) -> Result<PropFirmAttempt, StatsError> {
+    check_values(daily_returns)?;
+    spec.check()?;
+    if terms.validate().is_err() {
+        return Err(StatsError::InvalidSpec(
+            "the attempt terms are out of range",
+        ));
+    }
+    let n = daily_returns.len();
+    let mean = daily_returns.iter().sum::<f64>() / n as f64;
+    let shift = (1.0 - terms.reduced_edge_factor) * mean;
+    let reduced: Vec<f64> = daily_returns.iter().map(|r| r - shift).collect();
+    let days = spec.horizon_days + terms.funded_horizon_days as usize;
+    let mut draw = Resampler::new(n, spec.mean_block, spec.seed);
+    let (mut full, mut low) = (Tally::default(), Tally::default());
+    let mut path = Vec::with_capacity(days);
+    let mut returns = Vec::with_capacity(days);
+    for _ in 0..spec.paths {
+        draw.reset();
+        // Draw both horizons whatever happens on the path, so path k uses the same draws
+        // whatever the limits and the terms are.
+        path.clear();
+        path.extend((0..days).map(|_| draw.next()));
+        for (series, tally) in [(daily_returns, &mut full), (&reduced[..], &mut low)] {
+            returns.clear();
+            returns.extend(path.iter().map(|&i| series[i]));
+            tally.add(terms, walk_attempt(spec, terms, &returns));
+        }
+    }
+    Ok(PropFirmAttempt {
+        full: full.figures(),
+        reduced: low.figures(),
+        reduced_edge_factor: terms.reduced_edge_factor,
         paths: spec.paths,
     })
 }
@@ -856,6 +1110,10 @@ mod tests {
     fn challenge(horizon_days: usize) -> PropFirmSpec {
         PropFirmSpec {
             target: 0.10,
+            second_target: None,
+            min_days: 0,
+            best_day_share: None,
+            trailing_lock: None,
             daily_loss_limit: 0.05,
             max_drawdown: 0.10,
             drawdown: DrawdownMode::Static,
@@ -863,6 +1121,15 @@ mod tests {
             paths: 300,
             mean_block: 3,
             seed: 11,
+        }
+    }
+
+    /// A 10% target with both loss limits off.
+    fn unlimited(horizon_days: usize) -> PropFirmSpec {
+        PropFirmSpec {
+            daily_loss_limit: f64::INFINITY,
+            max_drawdown: f64::INFINITY,
+            ..challenge(horizon_days)
         }
     }
 
@@ -879,17 +1146,19 @@ mod tests {
         assert_eq!((odds.pass, odds.breach), (0.0, 1.0));
     }
 
-    fn walk(spec: &PropFirmSpec, path: &[f64]) -> PathOutcome {
+    /// The day `path` breaches on one balance.
+    fn walk(spec: &PropFirmSpec, path: &[f64]) -> Option<usize> {
         walk_path(spec, path.iter().copied())
+    }
+
+    /// The day `path` passes the evaluation at the size it was tested at.
+    fn passes(spec: &PropFirmSpec, path: &[f64]) -> Option<usize> {
+        walk_evaluation(spec, path, 1.0)
     }
 
     #[test]
     fn the_daily_loss_limit_and_both_drawdown_modes_break_where_worked_by_hand() {
-        let off = PropFirmSpec {
-            daily_loss_limit: f64::INFINITY,
-            max_drawdown: f64::INFINITY,
-            ..challenge(10)
-        };
+        let off = unlimited(10);
         // Daily loss: from 1.1, -4% loses 0.044 and -4.8% loses 0.0528, measured against a limit
         // of 0.05 of the starting balance. Against the day's opening equity, -4.8% would be under
         // a 5% limit and hold.
@@ -897,14 +1166,14 @@ mod tests {
             daily_loss_limit: 0.05,
             ..off
         };
-        assert_eq!(walk(&daily, &[0.1, -0.04]).breach_day, None);
-        assert_eq!(walk(&daily, &[0.1, -0.048]).breach_day, Some(2));
+        assert_eq!(walk(&daily, &[0.1, -0.04]), None);
+        assert_eq!(walk(&daily, &[0.1, -0.048]), Some(2));
         // A loss of exactly the limit breaches: 1 - 0.875 is 0.125, all exact in binary.
         let eighth = PropFirmSpec {
             daily_loss_limit: 0.125,
             ..off
         };
-        assert_eq!(walk(&eighth, &[-0.125]).breach_day, Some(1));
+        assert_eq!(walk(&eighth, &[-0.125]), Some(1));
         // 1.1 then -8%: 1.012. Static floor 0.9 holds; trailing floor 1.1 - 0.1 = 1.0 holds.
         // 1.1 then -10%: 0.99. Static holds; trailing breaches.
         let fixed = PropFirmSpec {
@@ -915,32 +1184,29 @@ mod tests {
             drawdown: DrawdownMode::Trailing,
             ..fixed
         };
-        assert_eq!(walk(&fixed, &[0.1, -0.08]).breach_day, None);
-        assert_eq!(walk(&trailing, &[0.1, -0.08]).breach_day, None);
-        assert_eq!(walk(&fixed, &[0.1, -0.1]).breach_day, None);
-        assert_eq!(walk(&trailing, &[0.1, -0.1]).breach_day, Some(2));
+        assert_eq!(walk(&fixed, &[0.1, -0.08]), None);
+        assert_eq!(walk(&trailing, &[0.1, -0.08]), None);
+        assert_eq!(walk(&fixed, &[0.1, -0.1]), None);
+        assert_eq!(walk(&trailing, &[0.1, -0.1]), Some(2));
         // Static: three days of -4% reach 0.8847, below 0.9, on day 3.
-        assert_eq!(walk(&fixed, &[-0.04, -0.04, -0.04]).breach_day, Some(3));
+        assert_eq!(walk(&fixed, &[-0.04, -0.04, -0.04]), Some(3));
         // Landing exactly on the static floor breaches: 1 - 0.25 is 0.75, exact in binary.
         let quarter = PropFirmSpec {
             max_drawdown: 0.25,
             ..off
         };
-        assert_eq!(walk(&quarter, &[-0.25]).breach_day, Some(1));
+        assert_eq!(walk(&quarter, &[-0.25]), Some(1));
         // The trailing floor sits max_drawdown of the starting balance below the peak, not a
         // fraction of the peak: from a peak of 1.2, -9% is 1.092, under 1.2 - 0.1 = 1.1 but
         // above 1.2 * 0.9 = 1.08.
-        assert_eq!(walk(&trailing, &[0.2, -0.09]).breach_day, Some(2));
+        assert_eq!(walk(&trailing, &[0.2, -0.09]), Some(2));
         // The path trades on after the target: day 1 reaches 1.1, day 2 breaches the trailing
-        // floor. That is a pass, because the target came first, and a breach.
-        let o = walk(&trailing, &[0.1, -0.1]);
-        assert_eq!(o.target_day, Some(1));
-        assert!(o.passed());
-        // Breaching on day 1 before reaching the target on day 2 would be no pass; a breach
-        // ends the walk, so the target is never seen.
-        let o = walk(&trailing, &[-0.15, 0.4]);
-        assert_eq!((o.breach_day, o.target_day), (Some(1), None));
-        assert!(!o.passed());
+        // floor. That is a pass on day 1, because the target came first, and a breach on day 2.
+        assert_eq!(passes(&trailing, &[0.1, -0.1]), Some(1));
+        assert_eq!(walk(&trailing, &[0.1, -0.1]), Some(2));
+        // Breaching on day 1 before reaching the target on day 2 is no pass.
+        assert_eq!(walk(&trailing, &[-0.15, 0.4]), Some(1));
+        assert_eq!(passes(&trailing, &[-0.15, 0.4]), None);
     }
 
     #[test]
@@ -952,7 +1218,8 @@ mod tests {
         assert_eq!(odds, again);
     }
 
-    /// 277 and 27 of 300 paths.
+    /// 277 and 27 of 300 paths, the values `main` gave before the new evaluation rules: a spec
+    /// with every new rule off is judged exactly as before.
     const PINNED_PROP: (f64, f64) = (277.0 / 300.0, 27.0 / 300.0);
 
     #[test]
@@ -963,11 +1230,27 @@ mod tests {
                 ..challenge(5)
             },
             PropFirmSpec {
+                second_target: Some(0.0),
+                ..challenge(5)
+            },
+            PropFirmSpec {
+                second_target: Some(f64::INFINITY),
+                ..challenge(5)
+            },
+            PropFirmSpec {
                 daily_loss_limit: -0.1,
                 ..challenge(5)
             },
             PropFirmSpec {
                 max_drawdown: f64::NAN,
+                ..challenge(5)
+            },
+            PropFirmSpec {
+                best_day_share: Some(1.5),
+                ..challenge(5)
+            },
+            PropFirmSpec {
+                trailing_lock: Some(-0.1),
                 ..challenge(5)
             },
             challenge(0),
@@ -981,6 +1264,467 @@ mod tests {
                 prop_firm_odds(&[0.01], &spec),
                 Err(StatsError::InvalidSpec(_))
             ));
+            assert!(matches!(
+                prop_firm_attempt(&[0.01], &spec, &terms()),
+                Err(StatsError::InvalidSpec(_))
+            ));
         }
+        let bad_terms = AttemptTerms {
+            profit_split: 0.0,
+            ..terms()
+        };
+        assert!(matches!(
+            prop_firm_attempt(&[0.01], &challenge(5), &bad_terms),
+            Err(StatsError::InvalidSpec(_))
+        ));
+        assert_eq!(
+            prop_firm_attempt(&[], &challenge(5), &terms()),
+            Err(StatsError::NoData)
+        );
+    }
+
+    #[test]
+    fn a_pass_counts_only_from_the_minimum_day() {
+        let min3 = PropFirmSpec {
+            min_days: 3,
+            max_drawdown: 0.10,
+            ..unlimited(10)
+        };
+        // Day 1 closes at 1.125, past the 1.10 target. With no minimum it passes on day 1; with a
+        // minimum of 3 days it passes on day 3, the minimum day itself, as the balance holds.
+        let early = [0.125, 0.0, 0.0, 0.0];
+        assert_eq!(passes(&unlimited(10), &early), Some(1));
+        assert_eq!(passes(&min3, &early), Some(3));
+        // Falling through the static floor before then is a breach, not a pass: day 2 closes at
+        // 1.125 * 0.75 = 0.84375, below the 0.9 floor.
+        assert_eq!(passes(&min3, &[0.125, -0.25, 0.5, 0.0]), None);
+        assert_eq!(walk(&min3, &[0.125, -0.25]), Some(2));
+    }
+
+    #[test]
+    fn the_best_day_rule_waits_until_later_profit_shrinks_the_big_day() {
+        let half = PropFirmSpec {
+            best_day_share: Some(0.5),
+            ..unlimited(10)
+        };
+        // Day 1 makes 0.125, the whole profit, so its share is 1, above 0.5. Every later day
+        // gains 1/32 of the balance, all exact in binary:
+        //   day 2: 1.125 * 33/32 = 1.16015625, profit 0.16015625, half 0.0801 < 0.125
+        //   day 3: * 33/32 = 1.1964111328125, profit 0.1964, half 0.0982 < 0.125
+        //   day 4: * 33/32 = 1.233798980712890625, profit 0.2338, half 0.1169 < 0.125
+        //   day 5: * 33/32 = 1.272355198860168457, profit 0.2724, half 0.1362 >= 0.125
+        // Each later day's gain is under 0.04, so day 1 stays the best day, and the pass comes on
+        // day 5. With no rule, day 1's 1.125 already passes the 1.10 target.
+        let path = [0.125, 0.03125, 0.03125, 0.03125, 0.03125, 0.03125];
+        assert_eq!(passes(&unlimited(10), &path), Some(1));
+        assert_eq!(passes(&half, &path), Some(5));
+        assert_eq!(passes(&half, &path[..4]), None);
+    }
+
+    #[test]
+    fn two_phases_need_both_targets_and_the_second_starts_from_a_fresh_balance() {
+        let two = PropFirmSpec {
+            second_target: Some(0.05),
+            max_drawdown: 0.10,
+            ..unlimited(10)
+        };
+        // Day 1 passes phase 1 at 1.125. Phase 2 starts at 1: day 2's +6.25% closes at 1.0625,
+        // past its 1.05 target.
+        assert_eq!(passes(&two, &[0.125, 0.0625]), Some(2));
+        // A pass needs both targets: phase 1 alone passes the one-phase challenge on day 1.
+        let flat = [0.125, 0.0, 0.0];
+        assert_eq!(passes(&unlimited(10), &flat), Some(1));
+        assert_eq!(passes(&two, &flat), None);
+        // Phase 2 counts from a fresh balance of 1, not from phase 1's 1.125: +3.125% closes at
+        // 1.03125, short of 1.05 (1.125 * 1.03125 = 1.16 would pass), and -12.5% closes at
+        // 0.875, through the 0.9 floor (1.125 * 0.875 = 0.984 would hold).
+        assert_eq!(passes(&two, &[0.125, 0.03125]), None);
+        assert_eq!(passes(&two, &[0.125, -0.125, 0.5]), None);
+        // A day can pass only one phase: the day that passes phase 1 does not count for phase 2.
+        assert_eq!(passes(&two, &[0.25]), None);
+    }
+
+    #[test]
+    fn a_locked_trailing_floor_rises_and_then_holds_at_its_level() {
+        let trailing = PropFirmSpec {
+            max_drawdown: 0.1,
+            drawdown: DrawdownMode::Trailing,
+            ..unlimited(10)
+        };
+        let at_start = PropFirmSpec {
+            trailing_lock: Some(0.0),
+            ..trailing
+        };
+        // The floor trails the peak by 0.1 until it reaches the start, then holds there.
+        assert_eq!(at_start.floor(1.0), 1.0 - 0.1);
+        assert!(close(at_start.floor(1.05), 0.95));
+        assert_eq!(at_start.floor(1.1), 1.0);
+        assert_eq!(at_start.floor(1.25), 1.0);
+        assert_eq!(trailing.floor(1.25), 1.25 - 0.1);
+        // Rising: from a peak of 1.05, -10% closes at 0.945, under the 0.95 floor.
+        assert_eq!(walk(&at_start, &[0.05, -0.1]), Some(2));
+        // Held: from a peak of 1.25, -12.5% closes at 1.09375. The floor trailing for ever is at
+        // 1.15 and breaches; locked at the start it is at 1.0 and holds, until a second -12.5%
+        // closes at 0.95703125.
+        assert_eq!(walk(&trailing, &[0.25, -0.125]), Some(2));
+        assert_eq!(walk(&at_start, &[0.25, -0.125]), None);
+        assert_eq!(walk(&at_start, &[0.25, -0.125, -0.125]), Some(3));
+        // Locked 5% above the start, the floor holds at 1.05: 1.09375 * 0.9375 = 1.025390625
+        // breaches it, though it is above the start.
+        let above = PropFirmSpec {
+            trailing_lock: Some(0.05),
+            ..trailing
+        };
+        assert_eq!(walk(&above, &[0.25, -0.125, -0.0625]), Some(3));
+        assert_eq!(walk(&at_start, &[0.25, -0.125, -0.0625]), None);
+    }
+
+    /// Neutral attempt terms: a payout a day from day 1, nothing capped, no fees but the
+    /// evaluation's, sizes as tested.
+    fn terms() -> AttemptTerms {
+        AttemptTerms {
+            account_size: 100_000.0,
+            evaluation_fee: 500.0,
+            pass_fee: 0.0,
+            refund_fee_with_first_payout: false,
+            profit_split: 0.75,
+            days_to_first_payout: 1,
+            payout_interval_days: 1,
+            min_payout: 0.0,
+            payout_cap: None,
+            max_payouts: None,
+            payout_locks_floor: false,
+            funded_horizon_days: 10,
+            evaluation_size: 1.0,
+            funded_size: 1.0,
+            reduced_edge_factor: 0.5,
+        }
+    }
+
+    /// Zero-mean daily returns of one fixed step `u`, drawn one at a time, under a static floor
+    /// with no daily limit.
+    ///
+    /// The returns compound, so after `a` steps up and `b` down the balance is
+    /// `(1 + u)^a (1 - u)^b`, whose log is `k u - (a + b) u^2 / 2` to second order, with
+    /// `k = a - b` the net steps. The target and the floor sit half a step off the lattice, at
+    /// `1 + 5.5 u` and `1 - 3.5 u`, so the drift of `u^2 / 2` per day cannot carry a lattice
+    /// point across either: with `u = 2^-10` it stays under `0.2 u` over 400 days. The walk
+    /// passes at `k = 6` and breaches at `k = -4`, and a symmetric walk from 0 between those
+    /// reaches 6 first with probability `room / (room + target) = 4 / 10 = 0.4`.
+    fn ruin_set_up() -> (Vec<f64>, PropFirmSpec, AttemptTerms) {
+        let u = 1.0 / 1024.0;
+        let spec = PropFirmSpec {
+            target: 5.5 * u,
+            max_drawdown: 3.5 * u,
+            // A walk between barriers 10 steps apart ends within 400 days except with a chance
+            // of about 0.951^400 (the largest eigenvalue of the walk, cos(pi / 10)), 2e-9.
+            horizon_days: 400,
+            paths: 20_000,
+            mean_block: 1,
+            seed: 172,
+            ..unlimited(400)
+        };
+        let terms = AttemptTerms {
+            funded_horizon_days: 1,
+            ..terms()
+        };
+        (vec![u, -u], spec, terms)
+    }
+
+    /// Four standard errors of a probability near 0.4 estimated from 20,000 paths:
+    /// `4 * sqrt(0.4 * 0.6 / 20000)` = 0.0139. A fixed seed makes the check deterministic; the
+    /// width says how far the estimate may sit from the exact 0.4 by chance alone.
+    const RUIN_TOLERANCE: f64 = 0.014;
+
+    #[test]
+    fn zero_mean_steps_pass_with_the_odds_of_the_gamblers_ruin() {
+        let (x, spec, terms) = ruin_set_up();
+        let a = prop_firm_attempt(&x, &spec, &terms).unwrap();
+        assert!((a.full.pass - 0.4).abs() < RUIN_TOLERANCE, "{a:?}");
+        // The series has a mean of exactly 0, so the reduced edge changes nothing.
+        assert_eq!(a.full.pass, a.reduced.pass);
+    }
+
+    #[test]
+    fn doubling_the_evaluation_size_doubles_each_days_return() {
+        // Doubled, each step is 2u and the levels at 5.5u and 3.5u sit between 4u and 6u and
+        // between 2u and 4u: the walk passes at 3 steps of 2u and breaches at 2, so the odds
+        // stay 2 / (2 + 3) = 0.4. The drift of (2u)^2 / 2 a day stays under the 0.5u margin for
+        // the first 256 days, which a walk between barriers 5 steps apart outlives with a chance
+        // of about cos(pi / 5)^256 = 0.809^256, 4e-24.
+        let (x, spec, terms) = ruin_set_up();
+        let doubled = AttemptTerms {
+            evaluation_size: 2.0,
+            ..terms
+        };
+        let a = prop_firm_attempt(&x, &spec, &doubled).unwrap();
+        assert!((a.full.pass - 0.4).abs() < RUIN_TOLERANCE, "{a:?}");
+        // On a constructed path the multiplier applies to every day: +1% a day reaches the 10%
+        // target on day 10 (1.01^9 = 1.0937, 1.01^10 = 1.1046), and +2% a day on day 5
+        // (1.02^4 = 1.0824, 1.02^5 = 1.1041).
+        let spec = unlimited(20);
+        assert_eq!(walk_evaluation(&spec, &[0.01; 20], 1.0), Some(10));
+        assert_eq!(walk_evaluation(&spec, &[0.01; 20], 2.0), Some(5));
+        // And to losses: -3% a day, doubled to -6%, breaches a 5% daily limit on day 1.
+        let daily = PropFirmSpec {
+            daily_loss_limit: 0.05,
+            ..spec
+        };
+        // At size 1, day 1's -3% holds and day 2's +25% closes at 0.97 * 1.25 = 1.2125, a pass.
+        let down = [-0.03, 0.25];
+        assert_eq!(walk_evaluation(&daily, &down, 1.0), Some(2));
+        assert_eq!(walk_evaluation(&daily, &down, 2.0), None);
+    }
+
+    fn funded(spec: &PropFirmSpec, terms: &AttemptTerms, path: &[f64]) -> Funded {
+        walk_funded(spec, terms, path)
+    }
+
+    #[test]
+    fn funded_payouts_follow_each_rule_to_the_cent() {
+        let floor_75 = PropFirmSpec {
+            max_drawdown: 0.25,
+            ..unlimited(10)
+        };
+        let rules = AttemptTerms {
+            days_to_first_payout: 3,
+            payout_interval_days: 2,
+            min_payout: 1_000.0,
+            payout_cap: Some(0.0625),
+            max_payouts: Some(3),
+            ..terms()
+        };
+        // Balances at each close, the floor at 0.75, all exact in binary:
+        //   day 1  +25%      1.25         before the first payout day
+        //   day 2   0        1.25         before the first payout day
+        //   day 3   0        1.25         first payout day: 0.25 of profit, capped at 0.0625
+        //                    1.1875
+        //   day 4   0        1.1875       1 day after the payout, under the 2-day interval
+        //   day 5   0        1.1875       2 days after: pays the cap again
+        //                    1.125
+        //   day 6  -10.9375% 1.001953125  (9/8 * 57/64 = 513/512), 1 day after the payout
+        //   day 7   0        1.001953125  due, but 0.75 of 1/512 of 100,000 is 146.48, under
+        //                                 the smallest payout of 1,000
+        //   day 8  +25%      1.25244140625 (513/512 * 5/4): pays the cap, the third payout
+        //                    1.18994140625
+        //   day 9   0        1 day after the payout
+        //   day 10  0        due again, but the account has made its 3 payouts
+        //   day 11 -50%      0.594970703125, through the floor: the account ends
+        //   day 12 +25%      never traded
+        let path = [
+            0.25, 0.0, 0.0, 0.0, 0.0, -0.109375, 0.0, 0.25, 0.0, 0.0, -0.5, 0.25,
+        ];
+        let f = funded(&floor_75, &rules, &path);
+        assert_eq!(f.payouts, 3);
+        assert_eq!(f.gross, 3.0 * 0.0625);
+        assert_eq!(f.balance, 0.594970703125);
+        // After the 75% split, on 100,000: 0.75 * 0.1875 * 100,000 = 14,062.50.
+        assert_eq!(rules.profit_split * f.gross * rules.account_size, 14_062.5);
+
+        // A payout locks the floor at the start: day 1 pays out the whole 0.25 of profit, which
+        // leaves 1.0, and day 2's -6.25% closes at 0.9375, through the locked floor of 1.0. The
+        // unlocked floor of 0.75 holds, and day 3's +25% (0.9375 * 1.25 = 1.171875) pays again.
+        let lock = AttemptTerms {
+            payout_locks_floor: true,
+            ..terms()
+        };
+        let path = [0.25, -0.0625, 0.25];
+        let locked = funded(&floor_75, &lock, &path);
+        assert_eq!(
+            (locked.payouts, locked.gross, locked.balance),
+            (1, 0.25, 0.9375)
+        );
+        let unlocked = funded(&floor_75, &terms(), &path);
+        assert_eq!(
+            (unlocked.payouts, unlocked.gross, unlocked.balance),
+            (2, 0.25 + 0.171875, 1.0)
+        );
+
+        // A payout lowers a trailing floor's peak by what it takes out: after day 1's payout the
+        // peak is 1.0 again, the floor 1.0 - 0.125 = 0.875, and 0.9375 holds. Had the peak stayed
+        // at 1.25 the floor would be 1.125 and the account would end on day 2.
+        let trailing = PropFirmSpec {
+            max_drawdown: 0.125,
+            drawdown: DrawdownMode::Trailing,
+            ..unlimited(10)
+        };
+        let t = funded(&trailing, &terms(), &path);
+        assert_eq!((t.payouts, t.gross, t.balance), (2, 0.25 + 0.171875, 1.0));
+    }
+
+    /// The figures of one attempt per path, from constructed paths.
+    fn figures(spec: &PropFirmSpec, terms: &AttemptTerms, paths: &[[f64; 4]]) -> AttemptFigures {
+        let mut tally = Tally::default();
+        for path in paths {
+            tally.add(terms, walk_attempt(spec, terms, path));
+        }
+        tally.figures()
+    }
+
+    #[test]
+    fn the_value_is_payouts_plus_any_refund_less_the_fees() {
+        // A 25% target over a 2-day evaluation, the floor at 0.75, then 2 funded days. Each path
+        // holds both horizons; after a pass on day 1 the funded days are the path's 2nd and 3rd.
+        let spec = PropFirmSpec {
+            target: 0.25,
+            max_drawdown: 0.25,
+            ..unlimited(2)
+        };
+        let fees = AttemptTerms {
+            pass_fee: 100.0,
+            funded_horizon_days: 2,
+            ..terms()
+        };
+        let paths = [
+            // Passes on day 1; funded: flat, then +50%, a payout of 0.5 of the balance.
+            [0.25, 0.0, 0.5, 0.0],
+            // Passes on day 1; funded: flat, then -50% through the floor, with no payout.
+            [0.25, 0.0, -0.5, 0.0],
+            // Breaches on day 1 and never passes.
+            [-0.5, 0.0, 0.0, 0.0],
+        ];
+        // Paid to the trader: 0.75 * 0.5 * 100,000 = 37,500, on the first path only.
+        // Without the refund: 37,500 - 500 - 100 = 36,900; -500 - 100 = -600; -500.
+        // Mean: (36,900 - 600 - 500) / 3 = 35,800 / 3.
+        let f = figures(&spec, &fees, &paths);
+        assert_eq!(f.value, 35_800.0 / 3.0);
+        assert_eq!(f.pass, 2.0 / 3.0);
+        assert_eq!(f.payouts_per_funded, Some(37_500.0 / 2.0));
+        assert_eq!(f.payout_chance, 1.0 / 3.0);
+        // With the refund, the first path also gets its 500 back: 37,400; the second made no
+        // payout and gets nothing back. Mean: (37,400 - 600 - 500) / 3 = 36,300 / 3.
+        let refund = AttemptTerms {
+            refund_fee_with_first_payout: true,
+            ..fees
+        };
+        assert_eq!(figures(&spec, &refund, &paths).value, 36_300.0 / 3.0);
+        // The passing fee falls on passes only: with no pass, every path pays the 500 alone.
+        let fail = figures(&spec, &fees, &[[-0.5, 0.0, 0.0, 0.0]; 3]);
+        assert_eq!(
+            (fail.value, fail.pass, fail.payouts_per_funded),
+            (-500.0, 0.0, None)
+        );
+    }
+
+    #[test]
+    fn with_zero_mean_returns_the_payouts_equal_the_losses_the_firm_absorbs() {
+        // Days drawn one at a time from a series of mean exactly 0 make the balance plus what has
+        // been paid out a martingale: each day multiplies the balance by 1 + r with E[r] = 0, a
+        // payout only moves money from the one to the other, and the account stops at a breach
+        // or the horizon. So E[gross payouts] = 1 - E[balance at the end], the balance where the
+        // account ended, breach or horizon.
+        let x: Vec<f64> = symmetric().iter().map(|r| r * 4.0).collect();
+        let spec = PropFirmSpec {
+            max_drawdown: 0.05,
+            ..unlimited(60)
+        };
+        let full_split = AttemptTerms {
+            profit_split: 1.0,
+            evaluation_fee: 0.0,
+            days_to_first_payout: 5,
+            payout_interval_days: 5,
+            funded_horizon_days: 60,
+            ..terms()
+        };
+        let paths = 20_000;
+        let mut draw = Resampler::new(x.len(), 1, 2026);
+        let (mut gross, mut absorbed, mut sum_sq) = (0.0, 0.0, 0.0);
+        for _ in 0..paths {
+            draw.reset();
+            let path: Vec<f64> = (0..60).map(|_| x[draw.next()]).collect();
+            let f = funded(&spec, &full_split, &path);
+            gross += f.gross;
+            absorbed += 1.0 - f.balance;
+            let gap = f.gross - (1.0 - f.balance);
+            sum_sq += gap * gap;
+        }
+        let (gross, absorbed) = (gross / paths as f64, absorbed / paths as f64);
+        // The standard error of the mean gap, from the paths' own spread.
+        let se =
+            (sum_sq / paths as f64 - (gross - absorbed).powi(2)).sqrt() / (paths as f64).sqrt();
+        // Payouts happen and losses are absorbed, so the check has something to balance.
+        assert!(gross > 0.005 && absorbed > 0.005, "{gross} {absorbed}");
+        // Within four standard errors, a chance of about 6e-5 of failing by luck alone.
+        assert!(
+            (gross - absorbed).abs() < 4.0 * se,
+            "{gross} {absorbed} {se}"
+        );
+    }
+
+    /// A series with a positive mean of about 0.002 a day and the spread of `symmetric() * 4`.
+    fn edged() -> Vec<f64> {
+        symmetric().iter().map(|r| r * 4.0 + 0.002).collect()
+    }
+
+    fn attempt_spec() -> PropFirmSpec {
+        PropFirmSpec {
+            target: 0.08,
+            max_drawdown: 0.08,
+            daily_loss_limit: 0.04,
+            paths: 500,
+            seed: 5,
+            ..challenge(60)
+        }
+    }
+
+    #[test]
+    fn a_factor_of_one_keeps_the_edge_and_a_factor_of_zero_removes_it() {
+        let x = edged();
+        let spec = attempt_spec();
+        let at = |factor| {
+            let terms = AttemptTerms {
+                reduced_edge_factor: factor,
+                funded_horizon_days: 60,
+                ..terms()
+            };
+            prop_firm_attempt(&x, &spec, &terms).unwrap()
+        };
+        // Subtracting (1 - 1) * mean is subtracting 0: the same numbers on the same draws.
+        let one = at(1.0);
+        assert_eq!(one.full, one.reduced);
+        // A factor of 0 subtracts the whole mean, which leaves symmetric() * 4 up to rounding in
+        // the last bits: the figures of that zero-mean series, on the same draws.
+        let zero = at(0.0);
+        let terms = AttemptTerms {
+            funded_horizon_days: 60,
+            ..terms()
+        };
+        let flat: Vec<f64> = symmetric().iter().map(|r| r * 4.0).collect();
+        let centred = prop_firm_attempt(&flat, &spec, &terms).unwrap().full;
+        assert_eq!(zero.full, one.full);
+        assert_eq!(zero.reduced.pass, centred.pass);
+        assert_eq!(zero.reduced.payout_chance, centred.payout_chance);
+        assert!(
+            (zero.reduced.value - centred.value).abs() < 1e-6,
+            "{zero:?} {centred:?}"
+        );
+        // The edge is worth something: without it an attempt passes less and is worth less.
+        assert!(zero.reduced.pass < zero.full.pass, "{zero:?}");
+        assert!(zero.reduced.value < zero.full.value, "{zero:?}");
+    }
+
+    #[test]
+    fn the_same_seed_gives_the_same_figures_and_paths_do_not_depend_on_earlier_limits() {
+        let x = edged();
+        let spec = attempt_spec();
+        let terms = AttemptTerms {
+            funded_horizon_days: 60,
+            ..terms()
+        };
+        let a = prop_firm_attempt(&x, &spec, &terms).unwrap();
+        assert_eq!(a, prop_firm_attempt(&x, &spec, &terms).unwrap());
+        let other = PropFirmSpec { seed: 6, ..spec };
+        assert_ne!(a.full, prop_firm_attempt(&x, &other, &terms).unwrap().full);
+        // Locking the floor after a payout ends funded accounts earlier. Every path still draws
+        // both horizons in full, so the next path's evaluation is the same and the pass odds do
+        // not move, while the payouts do.
+        let lock = AttemptTerms {
+            payout_locks_floor: true,
+            ..terms
+        };
+        let locked = prop_firm_attempt(&x, &spec, &lock).unwrap();
+        assert_eq!(locked.full.pass, a.full.pass);
+        assert_eq!(locked.reduced.pass, a.reduced.pass);
+        assert_ne!(locked.full.payouts_per_funded, a.full.payouts_per_funded);
     }
 }

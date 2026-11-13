@@ -1059,7 +1059,13 @@ export type RuleKind = "prop_firm" | "portfolio" | "high_risk";
  * What counts as tradable for one strategy: a kind with that strategy's limits. Each kind's
  * limits default to #35's; a strategy overrides a field by naming it.
  */
-export type VerdictRule = { "kind": "prop_firm", firm: FirmLimits, limits: PropFirmLimits, } | { "kind": "portfolio", benchmark: PortfolioBenchmark, limits: PortfolioLimits, } | { "kind": "high_risk", limits: HighRiskLimits, };
+export type VerdictRule = { "kind": "prop_firm", firm: FirmLimits, limits: PropFirmLimits, 
+/**
+ * What one attempt costs and what a funded account pays, so the battery can price an
+ * attempt in money and the kind gains its value line. `None`, and absent from a rule
+ * saved before the field existed, prices nothing.
+ */
+attempt: AttemptTerms | null, } | { "kind": "portfolio", benchmark: PortfolioBenchmark, limits: PortfolioLimits, } | { "kind": "high_risk", limits: HighRiskLimits, };
 
 /**
  * A prop firm's own rules. Losses and drawdowns are fractions of the starting balance.
@@ -1076,9 +1082,101 @@ daily_loss: number,
  */
 max_drawdown: number, drawdown: DrawdownMode, 
 /**
- * The profit that passes the challenge.
+ * The profit that passes the challenge, or its first phase when `second_target` is set.
  */
-profit_target: number, };
+profit_target: number, 
+/**
+ * The profit target of a second phase, which starts from a fresh balance on the day after
+ * the first phase passes. Both phases share the rule's `pass_horizon_days`. `None` is a
+ * one-phase challenge.
+ */
+second_target: number | null, 
+/**
+ * The fewest days each phase must run before its target can pass it. 0 sets no minimum.
+ */
+min_trading_days: number, 
+/**
+ * The best-day rule: a phase passes only once its largest single day's profit is at most
+ * this share of the phase's total profit. `None` sets no such rule.
+ */
+best_day_share: number | null, 
+/**
+ * For a trailing drawdown, the level the floor stops rising at, as a fraction of the starting
+ * balance above the start: 0 stops it at the starting balance. `None` lets it trail for ever.
+ */
+trailing_floor_lock: number | null, };
+
+/**
+ * The terms of one attempt at a prop-firm challenge: its fees, the funded account it leads to
+ * and the size traded in each. Money is in the account currency; fractions are of the starting
+ * balance. A firm's numbers are plan input; none are built in.
+ */
+export type AttemptTerms = { 
+/**
+ * The starting balance of the evaluation and of the funded account, which turns fractions
+ * into money.
+ */
+account_size: number, 
+/**
+ * The fee paid to start the evaluation.
+ */
+evaluation_fee: number, 
+/**
+ * A fee charged on passing the evaluation.
+ */
+pass_fee: number, 
+/**
+ * Whether the evaluation fee is paid back with the first payout.
+ */
+refund_fee_with_first_payout: boolean, 
+/**
+ * The trader's share of each payout's profit, above 0 and at most 1.
+ */
+profit_split: number, 
+/**
+ * The funded account's day, counted from 1, on whose close the first payout may be asked for.
+ */
+days_to_first_payout: number, 
+/**
+ * The days from one payout to the earliest next one.
+ */
+payout_interval_days: number, 
+/**
+ * The smallest payout the firm makes, after the split.
+ */
+min_payout: number, 
+/**
+ * The most profit one payout may count, as a fraction of the starting balance. `None` sets
+ * no cap.
+ */
+payout_cap: number | null, 
+/**
+ * The most payouts one funded account makes. `None` sets no limit.
+ */
+max_payouts: number | null, 
+/**
+ * Whether the first payout locks the floor at the starting balance for the rest of the
+ * account.
+ */
+payout_locks_floor: boolean, 
+/**
+ * Days the funded account is simulated for after a pass.
+ */
+funded_horizon_days: number, 
+/**
+ * The size traded in the evaluation, as a multiple of the size the strategy was tested at:
+ * each daily return is multiplied by it.
+ */
+evaluation_size: number, 
+/**
+ * The same for the funded account.
+ */
+funded_size: number, 
+/**
+ * The factor the mean daily return is scaled by for the second set of figures, between 0
+ * and 1: 0.5 asks what an attempt is worth if the edge is half what the test shows.
+ */
+reduced_edge_factor: number, };
 
 export type DrawdownMode = "static" | "trailing";
 
@@ -1324,6 +1422,12 @@ trade_bootstrap: MeanBootstrap | null,
  */
 prop_firm_odds: PropFirmOdds | null, 
 /**
+ * The value of one attempt, for a `prop_firm` rule with attempt terms: the evaluation to the
+ * rule's `pass_horizon_days`, then the funded account. `None` otherwise, and in a result
+ * saved before it existed.
+ */
+prop_firm_attempt: PropFirmAttempt | null, 
+/**
  * R8.
  */
 breakdown: Breakdown | null, 
@@ -1506,7 +1610,12 @@ pass_probability: number | null,
 /**
  * The chance of breaching a limit within the rule's horizon.
  */
-breach_probability: number | null, };
+breach_probability: number | null, 
+/**
+ * The value of one attempt in the account currency with the edge reduced by the rule's
+ * `reduced_edge_factor`, for a rule with attempt terms.
+ */
+attempt_value: number | null, };
 
 /**
  * The integrity checks read on the stitched walk-forward out-of-sample curve (I4 and I5),
@@ -1632,7 +1741,7 @@ export type Quantiles = { p05: number, p25: number, p50: number, p75: number, p9
  */
 export type PropFirmOdds = { 
 /**
- * The fraction of paths that reach the target within the horizon before breaching any
+ * The fraction of paths that pass every phase within the horizon before breaching any
  * limit. The `prop_firm` kind rule asks for at least 0.60.
  */
 pass: number, 
@@ -1642,6 +1751,43 @@ pass: number,
  * over 90 days.
  */
 breach: number, paths: number, };
+
+/**
+ * The value of a prop-firm attempt at the edge the test shows and at a reduced one.
+ */
+export type PropFirmAttempt = { 
+/**
+ * From the daily returns as they are.
+ */
+full: AttemptFigures, 
+/**
+ * From the daily returns with their mean scaled by `reduced_edge_factor` and their shape
+ * unchanged. The `prop_firm` kind rule asks for its `value` to be above zero.
+ */
+reduced: AttemptFigures, reduced_edge_factor: number, paths: number, };
+
+/**
+ * What one attempt is worth, from one series of daily returns.
+ */
+export type AttemptFigures = { 
+/**
+ * The fraction of attempts that pass the evaluation at the terms' evaluation size.
+ */
+pass: number, 
+/**
+ * The mean paid to the trader per funded account, after the split, in the account currency.
+ * `None` when no attempt passed.
+ */
+payouts_per_funded: number | null, 
+/**
+ * The fraction of attempts that end with at least one payout.
+ */
+payout_chance: number, 
+/**
+ * The value of one attempt in the account currency: the mean over attempts of the payouts
+ * received plus any refunded fee, less the fees paid.
+ */
+value: number, };
 
 /**
  * R8: where the out-of-sample profit came from. Reported only.
