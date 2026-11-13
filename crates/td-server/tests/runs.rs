@@ -73,12 +73,16 @@ enum Fill {
     /// Tries to delete the instrument, then writes as [`Fill::Minutes`] does; fails unless the
     /// delete was refused because the instrument is held.
     TriesDelete,
+    /// Waits until [`Filling::release`] is called, then writes as [`Fill::Minutes`] does.
+    Held,
 }
 
 /// A source for runs that download: it records each candle range asked of it.
 struct Filling {
     fill: Fill,
     asked: Mutex<Vec<(Millis, Millis)>>,
+    /// Whether a [`Fill::Held`] download may go on.
+    released: (Mutex<bool>, Condvar),
 }
 
 impl Filling {
@@ -86,7 +90,13 @@ impl Filling {
         Arc::new(Filling {
             fill,
             asked: Mutex::new(Vec::new()),
+            released: (Mutex::new(false), Condvar::new()),
         })
+    }
+
+    fn release(&self) {
+        *self.released.0.lock().unwrap() = true;
+        self.released.1.notify_all();
     }
 }
 
@@ -102,8 +112,14 @@ impl MarketSource for Filling {
         to: Millis,
     ) -> Result<DownloadReport, DataError> {
         self.asked.lock().unwrap().push((from, to));
+        if let Fill::Held = self.fill {
+            let (released, wake) = &self.released;
+            let guard = released.lock().unwrap();
+            // Bounded, so a test that never releases fails instead of hanging.
+            let _ = wake.wait_timeout_while(guard, WAIT, |r| !*r).unwrap();
+        }
         let candles: Vec<Candle> = match self.fill {
-            Fill::Minutes => minutes(40, 0..0)
+            Fill::Minutes | Fill::Held => minutes(40, 0..0)
                 .into_iter()
                 .filter(|c| (from..to).contains(&c.open_time))
                 .collect(),
@@ -1118,6 +1134,65 @@ async fn a_run_on_a_range_the_store_lacks_downloads_it_first_then_runs() {
         JobStatus::Done
     );
     assert_eq!(source.asked.lock().unwrap().len(), 1);
+}
+
+/// A run's download takes the instrument's one download: a second run on the same missing range
+/// waits for it instead of fetching the same days alongside it, then finds them stored, and a
+/// `/data/download` of the instrument meanwhile is refused as for any download in progress.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_runs_on_the_same_missing_range_fetch_it_once() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = Store::new(dir.path());
+    let id = instrument(InstrumentKind::Spot).id;
+    store.write_candles(&id, &minutes(3, 0..0)).expect("seeds");
+    let source = Filling::new(Fill::Held);
+    let t = TestServer::with_source(dir, store, source.clone()).await;
+    let body = serde_json::to_value(config(InstrumentKind::Spot, 5)).unwrap();
+    let first = t.start("/runs/backtest", &body).await;
+    let deadline = Instant::now() + WAIT;
+    while source.asked.lock().unwrap().is_empty() {
+        assert!(Instant::now() < deadline, "the first run never downloaded");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let download = json!({
+        "instrument": id,
+        "from": t0() + 3 * DAY,
+        "to": t0() + 5 * DAY,
+    });
+    let (status, refused) = t.post("/data/download", &download).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+    assert_eq!(refused["error"]["code"], "conflict");
+
+    // The second run gets as far as waiting, or (without the turn) as fetching, before the first
+    // download goes on.
+    let second = t.start("/runs/backtest", &body).await;
+    let deadline = Instant::now() + WAIT;
+    let message = loop {
+        let (_, state) = t.get(&format!("/jobs/{second}")).await;
+        let message = state["message"].as_str().unwrap_or_default().to_string();
+        if message.contains("download") {
+            break message;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the second run never got to the data: {state}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    assert_eq!(
+        message,
+        "waiting to download the data: binance:BTCUSDT:spot"
+    );
+    source.release();
+    for job in [first, second] {
+        assert_eq!(finished(&t, job).await["status"], "done");
+    }
+    assert_eq!(
+        *source.asked.lock().unwrap(),
+        [(t0() + 3 * DAY, t0() + 5 * DAY)],
+        "the missing days were fetched once"
+    );
 }
 
 /// With a data cutoff and nothing stored, a run ending after the cutoff is refused as past it

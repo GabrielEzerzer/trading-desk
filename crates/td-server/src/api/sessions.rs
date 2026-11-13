@@ -431,9 +431,29 @@ impl Sessions {
         done.map_err(ApiError::from)
     }
 
+    /// [`Sessions::manual`] on a blocking thread: the order's line is synced to disk under the
+    /// session's lock, which should hold up no async thread. A panic is passed on as if `act` had
+    /// run inline.
+    async fn manual_off_runtime(
+        self: &Arc<Self>,
+        id: &str,
+        act: impl FnOnce(&mut PaperSession) -> Result<PaperOrder, ManualError> + Send + 'static,
+    ) -> Result<PaperOrder, ApiError> {
+        let (sessions, id) = (Arc::clone(self), id.to_string());
+        match tokio::task::spawn_blocking(move || sessions.manual(&id, act)).await {
+            Ok(done) => done,
+            Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+            Err(e) => Err(ApiError::internal(format!("the order stopped: {e}"))),
+        }
+    }
+
     /// Places a manual order on a running session, accepted at the time the session's live
     /// source gives as the order is applied.
-    pub(crate) fn place(&self, id: &str, order: &ManualOrder) -> Result<PaperOrder, ApiError> {
+    pub(crate) async fn place(
+        self: &Arc<Self>,
+        id: &str,
+        order: ManualOrder,
+    ) -> Result<PaperOrder, ApiError> {
         // shortcut: the acceptance time is the local clock, assumed in step with the venue's.
         // A clock behind the venue by s seconds lets an order placed within s seconds after a bar
         // opened fill at that bar's open. Taking the newest in-progress kline time from the
@@ -445,12 +465,18 @@ impl Sessions {
         // bar; its checks on that bar (cash, holding, leverage) count the order. It cannot fill
         // there.
         let rest = self.streams.live().rest();
-        self.manual(id, |paper| paper.place(order, rest.now()))
+        self.manual_off_runtime(id, move |paper| paper.place(&order, rest.now()))
+            .await
     }
 
     /// Cancels a manual order on a running session.
-    pub(crate) fn cancel(&self, id: &str, order: OrderId) -> Result<PaperOrder, ApiError> {
-        self.manual(id, |paper| paper.cancel(order))
+    pub(crate) async fn cancel(
+        self: &Arc<Self>,
+        id: &str,
+        order: OrderId,
+    ) -> Result<PaperOrder, ApiError> {
+        self.manual_off_runtime(id, move |paper| paper.cancel(order))
+            .await
     }
 
     /// Stops every running session, for shutdown; none starts after this.
@@ -656,7 +682,7 @@ pub(super) async fn place_order(
     body: Result<Json<ManualOrder>, JsonRejection>,
 ) -> Result<(StatusCode, Json<PaperOrder>), ApiError> {
     let Json(order) = body?;
-    let placed = state.sessions.place(&id, &order)?;
+    let placed = state.sessions.place(&id, order).await?;
     Ok((StatusCode::CREATED, Json(placed)))
 }
 
@@ -667,7 +693,7 @@ pub(super) async fn cancel_order(
 ) -> Result<Json<PaperOrder>, ApiError> {
     let UrlPath((id, order)) =
         path.map_err(|_| ApiError::not_found("order ids are whole numbers"))?;
-    Ok(Json(state.sessions.cancel(&id, OrderId(order))?))
+    Ok(Json(state.sessions.cancel(&id, OrderId(order)).await?))
 }
 
 #[cfg(test)]
@@ -783,6 +809,61 @@ pub(crate) mod tests {
         }
         let refused = sessions.resume("s").await.expect_err("already running");
         assert_eq!(refused.body.code, "already_running");
+        sessions.stop_all().await;
+    }
+
+    /// A manual order's line is synced off the async thread: on this single-threaded runtime, a
+    /// sync made inline would run on the test's own thread, where it is set to fail.
+    #[tokio::test]
+    async fn a_manual_order_is_synced_off_the_async_thread() {
+        let (_dir, sessions) = one_session();
+        let now = Nowhere.now();
+        {
+            let entries = sessions.entries();
+            let mut paper = lock(&entries["s"].session);
+            let bar = Candle {
+                open_time: now - 60_000,
+                open: 100.0,
+                high: 100.0,
+                low: 100.0,
+                close: 100.0,
+                volume: 1.0,
+                quote_volume: 100.0,
+            };
+            paper.feed(bar, Vec::new(), false).expect("a live bar");
+        }
+        // A run that is going, so the session takes orders.
+        let (stop, stopped) = oneshot::channel();
+        let supervisor = tokio::spawn(async move {
+            let _ = stopped.await;
+        });
+        let (_running_tx, running) = watch::channel(false);
+        sessions.entries().get_mut("s").expect("loaded").run = Some(Run {
+            generation: u64::MAX,
+            stop,
+            supervisor,
+            ended: running,
+        });
+        let order = ManualOrder {
+            side: td_core::Side::Buy,
+            qty: 1.0,
+            order_type: crate::ManualOrderType::Limit,
+            limit_price: Some(50.0),
+            reduce_only: None,
+        };
+
+        crate::paper::FAIL_SYNC.set(true);
+        let placed = sessions.place("s", order).await;
+        let cancelled = match &placed {
+            Ok(order) => Some(sessions.cancel("s", order.order.id).await),
+            Err(_) => None,
+        };
+        crate::paper::FAIL_SYNC.set(false);
+        let placed = placed.expect("placed, synced on a blocking thread");
+        cancelled
+            .expect("placed")
+            .expect("cancelled, synced on a blocking thread");
+        assert_eq!(placed.source, crate::OrderSource::Manual);
         sessions.stop_all().await;
     }
 
