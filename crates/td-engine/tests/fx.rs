@@ -9,7 +9,7 @@ use td_core::{
     Candle, FeeSchedule, Instrument, InstrumentId, InstrumentKind, Millis, OrderRequest, OrderType,
     Side, Timeframe, Venue,
 };
-use td_engine::{Context, EngineError, Session, SessionConfig, Strategy};
+use td_engine::{Context, EngineError, OrderStatus, Session, SessionConfig, Strategy};
 
 /// USD/JPY: tick 0.001, lot 1, no fees.
 fn usdjpy() -> Instrument {
@@ -95,6 +95,15 @@ fn limit(side: Side, qty: f64, price: f64) -> OrderRequest {
 
 fn stop(side: Side, qty: f64, trigger: f64) -> OrderRequest {
     req(&usdjpy(), side, qty, OrderType::Stop { trigger })
+}
+
+fn stop_limit(side: Side, qty: f64, trigger: f64, price: f64) -> OrderRequest {
+    req(
+        &usdjpy(),
+        side,
+        qty,
+        OrderType::StopLimit { trigger, price },
+    )
 }
 
 /// Runs `plan` on FX over `(bid, ask)` one-minute bars.
@@ -585,6 +594,97 @@ fn a_buy_limit_between_the_bid_and_the_ask_close_rests_on_the_ask() {
     assert_eq!(fills(&s), [(Side::Buy, 150.010, 1000.0)]);
     assert_eq!(s.fills()[0].liquidity, td_core::Liquidity::Maker);
     assert_eq!(s.orders()[0].decision_close, 150.020);
+}
+
+#[test]
+fn a_buy_stop_limit_triggers_and_fills_on_the_ask() {
+    // A buy stop-limit, trigger 150.300 and limit 150.320, sent at bar 0's close. Bar 1 has a
+    // 0.040 spread: the ask high 150.330 reaches the trigger while the bid high 150.290 does not.
+    // The ask opened at 150.040, below the trigger, so it triggers at 150.300, inside its limit,
+    // and fills there as a taker. Read on the bid it would not have triggered.
+    let s = run_fx(
+        vec![(
+            0,
+            Send::Plain(stop_limit(Side::Buy, 1000.0, 150.300, 150.320)),
+        )],
+        &[
+            DECIDE,
+            (
+                [150.000, 150.290, 149.900, 150.100],
+                [150.040, 150.330, 149.940, 150.140],
+            ),
+        ],
+    );
+    assert_eq!(fills(&s), [(Side::Buy, 150.300, 1000.0)]);
+    assert_eq!(s.fills()[0].time, MIN);
+    assert_eq!(s.fills()[0].liquidity, td_core::Liquidity::Taker);
+}
+
+#[test]
+fn a_sell_stop_limit_triggered_past_its_limit_rests_on_the_bid() {
+    // A sell stop-limit, trigger 149.800 and limit 149.850, sent at bar 0's close. Bars 1 to 3
+    // have a 0.030 spread. Bar 1's bid opens at 149.700, through the trigger and below the limit,
+    // so it triggers but cannot fill and rests as a sell limit at 149.850. Bar 2: the ask high
+    // 149.870 is over the limit but the bid high 149.840 is not, and a sell reads the bid, so it
+    // still rests. Bar 3: the bid high 149.860 reaches the limit, and it fills there as a maker.
+    let s = run_fx(
+        vec![(
+            0,
+            Send::Plain(stop_limit(Side::Sell, 1000.0, 149.800, 149.850)),
+        )],
+        &[
+            DECIDE,
+            (
+                [149.700, 149.750, 149.650, 149.700],
+                [149.730, 149.780, 149.680, 149.730],
+            ),
+            (
+                [149.700, 149.840, 149.650, 149.800],
+                [149.730, 149.870, 149.680, 149.830],
+            ),
+            (
+                [149.800, 149.860, 149.750, 149.800],
+                [149.830, 149.890, 149.780, 149.830],
+            ),
+        ],
+    );
+    assert_eq!(fills(&s), [(Side::Sell, 149.850, 1000.0)]);
+    assert_eq!(s.fills()[0].time, 3 * MIN);
+    assert_eq!(s.fills()[0].liquidity, td_core::Liquidity::Maker);
+}
+
+#[test]
+fn an_ioc_order_takes_its_sides_open_or_is_cancelled() {
+    // Three IOC orders sent at bar 0's close; bar 1 opens at bid 150.000, ask 150.020.
+    // - A buy limit at 150.030 is marketable at the ask open and fills there, at 150.020, as a
+    //   taker. Read on the bid it would have filled at 150.000.
+    // - A sell limit at 150.010 is not marketable at the bid open, 150.000, so it is cancelled,
+    //   although the ask open and the bid high are over it: an IOC sees only its side's open.
+    // - A market sell fills at the bid open, 150.000.
+    let s = run_fx(
+        vec![
+            (0, Send::Plain(ioc(limit(Side::Buy, 1000.0, 150.030)))),
+            (0, Send::Plain(ioc(limit(Side::Sell, 1000.0, 150.010)))),
+            (0, Send::Plain(ioc(market(Side::Sell, 1000.0)))),
+        ],
+        &[
+            DECIDE,
+            (
+                [150.000, 150.100, 149.900, 150.050],
+                [150.020, 150.120, 149.920, 150.070],
+            ),
+        ],
+    );
+    assert_eq!(
+        fills(&s),
+        [(Side::Buy, 150.020, 1000.0), (Side::Sell, 150.000, 1000.0)]
+    );
+    assert!(
+        s.fills()
+            .iter()
+            .all(|f| f.time == MIN && f.liquidity == td_core::Liquidity::Taker)
+    );
+    assert!(matches!(s.orders()[1].status, OrderStatus::Cancelled(_)));
 }
 
 #[test]
