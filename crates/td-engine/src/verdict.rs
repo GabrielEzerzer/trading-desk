@@ -89,11 +89,22 @@ pub struct PropFirmLimits {
     /// The worst daily loss and the max drawdown, measured inside bars, must stay within this
     /// share of the firm's limits.
     pub share_of_firm_limits: f64,
-    /// The chance of reaching the profit target before breaching a limit must be at least this.
+    /// The chance of reaching the profit target within `pass_horizon_days`, before breaching a
+    /// limit, must be at least this.
     pub min_pass_probability: f64,
+    /// Days a simulated challenge runs for the pass odds: a path that has not reached the target
+    /// by then counts as not passed. 90 by default, a quarter; a plan for a challenge with no time
+    /// limit sets how long it is willing to run one. A rule saved before the field existed reads
+    /// as 90, the horizon it was judged on.
+    #[serde(default = "default_pass_horizon_days")]
+    pub pass_horizon_days: u32,
     /// The chance of breaching a limit within `breach_horizon_days` must be at most this.
     pub max_breach_probability: f64,
     pub breach_horizon_days: u32,
+}
+
+fn default_pass_horizon_days() -> u32 {
+    90
 }
 
 impl Default for PropFirmLimits {
@@ -101,6 +112,7 @@ impl Default for PropFirmLimits {
         PropFirmLimits {
             share_of_firm_limits: 0.5,
             min_pass_probability: 0.6,
+            pass_horizon_days: default_pass_horizon_days(),
             max_breach_probability: 0.1,
             breach_horizon_days: 90,
         }
@@ -217,10 +229,13 @@ impl VerdictRule {
                     "limits.max_breach_probability",
                     limits.max_breach_probability,
                 )?;
-                if limits.breach_horizon_days == 0 {
-                    return Err(PlanError(
-                        "limits.breach_horizon_days must be at least 1".into(),
-                    ));
+                for (name, days) in [
+                    ("pass_horizon_days", limits.pass_horizon_days),
+                    ("breach_horizon_days", limits.breach_horizon_days),
+                ] {
+                    if days == 0 {
+                        return Err(PlanError(format!("limits.{name} must be at least 1")));
+                    }
                 }
             }
             VerdictRule::Portfolio { limits, .. } => {
@@ -741,7 +756,10 @@ pub fn evaluate(rule: &VerdictRule, x: &KindInputs) -> Vec<Criterion> {
                 ),
                 line(
                     "pass_probability",
-                    "Chance of passing the challenge",
+                    &format!(
+                        "Chance of passing the challenge within {} days",
+                        limits.pass_horizon_days
+                    ),
                     x.pass_probability,
                     AtLeast,
                     limits.min_pass_probability,
@@ -911,11 +929,13 @@ pub struct EvidenceInputs {
     pub windows: usize,
     /// R3: the luck test's p. `None` when it was cancelled or not run.
     pub luck_p: Option<f64>,
-    /// R4: the out-of-sample return with fees and slippage multiplied by the cost stress.
+    /// R4: the out-of-sample return with fees, the per-unit commission, slippage and on a market
+    /// with quotes each bar's spread multiplied by the cost stress.
     pub stressed_return: Option<f64>,
-    /// R5: the neighbours' median objective over the best set's.
+    /// R5: the neighbours' median objective over R1's, both out of sample
+    /// ([`crate::PlateauReport`]).
     pub plateau_median_ratio: Option<f64>,
-    /// R5: the share of neighbours with a positive return.
+    /// R5: the share of neighbours with a positive out-of-sample return.
     pub plateau_positive_share: Option<f64>,
     /// R6: how many start offsets gave a result of the same sign as the main run.
     pub start_offsets_same_sign: usize,
@@ -1102,6 +1122,10 @@ pub struct Verdict {
     pub state: VerdictState,
     /// Every line of every layer that was judged, integrity first.
     pub criteria: Vec<Criterion>,
+    /// Costs the runs behind the verdict leave out, each named, so a verdict that rests on one is
+    /// visible. They do not change the state. Empty in a verdict saved before warnings existed.
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 impl Verdict {
@@ -1110,6 +1134,7 @@ impl Verdict {
             instrument,
             state: combine(&criteria),
             criteria,
+            warnings: Vec::new(),
         }
     }
 }
@@ -1656,6 +1681,13 @@ mod tests {
                 firm,
                 limits: PropFirmLimits {
                     breach_horizon_days: 0,
+                    ..PropFirmLimits::default()
+                },
+            },
+            VerdictRule::PropFirm {
+                firm,
+                limits: PropFirmLimits {
+                    pass_horizon_days: 0,
                     ..PropFirmLimits::default()
                 },
             },

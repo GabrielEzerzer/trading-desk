@@ -45,7 +45,7 @@ pub fn default_slippage_bps(instrument: &Instrument) -> f64 {
 /// fixture does not mean the behaviour is unchanged. A change that moves a result also moves
 /// td-bench's checksums, which leave the revision out: update `harness/evals/perf-checksums.txt`
 /// in the same change.
-pub const ENGINE_REVISION: u32 = 5;
+pub const ENGINE_REVISION: u32 = 6;
 
 /// Everything that defines a backtest apart from the data itself.
 ///

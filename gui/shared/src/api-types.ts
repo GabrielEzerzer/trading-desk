@@ -945,7 +945,13 @@ slippage: Array<SlippageOverride>,
  * [`BacktestConfig::account_currency`]: the quote currency, the default, or the base
  * currency, as a dollar account trading USD/JPY. Left out of JSON when it is the default.
  */
-account_currency?: AccountCurrency, };
+account_currency?: AccountCurrency, 
+/**
+ * Fees every run of the plan pays in place of each instrument's own, as in
+ * [`BacktestConfig::fee_override`]: a broker's commission per unit of an FX pair, for
+ * example. Left out of JSON when it is not set, the default.
+ */
+fee_override?: FeeSchedule | null, };
 
 /**
  * One instrument's slippage, overriding the backtest config's default for it.
@@ -988,7 +994,8 @@ export type WalkForwardPlan = { train_days: number, test_days: number, };
  */
 export type EvidenceSettings = { min_sample: MinSample, luck: LuckTest, 
 /**
- * R4: fees and slippage are multiplied by this, and the strategy must stay profitable.
+ * R4: fees (the per-unit commission too), slippage and on a market with quotes each bar's
+ * spread are multiplied by this, and the strategy must stay profitable.
  */
 cost_stress: number, plateau: Plateau, 
 /**
@@ -1032,11 +1039,13 @@ pass_p: number,
 inconclusive_p: number, };
 
 /**
- * R5: how the best parameter set's neighbours on the grid must do.
+ * R5: how the neighbours on the grid of the sets the walk-forward chose must do on its test
+ * windows ([`crate::PlateauReport`]).
  */
 export type Plateau = { 
 /**
- * The neighbours' median objective over the best set's must be at least this.
+ * The median over the neighbours of each one's objective over the chosen sets' on the same
+ * windows must be at least this.
  */
 min_median_ratio: number, 
 /**
@@ -1080,9 +1089,17 @@ export type PropFirmLimits = {
  */
 share_of_firm_limits: number, 
 /**
- * The chance of reaching the profit target before breaching a limit must be at least this.
+ * The chance of reaching the profit target within `pass_horizon_days`, before breaching a
+ * limit, must be at least this.
  */
 min_pass_probability: number, 
+/**
+ * Days a simulated challenge runs for the pass odds: a path that has not reached the target
+ * by then counts as not passed. 90 by default, a quarter; a plan for a challenge with no time
+ * limit sets how long it is willing to run one. A rule saved before the field existed reads
+ * as 90, the horizon it was judged on.
+ */
+pass_horizon_days: number, 
 /**
  * The chance of breaching a limit within `breach_horizon_days` must be at most this.
  */
@@ -1203,7 +1220,12 @@ export type Verdict = { instrument: InstrumentId, state: VerdictState,
 /**
  * Every line of every layer that was judged, integrity first.
  */
-criteria: Array<Criterion>, };
+criteria: Array<Criterion>, 
+/**
+ * Costs the runs behind the verdict leave out, each named, so a verdict that rests on one is
+ * visible. They do not change the state. Empty in a verdict saved before warnings existed.
+ */
+warnings: Array<string>, };
 
 /**
  * One instrument's test battery (#35) under a strategy's plan, as saved: what was tested, the
@@ -1261,7 +1283,8 @@ evidence: EvidenceInputs,
  */
 kind: KindInputs, oos_integrity: OosIntegrityInputs, 
 /**
- * R5's neighbours of the best parameter set on the grid.
+ * R5: the walk-forward's chosen sets against their grid neighbours, out of sample. `None`
+ * without a walk-forward.
  */
 plateau: PlateauReport | null, 
 /**
@@ -1278,7 +1301,8 @@ drawdown_bootstrap: DrawdownBootstrap | null,
  */
 trade_bootstrap: MeanBootstrap | null, 
 /**
- * The prop-firm challenge odds, for a `prop_firm` rule.
+ * The prop-firm challenge odds, for a `prop_firm` rule: passing within the rule's
+ * `pass_horizon_days`, breaching within its `breach_horizon_days`.
  */
 prop_firm_odds: PropFirmOdds | null, 
 /**
@@ -1375,15 +1399,17 @@ windows: number,
  */
 luck_p: number | null, 
 /**
- * R4: the out-of-sample return with fees and slippage multiplied by the cost stress.
+ * R4: the out-of-sample return with fees, the per-unit commission, slippage and on a market
+ * with quotes each bar's spread multiplied by the cost stress.
  */
 stressed_return: number | null, 
 /**
- * R5: the neighbours' median objective over the best set's.
+ * R5: the neighbours' median objective over R1's, both out of sample
+ * ([`crate::PlateauReport`]).
  */
 plateau_median_ratio: number | null, 
 /**
- * R5: the share of neighbours with a positive return.
+ * R5: the share of neighbours with a positive out-of-sample return.
  */
 plateau_positive_share: number | null, 
 /**
@@ -1490,18 +1516,54 @@ lowest_equity: number | null,
 curve: boolean, };
 
 /**
- * R5: the best parameter set and its neighbours on the grid.
+ * R5, out of sample: the walk-forward's chosen parameter sets against their neighbours on the
+ * grid. A neighbour is a direction on the grid, a step of -1, 0 or 1 on each axis (not all 0).
+ * In each window it is the set that window chose moved one step that way, run on the window's
+ * test bars as its chosen set was (warmed up on the train bars, closed out at the end). Each
+ * direction is judged only on the windows where its set ran: a window where it is off the grid
+ * or the strategy refuses it is left out, never filled with the chosen set's own run, which would
+ * pull the direction towards R1. Its runs are stitched as R1's curve is, and so are the chosen
+ * sets' own runs in the same windows, its reference. A direction that ran in no window is left
+ * out.
+ *
+ * The ratio is the median over the directions of each one's objective against its reference: the
+ * objective over the reference with `Maximize`, for a direction whose reference is above zero,
+ * and the reference over the objective with `Minimize`, so a ratio below 1 is worse either way.
+ * A direction with an undefined objective has the worst ratio (minus infinity with `Maximize`, 0
+ * with `Minimize`); one whose reference is undefined, or at or below zero with `Maximize`, has
+ * none and is left out of the median. The share is the directions whose stitched return is
+ * above zero.
+ *
+ * A result saved before R5 moved out of sample reads with `directions` empty and its ratio and
+ * share as they were judged then, on the full-period sweep.
  */
 export type PlateauReport = { 
 /**
- * The best row's grid coordinates.
+ * R1's stitched objective; `None` when it is undefined.
  */
-best: Array<number>, best_objective: number, 
+best_objective: number | null, directions: Array<PlateauDirection>, median_ratio: number | null, positive_share: number | null, };
+
 /**
- * The neighbours' grid coordinates and objective values, `None` where the objective is
- * undefined (it counts as the worst value).
+ * One of R5's neighbours, stitched over the windows.
  */
-neighbours: Array<[Array<number>, number | null]>, median_ratio: number | null, positive_share: number | null, };
+export type PlateauDirection = { 
+/**
+ * The step on each axis of the grid, in the order of the plan's axes.
+ */
+steps: Array<number>, 
+/**
+ * The windows in which the stepped set ran, the only ones it is judged on.
+ */
+windows: number, 
+/**
+ * The stitched objective; `None` when it is undefined.
+ */
+objective: number | null, total_return: number | null, 
+/**
+ * The chosen sets' own runs in the same windows, stitched the same way: their objective.
+ * `None` when it is undefined, or in a result saved before directions had it.
+ */
+reference: number | null, };
 
 /**
  * The distribution of a sample's mean under resampling.
@@ -1547,7 +1609,8 @@ p95: number, resamples: number, mean_block: number, };
 export type Quantiles = { p05: number, p25: number, p50: number, p75: number, p95: number, };
 
 /**
- * The odds of a prop-firm challenge over simulated paths.
+ * The odds of a prop-firm challenge over simulated paths. The battery takes `pass` and `breach`
+ * from runs to their own horizons, and the same run when the horizons are equal.
  */
 export type PropFirmOdds = { 
 /**
@@ -1605,7 +1668,12 @@ export type RegimeResult = { windows: number, strategy_return: number, };
 /**
  * R4: each test window's chosen parameters run again at higher costs.
  */
-export type CostStress = { multiplier: number, 
+export type CostStress = { 
+/**
+ * The fees, the per-unit commission, slippage and, on a market with quotes, each bar's spread
+ * are multiplied by this.
+ */
+multiplier: number, 
 /**
  * Each window's return at the stressed costs.
  */
