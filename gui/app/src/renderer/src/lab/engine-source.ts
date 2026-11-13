@@ -5,7 +5,8 @@
 import { ApiError } from '@td/shared'
 import type { BacktestConfig, InstrumentId, JobInfo, Params, StrategyInfo, Venue } from '@td/shared'
 import { api } from '../api'
-import { datasetRange, instrumentKey, latestRuns, toFinished, toVerdict } from './runs'
+import { formatCutoff } from './format'
+import { cutoffEnd, datasetRange, instrumentKey, latestRuns, toFinished, toVerdict } from './runs'
 import { type LabJob, type LabSource, RunCancelled, readableName } from './source'
 
 // shortcut: one backtest on defaults until #32 gives each strategy its plan. The money settings
@@ -125,6 +126,10 @@ export const engineLabSource: LabSource = {
   defaultInstrument: DEFAULT_INSTRUMENT,
   neverRunText: 'Run it to backtest it on the chosen data.',
 
+  async dataCutoff() {
+    return (await api.health()).data_cutoff
+  },
+
   async strategies() {
     const [list, runs] = await Promise.all([api.strategies(), api.runs()])
     const latest = latestRuns(runs)
@@ -156,11 +161,19 @@ export const engineLabSource: LabSource = {
     const { instrument, timeframe } = target
     const job = followJob(
       async () => {
-        const [coverage, listed] = await Promise.all([
+        const [coverage, listed, health] = await Promise.all([
           api.coverage(instrument),
           api.instruments(instrument.venue, instrument.kind),
+          api.health(),
         ])
-        const range = datasetRange(coverage, timeframe)
+        // With a data cutoff in force the run ends at the cutoff, since the engine refuses any later bar.
+        const cutoff = health.data_cutoff
+        const range = datasetRange(coverage, timeframe, cutoff === null ? undefined : cutoffEnd(cutoff))
+        if (!range && cutoff !== null && datasetRange(coverage, timeframe)) {
+          throw new Error(
+            `No ${timeframe} bars of ${instrumentKey(instrument)} are stored up to the data cutoff, ${formatCutoff(cutoff)}.`,
+          )
+        }
         if (!range) {
           throw new ApiError(422, 'data_missing', `No ${timeframe} bars are stored for ${instrumentKey(instrument)}.`)
         }

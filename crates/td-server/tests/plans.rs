@@ -23,7 +23,7 @@ use td_engine::{
 use td_server::api::auth::Token;
 use td_server::api::jobs::{JobInfo, JobResult, JobStatus};
 use td_server::api::plans::VerdictSummary;
-use td_server::api::runs::RunDetail;
+use td_server::api::runs::{DataCutoff, RunDetail};
 use td_server::api::source::{LiveSource, MarketSource};
 use td_server::api::ws::ServerMessage;
 use td_server::api::{ApiConfig, Server};
@@ -323,22 +323,36 @@ impl TestServer {
 
     /// [`TestServer::seeded`] with the venue list `listing`.
     async fn seeded_listing(entries: Vec<StrategyEntry>, listing: ListOnly) -> TestServer {
+        TestServer::seeded_with(entries, listing, None).await
+    }
+
+    /// [`TestServer::seeded`], started with `TD_DATA_CUTOFF` set to `cutoff`.
+    async fn seeded_with_cutoff(entries: Vec<StrategyEntry>, cutoff: &str) -> TestServer {
+        TestServer::seeded_with(entries, ListOnly::default(), Some(cutoff)).await
+    }
+
+    async fn seeded_with(
+        entries: Vec<StrategyEntry>,
+        listing: ListOnly,
+        cutoff: Option<&str>,
+    ) -> TestServer {
         let dir = tempfile::tempdir().expect("temp dir");
         let template = tokio::task::spawn_blocking(template_store).await.unwrap();
         copy_dir(template, dir.path());
-        TestServer::start(Arc::new(dir), entries, listing).await
+        TestServer::start(Arc::new(dir), entries, listing, cutoff).await
     }
 
     /// Another server on this one's store, running `entries`, as after a rebuild that changed the
     /// compiled-in strategies.
     async fn restarted(&self, entries: Vec<StrategyEntry>) -> TestServer {
-        TestServer::start(self.dir.clone(), entries, ListOnly::default()).await
+        TestServer::start(self.dir.clone(), entries, ListOnly::default(), None).await
     }
 
     async fn start(
         dir: Arc<TempDir>,
         entries: Vec<StrategyEntry>,
         listing: ListOnly,
+        cutoff: Option<&str>,
     ) -> TestServer {
         let store = Store::new(dir.path());
         let server = Server::start_with_strategies(
@@ -348,6 +362,7 @@ impl TestServer {
                 live: Arc::new(NoLive),
                 token: Token::generate().expect("rng"),
                 port: 0,
+                data_cutoff: cutoff.map(|c| DataCutoff::parse(c).expect("a cutoff")),
             },
             entries,
         )
@@ -1080,6 +1095,118 @@ async fn the_verdict_list_flags_a_changed_plan_and_prefers_a_complete_battery() 
     assert!(!r.complete);
 }
 
+/// A battery whose test period ends after the data cutoff is refused before any job starts,
+/// naming the cutoff; one whose period ends at the end of the cutoff date starts.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_battery_whose_period_ends_after_the_data_cutoff_is_refused() {
+    // The plan's period runs from 2024-01-01 to 2024-07-31 00:00.
+    let t = TestServer::seeded_with_cutoff(vec![entry(49)], "2024-06-30").await;
+    let (status, body) = t
+        .post("/runs/plan", &json!({ "strategy": "sma_cross" }))
+        .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["error"]["code"], "after_cutoff");
+    let message = body["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("ends at 2024-07-31 00:00 UTC")
+            && message.contains("TD_DATA_CUTOFF=2024-06-30"),
+        "{message}"
+    );
+    let (_, jobs) = t.get("/jobs").await;
+    assert_eq!(jobs, json!([]), "no job was created");
+
+    let t = TestServer::seeded_with_cutoff(vec![entry(49)], "2024-07-30").await;
+    let job = t.start_plan(&json!({ "strategy": "sma_cross" })).await;
+    let (status, body) = t.post(&format!("/jobs/{job}/cancel"), &json!(null)).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+}
+
+/// Each verdict row says whether the strategy's code still matches the code the battery ran,
+/// counts that in `stale`, lists the limits its rule loosened from the kind's defaults (and not
+/// the ones it tightened), and counts the distinct code versions that went through the battery.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_verdict_shows_its_code_its_loosened_limits_and_how_many_code_versions_were_tested() {
+    let mut loose = entry(49);
+    loose.rule = VerdictRule::Portfolio {
+        benchmark: PortfolioBenchmark::Cash,
+        limits: PortfolioLimits {
+            min_sharpe: 0.5,
+            max_drawdown: 0.2,
+            ..PortfolioLimits::default()
+        },
+    };
+    let t = TestServer::seeded(vec![loose]).await;
+    let mut ws = t.websocket().await;
+    let spot = json!({ "strategy": "sma_cross", "instruments": [id(InstrumentKind::Spot)] });
+    let job = t.start_plan(&spot).await;
+    let done = ws.follow(job).await.pop().unwrap();
+    assert_eq!(done.status, JobStatus::Done, "{:?}", done.error);
+    let first = plan_done(&done).instruments[0].run_id.clone();
+    let row = |rows: Vec<VerdictSummary>| -> VerdictSummary {
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        rows.into_iter().next().unwrap()
+    };
+    let r = row(t.verdicts("").await);
+    assert_eq!(r.code_matches, Some(true), "{r:?}");
+    assert!(!r.stale && r.plan_matches && r.engine_matches, "{r:?}");
+    assert_eq!((r.runs, r.code_versions), (1, 1));
+    let default_sharpe = PortfolioLimits::default().min_sharpe;
+    assert!(default_sharpe > 0.5);
+    assert_eq!(
+        r.loosened,
+        vec![td_engine::LoosenedLimit {
+            name: "min_sharpe".into(),
+            value: 0.5,
+            default: default_sharpe,
+        }],
+        "the tightened max_drawdown is not listed"
+    );
+    let (_, body) = t.get("/verdicts").await;
+    assert_eq!(body[0]["loosened"][0]["name"], "min_sharpe");
+    assert_eq!(body[0]["code_matches"], true);
+
+    // The code changed since the battery ran.
+    let runs_dir = t.runs_dir();
+    let record = runs_dir.join(first.as_str()).join("verdict.json");
+    rewrite_record(&runs_dir, &first, |v| {
+        v["code_hash"] = json!("0000000000000000")
+    });
+    let r = row(t.verdicts("").await);
+    assert_eq!(r.code_matches, Some(false), "{r:?}");
+    assert!(r.stale && r.plan_matches && r.engine_matches, "{r:?}");
+    assert_eq!(r.code_versions, 1);
+
+    // A battery saved before runs recorded their code is unknown, not a match, and counts as one
+    // more version.
+    std::thread::sleep(Duration::from_millis(5));
+    let SavedRun::Plan(run) = td_engine::load(&runs_dir, first.as_str()).unwrap() else {
+        panic!("a plan run");
+    };
+    let old = td_engine::save(&SavedRun::Plan(run), &runs_dir).unwrap();
+    std::fs::copy(&record, runs_dir.join(old.as_str()).join("verdict.json")).unwrap();
+    rewrite_record(&runs_dir, &old, |v| {
+        v.as_object_mut().unwrap().remove("code_hash");
+    });
+    let r = row(t.verdicts("").await);
+    assert_eq!(r.run_id, old);
+    assert_eq!(r.code_matches, None, "{r:?}");
+    assert!(r.stale);
+    assert_eq!((r.runs, r.code_versions), (2, 2));
+
+    // Read from the result when the verdict record is damaged, the code comes from the run's
+    // record.
+    std::fs::write(runs_dir.join(old.as_str()).join("verdict.json"), b"{").unwrap();
+    std::fs::write(
+        runs_dir.join(old.as_str()).join("record.json"),
+        serde_json::to_vec(&json!({ "code_hash": td_engine::code_hash("sma_cross") })).unwrap(),
+    )
+    .unwrap();
+    let r = row(t.verdicts("").await);
+    assert_eq!(r.run_id, old);
+    assert_eq!(r.code_matches, Some(true), "{r:?}");
+    assert_eq!(r.code_versions, 2);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn the_plan_routes_need_the_token() {
     let dir = tempfile::tempdir().unwrap();
@@ -1090,6 +1217,7 @@ async fn the_plan_routes_need_the_token() {
             live: Arc::new(NoLive),
             token: Token::generate().unwrap(),
             port: 0,
+            data_cutoff: None,
         },
         vec![entry(49)],
     )
@@ -1190,7 +1318,7 @@ async fn a_plan_on_fx_trades_on_the_stored_asks_in_every_step() {
     tokio::task::spawn_blocking(move || fx_store(&path))
         .await
         .unwrap();
-    let t = TestServer::start(Arc::new(dir), vec![fx_entry()], ListOnly::default()).await;
+    let t = TestServer::start(Arc::new(dir), vec![fx_entry()], ListOnly::default(), None).await;
     let mut ws = t.websocket().await;
     let job = t.start_plan(&json!({ "strategy": "sma_cross" })).await;
     let done = ws.follow(job).await.pop().unwrap();

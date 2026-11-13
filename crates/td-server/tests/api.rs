@@ -206,6 +206,7 @@ impl TestServer {
             live: Arc::new(NoLive),
             token: Token::generate().expect("rng"),
             port: 0,
+            data_cutoff: None,
         })
         .await
         .expect("starts");
@@ -343,7 +344,10 @@ async fn health_answers_the_version_with_the_token() {
     let t = TestServer::start(FakeSource::default()).await;
     let (status, body) = t.get("/health").await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body, json!({ "version": env!("CARGO_PKG_VERSION") }));
+    assert_eq!(
+        body,
+        json!({ "version": env!("CARGO_PKG_VERSION"), "data_cutoff": null })
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -957,6 +961,7 @@ fn the_binary_exits_after_the_grace_period_when_a_request_never_finishes() {
         .args(["--port", "0"])
         .env("TD_DATA_DIR", dir.path())
         .env_remove("TD_TOKEN")
+        .env_remove("TD_DATA_CUTOFF")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -1004,6 +1009,7 @@ fn the_binary_prints_the_handshake_and_stops_when_stdin_closes() {
         .args(["--port", "0"])
         .env("TD_DATA_DIR", dir.path())
         .env_remove("TD_TOKEN")
+        .env_remove("TD_DATA_CUTOFF")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -1051,6 +1057,31 @@ fn the_binary_prints_the_handshake_and_stops_when_stdin_closes() {
     let mut rest = String::new();
     stdout.read_to_string(&mut rest).unwrap();
     assert_eq!(rest, "", "stdout carries only the handshake");
+}
+
+/// A `TD_DATA_CUTOFF` that is not a real UTC date stops the engine before it listens, with an
+/// error that names the variable and the value, rather than running without the cutoff.
+#[test]
+fn the_binary_refuses_to_start_with_an_invalid_data_cutoff() {
+    let dir = tempfile::tempdir().unwrap();
+    for bad in ["2026-02-30", "30/06/2026", ""] {
+        let output = Command::new(env!("CARGO_BIN_EXE_td-server"))
+            .args(["--port", "0"])
+            .env("TD_DATA_DIR", dir.path())
+            .env_remove("TD_TOKEN")
+            .env("TD_DATA_CUTOFF", bad)
+            .stdin(Stdio::piped())
+            .output()
+            .expect("runs");
+        assert!(!output.status.success(), "{bad:?}: {}", output.status);
+        assert_eq!(output.stdout, b"", "{bad:?}: no handshake");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("TD_DATA_CUTOFF must be a UTC date written YYYY-MM-DD")
+                && stderr.contains(&format!("got {bad:?}")),
+            "{bad:?}: {stderr}"
+        );
+    }
 }
 
 #[test]

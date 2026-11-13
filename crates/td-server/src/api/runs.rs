@@ -14,7 +14,13 @@
 //!
 //! Every finished run is saved with [`td_engine::save_with_files`] under `<data dir>/runs`, with a
 //! `data.json` in the same atomic save holding the [`DataReport`]: the minutes and buckets the
-//! store's data left out.
+//! store's data left out, and a `record.json` holding the [`RunRecord`]: the hash of the
+//! strategy's code and the data cutoff the run was made under.
+//!
+//! With a data cutoff in force ([`DataCutoff`], `TD_DATA_CUTOFF`), every run, sweep,
+//! walk-forward and test battery whose range ends after the cutoff is refused with a 422
+//! `after_cutoff`, both when it is requested ([`check_run_data`]) and when its job loads the data
+//! ([`load_run_data`]), the two functions every run reads candles through.
 
 use std::fs;
 use std::ops::ControlFlow;
@@ -45,6 +51,118 @@ pub const RUNS_DIR: &str = "runs";
 
 /// The file beside a saved run's `result.json` that holds its [`DataReport`].
 const DATA_REPORT_FILE: &str = "data.json";
+
+/// The file beside a saved run's `result.json` that holds its [`RunRecord`].
+pub(super) const RECORD_FILE: &str = "record.json";
+
+/// The environment variable that sets the data cutoff.
+pub const DATA_CUTOFF_VAR: &str = "TD_DATA_CUTOFF";
+
+/// A UTC date after which no run reads bars (#114), set with `TD_DATA_CUTOFF=YYYY-MM-DD` when the
+/// engine starts. It keeps the latest months unseen while a strategy is worked on; the final check
+/// on them is a run made with the engine started without the setting. Paper sessions and the chart
+/// are not affected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DataCutoff {
+    date: String,
+    end: Millis,
+}
+
+impl DataCutoff {
+    /// Reads `YYYY-MM-DD`, a real date. Anything else is an error that says what is wanted.
+    pub fn parse(text: &str) -> Result<DataCutoff, String> {
+        let start = td_data::time::parse_date(text).map_err(|_| {
+            format!(
+                "{DATA_CUTOFF_VAR} must be a UTC date written YYYY-MM-DD, such as 2026-06-30, \
+                 got {text:?}"
+            )
+        })?;
+        Ok(DataCutoff {
+            date: text.to_string(),
+            end: start + DAY,
+        })
+    }
+
+    /// The cutoff from `TD_DATA_CUTOFF`: `None` when it is not set, an error when it is set to
+    /// anything but a date, an empty value included, so a mistyped cutoff stops the engine rather
+    /// than leaving the data open.
+    pub fn from_env() -> Result<Option<DataCutoff>, String> {
+        match std::env::var(DATA_CUTOFF_VAR) {
+            Err(std::env::VarError::NotPresent) => Ok(None),
+            Err(std::env::VarError::NotUnicode(_)) => {
+                Err(format!("{DATA_CUTOFF_VAR} is not valid text"))
+            }
+            Ok(text) => DataCutoff::parse(&text).map(Some),
+        }
+    }
+
+    /// The date as it was set.
+    pub fn date(&self) -> &str {
+        &self.date
+    }
+
+    /// Midnight UTC at the end of the date: the first moment whose bars are refused.
+    pub fn end(&self) -> Millis {
+        self.end
+    }
+
+    /// Refuses a configuration whose range ends after the cutoff with a 422 `after_cutoff`. A range
+    /// ending exactly at the end of the cutoff date reads no bar after it.
+    fn check(&self, config: &BacktestConfig) -> Result<(), ApiError> {
+        if config.to <= self.end {
+            return Ok(());
+        }
+        Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "after_cutoff",
+            format!(
+                "the range ends at {} UTC, after the data cutoff: the engine was started with \
+                 {DATA_CUTOFF_VAR}={}, so it reads no bar after that date. End the range at {} UTC \
+                 or earlier, or start the engine without {DATA_CUTOFF_VAR}",
+                format_minute(config.to),
+                self.date,
+                format_minute(self.end)
+            ),
+        ))
+    }
+}
+
+/// Refuses a configuration that reads past `cutoff`, when there is one.
+fn within_cutoff(config: &BacktestConfig, cutoff: Option<&DataCutoff>) -> Result<(), ApiError> {
+    cutoff.map_or(Ok(()), |c| c.check(config))
+}
+
+/// What a run was made under, saved beside it in `record.json`. A run saved before the file
+/// existed has none, and reads as unknown.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct RunRecord {
+    /// The hash of the strategy's source file ([`td_engine::code_hash`]); `None` for a strategy
+    /// the engine has no hash for.
+    #[serde(default)]
+    pub code_hash: Option<String>,
+    /// The data cutoff date in force when the run was made; `None` when there was none.
+    #[serde(default)]
+    pub data_cutoff: Option<String>,
+}
+
+impl RunRecord {
+    /// The record of a run of `strategy` made now, under `cutoff`.
+    pub fn new(strategy: &str, cutoff: Option<&DataCutoff>) -> RunRecord {
+        RunRecord {
+            code_hash: td_engine::code_hash(strategy).map(String::from),
+            data_cutoff: cutoff.map(|c| c.date.clone()),
+        }
+    }
+}
+
+/// Whether a saved code hash is the strategy's code in this engine: `None` when the run saved no
+/// hash (saved before hashes were recorded) or the strategy is no longer registered, so the answer
+/// is unknown.
+pub fn code_matches(strategy: &str, saved: Option<&str>) -> Option<bool> {
+    saved
+        .zip(td_engine::code_hash(strategy))
+        .map(|(saved, now)| saved == now)
+}
 
 /// Missing open time, or time without a funding rate, this long or longer in one stretch means the
 /// store lacks that part of a run's range, and the run is refused: a day for a market that never
@@ -122,6 +240,16 @@ pub struct RunDetail {
     /// Whether the run would come out the same today; set by `GET /runs/{id}`, `null` from
     /// `GET /jobs/{id}/result`.
     pub check: Option<RunCheck>,
+    /// The hash of the strategy's source file when the run was made ([`td_engine::code_hash`]);
+    /// `null` for a run saved before hashes were recorded.
+    pub code_hash: Option<String>,
+    /// Whether the strategy's source file is still the one the run was made with; `null` when that
+    /// is unknown: the run saved no hash, or the strategy is no longer registered. The hash covers
+    /// the strategy's own file only, not shared helpers it calls.
+    pub code_matches: Option<bool>,
+    /// The data cutoff date (`TD_DATA_CUTOFF`) in force when the run was made; `null` when there
+    /// was none, or for a run saved before cutoffs were recorded.
+    pub data_cutoff: Option<String>,
 }
 
 /// A saved run checked against the store and the engine as they are now, as
@@ -210,15 +338,15 @@ async fn start(
     let base = base_config(&request)
         .ok_or_else(|| ApiError::internal("not a run request"))?
         .clone();
-    let store = state.store.clone();
-    tokio::task::spawn_blocking(move || check_run_data(&store, &base))
+    let (store, cutoff) = (state.store.clone(), state.data_cutoff.clone());
+    tokio::task::spawn_blocking(move || check_run_data(&store, &base, cutoff.as_ref()))
         .await
         .map_err(|e| ApiError::internal(format!("the data check stopped: {e}")))??;
     let (store, runs_dir) = (state.store.clone(), state.runs_dir());
-    let work = request.clone();
-    let job = state
-        .jobs
-        .submit(request, move |ctx| execute(&work, &store, &runs_dir, ctx))?;
+    let (work, cutoff) = (request.clone(), state.data_cutoff.clone());
+    let job = state.jobs.submit(request, move |ctx| {
+        execute(&work, &store, cutoff.as_ref(), &runs_dir, ctx)
+    })?;
     Ok((StatusCode::ACCEPTED, Json(JobCreated { job_id: job.id })))
 }
 
@@ -305,10 +433,16 @@ fn read_data(store: &Store, config: &BacktestConfig) -> Result<StoreData, ApiErr
 /// [`load_run_data`], without keeping the data: the months' 1-minute candles, and a quoted
 /// market's asks, are read together ([`read_months`]) and gone through a month at a time, and only
 /// the missing minutes and whether any bar can be built are kept. A 400 for a bad range, a 422
-/// `data_missing` where `load_run_data` would refuse.
-pub fn check_run_data(store: &Store, config: &BacktestConfig) -> Result<(), ApiError> {
+/// `after_cutoff` for a range that ends after `cutoff`, and a 422 `data_missing` where
+/// `load_run_data` would refuse.
+pub fn check_run_data(
+    store: &Store,
+    config: &BacktestConfig,
+    cutoff: Option<&DataCutoff>,
+) -> Result<(), ApiError> {
     let id = &config.instrument.id;
     let (from, to) = data_range(config)?;
+    within_cutoff(config, cutoff)?;
     let timeframe = config.timeframe;
     // Each month's missing minutes; a gap that a month's end cuts is joined again by `refusal`.
     let mut gaps = Vec::new();
@@ -451,11 +585,17 @@ fn refusal(
     None
 }
 
-/// Loads a run's data, refusing with 422 `data_missing` when the store lacks part of the range:
-/// a stretch of missing minutes holding [`max_gap`] or more of open time or, for a perpetual,
-/// [`max_gap`] or more without funding rates, or no bar at all.
-pub fn load_run_data(store: &Store, config: &BacktestConfig) -> Result<RunData, ApiError> {
+/// Loads a run's data, refusing with 422 `after_cutoff` when the range ends after `cutoff`, and
+/// with 422 `data_missing` when the store lacks part of the range: a stretch of missing minutes
+/// holding [`max_gap`] or more of open time or, for a perpetual, [`max_gap`] or more without
+/// funding rates, or no bar at all.
+pub fn load_run_data(
+    store: &Store,
+    config: &BacktestConfig,
+    cutoff: Option<&DataCutoff>,
+) -> Result<RunData, ApiError> {
     let (from, to) = data_range(config)?;
+    within_cutoff(config, cutoff)?;
     let StoreData {
         loaded,
         asks,
@@ -539,6 +679,7 @@ fn spans(gaps: &[&Gap]) -> String {
 fn execute(
     request: &JobRequest,
     store: &Store,
+    cutoff: Option<&DataCutoff>,
     runs_dir: &Path,
     ctx: &JobCtx,
 ) -> Result<JobResult, JobError> {
@@ -550,8 +691,9 @@ fn execute(
         asks,
         funding,
         report,
-    } = load_run_data(store, base).map_err(changed_since_accepted)?;
+    } = load_run_data(store, base, cutoff).map_err(changed_since_accepted)?;
     ctx.checkpoint()?;
+    let record = RunRecord::new(&base.strategy, cutoff);
     let progress = |done: usize, total: usize| report_progress(ctx, done, total);
     let saved = match request {
         JobRequest::Download(_) | JobRequest::Plan(_) => {
@@ -583,7 +725,7 @@ fn execute(
     // A cancel that came in during the last steps still wins: nothing is saved.
     ctx.checkpoint()?;
     ctx.progress(1.0, "saving the result");
-    let id = save_run(&saved, &report, &[], runs_dir)?;
+    let id = save_run(&saved, &report, &record, &[], runs_dir)?;
     let done = RunDone {
         summary: saved.summary(id.clone()),
         run_id: id,
@@ -627,16 +769,22 @@ fn report_progress(ctx: &JobCtx, done: usize, total: usize) -> ControlFlow<()> {
     ControlFlow::Continue(())
 }
 
-/// Saves a run with its data report and any `extra` files, all in one atomic save.
+/// Saves a run with its data report, its record and any `extra` files, all in one atomic save.
 pub fn save_run(
     saved: &SavedRun,
     report: &DataReport,
+    record: &RunRecord,
     extra: &[(&str, &[u8])],
     runs_dir: &Path,
 ) -> Result<RunId, JobError> {
     let json = serde_json::to_vec_pretty(report)
         .map_err(|e| ApiError::internal(format!("cannot write the data report: {e}")))?;
-    let mut files = vec![(DATA_REPORT_FILE, json.as_slice())];
+    let record_json = serde_json::to_vec_pretty(record)
+        .map_err(|e| ApiError::internal(format!("cannot write the run record: {e}")))?;
+    let mut files = vec![
+        (DATA_REPORT_FILE, json.as_slice()),
+        (RECORD_FILE, record_json.as_slice()),
+    ];
     files.extend_from_slice(extra);
     // Two identical results saved in the same millisecond get the same id; the retry lands in a
     // later millisecond.
@@ -651,7 +799,8 @@ pub fn save_run(
     Ok(attempt.map_err(store_error)?)
 }
 
-/// Reads a saved run and its data report.
+/// Reads a saved run with its data report and record. A record that is missing (a run saved
+/// before records existed, or by another tool) or damaged reads as unknown.
 pub fn read_run(runs_dir: &Path, id: &str) -> Result<RunDetail, ApiError> {
     let run = td_engine::load(runs_dir, id).map_err(|e| match e {
         StoreError::InvalidRunId(_) => ApiError::not_found(format!("no run {id}")),
@@ -670,12 +819,20 @@ pub fn read_run(runs_dir: &Path, id: &str) -> Result<RunDetail, ApiError> {
             Err(e) => (None, Some(format!("{DATA_REPORT_FILE} is damaged: {e}"))),
         },
     };
+    let record: RunRecord = fs::read(runs_dir.join(id.as_str()).join(RECORD_FILE))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default();
+    let code_matches = code_matches(&run.base_config().strategy, record.code_hash.as_deref());
     Ok(RunDetail {
         id,
         run,
         data,
         data_error,
         check: None,
+        code_hash: record.code_hash,
+        code_matches,
+        data_cutoff: record.data_cutoff,
     })
 }
 
@@ -881,9 +1038,9 @@ mod tests {
     /// Loads a configuration's data as a job does, after asserting that the check made when the
     /// run is requested gives the same answer.
     fn checked(store: &Store, config: &BacktestConfig) -> Result<RunData, ApiError> {
-        let loaded = load_run_data(store, config);
+        let loaded = load_run_data(store, config, None);
         assert_eq!(
-            check_run_data(store, config).err(),
+            check_run_data(store, config, None).err(),
             loaded.as_ref().err().cloned(),
             "the check and the load disagree"
         );
@@ -1271,5 +1428,65 @@ mod tests {
             monday + HOUR + 30 * MINUTE,
         );
         refused(&short, "`to`");
+    }
+
+    #[test]
+    fn a_cutoff_must_be_a_real_utc_date() {
+        let cutoff = DataCutoff::parse("2024-03-02").unwrap();
+        assert_eq!(cutoff.date(), "2024-03-02");
+        assert_eq!(cutoff.end(), parse_date("2024-03-03").unwrap());
+        for bad in [
+            "",
+            "2024-3-2",
+            "02/03/2024",
+            "2024-02-30",
+            "2024-03-02T00:00",
+            " 2024-03-02",
+        ] {
+            let e = DataCutoff::parse(bad).unwrap_err();
+            assert!(e.contains("TD_DATA_CUTOFF must be a UTC date"), "{e}");
+            assert!(e.contains(&format!("{bad:?}")), "{e}");
+        }
+    }
+
+    /// The check made when a run is requested and the load its job makes both refuse a range
+    /// that ends after the cutoff, so neither path reads past it; a range ending at the end of the
+    /// cutoff date, or with no cutoff, loads.
+    #[test]
+    fn the_check_and_the_load_refuse_a_range_past_the_cutoff() {
+        let (_dir, store, spot, _) = store_with_an_hour_missing();
+        let cutoff = DataCutoff::parse("2024-03-02").unwrap();
+        let refused = [
+            check_run_data(&store, &spot, Some(&cutoff)).unwrap_err(),
+            load_run_data(&store, &spot, Some(&cutoff)).err().unwrap(),
+        ];
+        for e in refused {
+            assert_eq!(
+                (e.status.as_u16(), e.body.code.as_str()),
+                (422, "after_cutoff"),
+                "{}",
+                e.body.message
+            );
+            assert!(
+                e.body.message.contains(
+                    "the range ends at 2024-03-04 00:00 UTC, after the data cutoff: the engine \
+                     was started with TD_DATA_CUTOFF=2024-03-02"
+                ),
+                "{}",
+                e.body.message
+            );
+            assert!(
+                e.body
+                    .message
+                    .contains("End the range at 2024-03-03 00:00 UTC"),
+                "{}",
+                e.body.message
+            );
+        }
+        let mut within = spot.clone();
+        within.to = cutoff.end();
+        assert_eq!(check_run_data(&store, &within, Some(&cutoff)), Ok(()));
+        assert!(load_run_data(&store, &within, Some(&cutoff)).is_ok());
+        assert!(load_run_data(&store, &spot, None).is_ok());
     }
 }

@@ -17,6 +17,11 @@ pub(crate) mod private {
     include!(concat!(env!("OUT_DIR"), "/private_strategies.rs"));
 }
 
+/// The hash of each example's source file, from build.rs: `SMA_CROSS` for `sma_cross.rs`.
+pub(crate) mod example_hashes {
+    include!(concat!(env!("OUT_DIR"), "/example_hashes.rs"));
+}
+
 use td_core::{OrderRequest, OrderType, Side, TimeInForce};
 
 use crate::Context;

@@ -70,6 +70,10 @@ export interface VerdictPreview {
   equity: EquityPoint[]
   metrics: MetricRow[]
   trades: TradeRow[]
+  /** The strategy's code has changed since this run was made. False when it has not, or is unknown. */
+  codeChanged?: boolean
+  /** The data cutoff (`YYYY-MM-DD`, UTC) the run was made under, or null when there was none. */
+  dataCutoff?: string | null
 }
 
 /** A strategy's latest finished run, as the strategy list shows it. */
@@ -155,6 +159,8 @@ export interface LabSource {
   readonly defaultInstrument: InstrumentId
   /** What Run does, for a strategy that has never run. */
   readonly neverRunText: string
+  /** The data cutoff in force (`YYYY-MM-DD`, UTC): runs read no bar after it. Null when there is none. */
+  dataCutoff(): Promise<string | null>
   /** The full result of a strategy's latest run. */
   open(last: LastRun): Promise<VerdictPreview>
   run(name: string, target: RunTarget, onProgress: (progress: RunProgress) => void): LabRun

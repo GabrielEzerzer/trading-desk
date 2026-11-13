@@ -8,11 +8,15 @@
 // `config`: { engine: 'starting' | 'failed' | 'running', mock: boolean, hangStrategies: boolean,
 //             engineData: engine.json, noData?: boolean, deleteFails?: boolean, deleteStops?: boolean,
 //             backtest?: 'ok' | 'data_missing' | 'too_many_runs' | 'fails', download?: 'ok' | 'no_token',
-//             stepMs?: number,
+//             stepMs?: number, dataCutoff?: string, codeChanged?: boolean,
 //             instruments?: Instrument[], hangInstruments?: boolean, failInstruments?: boolean,
 //             candles?: { start: Candle, everyMs: number } | null, session?: SessionState | null,
 //             failSessions?: number,
 //             history?: Record<string, number | 'hang' | 'fail'> }
+//
+// `dataCutoff` (`YYYY-MM-DD`) is the engine's TD_DATA_CUTOFF: GET /health and every saved run report
+// it, and a backtest ending after it is refused with the engine's 422 `after_cutoff`. `codeChanged`
+// makes every saved run report that the strategy's code has changed since it ran.
 //
 // Every request is recorded in `window.__tdCalls`, and the topics subscribed now in
 // `window.__stubSubscribed`, so a flow can check what the app sent.
@@ -143,6 +147,10 @@ function installBridgeStub(config) {
       // The engine's text (td-server jobs.rs, MAX_RUN_JOBS = 8).
       return fail(429, 'too_many_runs', '8 runs are already queued or running, the most this server takes; wait for one to finish or cancel one')
     }
+    const cutoffEnd = config.dataCutoff ? Date.parse(`${config.dataCutoff}T00:00:00Z`) + 86_400_000 : null
+    if (cutoffEnd !== null && body.to > cutoffEnd) {
+      return fail(422, 'after_cutoff', `the range ends after the data cutoff: the engine was started with TD_DATA_CUTOFF=${config.dataCutoff}`)
+    }
     if (backtest === 'data_missing') {
       return fail(422, 'data_missing', `the store has no candles for ${key(body.instrument.id)} from 2024-03-04 00:00 to 2024-03-12 00:00 UTC; download them first`)
     }
@@ -226,14 +234,22 @@ function installBridgeStub(config) {
     if (held.months.length === 0 && !held.funding) stored.delete(id)
   }
 
+  /** A saved run with what it was made under: its code, whether that still matches, and the cutoff. */
+  const withRecord = (detail) => ({
+    ...detail,
+    code_hash: '5f0c2a9d1e7b3c48',
+    code_matches: !config.codeChanged,
+    data_cutoff: config.dataCutoff ?? null,
+  })
+
   function route({ method, path, query, body }) {
-    if (method === 'GET' && path === '/health') return ok({ version: '0.1.0' })
+    if (method === 'GET' && path === '/health') return ok({ version: '0.1.0', data_cutoff: config.dataCutoff ?? null })
     if (method === 'GET' && path === '/strategies') return ok(data.strategies)
     if (method === 'GET' && path === '/runs') return ok(data.runs)
     let m = /^\/runs\/([\w-]+)$/.exec(path)
     if (method === 'GET' && m && m[1] !== 'backtest') {
       const detail = data.details[m[1]]
-      return detail ? ok({ ...detail, check: { data_matches: true, engine_matches: true } }) : fail(404, 'not_found', `no run ${m[1]}`)
+      return detail ? ok(withRecord({ ...detail, check: { data_matches: true, engine_matches: true } })) : fail(404, 'not_found', `no run ${m[1]}`)
     }
     if (method === 'GET' && path === '/data/coverage') {
       const id = query.instrument
@@ -290,7 +306,7 @@ function installBridgeStub(config) {
     if (method === 'GET' && m && !m[2]) return ok(structuredClone(job))
     if (method === 'GET' && m?.[2] === 'result') {
       if (job.status !== 'done') return fail(409, 'job_not_done', `job ${job.id} is ${job.status}, not done yet`)
-      return ok(data.details[job.result.run_id])
+      return ok(withRecord(data.details[job.result.run_id]))
     }
     return fail(404, 'not_found', `${method} ${path} is not stubbed`)
   }

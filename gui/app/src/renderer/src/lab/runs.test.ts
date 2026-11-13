@@ -2,7 +2,7 @@ import { ApiError } from '@td/shared'
 import type { CoverageResponse, InstrumentId, RunDetail, RunSummary, StoredResponse } from '@td/shared'
 import { describe, expect, it } from 'vitest'
 import engine from '../../../../mock/engine.json'
-import { datasetRange, laterRun, latestRuns, runFailure, storedDatasets, toFinished, toVerdict } from './runs'
+import { cutoffEnd, datasetRange, laterRun, latestRuns, runFailure, storedDatasets, toFinished, toVerdict } from './runs'
 import { RunCancelled } from './source'
 
 const details = engine.details as unknown as Record<string, RunDetail>
@@ -84,6 +84,15 @@ describe('a saved backtest as the result screen', () => {
     expect(points.at(-1)?.t).toBe(one.time + 4999 * 3_600_000)
   })
 
+  it('says the code changed only when the engine says it no longer matches, and keeps the cutoff', () => {
+    const run = (code_matches: boolean | null, data_cutoff: string | null) =>
+      toVerdict({ ...detail(SMA), code_hash: null, code_matches, data_cutoff })
+    expect(run(false, null)).toMatchObject({ codeChanged: true, dataCutoff: null })
+    expect(run(true, '2025-03-31')).toMatchObject({ codeChanged: false, dataCutoff: '2025-03-31' })
+    // A run saved before runs recorded their code is unknown, not changed.
+    expect(run(null, null).codeChanged).toBe(false)
+  })
+
   it('refuses run kinds the Lab does not show yet', () => {
     const d = { ...detail(SMA), run: { kind: 'sweep', result: {} } } as unknown as RunDetail
     expect(() => toVerdict(d)).toThrow(/sweep run; the Lab shows backtests only/)
@@ -118,6 +127,17 @@ describe('the range of a dataset', () => {
     const t0 = Date.UTC(2024, 2, 1)
     expect(datasetRange(coverage(t0 + 30 * 60_000, t0 + 6 * H - 60_000), '1h')).toEqual({ from: t0 + H, to: t0 + 6 * H })
     expect(datasetRange(coverage(t0, t0 + 2 * 24 * H - 60_000), '1d')).toEqual({ from: t0, to: t0 + 2 * 24 * H })
+  })
+
+  it('ends at a data cutoff inside the stored range, and is null when no whole bar fits before it', () => {
+    const t0 = Date.UTC(2024, 2, 1)
+    const stored = coverage(t0, t0 + 10 * 24 * H - 60_000)
+    expect(cutoffEnd('2024-03-04')).toBe(Date.UTC(2024, 2, 5))
+    expect(datasetRange(stored, '1d', cutoffEnd('2024-03-04'))).toEqual({ from: t0, to: Date.UTC(2024, 2, 5) })
+    expect(datasetRange(stored, '1h', cutoffEnd('2024-03-04'))).toEqual({ from: t0, to: Date.UTC(2024, 2, 5) })
+    // A cutoff after the stored range changes nothing.
+    expect(datasetRange(stored, '1d', cutoffEnd('2025-01-01'))).toEqual(datasetRange(stored, '1d'))
+    expect(datasetRange(stored, '1d', cutoffEnd('2024-02-01'))).toBeNull()
   })
 
   it('is null when nothing is stored or no whole bar fits', () => {

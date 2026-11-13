@@ -1228,6 +1228,24 @@ criteria: Array<Criterion>,
 warnings: Array<string>, };
 
 /**
+ * A limit of a strategy's rule that is looser than its kind's default (#113), so a verdict
+ * judged under it can say so. A tightened limit is not listed.
+ */
+export type LoosenedLimit = { 
+/**
+ * The limit's field in the kind's limits, such as `min_sharpe`.
+ */
+name: string, 
+/**
+ * The rule's value.
+ */
+value: number, 
+/**
+ * The kind's default.
+ */
+default: number, };
+
+/**
  * One instrument's test battery (#35) under a strategy's plan, as saved: what was tested, the
  * engine that tested it and everything the battery produced, its verdict and seed included.
  */
@@ -1773,7 +1791,13 @@ export type ErrorResponse = { error: ErrorBody, };
  */
 export type ErrorBody = { code: string, message: string, };
 
-export type HealthResponse = { version: string, };
+export type HealthResponse = { version: string, 
+/**
+ * The data cutoff date (`TD_DATA_CUTOFF`, `YYYY-MM-DD` UTC) when one is in force: every run,
+ * sweep, walk-forward and test battery whose range ends after that date is refused. `null`
+ * when there is none.
+ */
+data_cutoff: string | null, };
 
 export type InstrumentsResponse = { instruments: Array<Instrument>, rejected: Array<RejectedInstrument>, };
 
@@ -2097,14 +2121,39 @@ engine_matches: boolean,
  */
 plan_matches: boolean, 
 /**
+ * Whether the strategy's source file is still the one the battery ran with: false when it has
+ * been edited since, `null` when that is unknown (a battery saved before code hashes were
+ * recorded, or a strategy no longer registered). The hash covers the strategy's own file only,
+ * not shared helpers it calls, so a change to a shared helper leaves this true.
+ */
+code_matches: boolean | null, 
+/**
+ * True unless `engine_matches`, `plan_matches` and `code_matches` are all true: the verdict
+ * may not be what this engine, plan, rule and code would give, so run the plan again.
+ */
+stale: boolean, 
+/**
+ * Every limit of the rule the verdict was judged under that is looser than its kind's default,
+ * with both values; empty when none is, or when the saved rule no longer reads as a rule
+ * (`plan_matches` is then false). Tightened limits are not listed.
+ */
+loosened: Array<LoosenedLimit>, 
+/**
  * False when a cancel stopped the battery's luck test, so its luck line is inconclusive.
  */
 complete: boolean, seed: number, 
 /**
  * How many batteries have been saved for this strategy on this instrument, this one included.
- * An instrument a cancel stopped before the luck test saved none and is not counted.
+ * An instrument a cancel stopped before the luck test saved none and is not counted. Keyed by
+ * strategy name: renaming a strategy starts the count again.
  */
-runs: number, };
+runs: number, 
+/**
+ * How many distinct versions of the strategy's source file have been through the battery on
+ * this instrument, this one included; batteries saved before code hashes were recorded count
+ * together as one version. Keyed by strategy name like `runs`.
+ */
+code_versions: number, };
 
 /**
  * A saved run in full.
@@ -2123,7 +2172,23 @@ data_error: string | null,
  * Whether the run would come out the same today; set by `GET /runs/{id}`, `null` from
  * `GET /jobs/{id}/result`.
  */
-check: RunCheck | null, };
+check: RunCheck | null, 
+/**
+ * The hash of the strategy's source file when the run was made ([`td_engine::code_hash`]);
+ * `null` for a run saved before hashes were recorded.
+ */
+code_hash: string | null, 
+/**
+ * Whether the strategy's source file is still the one the run was made with; `null` when that
+ * is unknown: the run saved no hash, or the strategy is no longer registered. The hash covers
+ * the strategy's own file only, not shared helpers it calls.
+ */
+code_matches: boolean | null, 
+/**
+ * The data cutoff date (`TD_DATA_CUTOFF`) in force when the run was made; `null` when there
+ * was none, or for a run saved before cutoffs were recorded.
+ */
+data_cutoff: string | null, };
 
 /**
  * A saved run checked against the store and the engine as they are now, as
