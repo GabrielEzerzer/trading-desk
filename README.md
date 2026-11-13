@@ -4,7 +4,7 @@ Trading Desk is the workspace I use for my own trading: a desktop app that backt
 
 ![Strategy Lab showing the result of an SMA cross backtest on BTCUSDT from January 2023 to October 2025: the return, CAGR, Sharpe and drawdown, the equity curve against buy and hold, and the metrics table](assets/lab-result.png)
 
-![Trading showing the live one-minute BTCUSDT chart on Binance spot, with the last few hours of history and the paper order panel](assets/trading.png)
+![Trading showing the live one-minute BTCUSDT chart on Binance spot with the last few hours of history, a running Manual paper session, and the paper order panel with a 0.01 BTC market order ready to send](assets/trading.png)
 
 Choosing a strategy in Strategy Lab and running it, through to the result. The wait while the run loads the data is shown at double speed.
 
