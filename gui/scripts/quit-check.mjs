@@ -40,6 +40,14 @@ if (section === 'trading') {
   await page.locator('canvas').first().waitFor({ timeout: 20_000 })
   // Long enough for the history to load and the live stream to deliver bars.
   await page.waitForTimeout(6_000)
+  // The chart mounts before any data arrives, so an empty chart (no history, offline) would pass
+  // without ever running the live stream that hangs the quit.
+  if ((await page.locator('.chart-empty').count()) > 0) {
+    killAll(processTree(app.process().pid))
+    rmSync(dataDir, { recursive: true, force: true })
+    console.error('quit-check: FAIL, the Trading chart did not load its history')
+    process.exit(2)
+  }
 }
 const tree = processTree(app.process().pid)
 const engine = tree.filter((p) => p.name.toLowerCase().startsWith('td-server'))
@@ -55,11 +63,12 @@ const started = Date.now()
 await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0]?.close())
 const left = await waitGone(tree, QUIT_WITHIN_MS)
 const ms = Date.now() - started
-rmSync(dataDir, { recursive: true, force: true })
 if (left.length > 0) {
   console.error(`quit-check: FAIL, still running ${QUIT_WITHIN_MS} ms after close: ${left.map((p) => `${p.name} ${p.pid}`).join(', ')}`)
   killAll(left)
+  rmSync(dataDir, { recursive: true, force: true })
   process.exit(1)
 }
+rmSync(dataDir, { recursive: true, force: true })
 console.log(`quit-check: PASS, all ${tree.length} processes exited ${ms} ms after the window closed`)
 process.exit(0)
