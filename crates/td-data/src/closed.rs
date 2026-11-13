@@ -1,7 +1,7 @@
 //! Closures a market with trading hours has that its weekly hours do not know: for FX on OANDA,
 //! about 24 December 22:00 to 25 December 22:00 UTC, from about 22:00 UTC on 31 December, and the
-//! minutes of a slow Sunday open. They are recorded when a month is downloaded, and coverage and the run check
-//! read them.
+//! minutes of a slow Sunday open. They are recorded when a month is downloaded, and coverage and
+//! the run check read them.
 //!
 //! A download of a kind with closed hours records, beside the month file, the spans of open time in
 //! the range it asked for that the venue returned nothing for: `<YYYY-MM>.parquet.closed.json`, a
@@ -11,10 +11,12 @@
 //! published yet.
 //!
 //! When the records are read ([`Store::closures`]), spans that meet, at a month's end or across
-//! closed hours, join into one stretch, and a stretch holding at most [`LONGEST_CLOSURE`] of open
-//! time counts as closed. A longer one is an outage, not a closure, so it stays missing and the run
-//! check refuses it. Records are written only for kinds with closed hours, so a crypto outage is
-//! always missing.
+//! closed hours, join into one stretch. A stretch holding at most [`SHORT_CLOSURE`] of open time,
+//! such as a late Sunday open, counts as closed. A longer one counts as closed only if it holds at
+//! most [`LONGEST_CLOSURE`] and overlaps the year-end holidays, 24 December 00:00 to 3 January
+//! 00:00 UTC, where OANDA's day-long closures fall. Any other stretch is an outage, not a closure:
+//! it stays missing, so its month is not complete and the run check refuses a long one. Records
+//! are written only for kinds with closed hours, so a crypto outage is always missing.
 //!
 //! A month downloaded before records were written has none: all its missing open time counts as
 //! missing, as before, and the run check keeps a wider limit for it (`max_gap` in td-server).
@@ -35,13 +37,23 @@ use crate::store::{
 };
 use crate::time::{DAY, MINUTE, Month};
 
-/// The longest stretch of open time without a candle that counts as a closure: 27 hours. OANDA's
-/// holiday closures run a little past a day. Stored USD/JPY shows Christmas closures of 1441 to
-/// 1500 minutes (2024: 24 December 21:55 to 25 December 22:04, 1449 minutes; 2016: 1500) and New
-/// Year closures of 1444. A holiday on a Friday joins across the weekend's closed hours to the
-/// Sunday open, which can come up to 175 minutes late, so a day plus three hours covers both with a
-/// few minutes to spare. A stretch longer than that is an outage.
-pub const LONGEST_CLOSURE: Millis = DAY + 3 * 60 * MINUTE;
+/// The longest stretch of open time without a candle that counts as a closure, and then only over
+/// the year-end holidays: 27 hours. OANDA's holiday closures run a little past a day. Stored
+/// USD/JPY, 2016 to 2025, shows Christmas closures of 1439 to 1500 minutes (2024: 24 December
+/// 21:55 to 25 December 22:04, 1449 minutes; 2016: 25 December 22:00 to 26 December 23:00, 1500).
+/// A holiday on a Friday joins across the weekend's closed hours to the Sunday open, which can come
+/// up to 175 minutes late, so a day plus three hours covers both with a few minutes to spare.
+pub const LONGEST_CLOSURE: Millis = DAY + 3 * HOUR;
+
+/// The longest stretch that counts as a closure at any time of year: 4 hours. In the same USD/JPY
+/// data, outside 24 December to 2 January, no stretch of an hour or more without a candle lasts
+/// longer than 175 minutes, the Sunday open of 20 October 2019 (21:00 to 23:55 UTC); the others
+/// are late Sunday opens of 60 to 129 minutes and one Thursday outage of 171 minutes on 12 May 2022.
+/// Four hours keeps about an hour above the slowest Sunday open seen, while a weekday outage of a
+/// day stays missing.
+const SHORT_CLOSURE: Millis = 4 * HOUR;
+
+const HOUR: Millis = 60 * MINUTE;
 
 /// What follows `.parquet` in the name of a month's record.
 pub(crate) const RECORD_SUFFIX: &str = ".closed.json";
@@ -217,12 +229,30 @@ impl Store {
             }
         }
         for stretch in recorded.chunk_by(|a, b| meet(id.kind, a, b)) {
-            if stretch.iter().map(|g| g.to - g.from).sum::<Millis>() <= LONGEST_CLOSURE {
+            let open: Millis = stretch.iter().map(|g| g.to - g.from).sum();
+            let (start, end) = (stretch[0].from, stretch[stretch.len() - 1].to);
+            if open <= SHORT_CLOSURE || (open <= LONGEST_CLOSURE && in_year_end(start, end)) {
                 closures.spans.extend_from_slice(stretch);
             }
         }
         Ok(closures)
     }
+}
+
+/// Whether `[from, to)` overlaps the year-end holidays, 24 December 00:00 to 3 January 00:00 UTC,
+/// of any year.
+fn in_year_end(from: Millis, to: Millis) -> bool {
+    let year = Month::containing(from).year;
+    (year - 1..=year).any(|y| {
+        let start = Month { year: y, month: 12 }.start() + 23 * DAY;
+        let end = Month {
+            year: y + 1,
+            month: 1,
+        }
+        .start()
+            + 2 * DAY;
+        from < end && to > start
+    })
 }
 
 /// Whether span `b`, after `a`, starts where `a` ends or only closed hours part them.
@@ -237,8 +267,6 @@ mod tests {
     use super::*;
     use crate::source::fake;
     use crate::time::{MINUTE, parse_date};
-
-    const HOUR: Millis = 60 * MINUTE;
 
     fn fx() -> InstrumentId {
         InstrumentId {
@@ -384,6 +412,61 @@ mod tests {
         let coverage = store.coverage(&fx()).expect("covers");
         assert_eq!(coverage[0].gaps, []);
         assert_eq!(coverage[0].minutes, coverage[0].open_minutes as usize);
+    }
+
+    /// The coverage of `month` stored with every open minute but those of `hole`, which a
+    /// download recorded as empty.
+    fn coverage_without(store: &Store, month: &str, hole: Gap) -> crate::MonthCoverage {
+        let month = Month::parse(month).expect("a month");
+        let open: Vec<Millis> = (month.start()..month.end())
+            .step_by(MINUTE as usize)
+            .filter(|&t| fx().kind.is_open(t) && !(hole.from..hole.to).contains(&t))
+            .collect();
+        let bids: Vec<_> = open.iter().map(|&t| fake::candle(t)).collect();
+        let asks: Vec<_> = open.iter().map(|&t| fake::ask(t)).collect();
+        store.write_quotes(&fx(), &bids, &asks).expect("writes");
+        store
+            .record_closures(&fx(), month, month.start(), month.end(), &[hole])
+            .expect("records");
+        let coverage = store.coverage(&fx()).expect("covers");
+        coverage
+            .into_iter()
+            .find(|c| c.month == month)
+            .expect("the month")
+    }
+
+    #[test]
+    fn a_long_recorded_span_outside_the_year_end_is_an_outage() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let store = Store::new(dir.path());
+        // 25 hours from Tuesday 11 March 2025: short of the 27-hour ceiling, but no holiday.
+        let tuesday = parse_date("2025-03-11").expect("a date");
+        let outage = Gap {
+            from: tuesday,
+            to: tuesday + 25 * HOUR,
+        };
+        let march = coverage_without(&store, "2025-03", outage);
+        assert_eq!(march.gaps, [outage]);
+        assert!(march.minutes < march.open_minutes as usize);
+    }
+
+    #[test]
+    fn a_late_sunday_open_counts_as_closed_at_any_time_of_year() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let store = Store::new(dir.path());
+        // The first three open hours of Sunday 15 June 2025.
+        let sunday = parse_date("2025-06-15").expect("a date");
+        let open = (sunday..sunday + DAY)
+            .step_by(MINUTE as usize)
+            .find(|&t| fx().kind.is_open(t))
+            .expect("opens on Sunday");
+        let late = Gap {
+            from: open,
+            to: open + 3 * HOUR,
+        };
+        let june = coverage_without(&store, "2025-06", late);
+        assert_eq!(june.gaps, []);
+        assert_eq!(june.minutes, june.open_minutes as usize);
     }
 
     #[test]
