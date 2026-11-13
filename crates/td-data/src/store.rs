@@ -77,19 +77,19 @@ const CANDLE_COLUMNS: [&str; 7] = [
 /// series has no volume of its own.
 const ASK_COLUMNS: [&str; 4] = ["ask_open", "ask_high", "ask_low", "ask_close"];
 /// What a read of a month's bids and asks together reads: the candle columns, then the ask prices.
-const QUOTE_COLUMNS: [&str; 11] = [
-    "open_time",
-    "open",
-    "high",
-    "low",
-    "close",
-    "volume",
-    "quote_volume",
-    "ask_open",
-    "ask_high",
-    "ask_low",
-    "ask_close",
-];
+const QUOTE_COLUMNS: [&str; CANDLE_COLUMNS.len() + ASK_COLUMNS.len()] = {
+    let mut names = [""; CANDLE_COLUMNS.len() + ASK_COLUMNS.len()];
+    let mut i = 0;
+    while i < names.len() {
+        names[i] = if i < CANDLE_COLUMNS.len() {
+            CANDLE_COLUMNS[i]
+        } else {
+            ASK_COLUMNS[i - CANDLE_COLUMNS.len()]
+        };
+        i += 1;
+    }
+    names
+};
 const FUNDING_COLUMNS: [&str; 2] = ["time", "rate"];
 /// The most decoded candles one [`Store`] keeps in memory, in bytes: five years of one instrument's
 /// 1-minute candles is about 147 MB, and BTCUSDT since 2017 about 272 MB. A range larger than
@@ -1333,8 +1333,6 @@ fn quote_batch(quotes: &[(Candle, Candle)]) -> Result<RecordBatch, DataError> {
     let float = |f: fn(&Candle) -> f64| -> ArrayRef {
         Arc::new(Float64Array::from_iter_values(asks.iter().map(f)))
     };
-    let mut names = CANDLE_COLUMNS.to_vec();
-    names.extend(ASK_COLUMNS);
     let mut columns = candle_batch(&bids)?.columns().to_vec();
     columns.extend([
         float(|c| c.open),
@@ -1342,7 +1340,7 @@ fn quote_batch(quotes: &[(Candle, Candle)]) -> Result<RecordBatch, DataError> {
         float(|c| c.low),
         float(|c| c.close),
     ]);
-    record_batch(&names, columns)
+    record_batch(&QUOTE_COLUMNS, columns)
 }
 
 /// The lock that serialises read-merge-write of one store file among this process's threads.
@@ -1711,23 +1709,33 @@ impl MonthCache {
     }
 
     /// The cached rows of `path` from the columns `names` when the file there is still the one
-    /// decoded; otherwise the generation to pass to [`MonthCache::insert`] after decoding it.
+    /// decoded; otherwise the generation to pass to [`MonthCache::insert`] after decoding it. A
+    /// month's bids alone come from its entry of bids and asks when it has one, since a month is
+    /// cached once (see [`MonthCache::insert`]).
     fn get(&self, path: &Path, names: &'static [&'static str]) -> Result<MonthRows, u64> {
         let now = fs::metadata(path).ok().and_then(|m| file_stamp(&m));
-        let key = (path.to_path_buf(), names);
         let mut state = hold(&self.state);
         state.tick += 1;
         let tick = state.tick;
-        match state.entries.get_mut(&key) {
-            Some(entry) if Some(entry.stamp) == now => {
-                entry.used = tick;
-                return Ok(entry.rows.clone());
+        let bids_alone = names == CANDLE_COLUMNS;
+        let quotes: &'static [&'static str] = &QUOTE_COLUMNS;
+        for held in std::iter::once(names).chain(bids_alone.then_some(quotes)) {
+            let key = (path.to_path_buf(), held);
+            match state.entries.get_mut(&key) {
+                Some(entry) if Some(entry.stamp) == now => {
+                    entry.used = tick;
+                    let mut rows = entry.rows.clone();
+                    if held != names {
+                        rows.asks = Arc::default();
+                    }
+                    return Ok(rows);
+                }
+                Some(_) => {
+                    let stale = state.entries.remove(&key).expect("just found");
+                    state.bytes -= stale.bytes();
+                }
+                None => {}
             }
-            Some(_) => {
-                let stale = state.entries.remove(&key).expect("just found");
-                state.bytes -= stale.bytes();
-            }
-            None => {}
         }
         Err(state.generation)
     }
@@ -1735,6 +1743,13 @@ impl MonthCache {
     /// Caches the rows decoded from `path`, stamped `stamp`, unless the store wrote or deleted a
     /// file since `generation` was read; evicts the least recently used entries to stay under the
     /// cap, though one month is kept even if it alone is over.
+    ///
+    /// A month is held once: its bids and asks replace an entry of its bids alone, and its bids
+    /// alone are not cached beside an entry of its bids and asks, which [`MonthCache::get`] serves
+    /// them from.
+    // shortcut: a month read for its bids, then for its bids and asks, is still decoded twice; only
+    // what is kept is shared. Decode the asks with the bids of a kind with quotes if that first
+    // pair of reads ever matters (a bids read would then fail on a bad ask row).
     fn insert(
         &self,
         path: PathBuf,
@@ -1747,10 +1762,23 @@ impl MonthCache {
         if state.generation != generation {
             return;
         }
-        let key = (path, names);
-        if let Some(old) = state.entries.remove(&key) {
-            state.bytes -= old.bytes();
+        let quotes: &'static [&'static str] = &QUOTE_COLUMNS;
+        if names == CANDLE_COLUMNS
+            && state
+                .entries
+                .get(&(path.clone(), quotes))
+                .is_some_and(|e| e.stamp == stamp)
+        {
+            return;
         }
+        let bids: &'static [&'static str] = &CANDLE_COLUMNS;
+        let replaced = std::iter::once(names).chain((names == QUOTE_COLUMNS).then_some(bids));
+        for held in replaced {
+            if let Some(old) = state.entries.remove(&(path.clone(), held)) {
+                state.bytes -= old.bytes();
+            }
+        }
+        let key = (path, names);
         state.tick += 1;
         let entry = CacheEntry {
             stamp,
@@ -2389,7 +2417,7 @@ mod tests {
     }
 
     #[test]
-    fn bids_and_asks_of_a_month_are_cached_apart() {
+    fn a_month_is_cached_once_for_its_bids_and_its_bids_and_asks() {
         let dir = tempfile::tempdir().expect("a temp dir");
         let store = Store::new(dir.path());
         let id = InstrumentId {
@@ -2414,12 +2442,23 @@ mod tests {
             })
             .collect();
         store.write_quotes(&id, &bids, &asks).expect("writes");
+        let one_month = (bids.len() + asks.len()) * size_of::<Candle>();
+        // Bids and asks first: the bids alone come from that one decode.
+        for _ in 0..2 {
+            assert_eq!(store.read_month_asks(&id, jan).expect("asks"), asks);
+            assert_eq!(store.read_month(&id, jan).expect("bids"), bids);
+        }
+        assert_eq!(decodes(&store), 1);
+        assert_eq!(cached(&store), (1, one_month));
+
+        // Bids alone first: the bids and asks decoded next replace them, and serve every later read.
+        let store = Store::new(dir.path());
         for _ in 0..2 {
             assert_eq!(store.read_month(&id, jan).expect("bids"), bids);
             assert_eq!(store.read_month_asks(&id, jan).expect("asks"), asks);
         }
         assert_eq!(decodes(&store), 2);
-        assert_eq!(cached(&store).0, 2);
+        assert_eq!(cached(&store), (1, one_month));
     }
 
     #[test]
