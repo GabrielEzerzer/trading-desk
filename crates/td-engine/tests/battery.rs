@@ -15,11 +15,11 @@ use td_core::{
     AccountCurrency, Candle, FeeSchedule, Instrument, InstrumentKind, Millis, Timeframe,
 };
 use td_engine::{
-    BatteryResult, BatterySpec, Direction, DrawdownMode, EvidenceSettings, FirmLimits,
-    HighRiskLimits, Layer, MAX_RUNS, Metric, Objective, Outcome, ParamAxis, ParamSpace, ParamValue,
-    Params, Period, PortfolioBenchmark, PortfolioLimits, PropFirmLimits, SlippageOverride,
-    SweepPlan, TestPlan, TesterError, VerdictRule, VerdictState, WalkForwardPlan, risk,
-    run_battery,
+    AttemptTerms, BatteryResult, BatterySpec, Direction, DrawdownMode, EvidenceSettings,
+    FirmLimits, HighRiskLimits, Layer, MAX_RUNS, Metric, Objective, Outcome, ParamAxis, ParamSpace,
+    ParamValue, Params, Period, PortfolioBenchmark, PortfolioLimits, PropFirmLimits,
+    SlippageOverride, SweepPlan, TestPlan, TesterError, VerdictRule, VerdictState, WalkForwardPlan,
+    risk, run_battery,
 };
 
 const HOUR: Millis = 3_600_000;
@@ -186,8 +186,13 @@ fn prop_firm_rule() -> VerdictRule {
             max_drawdown: 0.10,
             drawdown: DrawdownMode::Trailing,
             profit_target: 0.08,
+            second_target: None,
+            min_trading_days: 0,
+            best_day_share: None,
+            trailing_floor_lock: None,
         },
         limits: PropFirmLimits::default(),
+        attempt: None,
     }
 }
 
@@ -960,7 +965,7 @@ fn the_pass_odds_run_to_their_own_horizon() {
     let bars = edge_bars(DAYS);
     let plan = plan(DAYS);
     let odds = |pass_horizon_days| {
-        let VerdictRule::PropFirm { firm, limits } = prop_firm_rule() else {
+        let VerdictRule::PropFirm { firm, limits, .. } = prop_firm_rule() else {
             unreachable!()
         };
         let rule = VerdictRule::PropFirm {
@@ -969,6 +974,7 @@ fn the_pass_odds_run_to_their_own_horizon() {
                 pass_horizon_days,
                 ..limits
             },
+            attempt: None,
         };
         let r = battery(&plan, &rule, &bars, 7, None).unwrap();
         let odds = r.prop_firm_odds.unwrap();
@@ -982,4 +988,66 @@ fn the_pass_odds_run_to_their_own_horizon() {
     let (same, short) = (odds(90), odds(1));
     assert_eq!(short.breach, same.breach);
     assert!(short.pass < same.pass, "{short:?} against {same:?}");
+}
+
+/// A prop-firm rule with attempt terms prices an attempt beside the odds, and its value line
+/// reads the value at the reduced edge; without terms there is neither.
+#[test]
+fn attempt_terms_price_an_attempt_and_add_the_value_line() {
+    let bars = edge_bars(DAYS);
+    let plan = plan(DAYS);
+    let plain = battery(&plan, &prop_firm_rule(), &bars, 7, None).unwrap();
+    assert!(plain.prop_firm_attempt.is_none());
+    assert!(plain.kind.attempt_value.is_none());
+    assert!(
+        plain
+            .verdict
+            .criteria
+            .iter()
+            .all(|c| c.id != "attempt_value")
+    );
+
+    let VerdictRule::PropFirm { firm, limits, .. } = prop_firm_rule() else {
+        unreachable!()
+    };
+    let terms = AttemptTerms {
+        account_size: 50_000.0,
+        evaluation_fee: 300.0,
+        pass_fee: 0.0,
+        refund_fee_with_first_payout: true,
+        profit_split: 0.8,
+        days_to_first_payout: 10,
+        payout_interval_days: 10,
+        min_payout: 50.0,
+        payout_cap: None,
+        max_payouts: None,
+        payout_locks_floor: false,
+        funded_horizon_days: 90,
+        evaluation_size: 1.0,
+        funded_size: 1.0,
+        reduced_edge_factor: 0.5,
+    };
+    let rule = VerdictRule::PropFirm {
+        firm,
+        limits,
+        attempt: Some(terms),
+    };
+    let priced = battery(&plan, &rule, &bars, 7, None).unwrap();
+    let attempt = priced.prop_firm_attempt.unwrap();
+    assert_eq!(attempt.reduced_edge_factor, 0.5);
+    assert_eq!(priced.kind.attempt_value, Some(attempt.reduced.value));
+    assert_eq!(
+        line(&priced, "attempt_value").value,
+        Some(attempt.reduced.value)
+    );
+    // The odds are the same with or without terms: the attempt draws from its own seed stream.
+    assert_eq!(priced.prop_firm_odds, plain.prop_firm_odds);
+    // With no passing fee, an attempt loses at most its evaluation fee.
+    for f in [attempt.full, attempt.reduced] {
+        assert!(f.value >= -terms.evaluation_fee, "{f:?}");
+        assert!(
+            (0.0..=1.0).contains(&f.pass) && f.payout_chance <= f.pass,
+            "{f:?}"
+        );
+    }
 }

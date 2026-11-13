@@ -62,7 +62,7 @@ use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde::{Deserialize, Serialize};
-use td_core::{Candle, Carry, FeeSchedule, Instrument, Millis, Timeframe};
+use td_core::{Candle, Carry, FeeSchedule, Fill, Instrument, Millis, Timeframe};
 
 use crate::metrics::{self, DAY_MS, EquitySeries};
 use crate::plan::check_start_offsets;
@@ -70,8 +70,8 @@ use crate::risk::{self, DayRollover};
 use crate::rng::derive_seed;
 use crate::runner::select_bars;
 use crate::stats::{
-    self, BootstrapSpec, DEFAULT_RESAMPLES, DrawdownBootstrap, MeanBootstrap, PropFirmOdds,
-    PropFirmSpec, RuinSpec,
+    self, BootstrapSpec, DEFAULT_RESAMPLES, DrawdownBootstrap, MeanBootstrap, PropFirmAttempt,
+    PropFirmOdds, PropFirmSpec, RuinSpec,
 };
 use crate::strategies::direction;
 use crate::tester::stitched_headline;
@@ -94,6 +94,7 @@ const SEED_RUIN: u64 = 3;
 const SEED_PROP_FIRM: u64 = 4;
 const SEED_LUCK: u64 = 5;
 const SEED_DRAWDOWN_BOOTSTRAP: u64 = 6;
+const SEED_PROP_ATTEMPT: u64 = 7;
 
 /// The evidence lines of the runs that come after the statistics (R3, R4, R6).
 const LATER_LINES: [&str; 3] = ["luck_p", "stressed_return", "start_offsets"];
@@ -132,6 +133,10 @@ pub struct BatteryResult {
     /// The prop-firm challenge odds, for a `prop_firm` rule: passing within the rule's
     /// `pass_horizon_days`, breaching within its `breach_horizon_days`.
     pub prop_firm_odds: Option<PropFirmOdds>,
+    /// The value of one attempt, for a `prop_firm` rule with attempt terms: the evaluation to the
+    /// rule's `pass_horizon_days`, then the funded account. `None` otherwise, and in a result
+    /// saved before it existed.
+    pub prop_firm_attempt: Option<PropFirmAttempt>,
     /// R8.
     pub breakdown: Option<Breakdown>,
     /// R4. `None` when it did not run.
@@ -421,6 +426,7 @@ pub fn run_battery(
         drawdown_bootstrap: None,
         trade_bootstrap: None,
         prop_firm_odds: None,
+        prop_firm_attempt: None,
         breakdown: None,
         cost_stress: None,
         start_offsets: Vec::new(),
@@ -640,10 +646,23 @@ pub fn run_battery(
                 .map(|d| d.amount / cash),
             pass_probability: None,
             breach_probability: None,
+            attempt_value: None,
         };
-        if let VerdictRule::PropFirm { firm, limits } = rule {
+        if let VerdictRule::PropFirm {
+            firm,
+            limits,
+            attempt,
+        } = rule
+        {
+            // A firm counts trading days, not calendar days: the days of `daily` with a fill.
+            let step = plan.timeframe.duration_ms();
+            let traded = traded_days(&series, &wf.fills, step, daily.len());
             let spec = PropFirmSpec {
                 target: firm.profit_target,
+                second_target: firm.second_target,
+                min_days: firm.min_trading_days as usize,
+                best_day_share: firm.best_day_share,
+                trailing_lock: firm.trailing_floor_lock,
                 daily_loss_limit: firm.daily_loss,
                 max_drawdown: firm.max_drawdown,
                 drawdown: match firm.drawdown {
@@ -658,7 +677,7 @@ pub fn run_battery(
             // The firm rule sets no time limit of its own (see `FirmLimits`), so the pass odds
             // run to the rule's `pass_horizon_days`. With the two horizons equal, both odds come
             // from the same paths.
-            let breach = stats::prop_firm_odds(&daily, &spec).ok();
+            let breach = stats::prop_firm_odds(&daily, &traded, &spec).ok();
             let pass = if limits.pass_horizon_days == limits.breach_horizon_days {
                 breach
             } else {
@@ -666,7 +685,7 @@ pub fn run_battery(
                     horizon_days: limits.pass_horizon_days as usize,
                     ..spec
                 };
-                stats::prop_firm_odds(&daily, &spec).ok()
+                stats::prop_firm_odds(&daily, &traded, &spec).ok()
             };
             result.prop_firm_odds = pass.zip(breach).map(|(p, b)| PropFirmOdds {
                 pass: p.pass,
@@ -675,6 +694,16 @@ pub fn run_battery(
             });
             kind.pass_probability = result.prop_firm_odds.map(|o| o.pass);
             kind.breach_probability = result.prop_firm_odds.map(|o| o.breach);
+            if let Some(terms) = attempt {
+                let spec = PropFirmSpec {
+                    horizon_days: limits.pass_horizon_days as usize,
+                    seed: derive_seed(seed, SEED_PROP_ATTEMPT),
+                    ..spec
+                };
+                result.prop_firm_attempt =
+                    stats::prop_firm_attempt(&daily, &traded, &spec, terms).ok();
+                kind.attempt_value = result.prop_firm_attempt.map(|a| a.reduced.value);
+            }
         }
         result.breakdown = Some(breakdown);
     }
@@ -1186,6 +1215,29 @@ fn daily_returns(series: &EquitySeries) -> Vec<f64> {
         .windows(2)
         .map(|w| if w[0] > 0.0 { w[1] / w[0] - 1.0 } else { 0.0 })
         .collect()
+}
+
+/// Whether the strategy traded on each of the `days` days of [`daily_returns`] of `series`: true
+/// on a day that holds a fill. A fill is stamped with the open of its bar, of `step`
+/// milliseconds, and shows in the equity at the bar's close, so it is put on the day that close
+/// falls on, by [`metrics::daily_equity`]'s boundaries (UTC days, a close at exactly 00:00 ending
+/// the day before): the day whose return it moved.
+///
+/// shortcut: a day with any fill counts as a trading day, so a firm's own definition (a closed
+/// trade, a smallest trade size) is not modelled; upgrade when a plan's firm needs it.
+fn traded_days(series: &EquitySeries, fills: &[Fill], step: Millis, days: usize) -> Vec<bool> {
+    let mut traded = vec![false; days];
+    let Some(first) = series.times.first() else {
+        return traded;
+    };
+    let first_day = first.div_euclid(DAY_MS);
+    for f in fills {
+        let day = (f.time + step - 1).div_euclid(DAY_MS) - first_day;
+        if let Some(t) = usize::try_from(day).ok().and_then(|d| traded.get_mut(d)) {
+            *t = true;
+        }
+    }
+    traded
 }
 
 /// The prop-firm worst daily loss inside bars, as a fraction of the starting balance: the worse
@@ -1826,6 +1878,86 @@ mod tests {
         assert!(r.drawdown_bootstrap.is_some());
         assert_eq!(r.drawdown_bootstrap, drawn(SEED_DRAWDOWN_BOOTSTRAP));
         assert_ne!(r.drawdown_bootstrap, drawn(SEED_DAILY_BOOTSTRAP));
+    }
+
+    /// A prop firm's minimum counts only the days on which the walk-forward filled an order: the
+    /// battery flags the days of its fills, on the daily returns' own days, and runs the odds on
+    /// those flags rather than counting every day.
+    #[test]
+    fn only_days_with_a_fill_count_toward_a_firms_minimum() {
+        let (plan, bars) = sma_plan(sma_axes());
+        let seed = 7;
+        let firm = crate::FirmLimits {
+            daily_loss: 0.05,
+            max_drawdown: 0.10,
+            drawdown: DrawdownMode::Static,
+            profit_target: 0.02,
+            second_target: None,
+            min_trading_days: 20,
+            best_day_share: None,
+            trailing_floor_lock: None,
+        };
+        let rule = VerdictRule::PropFirm {
+            firm,
+            limits: crate::PropFirmLimits::default(),
+            attempt: None,
+        };
+        let spec = BatterySpec {
+            strategy: "sma_cross",
+            plan: &plan,
+            rule: &rule,
+            instrument: &test_instrument(),
+            seed,
+        };
+        let r = run_battery(&spec, &bars, &[], &[], None).unwrap();
+
+        let wf = r.walk_forward.as_ref().unwrap();
+        let cash = plan.backtest.starting_cash;
+        let series = EquitySeries::new(cash, &wf.equity, plan.timeframe);
+        let daily = daily_returns(&series);
+        let step = plan.timeframe.duration_ms();
+        let traded = traded_days(&series, &wf.fills, step, daily.len());
+        // A four-hour bar lies inside one UTC day, so a fill's day is the day its bar opened.
+        let first = series.times[0].div_euclid(DAY_MS);
+        let filled: BTreeSet<usize> = wf
+            .fills
+            .iter()
+            .map(|f| (f.time.div_euclid(DAY_MS) - first) as usize)
+            .collect();
+        let flagged: BTreeSet<usize> = (0..daily.len()).filter(|&d| traded[d]).collect();
+        assert_eq!(flagged, filled);
+        assert!(
+            !filled.is_empty() && filled.len() < daily.len(),
+            "{} days with a fill of {}",
+            filled.len(),
+            daily.len()
+        );
+
+        // The two horizons are equal, so one run of the odds gives both.
+        let odds = |traded: &[bool]| {
+            let spec = PropFirmSpec {
+                target: firm.profit_target,
+                second_target: None,
+                min_days: firm.min_trading_days as usize,
+                best_day_share: None,
+                trailing_lock: None,
+                daily_loss_limit: firm.daily_loss,
+                max_drawdown: firm.max_drawdown,
+                drawdown: stats::DrawdownMode::Static,
+                horizon_days: 90,
+                paths: DEFAULT_RESAMPLES,
+                mean_block: stats::default_block_len(daily.len()),
+                seed: derive_seed(seed, SEED_PROP_FIRM),
+            };
+            stats::prop_firm_odds(&daily, traded, &spec).unwrap()
+        };
+        let fills = odds(&traded);
+        let every_day = odds(&vec![true; daily.len()]);
+        assert_eq!(r.prop_firm_odds, Some(fills));
+        assert!(
+            fills.pass < every_day.pass,
+            "{fills:?} against {every_day:?}"
+        );
     }
 
     /// A decimal parameter swept over whole numbers: the chosen sets hold `equity_fraction` as the
