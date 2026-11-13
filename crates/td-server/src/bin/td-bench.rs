@@ -57,6 +57,10 @@ struct Args {
     /// The workloads file (default: `harness/evals/perf-workloads.json` in the workspace).
     #[arg(long)]
     workloads: Option<PathBuf>,
+    /// Write the one chosen workload's dataset into this data directory, keep it, and time
+    /// nothing. The GUI's engine integration test seeds its data folder this way.
+    #[arg(long)]
+    seed: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -175,12 +179,6 @@ fn bench_all(args: &Args) -> Result<(), String> {
     let text = fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
     let file: WorkloadFile =
         serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
-    // Fresh for every run, so no dataset an older binary wrote is ever timed; removed when the
-    // run ends, with an error too.
-    let data_dir = tempfile::Builder::new()
-        .prefix("td-bench-data-")
-        .tempdir()
-        .map_err(|e| format!("cannot make the data directory: {e}"))?;
     let chosen: Vec<&Workload> = file
         .workloads
         .iter()
@@ -194,6 +192,23 @@ fn bench_all(args: &Args) -> Result<(), String> {
     if chosen.is_empty() {
         return Err("no workload matches the split and filter".into());
     }
+    if let Some(dir) = &args.seed {
+        let [w] = chosen[..] else {
+            return Err(format!(
+                "--seed writes one dataset, and {} workloads match",
+                chosen.len()
+            ));
+        };
+        let (from, to) = dataset_range(w.months);
+        eprintln!("writing dataset {} into {}", w.name, dir.display());
+        return write_dataset(&Store::new(dir), w.kind, w.seed, from, to);
+    }
+    // Fresh for every run, so no dataset an older binary wrote is ever timed; removed when the
+    // run ends, with an error too.
+    let data_dir = tempfile::Builder::new()
+        .prefix("td-bench-data-")
+        .tempdir()
+        .map_err(|e| format!("cannot make the data directory: {e}"))?;
     let mut lines = Vec::new();
     let mut total_ms = 0.0;
     let mut checksums = String::new();

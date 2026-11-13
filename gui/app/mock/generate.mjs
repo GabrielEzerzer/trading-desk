@@ -345,9 +345,13 @@ function savedBacktest({ id, strategy, params, instrument, from, days, walk, tra
   const detail = {
     id,
     run: { kind: 'backtest', result },
-    data: { bars: days, gaps: [], dropped: [], tolerated: [], funding_rates: 0 },
+    data: { bars: days, gaps: [], dropped: [], tolerated: [], closures: [], funding_rates: 0 },
     data_error: null,
     check: null,
+    // As a run saved before code hashes and cutoffs were recorded; the bridge stub fills them in.
+    code_hash: null,
+    code_matches: null,
+    data_cutoff: null,
   }
   const summary = {
     id,

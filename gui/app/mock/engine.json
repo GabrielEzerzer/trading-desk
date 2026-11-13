@@ -5482,10 +5482,14 @@
     "gaps": [],
     "dropped": [],
     "tolerated": [],
+    "closures": [],
     "funding_rates": 0
    },
    "data_error": null,
-   "check": null
+   "check": null,
+   "code_hash": null,
+   "code_matches": null,
+   "data_cutoff": null
   },
   "1794299400000-b7c8d9e0": {
    "id": "1794299400000-b7c8d9e0",
@@ -5843,10 +5847,14 @@
     "gaps": [],
     "dropped": [],
     "tolerated": [],
+    "closures": [],
     "funding_rates": 0
    },
    "data_error": null,
-   "check": null
+   "check": null,
+   "code_hash": null,
+   "code_matches": null,
+   "data_cutoff": null
   },
   "1794312000000-0d1e2f3a": {
    "id": "1794312000000-0d1e2f3a",
@@ -10791,10 +10799,14 @@
     "gaps": [],
     "dropped": [],
     "tolerated": [],
+    "closures": [],
     "funding_rates": 0
    },
    "data_error": null,
-   "check": null
+   "check": null,
+   "code_hash": null,
+   "code_matches": null,
+   "data_cutoff": null
   }
  },
  "runResult": "1794312000000-0d1e2f3a"

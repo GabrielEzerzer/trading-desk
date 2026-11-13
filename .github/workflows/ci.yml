@@ -3,7 +3,11 @@
 # and a branch has results before its PR exists.
 # It runs the Rust suite: rustfmt, clippy with warnings denied, the workspace tests, and a check that
 # the generated TypeScript API types are up to date, and td-bench's results checksum against
-# harness/evals/perf-checksums.txt.
+# harness/evals/perf-checksums.txt. Then it runs the GUI's engine integration test
+# (gui/app/src/main/engine.integration.test.ts) against the td-server it built, on every push, since a
+# Rust-only change can break the app's calls; gui.yml builds no Rust, so there that test skips itself.
+# The windows job runs the store and API tests on Windows, the one OS the app ships for, where
+# junctions, file locks and denied renames behave differently from Linux.
 # Never give this workflow production URLs, real secrets, .env.local or a service_role key.
 name: ci
 
@@ -44,7 +48,7 @@ jobs:
       # td-bench's results checksum must equal the committed value; its timings are not judged.
       - name: Benchmark results are unchanged
         run: |
-          cargo build --release -p td-server --bin td-bench --locked
+          cargo build --release -p td-server --bin td-bench --bin td-server --locked
           for split in dev test; do
             want=$(awk -v s="$split" '$1 == s { print $2 }' harness/evals/perf-checksums.txt)
             out=$(target/release/td-bench --split "$split" --reps 1)
@@ -55,3 +59,35 @@ jobs:
               exit 1
             fi
           done
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
+        with:
+          package_json_file: gui/package.json
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: gui/pnpm-lock.yaml
+      # Against the release td-server built above; td-bench seeds its data folder. TD_ENGINE_TEST=1
+      # makes a missing binary fail the test instead of skipping it.
+      - name: GUI against the real engine
+        working-directory: gui
+        env:
+          TD_ENGINE_TEST: '1'
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm exec vitest run app/src/main/engine.integration.test.ts
+
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      # The store's delete containment (junctions), its file lock and its retried renames.
+      - name: Store tests
+        run: cargo test -p td-data --lib --test store --locked
+      # They also start the td-server binary and check it stops when its stdin closes.
+      - name: API tests
+        run: cargo test -p td-server --test api --locked
