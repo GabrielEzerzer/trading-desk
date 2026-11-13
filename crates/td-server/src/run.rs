@@ -183,11 +183,11 @@ async fn blocking<T: Send + 'static>(
 type OpenStream = Box<dyn FnOnce() -> Arc<SharedStream> + Send>;
 
 async fn drive(
-    shared: Arc<Mutex<PaperSession>>,
+    session: Arc<Mutex<PaperSession>>,
     rest: Arc<dyn Rest>,
     stream: OpenStream,
 ) -> Result<(), PaperError> {
-    let shared = &*shared;
+    let shared = &*session;
     let (id, timeframe, data_dir, next, live) = {
         let s = lock(shared);
         s.check_resumable()?;
@@ -263,14 +263,42 @@ async fn drive(
                     }
                     None => Vec::new(),
                 };
-                let mut s = lock(shared);
-                // Bars flow again, after a failed backfill too.
-                s.set_status(Status::Live);
-                s.feed(bar, charged, false)?;
+                feed_live(&session, bar, charged).await?;
             }
         }
     }
     Err(PaperError::FeedEnded)
+}
+
+/// Feeds one live bar with its funding on a blocking thread. Its line is synced to disk before the
+/// next bar is fed, as before, but the sync no longer holds up an async thread: a resume's backfill
+/// feeds hundreds of bars back to back, and requests for the session wait on its lock meanwhile.
+/// The lock is let go between bars.
+async fn feed_live(
+    session: &Arc<Mutex<PaperSession>>,
+    bar: Candle,
+    charged: Vec<Funding>,
+) -> Result<(), PaperError> {
+    let session = Arc::clone(session);
+    let fed = tokio::task::spawn_blocking(move || {
+        let mut s = lock(&session);
+        // A stop that landed while this waited for the lock has aborted the run loop and set the
+        // final status under the lock (see `start_on`), and a resume may be reading the log by
+        // now: feed nothing, as a stop before the bar arrived would have.
+        if matches!(s.status(), Status::Stopped | Status::Error(_)) {
+            return Ok(());
+        }
+        // Bars flow again, after a failed backfill too.
+        s.set_status(Status::Live);
+        s.feed(bar, charged, false)
+    })
+    .await;
+    match fed {
+        Ok(fed) => fed,
+        // Shown as a panic in the run loop, as one fed inline was.
+        Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+        Err(e) => Err(PaperError::Task(e.to_string())),
+    }
 }
 
 /// The bars of `timeframe` to warm up on, opening in `[from, end)`: from the local store as far as
@@ -589,6 +617,31 @@ mod tests {
         }
         let calls = *slow.calls.lock().expect("lock");
         (charged, calls, warnings)
+    }
+
+    /// The live bar's line is synced off the async thread: on this single-threaded runtime, a sync
+    /// made inline would run on the test's own thread, where it is set to fail.
+    #[tokio::test]
+    async fn a_live_bar_is_synced_off_the_async_thread() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let paper = PaperSession::create(dir.path(), "offthread", crate::paper::tests::config())
+            .expect("creates");
+        let session = Arc::new(Mutex::new(paper));
+        // As the run loop leaves it before its feed starts; a stopped session is fed nothing.
+        lock(&session).set_status(Status::Reconnecting);
+        crate::paper::FAIL_SYNC.set(true);
+        let fed = feed_live(&session, bar(T), Vec::new()).await;
+        crate::paper::FAIL_SYNC.set(false);
+        fed.expect("synced on a blocking thread");
+        assert_eq!(lock(&session).last_bar().map(|b| b.open_time), Some(T));
+        assert_eq!(*lock(&session).status(), Status::Live);
+
+        // A bar that waited for the lock while a stop set the final status is not fed.
+        lock(&session).set_status(Status::Stopped);
+        feed_live(&session, bar(T + MIN), Vec::new())
+            .await
+            .expect("skipped");
+        assert_eq!(lock(&session).last_bar().map(|b| b.open_time), Some(T));
     }
 
     #[tokio::test]

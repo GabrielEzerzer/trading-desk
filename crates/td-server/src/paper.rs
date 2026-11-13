@@ -971,7 +971,7 @@ struct Mark {
 #[cfg(test)]
 thread_local! {
     /// Makes [`sync_data`] fail on this thread, to test a line that was written but not synced.
-    static FAIL_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(crate) static FAIL_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// [`File::sync_data`]; tests can make it fail.
@@ -1028,7 +1028,7 @@ fn check_id(id: &str) -> Result<(), PaperError> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use td_core::{
         InstrumentId, InstrumentKind, OrderRequest, OrderType, Side, TimeInForce, Venue,
     };
@@ -1067,7 +1067,7 @@ mod tests {
         }
     }
 
-    fn config() -> PaperConfig {
+    pub(crate) fn config() -> PaperConfig {
         PaperConfig {
             strategy: "sma_cross".into(),
             params: Params::new(),
