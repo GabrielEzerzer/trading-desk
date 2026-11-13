@@ -142,6 +142,7 @@ pub fn render() -> String {
         td_engine::KindInputs,
         td_engine::OosIntegrityInputs,
         td_engine::PlateauReport,
+        td_engine::PlateauDirection,
         td_engine::stats::MeanBootstrap,
         td_engine::stats::DrawdownBootstrap,
         td_engine::stats::Quantiles,

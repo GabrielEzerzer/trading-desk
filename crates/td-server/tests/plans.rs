@@ -270,6 +270,7 @@ fn entry(permutations: u32) -> StrategyEntry {
             max_leverage: 1.0,
             slippage: Vec::new(),
             account_currency: td_core::AccountCurrency::Quote,
+            fee_override: None,
         },
         sweep: SweepPlan {
             fixed: Params::new(),
@@ -1183,7 +1184,7 @@ fn fx_entry() -> StrategyEntry {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_plan_on_fx_trades_on_the_stored_asks_and_skips_only_the_luck_test() {
+async fn a_plan_on_fx_trades_on_the_stored_asks_in_every_step() {
     let dir = tempfile::tempdir().expect("temp dir");
     let path = dir.path().to_path_buf();
     tokio::task::spawn_blocking(move || fx_store(&path))
@@ -1203,21 +1204,12 @@ async fn a_plan_on_fx_trades_on_the_stored_asks_and_skips_only_the_luck_test() {
 
     let mut sweeps = Vec::new();
     for kept in kept {
-        // The battery got as far as the luck test and skipped it, as on any market with quotes.
         let luck = kept
             .verdict
             .criteria
             .iter()
             .find(|c| c.id == "luck_p")
             .expect("a luck line");
-        assert_eq!(luck.outcome, td_engine::Outcome::Inconclusive, "{luck:?}");
-        assert_eq!(
-            luck.note.as_deref(),
-            Some(
-                "The luck test does not run on a market with quotes yet: it shuffles the bars \
-                 and cannot shuffle the asks with them."
-            )
-        );
         let (status, body) = t.get(&format!("/runs/{}", kept.run_id)).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         let detail: RunDetail = serde_json::from_value(body).unwrap();
@@ -1225,7 +1217,10 @@ async fn a_plan_on_fx_trades_on_the_stored_asks_and_skips_only_the_luck_test() {
             panic!("a plan run: {:?}", detail.run.kind());
         };
         assert_eq!(run.battery.verdict, kept.verdict);
-        assert!(run.battery.permutation.is_none() && !run.battery.luck_cancelled);
+        // The battery ran the luck test too, as on any market, and its line holds its p.
+        let permutation = run.battery.permutation.as_ref().expect("the luck test ran");
+        assert_eq!(luck.value, Some(permutation.p_value));
+        assert!(!run.battery.luck_cancelled);
         // The saved fingerprint covers the asks the store holds today.
         let check = detail.check.unwrap();
         assert!(check.data_matches);
