@@ -8,6 +8,7 @@ import { RunCancelled } from './source'
 
 const MINUTE = 60_000
 const HOUR = 60 * MINUTE
+const DAY = 24 * HOUR
 
 const TIMEFRAME_MS: Partial<Record<Timeframe, number>> = { '1h': HOUR, '4h': 4 * HOUR, '1d': 24 * HOUR }
 
@@ -56,19 +57,29 @@ export function latestRuns(runs: RunSummary[]): Map<string, LastRun> {
   )
 }
 
+/** Midnight UTC at the end of a data cutoff date (`YYYY-MM-DD`): the first moment the engine refuses. */
+export function cutoffEnd(date: string): Millis {
+  return Date.parse(`${date}T00:00:00Z`) + DAY
+}
+
 /**
  * The whole stored range of a dataset at a timeframe: from the first bar that opens at or after the
- * first stored minute to the end of the last whole bar. Null when nothing is stored or the range
- * holds no whole bar.
+ * first stored minute to the end of the last whole bar, ending no later than `until` (the end of a
+ * data cutoff). Null when nothing is stored or the range holds no whole bar.
  */
-export function datasetRange(coverage: CoverageResponse, timeframe: Timeframe): { from: Millis; to: Millis } | null {
+export function datasetRange(
+  coverage: CoverageResponse,
+  timeframe: Timeframe,
+  until?: Millis,
+): { from: Millis; to: Millis } | null {
   const step = TIMEFRAME_MS[timeframe]
   const first = coverage.months[0]?.first
   const last = coverage.months.at(-1)?.last
   if (!step || first === undefined || last === undefined) return null
   // Hours and days are aligned to the epoch (td_core::Timeframe::floor).
   const from = Math.ceil(first / step) * step
-  const to = Math.floor((last + MINUTE) / step) * step
+  const end = Math.min(last + MINUTE, until ?? Number.POSITIVE_INFINITY)
+  const to = Math.floor(end / step) * step
   return to > from ? { from, to } : null
 }
 
@@ -134,6 +145,9 @@ export function toVerdict(detail: RunDetail): VerdictPreview {
       returnPct: t.return_on_notional * 100,
       open: t.open,
     })),
+    // An old run that saved no code hash is unknown, and says nothing.
+    codeChanged: detail.code_matches === false,
+    dataCutoff: detail.data_cutoff ?? null,
   }
 }
 

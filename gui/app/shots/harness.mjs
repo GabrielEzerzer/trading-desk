@@ -405,6 +405,21 @@ export const STATES = [
     },
   },
   {
+    // The engine started with TD_DATA_CUTOFF, and the strategy's code changed since its saved run.
+    name: 'lab-engine-code-changed',
+    config: { engine: 'running', mock: false, dataCutoff: '2025-03-31', codeChanged: true },
+    steps: async (page) => {
+      await chooseRow(page, /SMA cross/)
+      await page.getByRole('heading', { name: 'No verdict rule yet' }).waitFor()
+      await page.getByText("The strategy's code has changed since this run", { exact: false }).waitFor()
+    },
+  },
+  {
+    name: 'lab-engine-cutoff',
+    config: { engine: 'running', mock: false, dataCutoff: '2025-03-31' },
+    steps: async (page) => page.getByText('Data cutoff in force', { exact: false }).waitFor(),
+  },
+  {
     name: 'lab-engine-null-metrics',
     config: { engine: 'running', mock: false },
     steps: async (page) => {

@@ -16,6 +16,7 @@ const KEY_STATES = [
   'lab-run-failed',
   'lab-list-engine',
   'lab-engine-past-result',
+  'lab-engine-code-changed',
   'lab-engine-null-metrics',
   'lab-engine-no-data',
   'lab-engine-downloading',

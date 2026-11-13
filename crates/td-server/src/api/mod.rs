@@ -3,7 +3,13 @@
 //!
 //! Routes (JSON in and out; errors are `{"error": {"code", "message"}}` with a matching status):
 //!
-//! - `GET /health`: the server version.
+//! - `GET /health`: the server version, and the data cutoff when one is in force (`data_cutoff`,
+//!   the date `TD_DATA_CUTOFF` set when the engine started; see [`runs::DataCutoff`]). With a
+//!   cutoff, every run, sweep, walk-forward and test battery whose range ends after the end of
+//!   that date is refused with a 422 `after_cutoff`, when it is requested and again when its job
+//!   loads the data. Paper sessions and `GET /candles` are not affected. This route is where the
+//!   API says a cutoff is in force; each saved run also records the cutoff it was made under
+//!   (`data_cutoff` on `GET /runs/{id}`).
 //! - `GET /instruments?venue=&kind=`: the instruments a venue lists, cached per server run.
 //! - `POST /data/download` `{instrument, from, to}`: starts a download job, answers `{job_id}`.
 //!   `from` may not be before 2017-01-01 UTC for binance and bybit ([`data::EARLIEST_FROM`]), or
@@ -46,7 +52,8 @@
 //!   where a bar of the timeframe opens. The range is checked against the store first: a gap of a
 //!   day or more, or for FX, whose venue closes on holidays, two days or more of open time counted
 //!   across the weekends inside it, is a 422 `data_missing` naming the missing spans; shorter gaps
-//!   are run and listed in the result's data report (`gaps`, `dropped`). A bad spec is a 400
+//!   are run and listed in the result's data report (`gaps`, `dropped`). A range that ends after
+//!   the data cutoff is a 422 `after_cutoff` (see `GET /health`). A bad spec is a 400
 //!   (`invalid_config`, which includes an unknown strategy and range edges off a bar boundary, or
 //!   `invalid_spec`). At most
 //!   [`jobs::MAX_RUN_JOBS`] run jobs are queued or running at once; one more is a 429
@@ -57,15 +64,18 @@
 //!   `job_not_done` while it is queued or running (ask again later), 409 `no_result` once it has
 //!   finished without a saved run (failed, cancelled, or not a run job).
 //! - `GET /runs`: the saved runs, newest first, one summary row each. `GET /runs/{id}`: one saved
-//!   run with its data report (`data_error` says why when that report is damaged) and a check of
-//!   whether its data and engine still match.
+//!   run with its data report (`data_error` says why when that report is damaged), a check of
+//!   whether its data and engine still match, the hash of the strategy's source file it was made
+//!   with and whether the file is still the same (`code_hash`, `code_matches`, `null` when
+//!   unknown) and the data cutoff it was made under (`data_cutoff`).
 //! - `POST /runs/plan` `{strategy, instruments?}` (a `PlanRequest`): runs the strategy's test
 //!   battery on each instrument of its plan, or on the given ones, as one job of kind `plan`, and
 //!   answers `{job_id}` (see [`plans`]). 400 `invalid_config` for an unknown strategy or an
 //!   instrument the venue does not list, `invalid_plan` for a plan or rule that fails its checks,
 //!   `instrument_not_in_plan` for an instrument the plan does not test, `invalid_request` for an
 //!   empty or repeated list; 422 `data_missing`, naming the instrument and the span, when the store
-//!   lacks part of the plan's period (nothing is downloaded); 429 `too_many_runs` as for the other
+//!   lacks part of the plan's period (nothing is downloaded); 422 `after_cutoff` when the period
+//!   ends after the data cutoff; 429 `too_many_runs` as for the other
 //!   runs. The job's result (`PlanDone`) holds one verdict and saved run id per instrument; a
 //!   cancelled plan job keeps the instruments it finished, and the one it stopped during the luck
 //!   test, in its result; a failed one keeps those it saved before the error. Each instrument's run
@@ -74,8 +84,14 @@
 //!   (`VerdictSummary`; the newest complete one, so a luck test stopped by a cancel does not
 //!   replace a finished battery), with how many batteries that pair has saved, the run id, its time
 //!   and the engine revision, whether that revision is this engine's (`engine_matches`), whether
-//!   the strategy's plan and rule are still the ones it ran under (`plan_matches`) and whether its
-//!   luck test finished (`complete`). Only the given strategy's with `strategy`.
+//!   the strategy's plan and rule are still the ones it ran under (`plan_matches`), whether the
+//!   strategy's source file is still the one it ran with (`code_matches`, `null` when unknown,
+//!   as for a battery saved before code hashes were recorded), `stale` when any of those three is
+//!   not true, and whether its luck test finished (`complete`). Each row also lists the limits of
+//!   the rule it was judged under that are looser than its kind's defaults (`loosened`), and how
+//!   many distinct versions of the strategy's code have been through the battery on that
+//!   instrument (`code_versions`). The run and version counts are keyed by strategy name, so
+//!   renaming a strategy starts both again from zero. Only the given strategy's with `strategy`.
 //! - Paper sessions (see [`sessions`]):
 //!   - `POST /sessions` `{strategy, params, instrument, timeframe, starting_cash, slippage_bps,
 //!     fees?}`: creates a session and starts it, 201 with its summary. `instrument` is an
@@ -178,6 +194,8 @@ pub struct ApiConfig {
     pub token: Token,
     /// The port on 127.0.0.1; 0 lets the operating system choose.
     pub port: u16,
+    /// The date after which runs read no bars (`TD_DATA_CUTOFF`); `None` for no limit.
+    pub data_cutoff: Option<runs::DataCutoff>,
 }
 
 type InstrumentCache = HashMap<(Venue, InstrumentKind), InstrumentsResponse>;
@@ -196,6 +214,8 @@ pub(crate) struct AppState {
     strategies: Arc<Vec<StrategyEntry>>,
     /// Turns true when the server is stopping; WebSocket connections close on it.
     shutdown: watch::Receiver<bool>,
+    /// The data cutoff every run is checked against.
+    data_cutoff: Option<runs::DataCutoff>,
 }
 
 impl AppState {
@@ -256,6 +276,7 @@ impl Server {
             instruments: Mutex::new(HashMap::new()),
             strategies: Arc::new(strategies),
             shutdown: shutdown_rx.clone(),
+            data_cutoff: config.data_cutoff,
         });
         let app = router(state).into_make_service_with_connect_info::<SocketAddr>();
         let mut stop = shutdown_rx;
@@ -360,11 +381,16 @@ pub(crate) fn router(state: Arc<AppState>) -> Router {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 pub struct HealthResponse {
     pub version: String,
+    /// The data cutoff date (`TD_DATA_CUTOFF`, `YYYY-MM-DD` UTC) when one is in force: every run,
+    /// sweep, walk-forward and test battery whose range ends after that date is refused. `null`
+    /// when there is none.
+    pub data_cutoff: Option<String>,
 }
 
-async fn health() -> Json<HealthResponse> {
+async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
     Json(HealthResponse {
         version: env!("CARGO_PKG_VERSION").to_string(),
+        data_cutoff: state.data_cutoff.as_ref().map(|c| c.date().to_string()),
     })
 }
 
@@ -493,6 +519,7 @@ mod tests {
             instruments: Mutex::new(HashMap::new()),
             strategies: Arc::new(td_engine::strategies()),
             shutdown: watch::channel(false).1,
+            data_cutoff: None,
         });
         let app = router(state).layer(MockConnectInfo(peer));
         let server = tokio::spawn(async move { axum::serve(listener, app).await });

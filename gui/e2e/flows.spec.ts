@@ -197,6 +197,32 @@ test.describe('running on the engine', () => {
     await expect(page.getByRole('button', { name: /Donchian breakout/ })).toContainText('10 Nov 2026 ·')
   })
 
+  test('with a data cutoff in force the Lab says so, and a run ends at the cutoff', async ({ page, open }) => {
+    await open({ ...engine, dataCutoff: '2025-03-31' })
+    await expect(page.getByText('Data cutoff in force: runs use no bars after 31 Mar 2025.')).toBeVisible()
+    await page.getByRole('button', { name: /Donchian breakout/ }).click()
+    await expect(page.getByText('Data cutoff in force: runs use no bars after 31 Mar 2025.')).toBeVisible()
+    await page.getByRole('button', { name: 'Overrides' }).click()
+    await page.getByRole('menuitemradio', { name: '1d' }).click()
+    await page.getByRole('button', { name: 'Run', exact: true }).click()
+    await expect(page.locator('#verdict')).toHaveText('No verdict rule yet', { timeout: 10_000 })
+    const sent = (await calls(page)).filter((c) => c.method === 'POST' && c.path === '/runs/backtest')
+    // The stored range runs to 2025-07-01; the run stops at the end of the cutoff date.
+    expect(sent[0]?.body).toMatchObject({ from: Date.UTC(2024, 0, 1), to: Date.UTC(2025, 3, 1) })
+    await expect(page.locator('.footnote')).toContainText('Data cutoff 31 Mar 2025')
+  })
+
+  test('a past run whose strategy code has changed says so; one that has not says nothing', async ({ page, open }) => {
+    await open({ ...engine, codeChanged: true })
+    await page.getByRole('button', { name: /SMA cross/ }).click()
+    await expect(page.locator('#verdict')).toHaveText('No verdict rule yet')
+    await expect(page.locator('.result-note')).toHaveText(
+      "The strategy's code has changed since this run, so the result may not hold for it now.",
+    )
+    await expect(page.locator('.footnote')).not.toContainText('Data cutoff')
+    await expect(page.locator('.cutoff-note')).toHaveCount(0)
+  })
+
   test('Cancel asks the engine to stop the job', async ({ page, open }) => {
     await open(engine)
     await page.getByRole('button', { name: /Donchian breakout/ }).click()
