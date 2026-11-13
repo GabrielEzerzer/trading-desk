@@ -16,6 +16,7 @@ import { createEngine } from './engine'
 import { isExternalLink } from './links'
 import { createQuit } from './quit'
 import { Sidecar, sidecarBin } from './sidecar'
+import { SMOKE_FAIL_CODE, createSmoke } from './smoke'
 import { EngineSocket } from './socket'
 import { spawnWatchdog } from './watchdog'
 
@@ -25,6 +26,23 @@ const MIN_WIDTH = 900
 const MIN_HEIGHT = 600
 
 const log = (line: string) => console.log(`[td-server] ${line}`)
+
+// The install check runs the installed app on a fresh profile (gui/scripts/install-check.mjs).
+if (process.env.TD_USER_DATA_DIR) app.setPath('userData', process.env.TD_USER_DATA_DIR)
+const engineBin = sidecarBin(process.env, app.getAppPath(), app.isPackaged)
+const smoke =
+  process.env.TD_SMOKE === '1'
+    ? createSmoke({
+        pass: () => {
+          console.log(`TD_SMOKE ok engine=${engineBin}`)
+          app.quit()
+        },
+        fail: (reason) => {
+          console.error(`TD_SMOKE fail: ${reason}`)
+          app.exit(SMOKE_FAIL_CODE)
+        },
+      })
+    : null
 
 let window: BrowserWindow | null = null
 // Aborted when the app quits, so no request to the engine is left open.
@@ -49,10 +67,13 @@ const quit = createQuit({
 })
 
 const engine = createEngine({
-  spawn: () => new Sidecar({ bin: sidecarBin(process.env, app.getAppPath(), app.isPackaged), env: process.env, log }),
+  spawn: () => new Sidecar({ bin: engineBin, env: process.env, log }),
   openSocket: (connection) => socket.open(connection),
   closeSocket: () => socket.close(),
-  onStatus: (status: EngineStatus) => window?.webContents.send(IPC.statusChanged, status),
+  onStatus: (status: EngineStatus) => {
+    window?.webContents.send(IPC.statusChanged, status)
+    smoke?.engine(status)
+  },
   quit,
   log,
 })
@@ -93,6 +114,8 @@ function registerIpc(): void {
   })
   ipcMain.handle(IPC.status, (event) => {
     checkSender(event)
+    // The renderer asks on start through window.td, so this proves the preload and the page run.
+    smoke?.loaded()
     return engine.status
   })
   ipcMain.handle(IPC.restartEngine, async (event, ...args: unknown[]) => {
@@ -138,6 +161,7 @@ function createWindow(): void {
   })
   window = win
   win.once('ready-to-show', () => win.show())
+  if (smoke) win.webContents.once('did-fail-load', (_event, code, description) => smoke.loadFailed(`${description} (${code})`))
   win.on('closed', () => {
     window = null
   })
