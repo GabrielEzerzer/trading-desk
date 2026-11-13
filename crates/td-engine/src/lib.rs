@@ -63,7 +63,7 @@ pub use plan::{
     date,
 };
 pub use portfolio::Portfolio;
-pub use registry::{StrategyEntry, build_strategy, find_strategy, strategies};
+pub use registry::{StrategyEntry, build_strategy, code_hash, find_strategy, strategies};
 pub use results::{
     PlanRun, RunId, RunKind, RunSummary, SavedRun, StoreError, list, load, save, save_with_files,
 };
@@ -89,8 +89,8 @@ pub use trades::{
 };
 pub use verdict::{
     Comparison, Criterion, DrawdownMode, EvidenceInputs, FirmLimits, HighRiskLimits,
-    IntegrityInputs, KindInputs, Layer, MAX_DROPPED_SHARE, OosIntegrityInputs, Outcome,
-    PortfolioBenchmark, PortfolioLimits, PropFirmLimits, RuleKind, TOO_GOOD_SHARPE, Unit, Verdict,
-    VerdictRule, VerdictState, combine, evaluate, evaluate_evidence, evaluate_integrity,
+    IntegrityInputs, KindInputs, Layer, LoosenedLimit, MAX_DROPPED_SHARE, OosIntegrityInputs,
+    Outcome, PortfolioBenchmark, PortfolioLimits, PropFirmLimits, RuleKind, TOO_GOOD_SHARPE, Unit,
+    Verdict, VerdictRule, VerdictState, combine, evaluate, evaluate_evidence, evaluate_integrity,
     evaluate_oos_integrity,
 };
