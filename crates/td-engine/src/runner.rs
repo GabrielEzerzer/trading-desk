@@ -279,6 +279,20 @@ pub fn run_strategy(
     run_built(config, bars, asks, funding, || Ok(strategy))
 }
 
+/// The metrics [`run`] would report, without the parts of its result a sweep row does not keep:
+/// the buy-and-hold benchmark, the data fingerprint and the copies of the equity and orders.
+pub(crate) fn run_metrics(
+    config: &BacktestConfig,
+    bars: &[Candle],
+    asks: &[Candle],
+    funding: &[(Millis, f64)],
+) -> Result<MetricsReport, EngineError> {
+    let sim = simulate(config, bars, asks, funding, || {
+        build_strategy(&config.strategy, &config.params)
+    })?;
+    Ok(sim.report)
+}
+
 /// The backtest of [`run`], building the strategy with `build` once the data has been checked, so
 /// a bad range or ask is reported before an unknown strategy, as it always was.
 fn run_built(
@@ -288,6 +302,79 @@ fn run_built(
     funding: &[(Millis, f64)],
     build: impl FnOnce() -> Result<Box<dyn Strategy>, EngineError>,
 ) -> Result<BacktestResult, EngineError> {
+    let Simulated {
+        warmup,
+        bars,
+        traded_asks,
+        used_asks,
+        funding,
+        ranges,
+        used_funding,
+        session,
+        fills,
+        trades,
+        series,
+        intrabar,
+        report,
+    } = simulate(config, bars, asks, funding, build)?;
+    let benchmark = benchmark(
+        config,
+        &bars,
+        &traded_asks,
+        &funding,
+        &ranges,
+        &series,
+        &report,
+    );
+    let mut used_bars = warmup;
+    used_bars.extend_from_slice(&bars);
+    let used_asks: Vec<Candle> = used_asks.into_iter().flatten().collect();
+
+    Ok(BacktestResult {
+        config: config.clone(),
+        engine_version: env!("CARGO_PKG_VERSION").to_string(),
+        engine_revision: ENGINE_REVISION,
+        data_fingerprint: data_fingerprint(&used_bars, &used_asks, &used_funding),
+        equity: session.equity().to_vec(),
+        orders: session.orders().to_vec(),
+        fills,
+        trades,
+        metrics: report,
+        benchmark,
+        equity_extremes: intrabar.ranges,
+    })
+}
+
+/// What a backtest's simulation leaves for [`run_built`] and [`run_metrics`] to finish from.
+struct Simulated {
+    /// The warm-up bars.
+    warmup: Vec<Candle>,
+    /// The traded bars.
+    bars: Vec<Candle>,
+    traded_asks: Vec<Option<Candle>>,
+    /// The ask of every warm-up bar, then of every traded bar.
+    used_asks: Vec<Option<Candle>>,
+    /// All the funding events given, sorted.
+    funding: Vec<(Millis, f64)>,
+    ranges: Vec<std::ops::Range<usize>>,
+    /// The funding events charged.
+    used_funding: Vec<(Millis, f64)>,
+    session: Session,
+    fills: Vec<Fill>,
+    trades: Vec<Trade>,
+    series: EquitySeries,
+    intrabar: Intrabar,
+    report: MetricsReport,
+}
+
+/// Checks the data, runs the strategy on a [`Session`] and derives the trade list and metrics.
+fn simulate(
+    config: &BacktestConfig,
+    bars: &[Candle],
+    asks: &[Candle],
+    funding: &[(Millis, f64)],
+    build: impl FnOnce() -> Result<Box<dyn Strategy>, EngineError>,
+) -> Result<Simulated, EngineError> {
     let (warmup, traded) = select_bars(config, bars)?;
     let mut used_asks = match_asks(config.instrument.id.kind, bars, asks, &warmup)?;
     let traded_asks = match_asks(config.instrument.id.kind, bars, asks, &traded)?;
@@ -357,31 +444,20 @@ fn run_built(
         session.portfolio().funding_paid(),
         account,
     );
-    let benchmark = benchmark(
-        config,
-        &bars,
-        &traded_asks,
-        &funding,
-        &ranges,
-        &series,
-        &report,
-    );
-    let mut used_bars = warmup;
-    used_bars.extend_from_slice(&bars);
-    let used_asks: Vec<Candle> = used_asks.into_iter().flatten().collect();
-
-    Ok(BacktestResult {
-        config: config.clone(),
-        engine_version: env!("CARGO_PKG_VERSION").to_string(),
-        engine_revision: ENGINE_REVISION,
-        data_fingerprint: data_fingerprint(&used_bars, &used_asks, &used_funding),
-        equity: session.equity().to_vec(),
-        orders: session.orders().to_vec(),
+    Ok(Simulated {
+        warmup,
+        bars,
+        traded_asks,
+        used_asks,
+        funding,
+        ranges,
+        used_funding,
+        session,
         fills,
         trades,
-        metrics: report,
-        benchmark,
-        equity_extremes: intrabar.ranges,
+        series,
+        intrabar,
+        report,
     })
 }
 
@@ -789,6 +865,80 @@ mod tests {
     use super::*;
 
     const HOUR: Millis = 3_600_000;
+
+    #[test]
+    fn run_metrics_reports_what_run_reports() {
+        let bars: Vec<Candle> = (0..300)
+            .map(|i| {
+                let close = 100.0 + 10.0 * ((i as f64) / 15.0).sin();
+                Candle {
+                    open_time: i * HOUR,
+                    open: close,
+                    high: close * 1.001,
+                    low: close * 0.999,
+                    close,
+                    volume: 1.0,
+                    quote_volume: close,
+                }
+            })
+            .collect();
+        let funding: Vec<(Millis, f64)> = (0..300 / 8).map(|i| (i * 8 * HOUR, 0.0001)).collect();
+        let mut config = BacktestConfig {
+            strategy: "sma_cross".into(),
+            params: Params::new()
+                .with("fast", crate::ParamValue::Int(3))
+                .with("slow", crate::ParamValue::Int(8))
+                .with("allow_short", crate::ParamValue::Bool(true)),
+            instrument: Instrument {
+                id: td_core::InstrumentId {
+                    venue: td_core::Venue::Binance,
+                    symbol: "TESTUSDT".into(),
+                    kind: InstrumentKind::Perpetual,
+                },
+                base: "TEST".into(),
+                quote: "USDT".into(),
+                tick_size: 0.01,
+                lot_size: 0.001,
+                min_qty: 0.001,
+                min_notional: 1.0,
+                fees: FeeSchedule {
+                    maker: 0.001,
+                    taker: 0.002,
+                    per_unit: 0.0,
+                },
+            },
+            timeframe: Timeframe::H1,
+            from: 50 * HOUR,
+            to: 300 * HOUR,
+            starting_cash: 10_000.0,
+            slippage_bps: 2.0,
+            fee_override: None,
+            max_leverage: 2.0,
+            warmup_from: Some(20 * HOUR),
+            close_at_end: true,
+            account_currency: AccountCurrency::Quote,
+        };
+        let full = run(&config, &bars, &[], &funding).unwrap();
+        assert!(full.metrics.trades > 2, "{:?}", full.metrics);
+        assert_eq!(
+            run_metrics(&config, &bars, &[], &funding).unwrap(),
+            full.metrics
+        );
+
+        // A parameter set the strategy refuses is the same error, which a sweep turns into a row.
+        config.params = config.params.with("fast", crate::ParamValue::Int(9));
+        let refused = run(&config, &bars, &[], &funding).unwrap_err();
+        assert!(
+            matches!(refused, EngineError::InvalidParam { .. }),
+            "{refused:?}"
+        );
+        assert_eq!(
+            run_metrics(&config, &bars, &[], &funding)
+                .unwrap_err()
+                .to_string(),
+            refused.to_string()
+        );
+    }
 
     #[test]
     fn alpha_is_annualised_by_the_returns_observed_per_year_across_weekend_gaps() {
