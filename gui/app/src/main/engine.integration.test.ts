@@ -164,6 +164,11 @@ describe.skipIf(!present)('the real td-server', () => {
       const { job_id } = await client.startBacktest(config)
       const job = ((await finished) as { job: JobInfo }).job
       expect(job).toMatchObject({ id: job_id, kind: 'backtest', status: 'done', error: null })
+      // A run downloads what the store lacks through the real venue (runs.rs, "downloading the
+      // data: ..."); the seeded range must cover it, so the test never reaches the network.
+      const progress = messages.flatMap((m) => (m.type === 'job' && m.job.id === job_id ? [m.job.message] : []))
+      expect(progress.length).toBeGreaterThan(0)
+      expect(progress.filter((line) => line.startsWith('downloading'))).toEqual([])
       expect((await client.job(job_id)).status).toBe('done')
       await expect(client.cancelJob(job_id)).rejects.toMatchObject({ status: 409, code: 'job_finished' })
 

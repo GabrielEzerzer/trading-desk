@@ -423,7 +423,9 @@ async fn strategies(State(state): State<Arc<AppState>>) -> Json<Vec<StrategyInfo
     Json(strategy_infos(state.strategies.as_ref().clone()))
 }
 
-fn strategy_infos(entries: Vec<StrategyEntry>) -> Vec<StrategyInfo> {
+/// What `GET /strategies` returns for `entries`. Public only so tests/gui_fixtures.rs can check
+/// the GUI's fake engine against it.
+pub fn strategy_infos(entries: Vec<StrategyEntry>) -> Vec<StrategyInfo> {
     entries
         .into_iter()
         .map(|e| StrategyInfo {
