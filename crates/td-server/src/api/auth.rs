@@ -33,7 +33,7 @@ use super::error::ApiError;
 pub const WS_TOKEN_PROTOCOL_PREFIX: &str = "td-token.";
 
 /// The one path where the subprotocol token counts.
-pub const WS_PATH: &str = "/ws";
+const WS_PATH: &str = "/ws";
 
 /// The secret a client must present. New for every launch unless `TD_TOKEN` fixes it.
 #[derive(Clone, PartialEq, Eq)]
@@ -82,7 +82,7 @@ impl Token {
 /// `forbidden_host`), and the token must match (401 `unauthorized`). A request with no known peer
 /// address is refused. `path` is the request's path, which decides whether a subprotocol token
 /// counts.
-pub fn check_request(
+fn check_request(
     token: &Token,
     port: u16,
     peer: Option<SocketAddr>,

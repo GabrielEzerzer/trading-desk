@@ -53,7 +53,7 @@ use super::jobs::{JobCreated, JobCtx, JobError, JobRequest, JobResult, JobStatus
 use super::source::MarketSource;
 
 /// The folder under the data directory that holds saved runs.
-pub const RUNS_DIR: &str = "runs";
+const RUNS_DIR: &str = "runs";
 
 /// The file beside a saved run's `result.json` that holds its [`DataReport`].
 const DATA_REPORT_FILE: &str = "data.json";
@@ -62,7 +62,7 @@ const DATA_REPORT_FILE: &str = "data.json";
 pub(super) const RECORD_FILE: &str = "record.json";
 
 /// The environment variable that sets the data cutoff.
-pub const DATA_CUTOFF_VAR: &str = "TD_DATA_CUTOFF";
+const DATA_CUTOFF_VAR: &str = "TD_DATA_CUTOFF";
 
 /// A UTC date after which no run reads bars (#114), set with `TD_DATA_CUTOFF=YYYY-MM-DD` when the
 /// engine starts. It keeps the latest months unseen while a strategy is worked on; the final check

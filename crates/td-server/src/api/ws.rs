@@ -65,7 +65,7 @@ use super::live::{AbortOnDrop, CandleFeed, ChartBar};
 use super::sessions::{SessionState, Sessions};
 use crate::SessionEvent;
 
-pub const JOBS_TOPIC: &str = "jobs";
+const JOBS_TOPIC: &str = "jobs";
 
 /// Messages from `candles:` and `session:` subscriptions waiting to be sent on one connection.
 const OUTGOING_BUFFER: usize = 1024;

@@ -70,7 +70,7 @@ use super::runs::{
 };
 
 /// The file beside a plan run's `result.json` that `GET /verdicts` reads.
-pub const VERDICT_FILE: &str = "verdict.json";
+const VERDICT_FILE: &str = "verdict.json";
 
 /// `POST /runs/plan`: run a strategy's test plan.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
@@ -110,7 +110,7 @@ pub struct PlanInstrumentDone {
 /// that lacks a field (written before it existed) or does not parse is read from the run's
 /// `result.json` instead.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct VerdictRecord {
+struct VerdictRecord {
     pub strategy: String,
     pub instrument: InstrumentId,
     pub seed: u64,
@@ -184,7 +184,7 @@ pub(super) struct VerdictsQuery {
 /// data and engine gives the same verdict, and running it again cannot draw a luckier luck test.
 /// FNV-1a over `strategy|venue:symbol:kind`, kept to its low 53 bits so it stays exact as a
 /// JavaScript number in the GUI.
-pub fn plan_seed(strategy: &str, instrument: &InstrumentId) -> u64 {
+fn plan_seed(strategy: &str, instrument: &InstrumentId) -> u64 {
     let hash = format!("{strategy}|{instrument}")
         .bytes()
         .fold(0xcbf2_9ce4_8422_2325, |h: u64, b| {
@@ -619,7 +619,7 @@ fn ran_under(entry: &StrategyEntry, record: &VerdictRecord, saved_view: &Value) 
 /// and then instrument. Only `strategy`'s when it is given. Each verdict's plan and rule are
 /// compared with those of the registered `strategies`, and its code hash with the registered
 /// strategy's ([`td_engine::code_hash`]).
-pub fn latest_verdicts(
+fn latest_verdicts(
     runs_dir: &Path,
     strategies: &[StrategyEntry],
     strategy: Option<&str>,
