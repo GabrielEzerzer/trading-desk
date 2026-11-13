@@ -1149,8 +1149,9 @@ payout_interval_days: number,
  */
 min_payout: number, 
 /**
- * The most profit one payout may count, as a fraction of the starting balance. `None` sets
- * no cap.
+ * The most profit one payout may count, as a fraction of the starting balance. A payout
+ * counts only the profit above the start, or above the floor if that is higher, and never
+ * moves the floor. `None` sets no cap.
  */
 payout_cap: number | null, 
 /**
@@ -1159,7 +1160,7 @@ payout_cap: number | null,
 max_payouts: number | null, 
 /**
  * Whether the first payout fixes the floor for the rest of the account: at the starting
- * balance, or where the floor stands after the payout if that is higher.
+ * balance, or where the floor stands at that payout if that is higher.
  */
 payout_locks_floor: boolean, 
 /**

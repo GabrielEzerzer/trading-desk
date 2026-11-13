@@ -123,15 +123,16 @@ pub struct AttemptTerms {
     /// The smallest payout the firm makes, after the split.
     #[serde(default)]
     pub min_payout: f64,
-    /// The most profit one payout may count, as a fraction of the starting balance. `None` sets
-    /// no cap.
+    /// The most profit one payout may count, as a fraction of the starting balance. A payout
+    /// counts only the profit above the start, or above the floor if that is higher, and never
+    /// moves the floor. `None` sets no cap.
     #[serde(default)]
     pub payout_cap: Option<f64>,
     /// The most payouts one funded account makes. `None` sets no limit.
     #[serde(default)]
     pub max_payouts: Option<u32>,
     /// Whether the first payout fixes the floor for the rest of the account: at the starting
-    /// balance, or where the floor stands after the payout if that is higher.
+    /// balance, or where the floor stands at that payout if that is higher.
     #[serde(default)]
     pub payout_locks_floor: bool,
     /// Days the funded account is simulated for after a pass.
