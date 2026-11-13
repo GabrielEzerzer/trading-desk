@@ -28,6 +28,8 @@ if (section !== 'lab' && section !== 'trading') {
 }
 const QUIT_WITHIN_MS = 5_000
 const dataDir = mkdtempSync(join(tmpdir(), 'td-quit-'))
+// A killed td-server can hold files for a moment on Windows, so retry on EBUSY and EPERM.
+const removeDataDir = () => rmSync(dataDir, { recursive: true, force: true, maxRetries: 10 })
 
 const app = await electron.launch({
   args: [join(gui, 'app')],
@@ -42,10 +44,11 @@ if (section === 'trading') {
   await page.waitForTimeout(6_000)
   // The chart mounts before any data arrives, so an empty chart (no history, offline) would pass
   // without ever running the live stream that hangs the quit.
-  if ((await page.locator('.chart-empty').count()) > 0) {
+  const empty = page.locator('.chart-empty')
+  if ((await empty.count()) > 0) {
+    console.error(`quit-check: FAIL, the Trading chart has no data: ${(await empty.first().innerText()).replace(/\s+/g, ' ')}`)
     killAll(processTree(app.process().pid))
-    rmSync(dataDir, { recursive: true, force: true })
-    console.error('quit-check: FAIL, the Trading chart did not load its history')
+    removeDataDir()
     process.exit(2)
   }
 }
@@ -66,9 +69,9 @@ const ms = Date.now() - started
 if (left.length > 0) {
   console.error(`quit-check: FAIL, still running ${QUIT_WITHIN_MS} ms after close: ${left.map((p) => `${p.name} ${p.pid}`).join(', ')}`)
   killAll(left)
-  rmSync(dataDir, { recursive: true, force: true })
+  removeDataDir()
   process.exit(1)
 }
-rmSync(dataDir, { recursive: true, force: true })
+removeDataDir()
 console.log(`quit-check: PASS, all ${tree.length} processes exited ${ms} ms after the window closed`)
 process.exit(0)
