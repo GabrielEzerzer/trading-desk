@@ -1922,7 +1922,8 @@ funding_bytes: number | null,
 bytes: number, };
 
 /**
- * One month file of an instrument's candles and its size on disk.
+ * One month file of an instrument's candles and its size on disk, with its closure record's,
+ * which a delete of the month removes with it.
  */
 export type StoredMonthInfo = { 
 /**

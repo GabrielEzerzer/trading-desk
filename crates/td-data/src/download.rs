@@ -101,7 +101,9 @@ pub(crate) fn download_candles_from(
         } else {
             store.write_candles(id, &candles)?;
         }
-        if closes {
+        // A month that holds nothing has no record either: the listing and a delete of all market
+        // data would not see it.
+        if closes && !(candles.is_empty() && stored.is_empty()) {
             candles.sort_by_key(|c| c.open_time);
             let mut empty = missing_minutes(id.kind, &candles, lo, hi);
             // Minutes up to now may only not be published yet.
@@ -365,9 +367,10 @@ mod tests {
         let coverage = store.coverage(&id).expect("covers");
         assert_eq!(coverage[0].gaps, []);
 
-        // A delete keeps the record, so a later download of part of the month asks for that part
-        // only.
+        // A delete removes the record with the month, so the next download of part of it fetches
+        // the whole month again.
         store.delete_months(&id, dec, dec).expect("deletes");
+        assert_eq!(store.closure_record(&id, dec).expect("reads"), None);
         let again = DailyFiles::fx(true);
         download_candles_from(
             &again,
@@ -381,8 +384,34 @@ mod tests {
         .expect("downloads");
         assert_eq!(
             *again.asked.lock().expect("lock"),
-            [(tuesday, tuesday + 2 * DAY)]
+            [(dec.start(), dec.end())]
         );
+    }
+
+    #[test]
+    fn an_fx_month_the_source_has_nothing_for_gets_no_record() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let store = Store::new(dir.path());
+        let id = id(InstrumentKind::Fx);
+        let feb = Month::parse("2024-02").expect("a month");
+        let source = DailyFiles {
+            missing_days: (0..29).map(|d| feb.start() + d * DAY).collect(),
+            ..DailyFiles::fx(true)
+        };
+        let http = Http::new().expect("an HTTP client");
+        download_candles_from(
+            &source,
+            &http,
+            &store,
+            &id,
+            feb.start(),
+            feb.end(),
+            &mut |_| {},
+        )
+        .expect("downloads");
+        // Nothing is stored, so the listing and a delete would not see a record either.
+        assert_eq!(store.read_month(&id, feb).expect("reads"), []);
+        assert_eq!(store.closure_record(&id, feb).expect("reads"), None);
     }
 
     #[test]

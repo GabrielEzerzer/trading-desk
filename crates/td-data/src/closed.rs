@@ -21,8 +21,9 @@
 //! A month downloaded before records were written has none: all its missing open time counts as
 //! missing, as before, and the run check keeps a wider limit for it (`max_gap` in td-server).
 //!
-//! A record stays when its month is deleted, as the lock sidecar does. It says what the venue had,
-//! which a delete does not change, and the next download of the month writes it again.
+//! A delete of a month removes its record with its data file, so the stored list and the delete
+//! treat records as the store's own files, and the next download of the month fetches all of it
+//! and writes the record again.
 
 use std::collections::BTreeSet;
 use std::fs;

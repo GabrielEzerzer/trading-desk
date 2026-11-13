@@ -70,6 +70,9 @@ enum Fill {
     Nothing,
     /// Fails, as a source with no OANDA token does.
     Fails,
+    /// Tries to delete the instrument, then writes as [`Fill::Minutes`] does; fails unless the
+    /// delete was refused because the instrument is held.
+    TriesDelete,
 }
 
 /// A source for runs that download: it records each candle range asked of it.
@@ -106,6 +109,20 @@ impl MarketSource for Filling {
                 .collect(),
             Fill::Nothing => Vec::new(),
             Fill::Fails => return Err(DataError::MissingOandaToken),
+            Fill::TriesDelete => match store.delete_instrument(id) {
+                Err(DataError::InstrumentBusy(_)) => minutes(40, 0..0)
+                    .into_iter()
+                    .filter(|c| (from..to).contains(&c.open_time))
+                    .collect(),
+                other => {
+                    return Err(DataError::InvalidInstrument {
+                        symbol: id.symbol.clone(),
+                        reason: format!(
+                            "the delete during the download was not refused: {other:?}"
+                        ),
+                    });
+                }
+            },
         };
         store.write_candles(id, &candles)?;
         Ok(DownloadReport {
@@ -1118,6 +1135,26 @@ async fn a_run_past_the_cutoff_is_refused_before_anything_is_downloaded() {
     let (_, jobs) = t.get("/jobs").await;
     assert_eq!(jobs, json!([]), "no job was created");
     assert_eq!(*source.asked.lock().unwrap(), []);
+}
+
+/// A run's download holds its instrument, so a delete of it meanwhile is refused and the stored
+/// days the run reads stay.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_delete_is_refused_while_a_run_downloads_the_instrument() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = Store::new(dir.path());
+    let id = instrument(InstrumentKind::Spot).id;
+    store.write_candles(&id, &minutes(3, 0..0)).expect("seeds");
+    let source = Filling::new(Fill::TriesDelete);
+    let t = TestServer::with_source(dir, store, source.clone()).await;
+    let mut ws = t.websocket().await;
+    let body = serde_json::to_value(config(InstrumentKind::Spot, 5)).unwrap();
+    let job = t.start("/runs/backtest", &body).await;
+    let last = ws.follow(job).await.pop().unwrap();
+    assert_eq!(last.status, JobStatus::Done, "{last:?}");
+    assert_eq!(source.asked.lock().unwrap().len(), 1);
+    let data = t.result(job).await.data.expect("a data report");
+    assert_eq!((data.bars, data.gaps.len()), (5 * 24, 0));
 }
 
 #[tokio::test(flavor = "multi_thread")]

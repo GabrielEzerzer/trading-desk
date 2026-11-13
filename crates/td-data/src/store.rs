@@ -199,7 +199,8 @@ pub struct MonthCoverage {
     pub bytes: u64,
 }
 
-/// One month file of an instrument's candles and its size on disk.
+/// One month file of an instrument's candles and its size on disk, with its closure record's
+/// ([`crate::closed`]), which a delete of the month removes with it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StoredMonth {
     pub month: Month,
@@ -845,7 +846,13 @@ impl Store {
                             match month_of_file(&name) {
                                 Some((month, true)) => {
                                     if let Some(bytes) = file_bytes(&dir.join(&name))? {
-                                        months.push(StoredMonth { month, bytes });
+                                        let record =
+                                            format!("{name}{}", crate::closed::RECORD_SUFFIX);
+                                        let record = file_bytes(&dir.join(record))?.unwrap_or(0);
+                                        months.push(StoredMonth {
+                                            month,
+                                            bytes: bytes + record,
+                                        });
                                     }
                                 }
                                 Some((month, false)) if name.ends_with(".tmp") => {
@@ -1046,7 +1053,9 @@ impl Store {
             let mut months = std::collections::BTreeSet::new();
             for name in dir_names(&dir, &mut Vec::new(), &self.root)? {
                 if let Some((month, data)) = month_of_file(&name)
-                    && (data || name.ends_with(".tmp"))
+                    && (data
+                        || name.ends_with(".tmp")
+                        || name.ends_with(crate::closed::RECORD_SUFFIX))
                     && (from..=to).contains(&month)
                 {
                     months.insert(month);
@@ -1376,20 +1385,26 @@ pub(crate) fn lock_across_processes(path: &Path) -> Result<File, DataError> {
     Ok(file)
 }
 
-/// Removes the store file at `path` under its lock, taken as a writer takes it, with any temp files
-/// a crashed writer left beside it, and adds them to `report`; the lock sidecar stays as it is.
+/// Removes the store file at `path` under its lock, taken as a writer takes it, with a month's
+/// closure record ([`crate::closed`]) and any temp files a crashed writer left beside it, and adds
+/// them to `report`; the lock sidecar stays as it is.
 /// While the lock is held no writer is part way through this file, in this process or another, so
 /// every temp file of it is a leftover, even one with no data file beside it. When `path` is not a
-/// regular file (nothing, or a link) and has no temp file, there is nothing to delete and no lock
-/// is taken.
+/// regular file (nothing, or a link) and has no record or temp file, there is nothing to delete
+/// and no lock is taken.
 fn remove_locked(path: &Path, report: &mut DeleteReport) -> Result<(), DataError> {
-    if file_bytes(path)?.is_none() && temp_files(path)?.is_empty() {
+    let mut record = path.as_os_str().to_owned();
+    record.push(crate::closed::RECORD_SUFFIX);
+    let record = PathBuf::from(record);
+    if file_bytes(path)?.is_none() && file_bytes(&record)?.is_none() && temp_files(path)?.is_empty()
+    {
         return Ok(());
     }
     let lock = file_lock(path);
     let _held = hold(&lock);
     let _locked = lock_across_processes(path)?;
-    for file in std::iter::once(path.to_path_buf()).chain(temp_files(path)?) {
+    let files = [path.to_path_buf(), record];
+    for file in files.into_iter().chain(temp_files(path)?) {
         let Some(bytes) = file_bytes(&file)? else {
             continue;
         };

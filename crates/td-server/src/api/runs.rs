@@ -868,6 +868,9 @@ fn execute(
             if steps.is_empty() {
                 return Err(changed_since_accepted(shortfall.refusal(id)).into());
             }
+            // Held from the download through the read, so a delete cannot remove a month between
+            // them.
+            let _hold = store.hold_for_download(id)?;
             download(source, store, id, &steps, ctx)?;
             ctx.progress(0.0, "loading the data");
             load_run_data(store, base, cutoff).map_err(not_filled)?

@@ -317,7 +317,8 @@ pub fn read_coverage(store: &Store, id: InstrumentId) -> Result<CoverageResponse
     })
 }
 
-/// One month file of an instrument's candles and its size on disk.
+/// One month file of an instrument's candles and its size on disk, with its closure record's,
+/// which a delete of the month removes with it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 pub struct StoredMonthInfo {
     /// `YYYY-MM`.
