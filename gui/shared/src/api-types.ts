@@ -795,7 +795,12 @@ test_from: number, test_to: number,
 /**
  * The best parameters on the train segment.
  */
-params: Params, in_sample: Headline, 
+params: Params, 
+/**
+ * Their place on the grid: the train sweep's best row's [`SweepRow::coords`]. Empty in a
+ * result saved before windows had them.
+ */
+coords: Array<number>, in_sample: Headline, 
 /**
  * The chosen parameters on the test segment, warmed up with the train bars and closed out
  * at its end; see [`WalkForwardResult`].
@@ -1044,7 +1049,8 @@ inconclusive_p: number, };
  */
 export type Plateau = { 
 /**
- * The neighbours' median objective over R1's must be at least this.
+ * The median over the neighbours of each one's objective over the chosen sets' on the same
+ * windows must be at least this.
  */
 min_median_ratio: number, 
 /**
@@ -1518,15 +1524,20 @@ curve: boolean, };
  * R5, out of sample: the walk-forward's chosen parameter sets against their neighbours on the
  * grid. A neighbour is a direction on the grid, a step of -1, 0 or 1 on each axis (not all 0).
  * In each window it is the set that window chose moved one step that way, run on the window's
- * test bars as its chosen set was (warmed up on the train bars, closed out at the end), and the
- * windows are stitched as R1's curve is. In a window where that set is off the grid or the
- * strategy refuses it, the neighbour takes the chosen set's own run; a direction with no run in
- * any window is left out.
+ * test bars as its chosen set was (warmed up on the train bars, closed out at the end). Each
+ * direction is judged only on the windows where its set ran: a window where it is off the grid
+ * or the strategy refuses it is left out, never filled with the chosen set's own run, which would
+ * pull the direction towards R1. Its runs are stitched as R1's curve is, and so are the chosen
+ * sets' own runs in the same windows, its reference. A direction that ran in no window is left
+ * out.
  *
- * The ratio is the neighbours' median objective over R1's: the median over R1's with `Maximize`,
- * defined when R1's objective is above zero, and R1's over the median with `Minimize`, so a
- * ratio below 1 is worse either way. An undefined objective counts as the worst value. The share
- * is the neighbours whose stitched return is above zero.
+ * The ratio is the median over the directions of each one's objective against its reference: the
+ * objective over the reference with `Maximize`, for a direction whose reference is above zero,
+ * and the reference over the objective with `Minimize`, so a ratio below 1 is worse either way.
+ * A direction with an undefined objective has the worst ratio (minus infinity with `Maximize`, 0
+ * with `Minimize`); one whose reference is undefined, or at or below zero with `Maximize`, has
+ * none and is left out of the median. The share is the directions whose stitched return is
+ * above zero.
  *
  * A result saved before R5 moved out of sample reads with `directions` empty and its ratio and
  * share as they were judged then, on the full-period sweep.
@@ -1546,13 +1557,18 @@ export type PlateauDirection = {
  */
 steps: Array<number>, 
 /**
- * The windows in which the stepped set ran; the others took the chosen set's run.
+ * The windows in which the stepped set ran, the only ones it is judged on.
  */
 windows: number, 
 /**
  * The stitched objective; `None` when it is undefined.
  */
-objective: number | null, total_return: number | null, };
+objective: number | null, total_return: number | null, 
+/**
+ * The chosen sets' own runs in the same windows, stitched the same way: their objective.
+ * `None` when it is undefined, or in a result saved before directions had it.
+ */
+reference: number | null, };
 
 /**
  * The distribution of a sample's mean under resampling.

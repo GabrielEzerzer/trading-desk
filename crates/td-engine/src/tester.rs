@@ -198,27 +198,19 @@ impl SweepSpec {
             - 1)
     }
 
-    /// The grid neighbours of `params`, a set on this spec's grid such as a walk-forward window's
-    /// choice: every set at most one step from it on every axis, itself left out, in grid order.
-    /// Each comes with its step on each axis (-1, 0 or 1) and its parameters as a sweep row of the
-    /// spec would hold them. Errors when `params` is not on the grid.
-    pub(crate) fn neighbours(
-        &self,
-        params: &Params,
-    ) -> Result<Vec<(Vec<i8>, Params)>, TesterError> {
+    /// The grid neighbours of the set at `coords` on this spec's grid, such as a walk-forward
+    /// window's choice ([`WindowResult::coords`]): every set at most one step from it on every
+    /// axis, itself left out, in grid order. Each comes with its step on each axis (-1, 0 or 1)
+    /// and its parameters as a sweep row of the spec would hold them. Errors when `coords` is not
+    /// a place on the grid.
+    pub(crate) fn neighbours(&self, coords: &[u64]) -> Result<Vec<(Vec<i8>, Params)>, TesterError> {
         let plan = Plan::new(self)?;
-        let mut coords = Vec::with_capacity(plan.axes.len());
-        for a in &plan.axes {
-            let value = params.get(&a.name);
-            let k = (0..a.count)
-                .find(|&k| Some(a.value(k)) == value)
-                .ok_or_else(|| {
-                    TesterError::InvalidSpec(format!(
-                        "parameter {:?} is not on the grid at {value:?}",
-                        a.name
-                    ))
-                })?;
-            coords.push(k);
+        if coords.len() != plan.axes.len()
+            || plan.axes.iter().zip(coords).any(|(a, &k)| k >= a.count)
+        {
+            return Err(TesterError::InvalidSpec(format!(
+                "{coords:?} is not a place on the grid"
+            )));
         }
         let mut out = Vec::new();
         // Every step vector in grid order: the first axis changes slowest.
@@ -233,7 +225,7 @@ impl SweepSpec {
             }
             let mut index = 0u64;
             let mut on_grid = true;
-            for ((a, &k), &d) in plan.axes.iter().zip(&coords).zip(&steps) {
+            for ((a, &k), &d) in plan.axes.iter().zip(coords).zip(&steps) {
                 match k.checked_add_signed(i64::from(d)) {
                     Some(at) if at < a.count => index = index * a.count + at,
                     _ => on_grid = false,
@@ -810,8 +802,9 @@ pub struct PermutationResult {
 /// unchanged, so a copy joins the warm-up bars where the real data does. Copy k's seed is
 /// derived from the spec's seed and k, so a copy does not depend on the others. `bars`, `asks`
 /// and `funding` are the data as [`crate::run`] takes it; on a market with quotes each traded
-/// bar's ask moves with its bar and keeps its spread as a share of the price, so a copy's runs
-/// pay the same spreads the real ones do.
+/// bar's ask is rebuilt on its shuffled bar with the spread of its own time slot
+/// (`permute_quotes`), so a copy's runs pay the spreads the real ones would at
+/// the same times.
 ///
 /// The sweeps run one after another, each in parallel on the current rayon pool as [`sweep`]
 /// does, and each keeps only its ranked rows: the best run is not run again. All the runs
@@ -1219,6 +1212,10 @@ pub struct WindowResult {
     pub test_to: Millis,
     /// The best parameters on the train segment.
     pub params: Params,
+    /// Their place on the grid: the train sweep's best row's [`SweepRow::coords`]. Empty in a
+    /// result saved before windows had them.
+    #[serde(default)]
+    pub coords: Vec<u64>,
     pub in_sample: Headline,
     /// The chosen parameters on the test segment, warmed up with the train bars and closed out
     /// at its end; see [`WalkForwardResult`].
@@ -1342,6 +1339,11 @@ pub fn walk_forward(
             None => ControlFlow::Continue(()),
         };
         let swept = sweep_planned(&train, &plan, bars, asks, funding, Some(&window_progress))?;
+        let coords = swept
+            .rows
+            .first()
+            .map(|r| r.coords.clone())
+            .unwrap_or_default();
         let best = swept.best.ok_or(TesterError::NoQualifyingRun {
             min_trades: spec.sweep.min_trades,
             window: Some(k),
@@ -1359,6 +1361,7 @@ pub fn walk_forward(
             test_from,
             test_to,
             params: best.config.params,
+            coords,
             in_sample: Headline::new(&best.metrics),
             out_of_sample: run(&test_config, bars, asks, funding)?,
         });
@@ -1838,6 +1841,111 @@ mod tests {
     use super::*;
     use crate::permute_bars;
 
+    /// On a market with quotes a copy keeps each hour's spread. A strategy with no edge that is in
+    /// the market only in the one hour whose spread is tight would otherwise beat every copy on
+    /// cost alone, since a copy's bars in that hour come from hours with wide spreads.
+    #[test]
+    fn the_luck_test_keeps_each_hours_spread() {
+        use td_core::{FeeSchedule, Instrument, InstrumentId, InstrumentKind, Venue};
+        const HOUR: Millis = 3_600_000;
+        // 60 days of hourly bars of a seeded random walk, without the FX weekend's closed hours.
+        let mut rng = crate::rng::SplitMix64(5);
+        let mut close = 100.0;
+        let bars: Vec<Candle> = (0..60 * 24)
+            .filter_map(|i| {
+                let open = close;
+                close = open * (1.0 + (rng.unit() - 0.5) * 0.004);
+                let t = i * HOUR;
+                let shut =
+                    InstrumentKind::Fx.closed_spans(t, t + HOUR).first() == Some(&(t..t + HOUR));
+                (!shut).then(|| Candle {
+                    open_time: t,
+                    open,
+                    high: open.max(close) * 1.000_5,
+                    low: open.min(close) * 0.999_5,
+                    close,
+                    volume: 1.0,
+                    quote_volume: close,
+                })
+            })
+            .collect();
+        // The strategy decides at the close of the 05:00 bar and buys at the 06:00 bar's open:
+        // that hour's spread is 0.02%, every other hour's 0.5%.
+        let asks: Vec<Candle> = bars
+            .iter()
+            .map(|b| {
+                let s = if b.open_time / HOUR % 24 == 6 {
+                    1.000_2
+                } else {
+                    1.005
+                };
+                Candle {
+                    open: b.open * s,
+                    high: b.high * s,
+                    low: b.low * s,
+                    close: b.close * s,
+                    ..*b
+                }
+            })
+            .collect();
+        let instrument = Instrument {
+            id: InstrumentId {
+                venue: Venue::Oanda,
+                symbol: "TEST_USD".into(),
+                kind: InstrumentKind::Fx,
+            },
+            base: "TEST".into(),
+            quote: "USD".into(),
+            tick_size: 0.000_01,
+            lot_size: 1.0,
+            min_qty: 1.0,
+            min_notional: 0.0,
+            fees: FeeSchedule {
+                maker: 0.0,
+                taker: 0.0,
+                per_unit: 0.0,
+            },
+        };
+        let spec = PermutationSpec {
+            sweep: SweepSpec {
+                base: BacktestConfig {
+                    strategy: "test_one_hour".into(),
+                    params: Params::new(),
+                    instrument,
+                    timeframe: Timeframe::H1,
+                    from: bars[0].open_time,
+                    to: bars.last().unwrap().open_time + HOUR,
+                    starting_cash: 10_000.0,
+                    slippage_bps: 0.0,
+                    fee_override: None,
+                    max_leverage: 1.0,
+                    warmup_from: None,
+                    close_at_end: true,
+                    account_currency: td_core::AccountCurrency::Quote,
+                },
+                axes: vec![ParamAxis {
+                    name: "hour".into(),
+                    space: ParamSpace::Values {
+                        values: vec![ParamValue::Int(5)],
+                    },
+                }],
+                mode: SweepMode::Grid,
+                objective: Objective {
+                    metric: Metric::TotalReturn,
+                    direction: Direction::Maximize,
+                },
+                min_trades: 1,
+            },
+            permutations: 19,
+            seed: 3,
+        };
+        let r = permutation_test(&spec, &bars, &asks, &[], None).unwrap();
+        assert_eq!(r.permuted_best.iter().flatten().count(), 19);
+        // Paying 0.5% a trade on about 40 trades, a copy would lose about a fifth more than the
+        // real run and the real run would rank first, at the smallest p there is, 1/20.
+        assert!(r.p_value > 0.2, "{r:?}");
+    }
+
     #[test]
     fn each_copy_is_the_traded_bars_shuffled_with_its_derived_seed_after_the_real_warm_up() {
         use td_core::{FeeSchedule, Instrument, InstrumentId, InstrumentKind, Venue};
@@ -2215,6 +2323,7 @@ mod tests {
                 test_from: config.from,
                 test_to: config.to,
                 params: base.params.clone(),
+                coords: Vec::new(),
                 in_sample: Headline::new(&out_of_sample.metrics),
                 out_of_sample,
             }

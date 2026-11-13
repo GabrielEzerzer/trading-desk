@@ -44,12 +44,16 @@ pub fn permute_bars(bars: &[Candle], seed: u64) -> Result<Vec<Candle>, CoreError
 }
 
 /// [`permute_bars`] for a market with quotes: `asks` is empty or holds each bar's ask, one per bar
-/// in the same order, and every ask moves with its bar. A rebuilt bar is its source bar scaled by
-/// the rebuilt open over the source open, and its ask is the source ask scaled by the same factor,
-/// written the same way (the rebuilt open times the ask's price over the source bar's open). So
-/// each bar keeps its spread as a share of its price, and because rounding is monotonic an ask at
-/// or above its bar stays at or above it. The bars come back exactly as [`permute_bars`] gives
-/// them for the same seed.
+/// in the same order. The bars come back exactly as [`permute_bars`] gives them for the same seed.
+///
+/// Each rebuilt bar's ask keeps the spread of its time slot, not of the bar whose move it took:
+/// the spread is a property of the hour (thin hours are wide, busy ones tight), and a strategy
+/// that trades only in a tight hour must pay that hour's spread on every copy too, or it would
+/// beat the copies on cost alone. At each of its four prices the ask is the rebuilt bar's price
+/// times the original ask's price over the original bar's at the same position, and its high and
+/// low are then widened to hold its open and close, as R4's widened asks are. The first bar and
+/// its ask are unchanged. Because every original ask is at or above its bar and rounding is
+/// monotonic, every rebuilt ask is at or above its rebuilt bar at all four prices.
 ///
 /// Panics if `asks` is neither empty nor as long as `bars`: the caller pairs them.
 pub(crate) fn permute_quotes(
@@ -89,14 +93,27 @@ pub(crate) fn permute_quotes(
     out.push(bars[0]);
     out_asks.extend(asks.first().copied());
     let mut prev_close = bars[0].close;
-    for (slot, &src) in bars[1..].iter().zip(&order) {
+    for (k, (slot, &src)) in bars[1..].iter().zip(&order).enumerate() {
         let b = &bars[src];
         let open = prev_close * (b.open / bars[src - 1].close);
         // `open * (b.open / b.open)` is `open` exactly.
         let bar = scaled(b, b, open, slot.open_time);
         bar.validate()?;
-        if let Some(ask) = asks.get(src) {
-            let ask = scaled(ask, b, open, slot.open_time);
+        if let Some(slot_ask) = asks.get(k + 1) {
+            // The slot's own spread, as a share of each price, on the rebuilt bar.
+            let (open, close) = (
+                bar.open * (slot_ask.open / slot.open),
+                bar.close * (slot_ask.close / slot.close),
+            );
+            let ask = Candle {
+                open,
+                high: (bar.high * (slot_ask.high / slot.high))
+                    .max(open)
+                    .max(close),
+                low: (bar.low * (slot_ask.low / slot.low)).min(open).min(close),
+                close,
+                ..bar
+            };
             ask.validate()?;
             out_asks.push(ask);
         }
@@ -226,11 +243,11 @@ mod tests {
         ));
     }
 
-    /// On a market with quotes each ask moves with its bar: the bars are exactly the ones
-    /// `permute_bars` gives, each ask stays at or above its bar, and it keeps its spread as a share
-    /// of the bar's price.
+    /// On a market with quotes the bars are exactly the ones `permute_bars` gives, each ask stays
+    /// at or above its bar, and it has the spread of its time slot as a share of the price, not
+    /// the spread of the bar whose move it took.
     #[test]
-    fn asks_move_with_their_bars_and_stay_at_or_above_them() {
+    fn asks_keep_their_slots_spread_and_stay_at_or_above_their_bars() {
         let bars = path();
         // Spreads that differ per bar and per price, from 0 to about 0.3%.
         let asks: Vec<Candle> = bars
@@ -258,13 +275,22 @@ mod tests {
                     "seed {seed} bar {k}: {b:?} {a:?}"
                 );
                 a.validate().unwrap();
-                // The source bar, found by its volume, and the same spread share at the close.
-                let src = b.volume as usize - 1;
-                let share = |a: &Candle, b: &Candle| a.close / b.close;
+                // The slot's own spread share at the open and close; the source bar, found by its
+                // volume, has a different one unless both spreads happen to match.
+                let share = |a: &Candle, b: &Candle| (a.open / b.open, a.close / b.close);
+                let (open, close) = share(a, b);
+                let (slot_open, slot_close) = share(&asks[k], &bars[k]);
                 assert!(
-                    rel_close(share(a, b), share(&asks[src], &bars[src])),
-                    "bar {k}"
+                    rel_close(open, slot_open) && rel_close(close, slot_close),
+                    "seed {seed} bar {k}"
                 );
+                let src = b.volume as usize - 1;
+                if src % 5 != k % 5 {
+                    assert!(
+                        !rel_close(close, share(&asks[src], &bars[src]).1),
+                        "bar {k}"
+                    );
+                }
             }
         }
         assert_eq!(

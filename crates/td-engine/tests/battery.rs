@@ -812,7 +812,7 @@ fn spread_only_plan() -> TestPlan {
 
 /// The battery runs on FX with its asks: every run fills buys on the ask, so a spread lowers each
 /// swept set's return against the same bars with a zero spread. I1 leaves the closed weekend out of
-/// the buckets, and the luck test shuffles the asks with the bars.
+/// the buckets, and the luck test rebuilds the asks on its shuffled bars.
 #[test]
 fn on_a_market_with_quotes_the_asks_reach_every_run() {
     let (bars, wide) = fx_bars(0.05);

@@ -62,7 +62,7 @@ use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde::{Deserialize, Serialize};
-use td_core::{Candle, Carry, FeeSchedule, Instrument, Millis};
+use td_core::{Candle, Carry, FeeSchedule, Instrument, Millis, Timeframe};
 
 use crate::metrics::{self, DAY_MS, EquitySeries};
 use crate::plan::check_start_offsets;
@@ -163,15 +163,20 @@ pub struct IntegrityReport {
 /// R5, out of sample: the walk-forward's chosen parameter sets against their neighbours on the
 /// grid. A neighbour is a direction on the grid, a step of -1, 0 or 1 on each axis (not all 0).
 /// In each window it is the set that window chose moved one step that way, run on the window's
-/// test bars as its chosen set was (warmed up on the train bars, closed out at the end), and the
-/// windows are stitched as R1's curve is. In a window where that set is off the grid or the
-/// strategy refuses it, the neighbour takes the chosen set's own run; a direction with no run in
-/// any window is left out.
+/// test bars as its chosen set was (warmed up on the train bars, closed out at the end). Each
+/// direction is judged only on the windows where its set ran: a window where it is off the grid
+/// or the strategy refuses it is left out, never filled with the chosen set's own run, which would
+/// pull the direction towards R1. Its runs are stitched as R1's curve is, and so are the chosen
+/// sets' own runs in the same windows, its reference. A direction that ran in no window is left
+/// out.
 ///
-/// The ratio is the neighbours' median objective over R1's: the median over R1's with `Maximize`,
-/// defined when R1's objective is above zero, and R1's over the median with `Minimize`, so a
-/// ratio below 1 is worse either way. An undefined objective counts as the worst value. The share
-/// is the neighbours whose stitched return is above zero.
+/// The ratio is the median over the directions of each one's objective against its reference: the
+/// objective over the reference with `Maximize`, for a direction whose reference is above zero,
+/// and the reference over the objective with `Minimize`, so a ratio below 1 is worse either way.
+/// A direction with an undefined objective has the worst ratio (minus infinity with `Maximize`, 0
+/// with `Minimize`); one whose reference is undefined, or at or below zero with `Maximize`, has
+/// none and is left out of the median. The share is the directions whose stitched return is
+/// above zero.
 ///
 /// A result saved before R5 moved out of sample reads with `directions` empty and its ratio and
 /// share as they were judged then, on the full-period sweep.
@@ -192,11 +197,15 @@ pub struct PlateauReport {
 pub struct PlateauDirection {
     /// The step on each axis of the grid, in the order of the plan's axes.
     pub steps: Vec<i8>,
-    /// The windows in which the stepped set ran; the others took the chosen set's run.
+    /// The windows in which the stepped set ran, the only ones it is judged on.
     pub windows: usize,
     /// The stitched objective; `None` when it is undefined.
     pub objective: Option<f64>,
     pub total_return: Option<f64>,
+    /// The chosen sets' own runs in the same windows, stitched the same way: their objective.
+    /// `None` when it is undefined, or in a result saved before directions had it.
+    #[serde(default)]
+    pub reference: Option<f64>,
 }
 
 /// R4: each test window's chosen parameters run again at higher costs.
@@ -499,7 +508,7 @@ pub fn run_battery(
         Some(wf) => {
             let mut runs = Vec::with_capacity(wf.windows.len());
             for w in &wf.windows {
-                let found = sweep_spec.neighbours(&w.params)?;
+                let found = sweep_spec.neighbours(&w.coords)?;
                 meter.base += neighbours - found.len();
                 let mut window = Vec::with_capacity(found.len());
                 for (steps, params) in found {
@@ -798,7 +807,9 @@ pub fn run_battery(
 
     let carry = instrument.id.kind.rules().unmodelled_carry;
     let warnings = match (&wf, carry) {
-        (Some(wf), Some(carry)) => carry_warning(carry, &wf.trades).into_iter().collect(),
+        (Some(wf), Some(carry)) => carry_warning(carry, &wf.trades, plan.timeframe)
+            .into_iter()
+            .collect(),
         _ => Vec::new(),
     };
     result.verdict = Verdict {
@@ -1002,14 +1013,17 @@ fn widened(bars: &[Candle], asks: &[Candle], multiplier: f64) -> Vec<Candle> {
 /// The warning for a market whose rules name a financing cost the engine does not model
 /// (`MarketRules::unmodelled_carry`), when any of `trades` held its position through a point
 /// where that cost is charged. A trade's times are the opens of the bars it opened and closed in,
-/// so a trade counts as held through a rollover that falls after the first and no later than the
-/// second: one closed in the bar that starts at the rollover counts, since the fill time does not
-/// say whether it filled before it.
-fn carry_warning(carry: Carry, trades: &[Trade]) -> Option<String> {
+/// on `timeframe`, so a trade counts as held through a rollover that falls after its entry bar's
+/// open and before its exit bar's end: a stop can fill anywhere inside the exit bar, and its time
+/// does not say whether that was before the rollover or after it.
+fn carry_warning(carry: Carry, trades: &[Trade], timeframe: Timeframe) -> Option<String> {
     let held = match carry {
         Carry::DailyRollover => trades
             .iter()
-            .filter(|t| DayRollover::NewYork1700.next_after(t.entry_time) <= t.exit_time)
+            .filter(|t| {
+                DayRollover::NewYork1700.next_after(t.entry_time)
+                    < t.exit_time + timeframe.duration_ms()
+            })
             .count(),
     };
     (held > 0).then(|| {
@@ -1117,32 +1131,28 @@ fn plateau(
     let directions: Vec<PlateauDirection> = steps
         .into_iter()
         .map(|steps| {
-            let segments: Vec<&BacktestResult> = wf
+            // Only the windows where this direction ran, with the chosen set's run beside each.
+            let (own, moved): (Vec<&BacktestResult>, Vec<&BacktestResult>) = wf
                 .windows
                 .iter()
                 .zip(runs)
-                .map(|(w, found)| {
-                    found
-                        .iter()
-                        .find(|(s, _)| s == steps)
-                        .map_or(&w.out_of_sample, |(_, r)| r)
+                .filter_map(|(w, found)| {
+                    let (_, r) = found.iter().find(|(s, _)| s == steps)?;
+                    Some((&w.out_of_sample, r))
                 })
-                .collect();
-            let h = stitched_headline(base, &segments);
+                .unzip();
+            let h = stitched_headline(base, &moved);
             PlateauDirection {
                 steps: steps.clone(),
-                windows: runs
-                    .iter()
-                    .filter(|found| found.iter().any(|(s, _)| s == steps))
-                    .count(),
+                windows: moved.len(),
                 objective: h.value(objective.metric),
                 total_return: h.total_return,
+                reference: stitched_headline(base, &own).value(objective.metric),
             }
         })
         .collect();
     let best_objective = Headline::new(&wf.metrics).value(objective.metric);
-    let (median_ratio, positive_share) =
-        plateau_numbers(best_objective, &directions, objective.direction);
+    let (median_ratio, positive_share) = plateau_numbers(&directions, objective.direction);
     PlateauReport {
         best_objective,
         directions,
@@ -1151,10 +1161,9 @@ fn plateau(
     }
 }
 
-/// R5's ratio and share from R1's objective and the neighbours (see [`PlateauReport`]). Both are
-/// `None` without neighbours, and the ratio also without R1's objective.
+/// R5's ratio and share from the directions, each with its reference (see [`PlateauReport`]).
+/// Both are `None` without directions, and the ratio also when no direction has one.
 fn plateau_numbers(
-    best: Option<f64>,
     directions: &[PlateauDirection],
     direction: Direction,
 ) -> (Option<f64>, Option<f64>) {
@@ -1165,29 +1174,24 @@ fn plateau_numbers(
             .count() as f64
             / directions.len() as f64
     });
-    let worst = match direction {
-        Direction::Maximize => f64::NEG_INFINITY,
-        Direction::Minimize => f64::INFINITY,
+    let ratio = |d: &PlateauDirection| match (direction, d.reference, d.objective) {
+        (Direction::Maximize, Some(r), Some(o)) if r > 0.0 => Some(o / r),
+        (Direction::Maximize, Some(r), None) if r > 0.0 => Some(f64::NEG_INFINITY),
+        (Direction::Maximize, _, _) => None,
+        (Direction::Minimize, Some(r), Some(o)) if o > 0.0 => Some(r / o),
+        // Neither drew down: as good as each other. Only the neighbour drew down nothing: better.
+        (Direction::Minimize, Some(r), Some(_)) => Some(if r == 0.0 { 1.0 } else { f64::INFINITY }),
+        (Direction::Minimize, Some(_), None) => Some(0.0),
+        (Direction::Minimize, None, _) => None,
     };
-    let mut values: Vec<f64> = directions
-        .iter()
-        .map(|d| d.objective.unwrap_or(worst))
-        .collect();
+    let mut values: Vec<f64> = directions.iter().filter_map(ratio).collect();
     values.sort_by(f64::total_cmp);
-    let median = match values.len() {
+    let median_ratio = match values.len() {
         0 => None,
         n if n % 2 == 1 => Some(values[n / 2]),
         n => Some((values[n / 2 - 1] + values[n / 2]) / 2.0),
-    };
-    let median_ratio = median
-        .zip(best)
-        .and_then(|(m, best)| match direction {
-            Direction::Maximize if best > 0.0 => Some(m / best),
-            Direction::Minimize if m > 0.0 => Some(best / m),
-            Direction::Minimize if m == 0.0 && best == 0.0 => Some(1.0),
-            _ => None,
-        })
-        .filter(|r| r.is_finite());
+    }
+    .filter(|r| r.is_finite());
     (median_ratio, positive_share)
 }
 
@@ -1511,62 +1515,80 @@ mod tests {
         assert_eq!(done, (1..=20).chain([r.runs]).collect::<Vec<_>>());
     }
 
-    /// One of R5's neighbours, with its objective (Sharpe or max drawdown, as the test reads it)
-    /// and its total return.
-    fn direction(steps: [i8; 2], objective: Option<f64>, total_return: f64) -> PlateauDirection {
+    /// One of R5's neighbours, with its objective (Sharpe or max drawdown, as the test reads it),
+    /// the chosen sets' objective over the same windows and its total return.
+    fn direction(
+        steps: [i8; 2],
+        objective: Option<f64>,
+        reference: Option<f64>,
+        total_return: f64,
+    ) -> PlateauDirection {
         PlateauDirection {
             steps: steps.to_vec(),
             windows: 1,
             objective,
             total_return: Some(total_return),
+            reference,
         }
     }
 
     #[test]
-    fn the_plateau_reads_the_neighbours_against_r1() {
+    fn the_plateau_reads_each_neighbour_against_its_own_windows() {
         use Direction::{Maximize, Minimize};
-        // (1, 1)'s objective is undefined and counts as the worst.
-        let directions = |second: Option<f64>| {
+        // (1, 1)'s objective is undefined and has the worst ratio.
+        let directions = |second: Option<f64>, reference: Option<f64>| {
             vec![
-                direction([0, 1], Some(1.5), 0.2),
-                direction([1, 0], second, 0.1),
-                direction([1, 1], None, -0.05),
+                direction([0, 1], Some(1.5), reference, 0.2),
+                direction([1, 0], second, reference, 0.1),
+                direction([1, 1], None, reference, -0.05),
             ]
         };
-        // Sorted [-inf, 1.0, 1.5]: the median is 1.0, half of R1's 2.0. Two of three neighbours
-        // made money.
+        // Ratios [-inf, 0.5, 0.75] against a reference of 2.0: the median is 0.5. Two of three
+        // neighbours made money.
         assert_eq!(
-            plateau_numbers(Some(2.0), &directions(Some(1.0)), Maximize),
+            plateau_numbers(&directions(Some(1.0), Some(2.0)), Maximize),
             (Some(0.5), Some(2.0 / 3.0))
         );
-        // With R1's objective at or below zero, or undefined, a ratio would read backwards or not
-        // at all, so there is none; the share still counts.
-        for best in [Some(0.0), Some(-0.5), None] {
+        // Each against its own reference: 1.5 / 1.5 and 1.0 / 4.0, and the undefined one.
+        let own = [
+            direction([0, 1], Some(1.5), Some(1.5), 0.2),
+            direction([1, 0], Some(1.0), Some(4.0), 0.1),
+            direction([1, 1], None, Some(2.0), -0.05),
+        ];
+        assert_eq!(plateau_numbers(&own, Maximize).0, Some(0.25));
+        // With a reference at or below zero, or undefined, a ratio would read backwards or not at
+        // all, so the direction has none; the share still counts it.
+        for reference in [Some(0.0), Some(-0.5), None] {
             assert_eq!(
-                plateau_numbers(best, &directions(Some(1.0)), Maximize),
+                plateau_numbers(&directions(Some(1.0), reference), Maximize),
                 (None, Some(2.0 / 3.0)),
-                "best {best:?}"
+                "reference {reference:?}"
             );
         }
-        // Two undefined neighbours of three put the median at the worst value: no finite ratio.
+        let mixed = [
+            own[0].clone(),
+            direction([1, 0], Some(-1.0), Some(-0.5), -0.1),
+        ];
+        assert_eq!(plateau_numbers(&mixed, Maximize), (Some(1.0), Some(0.5)));
+        // Two undefined neighbours of three put the median at the worst ratio: no finite ratio.
         assert_eq!(
-            plateau_numbers(Some(2.0), &directions(None), Maximize).0,
+            plateau_numbers(&directions(None, Some(2.0)), Maximize).0,
             None
         );
-        // Minimize, on max drawdown: an undefined neighbour counts as the largest, and the ratio
-        // is R1's over the median, so below 1 is worse here too. Sorted [0.2, 0.3, inf]: the
-        // median is 0.3.
+        // Minimize, on max drawdown: the ratio is the reference over the objective, so below 1 is
+        // worse here too, and an undefined neighbour has a ratio of 0. Sorted [0, 1/3, 1/2]: the
+        // median is 0.1 / 0.3.
         let min = vec![
-            direction([0, 1], Some(0.2), 0.1),
-            direction([1, 1], Some(0.3), 0.2),
-            direction([1, 0], None, -0.05),
+            direction([0, 1], Some(0.2), Some(0.1), 0.1),
+            direction([1, 1], Some(0.3), Some(0.1), 0.2),
+            direction([1, 0], None, Some(0.1), -0.05),
         ];
         assert_eq!(
-            plateau_numbers(Some(0.1), &min, Minimize),
+            plateau_numbers(&min, Minimize),
             (Some(0.1 / 0.3), Some(2.0 / 3.0))
         );
         // No neighbours: nothing to judge.
-        assert_eq!(plateau_numbers(Some(2.0), &[], Maximize), (None, None));
+        assert_eq!(plateau_numbers(&[], Maximize), (None, None));
     }
 
     #[test]
@@ -1617,10 +1639,12 @@ mod tests {
             exit_time: day + exit_hour * HOUR,
             ..trade(0, 0.0, false)
         };
-        // In at 01:00 and out at 21:00: intraday, no warning.
-        assert_eq!(carry_warning(carry, &[held(1, 21)]), None);
+        let h1 = td_core::Timeframe::H1;
+        // In at 01:00 and out in the bar that opens at 21:00 and ends at the rollover: intraday,
+        // no warning.
+        assert_eq!(carry_warning(carry, &[held(1, 21)], h1), None);
         // In at 20:00 and out at 01:00 the next day: held through the rollover.
-        let warning = carry_warning(carry, &[held(1, 21), held(20, 25)]).unwrap();
+        let warning = carry_warning(carry, &[held(1, 21), held(20, 25)], h1).unwrap();
         assert_eq!(
             warning,
             "1 of 2 out-of-sample trades held a position through the overnight swap at the daily \
@@ -1628,7 +1652,12 @@ mod tests {
              leave that cost out."
         );
         // Closed in the bar that opens at the rollover: counted, as it may have filled after it.
-        assert!(carry_warning(carry, &[held(20, 22)]).is_some());
+        assert!(carry_warning(carry, &[held(20, 22)], h1).is_some());
+        // On four-hour bars, in at 12:00 and stopped out inside the bar that opens at 20:00: that
+        // bar holds the 22:00 rollover, and the stop may have filled after it.
+        let h4 = td_core::Timeframe::H4;
+        assert!(carry_warning(carry, &[held(12, 20)], h4).is_some());
+        assert_eq!(carry_warning(carry, &[held(12, 16)], h4), None);
         // Perpetual funding is modelled, so a perpetual has no carry to warn of.
         assert_eq!(InstrumentKind::Perpetual.rules().unmodelled_carry, None);
         assert_eq!(InstrumentKind::Spot.rules().unmodelled_carry, None);
@@ -1716,17 +1745,20 @@ mod tests {
     /// 1,482 of 2,000 paths, seed 3.
     const PINNED_HAND_RUIN: f64 = 0.741;
 
-    /// The drawdown bootstrap draws from its own seed stream, not R7's: swapped, its paths would
-    /// repeat R7's draws exactly.
-    #[test]
-    fn the_drawdown_bootstrap_draws_from_its_own_seed_stream() {
-        let entry = crate::find_strategy("sma_cross").unwrap();
-        let instrument = test_instrument();
+    fn ints(v: &[i64]) -> crate::ParamSpace {
+        crate::ParamSpace::Values {
+            values: v.iter().map(|&x| crate::ParamValue::Int(x)).collect(),
+        }
+    }
+
+    /// sma_cross's plan on 250 days of four-hour bars of a triangle wave, as the battery's
+    /// integration tests use, swept over `axes`: four 45-day test windows after a 60-day train
+    /// window.
+    fn sma_plan(axes: Vec<crate::ParamAxis>) -> (TestPlan, Vec<Candle>) {
         let step = 4 * HOUR;
-        // 250 days of four-hour bars of a triangle wave, as the battery's integration tests use.
         let count = 250 * 6;
-        let mut plan = entry.plan;
-        plan.instruments = vec![instrument.id.clone()];
+        let mut plan = crate::find_strategy("sma_cross").unwrap().plan;
+        plan.instruments = vec![test_instrument().id];
         plan.timeframe = td_core::Timeframe::H4;
         plan.period = crate::Period {
             from: 0,
@@ -1737,22 +1769,10 @@ mod tests {
             test_days: 45,
         };
         plan.out_of_sample = None;
-        let ints = |v: [i64; 3]| crate::ParamSpace::Values {
-            values: v.iter().map(|&x| crate::ParamValue::Int(x)).collect(),
-        };
-        plan.sweep.axes = vec![
-            crate::ParamAxis {
-                name: "fast".into(),
-                space: ints([2, 3, 4]),
-            },
-            crate::ParamAxis {
-                name: "slow".into(),
-                space: ints([8, 12, 16]),
-            },
-        ];
+        plan.sweep.axes = axes;
         plan.sweep.min_trades = 3;
         plan.evidence.luck.permutations = 19;
-        let bars: Vec<Candle> = (0..count)
+        let bars = (0..count)
             .map(|i| {
                 let x = i as f64 / 60.0;
                 let close = 100.0 + 10.0 * (4.0 * (x - x.floor() - 0.5).abs() - 1.0);
@@ -1767,19 +1787,45 @@ mod tests {
                 }
             })
             .collect();
+        (plan, bars)
+    }
+
+    /// The 3 x 3 grid of fast and slow periods.
+    fn sma_axes() -> Vec<crate::ParamAxis> {
+        vec![
+            crate::ParamAxis {
+                name: "fast".into(),
+                space: ints(&[2, 3, 4]),
+            },
+            crate::ParamAxis {
+                name: "slow".into(),
+                space: ints(&[8, 12, 16]),
+            },
+        ]
+    }
+
+    fn sma_battery(plan: &TestPlan, bars: &[Candle], seed: u64) -> BatteryResult {
         let rule = VerdictRule::Portfolio {
             benchmark: PortfolioBenchmark::Cash,
             limits: crate::PortfolioLimits::default(),
         };
-        let seed = 7;
         let spec = BatterySpec {
-            strategy: entry.name,
-            plan: &plan,
+            strategy: "sma_cross",
+            plan,
             rule: &rule,
-            instrument: &instrument,
+            instrument: &test_instrument(),
             seed,
         };
-        let r = run_battery(&spec, &bars, &[], &[], None).unwrap();
+        run_battery(&spec, bars, &[], &[], None).unwrap()
+    }
+
+    /// The drawdown bootstrap draws from its own seed stream, not R7's: swapped, its paths would
+    /// repeat R7's draws exactly.
+    #[test]
+    fn the_drawdown_bootstrap_draws_from_its_own_seed_stream() {
+        let (plan, bars) = sma_plan(sma_axes());
+        let seed = 7;
+        let r = sma_battery(&plan, &bars, seed);
 
         let wf = r.walk_forward.as_ref().unwrap();
         let cash = plan.backtest.starting_cash;
@@ -1796,5 +1842,154 @@ mod tests {
         assert!(r.drawdown_bootstrap.is_some());
         assert_eq!(r.drawdown_bootstrap, drawn(SEED_DRAWDOWN_BOOTSTRAP));
         assert_ne!(r.drawdown_bootstrap, drawn(SEED_DAILY_BOOTSTRAP));
+    }
+
+    /// A decimal parameter swept over whole numbers: the chosen sets hold `equity_fraction` as the
+    /// decimal 1.0, not the listed 1, and R5 still finds their neighbours, by the chosen row's
+    /// place on the grid.
+    #[test]
+    fn r5_runs_on_a_decimal_parameter_swept_over_whole_numbers() {
+        let mut axes = sma_axes();
+        axes.push(crate::ParamAxis {
+            name: "equity_fraction".into(),
+            space: ints(&[0, 1]),
+        });
+        let (plan, bars) = sma_plan(axes);
+        let r = sma_battery(&plan, &bars, 7);
+
+        let wf = r.walk_forward.as_ref().unwrap();
+        for w in &wf.windows {
+            assert_eq!(
+                w.params.get("equity_fraction"),
+                Some(crate::ParamValue::Float(1.0))
+            );
+            assert_eq!(w.coords.last(), Some(&1));
+        }
+        let plateau = r.plateau.as_ref().unwrap();
+        assert!(!plateau.directions.is_empty());
+        assert!(plateau.directions.iter().all(|d| d.windows > 0));
+    }
+
+    /// Each of R5's neighbours runs on its window's test bars with the window's own test config:
+    /// every direction's numbers are its runs stitched by hand from those configs, over the
+    /// windows where it ran, against the chosen sets' runs in the same windows.
+    #[test]
+    fn r5_runs_each_neighbour_on_its_windows_test_config() {
+        let (plan, bars) = sma_plan(sma_axes());
+        let r = sma_battery(&plan, &bars, 7);
+
+        let wf = r.walk_forward.as_ref().unwrap();
+        let plateau = r.plateau.as_ref().unwrap();
+        let base = plan.backtest_config("sma_cross", test_instrument());
+        let metric = plan.sweep.objective.metric;
+        assert!(!plateau.directions.is_empty());
+        for d in &plateau.directions {
+            let (mut moved, mut own) = (Vec::new(), Vec::new());
+            for w in &wf.windows {
+                let found = wf.spec.sweep.neighbours(&w.coords).unwrap();
+                let Some((_, params)) = found.into_iter().find(|(s, _)| *s == d.steps) else {
+                    continue;
+                };
+                let config = BacktestConfig {
+                    params,
+                    ..w.out_of_sample.config.clone()
+                };
+                moved.push(run(&config, &bars, &[], &[]).unwrap());
+                own.push(&w.out_of_sample);
+            }
+            let h = stitched_headline(&base, &moved.iter().collect::<Vec<_>>());
+            assert_eq!(d.windows, moved.len(), "{d:?}");
+            assert_eq!(d.objective, h.value(metric), "{d:?}");
+            assert_eq!(d.total_return, h.total_return, "{d:?}");
+            assert_eq!(d.reference, stitched_headline(&base, &own).value(metric));
+        }
+    }
+
+    /// A cliff on one side of the chosen sets fails R5. One direction ran only in the even
+    /// windows, exactly as the chosen set did there; the other only in the odd windows, where it
+    /// lost to fees of 20% a fill. Each is judged on its own windows alone: filling the other
+    /// windows with the chosen set's run would hide most of the cliff.
+    #[test]
+    fn a_cliff_on_one_side_fails_the_plateau() {
+        let (plan, bars) = sma_plan(sma_axes());
+        let r = sma_battery(&plan, &bars, 7);
+        let wf = r.walk_forward.as_ref().unwrap();
+        assert_eq!(wf.windows.len(), 4);
+
+        let costly = |w: &crate::WindowResult| {
+            let config = BacktestConfig {
+                fee_override: Some(FeeSchedule {
+                    maker: 0.2,
+                    taker: 0.2,
+                    per_unit: 0.0,
+                }),
+                ..w.out_of_sample.config.clone()
+            };
+            run(&config, &bars, &[], &[]).unwrap()
+        };
+        let runs: Vec<Vec<(Vec<i8>, BacktestResult)>> = wf
+            .windows
+            .iter()
+            .enumerate()
+            .map(|(k, w)| match k % 2 {
+                0 => vec![(vec![-1, 0], w.out_of_sample.clone())],
+                _ => vec![(vec![1, 0], costly(w))],
+            })
+            .collect();
+        let base = plan.backtest_config("sma_cross", test_instrument());
+        let p = plateau(wf, &runs, &base, plan.sweep.objective);
+
+        let [flat, cliff] = p.directions.as_slice() else {
+            panic!("{:?}", p.directions)
+        };
+        assert_eq!(
+            (flat.steps.as_slice(), flat.windows),
+            ([-1, 0].as_slice(), 2)
+        );
+        assert_eq!(flat.objective, flat.reference);
+        let odd: Vec<&BacktestResult> = runs.iter().skip(1).step_by(2).map(|w| &w[0].1).collect();
+        let h = stitched_headline(&base, &odd);
+        assert_eq!((cliff.windows, cliff.total_return), (2, h.total_return));
+        assert!(h.total_return.unwrap() < 0.0, "{h:?}");
+        let settings = &plan.evidence.plateau;
+        assert!(
+            p.positive_share.unwrap() < settings.min_positive_share,
+            "{p:?}"
+        );
+        assert!(p.median_ratio.unwrap() < settings.min_median_ratio, "{p:?}");
+    }
+
+    /// A plateau saved before R5 moved out of sample, with its ratio and share, no directions and
+    /// no warnings on its verdict, still reads.
+    #[test]
+    fn a_plateau_saved_before_the_directions_still_reads() {
+        let old = serde_json::json!({
+            "best_objective": 1.25,
+            "median_ratio": 0.8,
+            "positive_share": 0.9,
+        });
+        let p: PlateauReport = serde_json::from_value(old).unwrap();
+        assert_eq!(
+            p,
+            PlateauReport {
+                best_objective: Some(1.25),
+                directions: Vec::new(),
+                median_ratio: Some(0.8),
+                positive_share: Some(0.9),
+            }
+        );
+        let direction: PlateauDirection = serde_json::from_value(serde_json::json!({
+            "steps": [1, 0],
+            "windows": 2,
+            "objective": 0.5,
+            "total_return": 0.1,
+        }))
+        .unwrap();
+        assert_eq!(direction.reference, None);
+        let mut verdict =
+            serde_json::to_value(Verdict::new(test_instrument().id, Vec::new())).unwrap();
+        verdict.as_object_mut().unwrap().remove("warnings");
+        let verdict: Verdict = serde_json::from_value(verdict).unwrap();
+        assert!(verdict.warnings.is_empty());
     }
 }

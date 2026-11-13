@@ -212,7 +212,8 @@ pub struct LuckTest {
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Plateau {
-    /// The neighbours' median objective over R1's must be at least this.
+    /// The median over the neighbours of each one's objective over the chosen sets' on the same
+    /// windows must be at least this.
     pub min_median_ratio: f64,
     /// At least this share of the neighbours must be profitable.
     pub min_positive_share: f64,
