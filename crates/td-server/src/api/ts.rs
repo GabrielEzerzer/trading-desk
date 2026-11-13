@@ -134,6 +134,7 @@ pub fn render() -> String {
         td_engine::Criterion,
         td_engine::VerdictState,
         td_engine::Verdict,
+        td_engine::LoosenedLimit,
         td_engine::PlanRun,
         td_engine::BatteryResult,
         td_engine::IntegrityReport,

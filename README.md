@@ -56,6 +56,12 @@ OANDA_API_TOKEN=<your token> target/release/td-data download --venue oanda --kin
 
 A request returns at most 5,000 minutes, so a month of one pair takes six or seven requests. A minute with no price is filled at the last close, with volume 0; most such minutes fall around the New York close. A run of an hour or more with no price, such as a market holiday, is left missing and shows as a gap, and nothing is stored for the weekend, when the market is closed.
 
+### Holding back recent data
+
+To keep the latest months unseen while you work on a strategy, start the engine with `TD_DATA_CUTOFF` set to a UTC date written `YYYY-MM-DD`, for example `TD_DATA_CUTOFF=2026-06-30`. While it is set, every backtest, sweep, out-of-sample run, walk-forward run and test battery whose range ends after the end of that date is refused with an error that names the cutoff, before any bar is read. A range that ends at midnight UTC at the end of the cutoff date is allowed. Paper trading and the live chart are not affected.
+
+The cutoff is shown in one place on the server, `GET /health` (`data_cutoff`), and the app shows it while it is in force. Each run saved under a cutoff records it, and `GET /runs/{id}` returns it as `data_cutoff`. A value that is not a real date, an empty one included, stops the engine at start with an error. For the final check on the held-back months, start the engine without the variable.
+
 ## Writing a strategy
 
 A strategy is one Rust file with three parts. `crates/td-engine/src/strategies/sma_cross.rs` is the example to copy.
@@ -65,6 +71,13 @@ A strategy is one Rust file with three parts. `crates/td-engine/src/strategies/s
 
    The battery runs the same tests on every market, keyed on what the market's rules say it can do rather than on its name. On a market with quotes, such as FX, the luck test rebuilds each shuffled bar's ask with the spread of the bar that stood at that time, so a strategy that trades only in a tight-spread hour pays that hour's spread on every shuffled copy too, and the cost stress widens each bar's spread by the same multiple it applies to fees, the per-unit commission and slippage. The parameter plateau is judged out of sample: in each walk-forward window, the neighbours on the grid of the set the window chose run on that window's test bars, and each is compared with the walk-forward's own runs in the windows where it ran. When a market charges a financing cost the engine does not model yet, such as the FX overnight swap, and a trade holds a position through the point where it is charged, the verdict carries a warning naming that cost.
 3. **The verdict rule** (`VerdictRule`). It is one of three kinds. `PropFirm` takes the firm's daily-loss and drawdown limits and its profit target; its limits set how many days the pass odds and the breach odds are simulated over (`pass_horizon_days` and `breach_horizon_days`, 90 each by default), so a challenge with no time limit can set a longer pass horizon. `Portfolio` is judged against `BuyAndHold` or `Cash`. `HighRisk` is judged on expectancy and risk of ruin. Each kind's limits default to #35's values. To change a single limit, name that field and fill the rest from the default, for example `PortfolioLimits { min_sharpe: 1.5, ..PortfolioLimits::default() }`.
+
+Each saved verdict says what it was judged on, so a strategy tested over many runs cannot look better than it is. `GET /verdicts` lists, for each strategy and instrument:
+
+- `code_matches`: whether the strategy's source file is the same as when the battery ran. The build hashes each strategy's own file, examples and private ones alike, and every run saves that hash. A run saved before hashes were recorded shows `null`, meaning unknown. The hash covers the strategy's file only, not shared helpers it calls, so a change to a helper alone leaves `code_matches` true.
+- `stale`: true unless the engine, the plan and rule, and the code all still match.
+- `loosened`: every limit of the verdict's rule that is looser than its kind's default, with both values. A lower minimum or a higher maximum is looser; a longer pass horizon and a shorter breach horizon are looser too. Tightened limits are not listed.
+- `runs` and `code_versions`: how many batteries have run on the pair, and how many distinct versions of the code they ran. Both are keyed by the strategy's name, so a renamed strategy starts again from zero.
 
 A private strategy goes in `crates/td-engine/src/strategies/private/`. Git ignores that folder, so it can hold your own strategies, or a checkout of a separate private repo of them (`git clone <url> crates/td-engine/src/strategies/private`). Every `*.rs` file in it is compiled in by `crates/td-engine/build.rs` and listed after the examples. Nothing else needs editing, and the engine builds without the folder. A file name must be a Rust module name, such as `my_strategy.rs`, and not a Rust keyword such as `mod.rs` or a bare `_.rs`. An example strategy in this repo also needs a `pub mod` line in `strategies/mod.rs` and an entry in `registry.rs`.
 

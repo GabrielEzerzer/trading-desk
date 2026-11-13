@@ -33,7 +33,7 @@ use td_server::api::data::read_coverage;
 use td_server::api::error::ApiError;
 use td_server::api::jobs::JobError;
 use td_server::api::runs::{
-    RunData, RunDone, check_run, check_run_data, load_run_data, read_run, save_run,
+    RunData, RunDone, RunRecord, check_run, check_run_data, load_run_data, read_run, save_run,
 };
 
 /// Every dataset starts at 2022-01-01T00:00Z.
@@ -275,7 +275,7 @@ fn bench(
     // Loaded once, outside the timed section, for the modes that time only the engine.
     let data = match w.mode {
         Mode::Load | Mode::LabBacktest => None,
-        _ => Some(load_run_data(store, &config).map_err(api_error)?),
+        _ => Some(load_run_data(store, &config, None).map_err(api_error)?),
     };
     for rep in 0..reps {
         // A store of its own for each repetition, as after an app start: whatever a store comes
@@ -292,8 +292,8 @@ fn bench(
             }
             (Mode::Load, _) => {
                 let start = Instant::now();
-                check_run_data(store, &config).map_err(api_error)?;
-                let loaded = load_run_data(store, &config).map_err(api_error)?;
+                check_run_data(store, &config, None).map_err(api_error)?;
+                let loaded = load_run_data(store, &config, None).map_err(api_error)?;
                 let ms = elapsed_ms(start);
                 eprintln!(
                     "  rep {rep}: {} bars, {} funding rates",
@@ -435,15 +435,16 @@ fn lab_backtest(
     let mut coverage = read_coverage(store, config.instrument.id.clone()).map_err(api_error)?;
     to_json(&coverage)?;
     split(&mut p.coverage);
-    check_run_data(store, config).map_err(api_error)?;
+    check_run_data(store, config, None).map_err(api_error)?;
     split(&mut p.check);
-    let data = load_run_data(store, config).map_err(api_error)?;
+    let data = load_run_data(store, config, None).map_err(api_error)?;
     split(&mut p.load);
     let result = engine_run(config, &data).map_err(|e| e.to_string())?;
     split(&mut p.run);
     let trades = result.trades.len();
     let saved = SavedRun::Backtest(Box::new(result));
-    let id = save_run(&saved, &data.report, &[], runs.path()).map_err(job_error)?;
+    let record = RunRecord::new(&config.strategy, None);
+    let id = save_run(&saved, &data.report, &record, &[], runs.path()).map_err(job_error)?;
     let done = RunDone {
         summary: saved.summary(id.clone()),
         run_id: id,

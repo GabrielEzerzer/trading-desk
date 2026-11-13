@@ -19,7 +19,7 @@ use td_server::api::auth::Token;
 use td_server::api::data::GapInfo;
 use td_server::api::jobs::{JobInfo, JobRequest, JobResult, JobStatus};
 const MAX_RUN_JOBS: usize = 8;
-use td_server::api::runs::{RunDetail, check_run_data, load_run_data};
+use td_server::api::runs::{DataCutoff, RunDetail, check_run_data, load_run_data};
 use td_server::api::source::{LiveSource, MarketSource};
 use td_server::api::ws::ServerMessage;
 use td_server::api::{ApiConfig, Server};
@@ -172,6 +172,11 @@ impl TestServer {
     /// A server whose store holds `days` days of minutes for BTCUSDT spot and perpetual, with a
     /// 30-minute outage at 10:00 on the second day and perpetual funding every 8 hours.
     async fn seeded(days: i64) -> TestServer {
+        TestServer::seeded_with(days, None).await
+    }
+
+    /// [`TestServer::seeded`], on a server started with a data cutoff when one is given.
+    async fn seeded_with(days: i64, cutoff: Option<&str>) -> TestServer {
         let dir = tempfile::tempdir().expect("temp dir");
         let store = Store::new(dir.path());
         let outage = t0() + DAY + 10 * HOUR..t0() + DAY + 10 * HOUR + 30 * MINUTE;
@@ -192,17 +197,23 @@ impl TestServer {
         store
             .write_funding(&instrument(InstrumentKind::Perpetual).id, &rates)
             .expect("seeds");
-        TestServer::on(dir, store).await
+        TestServer::on_with(dir, store, cutoff).await
     }
 
     /// A server on a store already seeded.
     async fn on(dir: TempDir, store: Store) -> TestServer {
+        TestServer::on_with(dir, store, None).await
+    }
+
+    /// [`TestServer::on`], started with `TD_DATA_CUTOFF` set to `cutoff` when one is given.
+    async fn on_with(dir: TempDir, store: Store, cutoff: Option<&str>) -> TestServer {
         let server = Server::start(ApiConfig {
             store: store.clone(),
             source: std::sync::Arc::new(NoSource),
             live: std::sync::Arc::new(NoLive),
             token: Token::generate().expect("rng"),
             port: 0,
+            data_cutoff: cutoff.map(|c| DataCutoff::parse(c).expect("a cutoff")),
         })
         .await
         .expect("starts");
@@ -604,6 +615,98 @@ async fn a_range_the_store_lacks_is_422_data_missing_and_starts_no_job() {
     assert_eq!(jobs, json!([]), "no job was created");
 }
 
+/// With a data cutoff in force, every run kind whose range ends after the cutoff date is a 422
+/// that names the cutoff and starts no job, though the store holds the bars; a run ending exactly
+/// at the end of the cutoff date runs, and its record says the cutoff was in force and which code
+/// it ran. `GET /health` says the cutoff is in force, and says nothing on a server without one.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_data_cutoff_refuses_runs_past_it_and_is_recorded_on_the_runs_it_allows() {
+    let t = TestServer::seeded_with(7, Some("2024-03-05")).await;
+    let sweep = sweep_spec(6, (3, 4), (10, 11));
+    let past = [
+        (
+            "/runs/backtest",
+            serde_json::to_value(config(InstrumentKind::Spot, 6)).unwrap(),
+        ),
+        ("/runs/sweep", sweep.clone()),
+        (
+            "/runs/out-of-sample",
+            json!({ "sweep": sweep, "split": { "fraction": 0.7 } }),
+        ),
+        (
+            "/runs/walk-forward",
+            json!({
+                "sweep": sweep,
+                "windows": { "train_bars": 72, "test_bars": 24, "step_bars": 24, "mode": "rolling" },
+            }),
+        ),
+    ];
+    for (path, body) in &past {
+        let (status, body) = t.post(path, body).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{path}: {body}");
+        assert_eq!(body["error"]["code"], "after_cutoff", "{path}");
+        let message = body["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains("ends at 2024-03-07 00:00 UTC")
+                && message.contains("TD_DATA_CUTOFF=2024-03-05")
+                && message.contains("End the range at 2024-03-06 00:00 UTC or earlier"),
+            "{path}: {message}"
+        );
+    }
+    let (_, jobs) = t.get("/jobs").await;
+    assert_eq!(jobs, json!([]), "no job was created");
+
+    let within = serde_json::to_value(config(InstrumentKind::Spot, 5)).unwrap();
+    let detail = saved_run(&t, "/runs/backtest", &within).await;
+    assert_eq!(detail.data_cutoff.as_deref(), Some("2024-03-05"));
+    assert_eq!(
+        detail.code_hash.as_deref(),
+        td_engine::code_hash("sma_cross")
+    );
+    assert!(detail.code_hash.is_some());
+    assert_eq!(detail.code_matches, Some(true));
+    let (status, reopened) = t.get(&format!("/runs/{}", detail.id)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(reopened["data_cutoff"], "2024-03-05");
+    assert_eq!(reopened["code_matches"], true);
+
+    let (status, health) = t.get("/health").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(health["data_cutoff"], "2024-03-05");
+    let open = TestServer::seeded(1).await;
+    let (_, health) = open.get("/health").await;
+    assert_eq!(health["data_cutoff"], Value::Null, "{health}");
+}
+
+/// A run saved before runs recorded their code, or by code that has changed since, says so on
+/// `GET /runs/{id}`: no record is unknown (null), never a match, and a different hash is false.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_saved_run_says_whether_the_code_it_ran_still_matches() {
+    let t = TestServer::seeded(3).await;
+    let body = serde_json::to_value(config(InstrumentKind::Spot, 3)).unwrap();
+    let detail = saved_run(&t, "/runs/backtest", &body).await;
+    assert_eq!(detail.data_cutoff, None, "no cutoff in force");
+    let folder = t.store.root().join("runs").join(detail.id.as_str());
+    let record = folder.join("record.json");
+    let saved: Value = serde_json::from_slice(&std::fs::read(&record).unwrap()).unwrap();
+    assert_eq!(
+        saved["code_hash"].as_str(),
+        td_engine::code_hash("sma_cross")
+    );
+
+    std::fs::write(&record, r#"{ "code_hash": "0000000000000000" }"#).unwrap();
+    let (_, changed) = t.get(&format!("/runs/{}", detail.id)).await;
+    assert_eq!(changed["code_matches"], false, "{changed}");
+    assert_eq!(changed["code_hash"], "0000000000000000");
+
+    std::fs::remove_file(&record).unwrap();
+    let (status, old) = t.get(&format!("/runs/{}", detail.id)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(old["code_matches"], Value::Null, "{old}");
+    assert_eq!(old["code_hash"], Value::Null);
+    assert_eq!(old["data_cutoff"], Value::Null);
+}
+
 /// Holds every thread of rayon's global pool until dropped.
 struct BusyGlobalPool(Arc<(Mutex<bool>, Condvar)>);
 
@@ -941,8 +1044,8 @@ fn an_fx_week_with_its_weekend_closed_passes_the_data_check_with_no_gap_or_dropp
         .write_quotes(&fx.instrument.id, &bids, &asks)
         .expect("seeds");
 
-    check_run_data(&store, &fx).expect("the weekend is closed, not missing");
-    let data = load_run_data(&store, &fx).expect("loads");
+    check_run_data(&store, &fx, None).expect("the weekend is closed, not missing");
+    let data = load_run_data(&store, &fx, None).expect("loads");
     assert_eq!(data.report.gaps, []);
     assert_eq!(data.report.dropped, [] as [Millis; 0]);
     assert_eq!(data.report.bars, 5 * 24, "five open days of hourly bars");
@@ -955,7 +1058,7 @@ fn an_fx_week_with_its_weekend_closed_passes_the_data_check_with_no_gap_or_dropp
     store
         .write_candles(&spot.instrument.id, &bids)
         .expect("seeds");
-    match check_run_data(&store, &spot) {
+    match check_run_data(&store, &spot, None) {
         Err(e) => assert_eq!(e.body.code, "data_missing", "{e:?}"),
         Ok(()) => panic!("spot with the weekend missing must be refused"),
     }
