@@ -291,14 +291,18 @@ test.describe('running on the engine', () => {
     await expect(page.getByRole('menuitemradio', { name: 'BTCUSDT spot, Binance' })).toHaveAttribute('aria-checked', 'true')
   })
 
-  test('with nothing stored, a strategy with a saved run still offers the download', async ({ page, open }) => {
+  test('with nothing stored, a strategy shows its saved result and offers the download beside it', async ({ page, open }) => {
     await open({ ...engine, noData: true })
     await page.getByRole('button', { name: /SMA cross/ }).click()
-    await expect(page.getByText('No data downloaded')).toBeVisible()
+    await expect(page.getByRole('heading', { name: 'No verdict rule yet' })).toBeVisible()
+    await expect(page.getByText('Nothing is stored now. Download the history of BTCUSDT perpetual, Binance to run this strategy again.')).toBeVisible()
     await page.getByRole('button', { name: 'Download BTCUSDT history' }).click()
     await expect(page.getByRole('progressbar', { name: 'Download progress' })).toBeVisible()
-    // Once the data is stored, the saved result shows again.
-    await expect(page.locator('#verdict')).toHaveText('No verdict rule yet', { timeout: 10_000 })
+    // Once the download stores the data, the offer goes and the result stays.
+    await expect(page.getByRole('button', { name: 'Download BTCUSDT history' })).toHaveCount(0, { timeout: 10_000 })
+    await expect(page.getByRole('progressbar')).toHaveCount(0, { timeout: 10_000 })
+    await expect(page.getByRole('heading', { name: 'No verdict rule yet' })).toBeVisible()
+    await expect(page.getByText('Nothing is stored now.', { exact: false })).toHaveCount(0)
   })
 
   test('a download can be cancelled', async ({ page, open }) => {
@@ -331,6 +335,135 @@ test.describe('running on the engine', () => {
     await page.getByRole('button', { name: 'Run', exact: true }).click()
     await expect(page.getByRole('alert')).toContainText('Run failed', { timeout: 10_000 })
     await expect(page.getByRole('alert')).toContainText(/strategy refused its parameters: slow must be above fast/i)
+  })
+
+  test('the stored data view deletes one instrument after asking, and the list updates', async ({ page, open }) => {
+    await open(engine)
+    await expect(page.getByRole('button', { name: /^Stored data/ })).toContainText('32.8 MB in 2 instruments')
+    await page.getByRole('button', { name: /^Stored data/ }).click()
+    await expect(page.getByRole('heading', { name: 'Market data', level: 1 })).toBeFocused()
+    const rows = page.locator('.data-table tbody tr')
+    await expect(rows).toHaveCount(2)
+    await expect(rows.first()).toContainText('BTCUSDT')
+    await expect(rows.first()).toContainText('31.6 MB')
+
+    await page.getByRole('button', { name: 'Delete BTCUSDT perpetual, Binance' }).click()
+    await page.getByRole('menuitem', { name: /All of it/ }).click()
+    const confirm = page.getByRole('group', { name: 'Confirm the delete' })
+    await expect(confirm).toContainText('Delete BTCUSDT perpetual, Binance: all 18 months and its funding rates?')
+    await expect(confirm).toContainText('This frees 31.6 MB.')
+    // Nothing is deleted until the delete is confirmed.
+    expect((await calls(page)).some((c) => c.path === '/data/delete')).toBe(false)
+
+    await confirm.getByRole('button', { name: 'Delete', exact: true }).click()
+    await expect(page.getByRole('status')).toHaveText('Deleted BTCUSDT perpetual, Binance. 31.6 MB freed.')
+    await expect(confirm).toBeHidden()
+    await expect(rows).toHaveCount(1)
+    await expect(rows.first()).toContainText('ETHUSDT')
+    await expect(page.locator('.verdict')).toHaveText('1.2 MB')
+    const deletes = (await calls(page)).filter((c) => c.method === 'POST' && c.path.startsWith('/data/delete'))
+    expect(deletes).toEqual([
+      { method: 'POST', path: '/data/delete', body: { instrument: { venue: 'binance', symbol: 'BTCUSDT', kind: 'perpetual' } } },
+    ])
+
+    // The data a run can use follows the store.
+    await page.getByRole('button', { name: 'Overrides' }).click()
+    await expect(page.getByRole('menuitemradio', { name: /, (Binance|Bybit)$/ })).toHaveText(['ETHUSDT spot, Bybit'])
+  })
+
+  test('a refused delete says why and keeps the data', async ({ page, open }) => {
+    await open({ ...engine, deleteFails: true })
+    await page.getByRole('button', { name: /^Stored data/ }).click()
+    await page.getByRole('button', { name: 'Delete all market data' }).click()
+    const confirm = page.getByRole('group', { name: 'Confirm the delete' })
+    await expect(confirm).toContainText('Delete all market data, 2 instruments? Saved runs and paper sessions stay.')
+    await expect(confirm).toContainText('This frees 32.8 MB.')
+    await confirm.getByRole('button', { name: 'Delete', exact: true }).click()
+    await expect(page.getByRole('alert')).toContainText('The delete failed. binance:BTCUSDT:perpetual is being downloaded or deleted right now')
+    await expect(page.locator('.data-table tbody tr')).toHaveCount(2)
+    await confirm.getByRole('button', { name: 'Cancel' }).click()
+    await expect(confirm).toBeHidden()
+  })
+
+  test('the view and each confirmation read the store again, so they name data td-data added since', async ({ page, open }) => {
+    // A download with the td-data command line tool, which the app does not see happen.
+    const downloaded = (id: string) =>
+      page.evaluate((id) => (window as unknown as { __stubDownloaded(id: string): void }).__stubDownloaded(id), id)
+    await open(engine)
+    await expect(page.getByRole('button', { name: /^Stored data/ })).toContainText('32.8 MB in 2 instruments')
+
+    await downloaded('binance:SOLUSDT:perpetual')
+    await page.getByRole('button', { name: /^Stored data/ }).click()
+    const rows = page.locator('.data-table tbody tr')
+    await expect(rows).toHaveCount(3)
+    await expect(rows.filter({ hasText: 'SOLUSDT' })).toHaveCount(1)
+
+    await downloaded('bybit:ADAUSDT:spot')
+    await page.getByRole('button', { name: 'Delete all market data' }).click()
+    const confirm = page.getByRole('group', { name: 'Confirm the delete' })
+    await expect(confirm).toContainText('Delete all market data, 4 instruments? Saved runs and paper sessions stay.')
+    await expect(confirm).toContainText('This frees 95.8 MB.')
+    await expect(rows.filter({ hasText: 'ADAUSDT' })).toHaveCount(1)
+  })
+
+  test('a delete that stops part-way says why, and the list shows what it removed', async ({ page, open }) => {
+    await open({ ...engine, deleteStops: true })
+    await page.getByRole('button', { name: /^Stored data/ }).click()
+    await page.getByRole('button', { name: 'Delete BTCUSDT perpetual, Binance' }).click()
+    await page.getByRole('menuitem', { name: /All of it/ }).click()
+    const confirm = page.getByRole('group', { name: 'Confirm the delete' })
+    await expect(confirm).toContainText('all 18 months and its funding rates?')
+    await confirm.getByRole('button', { name: 'Delete', exact: true }).click()
+    await expect(page.getByRole('alert')).toContainText('The delete failed.')
+    await expect(page.getByRole('alert')).toContainText('the delete stopped; files removed before it: 1,')
+    // The month it removed before it stopped is gone from the list and from the question.
+    await expect(confirm).toContainText('all 17 months and its funding rates?')
+    await expect(page.locator('.data-table tbody tr').first()).toContainText('Feb 2024')
+  })
+
+  test('a confirmation does not open when the list fails to load again, and Retry loads it', async ({ page, open }) => {
+    const storedFails = (fails: boolean) =>
+      page.evaluate((fails) => (window as unknown as { __stubStoredFails(fails: boolean): void }).__stubStoredFails(fails), fails)
+    await open(engine)
+    await page.getByRole('button', { name: /^Stored data/ }).click()
+    const rows = page.locator('.data-table tbody tr')
+    await expect(rows).toHaveCount(2)
+
+    await storedFails(true)
+    await page.getByRole('button', { name: 'Delete all market data' }).click()
+    const alert = page.getByRole('alert')
+    await expect(alert).toContainText('The list did not load again. The data folder could not be read.')
+    await expect(page.getByRole('group', { name: 'Confirm the delete' })).toHaveCount(0)
+    expect((await calls(page)).some((c) => c.path.startsWith('/data/delete'))).toBe(false)
+
+    await storedFails(false)
+    await alert.getByRole('button', { name: 'Retry' }).click()
+    await expect(alert).toHaveCount(0)
+    await expect(rows).toHaveCount(2)
+  })
+
+  test('deleting the only instrument keeps the view and says it was deleted', async ({ page, open }) => {
+    await open(engine)
+    await page.getByRole('button', { name: /^Stored data/ }).click()
+    // ETHUSDT spot goes first, so BTCUSDT perpetual is the only instrument, then that goes too.
+    for (const name of ['ETHUSDT spot, Bybit', 'BTCUSDT perpetual, Binance']) {
+      await page.getByRole('button', { name: `Delete ${name}` }).click()
+      await page.getByRole('menuitem', { name: /All of it/ }).click()
+      await page.getByRole('group', { name: 'Confirm the delete' }).getByRole('button', { name: 'Delete', exact: true }).click()
+      await expect(page.getByRole('status')).toContainText(`Deleted ${name}.`)
+    }
+    await expect(page.getByRole('status')).toHaveText('Deleted BTCUSDT perpetual, Binance. 31.6 MB freed.')
+    await expect(page.getByText('Download history from a strategy that has none', { exact: false })).toBeVisible()
+  })
+
+  test('a perpetual with only its funding rates stored is asked about as that', async ({ page, open }) => {
+    await open(engine)
+    await page.evaluate(() => (window as unknown as { __stubFundingOnly(id: string): void }).__stubFundingOnly('bybit:XRPUSDT:perpetual'))
+    await page.getByRole('button', { name: /^Stored data/ }).click()
+    await page.getByRole('button', { name: 'Delete XRPUSDT perpetual, Bybit' }).click()
+    await page.getByRole('menuitem', { name: /All of it/ }).click()
+    const confirm = page.getByRole('group', { name: 'Confirm the delete' })
+    await expect(confirm).toContainText('Delete the funding rates of XRPUSDT perpetual, Bybit?')
   })
 })
 

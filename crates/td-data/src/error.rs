@@ -123,6 +123,11 @@ pub enum DataError {
     #[error("the range {from} to {to} is empty: --to must be after --from")]
     EmptyRange { from: String, to: String },
 
+    #[error(
+        "{0} is being downloaded or deleted right now, in this app or another program on the same data folder; delete it again once that has finished"
+    )]
+    InstrumentBusy(String),
+
     #[error("no data directory: set TD_DATA_DIR")]
     NoDataDir,
 

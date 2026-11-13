@@ -2,6 +2,8 @@ import { describe, expect, it } from 'vitest'
 import type { ApiRequest, ApiResult } from './bridge'
 import { ApiError, createClient } from './client'
 
+const btc = { venue: 'binance', symbol: 'BTCUSDT', kind: 'spot' } as const
+
 describe('createClient', () => {
   it('builds the request for each route and returns the body', async () => {
     const sent: ApiRequest[] = []
@@ -17,6 +19,9 @@ describe('createClient', () => {
     await client.resumeSession('a')
     await client.placeOrder('a', { side: 'buy', qty: 0.5, type: 'limit', limit_price: 100 })
     await client.cancelOrder('a', 3)
+    await client.stored()
+    await client.deleteData({ instrument: btc, from: '2024-01', to: '2024-03' })
+    await client.deleteAllData()
     expect(sent).toEqual([
       { method: 'GET', path: '/health' },
       { method: 'GET', path: '/data/coverage', query: { instrument: 'binance:BTCUSDT:spot' } },
@@ -26,6 +31,9 @@ describe('createClient', () => {
       { method: 'POST', path: '/sessions/a/resume' },
       { method: 'POST', path: '/sessions/a/orders', body: { side: 'buy', qty: 0.5, type: 'limit', limit_price: 100 } },
       { method: 'POST', path: '/sessions/a/orders/3/cancel' },
+      { method: 'GET', path: '/data/stored' },
+      { method: 'POST', path: '/data/delete', body: { instrument: btc, from: '2024-01', to: '2024-03' } },
+      { method: 'POST', path: '/data/delete-all' },
     ])
   })
 

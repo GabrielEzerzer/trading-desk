@@ -155,6 +155,8 @@ fn fetch(case_path: &Path, dir: &Path) -> Res<()> {
         serde_json::to_string_pretty(&instrument)?,
     )?;
 
+    // Held across processes through the downloads and reads, as td-data and the server hold it.
+    let _hold = store.hold_for_download(&id)?;
     let report = download_candles(&http, &store, &id, from, to, &mut |line| {
         eprintln!("{line}")
     })?;

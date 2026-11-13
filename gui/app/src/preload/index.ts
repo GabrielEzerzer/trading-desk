@@ -17,6 +17,7 @@ const td: TdBridge = {
   status: () => ipcRenderer.invoke(IPC.status),
   onStatus: (listener) => listen<EngineStatus>(IPC.statusChanged, listener),
   restartEngine: () => ipcRenderer.invoke(IPC.restartEngine),
+  openDataFolder: () => ipcRenderer.invoke(IPC.openDataFolder),
   // Main adds this argument when the app runs with TD_MOCK=1. A sandboxed preload still has argv.
   mock: process.argv.includes(MOCK_ARG),
 }

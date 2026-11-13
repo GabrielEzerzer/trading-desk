@@ -250,6 +250,14 @@ struct Inner {
 }
 
 impl Inner {
+    /// Any queued or running download, with its instrument.
+    fn any_download(&self) -> Option<(u64, InstrumentId)> {
+        self.jobs.values().find_map(|e| {
+            let id = e.info.request.downloads()?;
+            (!e.info.status.is_finished()).then(|| (e.info.id, id.clone()))
+        })
+    }
+
     /// The id of the queued or running download job of `id`, if there is one.
     fn download_of(&self, id: &InstrumentId) -> Option<u64> {
         self.jobs
@@ -412,6 +420,11 @@ impl Jobs {
     /// The id of the queued or running download job of `id` in this server, if there is one.
     pub fn download_in_progress(&self, id: &InstrumentId) -> Option<u64> {
         self.lock().download_of(id)
+    }
+
+    /// A queued or running download of any instrument, with its job id.
+    pub fn any_download_in_progress(&self) -> Option<(u64, InstrumentId)> {
+        self.lock().any_download()
     }
 
     pub fn list(&self) -> Vec<JobInfo> {

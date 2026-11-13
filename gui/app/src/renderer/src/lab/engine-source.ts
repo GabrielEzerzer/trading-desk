@@ -43,14 +43,8 @@ class JobFailed extends Error {
 const missingToken = (e: unknown) =>
   e instanceof JobFailed && e.code === 'bad_request' && e.message.includes('needs an API token: set OANDA_API_TOKEN')
 
-// shortcut: the engine has no route that lists what the store holds, so the Lab asks for the
-// coverage of these instruments and of every instrument a saved run used. Ask the engine for its
-// stored instruments once it has a route for them.
-const CANDIDATES: InstrumentId[] = ['BTCUSDT', 'ETHUSDT'].flatMap((symbol) =>
-  (['binance', 'bybit'] as const).flatMap((venue) =>
-    (['spot', 'perpetual'] as const).map((kind) => ({ venue, symbol, kind })),
-  ),
-)
+/** The instrument a download offers when nothing is stored. */
+const DEFAULT_INSTRUMENT: InstrumentId = { venue: 'binance', symbol: 'BTCUSDT', kind: 'spot' }
 
 const defaults = (info: StrategyInfo | undefined): Params =>
   Object.fromEntries((info?.params ?? []).map((p) => [p.name, p.default]))
@@ -129,7 +123,7 @@ function followJob(start: () => Promise<number>, onUpdate: (job: JobInfo) => voi
 const strategyInfo = new Map<string, StrategyInfo>()
 
 export const engineLabSource: LabSource = {
-  defaultInstrument: CANDIDATES[0] as InstrumentId,
+  defaultInstrument: DEFAULT_INSTRUMENT,
   neverRunText: 'Run it to backtest it on the chosen data.',
 
   async dataCutoff() {
@@ -150,14 +144,13 @@ export const engineLabSource: LabSource = {
     }))
   },
 
-  async datasets() {
-    const runs = await api.runs()
-    const candidates = new Map(CANDIDATES.map((id) => [instrumentKey(id), id]))
-    for (const run of runs) candidates.set(instrumentKey(run.instrument), run.instrument)
-    const covered = await Promise.all(
-      [...candidates.values()].map(async (id) => ((await api.coverage(id)).months.length > 0 ? id : null)),
-    )
-    return covered.filter((id) => id !== null)
+  stored: () => api.stored(),
+
+  deleteData: (target) => (target === 'all' ? api.deleteAllData() : api.deleteData(target)),
+
+  async openDataFolder() {
+    const why = await window.td.openDataFolder()
+    if (why) throw new Error(why)
   },
 
   async open(last) {

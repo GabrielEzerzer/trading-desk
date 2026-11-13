@@ -63,6 +63,11 @@ export function formatMonth(ms: number): string {
 
 const VENUES: Record<InstrumentId['venue'], string> = { binance: 'Binance', bybit: 'Bybit', oanda: 'OANDA' }
 
+/** "Binance", "Bybit" or "OANDA". */
+export function formatVenue(venue: InstrumentId['venue']): string {
+  return VENUES[venue]
+}
+
 /** "BTCUSDT perpetual, Binance". */
 export function formatInstrument(id: InstrumentId): string {
   return `${id.symbol} ${id.kind}, ${VENUES[id.venue]}`
@@ -82,4 +87,17 @@ export function pnlTone(value: number, format: NumberFormat | 'return_pct'): 'ga
   const text = format === 'return_pct' ? formatReturnPct(value) : formatNumber(value, format)
   if (roundsToZero(text)) return undefined
   return value > 0 ? 'gain' : 'loss'
+}
+
+/** "1.5 kB", "12.3 MB" or "2.50 GB", in powers of 1000 as the td-data CLI writes sizes. */
+export function formatBytes(bytes: number): string {
+  if (bytes < 1e6) return `${(bytes / 1e3).toFixed(1)} kB`
+  if (bytes < 1e9) return `${(bytes / 1e6).toFixed(1)} MB`
+  return `${(bytes / 1e9).toFixed(2)} GB`
+}
+
+/** A store month, `2024-03`, as "Mar 2024". */
+export function formatStoreMonth(month: string): string {
+  const [year, m] = month.split('-')
+  return `${MONTHS[Number(m) - 1] ?? m} ${year}`
 }

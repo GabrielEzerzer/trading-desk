@@ -465,6 +465,145 @@ button {
   color: var(--grey-1);
 }
 
+/* The list's second section, the stored market data, stands clear of the strategies. */
+.list-section {
+  margin-top: var(--space-6);
+}
+
+/* Stored market data: the folder, the instruments as a table, and deletes that ask in place. */
+
+.data-folder {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  margin-bottom: var(--space-6);
+}
+
+.data-path {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--grey-1);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  user-select: text;
+}
+
+.data-folder .button-small {
+  flex: none;
+}
+
+.data-note {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-3);
+}
+
+.data-done {
+  margin: 0 0 var(--space-4);
+  border-radius: var(--radius-item);
+}
+
+.data-table td {
+  height: 44px;
+}
+
+.data-table .data-action {
+  width: 1%;
+  text-align: right;
+}
+
+.row-action {
+  height: var(--control-small);
+  padding: 0 var(--space-3);
+  border: 0;
+  border-radius: var(--radius-pill);
+  background: none;
+  color: var(--grey-1);
+  transition:
+    background-color var(--duration-hover) var(--ease-standard),
+    color var(--duration-hover) var(--ease-standard);
+}
+
+.row-action:hover,
+.row-action[data-state='open'] {
+  background: var(--fill-hover);
+  color: var(--ink);
+}
+
+.row-action:active {
+  opacity: var(--press-opacity);
+}
+
+.row-action[data-disabled] {
+  opacity: var(--press-opacity);
+}
+
+.data-table .confirm-row td {
+  height: auto;
+  padding: var(--space-2) 0 var(--space-5);
+  white-space: normal;
+}
+
+.confirm {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-2);
+}
+
+.confirm-text,
+.confirm-error {
+  max-width: 60ch;
+  margin: 0;
+}
+
+.confirm-text {
+  color: var(--grey-1);
+}
+
+/* The question itself reads first, in the ink. */
+.confirm > .confirm-text:first-child,
+.confirm-range {
+  color: var(--ink);
+}
+
+.confirm-range {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.pill-month {
+  height: 36px;
+  padding: 0 var(--space-2) 0 var(--space-3);
+}
+
+.confirm-actions {
+  display: flex;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+  /* Scrolled into view clear of the composer and its fade. */
+  scroll-margin-bottom: calc(var(--composer-clear) + var(--composer-fade));
+}
+
+.confirm-actions .button-dark,
+.confirm-actions .button-small {
+  height: 40px;
+  padding: 0 var(--space-5);
+}
+
+.data-foot {
+  margin: var(--space-5) 0;
+}
+
+/* A long run of months scrolls inside its menu rather than past the window. */
+.menu-months {
+  min-width: 160px;
+  max-height: min(320px, var(--radix-dropdown-menu-content-available-height));
+  overflow-y: auto;
+}
+
 /* Composer. */
 
 .composer-dock {
@@ -613,6 +752,11 @@ button {
   flex-wrap: wrap;
   align-items: baseline;
   gap: var(--space-3);
+  margin-bottom: var(--space-6);
+}
+
+/* The download offered under a saved result while nothing is stored. */
+.result .download-offer {
   margin-bottom: var(--space-6);
 }
 

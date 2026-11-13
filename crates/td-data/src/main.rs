@@ -47,7 +47,8 @@ enum Command {
     /// List every instrument the store holds, with the size of each month file and funding file.
     Stored,
     /// Delete an instrument's candles for a range of months, or with no range the whole
-    /// instrument, including a perpetual's funding file.
+    /// instrument, including a perpetual's funding file. Refused while the instrument is being
+    /// downloaded.
     Delete {
         #[command(flatten)]
         instrument: InstrumentArgs,
@@ -171,6 +172,9 @@ fn run(cli: Cli) -> Result<(), DataError> {
             let store = Store::open_default()?;
             let http = Http::new()?;
             eprintln!("store: {}", store.root().display());
+            // Held until the funding is stored too, so a delete of the instrument is refused
+            // meanwhile; this waits while a delete of it runs.
+            let _hold = store.hold_for_download(&id)?;
             let report = download_candles(&http, &store, &id, from, to, &mut |line| {
                 eprintln!("{line}")
             })?;

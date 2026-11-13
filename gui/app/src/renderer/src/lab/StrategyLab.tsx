@@ -1,12 +1,14 @@
-import type { InstrumentId, Timeframe } from '@td/shared'
-import { useCallback, useEffect, useRef, useState } from 'react'
+import type { InstrumentId, StoredResponse, Timeframe } from '@td/shared'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { sentence } from '../engine'
 import { Composer, type ComposerHandle } from './Composer'
-import { formatCutoff, formatDay, formatInstrument, formatNumber } from './format'
+import { formatBytes, formatCutoff, formatDay, formatInstrument, formatNumber } from './format'
 import { overallProgress, progressLabel } from './progress'
 import { Result } from './Result'
-import { type RunFailure, TIMEFRAMES, instrumentKey, laterRun, runFailure } from './runs'
+import { type RunFailure, TIMEFRAMES, instrumentKey, laterRun, runFailure, storedDatasets } from './runs'
+import { StoredData } from './StoredData'
 import {
+  type DeleteTarget,
   type LabSource,
   type LabStrategy,
   type LastRun,
@@ -43,13 +45,16 @@ const message = (e: unknown) => sentence(e instanceof Error ? e.message : String
 
 /**
  * The Lab: the strategy list until one is chosen, then that strategy's result, its run in
- * progress, its failed run, the offer to download data, or the offer to run it. The composer
- * floats at the bottom throughout.
+ * progress, its failed run, the offer to download data, or the offer to run it. The list also
+ * opens the stored market data. The composer floats at the bottom throughout.
  */
 export function StrategyLab() {
   const [source, setSource] = useState<LabSource | null>(null)
   const [strategies, setStrategies] = useState<LabStrategy[] | null>(null)
-  const [datasets, setDatasets] = useState<InstrumentId[] | null>(null)
+  // What the store holds; the instruments with candles are the data a run can use.
+  const [stored, setStored] = useState<StoredResponse | null>(null)
+  const [storedError, setStoredError] = useState<string | null>(null)
+  const [dataOpen, setDataOpen] = useState(false)
   const [dataCutoff, setDataCutoff] = useState<string | null>(null)
   const [loadError, setLoadError] = useState<string | null>(null)
   const [attempt, setAttempt] = useState(0)
@@ -67,6 +72,7 @@ export function StrategyLab() {
   const [fresh, setFresh] = useState<string | null>(null)
   const composer = useRef<ComposerHandle>(null)
   const scroller = useRef<HTMLDivElement>(null)
+  const dataHeading = useRef<HTMLHeadingElement>(null)
 
   useEffect(() => {
     let live = true
@@ -74,13 +80,13 @@ export function StrategyLab() {
     chooseLabSource()
       .then((s) => {
         if (live) setSource(s)
-        return Promise.all([s.strategies(), s.datasets(), s.dataCutoff()])
+        return Promise.all([s.strategies(), s.stored(), s.dataCutoff()])
       })
       .then(
-        ([list, stored, cutoff]) => {
+        ([list, held, cutoff]) => {
           if (!live) return
           setStrategies(list)
-          setDatasets(stored)
+          setStored(held)
           setDataCutoff(cutoff)
         },
         (e: unknown) => live && setLoadError(message(e)),
@@ -90,6 +96,10 @@ export function StrategyLab() {
     }
   }, [attempt])
 
+  const datasets = useMemo(
+    () => (stored && source ? storedDatasets(stored, source.defaultInstrument) : null),
+    [stored, source],
+  )
   const selected = strategies?.find((s) => s.name === selectedName) ?? null
   const instrument = datasets?.find((d) => instrumentKey(d) === chosenData) ?? datasets?.[0] ?? null
   const last = selected?.last ?? null
@@ -111,9 +121,44 @@ export function StrategyLab() {
 
   const select = (name: string | null) => {
     setSelectedName(name)
+    setDataOpen(false)
     scroller.current?.scrollTo({ top: 0 })
     // The chosen row unmounts; focus moves to the pill that now shows the choice, not to body.
     requestAnimationFrame(() => composer.current?.focusPicker())
+  }
+
+  const openData = () => {
+    setSelectedName(null)
+    setDataOpen(true)
+    // The list shown is read now: the td-data tool or another program may have changed the store
+    // since the Lab loaded.
+    void refreshStored()
+    scroller.current?.scrollTo({ top: 0 })
+    requestAnimationFrame(() => dataHeading.current?.focus({ preventScroll: true }))
+  }
+
+  /** Reads the stored list again; false when that failed, which `storedError` then says. */
+  const refreshStored = async () => {
+    if (!source) return false
+    try {
+      setStored(await source.stored())
+      setStoredError(null)
+      return true
+    } catch (e) {
+      setStoredError(message(e))
+      return false
+    }
+  }
+
+  // The list is read again after every delete, finished or not: one that stopped part-way has
+  // still removed files. A failed read leaves the delete's own result or error as it was.
+  const deleteData = async (target: DeleteTarget) => {
+    if (!source) throw new Error('The Lab has not loaded.')
+    try {
+      return await source.deleteData(target)
+    } finally {
+      await refreshStored()
+    }
   }
 
   const start = () => {
@@ -164,8 +209,8 @@ export function StrategyLab() {
     setDownload({ instrument: target, fraction: 0, cancelling: false, cancel })
     handle.result
       .then(async () => {
-        const stored = await source.datasets()
-        setDatasets(stored)
+        setStored(await source.stored())
+        setStoredError(null)
         setChosenData(instrumentKey(target))
         setFailure((f) => (f?.failure.kind === 'data_missing' ? null : f))
       })
@@ -183,7 +228,19 @@ export function StrategyLab() {
   else if (!instrument) runBlocked = 'Download data first.'
 
   const failed = failure?.name === selectedName ? failure : null
-  const noData = datasets?.length === 0 || failed?.failure.kind === 'data_missing'
+  const dataMissing = failed?.failure.kind === 'data_missing'
+  const noData = datasets?.length === 0 || dataMissing
+
+  /** The download offered beside a saved result while nothing is stored. */
+  const offerDownload = (target: InstrumentId) => (
+    <DownloadOffer
+      instrument={download?.instrument ?? target}
+      reason={`Nothing is stored now. Download the history of ${formatInstrument(target)} to run this strategy again.`}
+      download={download}
+      error={downloadError}
+      onDownload={() => startDownload(target)}
+    />
+  )
 
   let body: React.ReactNode
   if (loadError) {
@@ -202,12 +259,24 @@ export function StrategyLab() {
         <p className="state-quiet">Loading strategies</p>
       </div>
     )
+  } else if (dataOpen && stored) {
+    body = (
+      <StoredData
+        stored={stored}
+        refreshError={storedError}
+        onReload={refreshStored}
+        onDelete={deleteData}
+        onOpenFolder={() => source.openDataFolder()}
+        headingRef={dataHeading}
+      />
+    )
   } else if (!selected) {
-    body = <StrategyList strategies={strategies} onChoose={select} />
+    body = <StrategyList strategies={strategies} stored={stored} onChoose={select} onOpenData={openData} />
   } else if (run?.name === selected.name) {
     body = <Running strategy={selected} run={run} />
-  } else if (noData) {
-    // With nothing stored this shows even over a saved result, so a download is always on offer.
+  } else if (noData && !(last && !dataMissing)) {
+    // A run that found its data missing, or a strategy with no saved result while nothing is
+    // stored. A saved result shows below, with the download offered beside it.
     const target = failed?.instrument ?? source.defaultInstrument
     body = (
       <NoData
@@ -249,14 +318,18 @@ export function StrategyLab() {
         verdict={shown}
         fresh={fresh === selected.name}
         onCounted={counted}
+        offer={noData && offerDownload(shown.instrument)}
       />
     )
   } else if (last && openError?.id === last.id) {
     body = (
-      <div className="state" role="alert">
-        <p className="eyebrow">{selected.label}</p>
-        <p className="state-title">The result did not load</p>
-        <p className="state-text">{openError.message}</p>
+      <div className="state">
+        <div role="alert">
+          <p className="eyebrow">{selected.label}</p>
+          <p className="state-title">The result did not load</p>
+          <p className="state-text">{openError.message}</p>
+        </div>
+        {noData && offerDownload(source.defaultInstrument)}
       </div>
     )
   } else if (last) {
@@ -284,7 +357,9 @@ export function StrategyLab() {
 
   const phase =
     run?.name === selectedName ? 'running' : failed ? 'failed' : download ? 'downloading' : noData ? 'no-data' : 'idle'
-  const viewKey = `${loadError ? 'error' : strategies ? 'ready' : 'loading'}-${selectedName ?? 'list'}-${phase}`
+  // The data view keeps one key while it is open: a delete that empties the store changes the
+  // phase, and a new key would remount the view and lose the delete's message.
+  const viewKey = `${loadError ? 'error' : strategies ? 'ready' : 'loading'}-${dataOpen ? 'data' : `${selectedName ?? 'list'}-${phase}`}`
 
   return (
     <div className="lab">
@@ -303,6 +378,7 @@ export function StrategyLab() {
           ref={composer}
           strategies={strategies}
           selected={selected}
+          away={dataOpen}
           running={run !== null}
           runBlocked={runBlocked}
           datasets={datasets}
@@ -327,26 +403,55 @@ function lastRunText(last: LastRun | null): string {
   return `${formatDay(last.finishedAt)} · ${total}`
 }
 
-function StrategyList({ strategies, onChoose }: { strategies: LabStrategy[]; onChoose(name: string): void }) {
-  if (strategies.length === 0) {
-    return <p className="state-quiet">The engine lists no strategies.</p>
-  }
+interface ListProps {
+  strategies: LabStrategy[]
+  stored: StoredResponse | null
+  onChoose(name: string): void
+  onOpenData(): void
+}
+
+function StrategyList({ strategies, stored, onChoose, onOpenData }: ListProps) {
+  const total = stored?.instruments.reduce((sum, i) => sum + i.bytes, 0) ?? 0
+  const count = stored?.instruments.length ?? 0
   return (
-    <nav aria-labelledby="strategies-title">
-      <h1 id="strategies-title" className="eyebrow">
-        Strategies
-      </h1>
-      <ul className="strategy-list">
-        {strategies.map((s) => (
-          <li key={s.name}>
-            <button type="button" className="strategy-row" onClick={() => onChoose(s.name)}>
-              <span className="strategy-name">{s.label}</span>
-              <span className="strategy-meta">{[s.kind, lastRunText(s.last)].filter(Boolean).join(' · ')}</span>
-            </button>
-          </li>
-        ))}
-      </ul>
-    </nav>
+    <>
+      <nav aria-labelledby="strategies-title">
+        <h1 id="strategies-title" className="eyebrow">
+          Strategies
+        </h1>
+        {strategies.length === 0 ? (
+          <p className="state-quiet">The engine lists no strategies.</p>
+        ) : (
+          <ul className="strategy-list">
+            {strategies.map((s) => (
+              <li key={s.name}>
+                <button type="button" className="strategy-row" onClick={() => onChoose(s.name)}>
+                  <span className="strategy-name">{s.label}</span>
+                  <span className="strategy-meta">{[s.kind, lastRunText(s.last)].filter(Boolean).join(' · ')}</span>
+                </button>
+              </li>
+            ))}
+          </ul>
+        )}
+      </nav>
+      {stored && (
+        <nav className="list-section" aria-labelledby="data-title">
+          <h2 id="data-title" className="eyebrow">
+            Market data
+          </h2>
+          <ul className="strategy-list">
+            <li>
+              <button type="button" className="strategy-row" onClick={onOpenData}>
+                <span className="strategy-name">Stored data</span>
+                <span className="strategy-meta">
+                  {count === 0 ? 'Nothing stored' : `${formatBytes(total)} in ${count} instrument${count === 1 ? '' : 's'}`}
+                </span>
+              </button>
+            </li>
+          </ul>
+        </nav>
+      )}
+    </>
   )
 }
 
@@ -361,7 +466,7 @@ interface NoDataProps {
 }
 
 /** The store lacks the run's data: the offer to download the instrument's history, then its progress. */
-function NoData({ strategy, instrument, title, reason, download, error, onDownload }: NoDataProps) {
+function NoData({ strategy, title, ...offer }: NoDataProps) {
   return (
     <div className="state">
       <p className="eyebrow">{strategy.label}</p>
@@ -370,6 +475,17 @@ function NoData({ strategy, instrument, title, reason, download, error, onDownlo
           {title}
         </p>
       </div>
+      <DownloadOffer {...offer} />
+    </div>
+  )
+}
+
+type DownloadOfferProps = Omit<NoDataProps, 'strategy' | 'title'>
+
+/** Why a download is needed and the button that starts it, or the download's progress. */
+function DownloadOffer({ instrument, reason, download, error, onDownload }: DownloadOfferProps) {
+  return (
+    <div className="download-offer">
       {download ? (
         <>
           <ProgressBar

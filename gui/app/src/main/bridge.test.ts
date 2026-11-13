@@ -76,6 +76,9 @@ describe('validateRequest', () => {
     ['a body on a route that takes none', { method: 'GET', path: '/health', body: {} }],
     ['a POST route without a body', { method: 'POST', path: '/data/download' }],
     ['an array body', { method: 'POST', path: '/data/download', body: [] }],
+    ['a delete without a body', { method: 'POST', path: '/data/delete' }],
+    ['a body on delete-all', { method: 'POST', path: '/data/delete-all', body: {} }],
+    ['GET on delete-all', { method: 'GET', path: '/data/delete-all' }],
     ['a request that is not an object', 'GET /health'],
     ['null', null],
   ])('refuses %s', (_name, input) => {
@@ -85,6 +88,22 @@ describe('validateRequest', () => {
   it('refuses an oversized body', () => {
     const body = { instrument: 'x'.repeat(70 * 1024) }
     expect(() => validateRequest({ method: 'POST', path: '/data/download', body })).toThrow(/too large/)
+  })
+})
+
+describe('stored data routes', () => {
+  it('passes the listing, a delete with its body and delete-all', () => {
+    expect(validateRequest({ method: 'GET', path: '/data/stored' })).toEqual({ method: 'GET', path: '/data/stored' })
+    const body = { instrument: { venue: 'binance', symbol: 'BTCUSDT', kind: 'spot' }, from: '2024-01', to: '2024-02' }
+    expect(validateRequest({ method: 'POST', path: '/data/delete', body })).toEqual({
+      method: 'POST',
+      path: '/data/delete',
+      body,
+    })
+    expect(validateRequest({ method: 'POST', path: '/data/delete-all' })).toEqual({
+      method: 'POST',
+      path: '/data/delete-all',
+    })
   })
 })
 
