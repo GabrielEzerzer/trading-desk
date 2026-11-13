@@ -748,7 +748,7 @@ fn deleting_a_whole_perpetual_removes_its_candles_and_funding_and_leaves_its_loc
     let ids: Vec<InstrumentId> = stored.instruments.into_iter().map(|i| i.id).collect();
     assert_eq!(ids, std::slice::from_ref(&spot));
     assert_eq!(stored.unrecognised, Vec::<std::path::PathBuf>::new());
-    // Of the perpetual, only its lock files are left, empty, as writers leave them.
+    // Of the perpetual, only its lock files are left, empty, as writers and deletes leave them.
     let perp_files: Vec<String> = tree(dir.path())
         .into_iter()
         .filter(|f| f.contains("perpetual") || f.starts_with("funding"))
@@ -761,6 +761,7 @@ fn deleting_a_whole_perpetual_removes_its_candles_and_funding_and_leaves_its_loc
             "candles/binance/perpetual/BTCUSDT/1m/2024-02.parquet.lock",
             "candles/binance/perpetual/BTCUSDT/1m/2024-03.parquet.lock",
             "funding/binance/BTCUSDT.parquet.lock",
+            "locks/binance/perpetual/BTCUSDT.lock",
         ]
     );
     for file in &perp_files {
@@ -1177,4 +1178,104 @@ fn a_write_over_two_months_with_a_later_month_unreadable_writes_neither() {
         "January is untouched"
     );
     assert_eq!(std::fs::read(&february).expect("the file"), b"not parquet");
+}
+
+#[test]
+fn a_delete_is_refused_while_another_handle_holds_the_instrument_and_allowed_once_released() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let store = Store::new(dir.path());
+    let perp = btc(InstrumentKind::Perpetual);
+    let spot = btc(InstrumentKind::Spot);
+    store_three_months(&store, &perp);
+    store_three_months(&store, &spot);
+    let before = store.stored().expect("lists");
+
+    // A download of the perpetual through another store value on the folder, as another process
+    // has: the hold is an OS lock, so it reaches across values and processes alike.
+    let hold = Store::new(dir.path())
+        .hold_for_download(&perp)
+        .expect("holds");
+    let busy = |result: Result<DeleteReport, DataError>| matches!(&result, Err(DataError::InstrumentBusy(id)) if id == "binance:BTCUSDT:perpetual");
+    assert!(busy(store.delete_instrument(&perp)));
+    assert!(busy(store.delete_months(
+        &perp,
+        month("2024-01"),
+        month("2024-01")
+    )));
+    assert!(busy(store.delete_all()), "all market data is refused too");
+    assert_eq!(
+        store.stored().expect("lists"),
+        before,
+        "nothing was deleted"
+    );
+    // Another download of it shares the hold, and another instrument is not held up.
+    drop(
+        store
+            .hold_for_download(&perp)
+            .expect("a second download holds too"),
+    );
+    assert_eq!(store.delete_instrument(&spot).expect("deletes").files, 3);
+
+    drop(hold);
+    assert_eq!(store.delete_instrument(&perp).expect("deletes").files, 4);
+}
+
+#[test]
+fn deleting_all_market_data_leaves_saved_runs_paper_sessions_and_unrecognised_files() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let store = Store::new(dir.path());
+    let eth = InstrumentId {
+        symbol: "ETHUSDT".into(),
+        ..btc(InstrumentKind::Spot)
+    };
+    for id in [
+        &btc(InstrumentKind::Perpetual),
+        &btc(InstrumentKind::Spot),
+        &eth,
+    ] {
+        store_three_months(&store, id);
+    }
+    let total: u64 = store
+        .stored()
+        .expect("lists")
+        .instruments
+        .iter()
+        .map(|i| i.bytes())
+        .sum();
+    let kept = [
+        "runs/1794311000000-0a1b2c3d/config.json",
+        "paper/1794311000000-sma/events.jsonl",
+        "candles/binance/spot/BTCUSDT/1m/notes.txt",
+    ];
+    for file in kept {
+        let path = dir.path().join(file);
+        std::fs::create_dir_all(path.parent().unwrap()).expect("makes the folder");
+        std::fs::write(&path, b"kept").expect("writes");
+    }
+
+    let report = store.delete_all().expect("deletes");
+    assert_eq!(
+        report,
+        DeleteReport {
+            files: 10,
+            bytes: total
+        }
+    );
+    let stored = store.stored().expect("lists");
+    assert!(stored.instruments.is_empty());
+    assert_eq!(
+        strays(&stored),
+        ["candles/binance/spot/BTCUSDT/1m/notes.txt"]
+    );
+    for file in kept {
+        assert_eq!(
+            std::fs::read(dir.path().join(file)).expect("stays"),
+            b"kept",
+            "{file}"
+        );
+    }
+    assert_eq!(
+        store.delete_all().expect("deletes nothing"),
+        DeleteReport::default()
+    );
 }

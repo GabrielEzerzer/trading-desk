@@ -1798,6 +1798,11 @@ export type FundingCoverage = { rates: number, first: number | null, last: numbe
 
 export type StoredResponse = { 
 /**
+ * The data folder, as an absolute path. It also holds saved runs and paper sessions, which
+ * are not market data.
+ */
+data_dir: string, 
+/**
  * Every instrument with at least one month file or a funding file, in instrument order.
  */
 instruments: Array<StoredInstrumentInfo>, 

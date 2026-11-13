@@ -369,7 +369,7 @@ async fn requests_without_the_token_or_with_a_wrong_one_are_401() {
             "{path} with a wrong token"
         );
     }
-    for path in ["/data/download", "/data/delete"] {
+    for path in ["/data/download", "/data/delete", "/data/delete-all"] {
         let (status, _) = t.send(t.client.post(t.url(path)).body("{}")).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED, "{path} without a token");
     }
@@ -1083,7 +1083,11 @@ async fn stored_data_lists_with_sizes_and_deletes_by_month_range_or_whole_instru
     let t = TestServer::start(FakeSource::default()).await;
     let (status, empty) = t.get("/data/stored").await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(empty, json!({ "instruments": [], "unrecognised": [] }));
+    let data_dir = t._dir.path().to_string_lossy().into_owned();
+    assert_eq!(
+        empty,
+        json!({ "data_dir": data_dir, "instruments": [], "unrecognised": [] })
+    );
     download_two_months(&t, "BTCUSDT").await;
     download_two_months(&t, "ETHUSDT").await;
 
@@ -1249,4 +1253,75 @@ async fn a_delete_while_the_instrument_downloads_is_409() {
     let (status, removed) = t.post("/data/delete", &delete("BTCUSDT")).await;
     assert_eq!(status, StatusCode::OK, "{removed}");
     assert_eq!(removed["files"], 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_delete_is_refused_while_another_process_downloads_the_instrument() {
+    let t = TestServer::start(FakeSource::default()).await;
+    download_two_months(&t, "BTCUSDT").await;
+    let (_, before) = t.get("/data/stored").await;
+    let id = InstrumentId {
+        venue: Venue::Bybit,
+        symbol: "BTCUSDT".into(),
+        kind: InstrumentKind::Perpetual,
+    };
+    // Another process on the same data folder, such as the `td-data` CLI, downloading it.
+    let hold = Store::new(t._dir.path())
+        .hold_for_download(&id)
+        .expect("holds");
+    let delete = json!({ "instrument": id }).to_string();
+    let range = json!({ "instrument": id, "from": "2024-01", "to": "2024-01" }).to_string();
+    for (path, body) in [
+        ("/data/delete", delete.as_str()),
+        ("/data/delete", range.as_str()),
+        ("/data/delete-all", ""),
+    ] {
+        let (status, answer) = t.post(path, body).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{path} {body}: {answer}");
+        assert_eq!(answer["error"]["code"], "conflict");
+        let message = answer["error"]["message"].as_str().unwrap();
+        assert!(
+            message.starts_with("bybit:BTCUSDT:perpetual is being downloaded or deleted"),
+            "{message}"
+        );
+    }
+    assert_eq!(t.get("/data/stored").await.1, before, "nothing was deleted");
+
+    drop(hold);
+    let (status, removed) = t.post("/data/delete", &delete).await;
+    assert_eq!(status, StatusCode::OK, "{removed}");
+    assert_eq!(removed["files"], 3, "two months and the funding file");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn delete_all_removes_every_instrument_and_leaves_runs_and_paper_sessions() {
+    let t = TestServer::start(FakeSource::default()).await;
+    download_two_months(&t, "BTCUSDT").await;
+    download_two_months(&t, "ETHUSDT").await;
+    let (_, stored) = t.get("/data/stored").await;
+    let total: u64 = stored["instruments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["bytes"].as_u64().unwrap())
+        .sum();
+    let root = t._dir.path();
+    for file in ["runs/1/config.json", "paper/s1/events.jsonl"] {
+        let path = root.join(file);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"kept").unwrap();
+    }
+
+    let (status, removed) = t.post("/data/delete-all", "").await;
+    assert_eq!(status, StatusCode::OK, "{removed}");
+    assert_eq!(removed, json!({ "files": 6, "bytes": total }));
+    let (_, stored) = t.get("/data/stored").await;
+    assert_eq!(stored["instruments"], json!([]));
+    for file in ["runs/1/config.json", "paper/s1/events.jsonl"] {
+        assert_eq!(std::fs::read(root.join(file)).unwrap(), b"kept", "{file}");
+    }
+    // With nothing stored it removes nothing.
+    let (status, removed) = t.post("/data/delete-all", "").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(removed, json!({ "files": 0, "bytes": 0 }));
 }
