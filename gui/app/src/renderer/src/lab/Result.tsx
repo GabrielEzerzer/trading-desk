@@ -2,6 +2,7 @@ import { CheckIcon, CrossIcon } from '../icons'
 import { useCountUp } from '../motion'
 import { EquityChart } from './EquityChart'
 import {
+  formatCutoff,
   formatDay,
   formatInstrument,
   formatLimit,
@@ -46,6 +47,10 @@ export function Result({ strategy, verdict, fresh, onCounted }: Props) {
         </h2>
         {strategy.kind && <span className="verdict-kind">{strategy.kind}</span>}
       </div>
+
+      {verdict.codeChanged && (
+        <p className="result-note">The strategy's code has changed since this run, so the result may not hold for it now.</p>
+      )}
 
       {verdict.criteria.length > 0 && (
         <ul className="criteria" aria-label="Criteria">
@@ -158,7 +163,10 @@ export function Result({ strategy, verdict, fresh, onCounted }: Props) {
         </table>
       </section>
 
-      <p className="footnote">Finished {formatDay(verdict.finishedAt)}</p>
+      <p className="footnote">
+        Finished {formatDay(verdict.finishedAt)}
+        {verdict.dataCutoff && ` · Data cutoff ${formatCutoff(verdict.dataCutoff)}`}
+      </p>
     </article>
   )
 }

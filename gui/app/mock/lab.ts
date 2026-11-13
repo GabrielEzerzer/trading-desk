@@ -71,6 +71,7 @@ export function createMockLabSource({ stepMs = 700, listMs = 300, now = Date.now
   return {
     defaultInstrument: data.datasets[0] as InstrumentId,
     neverRunText: 'Run its test plan to get a verdict.',
+    dataCutoff: async () => null,
     strategies: () =>
       new Promise((resolve) => {
         setTimeout(() => resolve(data.strategies.map((s) => ({ ...s, label: readableName(s.name) }))), listMs)

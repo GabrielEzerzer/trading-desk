@@ -2,7 +2,7 @@ import type { InstrumentId, Timeframe } from '@td/shared'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { sentence } from '../engine'
 import { Composer, type ComposerHandle } from './Composer'
-import { formatDay, formatInstrument, formatNumber } from './format'
+import { formatCutoff, formatDay, formatInstrument, formatNumber } from './format'
 import { overallProgress, progressLabel } from './progress'
 import { Result } from './Result'
 import { type RunFailure, TIMEFRAMES, instrumentKey, laterRun, runFailure } from './runs'
@@ -50,6 +50,7 @@ export function StrategyLab() {
   const [source, setSource] = useState<LabSource | null>(null)
   const [strategies, setStrategies] = useState<LabStrategy[] | null>(null)
   const [datasets, setDatasets] = useState<InstrumentId[] | null>(null)
+  const [dataCutoff, setDataCutoff] = useState<string | null>(null)
   const [loadError, setLoadError] = useState<string | null>(null)
   const [attempt, setAttempt] = useState(0)
   const [selectedName, setSelectedName] = useState<string | null>(null)
@@ -73,13 +74,14 @@ export function StrategyLab() {
     chooseLabSource()
       .then((s) => {
         if (live) setSource(s)
-        return Promise.all([s.strategies(), s.datasets()])
+        return Promise.all([s.strategies(), s.datasets(), s.dataCutoff()])
       })
       .then(
-        ([list, stored]) => {
+        ([list, stored, cutoff]) => {
           if (!live) return
           setStrategies(list)
           setDatasets(stored)
+          setDataCutoff(cutoff)
         },
         (e: unknown) => live && setLoadError(message(e)),
       )
@@ -290,6 +292,9 @@ export function StrategyLab() {
       <div className="lab-scroll" ref={scroller} tabIndex={0}>
         {/* A new key per view, so each new view fades in once. */}
         <div className="column fade-in" key={viewKey}>
+          {dataCutoff && (
+            <p className="cutoff-note">Data cutoff in force: runs use no bars after {formatCutoff(dataCutoff)}.</p>
+          )}
           {body}
         </div>
       </div>

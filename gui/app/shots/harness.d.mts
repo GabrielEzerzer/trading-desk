@@ -22,6 +22,10 @@ export interface StubConfig {
   download?: 'ok' | 'no_token'
   /** Time between a job's steps, 700 ms by default. */
   stepMs?: number
+  /** The engine's TD_DATA_CUTOFF (`YYYY-MM-DD`): reported by GET /health and saved runs, enforced on backtests. */
+  dataCutoff?: string
+  /** Saved runs report that the strategy's code has changed since they ran. */
+  codeChanged?: boolean
   /** GET /instruments answers from these, else from the engine.json fixtures. */
   instruments?: Instrument[]
   /** GET /instruments never answers. */

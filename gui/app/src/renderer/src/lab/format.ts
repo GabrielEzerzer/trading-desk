@@ -50,6 +50,11 @@ export function formatDay(ms: number): string {
   return `${d.getUTCDate()} ${MONTHS[d.getUTCMonth()]} ${d.getUTCFullYear()}`
 }
 
+/** A data cutoff date (`YYYY-MM-DD`, UTC) as "30 Jun 2026". */
+export function formatCutoff(date: string): string {
+  return formatDay(Date.parse(`${date}T00:00:00Z`))
+}
+
 /** "Mar 2024". */
 export function formatMonth(ms: number): string {
   const d = new Date(ms)
