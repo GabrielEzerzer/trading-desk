@@ -1772,3 +1772,72 @@ fn walk_forward_scales_each_windows_extremes_like_its_equity() {
     assert!(b.metrics.max_drawdown_intrabar.is_some());
     assert!(b.alpha.is_some() && b.beta.is_some());
 }
+
+/// The rising line as FX quotes over 100 hourly bars, Monday 00:00 to Thursday 04:00 UTC, all in
+/// open hours: the bid as `rising_bars` gives it and the ask 0.02 above it.
+fn fx_rising() -> (Vec<Candle>, Vec<Candle>) {
+    let bars = rising_bars(100);
+    let asks = bars
+        .iter()
+        .map(|b| Candle {
+            open: b.open + 0.02,
+            high: b.high + 0.02,
+            low: b.low + 0.02,
+            close: b.close + 0.02,
+            ..*b
+        })
+        .collect();
+    (bars, asks)
+}
+
+/// Long-only SMA cross with fast 1 on FX over `fx_rising`.
+fn fx_rising_spec() -> SweepSpec {
+    let mut b = base(common::instrument(td_core::InstrumentKind::Fx), 100);
+    b.params = Params::new().with("fast", ParamValue::Int(1));
+    spec(b, vec![values("slow", &ints(&[5, 10]))])
+}
+
+/// Checks that `o` traded on its own side of the quotes, with no slippage: a buy at the ask open
+/// and a sell at the bid open of its bar, and that it is the run its configuration gives on the
+/// same data.
+fn assert_on_quotes(o: &td_engine::BacktestResult, bars: &[Candle], asks: &[Candle]) {
+    assert!(!o.fills.is_empty());
+    for f in &o.fills {
+        let k = bars.iter().position(|b| b.open_time == f.time).unwrap();
+        let open = match f.side {
+            td_core::Side::Buy => asks[k].open,
+            td_core::Side::Sell => bars[k].open,
+        };
+        assert!((f.price - open).abs() < 1e-9, "{f:?}");
+    }
+    assert_eq!(run(&o.config, bars, asks, &[]).unwrap().fills, o.fills);
+}
+
+#[test]
+fn out_of_sample_and_walk_forward_trade_fx_on_its_quotes() {
+    let (bars, asks) = fx_rising();
+    let oos = OosSpec {
+        sweep: fx_rising_spec(),
+        split: Split::Fraction(0.5),
+    };
+    let r = out_of_sample(&oos, &bars, &asks, &[], None).unwrap();
+    assert_on_quotes(&r.out_of_sample, &bars, &asks);
+    // FX needs its asks: without them the in-sample sweep cannot run.
+    assert!(out_of_sample(&oos, &bars, &[], &[], None).is_err());
+
+    let wf = WalkForwardSpec {
+        sweep: fx_rising_spec(),
+        windows: WindowSpec {
+            train_bars: 30,
+            test_bars: 20,
+            step_bars: 20,
+            mode: WindowMode::Rolling,
+        },
+    };
+    let r = walk_forward(&wf, &bars, &asks, &[], None).unwrap();
+    assert_eq!(r.windows.len(), 3);
+    for w in &r.windows {
+        assert_on_quotes(&w.out_of_sample, &bars, &asks);
+    }
+    assert!(walk_forward(&wf, &bars, &[], &[], None).is_err());
+}
