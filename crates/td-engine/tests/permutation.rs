@@ -138,7 +138,7 @@ fn pool(threads: usize) -> rayon::ThreadPool {
 
 #[test]
 fn a_planted_edge_beats_every_shuffled_copy_and_noise_does_not() {
-    let edge = permutation_test(&spec(19, 7), &trending_bars(), &[], None).unwrap();
+    let edge = permutation_test(&spec(19, 7), &trending_bars(), &[], &[], None).unwrap();
     assert_eq!(edge.permuted_best.len(), 19);
     assert!(edge.real_best > 0.0, "{edge:?}");
     // Every copy qualifies and none comes close: p is the smallest 19 copies allow.
@@ -146,7 +146,7 @@ fn a_planted_edge_beats_every_shuffled_copy_and_noise_does_not() {
     assert_eq!(edge.at_least_as_good, 0, "{edge:?}");
     assert_eq!(edge.p_value, 0.05);
 
-    let noise = permutation_test(&spec(19, 7), &noise_bars(42), &[], None).unwrap();
+    let noise = permutation_test(&spec(19, 7), &noise_bars(42), &[], &[], None).unwrap();
     // Pinned for the seeds: the real best is in the middle of the copies' bests.
     assert_eq!(noise.at_least_as_good, PINNED_NOISE_COUNT, "{noise:?}");
     assert_eq!(noise.p_value, (1 + PINNED_NOISE_COUNT) as f64 / 20.0);
@@ -157,7 +157,7 @@ const PINNED_NOISE_COUNT: usize = 6;
 
 #[test]
 fn the_p_value_counts_copies_at_least_as_good_as_the_real_best() {
-    let r = permutation_test(&spec(9, 3), &noise_bars(42), &[], None).unwrap();
+    let r = permutation_test(&spec(9, 3), &noise_bars(42), &[], &[], None).unwrap();
     let qualified = r.permuted_best.iter().flatten().count();
     let count = r
         .permuted_best
@@ -179,7 +179,7 @@ fn the_p_value_counts_copies_at_least_as_good_as_the_real_best() {
         metric: Metric::MaxDrawdown,
         direction: Direction::Minimize,
     };
-    let r = permutation_test(&s, &noise_bars(42), &[], None).unwrap();
+    let r = permutation_test(&s, &noise_bars(42), &[], &[], None).unwrap();
     let count = r
         .permuted_best
         .iter()
@@ -193,10 +193,11 @@ fn the_p_value_counts_copies_at_least_as_good_as_the_real_best() {
 #[test]
 fn a_seed_gives_the_same_result_at_any_thread_count_and_another_seed_differs() {
     let bars = noise_bars(9);
-    let serial = pool(1).install(|| permutation_test(&spec(5, 11), &bars, &[], None).unwrap());
-    let parallel = pool(4).install(|| permutation_test(&spec(5, 11), &bars, &[], None).unwrap());
+    let serial = pool(1).install(|| permutation_test(&spec(5, 11), &bars, &[], &[], None).unwrap());
+    let parallel =
+        pool(4).install(|| permutation_test(&spec(5, 11), &bars, &[], &[], None).unwrap());
     assert_eq!(serial, parallel);
-    let other = permutation_test(&spec(5, 12), &bars, &[], None).unwrap();
+    let other = permutation_test(&spec(5, 12), &bars, &[], &[], None).unwrap();
     assert_eq!(other.real_best, serial.real_best);
     assert_ne!(other.permuted_best, serial.permuted_best);
 }
@@ -213,12 +214,12 @@ fn progress_counts_every_run_once_and_a_break_cancels_with_no_p_value() {
         max_done.fetch_max(done, Ordering::Relaxed);
         ControlFlow::Continue(())
     };
-    let full = pool(2).install(|| permutation_test(&spec(4, 1), &bars, &[], Some(&counting)));
+    let full = pool(2).install(|| permutation_test(&spec(4, 1), &bars, &[], &[], Some(&counting)));
     assert_eq!(calls.load(Ordering::Relaxed), 30);
     assert_eq!(max_done.load(Ordering::Relaxed), 30);
     assert_eq!(
         full.unwrap(),
-        permutation_test(&spec(4, 1), &bars, &[], None).unwrap()
+        permutation_test(&spec(4, 1), &bars, &[], &[], None).unwrap()
     );
 
     // Stop during the second copy's sweep: on one thread nothing runs after the break.
@@ -231,7 +232,7 @@ fn progress_counts_every_run_once_and_a_break_cancels_with_no_p_value() {
             ControlFlow::Continue(())
         }
     };
-    let r = pool(1).install(|| permutation_test(&spec(4, 1), &bars, &[], Some(&stop)));
+    let r = pool(1).install(|| permutation_test(&spec(4, 1), &bars, &[], &[], Some(&stop)));
     assert_eq!(r, Err(TesterError::Cancelled));
     assert_eq!(calls.load(Ordering::Relaxed), 15);
 }
@@ -240,13 +241,13 @@ fn progress_counts_every_run_once_and_a_break_cancels_with_no_p_value() {
 fn bad_specs_are_refused_before_running() {
     let bars = noise_bars(5);
     assert!(matches!(
-        permutation_test(&spec(0, 1), &bars, &[], None),
+        permutation_test(&spec(0, 1), &bars, &[], &[], None),
         Err(TesterError::InvalidSpec(_))
     ));
     // 6 runs per sweep: the real sweep and the copies together may not pass the run limit.
     let copies = MAX_RUNS / 6;
     assert_eq!(
-        permutation_test(&spec(copies, 1), &bars, &[], None),
+        permutation_test(&spec(copies, 1), &bars, &[], &[], None),
         Err(TesterError::TooManyRuns {
             runs: 6 * (copies as u128 + 1),
             limit: MAX_RUNS,
@@ -256,7 +257,7 @@ fn bad_specs_are_refused_before_running() {
     let mut never = spec(3, 1);
     never.sweep.min_trades = 10_000;
     assert_eq!(
-        permutation_test(&never, &bars, &[], None),
+        permutation_test(&never, &bars, &[], &[], None),
         Err(TesterError::NoQualifyingRun {
             min_trades: 10_000,
             window: None,

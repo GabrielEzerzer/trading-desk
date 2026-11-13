@@ -105,6 +105,11 @@ pub struct BacktestSettings {
     /// currency, as a dollar account trading USD/JPY. Left out of JSON when it is the default.
     #[serde(default, skip_serializing_if = "AccountCurrency::is_quote")]
     pub account_currency: AccountCurrency,
+    /// Fees every run of the plan pays in place of each instrument's own, as in
+    /// [`BacktestConfig::fee_override`]: a broker's commission per unit of an FX pair, for
+    /// example. Left out of JSON when it is not set, the default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fee_override: Option<FeeSchedule>,
 }
 
 /// One instrument's slippage, overriding the backtest config's default for it.
@@ -163,7 +168,8 @@ pub struct WalkForwardPlan {
 pub struct EvidenceSettings {
     pub min_sample: MinSample,
     pub luck: LuckTest,
-    /// R4: fees and slippage are multiplied by this, and the strategy must stay profitable.
+    /// R4: fees (the per-unit commission too), slippage and on a market with quotes each bar's
+    /// spread are multiplied by this, and the strategy must stay profitable.
     pub cost_stress: f64,
     pub plateau: Plateau,
     /// R6: how many different start offsets must all give a result of the same sign.
@@ -200,12 +206,14 @@ pub struct LuckTest {
     pub inconclusive_p: f64,
 }
 
-/// R5: how the best parameter set's neighbours on the grid must do.
+/// R5: how the neighbours on the grid of the sets the walk-forward chose must do on its test
+/// windows ([`crate::PlateauReport`]).
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Plateau {
-    /// The neighbours' median objective over the best set's must be at least this.
+    /// The median over the neighbours of each one's objective over the chosen sets' on the same
+    /// windows must be at least this.
     pub min_median_ratio: f64,
     /// At least this share of the neighbours must be profitable.
     pub min_positive_share: f64,
@@ -325,8 +333,8 @@ impl WalkForwardPlan {
 
 impl TestPlan {
     /// The backtest of `strategy` on `instrument` over the plan's period, with the sweep's fixed
-    /// parameters. The slippage is the plan's for `instrument`, or [`default_slippage_bps`] for it
-    /// when the plan sets none.
+    /// parameters and the plan's fee override. The slippage is the plan's for `instrument`, or
+    /// [`default_slippage_bps`] for it when the plan sets none.
     pub fn backtest_config(&self, strategy: &str, instrument: Instrument) -> BacktestConfig {
         let slippage_bps = self
             .backtest
@@ -341,7 +349,7 @@ impl TestPlan {
             to: self.period.to,
             starting_cash: self.backtest.starting_cash,
             slippage_bps,
-            fee_override: None,
+            fee_override: self.backtest.fee_override,
             max_leverage: self.backtest.max_leverage,
             warmup_from: None,
             close_at_end: false,
@@ -418,6 +426,11 @@ impl TestPlan {
         }
         if !(b.max_leverage > 0.0 && b.max_leverage.is_finite()) {
             return refuse("the leverage cap must be a positive number");
+        }
+        if let Some(f) = b.fee_override
+            && !(f.maker.is_finite() && f.taker.is_finite() && f.per_unit.is_finite())
+        {
+            return refuse("the fee override's fees must be numbers");
         }
         let bar = tf.duration_ms();
         let w = &self.walk_forward;
@@ -711,7 +724,7 @@ mod tests {
     #[test]
     fn invalid_plans_are_refused() {
         type Tweak = fn(&mut TestPlan);
-        let cases: [(&str, Tweak); 16] = [
+        let cases: [(&str, Tweak); 17] = [
             ("no instruments", |p| p.instruments.clear()),
             ("an instrument twice", |p| {
                 let first = p.instruments[0].clone();
@@ -744,6 +757,13 @@ mod tests {
                 p.backtest.slippage = vec![o.clone(), o];
             }),
             ("no leverage", |p| p.backtest.max_leverage = 0.0),
+            ("a fee override that is not a number", |p| {
+                p.backtest.fee_override = Some(FeeSchedule {
+                    maker: 0.0,
+                    taker: 0.0,
+                    per_unit: f64::NAN,
+                });
+            }),
             ("no test days", |p| p.walk_forward.test_days = 0),
             ("days that are not whole weekly bars", |p| {
                 p.timeframe = Timeframe::W1;

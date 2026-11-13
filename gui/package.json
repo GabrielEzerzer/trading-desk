@@ -9,6 +9,8 @@
     "dev": "pnpm engine && pnpm --filter @td/app dev",
     "dev:hush": "pnpm engine && hush run -- pnpm --filter @td/app dev",
     "build": "pnpm --filter @td/app build",
+    "dist": "pnpm engine && pnpm build && pnpm --filter @td/app dist",
+    "install-check": "node scripts/install-check.mjs",
     "typecheck": "pnpm -r typecheck && tsc -p tsconfig.e2e.json",
     "test": "vitest run",
     "shots": "pnpm --filter @td/app build && node app/shots/shots.mjs",

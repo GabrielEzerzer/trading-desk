@@ -249,9 +249,10 @@ impl Strategy for Gotobi {
 ///   on a 12-pip stop a trade is about 6x, so the cap only refuses entries from much larger risk
 ///   settings. Slippage is 0 because the bid and ask bars already carry the cost of crossing the
 ///   spread, which is the cost the published result is stated after. The cost stress (R4)
-///   multiplies fees and slippage, which are both 0 here, and not the spread, so it has nothing to
-///   stress on this plan; a comparison with the published figure after a commission needs a run
-///   with the commission set.
+///   widens each bar's spread as well as multiplying fees and slippage, so it stresses the one
+///   cost this plan pays. The plan sets no commission: a broker's per-unit commission goes in
+///   the backtest settings' `fee_override`, and a comparison with the published figure after a
+///   commission needs it set.
 /// - **Sweep.** Only `stop_pips`, from 6 to 24 in steps of 3, so 12 has two neighbours on each
 ///   side for the plateau test (R5) and a stop twice as tight or twice as wide is tried.
 ///   `risk_pct` is fixed at its default: it only scales the size, and sweeping it would have the
@@ -292,6 +293,7 @@ fn plan() -> TestPlan {
                 bps: 0.0,
             }],
             account_currency: AccountCurrency::Base,
+            fee_override: None,
         },
         sweep: SweepPlan {
             fixed: Params::new()

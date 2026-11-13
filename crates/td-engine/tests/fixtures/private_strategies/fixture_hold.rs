@@ -72,6 +72,7 @@ fn plan() -> TestPlan {
             // SlippageOverride here to set one.
             slippage: Vec::new(),
             account_currency: AccountCurrency::Quote,
+            fee_override: None,
         },
         sweep: SweepPlan {
             fixed: Params::new(),
