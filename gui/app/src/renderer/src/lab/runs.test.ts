@@ -129,6 +129,16 @@ describe('the range of a dataset', () => {
     expect(datasetRange(coverage(t0, t0 + 2 * 24 * H - 60_000), '1d')).toEqual({ from: t0, to: t0 + 2 * 24 * H })
   })
 
+  it('covers every timeframe, with weeks opening on Monday', () => {
+    const t0 = Date.UTC(2024, 2, 1)
+    expect(datasetRange(coverage(t0 + 60_000, t0 + H - 60_000), '15m')).toEqual({ from: t0 + 15 * 60_000, to: t0 + H })
+    // Monday 2024-03-04 to the end of Sunday 2024-03-24: three whole weeks.
+    expect(datasetRange(coverage(Date.UTC(2024, 2, 1), Date.UTC(2024, 2, 25) - 60_000), '1w')).toEqual({
+      from: Date.UTC(2024, 2, 4),
+      to: Date.UTC(2024, 2, 25),
+    })
+  })
+
   it('ends at a data cutoff inside the stored range, and is null when no whole bar fits before it', () => {
     const t0 = Date.UTC(2024, 2, 1)
     const stored = coverage(t0, t0 + 10 * 24 * H - 60_000)

@@ -248,8 +248,13 @@ impl Session {
         let first_new_fill = self.fills.len();
         let instrument = &self.instrument;
         let breached = |book: &Portfolio| liquidation_trigger(instrument, book, &bar, funding);
-        // The orders resting as the bar's fills go, for the stops in force when a trade opens.
-        let mut resting: Vec<Order> = self.broker.open_orders().to_vec();
+        // The stops resting as the bar's fills go, for the stops in force when a trade opens.
+        let mut resting: Vec<(OrderId, Side, f64)> = self
+            .broker
+            .open_orders()
+            .iter()
+            .filter_map(|o| stop_of(o).map(|(side, trigger)| (o.id, side, trigger)))
+            .collect();
         // The stops of the last trade opened on this bar: those resting when it opened, then
         // those placed or filled after it, until the next fill that opens a position.
         let mut opened: Option<TradeStops> = None;
@@ -263,7 +268,7 @@ impl Session {
                     self.portfolio
                         .apply_fill(fill.side, fill.qty, fill.price, fill.fee);
                     let after = self.portfolio.position();
-                    resting.retain(|o| o.id != fill.order_id);
+                    resting.retain(|&(id, ..)| id != fill.order_id);
                     // A fill that opens a position, from flat or by flipping it, starts a new
                     // trade, which keeps its own stops apart from those of the trade before it.
                     // `signum` of 0.0 is 1.0, so flat is checked on its own.
@@ -273,8 +278,8 @@ impl Session {
                             entry_time: fill.time,
                             ..TradeStops::default()
                         };
-                        for order in &resting {
-                            add_stop(&mut stops, order);
+                        for &(_, side, trigger) in &resting {
+                            stops.add(side, trigger);
                         }
                         opened = Some(stops);
                     }
@@ -286,14 +291,16 @@ impl Session {
                     self.fills.push(fill);
                 }
                 BrokerEvent::Cancelled { id, reason } => {
-                    resting.retain(|o| o.id != id);
+                    resting.retain(|&(resting_id, ..)| resting_id != id);
                     self.order_mut(id).status = OrderStatus::Cancelled(reason);
                 }
                 BrokerEvent::Placed(order) => {
                     if let Some(stops) = opened.as_mut() {
                         add_stop(stops, &order);
                     }
-                    resting.push(order.clone());
+                    if let Some((side, trigger)) = stop_of(&order) {
+                        resting.push((order.id, side, trigger));
+                    }
                     let id = order.id;
                     *self.order_mut(id) = order;
                 }
@@ -712,12 +719,20 @@ pub(crate) fn check_quote(bar: &Candle, ask: &Candle) -> Result<(), EngineError>
 
 /// Counts `order` in `stops` if it is a reduce-only stop or stop-limit.
 fn add_stop(stops: &mut TradeStops, order: &Order) {
-    let req = &order.request;
-    if !req.reduce_only {
-        return;
+    if let Some((side, trigger)) = stop_of(order) {
+        stops.add(side, trigger);
     }
-    if let OrderType::Stop { trigger } | OrderType::StopLimit { trigger, .. } = req.order_type {
-        stops.add(req.side, trigger);
+}
+
+/// The side and trigger of `order` when it is a reduce-only stop, the kind a trade counts among
+/// its stops.
+fn stop_of(order: &Order) -> Option<(Side, f64)> {
+    let req = &order.request;
+    match req.order_type {
+        OrderType::Stop { trigger } | OrderType::StopLimit { trigger, .. } if req.reduce_only => {
+            Some((req.side, trigger))
+        }
+        _ => None,
     }
 }
 

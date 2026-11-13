@@ -4,7 +4,7 @@ import type { Candle, InstrumentId, OrderId, SessionState, SessionSummary, Start
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { sentence } from '../engine'
 import { type CandleSeries, EMPTY_SERIES, withClosed, withForming, withHistory } from './candles'
-import { applySessionEvent, pickSession, refetches, rejection } from './session'
+import { applyRefetch, applySessionEvent, pickSession, refetches, rejection } from './session'
 import type { InstrumentList, TradingSource } from './source'
 
 export const errorText = (e: unknown) => sentence(e instanceof Error ? e.message : String(e))
@@ -170,7 +170,7 @@ export function usePaperSession(source: TradingSource | null, id: InstrumentId):
       // Several events arrive per bar; one fetch after the burst covers them.
       refetch = setTimeout(() => {
         source.session(sessionId).then(
-          (s) => live && setState(s),
+          (s) => live && setState((cur) => applyRefetch(cur, s)),
           () => {},
         )
       }, 50)

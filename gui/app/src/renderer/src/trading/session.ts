@@ -33,6 +33,14 @@ export function applySessionEvent(state: SessionState, event: SessionEvent): { s
   return { state: applyInPlace(state, event), refetch: refetches(event) }
 }
 
+/**
+ * Applies a refetched state to the one shown. Status changes arrive only as events, so the status
+ * shown is kept: a fetch the engine answered before a stop can resolve after the stop's event.
+ */
+export function applyRefetch(current: SessionState | null, fetched: SessionState): SessionState {
+  return current && current.id === fetched.id ? { ...fetched, status: current.status } : fetched
+}
+
 /** Whether an event moves the position, so the full state must be fetched again. */
 export function refetches(event: SessionEvent): boolean {
   return event.event === 'fill' || event.event === 'order' || event.event === 'funding' || event.event === 'bar'

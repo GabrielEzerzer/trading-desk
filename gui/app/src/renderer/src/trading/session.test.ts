@@ -1,7 +1,7 @@
 import type { InstrumentId, SessionState, SessionSummary, Status } from '@td/shared'
 import { describe, expect, it } from 'vitest'
 import { loadRecent, pushRecent } from './recent'
-import { applySessionEvent, pickSession, rejection } from './session'
+import { applyRefetch, applySessionEvent, pickSession, rejection } from './session'
 import { loadInstrumentLists } from './source'
 
 const btc: InstrumentId = { venue: 'binance', symbol: 'BTCUSDT', kind: 'spot' }
@@ -66,6 +66,24 @@ describe('applySessionEvent', () => {
     } as const
     expect(rejection({ event: 'order', order })).toBe('not enough cash')
     expect(rejection({ event: 'order', order: { ...order, status: { status: 'open' } } })).toBeNull()
+  })
+})
+
+describe('applyRefetch', () => {
+  const state = (id: string, status: Status['status'], equity: number) =>
+    ({ id, status: { status }, equity, dropped: [], warnings: [] }) as unknown as SessionState
+
+  it('keeps the status an event set when an older fetch resolves after it', () => {
+    // A bar schedules the fetch, the engine answers it while live, then the stop's event arrives first.
+    const stopped = state('s', 'stopped', 10_000)
+    const answeredBeforeStop = state('s', 'live', 10_050)
+    expect(applyRefetch(stopped, answeredBeforeStop)).toEqual(state('s', 'stopped', 10_050))
+  })
+
+  it('takes the fetched state whole when none of this session is shown', () => {
+    const fetched = state('s', 'live', 10_000)
+    expect(applyRefetch(null, fetched)).toBe(fetched)
+    expect(applyRefetch(state('other', 'stopped', 1), fetched)).toBe(fetched)
   })
 })
 

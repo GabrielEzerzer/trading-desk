@@ -73,6 +73,7 @@ use crate::stats::{
     self, BootstrapSpec, DEFAULT_RESAMPLES, DrawdownBootstrap, MeanBootstrap, PropFirmOdds,
     PropFirmSpec, RuinSpec,
 };
+use crate::strategies::direction;
 use crate::tester::stitched_headline;
 use crate::verdict::{
     IntegrityInputs, OosIntegrityInputs, evaluate_integrity, evaluate_oos_integrity,
@@ -716,7 +717,7 @@ pub fn run_battery(
         result.cost_stress = Some(stress);
 
         // 6. R6: the walk-forward with its windows moved back.
-        let main_sign = evidence.oos_return.map(sign);
+        let main_sign = evidence.oos_return.map(direction);
         for (&shift, &planned) in offsets.iter().zip(&offset_windows) {
             let mut offset = StartOffset {
                 shift_bars: shift,
@@ -748,7 +749,7 @@ pub fn run_battery(
         evidence.start_offsets_same_sign = result
             .start_offsets
             .iter()
-            .filter(|o| main_sign.is_some() && o.oos_return.map(sign) == main_sign)
+            .filter(|o| main_sign.is_some() && o.oos_return.map(direction) == main_sign)
             .count();
 
         // 7. R3: the luck test, last.
@@ -950,17 +951,6 @@ fn later_lines_cannot_change(
 /// never land back on the main run's boundaries.
 fn start_offset_shifts(test_bars: usize, n: usize) -> Vec<usize> {
     (1..=n).map(|k| k * test_bars / (n + 1)).collect()
-}
-
-/// -1, 0 or 1.
-fn sign(x: f64) -> i8 {
-    if x > 0.0 {
-        1
-    } else if x < 0.0 {
-        -1
-    } else {
-        0
-    }
 }
 
 /// I1: the buckets of `config`'s period that are not wholly inside the market's closed hours,
@@ -1184,14 +1174,8 @@ fn plateau_numbers(
         (Direction::Minimize, Some(_), None) => Some(0.0),
         (Direction::Minimize, None, _) => None,
     };
-    let mut values: Vec<f64> = directions.iter().filter_map(ratio).collect();
-    values.sort_by(f64::total_cmp);
-    let median_ratio = match values.len() {
-        0 => None,
-        n if n % 2 == 1 => Some(values[n / 2]),
-        n => Some((values[n / 2 - 1] + values[n / 2]) / 2.0),
-    }
-    .filter(|r| r.is_finite());
+    let values: Vec<f64> = directions.iter().filter_map(ratio).collect();
+    let median_ratio = metrics::median(&values);
     (median_ratio, positive_share)
 }
 
