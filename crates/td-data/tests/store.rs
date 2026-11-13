@@ -1221,6 +1221,29 @@ fn a_delete_is_refused_while_another_handle_holds_the_instrument_and_allowed_onc
 }
 
 #[test]
+fn holding_an_instrument_that_was_never_stored_lists_nothing() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let store = Store::new(dir.path());
+    let hold = store
+        .hold_for_download(&btc(InstrumentKind::Perpetual))
+        .expect("holds");
+    assert!(
+        dir.path()
+            .join("locks/binance/perpetual/BTCUSDT.lock")
+            .is_file()
+    );
+    // The listing reads candles/ and funding/ only, so the lock file is neither an instrument nor
+    // an unrecognised entry, and delete-all, which deletes what the listing names, has nothing.
+    let stored = store.stored().expect("lists");
+    assert!(stored.instruments.is_empty() && stored.unrecognised.is_empty());
+    drop(hold);
+    assert_eq!(
+        store.delete_all().expect("deletes"),
+        DeleteReport::default()
+    );
+}
+
+#[test]
 fn deleting_all_market_data_leaves_saved_runs_paper_sessions_and_unrecognised_files() {
     let dir = tempfile::tempdir().expect("a temp dir");
     let store = Store::new(dir.path());

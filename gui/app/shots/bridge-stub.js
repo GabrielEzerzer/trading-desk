@@ -25,6 +25,7 @@
 // fails as the engine does when a file cannot be removed. `window.__stubDownloaded(id)` stores an
 // instrument as td-data on the command line would, without the app knowing, and
 // `window.__stubFundingOnly(id)` stores a perpetual's funding file with no months.
+// `window.__stubStoredFails(true)` makes GET /data/stored fail until it is called with false.
 // `openDataFolder` counts its calls in `window.__stubOpened`.
 //
 // For Trading in engine mode it answers GET /instruments from `config.instruments` (else the
@@ -65,6 +66,10 @@ function installBridgeStub(config) {
   if (!config.noData) Object.keys(data.coverage).forEach(store)
   window.__stubDownloaded = store
   window.__stubFundingOnly = (id) => stored.set(id, { months: [], funding: true })
+  let storedFails = false
+  window.__stubStoredFails = (fails) => {
+    storedFails = fails
+  }
   const FUNDING_BYTES = 52_000
   let backtest = config.backtest ?? 'ok'
   const jobs = new Map()
@@ -244,7 +249,9 @@ function installBridgeStub(config) {
       }
       return ok({ instrument: { venue, symbol, kind }, months, funding })
     }
-    if (method === 'GET' && path === '/data/stored') return ok(storedResponse())
+    if (method === 'GET' && path === '/data/stored') {
+      return storedFails ? fail(500, 'internal', 'the data folder could not be read') : ok(storedResponse())
+    }
     if (method === 'POST' && (path === '/data/delete' || path === '/data/delete-all')) {
       if (config.deleteFails) {
         const id = path === '/data/delete' ? key(body.instrument) : [...stored.keys()][0]

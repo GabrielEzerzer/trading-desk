@@ -391,6 +391,27 @@ test.describe('running on the engine', () => {
     await expect(page.locator('.data-table tbody tr').first()).toContainText('Feb 2024')
   })
 
+  test('a confirmation does not open when the list fails to load again, and Retry loads it', async ({ page, open }) => {
+    const storedFails = (fails: boolean) =>
+      page.evaluate((fails) => (window as unknown as { __stubStoredFails(fails: boolean): void }).__stubStoredFails(fails), fails)
+    await open(engine)
+    await page.getByRole('button', { name: /^Stored data/ }).click()
+    const rows = page.locator('.data-table tbody tr')
+    await expect(rows).toHaveCount(2)
+
+    await storedFails(true)
+    await page.getByRole('button', { name: 'Delete all market data' }).click()
+    const alert = page.getByRole('alert')
+    await expect(alert).toContainText('The list did not load again. The data folder could not be read.')
+    await expect(page.getByRole('group', { name: 'Confirm the delete' })).toHaveCount(0)
+    expect((await calls(page)).some((c) => c.path.startsWith('/data/delete'))).toBe(false)
+
+    await storedFails(false)
+    await alert.getByRole('button', { name: 'Retry' }).click()
+    await expect(alert).toHaveCount(0)
+    await expect(rows).toHaveCount(2)
+  })
+
   test('a perpetual with only its funding rates stored is asked about as that', async ({ page, open }) => {
     await open(engine)
     await page.evaluate(() => (window as unknown as { __stubFundingOnly(id: string): void }).__stubFundingOnly('bybit:XRPUSDT:perpetual'))

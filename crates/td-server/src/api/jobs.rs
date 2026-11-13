@@ -250,7 +250,6 @@ struct Inner {
 }
 
 impl Inner {
-    /// The id of the queued or running download job of `id`, if there is one.
     /// Any queued or running download, with its instrument.
     fn any_download(&self) -> Option<(u64, InstrumentId)> {
         self.jobs.values().find_map(|e| {
@@ -259,6 +258,7 @@ impl Inner {
         })
     }
 
+    /// The id of the queued or running download job of `id`, if there is one.
     fn download_of(&self, id: &InstrumentId) -> Option<u64> {
         self.jobs
             .values()
