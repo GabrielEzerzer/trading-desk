@@ -437,6 +437,17 @@ export const STATES = [
     },
   },
   {
+    // Nothing is stored, as after deleting all market data: the saved result shows, with the
+    // download offered under its verdict.
+    name: 'lab-engine-past-result-no-data',
+    config: { engine: 'running', mock: false, noData: true },
+    steps: async (page) => {
+      await chooseRow(page, /SMA cross/)
+      await page.getByRole('heading', { name: 'No verdict rule yet' }).waitFor()
+      await page.getByRole('button', { name: 'Download BTCUSDT history' }).waitFor()
+    },
+  },
+  {
     name: 'lab-engine-no-data',
     config: { engine: 'running', mock: false, noData: true },
     steps: async (page) => {

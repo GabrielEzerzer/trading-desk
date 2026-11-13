@@ -755,6 +755,11 @@ button {
   margin-bottom: var(--space-6);
 }
 
+/* The download offered under a saved result while nothing is stored. */
+.result .download-offer {
+  margin-bottom: var(--space-6);
+}
+
 .verdict {
   margin: 0;
   font-size: var(--text-verdict);

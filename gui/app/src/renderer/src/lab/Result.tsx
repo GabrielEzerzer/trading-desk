@@ -22,6 +22,8 @@ interface Props {
   /** True right after a run finished: the numbers count up once. */
   fresh: boolean
   onCounted(): void
+  /** Shown under the verdict: the download offered while nothing is stored. */
+  offer?: React.ReactNode
 }
 
 /**
@@ -29,7 +31,7 @@ interface Props {
  * the equity curve against its benchmark, then the metrics and trade tables. A run with no verdict
  * rule yet (#32) says so where the verdict goes and has no criteria.
  */
-export function Result({ strategy, verdict, fresh, onCounted }: Props) {
+export function Result({ strategy, verdict, fresh, onCounted, offer }: Props) {
   const progress = useCountUp(fresh, onCounted)
   // Counting numbers are scaled toward their true value; at progress 1 they are exact.
   const count = (value: number) => (progress === 1 ? value : value * progress)
@@ -46,6 +48,7 @@ export function Result({ strategy, verdict, fresh, onCounted }: Props) {
         </h2>
         {strategy.kind && <span className="verdict-kind">{strategy.kind}</span>}
       </div>
+      {offer}
 
       {verdict.criteria.length > 0 && (
         <ul className="criteria" aria-label="Criteria">

@@ -265,14 +265,18 @@ test.describe('running on the engine', () => {
     await expect(page.getByRole('menuitemradio', { name: 'BTCUSDT spot, Binance' })).toHaveAttribute('aria-checked', 'true')
   })
 
-  test('with nothing stored, a strategy with a saved run still offers the download', async ({ page, open }) => {
+  test('with nothing stored, a strategy shows its saved result and offers the download beside it', async ({ page, open }) => {
     await open({ ...engine, noData: true })
     await page.getByRole('button', { name: /SMA cross/ }).click()
-    await expect(page.getByText('No data downloaded')).toBeVisible()
+    await expect(page.getByRole('heading', { name: 'No verdict rule yet' })).toBeVisible()
+    await expect(page.getByText('Nothing is stored now. Download the history of BTCUSDT perpetual, Binance to run this strategy again.')).toBeVisible()
     await page.getByRole('button', { name: 'Download BTCUSDT history' }).click()
     await expect(page.getByRole('progressbar', { name: 'Download progress' })).toBeVisible()
-    // Once the data is stored, the saved result shows again.
-    await expect(page.locator('#verdict')).toHaveText('No verdict rule yet', { timeout: 10_000 })
+    // Once the download stores the data, the offer goes and the result stays.
+    await expect(page.getByRole('button', { name: 'Download BTCUSDT history' })).toHaveCount(0, { timeout: 10_000 })
+    await expect(page.getByRole('progressbar')).toHaveCount(0, { timeout: 10_000 })
+    await expect(page.getByRole('heading', { name: 'No verdict rule yet' })).toBeVisible()
+    await expect(page.getByText('Nothing is stored now.', { exact: false })).toHaveCount(0)
   })
 
   test('a download can be cancelled', async ({ page, open }) => {
@@ -410,6 +414,20 @@ test.describe('running on the engine', () => {
     await alert.getByRole('button', { name: 'Retry' }).click()
     await expect(alert).toHaveCount(0)
     await expect(rows).toHaveCount(2)
+  })
+
+  test('deleting the only instrument keeps the view and says it was deleted', async ({ page, open }) => {
+    await open(engine)
+    await page.getByRole('button', { name: /^Stored data/ }).click()
+    // ETHUSDT spot goes first, so BTCUSDT perpetual is the only instrument, then that goes too.
+    for (const name of ['ETHUSDT spot, Bybit', 'BTCUSDT perpetual, Binance']) {
+      await page.getByRole('button', { name: `Delete ${name}` }).click()
+      await page.getByRole('menuitem', { name: /All of it/ }).click()
+      await page.getByRole('group', { name: 'Confirm the delete' }).getByRole('button', { name: 'Delete', exact: true }).click()
+      await expect(page.getByRole('status')).toContainText(`Deleted ${name}.`)
+    }
+    await expect(page.getByRole('status')).toHaveText('Deleted BTCUSDT perpetual, Binance. 31.6 MB freed.')
+    await expect(page.getByText('Download history from a strategy that has none', { exact: false })).toBeVisible()
   })
 
   test('a perpetual with only its funding rates stored is asked about as that', async ({ page, open }) => {

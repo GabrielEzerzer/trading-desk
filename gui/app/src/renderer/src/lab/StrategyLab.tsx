@@ -226,7 +226,19 @@ export function StrategyLab() {
   else if (!instrument) runBlocked = 'Download data first.'
 
   const failed = failure?.name === selectedName ? failure : null
-  const noData = datasets?.length === 0 || failed?.failure.kind === 'data_missing'
+  const dataMissing = failed?.failure.kind === 'data_missing'
+  const noData = datasets?.length === 0 || dataMissing
+
+  /** The download offered beside a saved result while nothing is stored. */
+  const offerDownload = (target: InstrumentId) => (
+    <DownloadOffer
+      instrument={download?.instrument ?? target}
+      reason={`Nothing is stored now. Download the history of ${formatInstrument(target)} to run this strategy again.`}
+      download={download}
+      error={downloadError}
+      onDownload={() => startDownload(target)}
+    />
+  )
 
   let body: React.ReactNode
   if (loadError) {
@@ -260,8 +272,9 @@ export function StrategyLab() {
     body = <StrategyList strategies={strategies} stored={stored} onChoose={select} onOpenData={openData} />
   } else if (run?.name === selected.name) {
     body = <Running strategy={selected} run={run} />
-  } else if (noData) {
-    // With nothing stored this shows even over a saved result, so a download is always on offer.
+  } else if (noData && !(last && !dataMissing)) {
+    // A run that found its data missing, or a strategy with no saved result while nothing is
+    // stored. A saved result shows below, with the download offered beside it.
     const target = failed?.instrument ?? source.defaultInstrument
     body = (
       <NoData
@@ -303,14 +316,18 @@ export function StrategyLab() {
         verdict={shown}
         fresh={fresh === selected.name}
         onCounted={counted}
+        offer={noData && offerDownload(shown.instrument)}
       />
     )
   } else if (last && openError?.id === last.id) {
     body = (
-      <div className="state" role="alert">
-        <p className="eyebrow">{selected.label}</p>
-        <p className="state-title">The result did not load</p>
-        <p className="state-text">{openError.message}</p>
+      <div className="state">
+        <div role="alert">
+          <p className="eyebrow">{selected.label}</p>
+          <p className="state-title">The result did not load</p>
+          <p className="state-text">{openError.message}</p>
+        </div>
+        {noData && offerDownload(source.defaultInstrument)}
       </div>
     )
   } else if (last) {
@@ -338,7 +355,9 @@ export function StrategyLab() {
 
   const phase =
     run?.name === selectedName ? 'running' : failed ? 'failed' : download ? 'downloading' : noData ? 'no-data' : 'idle'
-  const viewKey = `${loadError ? 'error' : strategies ? 'ready' : 'loading'}-${dataOpen ? 'data' : (selectedName ?? 'list')}-${phase}`
+  // The data view keeps one key while it is open: a delete that empties the store changes the
+  // phase, and a new key would remount the view and lose the delete's message.
+  const viewKey = `${loadError ? 'error' : strategies ? 'ready' : 'loading'}-${dataOpen ? 'data' : `${selectedName ?? 'list'}-${phase}`}`
 
   return (
     <div className="lab">
@@ -442,7 +461,7 @@ interface NoDataProps {
 }
 
 /** The store lacks the run's data: the offer to download the instrument's history, then its progress. */
-function NoData({ strategy, instrument, title, reason, download, error, onDownload }: NoDataProps) {
+function NoData({ strategy, title, ...offer }: NoDataProps) {
   return (
     <div className="state">
       <p className="eyebrow">{strategy.label}</p>
@@ -451,6 +470,17 @@ function NoData({ strategy, instrument, title, reason, download, error, onDownlo
           {title}
         </p>
       </div>
+      <DownloadOffer {...offer} />
+    </div>
+  )
+}
+
+type DownloadOfferProps = Omit<NoDataProps, 'strategy' | 'title'>
+
+/** Why a download is needed and the button that starts it, or the download's progress. */
+function DownloadOffer({ instrument, reason, download, error, onDownload }: DownloadOfferProps) {
+  return (
+    <div className="download-offer">
       {download ? (
         <>
           <ProgressBar
