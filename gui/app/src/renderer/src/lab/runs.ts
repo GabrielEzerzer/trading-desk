@@ -2,7 +2,15 @@
 // strategy's latest run, a stored dataset as a run's range, and a failed call as the state to show.
 
 import { ApiError } from '@td/shared'
-import type { CoverageResponse, InstrumentId, MetricsReport, RunDetail, RunSummary, Timeframe } from '@td/shared'
+import type {
+  CoverageResponse,
+  InstrumentId,
+  MetricsReport,
+  RunDetail,
+  RunSummary,
+  StoredResponse,
+  Timeframe,
+} from '@td/shared'
 import type { EquityPoint, FinishedRun, LastRun, Millis, VerdictPreview } from './source'
 import { RunCancelled } from './source'
 
@@ -20,6 +28,13 @@ const MAX_CHART_POINTS = 1000
 /** `binance:BTCUSDT:spot`, the form the engine writes an instrument in. */
 export function instrumentKey(id: InstrumentId): string {
   return `${id.venue}:${id.symbol}:${id.kind}`
+}
+
+/** The instruments with candles stored, `first` first when it is one of them, then in the store's order. */
+export function storedDatasets(stored: StoredResponse, first: InstrumentId): InstrumentId[] {
+  const ids = stored.instruments.filter((i) => i.months.length > 0).map((i) => i.instrument)
+  const key = instrumentKey(first)
+  return [...ids.filter((id) => instrumentKey(id) === key), ...ids.filter((id) => instrumentKey(id) !== key)]
 }
 
 /** When a run was saved: its id starts with the save time in milliseconds (td_engine::RunId). */

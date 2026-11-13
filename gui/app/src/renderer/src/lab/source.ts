@@ -2,7 +2,7 @@
 // (engine-source.ts) runs backtests on the engine, and the mock one (app/mock/lab.ts, chosen with
 // TD_MOCK=1) reads fixtures.
 
-import type { InstrumentId, Timeframe } from '@td/shared'
+import type { DeleteRequest, DeleteResult, InstrumentId, StoredResponse, Timeframe } from '@td/shared'
 
 /** Milliseconds since the Unix epoch, UTC. */
 export type Millis = number
@@ -140,10 +140,17 @@ export class RunCancelled extends Error {
   }
 }
 
+/** What a delete of stored market data removes: one instrument, a range of its months, or all of it. */
+export type DeleteTarget = DeleteRequest | 'all'
+
 export interface LabSource {
   strategies(): Promise<LabStrategy[]>
-  /** The instruments with candles stored, the default first. */
-  datasets(): Promise<InstrumentId[]>
+  /** The data folder and every instrument with stored data, with the size of each file. */
+  stored(): Promise<StoredResponse>
+  /** Deletes stored market data; saved runs and paper sessions stay. */
+  deleteData(target: DeleteTarget): Promise<DeleteResult>
+  /** Opens the data folder in the file explorer. */
+  openDataFolder(): Promise<void>
   /** The instrument to offer for download when nothing is stored. */
   readonly defaultInstrument: InstrumentId
   /** What Run does, for a strategy that has never run. */

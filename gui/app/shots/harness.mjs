@@ -95,6 +95,20 @@ const chooseRow = async (page, name) => {
   await page.mouse.move(0, 0)
 }
 
+/** Opens the stored market data from the strategy list. */
+const openStoredData = async (page) => {
+  await chooseRow(page, /^Stored data/)
+  await page.getByRole('heading', { name: 'Market data', level: 1 }).waitFor()
+}
+
+/** Opens the stored data and asks to delete all of BTCUSDT perpetual. */
+const askDeleteBtc = async (page) => {
+  await openStoredData(page)
+  await page.getByRole('button', { name: 'Delete BTCUSDT perpetual, Binance' }).click()
+  await page.getByRole('menuitem', { name: /All of it/ }).click()
+  await page.getByRole('group', { name: 'Confirm the delete' }).waitFor()
+}
+
 // Trading. Its states carry `section: 'trading'`. Those past the engine's start run on
 // Playwright's clock, held still: the mock emits a bar every 1.5 s and the engine stub one every
 // 250 ms, so a state reached in real time would show however many bars had come by then. `hold`
@@ -485,6 +499,46 @@ export const STATES = [
       await chooseRow(page, /Donchian breakout/)
       await page.getByRole('button', { name: 'Overrides' }).click()
       await page.getByRole('menuitemradio', { name: 'BTCUSDT perpetual, Binance' }).waitFor()
+    },
+  },
+  {
+    name: 'lab-data',
+    config: { engine: 'running', mock: true },
+    steps: openStoredData,
+  },
+  {
+    name: 'lab-data-empty',
+    config: { engine: 'running', mock: false, noData: true },
+    steps: async (page) => {
+      await openStoredData(page)
+      await page.getByText('Nothing stored', { exact: true }).waitFor()
+    },
+  },
+  {
+    name: 'lab-data-confirm',
+    config: { engine: 'running', mock: false },
+    steps: askDeleteBtc,
+  },
+  {
+    name: 'lab-data-confirm-range',
+    config: { engine: 'running', mock: false },
+    steps: async (page) => {
+      await openStoredData(page)
+      await page.getByRole('button', { name: 'Delete BTCUSDT perpetual, Binance' }).click()
+      await page.getByRole('menuitem', { name: 'A range of months' }).click()
+      await page.getByRole('button', { name: 'To: Jan 2024' }).click()
+      await page.getByRole('menuitemradio', { name: 'Jun 2024' }).click()
+      await page.getByText('That is 6 months.', { exact: false }).waitFor()
+    },
+  },
+  {
+    name: 'lab-data-delete-failed',
+    config: { engine: 'running', mock: false, deleteFails: true },
+    steps: async (page) => {
+      await askDeleteBtc(page)
+      await page.getByRole('button', { name: 'Delete', exact: true }).click()
+      await page.mouse.move(0, 0)
+      await page.getByText('The delete failed.', { exact: false }).waitFor()
     },
   },
   {

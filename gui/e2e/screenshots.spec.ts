@@ -20,6 +20,10 @@ const KEY_STATES = [
   'lab-engine-no-data',
   'lab-engine-downloading',
   'lab-engine-too-many-runs',
+  'lab-data',
+  'lab-data-empty',
+  'lab-data-confirm',
+  'lab-data-delete-failed',
   ...STATES.filter((s) => s.section === 'trading').map((s) => s.name),
 ]
 

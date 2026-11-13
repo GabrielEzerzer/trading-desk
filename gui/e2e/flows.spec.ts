@@ -306,6 +306,54 @@ test.describe('running on the engine', () => {
     await expect(page.getByRole('alert')).toContainText('Run failed', { timeout: 10_000 })
     await expect(page.getByRole('alert')).toContainText(/strategy refused its parameters: slow must be above fast/i)
   })
+
+  test('the stored data view deletes one instrument after asking, and the list updates', async ({ page, open }) => {
+    await open(engine)
+    await expect(page.getByRole('button', { name: /^Stored data/ })).toContainText('32.8 MB in 2 instruments')
+    await page.getByRole('button', { name: /^Stored data/ }).click()
+    await expect(page.getByRole('heading', { name: 'Market data', level: 1 })).toBeFocused()
+    const rows = page.locator('.data-table tbody tr')
+    await expect(rows).toHaveCount(2)
+    await expect(rows.first()).toContainText('BTCUSDT')
+    await expect(rows.first()).toContainText('31.6 MB')
+
+    await page.getByRole('button', { name: 'Delete BTCUSDT perpetual, Binance' }).click()
+    await page.getByRole('menuitem', { name: /All of it/ }).click()
+    const confirm = page.getByRole('group', { name: 'Confirm the delete' })
+    await expect(confirm).toContainText('Delete BTCUSDT perpetual, Binance: all 18 months and its funding rates?')
+    await expect(confirm).toContainText('This frees 31.6 MB.')
+    // Nothing is deleted until the delete is confirmed.
+    expect((await calls(page)).some((c) => c.path === '/data/delete')).toBe(false)
+
+    await confirm.getByRole('button', { name: 'Delete', exact: true }).click()
+    await expect(page.getByRole('status')).toHaveText('Deleted BTCUSDT perpetual, Binance. 31.6 MB freed.')
+    await expect(confirm).toBeHidden()
+    await expect(rows).toHaveCount(1)
+    await expect(rows.first()).toContainText('ETHUSDT')
+    await expect(page.locator('.verdict')).toHaveText('1.2 MB')
+    const deletes = (await calls(page)).filter((c) => c.method === 'POST' && c.path.startsWith('/data/delete'))
+    expect(deletes).toEqual([
+      { method: 'POST', path: '/data/delete', body: { instrument: { venue: 'binance', symbol: 'BTCUSDT', kind: 'perpetual' } } },
+    ])
+
+    // The data a run can use follows the store.
+    await page.getByRole('button', { name: 'Overrides' }).click()
+    await expect(page.getByRole('menuitemradio', { name: /, (Binance|Bybit)$/ })).toHaveText(['ETHUSDT spot, Bybit'])
+  })
+
+  test('a refused delete says why and keeps the data', async ({ page, open }) => {
+    await open({ ...engine, deleteFails: true })
+    await page.getByRole('button', { name: /^Stored data/ }).click()
+    await page.getByRole('button', { name: 'Delete all market data' }).click()
+    const confirm = page.getByRole('group', { name: 'Confirm the delete' })
+    await expect(confirm).toContainText('Delete all market data, 2 instruments? Saved runs and paper sessions stay.')
+    await expect(confirm).toContainText('This frees 32.8 MB.')
+    await confirm.getByRole('button', { name: 'Delete', exact: true }).click()
+    await expect(page.getByRole('alert')).toContainText('The delete failed. binance:BTCUSDT:perpetual is being downloaded or deleted right now')
+    await expect(page.locator('.data-table tbody tr')).toHaveCount(2)
+    await confirm.getByRole('button', { name: 'Cancel' }).click()
+    await expect(confirm).toBeHidden()
+  })
 })
 
 test.describe('trading', () => {

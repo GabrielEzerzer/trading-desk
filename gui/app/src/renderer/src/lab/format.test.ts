@@ -1,5 +1,15 @@
 import { describe, expect, it } from 'vitest'
-import { formatDay, formatInstrument, formatLimit, formatNumber, formatPrice, formatReturnPct, pnlTone } from './format'
+import {
+  formatBytes,
+  formatDay,
+  formatInstrument,
+  formatLimit,
+  formatNumber,
+  formatPrice,
+  formatReturnPct,
+  formatStoreMonth,
+  pnlTone,
+} from './format'
 import { readableName } from './source'
 import { sentence } from '../engine'
 
@@ -56,5 +66,15 @@ describe('format', () => {
   it('makes engine ids readable', () => {
     expect(readableName('sma_cross')).toBe('SMA cross')
     expect(readableName('donchian_breakout')).toBe('Donchian breakout')
+  })
+
+  it('writes sizes as the CLI does and store months as month and year', () => {
+    expect(formatBytes(0)).toBe('0.0 kB')
+    expect(formatBytes(1_500)).toBe('1.5 kB')
+    expect(formatBytes(1_000_000)).toBe('1.0 MB')
+    expect(formatBytes(12_345_678)).toBe('12.3 MB')
+    expect(formatBytes(2_500_000_000)).toBe('2.50 GB')
+    expect(formatStoreMonth('2024-03')).toBe('Mar 2024')
+    expect(formatStoreMonth('2025-12')).toBe('Dec 2025')
   })
 })

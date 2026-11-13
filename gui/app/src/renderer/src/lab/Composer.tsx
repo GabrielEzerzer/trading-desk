@@ -15,6 +15,8 @@ export interface ComposerHandle {
 interface Props {
   strategies: LabStrategy[]
   selected: LabStrategy | null
+  /** Another view than the strategy list is open with no strategy chosen: the stored data. */
+  away: boolean
   running: boolean
   /** Why Run cannot start now, or null when it can. */
   runBlocked: string | null
@@ -38,6 +40,7 @@ interface Props {
 export function Composer({
   strategies,
   selected,
+  away,
   running,
   runBlocked,
   datasets,
@@ -92,7 +95,7 @@ export function Composer({
                   </Menu.RadioItem>
                 ))}
               </Menu.RadioGroup>
-              {selected && (
+              {(selected || away) && (
                 <>
                   <Menu.Separator className="menu-separator" />
                   <Menu.Item className="menu-item" onSelect={() => onSelect(null)}>

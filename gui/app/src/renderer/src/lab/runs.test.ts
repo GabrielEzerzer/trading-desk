@@ -1,8 +1,8 @@
 import { ApiError } from '@td/shared'
-import type { CoverageResponse, RunDetail, RunSummary } from '@td/shared'
+import type { CoverageResponse, InstrumentId, RunDetail, RunSummary, StoredResponse } from '@td/shared'
 import { describe, expect, it } from 'vitest'
 import engine from '../../../../mock/engine.json'
-import { datasetRange, laterRun, latestRuns, runFailure, toFinished, toVerdict } from './runs'
+import { datasetRange, laterRun, latestRuns, runFailure, storedDatasets, toFinished, toVerdict } from './runs'
 import { RunCancelled } from './source'
 
 const details = engine.details as unknown as Record<string, RunDetail>
@@ -157,5 +157,26 @@ describe("a finished run as the strategy's last run", () => {
 
   it('keeps a newer last run, when a run cancelled while saving finishes late', () => {
     expect(laterRun(run(3), run(2))).toEqual(run(3))
+  })
+})
+
+describe('storedDatasets', () => {
+  const id = (symbol: string, kind: InstrumentId['kind']): InstrumentId => ({ venue: 'binance', symbol, kind })
+  const info = (instrument: InstrumentId, months: number) => ({
+    instrument,
+    months: Array.from({ length: months }, (_, i) => ({ month: `2024-0${i + 1}`, bytes: 10 })),
+    funding_bytes: instrument.kind === 'perpetual' ? 5 : null,
+    bytes: months * 10,
+  })
+  const stored: StoredResponse = {
+    data_dir: '/data',
+    instruments: [info(id('BTCUSDT', 'perpetual'), 0), info(id('ETHUSDT', 'spot'), 2), info(id('SOLUSDT', 'spot'), 1)],
+    unrecognised: [],
+  }
+
+  it('lists instruments with candles, the default first, then in the store order', () => {
+    expect(storedDatasets(stored, id('SOLUSDT', 'spot'))).toEqual([id('SOLUSDT', 'spot'), id('ETHUSDT', 'spot')])
+    // An instrument with only a funding file has nothing to run on.
+    expect(storedDatasets(stored, id('BTCUSDT', 'perpetual'))).toEqual([id('ETHUSDT', 'spot'), id('SOLUSDT', 'spot')])
   })
 })

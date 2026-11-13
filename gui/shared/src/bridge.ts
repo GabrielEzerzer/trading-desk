@@ -43,6 +43,11 @@ export interface TdBridge {
   /** Starts the engine again after it failed. Does nothing while it is starting or running. */
   restartEngine(): Promise<void>
   /**
+   * Opens the engine's data folder in the file explorer. Main asks the engine for the folder; the
+   * renderer cannot name a path. Resolves with null once it is open, or with why it did not open.
+   */
+  openDataFolder(): Promise<string | null>
+  /**
    * True when the app was started with `TD_MOCK=1`: the renderer then reads its Lab data from the
    * fixtures in `app/mock/` instead of the engine. Not a secret.
    */
@@ -58,6 +63,7 @@ export const IPC = {
   status: 'td:status',
   statusChanged: 'td:status-changed',
   restartEngine: 'td:restart-engine',
+  openDataFolder: 'td:open-data-folder',
 } as const
 
 /** The renderer argument main adds when the app runs on mock data (`TD_MOCK=1`). */
