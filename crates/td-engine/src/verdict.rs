@@ -47,8 +47,9 @@ pub enum VerdictRule {
         limits: PropFirmLimits,
         /// What one attempt costs and what a funded account pays, so the battery can price an
         /// attempt in money and the kind gains its value line. `None`, and absent from a rule
-        /// saved before the field existed, prices nothing.
-        #[serde(default)]
+        /// saved before the field existed, prices nothing. Left out of JSON when `None`, so a rule
+        /// without terms is written as it was before the field existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         attempt: Option<AttemptTerms>,
     },
     /// Held as part of a portfolio, judged on risk-adjusted return against a benchmark. Long/short
@@ -61,7 +62,9 @@ pub enum VerdictRule {
     HighRisk { limits: HighRiskLimits },
 }
 
-/// A prop firm's own rules. Losses and drawdowns are fractions of the starting balance.
+/// A prop firm's own rules. Losses and drawdowns are fractions of the starting balance. Each
+/// optional rule is left out of JSON when it is off, so a firm without it is written as it was
+/// before the rule existed.
 ///
 /// shortcut: no time limit on the challenge; add one if a firm the desk trades on has it.
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -78,18 +81,18 @@ pub struct FirmLimits {
     /// The profit target of a second phase, which starts from a fresh balance on the day after
     /// the first phase passes. Both phases share the rule's `pass_horizon_days`. `None` is a
     /// one-phase challenge.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub second_target: Option<f64>,
     /// The fewest days each phase must run before its target can pass it. 0 sets no minimum.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_zero")]
     pub min_trading_days: u32,
     /// The best-day rule: a phase passes only once its largest single day's profit is at most
     /// this share of the phase's total profit. `None` sets no such rule.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub best_day_share: Option<f64>,
     /// For a trailing drawdown, the level the floor stops rising at, as a fraction of the starting
     /// balance above the start: 0 stops it at the starting balance. `None` lets it trail for ever.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trailing_floor_lock: Option<f64>,
 }
 
@@ -127,8 +130,8 @@ pub struct AttemptTerms {
     /// The most payouts one funded account makes. `None` sets no limit.
     #[serde(default)]
     pub max_payouts: Option<u32>,
-    /// Whether the first payout locks the floor at the starting balance for the rest of the
-    /// account.
+    /// Whether the first payout fixes the floor for the rest of the account: at the starting
+    /// balance, or where the floor stands after the payout if that is higher.
     #[serde(default)]
     pub payout_locks_floor: bool,
     /// Days the funded account is simulated for after a pass.
@@ -144,6 +147,10 @@ pub struct AttemptTerms {
     /// and 1: 0.5 asks what an attempt is worth if the edge is half what the test shows.
     #[serde(default = "default_reduced_edge_factor")]
     pub reduced_edge_factor: f64,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 fn one() -> f64 {
@@ -2789,6 +2796,11 @@ mod tests {
         // that trails for ever, and no attempt terms.
         assert_eq!(rule, prop(DrawdownMode::Trailing));
         assert_eq!(rule.validate(), Ok(()));
+        // Written back, it is exactly the JSON it was saved as: a field that is off is left out.
+        // td-server's verdict list compares the registered rule's JSON with the rule saved in each
+        // verdict record, so a verdict saved before the new fields stays current.
+        let original: serde_json::Value = serde_json::from_str(saved).unwrap();
+        assert_eq!(serde_json::to_value(rule).unwrap(), original);
         let lines = evaluate(&rule, &good_prop());
         assert_eq!(
             ids(&lines),

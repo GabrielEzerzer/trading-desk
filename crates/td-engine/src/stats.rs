@@ -643,15 +643,18 @@ struct Funded {
 /// limits, with each day's return multiplied by the terms' funded size. A payout is asked for at
 /// the close of every day the terms allow one, for all the profit above the starting balance up
 /// to the cap, and is made when the trader's share reaches the smallest payout. The amount
-/// leaves the balance and lowers the trailing floor's peak by as much, since a withdrawal is not
-/// a trading loss. The account ends at a breach or when `returns` run out.
+/// leaves the balance and lowers the trailing floor's peak by as much. A floor that is fixed, by
+/// reaching its trailing lock or by a payout that locks it, stays where it is. The account ends
+/// at a breach or when `returns` run out.
 ///
 /// shortcut: the funded account keeps the evaluation's loss limits; give it its own once a firm
 /// in a plan sets different ones.
 ///
 /// shortcut: payouts are always asked for as early and as large as allowed, so with a floor
-/// locked at the starting balance an uncapped payout leaves the account on its floor, and its
-/// next day at or below the start ends it; add a payout plan once a plan needs to keep a buffer.
+/// fixed at the starting balance an uncapped payout leaves the account on its floor, and its
+/// next day at or below the start ends it; with a floor fixed above the start it leaves the
+/// account under its floor, and its next day at or below that floor ends it. Add a payout plan
+/// once a plan needs to keep a buffer.
 fn walk_funded(spec: &PropFirmSpec, terms: &AttemptTerms, returns: &[f64]) -> Funded {
     let first = terms.days_to_first_payout as usize;
     let interval = terms.payout_interval_days as usize;
@@ -661,11 +664,12 @@ fn walk_funded(spec: &PropFirmSpec, terms: &AttemptTerms, returns: &[f64]) -> Fu
         payouts: 0,
         balance: 1.0,
     };
-    let (mut peak, mut locked, mut last) = (1.0f64, false, None::<usize>);
+    // The floor once it no longer moves.
+    let (mut peak, mut fixed, mut last) = (1.0f64, None::<f64>, None::<usize>);
     for (day, &r) in (1..).zip(returns) {
         let prev = out.balance;
         out.balance *= 1.0 + terms.funded_size * r;
-        let floor = if locked { 1.0 } else { spec.floor(peak) };
+        let floor = fixed.unwrap_or_else(|| spec.floor(peak));
         peak = peak.max(out.balance);
         if spec.breached(prev, out.balance, floor) {
             break;
@@ -680,12 +684,26 @@ fn walk_funded(spec: &PropFirmSpec, terms: &AttemptTerms, returns: &[f64]) -> Fu
         let profit = out.balance - 1.0;
         let amount = terms.payout_cap.map_or(profit, |cap| profit.min(cap));
         if amount > 0.0 && terms.profit_split * amount * terms.account_size >= terms.min_payout {
+            // Without payouts the peak never falls, so a trailing floor that reaches its lock
+            // stays there; lowering the peak below must not take it back down.
+            if let Some(lock) = spec.trailing_lock
+                && spec.floor(peak) >= 1.0 + lock
+            {
+                fixed.get_or_insert(1.0 + lock);
+            }
             out.balance -= amount;
+            // shortcut: a payout lowers a trailing floor's peak by the amount withdrawn, which
+            // favours the trader, and firms differ: some leave the floor where it was. Make it a
+            // firm rule once a plan's firm does that.
             peak -= amount;
             out.gross += amount;
             out.payouts += 1;
             last = Some(day);
-            locked |= terms.payout_locks_floor;
+            if terms.payout_locks_floor {
+                // At the start, or where the floor stands now if that is higher: a payout never
+                // makes the account safer than it was.
+                fixed = Some(fixed.unwrap_or_else(|| spec.floor(peak)).max(1.0));
+            }
         }
     }
     out
@@ -1550,6 +1568,59 @@ mod tests {
         };
         let t = funded(&trailing, &terms(), &path);
         assert_eq!((t.payouts, t.gross, t.balance), (2, 0.25 + 0.171875, 1.0));
+    }
+
+    #[test]
+    fn a_payout_does_not_unlock_a_trailing_floor_that_reached_its_lock() {
+        // A trailing drawdown of 0.1 whose floor locks at the start, payouts from day 1, no cap:
+        //   day 1  +12%  1.12, peak 1.12: the floor is min(1.12 - 0.1, 1.0) = 1.0, at its lock.
+        //                The payout takes the 0.12 of profit: 1.0, and the peak falls to 1.0.
+        //   day 2  -5%   0.95, at or below the floor held at 1.0: the account ends.
+        // Had the payout unlocked the floor, it would be min(1.0 - 0.1, 1.0) = 0.9 on day 2,
+        // 0.95 would hold, and day 3's +10% (0.95 * 1.1 = 1.045) would pay a second time.
+        let locks = PropFirmSpec {
+            max_drawdown: 0.1,
+            drawdown: DrawdownMode::Trailing,
+            trailing_lock: Some(0.0),
+            ..unlimited(10)
+        };
+        let f = funded(&locks, &terms(), &[0.12, -0.05, 0.1]);
+        assert_eq!(f.payouts, 1);
+        assert!(close(f.gross, 0.12) && close(f.balance, 0.95), "{f:?}");
+    }
+
+    #[test]
+    fn a_payout_that_locks_the_floor_never_lowers_a_floor_above_the_start() {
+        // A trailing drawdown of 0.04, no trailing lock, payouts capped at 0.02, and the first
+        // payout locks the floor:
+        //   day 1  +10%  1.10, peak 1.10. The payout takes the cap: 1.08, and the peak falls to
+        //                1.08, so the trailing floor stands at 1.08 - 0.04 = 1.04, above the
+        //                start. The lock fixes it there, the higher of 1.0 and 1.04.
+        //   day 2  -5%   1.08 * 0.95 = 1.026, at or below 1.04: the account ends.
+        // A floor locked at the start instead would hold 1.026 above 1.0 and pay the cap again
+        // on day 2. With the lock or without it the account ends the same: a payout never makes
+        // it safer.
+        let trailing = PropFirmSpec {
+            max_drawdown: 0.04,
+            drawdown: DrawdownMode::Trailing,
+            ..unlimited(10)
+        };
+        let capped = AttemptTerms {
+            payout_cap: Some(0.02),
+            ..terms()
+        };
+        let lock = AttemptTerms {
+            payout_locks_floor: true,
+            ..capped
+        };
+        let path = [0.1, -0.05];
+        let locked = funded(&trailing, &lock, &path);
+        assert_eq!(locked.payouts, 1);
+        assert!(
+            close(locked.gross, 0.02) && close(locked.balance, 1.026),
+            "{locked:?}"
+        );
+        assert_eq!(locked, funded(&trailing, &capped, &path));
     }
 
     /// The figures of one attempt per path, from constructed paths.

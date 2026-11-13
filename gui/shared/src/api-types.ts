@@ -1063,12 +1063,15 @@ export type VerdictRule = { "kind": "prop_firm", firm: FirmLimits, limits: PropF
 /**
  * What one attempt costs and what a funded account pays, so the battery can price an
  * attempt in money and the kind gains its value line. `None`, and absent from a rule
- * saved before the field existed, prices nothing.
+ * saved before the field existed, prices nothing. Left out of JSON when `None`, so a rule
+ * without terms is written as it was before the field existed.
  */
-attempt: AttemptTerms | null, } | { "kind": "portfolio", benchmark: PortfolioBenchmark, limits: PortfolioLimits, } | { "kind": "high_risk", limits: HighRiskLimits, };
+attempt?: AttemptTerms | null, } | { "kind": "portfolio", benchmark: PortfolioBenchmark, limits: PortfolioLimits, } | { "kind": "high_risk", limits: HighRiskLimits, };
 
 /**
- * A prop firm's own rules. Losses and drawdowns are fractions of the starting balance.
+ * A prop firm's own rules. Losses and drawdowns are fractions of the starting balance. Each
+ * optional rule is left out of JSON when it is off, so a firm without it is written as it was
+ * before the rule existed.
  *
  * shortcut: no time limit on the challenge; add one if a firm the desk trades on has it.
  */
@@ -1090,21 +1093,21 @@ profit_target: number,
  * the first phase passes. Both phases share the rule's `pass_horizon_days`. `None` is a
  * one-phase challenge.
  */
-second_target: number | null, 
+second_target?: number | null, 
 /**
  * The fewest days each phase must run before its target can pass it. 0 sets no minimum.
  */
-min_trading_days: number, 
+min_trading_days?: number, 
 /**
  * The best-day rule: a phase passes only once its largest single day's profit is at most
  * this share of the phase's total profit. `None` sets no such rule.
  */
-best_day_share: number | null, 
+best_day_share?: number | null, 
 /**
  * For a trailing drawdown, the level the floor stops rising at, as a fraction of the starting
  * balance above the start: 0 stops it at the starting balance. `None` lets it trail for ever.
  */
-trailing_floor_lock: number | null, };
+trailing_floor_lock?: number | null, };
 
 /**
  * The terms of one attempt at a prop-firm challenge: its fees, the funded account it leads to
@@ -1155,8 +1158,8 @@ payout_cap: number | null,
  */
 max_payouts: number | null, 
 /**
- * Whether the first payout locks the floor at the starting balance for the rest of the
- * account.
+ * Whether the first payout fixes the floor for the rest of the account: at the starting
+ * balance, or where the floor stands after the payout if that is higher.
  */
 payout_locks_floor: boolean, 
 /**
