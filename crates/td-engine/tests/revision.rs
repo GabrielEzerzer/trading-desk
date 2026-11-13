@@ -20,6 +20,10 @@ use td_engine::ENGINE_REVISION;
 /// td-bench's data report or loaded data, not a result, appends a row at the same revision, so
 /// the diff says that no result moved. The golden fixture holds only results and the revision, so
 /// a row at the same revision must keep it unchanged.
+///
+/// shortcut: a test cannot see edits to its own history, so a row edited in place (the last row's
+/// checksums overwritten instead of a new row appended) is not caught. Upgrade with a CI step that
+/// fails when `git diff origin/main -- crates/td-engine/tests/revision.rs` removes lines.
 const MEASURED: &[(u32, &str, &str, &str)] = &[(
     7,
     "c1ad6b64d1a62ad0",
