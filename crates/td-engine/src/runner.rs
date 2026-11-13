@@ -306,10 +306,9 @@ fn run_built(
         warmup,
         bars,
         traded_asks,
-        used_asks,
+        warmup_asks,
         funding,
         ranges,
-        used_funding,
         session,
         fills,
         trades,
@@ -328,7 +327,16 @@ fn run_built(
     );
     let mut used_bars = warmup;
     used_bars.extend_from_slice(&bars);
-    let used_asks: Vec<Candle> = used_asks.into_iter().flatten().collect();
+    let used_asks: Vec<Candle> = warmup_asks
+        .into_iter()
+        .chain(traded_asks)
+        .flatten()
+        .collect();
+    // The funding events charged: those of each traded bar, in order.
+    let used_funding: Vec<(Millis, f64)> = ranges
+        .iter()
+        .flat_map(|r| funding[r.clone()].iter().copied())
+        .collect();
 
     Ok(BacktestResult {
         config: config.clone(),
@@ -352,13 +360,12 @@ struct Simulated {
     /// The traded bars.
     bars: Vec<Candle>,
     traded_asks: Vec<Option<Candle>>,
-    /// The ask of every warm-up bar, then of every traded bar.
-    used_asks: Vec<Option<Candle>>,
+    /// The ask of every warm-up bar.
+    warmup_asks: Vec<Option<Candle>>,
     /// All the funding events given, sorted.
     funding: Vec<(Millis, f64)>,
+    /// The range of `funding` charged on each traded bar.
     ranges: Vec<std::ops::Range<usize>>,
-    /// The funding events charged.
-    used_funding: Vec<(Millis, f64)>,
     session: Session,
     fills: Vec<Fill>,
     trades: Vec<Trade>,
@@ -376,11 +383,10 @@ fn simulate(
     build: impl FnOnce() -> Result<Box<dyn Strategy>, EngineError>,
 ) -> Result<Simulated, EngineError> {
     let (warmup, traded) = select_bars(config, bars)?;
-    let mut used_asks = match_asks(config.instrument.id.kind, bars, asks, &warmup)?;
+    let warmup_asks = match_asks(config.instrument.id.kind, bars, asks, &warmup)?;
     let traded_asks = match_asks(config.instrument.id.kind, bars, asks, &traded)?;
     // The session checks each traded bar's ask as it is fed, but warm-up bars are fed without one.
-    check_quotes(&warmup, &used_asks)?;
-    used_asks.extend_from_slice(&traded_asks);
+    check_quotes(&warmup, &warmup_asks)?;
     let bars = traded;
     let tf = config.timeframe;
     let funding = sorted_funding(funding);
@@ -399,14 +405,12 @@ fn simulate(
         session.warm_up(*bar, &[])?;
     }
     let mut positions = Vec::with_capacity(bars.len());
-    let mut used_funding = Vec::new();
     // The bar whose close decides the close-out, so it fills at the last bar's open.
     let close_out_at = bars.len().checked_sub(2).filter(|_| config.close_at_end);
     for (i, ((bar, ask), range)) in bars.iter().zip(&traded_asks).zip(&ranges).enumerate() {
         let events = &funding[range.clone()];
         session.on_bar_with_ask(*bar, *ask, events)?;
         positions.push(session.portfolio().position());
-        used_funding.extend_from_slice(events);
         if close_out_at == Some(i) {
             session.close_out();
         }
@@ -448,10 +452,9 @@ fn simulate(
         warmup,
         bars,
         traded_asks,
-        used_asks,
+        warmup_asks,
         funding,
         ranges,
-        used_funding,
         session,
         fills,
         trades,
