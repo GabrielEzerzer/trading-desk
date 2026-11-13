@@ -64,7 +64,6 @@ export const STATES: State[]
 /** Trading on the engine stub: instruments from the fixtures and a closed bar every 250 ms. */
 export const engineTrading: State['config']
 export function serve(): Promise<{ server: Server; url: string }>
-export function stubScript(config: State['config']): string
 export function openApp(page: Page, url: string, config: State['config'], options?: { clock?: boolean }): Promise<void>
 export function realTimers(page: Page): Promise<void>
 export function settle(page: Page): Promise<void>

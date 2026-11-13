@@ -181,7 +181,7 @@ pub(super) async fn download(
 
 /// The download job: one calendar month at a time, checking for a cancel between months, then
 /// the funding rates of a perpetual. The range ends at now at the latest.
-pub fn run_download(
+fn run_download(
     source: &dyn MarketSource,
     store: &Store,
     request: &DownloadRequest,
