@@ -1,10 +1,12 @@
 import { ApiError } from '@td/shared'
-import type { CoverageResponse, RunDetail, RunSummary } from '@td/shared'
+import type { CoverageResponse, InstrumentId, RunDetail, RunSummary, StoredResponse } from '@td/shared'
 import { describe, expect, it } from 'vitest'
 import engine from '../../../../mock/engine.json'
-import { datasetRange, laterRun, latestRuns, runFailure, toFinished, toVerdict } from './runs'
+import { cutoffEnd, datasetRange, laterRun, latestRuns, runFailure, storedDatasets, toFinished, toVerdict } from './runs'
 import { RunCancelled } from './source'
 
+// A JSON import's strings are not the types' literal unions, hence the casts; the Rust test
+// crates/td-server/tests/gui_fixtures.rs checks engine.json against the engine's real types instead.
 const details = engine.details as unknown as Record<string, RunDetail>
 const runs = engine.runs as unknown as RunSummary[]
 const detail = (id: string) => {
@@ -84,6 +86,15 @@ describe('a saved backtest as the result screen', () => {
     expect(points.at(-1)?.t).toBe(one.time + 4999 * 3_600_000)
   })
 
+  it('says the code changed only when the engine says it no longer matches, and keeps the cutoff', () => {
+    const run = (code_matches: boolean | null, data_cutoff: string | null) =>
+      toVerdict({ ...detail(SMA), code_hash: null, code_matches, data_cutoff })
+    expect(run(false, null)).toMatchObject({ codeChanged: true, dataCutoff: null })
+    expect(run(true, '2025-03-31')).toMatchObject({ codeChanged: false, dataCutoff: '2025-03-31' })
+    // A run saved before runs recorded their code is unknown, not changed.
+    expect(run(null, null).codeChanged).toBe(false)
+  })
+
   it('refuses run kinds the Lab does not show yet', () => {
     const d = { ...detail(SMA), run: { kind: 'sweep', result: {} } } as unknown as RunDetail
     expect(() => toVerdict(d)).toThrow(/sweep run; the Lab shows backtests only/)
@@ -118,6 +129,27 @@ describe('the range of a dataset', () => {
     const t0 = Date.UTC(2024, 2, 1)
     expect(datasetRange(coverage(t0 + 30 * 60_000, t0 + 6 * H - 60_000), '1h')).toEqual({ from: t0 + H, to: t0 + 6 * H })
     expect(datasetRange(coverage(t0, t0 + 2 * 24 * H - 60_000), '1d')).toEqual({ from: t0, to: t0 + 2 * 24 * H })
+  })
+
+  it('covers every timeframe, with weeks opening on Monday', () => {
+    const t0 = Date.UTC(2024, 2, 1)
+    expect(datasetRange(coverage(t0 + 60_000, t0 + H - 60_000), '15m')).toEqual({ from: t0 + 15 * 60_000, to: t0 + H })
+    // Monday 2024-03-04 to the end of Sunday 2024-03-24: three whole weeks.
+    expect(datasetRange(coverage(Date.UTC(2024, 2, 1), Date.UTC(2024, 2, 25) - 60_000), '1w')).toEqual({
+      from: Date.UTC(2024, 2, 4),
+      to: Date.UTC(2024, 2, 25),
+    })
+  })
+
+  it('ends at a data cutoff inside the stored range, and is null when no whole bar fits before it', () => {
+    const t0 = Date.UTC(2024, 2, 1)
+    const stored = coverage(t0, t0 + 10 * 24 * H - 60_000)
+    expect(cutoffEnd('2024-03-04')).toBe(Date.UTC(2024, 2, 5))
+    expect(datasetRange(stored, '1d', cutoffEnd('2024-03-04'))).toEqual({ from: t0, to: Date.UTC(2024, 2, 5) })
+    expect(datasetRange(stored, '1h', cutoffEnd('2024-03-04'))).toEqual({ from: t0, to: Date.UTC(2024, 2, 5) })
+    // A cutoff after the stored range changes nothing.
+    expect(datasetRange(stored, '1d', cutoffEnd('2025-01-01'))).toEqual(datasetRange(stored, '1d'))
+    expect(datasetRange(stored, '1d', cutoffEnd('2024-02-01'))).toBeNull()
   })
 
   it('is null when nothing is stored or no whole bar fits', () => {
@@ -157,5 +189,26 @@ describe("a finished run as the strategy's last run", () => {
 
   it('keeps a newer last run, when a run cancelled while saving finishes late', () => {
     expect(laterRun(run(3), run(2))).toEqual(run(3))
+  })
+})
+
+describe('storedDatasets', () => {
+  const id = (symbol: string, kind: InstrumentId['kind']): InstrumentId => ({ venue: 'binance', symbol, kind })
+  const info = (instrument: InstrumentId, months: number) => ({
+    instrument,
+    months: Array.from({ length: months }, (_, i) => ({ month: `2024-0${i + 1}`, bytes: 10 })),
+    funding_bytes: instrument.kind === 'perpetual' ? 5 : null,
+    bytes: months * 10,
+  })
+  const stored: StoredResponse = {
+    data_dir: '/data',
+    instruments: [info(id('BTCUSDT', 'perpetual'), 0), info(id('ETHUSDT', 'spot'), 2), info(id('SOLUSDT', 'spot'), 1)],
+    unrecognised: [],
+  }
+
+  it('lists instruments with candles, the default first, then in the store order', () => {
+    expect(storedDatasets(stored, id('SOLUSDT', 'spot'))).toEqual([id('SOLUSDT', 'spot'), id('ETHUSDT', 'spot')])
+    // An instrument with only a funding file has nothing to run on.
+    expect(storedDatasets(stored, id('BTCUSDT', 'perpetual'))).toEqual([id('ETHUSDT', 'spot'), id('SOLUSDT', 'spot')])
   })
 })

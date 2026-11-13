@@ -4,7 +4,9 @@
 //! Bars come from the local store first, resampled from its 1-minute candles by the store's own
 //! rule ([`td_data::resample`]). The bar slots the store does not cover are fetched from the
 //! venue's REST API at the timeframe itself, the way a paper session warms up, and are not written
-//! to the store: only download jobs fill it.
+//! to the store: only download jobs fill it. A venue with no live stream (oanda) has no such REST
+//! bars, so there those slots are reported missing. A slot wholly inside the market's closed hours
+//! (an FX weekend) has no bar to find, so it is neither fetched nor reported missing.
 
 use std::sync::Arc;
 
@@ -20,7 +22,7 @@ use td_data::{DataError, Store};
 use ts_rs::TS;
 
 use super::AppState;
-use super::data::{EARLIEST_FROM, parse_instrument};
+use super::data::{earliest_from, parse_instrument};
 use super::error::ApiError;
 
 /// The most bars one response holds, and the default `limit`.
@@ -54,7 +56,7 @@ pub struct CandlesResponse {
     /// The bar slots the response covers: open times in `[from, to)`, each on a bar boundary. `to`
     /// is the asked `to` rounded up to a boundary, but no later than the open time of the bar
     /// still forming; `from` is later than asked when the limit cut the range, and never before
-    /// 2017-01-01.
+    /// the venue's earliest download date (2017-01-01, or 2007-01-01 for oanda).
     pub from: Millis,
     pub to: Millis,
     /// `from` was given and the range held more than `limit` bar slots, so the oldest were left
@@ -64,7 +66,8 @@ pub struct CandlesResponse {
     pub candles: Vec<Candle>,
     /// The bars fetched from the venue rather than read from the store.
     pub from_venue: Vec<BarSpan>,
-    /// Slots in `[from, to)` with no bar in the store or at the venue.
+    /// Slots in `[from, to)` with no bar in the store or at the venue, apart from those wholly
+    /// inside the market's closed hours (an FX weekend), which have no bar to miss.
     pub missing: Vec<BarSpan>,
 }
 
@@ -112,10 +115,11 @@ fn read_candles(
         if floor == t { t } else { floor + dur }
     };
     // Clamped first, so the arithmetic below cannot overflow. The bar open at `now` is not closed.
-    let clamp = |t: Millis| t.clamp(EARLIEST_FROM, now.max(EARLIEST_FROM));
+    let (earliest, _) = earliest_from(id.venue);
+    let clamp = |t: Millis| t.clamp(earliest, now.max(earliest));
     let end = ceil(clamp(to)).min(timeframe.floor(now));
     let window = end - limit as i64 * dur;
-    let asked = ceil(clamp(query.from.unwrap_or(EARLIEST_FROM)));
+    let asked = ceil(clamp(query.from.unwrap_or(earliest)));
     let from = asked.max(window).min(end);
     let truncated = query.from.is_some() && asked < window;
 
@@ -123,6 +127,11 @@ fn read_candles(
         ((from..end).contains(&t) && timeframe.floor(t) == t).then(|| ((t - from) / dur) as usize)
     };
     let mut slots: Vec<Slot> = vec![None; ((end - from) / dur) as usize];
+    let kind = id.kind;
+    let closed = |i: usize| {
+        let t = from + i as i64 * dur;
+        kind.closed_spans(t, t + dur).first() == Some(&(t..t + dur))
+    };
     // The stored minutes are read about a month at a time, so a daily or weekly chart over years
     // never holds years of minutes at once, and every piece ends on a bar boundary. Up to 1d a
     // piece ends at the next month start, which is a whole day, so it reads one month file; weeks
@@ -145,15 +154,18 @@ fn read_candles(
         }
         start = stop;
     }
-    // One request over every slot the store lacks: at most `limit` bars, a few pages at most.
+    // One request over every open slot the store lacks: at most `limit` bars, a few pages at most.
+    let lacking = |(i, slot): (usize, &Slot)| slot.is_none() && !closed(i);
     if let (Some(first), Some(last)) = (
-        slots.iter().position(Option::is_none),
-        slots.iter().rposition(Option::is_none),
+        slots.iter().enumerate().position(lacking),
+        slots.iter().enumerate().rposition(lacking),
     ) {
         let (span_from, span_to) = (from + first as i64 * dur, from + (last as i64 + 1) * dur);
-        let fetched = rest
-            .klines(&id, timeframe, span_from, span_to)
-            .map_err(|e| venue_error(&id, timeframe, e))?;
+        let fetched = match rest.klines(&id, timeframe, span_from, span_to) {
+            // A venue with no live stream (oanda) has no REST bars either: its slots stay missing.
+            Err(DataError::NoLiveStream(_)) => Vec::new(),
+            fetched => fetched.map_err(|e| venue_error(&id, timeframe, e))?,
+        };
         // A bar that fails validation is skipped, as in a session's warm-up.
         for bar in fetched.into_iter().filter(|b| b.validate().is_ok()) {
             if let Some(i) = slot_of(bar.open_time)
@@ -183,6 +195,7 @@ fn read_candles(
                     extend(&mut response.from_venue, open_time, dur);
                 }
             }
+            None if closed(i) => {}
             None => extend(&mut response.missing, open_time, dur),
         }
     }

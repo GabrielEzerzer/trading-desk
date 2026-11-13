@@ -12,12 +12,13 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 use td_core::{InstrumentId, Millis};
 use td_data::time::now_ms;
-use tokio::sync::{Notify, Semaphore, broadcast};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, broadcast};
 use ts_rs::TS;
 
 use td_engine::{BacktestConfig, OosSpec, SweepSpec, WalkForwardSpec};
@@ -27,8 +28,12 @@ use super::error::{ApiError, ErrorBody};
 use super::plans::{PlanDone, PlanRequest};
 use super::runs::RunDone;
 
-/// How many downloads run at once, for the venues' rate limits; the rest wait as `queued`.
+/// How many downloads run at once, for the venues' rate limits; the rest wait as `queued`. A run
+/// job that downloads what its range lacks takes one of these too ([`JobCtx::download_turn`]).
 const MAX_DOWNLOADS: usize = 2;
+
+/// How often a run job waiting for its turn to download looks again.
+const TURN_POLL: Duration = Duration::from_millis(20);
 
 /// How many runs (backtests and tester runs) go at once, apart from downloads, so a long sweep
 /// never holds up a download. A tester run spreads over every core on a rayon pool of its own;
@@ -234,6 +239,44 @@ impl JobCtx {
             Ok(())
         }
     }
+
+    /// Waits, from a job's blocking thread, until no other download of `id` is queued or running
+    /// in this server and a download slot is free, then holds both until the turn is dropped. A
+    /// run job takes this before it downloads what its range lacks, so its fetches count against
+    /// [`MAX_DOWNLOADS`] and never overlap another download of the same instrument; meanwhile a
+    /// `/data/download` of `id` is refused with 409 as for any download in progress. Stops
+    /// waiting with `Err(JobError::Cancelled)` on a cancel.
+    // shortcut: waits by looking again every TURN_POLL rather than queueing on the semaphore, so a
+    // run can be overtaken by downloads queued after it; queue it properly if runs are seen
+    // starving behind a stream of downloads.
+    pub fn download_turn(&self, id: &InstrumentId) -> Result<DownloadTurn, JobError> {
+        let mut waiting = false;
+        loop {
+            self.checkpoint()?;
+            if let Some(turn) = self.jobs.take_turn(self.id, id) {
+                return Ok(turn);
+            }
+            if !waiting {
+                waiting = true;
+                self.progress(0.0, format!("waiting to download the data: {id}"));
+            }
+            std::thread::sleep(TURN_POLL);
+        }
+    }
+}
+
+/// A run job's turn to download an instrument, from [`JobCtx::download_turn`]; dropping it frees
+/// the instrument and the download slot.
+pub struct DownloadTurn {
+    jobs: Arc<Jobs>,
+    id: InstrumentId,
+    _slot: OwnedSemaphorePermit,
+}
+
+impl Drop for DownloadTurn {
+    fn drop(&mut self) {
+        self.jobs.lock().fetching.remove(&self.id);
+    }
 }
 
 struct Entry {
@@ -247,15 +290,33 @@ struct Entry {
 struct Inner {
     next_id: u64,
     jobs: BTreeMap<u64, Entry>,
+    /// The instruments run jobs are downloading, with each one's job id ([`DownloadTurn`]).
+    fetching: BTreeMap<InstrumentId, u64>,
 }
 
 impl Inner {
-    /// The id of the queued or running download job of `id`, if there is one.
+    /// Any queued or running download, a download job's or a run job's, with its instrument.
+    fn any_download(&self) -> Option<(u64, InstrumentId)> {
+        let jobs = self.jobs.values().find_map(|e| {
+            let id = e.info.request.downloads()?;
+            (!e.info.status.is_finished()).then(|| (e.info.id, id.clone()))
+        });
+        jobs.or_else(|| {
+            self.fetching
+                .iter()
+                .next()
+                .map(|(id, &job)| (job, id.clone()))
+        })
+    }
+
+    /// The id of the job with a queued or running download of `id`, a download job or a run job
+    /// downloading it, if there is one.
     fn download_of(&self, id: &InstrumentId) -> Option<u64> {
         self.jobs
             .values()
             .find(|e| !e.info.status.is_finished() && e.info.request.downloads() == Some(id))
             .map(|e| e.info.id)
+            .or_else(|| self.fetching.get(id).copied())
     }
 }
 
@@ -284,6 +345,23 @@ impl Jobs {
     fn lock(&self) -> MutexGuard<'_, Inner> {
         // A panic while holding the lock leaves plain data behind, still consistent enough to read.
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Job `job`'s turn to download `id`, if no other download of it is queued or running and a
+    /// download slot is free. Both are checked and taken under the registry's lock, so a download
+    /// job submitted meanwhile sees the turn and is refused.
+    fn take_turn(self: &Arc<Self>, job: u64, id: &InstrumentId) -> Option<DownloadTurn> {
+        let mut inner = self.lock();
+        if inner.download_of(id).is_some() {
+            return None;
+        }
+        let slot = self.download_slots.clone().try_acquire_owned().ok()?;
+        inner.fetching.insert(id.clone(), job);
+        Some(DownloadTurn {
+            jobs: self.clone(),
+            id: id.clone(),
+            _slot: slot,
+        })
     }
 
     /// 429 `too_many_runs` when [`MAX_RUN_JOBS`] run jobs are already queued or running. A route
@@ -315,11 +393,11 @@ impl Jobs {
     /// I/O or compute for as long as it needs; it should call [`JobCtx::checkpoint`] between steps.
     /// Must be called from inside the Tokio runtime.
     ///
-    /// A download of an instrument that already has an unfinished download job is refused with
-    /// 409 `conflict`: two jobs would fetch the same data twice. This is a courtesy within one
-    /// server process only; the store's per-file locks hold across processes, so a duplicate
-    /// download started by another server on the same data folder (the other app's sidecar) is
-    /// safe, just redundant. A run beyond [`MAX_RUN_JOBS`] queued or running is refused with 429
+    /// A download of an instrument that already has an unfinished download job, or a run job
+    /// downloading it, is refused with 409 `conflict`: two jobs would fetch the same data twice.
+    /// This is a courtesy within one server process only; the store's per-file locks hold across
+    /// processes, so a duplicate download started by another server on the same data folder (the
+    /// other app's sidecar) is safe, just redundant. A run beyond [`MAX_RUN_JOBS`] queued or running is refused with 429
     /// `too_many_runs`.
     pub fn submit<F>(self: &Arc<Self>, request: JobRequest, work: F) -> Result<JobInfo, ApiError>
     where
@@ -412,6 +490,11 @@ impl Jobs {
     /// The id of the queued or running download job of `id` in this server, if there is one.
     pub fn download_in_progress(&self, id: &InstrumentId) -> Option<u64> {
         self.lock().download_of(id)
+    }
+
+    /// A queued or running download of any instrument, with its job id.
+    pub fn any_download_in_progress(&self) -> Option<(u64, InstrumentId)> {
+        self.lock().any_download()
     }
 
     pub fn list(&self) -> Vec<JobInfo> {

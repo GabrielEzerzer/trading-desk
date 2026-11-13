@@ -31,7 +31,7 @@ export interface QuitTimings {
 
 // The sidecar's own stop grace is 11 s (sidecar.ts), after which it kills the engine; this leaves
 // two more seconds for that kill and the drain of its output.
-export const QUIT_TIMINGS: QuitTimings = { stopTimeoutMs: 13_000, terminateAfterMs: 3_000 }
+const QUIT_TIMINGS: QuitTimings = { stopTimeoutMs: 13_000, terminateAfterMs: 3_000 }
 
 export interface Quit {
   /** True from the first `before-quit` on. Nothing new may start once it is set. */

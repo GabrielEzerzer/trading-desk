@@ -4,7 +4,7 @@
 /**
  * An exchange the desk reads data from and simulates orders against.
  */
-export type Venue = "binance" | "bybit";
+export type Venue = "binance" | "bybit" | "oanda";
 
 export type InstrumentKind = "spot" | "perpetual" | "fx";
 
@@ -927,8 +927,7 @@ export type Period = { from: number, to: number, };
  */
 export type BacktestSettings = { 
 /**
- * Starting balance in the quote asset: a plan's runs are on a quote-currency account (see
- * [`TestPlan::backtest_config`]).
+ * Starting balance in the account currency (`account_currency`).
  */
 starting_cash: number, 
 /**
@@ -940,7 +939,19 @@ max_leverage: number,
  * backtest config's default slippage for that instrument (#35: 2 bps on BTC and ETH, 5 bps
  * on other large caps); an empty list uses the default everywhere.
  */
-slippage: Array<SlippageOverride>, };
+slippage: Array<SlippageOverride>, 
+/**
+ * The currency the plan's runs hold and report in, as in
+ * [`BacktestConfig::account_currency`]: the quote currency, the default, or the base
+ * currency, as a dollar account trading USD/JPY. Left out of JSON when it is the default.
+ */
+account_currency?: AccountCurrency, 
+/**
+ * Fees every run of the plan pays in place of each instrument's own, as in
+ * [`BacktestConfig::fee_override`]: a broker's commission per unit of an FX pair, for
+ * example. Left out of JSON when it is not set, the default.
+ */
+fee_override?: FeeSchedule | null, };
 
 /**
  * One instrument's slippage, overriding the backtest config's default for it.
@@ -983,7 +994,8 @@ export type WalkForwardPlan = { train_days: number, test_days: number, };
  */
 export type EvidenceSettings = { min_sample: MinSample, luck: LuckTest, 
 /**
- * R4: fees and slippage are multiplied by this, and the strategy must stay profitable.
+ * R4: fees (the per-unit commission too), slippage and on a market with quotes each bar's
+ * spread are multiplied by this, and the strategy must stay profitable.
  */
 cost_stress: number, plateau: Plateau, 
 /**
@@ -1027,11 +1039,13 @@ pass_p: number,
 inconclusive_p: number, };
 
 /**
- * R5: how the best parameter set's neighbours on the grid must do.
+ * R5: how the neighbours on the grid of the sets the walk-forward chose must do on its test
+ * windows ([`crate::PlateauReport`]).
  */
 export type Plateau = { 
 /**
- * The neighbours' median objective over the best set's must be at least this.
+ * The median over the neighbours of each one's objective over the chosen sets' on the same
+ * windows must be at least this.
  */
 min_median_ratio: number, 
 /**
@@ -1075,9 +1089,17 @@ export type PropFirmLimits = {
  */
 share_of_firm_limits: number, 
 /**
- * The chance of reaching the profit target before breaching a limit must be at least this.
+ * The chance of reaching the profit target within `pass_horizon_days`, before breaching a
+ * limit, must be at least this.
  */
 min_pass_probability: number, 
+/**
+ * Days a simulated challenge runs for the pass odds: a path that has not reached the target
+ * by then counts as not passed. 90 by default, a quarter; a plan for a challenge with no time
+ * limit sets how long it is willing to run one. A rule saved before the field existed reads
+ * as 90, the horizon it was judged on.
+ */
+pass_horizon_days: number, 
 /**
  * The chance of breaching a limit within `breach_horizon_days` must be at most this.
  */
@@ -1123,8 +1145,8 @@ export type HighRiskLimits = {
  */
 min_trades: number, 
 /**
- * Mean net P&L per closed trade strictly above this, in the run's account currency (the
- * quote asset on a plan's runs).
+ * Mean net P&L per closed trade strictly above this, in the run's account currency (on a
+ * plan's runs, the one its backtest settings name).
  */
 min_expectancy: number, 
 /**
@@ -1198,7 +1220,30 @@ export type Verdict = { instrument: InstrumentId, state: VerdictState,
 /**
  * Every line of every layer that was judged, integrity first.
  */
-criteria: Array<Criterion>, };
+criteria: Array<Criterion>, 
+/**
+ * Costs the runs behind the verdict leave out, each named, so a verdict that rests on one is
+ * visible. They do not change the state. Empty in a verdict saved before warnings existed.
+ */
+warnings: Array<string>, };
+
+/**
+ * A limit of a strategy's rule that is looser than its kind's default (#113), so a verdict
+ * judged under it can say so. A tightened limit is not listed.
+ */
+export type LoosenedLimit = { 
+/**
+ * The limit's field in the kind's limits, such as `min_sharpe`.
+ */
+name: string, 
+/**
+ * The rule's value.
+ */
+value: number, 
+/**
+ * The kind's default.
+ */
+default: number, };
 
 /**
  * One instrument's test battery (#35) under a strategy's plan, as saved: what was tested, the
@@ -1256,7 +1301,8 @@ evidence: EvidenceInputs,
  */
 kind: KindInputs, oos_integrity: OosIntegrityInputs, 
 /**
- * R5's neighbours of the best parameter set on the grid.
+ * R5: the walk-forward's chosen sets against their grid neighbours, out of sample. `None`
+ * without a walk-forward.
  */
 plateau: PlateauReport | null, 
 /**
@@ -1273,7 +1319,8 @@ drawdown_bootstrap: DrawdownBootstrap | null,
  */
 trade_bootstrap: MeanBootstrap | null, 
 /**
- * The prop-firm challenge odds, for a `prop_firm` rule.
+ * The prop-firm challenge odds, for a `prop_firm` rule: passing within the rule's
+ * `pass_horizon_days`, breaching within its `breach_horizon_days`.
  */
 prop_firm_odds: PropFirmOdds | null, 
 /**
@@ -1370,15 +1417,17 @@ windows: number,
  */
 luck_p: number | null, 
 /**
- * R4: the out-of-sample return with fees and slippage multiplied by the cost stress.
+ * R4: the out-of-sample return with fees, the per-unit commission, slippage and on a market
+ * with quotes each bar's spread multiplied by the cost stress.
  */
 stressed_return: number | null, 
 /**
- * R5: the neighbours' median objective over the best set's.
+ * R5: the neighbours' median objective over R1's, both out of sample
+ * ([`crate::PlateauReport`]).
  */
 plateau_median_ratio: number | null, 
 /**
- * R5: the share of neighbours with a positive return.
+ * R5: the share of neighbours with a positive out-of-sample return.
  */
 plateau_positive_share: number | null, 
 /**
@@ -1485,18 +1534,54 @@ lowest_equity: number | null,
 curve: boolean, };
 
 /**
- * R5: the best parameter set and its neighbours on the grid.
+ * R5, out of sample: the walk-forward's chosen parameter sets against their neighbours on the
+ * grid. A neighbour is a direction on the grid, a step of -1, 0 or 1 on each axis (not all 0).
+ * In each window it is the set that window chose moved one step that way, run on the window's
+ * test bars as its chosen set was (warmed up on the train bars, closed out at the end). Each
+ * direction is judged only on the windows where its set ran: a window where it is off the grid
+ * or the strategy refuses it is left out, never filled with the chosen set's own run, which would
+ * pull the direction towards R1. Its runs are stitched as R1's curve is, and so are the chosen
+ * sets' own runs in the same windows, its reference. A direction that ran in no window is left
+ * out.
+ *
+ * The ratio is the median over the directions of each one's objective against its reference: the
+ * objective over the reference with `Maximize`, for a direction whose reference is above zero,
+ * and the reference over the objective with `Minimize`, so a ratio below 1 is worse either way.
+ * A direction with an undefined objective has the worst ratio (minus infinity with `Maximize`, 0
+ * with `Minimize`); one whose reference is undefined, or at or below zero with `Maximize`, has
+ * none and is left out of the median. The share is the directions whose stitched return is
+ * above zero.
+ *
+ * A result saved before R5 moved out of sample reads with `directions` empty and its ratio and
+ * share as they were judged then, on the full-period sweep.
  */
 export type PlateauReport = { 
 /**
- * The best row's grid coordinates.
+ * R1's stitched objective; `None` when it is undefined.
  */
-best: Array<number>, best_objective: number, 
+best_objective: number | null, directions: Array<PlateauDirection>, median_ratio: number | null, positive_share: number | null, };
+
 /**
- * The neighbours' grid coordinates and objective values, `None` where the objective is
- * undefined (it counts as the worst value).
+ * One of R5's neighbours, stitched over the windows.
  */
-neighbours: Array<[Array<number>, number | null]>, median_ratio: number | null, positive_share: number | null, };
+export type PlateauDirection = { 
+/**
+ * The step on each axis of the grid, in the order of the plan's axes.
+ */
+steps: Array<number>, 
+/**
+ * The windows in which the stepped set ran, the only ones it is judged on.
+ */
+windows: number, 
+/**
+ * The stitched objective; `None` when it is undefined.
+ */
+objective: number | null, total_return: number | null, 
+/**
+ * The chosen sets' own runs in the same windows, stitched the same way: their objective.
+ * `None` when it is undefined, or in a result saved before directions had it.
+ */
+reference: number | null, };
 
 /**
  * The distribution of a sample's mean under resampling.
@@ -1542,7 +1627,8 @@ p95: number, resamples: number, mean_block: number, };
 export type Quantiles = { p05: number, p25: number, p50: number, p75: number, p95: number, };
 
 /**
- * The odds of a prop-firm challenge over simulated paths.
+ * The odds of a prop-firm challenge over simulated paths. The battery takes `pass` and `breach`
+ * from runs to their own horizons, and the same run when the horizons are equal.
  */
 export type PropFirmOdds = { 
 /**
@@ -1566,8 +1652,10 @@ export type Breakdown = { long: SideResult, short: SideResult,
  */
 funding_paid: number, 
 /**
- * Windows where buy and hold rose over the test window, and the strategy's return in them,
- * compounded.
+ * Windows where the instrument's price rose over the test window, and the strategy's return
+ * in them, compounded. The price is the quote currency per unit of the base, so a long
+ * position gained in those windows in either currency: on a dollar account trading USD/JPY,
+ * a rising window is one where the dollar strengthened against the yen.
  */
 rising: RegimeResult, 
 /**
@@ -1589,7 +1677,7 @@ export type SideResult = {
  */
 trades: number, 
 /**
- * Their net P&L, in the quote asset.
+ * Their net P&L, in the account currency.
  */
 net_pnl: number, };
 
@@ -1598,7 +1686,12 @@ export type RegimeResult = { windows: number, strategy_return: number, };
 /**
  * R4: each test window's chosen parameters run again at higher costs.
  */
-export type CostStress = { multiplier: number, 
+export type CostStress = { 
+/**
+ * The fees, the per-unit commission, slippage and, on a market with quotes, each bar's spread
+ * are multiplied by this.
+ */
+multiplier: number, 
 /**
  * Each window's return at the stressed costs.
  */
@@ -1698,7 +1791,13 @@ export type ErrorResponse = { error: ErrorBody, };
  */
 export type ErrorBody = { code: string, message: string, };
 
-export type HealthResponse = { version: string, };
+export type HealthResponse = { version: string, 
+/**
+ * The data cutoff date (`TD_DATA_CUTOFF`, `YYYY-MM-DD` UTC) when one is in force: every run,
+ * sweep, walk-forward and test battery whose range ends after that date is refused. `null`
+ * when there is none.
+ */
+data_cutoff: string | null, };
 
 export type InstrumentsResponse = { instruments: Array<Instrument>, rejected: Array<RejectedInstrument>, };
 
@@ -1713,7 +1812,8 @@ export type RejectedInstrument = { symbol: string, reason: string, };
  */
 export type DownloadRequest = { instrument: InstrumentId, 
 /**
- * Not before 2017-01-01 00:00 UTC (1483228800000); earlier is a 400.
+ * Not before 2017-01-01 00:00 UTC (1483228800000) for binance and bybit, or before
+ * 2007-01-01 00:00 UTC (1167609600000) for oanda; earlier is a 400.
  */
 from: number, to: number, };
 
@@ -1790,6 +1890,11 @@ export type FundingCoverage = { rates: number, first: number | null, last: numbe
 
 export type StoredResponse = { 
 /**
+ * The data folder, as an absolute path. It also holds saved runs and paper sessions, which
+ * are not market data.
+ */
+data_dir: string, 
+/**
  * Every instrument with at least one month file or a funding file, in instrument order.
  */
 instruments: Array<StoredInstrumentInfo>, 
@@ -1817,7 +1922,8 @@ funding_bytes: number | null,
 bytes: number, };
 
 /**
- * One month file of an instrument's candles and its size on disk.
+ * One month file of an instrument's candles and its size on disk, with its closure record's,
+ * which a delete of the month removes with it.
  */
 export type StoredMonthInfo = { 
 /**
@@ -1852,7 +1958,7 @@ export type CandlesResponse = { instrument: InstrumentId, timeframe: Timeframe,
  * The bar slots the response covers: open times in `[from, to)`, each on a bar boundary. `to`
  * is the asked `to` rounded up to a boundary, but no later than the open time of the bar
  * still forming; `from` is later than asked when the limit cut the range, and never before
- * 2017-01-01.
+ * the venue's earliest download date (2017-01-01, or 2007-01-01 for oanda).
  */
 from: number, to: number, 
 /**
@@ -1869,7 +1975,8 @@ candles: Array<Candle>,
  */
 from_venue: Array<BarSpan>, 
 /**
- * Slots in `[from, to)` with no bar in the store or at the venue.
+ * Slots in `[from, to)` with no bar in the store or at the venue, apart from those wholly
+ * inside the market's closed hours (an FX weekend), which have no bar to miss.
  */
 missing: Array<BarSpan>, };
 
@@ -2015,14 +2122,39 @@ engine_matches: boolean,
  */
 plan_matches: boolean, 
 /**
+ * Whether the strategy's source file is still the one the battery ran with: false when it has
+ * been edited since, `null` when that is unknown (a battery saved before code hashes were
+ * recorded, or a strategy no longer registered). The hash covers the strategy's own file only,
+ * not shared helpers it calls, so a change to a shared helper leaves this true.
+ */
+code_matches: boolean | null, 
+/**
+ * True unless `engine_matches`, `plan_matches` and `code_matches` are all true: the verdict
+ * may not be what this engine, plan, rule and code would give, so run the plan again.
+ */
+stale: boolean, 
+/**
+ * Every limit of the rule the verdict was judged under that is looser than its kind's default,
+ * with both values; empty when none is, or when the saved rule no longer reads as a rule
+ * (`plan_matches` is then false). Tightened limits are not listed.
+ */
+loosened: Array<LoosenedLimit>, 
+/**
  * False when a cancel stopped the battery's luck test, so its luck line is inconclusive.
  */
 complete: boolean, seed: number, 
 /**
  * How many batteries have been saved for this strategy on this instrument, this one included.
- * An instrument a cancel stopped before the luck test saved none and is not counted.
+ * An instrument a cancel stopped before the luck test saved none and is not counted. Keyed by
+ * strategy name: renaming a strategy starts the count again.
  */
-runs: number, };
+runs: number, 
+/**
+ * How many distinct versions of the strategy's source file have been through the battery on
+ * this instrument, this one included; batteries saved before code hashes were recorded count
+ * together as one version. Keyed by strategy name like `runs`.
+ */
+code_versions: number, };
 
 /**
  * A saved run in full.
@@ -2041,7 +2173,23 @@ data_error: string | null,
  * Whether the run would come out the same today; set by `GET /runs/{id}`, `null` from
  * `GET /jobs/{id}/result`.
  */
-check: RunCheck | null, };
+check: RunCheck | null, 
+/**
+ * The hash of the strategy's source file when the run was made ([`td_engine::code_hash`]);
+ * `null` for a run saved before hashes were recorded.
+ */
+code_hash: string | null, 
+/**
+ * Whether the strategy's source file is still the one the run was made with; `null` when that
+ * is unknown: the run saved no hash, or the strategy is no longer registered. The hash covers
+ * the strategy's own file only, not shared helpers it calls.
+ */
+code_matches: boolean | null, 
+/**
+ * The data cutoff date (`TD_DATA_CUTOFF`) in force when the run was made; `null` when there
+ * was none, or for a run saved before cutoffs were recorded.
+ */
+data_cutoff: string | null, };
 
 /**
  * A saved run checked against the store and the engine as they are now, as
@@ -2073,9 +2221,17 @@ bars: number,
 /**
  * Every stretch of minutes in the range (warm-up included) the store has no candle for,
  * oldest first, including any at the start or the end of the range, in the instrument's open
- * hours. Each is shorter than a day; a longer one refuses the run.
+ * hours, apart from recorded closures. Together with any next to it that only closed hours
+ * part it from, each holds less than a day of open time, or two days for FX in a month
+ * downloaded before closures were recorded; more refuses the run.
  */
 gaps: Array<GapInfo>, 
+/**
+ * The spans in the range (warm-up included), oldest first, that downloads recorded the venue
+ * had nothing for and that count as closed, such as 25 December for FX: neither gaps nor
+ * dropped buckets. Empty in a run saved before closures were reported.
+ */
+closures: Array<GapInfo>, 
 /**
  * Open times of every bucket in the range the run has no bar for: buckets with no minutes at
  * all, and buckets left out because too many of their minutes are missing (td-data's rule: a

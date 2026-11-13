@@ -2,7 +2,7 @@
 // (engine-source.ts) runs backtests on the engine, and the mock one (app/mock/lab.ts, chosen with
 // TD_MOCK=1) reads fixtures.
 
-import type { InstrumentId, Timeframe } from '@td/shared'
+import type { DeleteRequest, DeleteResult, InstrumentId, StoredResponse, Timeframe } from '@td/shared'
 
 /** Milliseconds since the Unix epoch, UTC. */
 export type Millis = number
@@ -70,6 +70,10 @@ export interface VerdictPreview {
   equity: EquityPoint[]
   metrics: MetricRow[]
   trades: TradeRow[]
+  /** The strategy's code has changed since this run was made. False when it has not, or is unknown. */
+  codeChanged?: boolean
+  /** The data cutoff (`YYYY-MM-DD`, UTC) the run was made under, or null when there was none. */
+  dataCutoff?: string | null
 }
 
 /** A strategy's latest finished run, as the strategy list shows it. */
@@ -140,14 +144,23 @@ export class RunCancelled extends Error {
   }
 }
 
+/** What a delete of stored market data removes: one instrument, a range of its months, or all of it. */
+export type DeleteTarget = DeleteRequest | 'all'
+
 export interface LabSource {
   strategies(): Promise<LabStrategy[]>
-  /** The instruments with candles stored, the default first. */
-  datasets(): Promise<InstrumentId[]>
+  /** The data folder and every instrument with stored data, with the size of each file. */
+  stored(): Promise<StoredResponse>
+  /** Deletes stored market data; saved runs and paper sessions stay. */
+  deleteData(target: DeleteTarget): Promise<DeleteResult>
+  /** Opens the data folder in the file explorer. */
+  openDataFolder(): Promise<void>
   /** The instrument to offer for download when nothing is stored. */
   readonly defaultInstrument: InstrumentId
   /** What Run does, for a strategy that has never run. */
   readonly neverRunText: string
+  /** The data cutoff in force (`YYYY-MM-DD`, UTC): runs read no bar after it. Null when there is none. */
+  dataCutoff(): Promise<string | null>
   /** The full result of a strategy's latest run. */
   open(last: LastRun): Promise<VerdictPreview>
   run(name: string, target: RunTarget, onProgress: (progress: RunProgress) => void): LabRun

@@ -9,16 +9,12 @@
 use serde::{Deserialize, Serialize};
 use td_core::{AccountCurrency, Candle, Fill, Liquidity, Millis, civil_from_days, days_from_civil};
 
-use crate::metrics::{DAY_MS, EquitySeries};
-use crate::trades::closing_side;
+use crate::metrics::{DAY_MS, EquitySeries, finite};
+use crate::portfolio::next_position;
+use crate::trades::{closing_side, fill_side};
 use crate::{BarFunding, EquityPoint};
 
 const HOUR_MS: Millis = 3_600_000;
-
-/// `Some(x)` if `x` is finite.
-fn finite(x: f64) -> Option<f64> {
-    x.is_finite().then_some(x)
-}
 
 // ---------------------------------------------------------------------------------------------
 // Equity inside each bar
@@ -62,8 +58,9 @@ pub struct Intrabar {
 ///
 /// - the open, with the position held into the bar, from the previous close's equity moved by
 ///   the gap and less the funding charged at the open;
-/// - each fill's price, with the position before that fill (each fill then takes its fee off);
-///   for a fill that reduces the position as a maker (a limit, which the model fills after the
+/// - each fill's price, with the position before that fill (each fill then takes its fee off),
+///   moved by the spread at the open for a fill on the other side from the one the position
+///   closes on, an add on a market with quotes; for a fill that reduces the position as a maker (a limit, which the model fills after the
 ///   stops inside the range, the order worse for the strategy) also the adverse extreme, the low
 ///   for a long and the high for a short;
 /// - the low and high with the position after all the bar's fills, from the equity at the close,
@@ -129,15 +126,24 @@ pub fn intrabar(
         while next < fills.len() && fills[next].time <= bar.open_time {
             let f = &fills[next];
             next += 1;
-            // A fill that reduces the position is on the side the position closes on.
-            // shortcut: on a market with quotes a fill that adds to the position is on the other
-            // side, so the position before it is valued at the fill's price instead of the
-            // closing price at that moment (the fill's price and the spread then), which the
-            // candles do not give; it overstates the equity at that point by up to the spread on
-            // that position. Take the closing side's price at the fill when the fill model records
-            // it.
+            // A fill that reduces the position is on the side the position closes on. One that
+            // adds to it is on the other side on a market with quotes, so the position before it
+            // is valued one spread from the fill's price, the spread at the bar's open, as the
+            // broker starts an attached stop. A fill inside its side's candle met the closing side
+            // inside that side's candle, so the price is held there, as `build_trades` holds the
+            // add's excursion; one filled between the bars met it on the way to the open.
+            // shortcut: the spread at the fill itself is not in the candles, so a spread that
+            // changed between the open and the fill still misstates the equity there by the change
+            // on that position. Take the closing side's price at the fill when the fill model
+            // records it.
+            let c = closing_side(bar, ask, pos);
+            let own = fill_side(bar, ask, f.side);
+            let mut before = f.price + (c.open - own.open);
+            if (own.low..=own.high).contains(&f.price) {
+                before = before.clamp(c.low, c.high);
+            }
+            see(pos, before, shift(e, pos, avg, p, before));
             let at_fill = shift(e, pos, avg, p, f.price);
-            see(pos, f.price, at_fill);
             let dq = f.side.sign() * f.qty;
             let reducing = pos != 0.0 && f64::signum(pos) != dq.signum();
             if reducing && f.liquidity == Liquidity::Maker {
@@ -146,21 +152,7 @@ pub fn intrabar(
                 see(pos, adverse, shift(e, pos, avg, p, adverse));
             }
             (e, p) = (at_fill - f.fee, f.price);
-            let mut new = pos + dq;
-            // The portfolio's rule for float residue.
-            if new.abs() <= 1e-9 * (f64::abs(pos) + f.qty) {
-                new = 0.0;
-            }
-            avg = if new == 0.0 {
-                0.0
-            } else if pos == 0.0 || pos.signum() != new.signum() {
-                f.price
-            } else if new.abs() > pos.abs() {
-                (pos.abs() * avg + f.qty * f.price) / new.abs()
-            } else {
-                avg
-            };
-            pos = new;
+            (pos, avg) = next_position(pos, avg, dq, f.price);
         }
         let close = point.equity;
         // The range is priced before the funding due later in the bar, which the session

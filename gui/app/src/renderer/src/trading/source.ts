@@ -7,28 +7,25 @@ import type {
   Instrument,
   InstrumentId,
   InstrumentKind,
-  OrderType,
+  ManualOrder,
+  OrderId,
   ServerMessage,
   SessionEvent,
   SessionState,
   SessionSummary,
-  Side,
   StartSessionRequest,
   StrategyInfo,
   Timeframe,
   Venue,
 } from '@td/shared'
 import { api } from '../api'
+import { formatVenue } from '../lab/format'
 
-/** The strategy name of a session where you place every order yourself. */
-export const MANUAL = 'manual'
+/** The strategy name of a session where you place every order yourself (td-server's `MANUAL_STRATEGY`). */
+export const MANUAL = 'none'
 
-// shortcut: the body of a manual order is decided with its endpoint (#36); align this then.
-export interface ManualOrder {
-  side: Side
-  qty: number
-  order_type: OrderType
-}
+/** The body of `POST /sessions/{id}/orders`. */
+export type { ManualOrder }
 
 export interface InstrumentList {
   instruments: Instrument[]
@@ -75,9 +72,11 @@ export interface TradingSource {
   /** Follows one session. Returns a function that stops it. */
   watchSession(id: string, feed: SessionFeed): () => void
   placeOrder(sessionId: string, order: ManualOrder): Promise<void>
+  /** Cancels an open manual order. */
+  cancelOrder(sessionId: string, orderId: OrderId): Promise<void>
 }
 
-export function candleTopic(id: InstrumentId, timeframe: Timeframe): string {
+function candleTopic(id: InstrumentId, timeframe: Timeframe): string {
   return `candles:${id.venue}:${id.symbol}:${id.kind}:${timeframe}`
 }
 
@@ -87,8 +86,6 @@ const LISTS: [Venue, InstrumentKind][] = [
   ['bybit', 'spot'],
   ['bybit', 'perpetual'],
 ]
-
-const VENUE_NAMES: Record<Venue, string> = { binance: 'Binance', bybit: 'Bybit' }
 
 /** Loads the four venue lists; one that fails is named in `problems`, and only all failing throws. */
 export async function loadInstrumentLists(
@@ -100,7 +97,7 @@ export async function loadInstrumentLists(
   results.forEach((result, i) => {
     const [venue, kind] = LISTS[i] as [Venue, InstrumentKind]
     if (result.status === 'fulfilled') instruments.push(...result.value)
-    else problems.push(`The ${VENUE_NAMES[venue]} ${kind} list did not load.`)
+    else problems.push(`The ${formatVenue(venue)} ${kind} list did not load.`)
   })
   if (instruments.length === 0 && problems.length === LISTS.length) {
     const first = results.find((r) => r.status === 'rejected')
@@ -108,8 +105,6 @@ export async function loadInstrumentLists(
   }
   return { instruments, problems }
 }
-
-const UNTIL_36 = 'Manual orders arrive with the order endpoint (#36).'
 
 /** Subscribes to a topic and passes on its messages; returns the function that ends it. */
 function follow(topic: string, onMessage: (message: ServerMessage) => void): () => void {
@@ -121,13 +116,10 @@ function follow(topic: string, onMessage: (message: ServerMessage) => void): () 
   }
 }
 
-/**
- * The real engine. It has no manual orders yet (#36), so the composer says orders are not
- * available.
- */
+/** The real engine. */
 export const engineTradingSource: TradingSource = {
-  orders: { available: false, reason: UNTIL_36 },
-  manualSessions: { available: false, reason: 'Manual sessions arrive with the order endpoint (#36).' },
+  orders: { available: true },
+  manualSessions: { available: true },
   instruments: () => loadInstrumentLists(async (venue, kind) => (await api.instruments(venue, kind)).instruments),
   strategies: () => api.strategies(),
   history: async (id, timeframe) => (await api.candles(id, timeframe, HISTORY_BARS)).candles,
@@ -149,7 +141,12 @@ export const engineTradingSource: TradingSource = {
       else if (m.type === 'session' && m.id === id) feed.onEvent(m.event)
     })
   },
-  placeOrder: () => Promise.reject(new Error(UNTIL_36)),
+  async placeOrder(sessionId, order) {
+    await api.placeOrder(sessionId, order)
+  },
+  async cancelOrder(sessionId, orderId) {
+    await api.cancelOrder(sessionId, orderId)
+  },
 }
 
 /** The engine, or the fixtures in app/mock/ when the app was started with TD_MOCK=1. */

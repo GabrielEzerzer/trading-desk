@@ -1,11 +1,16 @@
 {
   "name": "trading-desk-gui",
   "private": true,
+  "license": "GPL-3.0-only",
   "type": "module",
   "packageManager": "pnpm@10.28.2",
   "scripts": {
-    "dev": "cargo build --release -p td-server --bin td-server --manifest-path ../Cargo.toml && pnpm --filter @td/app dev",
+    "engine": "cargo build --release -p td-server --bin td-server --manifest-path ../Cargo.toml",
+    "dev": "pnpm engine && pnpm --filter @td/app dev",
+    "dev:hush": "pnpm engine && hush run -- pnpm --filter @td/app dev",
     "build": "pnpm --filter @td/app build",
+    "dist": "pnpm engine && pnpm build && pnpm --filter @td/app dist",
+    "install-check": "node scripts/install-check.mjs",
     "typecheck": "pnpm -r typecheck && tsc -p tsconfig.e2e.json",
     "test": "vitest run",
     "shots": "pnpm --filter @td/app build && node app/shots/shots.mjs",

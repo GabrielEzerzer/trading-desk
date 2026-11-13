@@ -12,10 +12,11 @@ use futures_util::{SinkExt, StreamExt};
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 use td_core::{Candle, FeeSchedule, Instrument, InstrumentId, InstrumentKind, Millis, Venue};
-use td_data::time::{MINUTE, Month, now_ms, parse_date};
+use td_data::time::{DAY, MINUTE, Month, now_ms, parse_date};
 use td_data::{DataError, DownloadReport, InstrumentList, Store};
 use td_server::api::auth::Token;
-use td_server::api::data::EARLIEST_FROM;
+use td_server::api::data::{EARLIEST_FROM, OANDA_EARLIEST_FROM};
+use td_server::api::error::ApiError;
 use td_server::api::jobs::{JobInfo, JobResult, JobStatus};
 use td_server::api::source::{LiveSource, MarketSource};
 use td_server::api::ws::ServerMessage;
@@ -93,6 +94,10 @@ impl MarketSource for FakeSource {
         from: Millis,
         to: Millis,
     ) -> Result<DownloadReport, DataError> {
+        // Fails as the real source does when the server has no OANDA token.
+        if id.venue == Venue::Oanda {
+            return Err(DataError::MissingOandaToken);
+        }
         if self.gated {
             let mut permits = self.permits.lock().unwrap();
             while *permits == 0 {
@@ -201,6 +206,7 @@ impl TestServer {
             live: Arc::new(NoLive),
             token: Token::generate().expect("rng"),
             port: 0,
+            data_cutoff: None,
         })
         .await
         .expect("starts");
@@ -338,7 +344,10 @@ async fn health_answers_the_version_with_the_token() {
     let t = TestServer::start(FakeSource::default()).await;
     let (status, body) = t.get("/health").await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body, json!({ "version": env!("CARGO_PKG_VERSION") }));
+    assert_eq!(
+        body,
+        json!({ "version": env!("CARGO_PKG_VERSION"), "data_cutoff": null })
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -364,7 +373,7 @@ async fn requests_without_the_token_or_with_a_wrong_one_are_401() {
             "{path} with a wrong token"
         );
     }
-    for path in ["/data/download", "/data/delete"] {
+    for path in ["/data/download", "/data/delete", "/data/delete-all"] {
         let (status, _) = t.send(t.client.post(t.url(path)).body("{}")).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED, "{path} without a token");
     }
@@ -442,6 +451,10 @@ async fn instruments_come_from_the_source_once_per_list_and_then_from_memory() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["instruments"][0]["id"]["kind"], "perpetual");
     assert_eq!(t.source.instrument_calls.load(Ordering::SeqCst), 2);
+    let (status, body) = t.get("/instruments?venue=oanda&kind=fx").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["instruments"][0]["id"]["venue"], "oanda");
+    assert_eq!(body["instruments"][0]["id"]["kind"], "fx");
 
     for bad in [
         "/instruments?venue=kraken&kind=spot",
@@ -569,6 +582,58 @@ async fn a_download_job_reaches_done_on_the_jobs_topic_and_shows_in_coverage() {
         .await;
     assert_eq!(empty["months"], json!([]));
     assert_eq!(empty["funding"], Value::Null);
+    let (status, fx) = t.get("/data/coverage?instrument=oanda:USDJPY:fx").await;
+    assert_eq!(status, StatusCode::OK, "{fx}");
+    assert_eq!(fx["months"], json!([]));
+}
+
+/// A missing or refused OANDA token is the client's to fix, not the venue failing: a 400 with the
+/// `bad_request` code, as a failed download job carries it.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_oanda_download_without_a_token_fails_as_a_bad_request() {
+    let refused = DataError::OandaRefused {
+        url: "https://api-fxpractice.oanda.com/v3/instruments/USD_JPY/candles".into(),
+        status: 401,
+        message: "Insufficient authorization to perform request.".into(),
+    };
+    for error in [DataError::MissingOandaToken, refused] {
+        let api = ApiError::from(error);
+        assert_eq!(
+            (api.status.as_u16(), api.body.code.as_str()),
+            (400, "bad_request")
+        );
+        assert!(api.body.message.contains("OANDA_API_TOKEN"), "{api:?}");
+    }
+
+    let t = TestServer::start(FakeSource::default()).await;
+    let mut ws = t.websocket().await;
+    ws.send(json!({ "type": "subscribe", "topic": "jobs" }))
+        .await;
+    assert!(matches!(
+        ws.next().await,
+        Some(ServerMessage::Subscribed { .. })
+    ));
+    let body = json!({
+        "instrument": { "venue": "oanda", "symbol": "USDJPY", "kind": "fx" },
+        "from": day("2024-01-08"),
+        "to": day("2024-01-15"),
+    });
+    let (status, created) = t.post("/data/download", &body.to_string()).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{created}");
+    let id = created["job_id"].as_u64().expect("a job id");
+    let job = ws.until_job(id, JobStatus::Failed).await;
+    let error = job.error.expect("an error");
+    assert_eq!(error.code, "bad_request");
+    assert!(
+        error
+            .message
+            .contains("needs an API token: set OANDA_API_TOKEN"),
+        "{}",
+        error.message
+    );
+    let (_, fetched) = t.get(&format!("/jobs/{id}")).await;
+    assert_eq!(fetched["status"], "failed");
+    assert_eq!(fetched["error"]["code"], "bad_request");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -670,6 +735,59 @@ async fn bad_requests_get_json_errors_with_matching_statuses() {
     let (status, body) = t.post("/health", "").await;
     assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
     assert_eq!(body["error"]["code"], "method_not_allowed");
+}
+
+/// The earliest `from` is the venue's: Binance and Bybit keep 2017-01-01 and its message, and
+/// OANDA's FX history downloads from 2016, back to 2007-01-01.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_earliest_download_from_is_the_venues() {
+    let t = TestServer::start(FakeSource::default()).await;
+    let download = |venue: &str, symbol: &str, kind: &str, from: Millis| {
+        json!({
+            "instrument": { "venue": venue, "symbol": symbol, "kind": kind },
+            "from": from,
+            "to": from + 7 * DAY,
+        })
+        .to_string()
+    };
+
+    assert_eq!(EARLIEST_FROM, day("2017-01-01"));
+    for (venue, kind) in [("binance", "spot"), ("bybit", "perpetual")] {
+        for from in [EARLIEST_FROM - MINUTE, day("2016-01-01")] {
+            let body = download(venue, "BTCUSDT", kind, from);
+            let (status, answer) = t.post("/data/download", &body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(
+                answer["error"]["message"],
+                "`from` must not be before 2017-01-01 00:00 UTC (1483228800000), before either \
+                 venue's earliest data"
+            );
+        }
+    }
+    assert_eq!(t.get("/jobs").await.1, json!([]), "no job was started");
+
+    // 2005 and 2006 are refused: the FX market hours follow the US daylight-saving rule of 2007.
+    assert_eq!(OANDA_EARLIEST_FROM, day("2007-01-01"));
+    for from in [OANDA_EARLIEST_FROM - MINUTE, day("2005-01-01")] {
+        let early = download("oanda", "USDJPY", "fx", from);
+        let (status, answer) = t.post("/data/download", &early).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{answer}");
+        assert_eq!(
+            answer["error"]["message"],
+            "`from` must not be before 2007-01-01 00:00 UTC (1167609600000) for oanda: the FX \
+             market hours follow the US daylight-saving rule in force since 2007"
+        );
+    }
+    assert_eq!(t.get("/jobs").await.1, json!([]), "no job was started");
+    for from in [day("2016-01-01"), OANDA_EARLIEST_FROM] {
+        let body = download("oanda", "USDJPY", "fx", from);
+        let (status, created) = t.post("/data/download", &body).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}: {created}");
+        // The fake fails the job as a server without an OANDA token does; the next download of
+        // the same instrument waits for that, or it would be a 409.
+        let id = created["job_id"].as_u64().expect("a job id");
+        t.until_status(id, "failed").await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -843,6 +961,7 @@ fn the_binary_exits_after_the_grace_period_when_a_request_never_finishes() {
         .args(["--port", "0"])
         .env("TD_DATA_DIR", dir.path())
         .env_remove("TD_TOKEN")
+        .env_remove("TD_DATA_CUTOFF")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -890,6 +1009,7 @@ fn the_binary_prints_the_handshake_and_stops_when_stdin_closes() {
         .args(["--port", "0"])
         .env("TD_DATA_DIR", dir.path())
         .env_remove("TD_TOKEN")
+        .env_remove("TD_DATA_CUTOFF")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -939,6 +1059,31 @@ fn the_binary_prints_the_handshake_and_stops_when_stdin_closes() {
     assert_eq!(rest, "", "stdout carries only the handshake");
 }
 
+/// A `TD_DATA_CUTOFF` that is not a real UTC date stops the engine before it listens, with an
+/// error that names the variable and the value, rather than running without the cutoff.
+#[test]
+fn the_binary_refuses_to_start_with_an_invalid_data_cutoff() {
+    let dir = tempfile::tempdir().unwrap();
+    for bad in ["2026-02-30", "30/06/2026", ""] {
+        let output = Command::new(env!("CARGO_BIN_EXE_td-server"))
+            .args(["--port", "0"])
+            .env("TD_DATA_DIR", dir.path())
+            .env_remove("TD_TOKEN")
+            .env("TD_DATA_CUTOFF", bad)
+            .stdin(Stdio::piped())
+            .output()
+            .expect("runs");
+        assert!(!output.status.success(), "{bad:?}: {}", output.status);
+        assert_eq!(output.stdout, b"", "{bad:?}: no handshake");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("TD_DATA_CUTOFF must be a UTC date written YYYY-MM-DD")
+                && stderr.contains(&format!("got {bad:?}")),
+            "{bad:?}: {stderr}"
+        );
+    }
+}
+
 #[test]
 fn the_committed_typescript_types_are_up_to_date() {
     let committed = std::fs::read_to_string(ts::output_path())
@@ -969,7 +1114,11 @@ async fn stored_data_lists_with_sizes_and_deletes_by_month_range_or_whole_instru
     let t = TestServer::start(FakeSource::default()).await;
     let (status, empty) = t.get("/data/stored").await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(empty, json!({ "instruments": [], "unrecognised": [] }));
+    let data_dir = t._dir.path().to_string_lossy().into_owned();
+    assert_eq!(
+        empty,
+        json!({ "data_dir": data_dir, "instruments": [], "unrecognised": [] })
+    );
     download_two_months(&t, "BTCUSDT").await;
     download_two_months(&t, "ETHUSDT").await;
 
@@ -1135,4 +1284,104 @@ async fn a_delete_while_the_instrument_downloads_is_409() {
     let (status, removed) = t.post("/data/delete", &delete("BTCUSDT")).await;
     assert_eq!(status, StatusCode::OK, "{removed}");
     assert_eq!(removed["files"], 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn delete_all_is_409_while_this_server_has_a_download_in_progress() {
+    let t = TestServer::start(FakeSource::gated()).await;
+    let body = json!({
+        "instrument": { "venue": "binance", "symbol": "BTCUSDT", "kind": "spot" },
+        "from": day("2024-01-01"),
+        "to": day("2024-02-01"),
+    });
+    let (status, created) = t.post("/data/download", &body.to_string()).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let job = created["job_id"].as_u64().unwrap();
+    // Nothing is stored yet, so no stored instrument is held: only the queue says a download is on.
+    let (status, answer) = t.post("/data/delete-all", "").await;
+    assert_eq!(status, StatusCode::CONFLICT, "{answer}");
+    assert_eq!(answer["error"]["code"], "conflict");
+    assert_eq!(
+        answer["error"]["message"],
+        format!(
+            "binance:BTCUSDT:spot has a download in progress (job {job}); wait for it or cancel it"
+        )
+    );
+
+    t.source.release(1);
+    t.until_status(job, "done").await;
+    let (status, removed) = t.post("/data/delete-all", "").await;
+    assert_eq!(status, StatusCode::OK, "{removed}");
+    assert_eq!(removed["files"], 1, "the one month the download stored");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_delete_is_refused_while_another_process_downloads_the_instrument() {
+    let t = TestServer::start(FakeSource::default()).await;
+    download_two_months(&t, "BTCUSDT").await;
+    let (_, before) = t.get("/data/stored").await;
+    let id = InstrumentId {
+        venue: Venue::Bybit,
+        symbol: "BTCUSDT".into(),
+        kind: InstrumentKind::Perpetual,
+    };
+    // Another process on the same data folder, such as the `td-data` CLI, downloading it.
+    let hold = Store::new(t._dir.path())
+        .hold_for_download(&id)
+        .expect("holds");
+    let delete = json!({ "instrument": id }).to_string();
+    let range = json!({ "instrument": id, "from": "2024-01", "to": "2024-01" }).to_string();
+    for (path, body) in [
+        ("/data/delete", delete.as_str()),
+        ("/data/delete", range.as_str()),
+        ("/data/delete-all", ""),
+    ] {
+        let (status, answer) = t.post(path, body).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{path} {body}: {answer}");
+        assert_eq!(answer["error"]["code"], "conflict");
+        let message = answer["error"]["message"].as_str().unwrap();
+        assert!(
+            message.starts_with("bybit:BTCUSDT:perpetual is being downloaded or deleted"),
+            "{message}"
+        );
+    }
+    assert_eq!(t.get("/data/stored").await.1, before, "nothing was deleted");
+
+    drop(hold);
+    let (status, removed) = t.post("/data/delete", &delete).await;
+    assert_eq!(status, StatusCode::OK, "{removed}");
+    assert_eq!(removed["files"], 3, "two months and the funding file");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn delete_all_removes_every_instrument_and_leaves_runs_and_paper_sessions() {
+    let t = TestServer::start(FakeSource::default()).await;
+    download_two_months(&t, "BTCUSDT").await;
+    download_two_months(&t, "ETHUSDT").await;
+    let (_, stored) = t.get("/data/stored").await;
+    let total: u64 = stored["instruments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["bytes"].as_u64().unwrap())
+        .sum();
+    let root = t._dir.path();
+    for file in ["runs/1/config.json", "paper/s1/events.jsonl"] {
+        let path = root.join(file);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"kept").unwrap();
+    }
+
+    let (status, removed) = t.post("/data/delete-all", "").await;
+    assert_eq!(status, StatusCode::OK, "{removed}");
+    assert_eq!(removed, json!({ "files": 6, "bytes": total }));
+    let (_, stored) = t.get("/data/stored").await;
+    assert_eq!(stored["instruments"], json!([]));
+    for file in ["runs/1/config.json", "paper/s1/events.jsonl"] {
+        assert_eq!(std::fs::read(root.join(file)).unwrap(), b"kept", "{file}");
+    }
+    // With nothing stored it removes nothing.
+    let (status, removed) = t.post("/data/delete-all", "").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(removed, json!({ "files": 0, "bytes": 0 }));
 }

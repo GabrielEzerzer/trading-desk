@@ -552,7 +552,9 @@ impl PaperSession {
     /// reports its events. A warm-up bar goes through [`Session::warm_up`], with trading disabled.
     /// A live bar's line is synced to disk before this returns; warm-up lines are synced with the
     /// first live one. On an engine error nothing changes; on a log error the bar has been applied
-    /// but may not be saved and is not reported, so stop the session.
+    /// but may not be saved and is not reported, so stop the session. After
+    /// [`td_engine::EngineError::StrategyFailed`] the engine session has taken the bar in full,
+    /// but the bar is not logged or reported, so stop the session then too.
     pub fn feed(
         &mut self,
         bar: Candle,
@@ -969,7 +971,7 @@ struct Mark {
 #[cfg(test)]
 thread_local! {
     /// Makes [`sync_data`] fail on this thread, to test a line that was written but not synced.
-    static FAIL_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(crate) static FAIL_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// [`File::sync_data`]; tests can make it fail.
@@ -1026,7 +1028,7 @@ fn check_id(id: &str) -> Result<(), PaperError> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use td_core::{
         InstrumentId, InstrumentKind, OrderRequest, OrderType, Side, TimeInForce, Venue,
     };
@@ -1065,7 +1067,7 @@ mod tests {
         }
     }
 
-    fn config() -> PaperConfig {
+    pub(crate) fn config() -> PaperConfig {
         PaperConfig {
             strategy: "sma_cross".into(),
             params: Params::new(),

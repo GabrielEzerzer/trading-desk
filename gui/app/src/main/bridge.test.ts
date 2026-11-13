@@ -1,5 +1,51 @@
+import { type Client, createClient, type InstrumentId } from '@td/shared'
 import { describe, expect, it } from 'vitest'
 import { RefusedRequest, validateRequest, validateTopic } from './bridge'
+
+const btc: InstrumentId = { venue: 'binance', symbol: 'BTCUSDT', kind: 'spot' }
+const sessionId = '1762790400000-0a1b2c3d'
+
+// Arguments for every client method. The type makes a method added to the client fail typecheck
+// until it has a sample here, so the test below sends it through main's checks too.
+const SAMPLES: { [K in keyof Client]: Parameters<Client[K]> } = {
+  health: [],
+  instruments: ['bybit', 'perpetual'],
+  downloadData: [{ instrument: btc, from: 1, to: 2 }],
+  coverage: [btc],
+  stored: [],
+  deleteData: [{ instrument: btc, from: '2024-01', to: '2024-02' }],
+  deleteAllData: [],
+  candles: [btc, '5m', 500],
+  strategies: [],
+  jobs: [],
+  job: [12],
+  cancelJob: [12],
+  jobResult: [12],
+  startBacktest: [{} as Parameters<Client['startBacktest']>[0]],
+  runs: [],
+  run: ['1794242520000-0a1b2c3d'],
+  sessions: [],
+  session: [sessionId],
+  startSession: [{} as Parameters<Client['startSession']>[0]],
+  stopSession: [sessionId],
+  resumeSession: [sessionId],
+  placeOrder: [sessionId, {} as Parameters<Client['placeOrder']>[1]],
+  cancelOrder: [sessionId, 3],
+}
+
+describe('the client and main agree', () => {
+  it('passes every request the client makes', async () => {
+    const client = createClient(async (request) => {
+      validateRequest(request)
+      return { ok: true, status: 200, body: {} }
+    })
+    for (const [name, method] of Object.entries(client)) {
+      const args = (SAMPLES as Record<string, unknown[] | undefined>)[name]
+      expect(args, `a sample for ${name}`).toBeDefined()
+      await expect((method as (...a: unknown[]) => Promise<unknown>)(...args!), name).resolves.toBeDefined()
+    }
+  })
+})
 
 describe('validateRequest', () => {
   it('passes the routes the app may call, as clean copies', () => {
@@ -76,6 +122,9 @@ describe('validateRequest', () => {
     ['a body on a route that takes none', { method: 'GET', path: '/health', body: {} }],
     ['a POST route without a body', { method: 'POST', path: '/data/download' }],
     ['an array body', { method: 'POST', path: '/data/download', body: [] }],
+    ['a delete without a body', { method: 'POST', path: '/data/delete' }],
+    ['a body on delete-all', { method: 'POST', path: '/data/delete-all', body: {} }],
+    ['GET on delete-all', { method: 'GET', path: '/data/delete-all' }],
     ['a request that is not an object', 'GET /health'],
     ['null', null],
   ])('refuses %s', (_name, input) => {
@@ -85,6 +134,22 @@ describe('validateRequest', () => {
   it('refuses an oversized body', () => {
     const body = { instrument: 'x'.repeat(70 * 1024) }
     expect(() => validateRequest({ method: 'POST', path: '/data/download', body })).toThrow(/too large/)
+  })
+})
+
+describe('stored data routes', () => {
+  it('passes the listing, a delete with its body and delete-all', () => {
+    expect(validateRequest({ method: 'GET', path: '/data/stored' })).toEqual({ method: 'GET', path: '/data/stored' })
+    const body = { instrument: { venue: 'binance', symbol: 'BTCUSDT', kind: 'spot' }, from: '2024-01', to: '2024-02' }
+    expect(validateRequest({ method: 'POST', path: '/data/delete', body })).toEqual({
+      method: 'POST',
+      path: '/data/delete',
+      body,
+    })
+    expect(validateRequest({ method: 'POST', path: '/data/delete-all' })).toEqual({
+      method: 'POST',
+      path: '/data/delete-all',
+    })
   })
 })
 
@@ -116,6 +181,16 @@ describe('paper session routes', () => {
       method: 'POST',
       path: '/sessions/abc/resume',
     })
+    const order = { side: 'buy', qty: 0.5, type: 'market' }
+    expect(validateRequest({ method: 'POST', path: '/sessions/abc/orders', body: order })).toEqual({
+      method: 'POST',
+      path: '/sessions/abc/orders',
+      body: order,
+    })
+    expect(validateRequest({ method: 'POST', path: '/sessions/abc/orders/12/cancel' })).toEqual({
+      method: 'POST',
+      path: '/sessions/abc/orders/12/cancel',
+    })
   })
 
   it.each([
@@ -131,7 +206,10 @@ describe('paper session routes', () => {
     ['a start without a body', { method: 'POST', path: '/sessions' }],
     ['a start with an array body', { method: 'POST', path: '/sessions', body: [start] }],
     ['a query on the session list', { method: 'GET', path: '/sessions', query: { status: 'live' } }],
-    ['manual orders, which do not exist yet (#36)', { method: 'POST', path: '/sessions/abc/orders', body: {} }],
+    ['an order without a body', { method: 'POST', path: '/sessions/abc/orders' }],
+    ['GET on the orders', { method: 'GET', path: '/sessions/abc/orders' }],
+    ['a cancel of an order id that is not a number', { method: 'POST', path: '/sessions/abc/orders/x/cancel' }],
+    ['a body on cancel', { method: 'POST', path: '/sessions/abc/orders/1/cancel', body: {} }],
     ['candle history without its query', { method: 'GET', path: '/candles' }],
     [
       'candle history with a range',

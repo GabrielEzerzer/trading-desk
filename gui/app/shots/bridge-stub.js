@@ -2,19 +2,35 @@
 // before the page loads.
 // It implements the TdBridge contract (gui/shared/src/bridge.ts) with a scripted engine status, and
 // answers the engine's routes from the fixtures in app/mock/engine.json: the strategy list, saved
-// runs, stored-data coverage, instrument rules, and backtest and download jobs whose changes arrive
-// on the `jobs` topic like the engine's. Never part of the app bundle.
+// runs, stored data with its coverage and deletes, instrument rules, and backtest and download jobs
+// whose changes arrive on the `jobs` topic like the engine's. Never part of the app bundle.
 //
 // `config`: { engine: 'starting' | 'failed' | 'running', mock: boolean, hangStrategies: boolean,
-//             engineData: engine.json, noData?: boolean,
-//             backtest?: 'ok' | 'data_missing' | 'too_many_runs' | 'fails', stepMs?: number,
+//             engineData: engine.json, noData?: boolean, deleteFails?: boolean, deleteStops?: boolean,
+//             backtest?: 'ok' | 'data_missing' | 'too_many_runs' | 'fails', download?: 'ok' | 'no_token',
+//             stepMs?: number, dataCutoff?: string, codeChanged?: boolean,
 //             instruments?: Instrument[], hangInstruments?: boolean, failInstruments?: boolean,
 //             candles?: { start: Candle, everyMs: number } | null, session?: SessionState | null,
 //             failSessions?: number,
 //             history?: Record<string, number | 'hang' | 'fail'> }
 //
+// `dataCutoff` (`YYYY-MM-DD`) is the engine's TD_DATA_CUTOFF: GET /health and every saved run report
+// it, and a backtest ending after it is refused with the engine's 422 `after_cutoff`. `codeChanged`
+// makes every saved run report that the strategy's code has changed since it ran.
+//
 // Every request is recorded in `window.__tdCalls`, and the topics subscribed now in
 // `window.__stubSubscribed`, so a flow can check what the app sent.
+//
+// Stored data: every coverage fixture is stored unless `config.noData`, and a download stores its
+// instrument. GET /data/stored lists them with each month's size and, for a perpetual, a funding
+// file; POST /data/delete and /data/delete-all remove months as the engine's store does (a range
+// keeps the funding file). With `config.deleteFails` every delete answers the engine's 409 for an
+// instrument that a download holds. With `config.deleteStops` a delete removes its first month, then
+// fails as the engine does when a file cannot be removed. `window.__stubDownloaded(id)` stores an
+// instrument as td-data on the command line would, without the app knowing, and
+// `window.__stubFundingOnly(id)` stores a perpetual's funding file with no months.
+// `window.__stubStoredFails(true)` makes GET /data/stored fail until it is called with false.
+// `openDataFolder` counts its calls in `window.__stubOpened`.
 //
 // For Trading in engine mode it answers GET /instruments from `config.instruments` (else the
 // engine.json fixtures), GET /sessions and GET /sessions/{id} from `config.session`, and on a
@@ -27,7 +43,10 @@
 // milliseconds, never (`hang`), or with the engine's 502 (`fail`); without an entry it answers at
 // once. GET /sessions fails the first `config.failSessions` times. POST /sessions answers after
 // 300 ms with a new warming-up session, which GET /sessions then lists; `window.__stubStarts`
-// counts the requests.
+// counts the requests. POST /sessions/{id}/orders adds an open manual order to that session and
+// POST /sessions/{id}/orders/{n}/cancel cancels one, each reported on its `session:` topic like the
+// engine's; neither fills. Like the engine, an order before the session's first live bar gets 409
+// `not_live`; `window.__stubGoLive()` makes the session live and reports it on its topic.
 
 function installBridgeStub(config) {
   const listeners = new Set()
@@ -41,8 +60,21 @@ function installBridgeStub(config) {
   const data = config.engineData
   const stepMs = config.stepMs ?? 700
   const key = (id) => `${id.venue}:${id.symbol}:${id.kind}`
-  // Instruments with candles stored; a download adds its instrument.
-  const stored = new Set(config.noData ? [] : Object.keys(data.coverage))
+  // The months stored for each instrument, and whether a perpetual's funding file is; a download
+  // stores its instrument, with the first fixture's months when it has none of its own.
+  const stored = new Map()
+  const store = (id) => {
+    const months = structuredClone(data.coverage[id] ?? Object.values(data.coverage)[0])
+    stored.set(id, { months, funding: id.endsWith(':perpetual') })
+  }
+  if (!config.noData) Object.keys(data.coverage).forEach(store)
+  window.__stubDownloaded = store
+  window.__stubFundingOnly = (id) => stored.set(id, { months: [], funding: true })
+  let storedFails = false
+  window.__stubStoredFails = (fails) => {
+    storedFails = fails
+  }
+  const FUNDING_BYTES = 52_000
   let backtest = config.backtest ?? 'ok'
   const jobs = new Map()
   let nextJob = 1
@@ -115,6 +147,10 @@ function installBridgeStub(config) {
       // The engine's text (td-server jobs.rs, MAX_RUN_JOBS = 8).
       return fail(429, 'too_many_runs', '8 runs are already queued or running, the most this server takes; wait for one to finish or cancel one')
     }
+    const cutoffEnd = config.dataCutoff ? Date.parse(`${config.dataCutoff}T00:00:00Z`) + 86_400_000 : null
+    if (cutoffEnd !== null && body.to > cutoffEnd) {
+      return fail(422, 'after_cutoff', `the range ends after the data cutoff: the engine was started with TD_DATA_CUTOFF=${config.dataCutoff}`)
+    }
     if (backtest === 'data_missing') {
       return fail(422, 'data_missing', `the store has no candles for ${key(body.instrument.id)} from 2024-03-04 00:00 to 2024-03-12 00:00 UTC; download them first`)
     }
@@ -149,28 +185,75 @@ function installBridgeStub(config) {
   }
 
   function startDownload(body) {
+    if (config.download === 'no_token') {
+      // The engine's failed job when OANDA_API_TOKEN is not set (td-data's MissingOandaToken).
+      return startJob('download', body, [], () => ({
+        status: 'failed',
+        error: { code: 'bad_request', message: "oanda's history needs an API token: set OANDA_API_TOKEN to the token of an OANDA practice account" },
+      }))
+    }
     const steps = [0.25, 0.5, 0.75, 1].map((progress, i) => ({ progress, message: `${key(body.instrument)} month ${i + 1}` }))
     return startJob('download', body, steps, () => {
-      stored.add(key(body.instrument))
+      store(key(body.instrument))
       // The download filled what a refused run was missing.
       if (backtest === 'data_missing') backtest = 'ok'
       return { status: 'done', progress: 1, result: { kind: 'download', candles: 1000, months: [], missing_files: [], gaps: [], funding_rates: null } }
     })
   }
 
+  function storedResponse() {
+    const instruments = [...stored.keys()].sort().map((id) => {
+      const [venue, symbol, kind] = id.split(':')
+      const { months, funding } = stored.get(id)
+      const funding_bytes = funding ? FUNDING_BYTES : null
+      return {
+        instrument: { venue, symbol, kind },
+        months: months.map((m) => ({ month: m.month, bytes: m.bytes })),
+        funding_bytes,
+        bytes: months.reduce((sum, m) => sum + m.bytes, 0) + (funding_bytes ?? 0),
+      }
+    })
+    return { data_dir: String.raw`C:\Users\trader\AppData\Local\trading-desk`, instruments, unrecognised: [] }
+  }
+
+  /** Deletes `id`'s months from `from` to `to` (every month and the funding file with neither). */
+  function deleteStored(id, from, to, removed) {
+    const held = stored.get(id)
+    if (!held) return
+    const goes = (m) => !from || (m.month >= from && m.month <= to)
+    for (const m of held.months.filter(goes)) {
+      removed.files += 1
+      removed.bytes += m.bytes
+    }
+    held.months = held.months.filter((m) => !goes(m))
+    if (!from && held.funding) {
+      removed.files += 1
+      removed.bytes += FUNDING_BYTES
+      held.funding = false
+    }
+    if (held.months.length === 0 && !held.funding) stored.delete(id)
+  }
+
+  /** A saved run with what it was made under: its code, whether that still matches, and the cutoff. */
+  const withRecord = (detail) => ({
+    ...detail,
+    code_hash: '5f0c2a9d1e7b3c48',
+    code_matches: !config.codeChanged,
+    data_cutoff: config.dataCutoff ?? null,
+  })
+
   function route({ method, path, query, body }) {
-    if (method === 'GET' && path === '/health') return ok({ version: '0.1.0' })
+    if (method === 'GET' && path === '/health') return ok({ version: '0.1.0', data_cutoff: config.dataCutoff ?? null })
     if (method === 'GET' && path === '/strategies') return ok(data.strategies)
     if (method === 'GET' && path === '/runs') return ok(data.runs)
     let m = /^\/runs\/([\w-]+)$/.exec(path)
     if (method === 'GET' && m && m[1] !== 'backtest') {
       const detail = data.details[m[1]]
-      return detail ? ok({ ...detail, check: { data_matches: true, engine_matches: true } }) : fail(404, 'not_found', `no run ${m[1]}`)
+      return detail ? ok(withRecord({ ...detail, check: { data_matches: true, engine_matches: true } })) : fail(404, 'not_found', `no run ${m[1]}`)
     }
     if (method === 'GET' && path === '/data/coverage') {
       const id = query.instrument
-      // A downloaded instrument without coverage of its own reads like the first stored one.
-      const months = stored.has(id) ? (data.coverage[id] ?? Object.values(data.coverage)[0]) : []
+      const months = stored.get(id)?.months ?? []
       const [venue, symbol, kind] = id.split(':')
       // A perpetual reports its stored funding rates, one every 8 hours over the stored range; spot reports null.
       let funding = null
@@ -181,6 +264,27 @@ function installBridgeStub(config) {
         funding = first === null ? { rates: 0, first: null, last: null } : { rates: (last - first) / step + 1, first, last }
       }
       return ok({ instrument: { venue, symbol, kind }, months, funding })
+    }
+    if (method === 'GET' && path === '/data/stored') {
+      return storedFails ? fail(500, 'internal', 'the data folder could not be read') : ok(storedResponse())
+    }
+    if (method === 'POST' && (path === '/data/delete' || path === '/data/delete-all')) {
+      if (config.deleteFails) {
+        const id = path === '/data/delete' ? key(body.instrument) : [...stored.keys()][0]
+        // The engine's words (td-data error.rs, InstrumentBusy).
+        return fail(409, 'conflict', `${id} is being downloaded or deleted right now, in this app or another program on the same data folder; delete it again once that has finished`)
+      }
+      const ids = path === '/data/delete' ? [key(body.instrument)] : [...stored.keys()]
+      const removed = { files: 0, bytes: 0 }
+      if (config.deleteStops) {
+        const [first] = stored.get(ids[0])?.months ?? []
+        if (first) deleteStored(ids[0], first.month, first.month, removed)
+        // The engine's words (td-data store.rs, remove_locked) for a file it could not remove.
+        const file = String.raw`C:\Users\trader\AppData\Local\trading-desk\candles\binance\perpetual\BTCUSDT\2024-02.parquet`
+        return fail(500, 'internal', `${file}: Access is denied. (os error 5) (the delete stopped; files removed before it: ${removed.files}, ${removed.bytes} bytes)`)
+      }
+      for (const id of ids) deleteStored(id, body?.from, body?.to, removed)
+      return ok(removed)
     }
     if (method === 'GET' && path === '/instruments') {
       const instruments = (config.instruments ?? data.instruments).filter((i) => i.id.venue === query.venue && i.id.kind === query.kind)
@@ -202,7 +306,7 @@ function installBridgeStub(config) {
     if (method === 'GET' && m && !m[2]) return ok(structuredClone(job))
     if (method === 'GET' && m?.[2] === 'result') {
       if (job.status !== 'done') return fail(409, 'job_not_done', `job ${job.id} is ${job.status}, not done yet`)
-      return ok(data.details[job.result.run_id])
+      return ok(withRecord(data.details[job.result.run_id]))
     }
     return fail(404, 'not_found', `${method} ${path} is not stubbed`)
   }
@@ -310,6 +414,54 @@ function installBridgeStub(config) {
     })
   }
 
+  let nextOrder = 1
+  const emitOrder = (order) => emit({ type: 'session', id: config.session.id, event: { event: 'order', order: structuredClone(order) } })
+
+  window.__stubGoLive = () => {
+    const session = config.session
+    session.status = { status: 'live' }
+    session.live_from = session.last_bar?.open_time ?? Date.now()
+    emit({ type: 'session', id: session.id, event: { event: 'status', status: session.status } })
+  }
+
+  function placeOrder(body) {
+    const session = config.session
+    if (session.live_from === null) {
+      // The engine's words (td-server error.rs, ManualError::NotLive).
+      return fail(409, 'not_live', 'the session has not fed its first live bar yet; orders can be placed once it has')
+    }
+    const order = {
+      source: 'manual',
+      id: nextOrder++,
+      request: {
+        instrument: session.config.instrument.id,
+        side: body.side,
+        qty: body.qty,
+        order_type: body.type === 'limit' ? { type: 'limit', price: body.limit_price } : { type: 'market' },
+        tif: 'gtc',
+        reduce_only: body.reduce_only ?? false,
+        client_tag: null,
+      },
+      submitted_at: session.last_bar?.open_time ?? 0,
+      decision_close: session.last_bar?.close ?? 0,
+      attached_stop: null,
+      status: { status: 'open' },
+    }
+    session.open_orders = [...session.open_orders, order]
+    emitOrder(order)
+    return { ok: true, status: 201, body: structuredClone(order) }
+  }
+
+  function cancelOrder(id) {
+    const session = config.session
+    const order = session.open_orders.find((o) => o.id === id)
+    if (!order) return fail(404, 'not_found', `no order ${id} in this session`)
+    const cancelled = { ...order, status: { status: 'cancelled', reason: 'cancelled manually' } }
+    session.open_orders = session.open_orders.filter((o) => o.id !== id)
+    emitOrder(cancelled)
+    return ok(structuredClone(cancelled))
+  }
+
   window.td = {
     mock: config.mock,
     async request(request) {
@@ -356,6 +508,10 @@ function installBridgeStub(config) {
         return ok(summary(config.session))
       }
       if (method === 'GET' && config.session && path === `/sessions/${config.session.id}`) return ok(config.session)
+      const order = /^\/sessions\/([\w-]+)\/orders(?:\/(\d+)\/cancel)?$/.exec(path)
+      if (method === 'POST' && order && order[1] === config.session?.id) {
+        return order[2] === undefined ? placeOrder(request.body) : cancelOrder(Number(order[2]))
+      }
       if (method === 'GET' && path === '/candles') return candles(request.query)
       return route(request)
     },
@@ -384,6 +540,10 @@ function installBridgeStub(config) {
     },
     async status() {
       return status
+    },
+    async openDataFolder() {
+      window.__stubOpened = (window.__stubOpened ?? 0) + 1
+      return null
     },
     onStatus(listener) {
       listeners.add(listener)

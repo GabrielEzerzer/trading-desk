@@ -1,10 +1,10 @@
 // Trading's data, read through its `TradingSource`.
 
-import type { Candle, InstrumentId, SessionState, SessionSummary, StartSessionRequest, Timeframe } from '@td/shared'
+import type { Candle, InstrumentId, OrderId, SessionState, SessionSummary, StartSessionRequest, Timeframe } from '@td/shared'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { sentence } from '../engine'
 import { type CandleSeries, EMPTY_SERIES, withClosed, withForming, withHistory } from './candles'
-import { applySessionEvent, pickSession, refetches, rejection } from './session'
+import { applyRefetch, applySessionEvent, pickSession, refetches, rejection } from './session'
 import type { InstrumentList, TradingSource } from './source'
 
 export const errorText = (e: unknown) => sentence(e instanceof Error ? e.message : String(e))
@@ -118,6 +118,8 @@ export interface PaperSession {
   start(request: StartSessionRequest): Promise<boolean>
   stop(): void
   resume(): void
+  /** Cancels an open manual order; a refusal shows as `error`. */
+  cancel(orderId: OrderId): void
   reload(): void
 }
 
@@ -168,7 +170,7 @@ export function usePaperSession(source: TradingSource | null, id: InstrumentId):
       // Several events arrive per bar; one fetch after the burst covers them.
       refetch = setTimeout(() => {
         source.session(sessionId).then(
-          (s) => live && setState(s),
+          (s) => live && setState((cur) => applyRefetch(cur, s)),
           () => {},
         )
       }, 50)
@@ -232,6 +234,9 @@ export function usePaperSession(source: TradingSource | null, id: InstrumentId):
     },
     resume: () => {
       if (source && sessionId) void act(() => source.resumeSession(sessionId))
+    },
+    cancel: (orderId) => {
+      if (source && sessionId) void act(() => source.cancelOrder(sessionId, orderId))
     },
     reload: () => setRevision((n) => n + 1),
   }

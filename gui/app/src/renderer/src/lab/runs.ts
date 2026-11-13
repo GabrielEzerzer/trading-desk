@@ -2,14 +2,23 @@
 // strategy's latest run, a stored dataset as a run's range, and a failed call as the state to show.
 
 import { ApiError } from '@td/shared'
-import type { CoverageResponse, InstrumentId, MetricsReport, RunDetail, RunSummary, Timeframe } from '@td/shared'
+import type {
+  CoverageResponse,
+  InstrumentId,
+  MetricsReport,
+  RunDetail,
+  RunSummary,
+  StoredResponse,
+  Timeframe,
+} from '@td/shared'
+import { TIMEFRAME_MS } from '../trading/candles'
 import type { EquityPoint, FinishedRun, LastRun, Millis, VerdictPreview } from './source'
 import { RunCancelled } from './source'
 
 const MINUTE = 60_000
-const HOUR = 60 * MINUTE
-
-const TIMEFRAME_MS: Partial<Record<Timeframe, number>> = { '1h': HOUR, '4h': 4 * HOUR, '1d': 24 * HOUR }
+const DAY = 24 * 60 * MINUTE
+/** Weekly bars open on Mondays, counted from Monday 1970-01-05 (td_core's `FIRST_MONDAY`). */
+const FIRST_MONDAY = 4 * DAY
 
 /** The timeframes the overrides menu offers, the default first. */
 export const TIMEFRAMES = ['1h', '4h', '1d'] as const satisfies readonly Timeframe[]
@@ -22,8 +31,15 @@ export function instrumentKey(id: InstrumentId): string {
   return `${id.venue}:${id.symbol}:${id.kind}`
 }
 
+/** The instruments with candles stored, `first` first when it is one of them, then in the store's order. */
+export function storedDatasets(stored: StoredResponse, first: InstrumentId): InstrumentId[] {
+  const ids = stored.instruments.filter((i) => i.months.length > 0).map((i) => i.instrument)
+  const key = instrumentKey(first)
+  return [...ids.filter((id) => instrumentKey(id) === key), ...ids.filter((id) => instrumentKey(id) !== key)]
+}
+
 /** When a run was saved: its id starts with the save time in milliseconds (td_engine::RunId). */
-export function runSavedAt(id: string): Millis {
+function runSavedAt(id: string): Millis {
   return Number(id.slice(0, 13))
 }
 
@@ -56,19 +72,30 @@ export function latestRuns(runs: RunSummary[]): Map<string, LastRun> {
   )
 }
 
+/** Midnight UTC at the end of a data cutoff date (`YYYY-MM-DD`): the first moment the engine refuses. */
+export function cutoffEnd(date: string): Millis {
+  return Date.parse(`${date}T00:00:00Z`) + DAY
+}
+
 /**
  * The whole stored range of a dataset at a timeframe: from the first bar that opens at or after the
- * first stored minute to the end of the last whole bar. Null when nothing is stored or the range
- * holds no whole bar.
+ * first stored minute to the end of the last whole bar, ending no later than `until` (the end of a
+ * data cutoff). Null when nothing is stored or the range holds no whole bar.
  */
-export function datasetRange(coverage: CoverageResponse, timeframe: Timeframe): { from: Millis; to: Millis } | null {
+export function datasetRange(
+  coverage: CoverageResponse,
+  timeframe: Timeframe,
+  until?: Millis,
+): { from: Millis; to: Millis } | null {
   const step = TIMEFRAME_MS[timeframe]
   const first = coverage.months[0]?.first
   const last = coverage.months.at(-1)?.last
-  if (!step || first === undefined || last === undefined) return null
-  // Hours and days are aligned to the epoch (td_core::Timeframe::floor).
-  const from = Math.ceil(first / step) * step
-  const to = Math.floor((last + MINUTE) / step) * step
+  if (first === undefined || last === undefined) return null
+  // Bars are aligned to the epoch, weeks to the first Monday (td_core::Timeframe::floor).
+  const origin = timeframe === '1w' ? FIRST_MONDAY : 0
+  const from = origin + Math.ceil((first - origin) / step) * step
+  const end = Math.min(last + MINUTE, until ?? Number.POSITIVE_INFINITY)
+  const to = origin + Math.floor((end - origin) / step) * step
   return to > from ? { from, to } : null
 }
 
@@ -134,6 +161,9 @@ export function toVerdict(detail: RunDetail): VerdictPreview {
       returnPct: t.return_on_notional * 100,
       open: t.open,
     })),
+    // An old run that saved no code hash is unknown, and says nothing.
+    codeChanged: detail.code_matches === false,
+    dataCutoff: detail.data_cutoff ?? null,
   }
 }
 

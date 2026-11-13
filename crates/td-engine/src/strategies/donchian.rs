@@ -2,7 +2,8 @@
 //! (see `sma_cross.rs`).
 
 use td_core::{
-    Candle, InstrumentId, InstrumentKind, OrderId, OrderType, Rounding, Side, Timeframe, Venue,
+    AccountCurrency, Candle, InstrumentId, InstrumentKind, OrderId, OrderType, Rounding, Side,
+    Timeframe, Venue,
 };
 
 use crate::strategies::{affordable_qty, order};
@@ -214,6 +215,8 @@ fn plan() -> TestPlan {
             // Each instrument takes the backtest config's default slippage; list a
             // SlippageOverride here to set one.
             slippage: Vec::new(),
+            account_currency: AccountCurrency::Quote,
+            fee_override: None,
         },
         sweep: SweepPlan {
             fixed: Params::new()

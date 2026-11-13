@@ -6,7 +6,9 @@ use std::process::ExitCode;
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use td_core::{InstrumentId, InstrumentKind, Venue};
 use td_data::time::{Month, format_minute, parse_date};
-use td_data::{DataError, Gap, Http, Store, download_candles, download_funding, fetch_instruments};
+use td_data::{
+    DataError, Gap, Http, Store, cached_instruments, download_candles, download_funding,
+};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -27,7 +29,8 @@ enum Command {
         #[arg(long)]
         kind: KindArg,
     },
-    /// Download 1-minute candles (and funding rates, for a perpetual) into the store.
+    /// Download 1-minute candles (and funding rates, for a perpetual) into the store. OANDA needs
+    /// the token of a practice account in OANDA_API_TOKEN.
     Download {
         #[command(flatten)]
         instrument: InstrumentArgs,
@@ -46,7 +49,8 @@ enum Command {
     /// List every instrument the store holds, with the size of each month file and funding file.
     Stored,
     /// Delete an instrument's candles for a range of months, or with no range the whole
-    /// instrument, including a perpetual's funding file.
+    /// instrument, including a perpetual's funding file. Refused while the instrument is being
+    /// downloaded.
     Delete {
         #[command(flatten)]
         instrument: InstrumentArgs,
@@ -88,6 +92,7 @@ impl InstrumentArgs {
 enum VenueArg {
     Binance,
     Bybit,
+    Oanda,
 }
 
 impl From<VenueArg> for Venue {
@@ -95,6 +100,7 @@ impl From<VenueArg> for Venue {
         match v {
             VenueArg::Binance => Venue::Binance,
             VenueArg::Bybit => Venue::Bybit,
+            VenueArg::Oanda => Venue::Oanda,
         }
     }
 }
@@ -129,7 +135,8 @@ fn main() -> ExitCode {
 fn run(cli: Cli) -> Result<(), DataError> {
     match cli.command {
         Command::Instruments { venue, kind } => {
-            let list = fetch_instruments(&Http::new()?, venue.into(), kind.into())?;
+            let store = Store::open_default()?;
+            let list = cached_instruments(&Http::new()?, &store, venue.into(), kind.into())?;
             println!("symbol\tbase\tquote\ttick\tlot\tmin_qty\tmin_notional\tmaker\ttaker");
             for i in &list.instruments {
                 println!(
@@ -168,6 +175,9 @@ fn run(cli: Cli) -> Result<(), DataError> {
             let store = Store::open_default()?;
             let http = Http::new()?;
             eprintln!("store: {}", store.root().display());
+            // Held until the funding is stored too, so a delete of the instrument is refused
+            // meanwhile; this waits while a delete of it runs.
+            let _hold = store.hold_for_download(&id)?;
             let report = download_candles(&http, &store, &id, from, to, &mut |line| {
                 eprintln!("{line}")
             })?;
@@ -362,5 +372,28 @@ mod tests {
             "forex",
         ];
         assert!(Cli::try_parse_from(bad).is_err());
+    }
+
+    #[test]
+    fn a_download_names_oanda_by_its_venue_name() {
+        let cli = Cli::try_parse_from([
+            "td-data",
+            "download",
+            "--venue",
+            "oanda",
+            "--kind",
+            "fx",
+            "--symbol",
+            "USDJPY",
+            "--from",
+            "2024-01-08",
+            "--to",
+            "2024-01-15",
+        ])
+        .expect("parses");
+        let Command::Download { instrument, .. } = cli.command else {
+            panic!("not the download command");
+        };
+        assert_eq!(instrument.id().to_string(), "oanda:USDJPY:fx");
     }
 }

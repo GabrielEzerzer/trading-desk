@@ -4,6 +4,7 @@ import {
   type ApiResult,
   type EngineStatus,
   type ServerMessage,
+  type StoredResponse,
   GROUND,
   INK,
   IPC,
@@ -15,6 +16,7 @@ import { createEngine } from './engine'
 import { isExternalLink } from './links'
 import { createQuit } from './quit'
 import { Sidecar, sidecarBin } from './sidecar'
+import { SMOKE_FAIL_CODE, createSmoke } from './smoke'
 import { EngineSocket } from './socket'
 import { spawnWatchdog } from './watchdog'
 
@@ -24,6 +26,23 @@ const MIN_WIDTH = 900
 const MIN_HEIGHT = 600
 
 const log = (line: string) => console.log(`[td-server] ${line}`)
+
+// The install check runs the installed app on a fresh profile (gui/scripts/install-check.mjs).
+if (process.env.TD_USER_DATA_DIR) app.setPath('userData', process.env.TD_USER_DATA_DIR)
+const engineBin = sidecarBin(process.env, app.getAppPath(), app.isPackaged)
+const smoke =
+  process.env.TD_SMOKE === '1'
+    ? createSmoke({
+        pass: () => {
+          console.log(`TD_SMOKE ok engine=${engineBin}`)
+          app.quit()
+        },
+        fail: (reason) => {
+          console.error(`TD_SMOKE fail: ${reason}`)
+          app.exit(SMOKE_FAIL_CODE)
+        },
+      })
+    : null
 
 let window: BrowserWindow | null = null
 // Aborted when the app quits, so no request to the engine is left open.
@@ -48,10 +67,13 @@ const quit = createQuit({
 })
 
 const engine = createEngine({
-  spawn: () => new Sidecar({ bin: sidecarBin(process.env, app.getAppPath(), app.isPackaged), env: process.env, log }),
+  spawn: () => new Sidecar({ bin: engineBin, env: process.env, log }),
   openSocket: (connection) => socket.open(connection),
   closeSocket: () => socket.close(),
-  onStatus: (status: EngineStatus) => window?.webContents.send(IPC.statusChanged, status),
+  onStatus: (status: EngineStatus) => {
+    window?.webContents.send(IPC.statusChanged, status)
+    smoke?.engine(status)
+  },
   quit,
   log,
 })
@@ -92,12 +114,27 @@ function registerIpc(): void {
   })
   ipcMain.handle(IPC.status, (event) => {
     checkSender(event)
+    // The renderer asks on start through window.td, so this proves the preload and the page run.
+    smoke?.loaded()
     return engine.status
   })
   ipcMain.handle(IPC.restartEngine, async (event, ...args: unknown[]) => {
     checkSender(event)
     if (args.length > 0) throw new Error('restartEngine takes no arguments')
     await engine.restart()
+  })
+  // The folder comes from the engine, never from the renderer, so the page cannot open any other path.
+  ipcMain.handle(IPC.openDataFolder, async (event, ...args: unknown[]): Promise<string | null> => {
+    checkSender(event)
+    if (args.length > 0) throw new Error('openDataFolder takes no arguments')
+    const connection = engine.connection
+    if (!connection || quit.quitting) return 'The engine is not running.'
+    const result = await sendRequest(connection, { method: 'GET', path: '/data/stored' }, requests.signal)
+    if (!result.ok) return result.error.message
+    const folder = (result.body as StoredResponse).data_dir
+    if (typeof folder !== 'string' || folder === '') return 'The engine did not say where its data folder is.'
+    // openPath answers an empty string once the folder is open, else why it did not open.
+    return (await shell.openPath(folder)) || null
   })
 }
 
@@ -124,6 +161,7 @@ function createWindow(): void {
   })
   window = win
   win.once('ready-to-show', () => win.show())
+  if (smoke) win.webContents.once('did-fail-load', (_event, code, description) => smoke.loadFailed(`${description} (${code})`))
   win.on('closed', () => {
     window = null
   })

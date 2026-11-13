@@ -2,7 +2,7 @@
 //! into the crate's tests by build.rs the way a file in `src/strategies/private/` is compiled
 //! into the engine.
 
-use td_core::{Candle, InstrumentId, InstrumentKind, OrderType, Side, Timeframe, Venue};
+use td_core::{AccountCurrency, Candle, InstrumentId, InstrumentKind, OrderType, Side, Timeframe, Venue};
 
 use crate::strategies::{affordable_qty, order};
 use crate::{
@@ -71,6 +71,8 @@ fn plan() -> TestPlan {
             // Each instrument takes the backtest config's default slippage; list a
             // SlippageOverride here to set one.
             slippage: Vec::new(),
+            account_currency: AccountCurrency::Quote,
+            fee_override: None,
         },
         sweep: SweepPlan {
             fixed: Params::new(),

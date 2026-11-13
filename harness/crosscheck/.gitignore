@@ -1,0 +1,7 @@
+# The harness's own candle store and exports: market data is never committed.
+data/
+# Run outputs (both engines' results, curves and metrics); the reports in reports/ are committed.
+out/
+.venv/
+__pycache__/
+.pytest_cache/

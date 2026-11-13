@@ -6,6 +6,7 @@
 //! `gotobi_calendar` is a calendar for strategies to use, not a strategy.
 
 pub mod donchian;
+pub mod gotobi;
 pub mod gotobi_calendar;
 pub mod sma_cross;
 #[cfg(test)]
@@ -14,6 +15,11 @@ pub(crate) mod test_only;
 /// The strategies in `private/`, compiled in by build.rs; an empty list without the folder.
 pub(crate) mod private {
     include!(concat!(env!("OUT_DIR"), "/private_strategies.rs"));
+}
+
+/// The hash of each example's source file, from build.rs: `SMA_CROSS` for `sma_cross.rs`.
+pub(crate) mod example_hashes {
+    include!(concat!(env!("OUT_DIR"), "/example_hashes.rs"));
 }
 
 use td_core::{OrderRequest, OrderType, Side, TimeInForce};
@@ -52,7 +58,7 @@ fn affordable_qty(ctx: &Context, budget: f64, price: f64) -> f64 {
 }
 
 /// -1, 0 or 1. Unlike `f64::signum`, zero maps to zero.
-fn direction(x: f64) -> f64 {
+pub(crate) fn direction(x: f64) -> f64 {
     if x > 0.0 {
         1.0
     } else if x < 0.0 {

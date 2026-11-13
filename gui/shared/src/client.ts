@@ -5,6 +5,8 @@ import type {
   BacktestConfig,
   CandlesResponse,
   CoverageResponse,
+  DeleteRequest,
+  DeleteResult,
   DownloadRequest,
   HealthResponse,
   InstrumentId,
@@ -12,11 +14,15 @@ import type {
   InstrumentsResponse,
   JobCreated,
   JobInfo,
+  ManualOrder,
+  OrderId,
+  PaperOrder,
   RunDetail,
   RunSummary,
   SessionState,
   SessionSummary,
   StartSessionRequest,
+  StoredResponse,
   StrategyInfo,
   Timeframe,
   Venue,
@@ -62,6 +68,15 @@ export function createClient(send: Send) {
         path: '/data/coverage',
         query: { instrument: `${instrument.venue}:${instrument.symbol}:${instrument.kind}` },
       }),
+    /** The data folder and every instrument the store holds, with the size of each file. */
+    stored: () => call<StoredResponse>({ method: 'GET', path: '/data/stored' }),
+    /**
+     * Deletes an instrument's months `from` to `to` (`YYYY-MM`, both included), or with neither the
+     * whole instrument; 409 `conflict` while a download of it runs.
+     */
+    deleteData: (request: DeleteRequest) => call<DeleteResult>({ method: 'POST', path: '/data/delete', body: request }),
+    /** Deletes every stored instrument; saved runs and paper sessions stay. 409 `conflict` while any downloads. */
+    deleteAllData: () => call<DeleteResult>({ method: 'POST', path: '/data/delete-all' }),
     /** The last `limit` closed bars, oldest first; the engine caps `limit` at 5000. */
     candles: (instrument: InstrumentId, timeframe: Timeframe, limit: number) =>
       call<CandlesResponse>({
@@ -95,6 +110,16 @@ export function createClient(send: Send) {
     /** Replays a stopped session and starts it again. */
     resumeSession: (id: string) =>
       call<SessionSummary>({ method: 'POST', path: `/sessions/${encodeURIComponent(id)}/resume` }),
+    /**
+     * Places a manual order: 400 `invalid_order` with the engine's reason when it fails its checks,
+     * 409 `not_live`, `catching_up` or `not_running`, 404 `not_found` for no such session, and 422
+     * only for a body that does not parse.
+     */
+    placeOrder: (id: string, order: ManualOrder) =>
+      call<PaperOrder>({ method: 'POST', path: `/sessions/${encodeURIComponent(id)}/orders`, body: order }),
+    /** Cancels an open manual order; 409 `not_manual` or `order_done` when it cannot be. */
+    cancelOrder: (id: string, order: OrderId) =>
+      call<PaperOrder>({ method: 'POST', path: `/sessions/${encodeURIComponent(id)}/orders/${order}/cancel` }),
   }
 }
 

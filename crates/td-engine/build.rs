@@ -8,7 +8,9 @@
 //! either way.
 //!
 //! It also writes `$OUT_DIR/fixture_strategies.rs` from `tests/fixtures/private_strategies/`, which
-//! the crate's tests compile in the same way.
+//! the crate's tests compile in the same way, and `$OUT_DIR/example_hashes.rs`, the hash of each
+//! example strategy's file. The private and fixture lists carry their files' hashes too; the
+//! registry gives each strategy's with `code_hash`, and saved runs and verdicts record it.
 //!
 //! Cargo reruns this script when anything under `src/strategies/` changes. That folder always
 //! exists, so cloning or deleting `private/` inside it is noticed too; watching a folder that may
@@ -17,7 +19,7 @@
 #[path = "build/private_strategies.rs"]
 mod private_strategies;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::{env, fs};
 
 fn main() {
@@ -39,10 +41,16 @@ fn main() {
         ),
     ] {
         let source = private_strategies::generate(&dir).unwrap_or_else(|e| panic!("{e}"));
-        let path = out.join(file);
-        // Unchanged source is left alone, so its timestamp does not trigger a rebuild.
-        if fs::read_to_string(&path).ok().as_deref() != Some(source.as_str()) {
-            fs::write(&path, source).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-        }
+        write_if_changed(&out.join(file), &source);
+    }
+    let examples = private_strategies::example_hashes(&manifest.join("src").join("strategies"))
+        .unwrap_or_else(|e| panic!("{e}"));
+    write_if_changed(&out.join("example_hashes.rs"), &examples);
+}
+
+/// Unchanged source is left alone, so its timestamp does not trigger a rebuild.
+fn write_if_changed(path: &Path, source: &str) {
+    if fs::read_to_string(path).ok().as_deref() != Some(source) {
+        fs::write(path, source).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
     }
 }

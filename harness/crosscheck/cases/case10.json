@@ -1,0 +1,18 @@
+{
+  "name": "case10",
+  "title": "sma_cross with a resting limit, long only, Binance spot BTCUSDT, 1h, March 2023 with the exchange's outage of 24 March",
+  "about": "Two missing hours (one bucket dropped as incomplete, one with no minutes), a sell limit resting across them and filled on the first bar after, cancels after N bars, equity sizing",
+  "exercises": ["dropped_buckets", "funding_in_gap", "limit_through_dropped_bucket"],
+  "exercise_note": "No period was searched for the missing ones: the search for a perpetual period with a dropped bucket that carries a real price move, ideally with a funding stamp inside it, was stopped before it found one, and nothing from it is used. On this case as it stands, funding in a gap cannot happen (a spot instrument has no funding), and its one dropped bucket moves the price by 0.01, so no resting limit can open through it.",
+  "strategy": "crosscheck_sma_limit",
+  "params": { "fast": 5, "slow": 20, "equity_fraction": 0.95, "offset": 0.002, "cancel_after": 3 },
+  "venue": "binance",
+  "kind": "spot",
+  "symbol": "BTCUSDT",
+  "timeframe": "1h",
+  "from": "2023-03-01",
+  "to": "2023-04-01",
+  "starting_cash": 10000.0,
+  "fees": { "maker": 0.001, "taker": 0.001 },
+  "data": "data/export/case10"
+}

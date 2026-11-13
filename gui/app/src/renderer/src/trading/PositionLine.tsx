@@ -1,6 +1,6 @@
 import * as Menu from '@radix-ui/react-dropdown-menu'
 import * as Popover from '@radix-ui/react-popover'
-import type { Fill, Instrument, InstrumentId, Order, SessionState, Status, StrategyInfo, Timeframe, Trade } from '@td/shared'
+import type { Fill, Instrument, InstrumentId, PaperOrder, SessionState, Status, StrategyInfo, Timeframe, Trade } from '@td/shared'
 import { type ReactNode, useEffect, useState } from 'react'
 import { CheckIcon, ChevronIcon } from '../icons'
 import { readableName } from '../lab/source'
@@ -24,11 +24,11 @@ export function moneyTone(value: number): 'gain' | 'loss' | undefined {
   return value > 0 ? 'gain' : 'loss'
 }
 
-export function strategyLabel(name: string): string {
+function strategyLabel(name: string): string {
   return name === MANUAL ? 'Manual' : readableName(name)
 }
 
-export function statusText(status: Status): string {
+function statusText(status: Status): string {
   switch (status.status) {
     case 'warming_up':
       return 'Warming up'
@@ -266,7 +266,14 @@ function SessionPanel({
         {!state ? (
           <p className="panel-empty">Loading the session</p>
         ) : tab === 'orders' ? (
-          <OrdersTable orders={state.open_orders} base={base} lot={lot} tick={tick} />
+          <OrdersTable
+            orders={state.open_orders}
+            base={base}
+            lot={lot}
+            tick={tick}
+            onCancel={running ? session.cancel : null}
+            busy={session.busy}
+          />
         ) : tab === 'fills' ? (
           <FillsTable fills={state.fills} lot={lot} tick={tick} />
         ) : (
@@ -279,7 +286,22 @@ function SessionPanel({
 
 const side = (s: 'buy' | 'sell') => (s === 'buy' ? 'Buy' : 'Sell')
 
-function OrdersTable({ orders, base, lot, tick }: { orders: Order[]; base: string; lot: number; tick: number }) {
+function OrdersTable({
+  orders,
+  base,
+  lot,
+  tick,
+  onCancel,
+  busy,
+}: {
+  orders: PaperOrder[]
+  base: string
+  lot: number
+  tick: number
+  /** Cancels a manual order; null while the session is stopped. */
+  onCancel: ((id: number) => void) | null
+  busy: boolean
+}) {
   if (orders.length === 0) return <p className="panel-empty">No open orders.</p>
   return (
     <table className="table">
@@ -296,6 +318,11 @@ function OrdersTable({ orders, base, lot, tick }: { orders: Order[]; base: strin
           <th scope="col" className="num">
             Placed
           </th>
+          {onCancel && (
+            <th scope="col">
+              <span className="visually-hidden">Cancel</span>
+            </th>
+          )}
         </tr>
       </thead>
       <tbody>
@@ -308,6 +335,21 @@ function OrdersTable({ orders, base, lot, tick }: { orders: Order[]; base: strin
               <td className="num">{formatStep(o.request.qty, lot)}</td>
               <td className="num">{type.type === 'limit' ? formatStep(type.price, tick) : 'Next open'}</td>
               <td className="num muted">{clock(o.submitted_at)}</td>
+              {onCancel && (
+                <td className="num">
+                  {o.source === 'manual' && (
+                    <button
+                      type="button"
+                      className="button-small"
+                      aria-label={`Cancel the ${side(o.request.side).toLowerCase()} order of ${formatStep(o.request.qty, lot)} ${base}`}
+                      aria-disabled={busy}
+                      onClick={() => !busy && onCancel(o.id)}
+                    >
+                      Cancel
+                    </button>
+                  )}
+                </td>
+              )}
             </tr>
           )
         })}

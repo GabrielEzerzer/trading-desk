@@ -3,27 +3,42 @@
 //!
 //! Routes (JSON in and out; errors are `{"error": {"code", "message"}}` with a matching status):
 //!
-//! - `GET /health`: the server version.
+//! - `GET /health`: the server version, and the data cutoff when one is in force (`data_cutoff`,
+//!   the date `TD_DATA_CUTOFF` set when the engine started; see [`runs::DataCutoff`]). With a
+//!   cutoff, every run, sweep, walk-forward and test battery whose range ends after the end of
+//!   that date is refused with a 422 `after_cutoff`, when it is requested and again when its job
+//!   loads the data. Paper sessions and `GET /candles` are not affected. This route is where the
+//!   API says a cutoff is in force; each saved run also records the cutoff it was made under
+//!   (`data_cutoff` on `GET /runs/{id}`).
 //! - `GET /instruments?venue=&kind=`: the instruments a venue lists, cached per server run.
 //! - `POST /data/download` `{instrument, from, to}`: starts a download job, answers `{job_id}`.
-//!   `from` may not be before 2017-01-01 UTC ([`data::EARLIEST_FROM`]); an instrument that already
-//!   has an unfinished download in this server is a 409 `conflict` (a duplicate from another
-//!   server on the same data folder is safe, since the store locks across processes, just
+//!   `from` may not be before 2017-01-01 UTC for binance and bybit ([`data::EARLIEST_FROM`]), or
+//!   before 2007-01-01 UTC for oanda ([`data::OANDA_EARLIEST_FROM`]); an instrument that
+//!   already has an unfinished download in this server is a 409 `conflict` (a duplicate from
+//!   another server on the same data folder is safe, since the store locks across processes, just
 //!   redundant).
 //! - `GET /data/coverage?instrument=venue:symbol:kind`: which months and minutes the store holds,
-//!   and each month file's bytes.
-//! - `GET /data/stored`: every instrument the store holds, with each month file's bytes and the
-//!   funding file's, and any paths in the data folder the store did not write.
+//!   and each month file's bytes. A closure recorded at download time is closed time, neither a
+//!   gap nor counted in `month_minutes`.
+//! - `GET /data/stored`: the data folder's path, every instrument the store holds, with each month
+//!   file's bytes and the funding file's, and any paths in the data folder the store did not write.
 //! - `POST /data/delete` `{instrument, from?, to?}`: deletes the candles of the months `from` to
 //!   `to` (`YYYY-MM`, both included), or with neither the whole instrument including a
 //!   perpetual's funding file, and answers `{files, bytes}` removed. An instrument with a queued
-//!   or running download in this server is a 409 `conflict`.
+//!   download in this server, or a running download or delete here or in another process on the
+//!   same data folder, is a 409 `conflict`.
+//! - `POST /data/delete-all`: deletes every stored instrument as `/data/delete` does, and answers
+//!   `{files, bytes}` removed; saved runs and paper sessions stay. A 409 `conflict`, deleting
+//!   nothing, while any stored instrument is held by a download or delete.
 //! - `GET /candles?instrument=venue:symbol:kind&timeframe=&from=&to=&limit=`: closed bars of the
 //!   timeframe with open times in `[from, to)`, oldest first, for a chart (see [`candles`]). Bars
 //!   come from the store, resampled from its minutes; the slots it does not cover are fetched from
 //!   the venue's REST API, as a paper session's warm-up does, and are not stored, so an instrument
-//!   with no stored data works too. A bar still open is never returned. `to` defaults to now and
-//!   `from` to 2017-01-01; either one between bar boundaries is rounded up to the next. `limit` defaults to and is capped at [`candles::MAX_CANDLES`]; a range
+//!   with no stored data works too. Oanda has no live stream and so no REST bars: there the slots
+//!   the store does not cover are reported missing. A bar still open is never returned. `to`
+//!   defaults to now and `from` to the venue's earliest download date (2017-01-01, or 2007-01-01
+//!   for oanda), which is also the earliest bar served; either one between bar boundaries is
+//!   rounded up to the next. `limit` defaults to and is capped at [`candles::MAX_CANDLES`]; a range
 //!   holding more bar slots than `limit` is cut to the latest `limit` slots ending at `to`, so the
 //!   chart gets the latest history (`truncated` says so when `from` was given). The response
 //!   names the spans served by the venue (`from_venue`) and the slots neither had (`missing`). A
@@ -39,27 +54,39 @@
 //!   `POST /runs/out-of-sample` (an `OosSpec`), `POST /runs/walk-forward` (a `WalkForwardSpec`):
 //!   start a run job, answer `{job_id}`. An out-of-sample run's job kind is `oos`, the same as its
 //!   saved run's kind; only the route spells it out. `from`, `to` and `warmup_from` must each be
-//!   where a bar of the timeframe opens. The range is checked against the store first: a gap of a
-//!   day or more is a 422 `data_missing` naming the missing spans; shorter gaps are run and listed
-//!   in the result's data report (`gaps`, `dropped`). A bad spec is a 400 (`invalid_config`, which
-//!   includes an unknown strategy and range edges off a bar boundary, or `invalid_spec`). At most
+//!   where a bar of the timeframe opens. The store lacks part of the range when it is missing a
+//!   day or more of open time in one stretch, counted across the weekends inside it, apart from
+//!   closures recorded at download time; for FX in a month downloaded before closures were
+//!   recorded, two days. The job then downloads that part first, reporting
+//!   `downloading the data: ...`, and runs once the store holds it; a failed download fails the
+//!   job with the source's error, and one that does not fill the range fails it with a
+//!   `data_missing` naming the missing spans. A range nothing can be downloaded for (after now,
+//!   or before the venue's earliest data) is a 422 `data_missing` when it is requested. Shorter
+//!   gaps are run and listed in the result's data report (`gaps`, `dropped`), with the recorded
+//!   closures in its `closures`. A range that ends after the data cutoff is a 422 `after_cutoff`
+//!   (see `GET /health`) when it is requested, before anything is downloaded. A bad spec is a 400
+//!   (`invalid_config`, which includes an unknown strategy and range edges off a bar boundary, or
+//!   `invalid_spec`). At most
 //!   [`jobs::MAX_RUN_JOBS`] run jobs are queued or running at once; one more is a 429
 //!   `too_many_runs`. A queued run holds only its request and loads its data when it gets one of
-//!   the run slots; if the store changed meanwhile so that the run would be refused, the job fails
-//!   with that `data_missing` error. Each finished run is saved (see [`runs`]).
+//!   the run slots, downloading then what the store lacks. Each finished run is saved (see
+//!   [`runs`]).
 //! - `GET /jobs/{id}/result`: the saved run of a finished run job (`RunDetail`); 409
 //!   `job_not_done` while it is queued or running (ask again later), 409 `no_result` once it has
 //!   finished without a saved run (failed, cancelled, or not a run job).
 //! - `GET /runs`: the saved runs, newest first, one summary row each. `GET /runs/{id}`: one saved
-//!   run with its data report (`data_error` says why when that report is damaged) and a check of
-//!   whether its data and engine still match.
+//!   run with its data report (`data_error` says why when that report is damaged), a check of
+//!   whether its data and engine still match, the hash of the strategy's source file it was made
+//!   with and whether the file is still the same (`code_hash`, `code_matches`, `null` when
+//!   unknown) and the data cutoff it was made under (`data_cutoff`).
 //! - `POST /runs/plan` `{strategy, instruments?}` (a `PlanRequest`): runs the strategy's test
 //!   battery on each instrument of its plan, or on the given ones, as one job of kind `plan`, and
 //!   answers `{job_id}` (see [`plans`]). 400 `invalid_config` for an unknown strategy or an
 //!   instrument the venue does not list, `invalid_plan` for a plan or rule that fails its checks,
 //!   `instrument_not_in_plan` for an instrument the plan does not test, `invalid_request` for an
 //!   empty or repeated list; 422 `data_missing`, naming the instrument and the span, when the store
-//!   lacks part of the plan's period (nothing is downloaded); 429 `too_many_runs` as for the other
+//!   lacks part of the plan's period (nothing is downloaded); 422 `after_cutoff` when the period
+//!   ends after the data cutoff; 429 `too_many_runs` as for the other
 //!   runs. The job's result (`PlanDone`) holds one verdict and saved run id per instrument; a
 //!   cancelled plan job keeps the instruments it finished, and the one it stopped during the luck
 //!   test, in its result; a failed one keeps those it saved before the error. Each instrument's run
@@ -68,8 +95,14 @@
 //!   (`VerdictSummary`; the newest complete one, so a luck test stopped by a cancel does not
 //!   replace a finished battery), with how many batteries that pair has saved, the run id, its time
 //!   and the engine revision, whether that revision is this engine's (`engine_matches`), whether
-//!   the strategy's plan and rule are still the ones it ran under (`plan_matches`) and whether its
-//!   luck test finished (`complete`). Only the given strategy's with `strategy`.
+//!   the strategy's plan and rule are still the ones it ran under (`plan_matches`), whether the
+//!   strategy's source file is still the one it ran with (`code_matches`, `null` when unknown,
+//!   as for a battery saved before code hashes were recorded), `stale` when any of those three is
+//!   not true, and whether its luck test finished (`complete`). Each row also lists the limits of
+//!   the rule it was judged under that are looser than its kind's defaults (`loosened`), and how
+//!   many distinct versions of the strategy's code have been through the battery on that
+//!   instrument (`code_versions`). The run and version counts are keyed by strategy name, so
+//!   renaming a strategy starts both again from zero. Only the given strategy's with `strategy`.
 //! - Paper sessions (see [`sessions`]):
 //!   - `POST /sessions` `{strategy, params, instrument, timeframe, starting_cash, slippage_bps,
 //!     fees?}`: creates a session and starts it, 201 with its summary. `instrument` is an
@@ -172,6 +205,8 @@ pub struct ApiConfig {
     pub token: Token,
     /// The port on 127.0.0.1; 0 lets the operating system choose.
     pub port: u16,
+    /// The date after which runs read no bars (`TD_DATA_CUTOFF`); `None` for no limit.
+    pub data_cutoff: Option<runs::DataCutoff>,
 }
 
 type InstrumentCache = HashMap<(Venue, InstrumentKind), InstrumentsResponse>;
@@ -190,6 +225,8 @@ pub(crate) struct AppState {
     strategies: Arc<Vec<StrategyEntry>>,
     /// Turns true when the server is stopping; WebSocket connections close on it.
     shutdown: watch::Receiver<bool>,
+    /// The data cutoff every run is checked against.
+    data_cutoff: Option<runs::DataCutoff>,
 }
 
 impl AppState {
@@ -250,6 +287,7 @@ impl Server {
             instruments: Mutex::new(HashMap::new()),
             strategies: Arc::new(strategies),
             shutdown: shutdown_rx.clone(),
+            data_cutoff: config.data_cutoff,
         });
         let app = router(state).into_make_service_with_connect_info::<SocketAddr>();
         let mut stop = shutdown_rx;
@@ -321,6 +359,7 @@ pub(crate) fn router(state: Arc<AppState>) -> Router {
         .route("/data/coverage", get(data::coverage))
         .route("/data/stored", get(data::stored))
         .route("/data/delete", post(data::delete))
+        .route("/data/delete-all", post(data::delete_all))
         .route("/candles", get(candles::candles))
         .route("/strategies", get(strategies))
         .route("/jobs", get(list_jobs))
@@ -354,11 +393,16 @@ pub(crate) fn router(state: Arc<AppState>) -> Router {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 pub struct HealthResponse {
     pub version: String,
+    /// The data cutoff date (`TD_DATA_CUTOFF`, `YYYY-MM-DD` UTC) when one is in force: every run,
+    /// sweep, walk-forward and test battery whose range ends after that date is refused. `null`
+    /// when there is none.
+    pub data_cutoff: Option<String>,
 }
 
-async fn health() -> Json<HealthResponse> {
+async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
     Json(HealthResponse {
         version: env!("CARGO_PKG_VERSION").to_string(),
+        data_cutoff: state.data_cutoff.as_ref().map(|c| c.date().to_string()),
     })
 }
 
@@ -379,7 +423,9 @@ async fn strategies(State(state): State<Arc<AppState>>) -> Json<Vec<StrategyInfo
     Json(strategy_infos(state.strategies.as_ref().clone()))
 }
 
-fn strategy_infos(entries: Vec<StrategyEntry>) -> Vec<StrategyInfo> {
+/// What `GET /strategies` returns for `entries`. Public only so tests/gui_fixtures.rs can check
+/// the GUI's fake engine against it.
+pub fn strategy_infos(entries: Vec<StrategyEntry>) -> Vec<StrategyInfo> {
     entries
         .into_iter()
         .map(|e| StrategyInfo {
@@ -487,6 +533,7 @@ mod tests {
             instruments: Mutex::new(HashMap::new()),
             strategies: Arc::new(td_engine::strategies()),
             shutdown: watch::channel(false).1,
+            data_cutoff: None,
         });
         let app = router(state).layer(MockConnectInfo(peer));
         let server = tokio::spawn(async move { axum::serve(listener, app).await });

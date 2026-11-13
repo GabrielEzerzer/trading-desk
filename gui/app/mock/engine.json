@@ -20,7 +20,73 @@
      "max": 400,
      "description": "Slow average length, in bars."
     }
-   ]
+   ],
+   "kind": "portfolio",
+   "plan": {
+    "instruments": [
+     {
+      "venue": "binance",
+      "symbol": "BTCUSDT",
+      "kind": "perpetual"
+     }
+    ],
+    "timeframe": "1d",
+    "period": {
+     "from": 1704067200000,
+     "to": 1751328000000
+    },
+    "backtest": {
+     "starting_cash": 10000,
+     "max_leverage": 1,
+     "slippage": []
+    },
+    "sweep": {
+     "fixed": {},
+     "axes": [],
+     "objective": {
+      "metric": "sharpe",
+      "direction": "maximize"
+     },
+     "min_trades": 10
+    },
+    "walk_forward": {
+     "train_days": 180,
+     "test_days": 60
+    },
+    "out_of_sample": {
+     "fraction": 0.7
+    },
+    "evidence": {
+     "min_sample": {
+      "trades": 30,
+      "days": 180,
+      "windows": 4
+     },
+     "luck": {
+      "permutations": 199,
+      "pass_p": 0.05,
+      "inconclusive_p": 0.1
+     },
+     "cost_stress": 2,
+     "plateau": {
+      "min_median_ratio": 0.6,
+      "min_positive_share": 0.8
+     },
+     "start_offsets": 8
+    }
+   },
+   "rule": {
+    "kind": "portfolio",
+    "benchmark": "buy_and_hold",
+    "limits": {
+     "min_sharpe": 1,
+     "max_drawdown": 0.3,
+     "max_drawdown_vs_benchmark": 0.75,
+     "min_alpha": 0,
+     "max_p_mean_not_positive": 0.1,
+     "max_resampled_drawdown": 0.45
+    }
+   }
   },
   {
    "name": "rsi_reversion",
@@ -42,7 +108,73 @@
      "max": 50,
      "description": "The RSI level to buy below."
     }
-   ]
+   ],
+   "kind": "portfolio",
+   "plan": {
+    "instruments": [
+     {
+      "venue": "binance",
+      "symbol": "BTCUSDT",
+      "kind": "perpetual"
+     }
+    ],
+    "timeframe": "1d",
+    "period": {
+     "from": 1704067200000,
+     "to": 1751328000000
+    },
+    "backtest": {
+     "starting_cash": 10000,
+     "max_leverage": 1,
+     "slippage": []
+    },
+    "sweep": {
+     "fixed": {},
+     "axes": [],
+     "objective": {
+      "metric": "sharpe",
+      "direction": "maximize"
+     },
+     "min_trades": 10
+    },
+    "walk_forward": {
+     "train_days": 180,
+     "test_days": 60
+    },
+    "out_of_sample": {
+     "fraction": 0.7
+    },
+    "evidence": {
+     "min_sample": {
+      "trades": 30,
+      "days": 180,
+      "windows": 4
+     },
+     "luck": {
+      "permutations": 199,
+      "pass_p": 0.05,
+      "inconclusive_p": 0.1
+     },
+     "cost_stress": 2,
+     "plateau": {
+      "min_median_ratio": 0.6,
+      "min_positive_share": 0.8
+     },
+     "start_offsets": 8
+    }
+   },
+   "rule": {
+    "kind": "portfolio",
+    "benchmark": "buy_and_hold",
+    "limits": {
+     "min_sharpe": 1,
+     "max_drawdown": 0.3,
+     "max_drawdown_vs_benchmark": 0.75,
+     "min_alpha": 0,
+     "max_p_mean_not_positive": 0.1,
+     "max_resampled_drawdown": 0.45
+    }
+   }
   },
   {
    "name": "donchian_breakout",
@@ -56,12 +188,144 @@
      "max": 200,
      "description": "Channel length, in bars."
     }
-   ]
+   ],
+   "kind": "portfolio",
+   "plan": {
+    "instruments": [
+     {
+      "venue": "binance",
+      "symbol": "BTCUSDT",
+      "kind": "perpetual"
+     }
+    ],
+    "timeframe": "1d",
+    "period": {
+     "from": 1704067200000,
+     "to": 1751328000000
+    },
+    "backtest": {
+     "starting_cash": 10000,
+     "max_leverage": 1,
+     "slippage": []
+    },
+    "sweep": {
+     "fixed": {},
+     "axes": [],
+     "objective": {
+      "metric": "sharpe",
+      "direction": "maximize"
+     },
+     "min_trades": 10
+    },
+    "walk_forward": {
+     "train_days": 180,
+     "test_days": 60
+    },
+    "out_of_sample": {
+     "fraction": 0.7
+    },
+    "evidence": {
+     "min_sample": {
+      "trades": 30,
+      "days": 180,
+      "windows": 4
+     },
+     "luck": {
+      "permutations": 199,
+      "pass_p": 0.05,
+      "inconclusive_p": 0.1
+     },
+     "cost_stress": 2,
+     "plateau": {
+      "min_median_ratio": 0.6,
+      "min_positive_share": 0.8
+     },
+     "start_offsets": 8
+    }
+   },
+   "rule": {
+    "kind": "portfolio",
+    "benchmark": "buy_and_hold",
+    "limits": {
+     "min_sharpe": 1,
+     "max_drawdown": 0.3,
+     "max_drawdown_vs_benchmark": 0.75,
+     "min_alpha": 0,
+     "max_p_mean_not_positive": 0.1,
+     "max_resampled_drawdown": 0.45
+    }
+   }
   },
   {
    "name": "funding_carry",
    "description": "Holds the side of a perpetual that collects funding while the rate stays above its threshold.",
-   "params": []
+   "params": [],
+   "kind": "portfolio",
+   "plan": {
+    "instruments": [
+     {
+      "venue": "binance",
+      "symbol": "BTCUSDT",
+      "kind": "perpetual"
+     }
+    ],
+    "timeframe": "1d",
+    "period": {
+     "from": 1704067200000,
+     "to": 1751328000000
+    },
+    "backtest": {
+     "starting_cash": 10000,
+     "max_leverage": 1,
+     "slippage": []
+    },
+    "sweep": {
+     "fixed": {},
+     "axes": [],
+     "objective": {
+      "metric": "sharpe",
+      "direction": "maximize"
+     },
+     "min_trades": 10
+    },
+    "walk_forward": {
+     "train_days": 180,
+     "test_days": 60
+    },
+    "out_of_sample": {
+     "fraction": 0.7
+    },
+    "evidence": {
+     "min_sample": {
+      "trades": 30,
+      "days": 180,
+      "windows": 4
+     },
+     "luck": {
+      "permutations": 199,
+      "pass_p": 0.05,
+      "inconclusive_p": 0.1
+     },
+     "cost_stress": 2,
+     "plateau": {
+      "min_median_ratio": 0.6,
+      "min_positive_share": 0.8
+     },
+     "start_offsets": 8
+    }
+   },
+   "rule": {
+    "kind": "portfolio",
+    "benchmark": "buy_and_hold",
+    "limits": {
+     "min_sharpe": 1,
+     "max_drawdown": 0.3,
+     "max_drawdown_vs_benchmark": 0.75,
+     "min_alpha": 0,
+     "max_p_mean_not_positive": 0.1,
+     "max_resampled_drawdown": 0.45
+    }
+   }
   }
  ],
  "instruments": [
@@ -125,7 +389,8 @@
     "month_minutes": 44640,
     "first": 1704067200000,
     "last": 1706745540000,
-    "gaps": []
+    "gaps": [],
+    "bytes": 1785600
    },
    {
     "month": "2024-02",
@@ -133,7 +398,8 @@
     "month_minutes": 41760,
     "first": 1706745600000,
     "last": 1709251140000,
-    "gaps": []
+    "gaps": [],
+    "bytes": 1670400
    },
    {
     "month": "2024-03",
@@ -141,7 +407,8 @@
     "month_minutes": 44640,
     "first": 1709251200000,
     "last": 1711929540000,
-    "gaps": []
+    "gaps": [],
+    "bytes": 1785600
    },
    {
     "month": "2024-04",
@@ -149,7 +416,8 @@
     "month_minutes": 43200,
     "first": 1711929600000,
     "last": 1714521540000,
-    "gaps": []
+    "gaps": [],
+    "bytes": 1728000
    },
    {
     "month": "2024-05",
@@ -157,7 +425,8 @@
     "month_minutes": 44640,
     "first": 1714521600000,
     "last": 1717199940000,
-    "gaps": []
+    "gaps": [],
+    "bytes": 1785600
    },
    {
     "month": "2024-06",
@@ -165,7 +434,8 @@
     "month_minutes": 43200,
     "first": 1717200000000,
     "last": 1719791940000,
-    "gaps": []
+    "gaps": [],
+    "bytes": 1728000
    },
    {
     "month": "2024-07",
@@ -173,7 +443,8 @@
     "month_minutes": 44640,
     "first": 1719792000000,
     "last": 1722470340000,
-    "gaps": []
+    "gaps": [],
+    "bytes": 1785600
    },
    {
     "month": "2024-08",
@@ -181,7 +452,8 @@
     "month_minutes": 44640,
     "first": 1722470400000,
     "last": 1725148740000,
-    "gaps": []
+    "gaps": [],
+    "bytes": 1785600
    },
    {
     "month": "2024-09",
@@ -189,7 +461,8 @@
     "month_minutes": 43200,
     "first": 1725148800000,
     "last": 1727740740000,
-    "gaps": []
+    "gaps": [],
+    "bytes": 1728000
    },
    {
     "month": "2024-10",
@@ -197,7 +470,8 @@
     "month_minutes": 44640,
     "first": 1727740800000,
     "last": 1730419140000,
-    "gaps": []
+    "gaps": [],
+    "bytes": 1785600
    },
    {
     "month": "2024-11",
@@ -205,7 +479,8 @@
     "month_minutes": 43200,
     "first": 1730419200000,
     "last": 1733011140000,
-    "gaps": []
+    "gaps": [],
+    "bytes": 1728000
    },
    {
     "month": "2024-12",
@@ -213,7 +488,8 @@
     "month_minutes": 44640,
     "first": 1733011200000,
     "last": 1735689540000,
-    "gaps": []
+    "gaps": [],
+    "bytes": 1785600
    },
    {
     "month": "2025-01",
@@ -221,7 +497,8 @@
     "month_minutes": 44640,
     "first": 1735689600000,
     "last": 1738367940000,
-    "gaps": []
+    "gaps": [],
+    "bytes": 1785600
    },
    {
     "month": "2025-02",
@@ -229,7 +506,8 @@
     "month_minutes": 40320,
     "first": 1738368000000,
     "last": 1740787140000,
-    "gaps": []
+    "gaps": [],
+    "bytes": 1612800
    },
    {
     "month": "2025-03",
@@ -237,7 +515,8 @@
     "month_minutes": 44640,
     "first": 1740787200000,
     "last": 1743465540000,
-    "gaps": []
+    "gaps": [],
+    "bytes": 1785600
    },
    {
     "month": "2025-04",
@@ -245,7 +524,8 @@
     "month_minutes": 43200,
     "first": 1743465600000,
     "last": 1746057540000,
-    "gaps": []
+    "gaps": [],
+    "bytes": 1728000
    },
    {
     "month": "2025-05",
@@ -253,7 +533,8 @@
     "month_minutes": 44640,
     "first": 1746057600000,
     "last": 1748735940000,
-    "gaps": []
+    "gaps": [],
+    "bytes": 1785600
    },
    {
     "month": "2025-06",
@@ -261,7 +542,8 @@
     "month_minutes": 43200,
     "first": 1748736000000,
     "last": 1751327940000,
-    "gaps": []
+    "gaps": [],
+    "bytes": 1728000
    }
   ],
   "bybit:ETHUSDT:spot": [
@@ -271,7 +553,8 @@
     "month_minutes": 43200,
     "first": 1748822400000,
     "last": 1750636740000,
-    "gaps": []
+    "gaps": [],
+    "bytes": 1209600
    }
   ]
  },
@@ -2579,7 +2862,12 @@
        "funding": 0,
        "net_pnl": -174.89,
        "return_on_notional": -0.0175,
-       "bars_held": 5
+       "bars_held": 5,
+       "stop": null,
+       "r_multiple": null,
+       "mae": null,
+       "mfe": null,
+       "force_closed": false
       },
       {
        "side": "short",
@@ -2594,7 +2882,12 @@
        "funding": 0,
        "net_pnl": 1300.56,
        "return_on_notional": 0.1301,
-       "bars_held": 1
+       "bars_held": 1,
+       "stop": null,
+       "r_multiple": null,
+       "mae": null,
+       "mfe": null,
+       "force_closed": false
       },
       {
        "side": "long",
@@ -2609,7 +2902,12 @@
        "funding": 0,
        "net_pnl": -173.79,
        "return_on_notional": -0.0174,
-       "bars_held": 16
+       "bars_held": 16,
+       "stop": null,
+       "r_multiple": null,
+       "mae": null,
+       "mfe": null,
+       "force_closed": false
       },
       {
        "side": "long",
@@ -2624,7 +2922,12 @@
        "funding": 0,
        "net_pnl": -443.76,
        "return_on_notional": -0.0444,
-       "bars_held": 7
+       "bars_held": 7,
+       "stop": null,
+       "r_multiple": null,
+       "mae": null,
+       "mfe": null,
+       "force_closed": false
       },
       {
        "side": "long",
@@ -2639,7 +2942,12 @@
        "funding": 0,
        "net_pnl": -312.85,
        "return_on_notional": -0.0313,
-       "bars_held": 2
+       "bars_held": 2,
+       "stop": null,
+       "r_multiple": null,
+       "mae": null,
+       "mfe": null,
+       "force_closed": false
       },
       {
        "side": "long",
@@ -2654,7 +2962,12 @@
        "funding": 0,
        "net_pnl": -410.94,
        "return_on_notional": -0.0411,
-       "bars_held": 15
+       "bars_held": 15,
+       "stop": null,
+       "r_multiple": null,
+       "mae": null,
+       "mfe": null,
+       "force_closed": false
       },
       {
        "side": "long",
@@ -2669,7 +2982,12 @@
        "funding": 0,
        "net_pnl": 364.15,
        "return_on_notional": 0.0364,
-       "bars_held": 11
+       "bars_held": 11,
+       "stop": null,
+       "r_multiple": null,
+       "mae": null,
+       "mfe": null,
+       "force_closed": false
       },
       {
        "side": "long",
@@ -2684,7 +3002,12 @@
        "funding": 0,
        "net_pnl": -469.19,
        "return_on_notional": -0.0469,
-       "bars_held": 10
+       "bars_held": 10,
+       "stop": null,
+       "r_multiple": null,
+       "mae": null,
+       "mfe": null,
+       "force_closed": false
       },
       {
        "side": "short",
@@ -2699,7 +3022,12 @@
        "funding": 0,
        "net_pnl": -275.63,
        "return_on_notional": -0.0276,
-       "bars_held": 10
+       "bars_held": 10,
+       "stop": null,
+       "r_multiple": null,
+       "mae": null,
+       "mfe": null,
+       "force_closed": false
       },
       {
        "side": "long",
@@ -2714,7 +3042,12 @@
        "funding": 0,
        "net_pnl": 902.62,
        "return_on_notional": 0.0903,
-       "bars_held": 2
+       "bars_held": 2,
+       "stop": null,
+       "r_multiple": null,
+       "mae": null,
+       "mfe": null,
+       "force_closed": false
       },
       {
        "side": "long",
@@ -2729,7 +3062,12 @@
        "funding": 0,
        "net_pnl": -193.81,
        "return_on_notional": -0.0194,
-       "bars_held": 4
+       "bars_held": 4,
+       "stop": null,
+       "r_multiple": null,
+       "mae": null,
+       "mfe": null,
+       "force_closed": false
       },
       {
        "side": "long",
@@ -2744,7 +3082,12 @@
        "funding": 0,
        "net_pnl": -288.69,
        "return_on_notional": -0.0289,
-       "bars_held": 2
+       "bars_held": 2,
+       "stop": null,
+       "r_multiple": null,
+       "mae": null,
+       "mfe": null,
+       "force_closed": false
       },
       {
        "side": "long",
@@ -2759,7 +3102,12 @@
        "funding": 0,
        "net_pnl": -494.98,
        "return_on_notional": -0.0495,
-       "bars_held": 8
+       "bars_held": 8,
+       "stop": null,
+       "r_multiple": null,
+       "mae": null,
+       "mfe": null,
+       "force_closed": false
       },
       {
        "side": "long",
@@ -2774,7 +3122,12 @@
        "funding": 0,
        "net_pnl": 429.25,
        "return_on_notional": 0.0429,
-       "bars_held": 12
+       "bars_held": 12,
+       "stop": null,
+       "r_multiple": null,
+       "mae": null,
+       "mfe": null,
+       "force_closed": false
       },
       {
        "side": "long",
@@ -2789,7 +3142,12 @@
        "funding": 0,
        "net_pnl": -502.16,
        "return_on_notional": -0.0502,
-       "bars_held": 7
+       "bars_held": 7,
+       "stop": null,
+       "r_multiple": null,
+       "mae": null,
+       "mfe": null,
+       "force_closed": false
       },
       {
        "side": "short",
@@ -2804,7 +3162,12 @@
        "funding": 0,
        "net_pnl": 755.16,
        "return_on_notional": 0.0755,
-       "bars_held": 18
+       "bars_held": 18,
+       "stop": null,
+       "r_multiple": null,
+       "mae": null,
+       "mfe": null,
+       "force_closed": false
       },
       {
        "side": "long",
@@ -2819,7 +3182,12 @@
        "funding": 0,
        "net_pnl": 1338.52,
        "return_on_notional": 0.1339,
-       "bars_held": 1
+       "bars_held": 1,
+       "stop": null,
+       "r_multiple": null,
+       "mae": null,
+       "mfe": null,
+       "force_closed": false
       },
       {
        "side": "short",
@@ -2834,7 +3202,12 @@
        "funding": 0,
        "net_pnl": 970.79,
        "return_on_notional": 0.0971,
-       "bars_held": 3
+       "bars_held": 3,
+       "stop": null,
+       "r_multiple": null,
+       "mae": null,
+       "mfe": null,
+       "force_closed": false
       }
      ],
      "metrics": {
@@ -2858,7 +3231,17 @@
       "exposure": 0.42,
       "turnover": 3.1,
       "fees_paid": 178.62,
-      "funding_paid": 0
+      "funding_paid": 0,
+      "max_drawdown_intrabar": null,
+      "static_drawdown": null,
+      "static_drawdown_intrabar": null,
+      "worst_daily_loss": null,
+      "worst_daily_loss_intrabar": null,
+      "peak_leverage": null,
+      "expectancy_r": null,
+      "payoff_ratio": 2.55,
+      "longest_losing_streak": 4,
+      "force_closed_trades": 0
      },
      "benchmark": {
       "qty": 0.2381,
@@ -5074,11 +5457,24 @@
        "exposure": null,
        "turnover": null,
        "fees_paid": 0,
-       "funding_paid": 0
+       "funding_paid": 0,
+       "max_drawdown_intrabar": null,
+       "static_drawdown": null,
+       "static_drawdown_intrabar": null,
+       "worst_daily_loss": null,
+       "worst_daily_loss_intrabar": null,
+       "peak_leverage": null,
+       "expectancy_r": null,
+       "payoff_ratio": null,
+       "longest_losing_streak": 0,
+       "force_closed_trades": 0
       },
       "excess_return": null,
-      "correlation": null
-     }
+      "correlation": null,
+      "alpha": null,
+      "beta": null
+     },
+     "equity_extremes": []
     }
    },
    "data": {
@@ -5086,10 +5482,14 @@
     "gaps": [],
     "dropped": [],
     "tolerated": [],
+    "closures": [],
     "funding_rates": 0
    },
    "data_error": null,
-   "check": null
+   "check": null,
+   "code_hash": null,
+   "code_matches": null,
+   "data_cutoff": null
   },
   "1794299400000-b7c8d9e0": {
    "id": "1794299400000-b7c8d9e0",
@@ -5231,7 +5631,12 @@
        "funding": 0,
        "net_pnl": 457.49,
        "return_on_notional": 0.0457,
-       "bars_held": 4
+       "bars_held": 4,
+       "stop": null,
+       "r_multiple": null,
+       "mae": null,
+       "mfe": null,
+       "force_closed": false
       },
       {
        "side": "long",
@@ -5246,7 +5651,12 @@
        "funding": 0,
        "net_pnl": 387.88,
        "return_on_notional": 0.0388,
-       "bars_held": 3
+       "bars_held": 3,
+       "stop": null,
+       "r_multiple": null,
+       "mae": null,
+       "mfe": null,
+       "force_closed": false
       },
       {
        "side": "long",
@@ -5261,7 +5671,12 @@
        "funding": 0,
        "net_pnl": 449.54,
        "return_on_notional": 0.045,
-       "bars_held": 5
+       "bars_held": 5,
+       "stop": null,
+       "r_multiple": null,
+       "mae": null,
+       "mfe": null,
+       "force_closed": false
       }
      ],
      "metrics": {
@@ -5285,7 +5700,17 @@
       "exposure": 0.42,
       "turnover": 3.1,
       "fees_paid": 30.66,
-      "funding_paid": 0
+      "funding_paid": 0,
+      "max_drawdown_intrabar": null,
+      "static_drawdown": null,
+      "static_drawdown_intrabar": null,
+      "worst_daily_loss": null,
+      "worst_daily_loss_intrabar": null,
+      "peak_leverage": null,
+      "expectancy_r": null,
+      "payoff_ratio": null,
+      "longest_losing_streak": 0,
+      "force_closed_trades": 0
      },
      "benchmark": {
       "qty": 4,
@@ -5397,11 +5822,24 @@
        "exposure": null,
        "turnover": null,
        "fees_paid": 0,
-       "funding_paid": 0
+       "funding_paid": 0,
+       "max_drawdown_intrabar": null,
+       "static_drawdown": null,
+       "static_drawdown_intrabar": null,
+       "worst_daily_loss": null,
+       "worst_daily_loss_intrabar": null,
+       "peak_leverage": null,
+       "expectancy_r": null,
+       "payoff_ratio": null,
+       "longest_losing_streak": 0,
+       "force_closed_trades": 0
       },
       "excess_return": null,
-      "correlation": null
-     }
+      "correlation": null,
+      "alpha": null,
+      "beta": null
+     },
+     "equity_extremes": []
     }
    },
    "data": {
@@ -5409,10 +5847,14 @@
     "gaps": [],
     "dropped": [],
     "tolerated": [],
+    "closures": [],
     "funding_rates": 0
    },
    "data_error": null,
-   "check": null
+   "check": null,
+   "code_hash": null,
+   "code_matches": null,
+   "data_cutoff": null
   },
   "1794312000000-0d1e2f3a": {
    "id": "1794312000000-0d1e2f3a",
@@ -7657,7 +8099,12 @@
        "funding": 0,
        "net_pnl": 545.44,
        "return_on_notional": 0.0546,
-       "bars_held": 2
+       "bars_held": 2,
+       "stop": null,
+       "r_multiple": null,
+       "mae": null,
+       "mfe": null,
+       "force_closed": false
       },
       {
        "side": "short",
@@ -7672,7 +8119,12 @@
        "funding": 0,
        "net_pnl": -488.28,
        "return_on_notional": -0.0488,
-       "bars_held": 5
+       "bars_held": 5,
+       "stop": null,
+       "r_multiple": null,
+       "mae": null,
+       "mfe": null,
+       "force_closed": false
       },
       {
        "side": "long",
@@ -7687,7 +8139,12 @@
        "funding": 0,
        "net_pnl": 1770.68,
        "return_on_notional": 0.177,
-       "bars_held": 1
+       "bars_held": 1,
+       "stop": null,
+       "r_multiple": null,
+       "mae": null,
+       "mfe": null,
+       "force_closed": false
       },
       {
        "side": "short",
@@ -7702,7 +8159,12 @@
        "funding": 0,
        "net_pnl": -232.11,
        "return_on_notional": -0.0232,
-       "bars_held": 9
+       "bars_held": 9,
+       "stop": null,
+       "r_multiple": null,
+       "mae": null,
+       "mfe": null,
+       "force_closed": false
       },
       {
        "side": "long",
@@ -7717,7 +8179,12 @@
        "funding": 0,
        "net_pnl": 601.59,
        "return_on_notional": 0.0601,
-       "bars_held": 8
+       "bars_held": 8,
+       "stop": null,
+       "r_multiple": null,
+       "mae": null,
+       "mfe": null,
+       "force_closed": false
       },
       {
        "side": "long",
@@ -7732,7 +8199,12 @@
        "funding": 0,
        "net_pnl": -579.37,
        "return_on_notional": -0.0579,
-       "bars_held": 8
+       "bars_held": 8,
+       "stop": null,
+       "r_multiple": null,
+       "mae": null,
+       "mfe": null,
+       "force_closed": false
       },
       {
        "side": "long",
@@ -7747,7 +8219,12 @@
        "funding": 0,
        "net_pnl": -605.27,
        "return_on_notional": -0.0605,
-       "bars_held": 7
+       "bars_held": 7,
+       "stop": null,
+       "r_multiple": null,
+       "mae": null,
+       "mfe": null,
+       "force_closed": false
       },
       {
        "side": "long",
@@ -7762,7 +8239,12 @@
        "funding": 0,
        "net_pnl": -606.81,
        "return_on_notional": -0.0607,
-       "bars_held": 10
+       "bars_held": 10,
+       "stop": null,
+       "r_multiple": null,
+       "mae": null,
+       "mfe": null,
+       "force_closed": false
       },
       {
        "side": "long",
@@ -7777,7 +8259,12 @@
        "funding": 0,
        "net_pnl": -423.03,
        "return_on_notional": -0.0423,
-       "bars_held": 13
+       "bars_held": 13,
+       "stop": null,
+       "r_multiple": null,
+       "mae": null,
+       "mfe": null,
+       "force_closed": false
       },
       {
        "side": "short",
@@ -7792,7 +8279,12 @@
        "funding": 0,
        "net_pnl": 1089,
        "return_on_notional": 0.1089,
-       "bars_held": 2
+       "bars_held": 2,
+       "stop": null,
+       "r_multiple": null,
+       "mae": null,
+       "mfe": null,
+       "force_closed": false
       },
       {
        "side": "long",
@@ -7807,7 +8299,12 @@
        "funding": 0,
        "net_pnl": 1181.86,
        "return_on_notional": 0.1182,
-       "bars_held": 9
+       "bars_held": 9,
+       "stop": null,
+       "r_multiple": null,
+       "mae": null,
+       "mfe": null,
+       "force_closed": false
       },
       {
        "side": "short",
@@ -7822,7 +8319,12 @@
        "funding": 0,
        "net_pnl": 1139.81,
        "return_on_notional": 0.1139,
-       "bars_held": 14
+       "bars_held": 14,
+       "stop": null,
+       "r_multiple": null,
+       "mae": null,
+       "mfe": null,
+       "force_closed": false
       },
       {
        "side": "short",
@@ -7837,7 +8339,12 @@
        "funding": 0,
        "net_pnl": 1903.97,
        "return_on_notional": 0.1905,
-       "bars_held": 11
+       "bars_held": 11,
+       "stop": null,
+       "r_multiple": null,
+       "mae": null,
+       "mfe": null,
+       "force_closed": false
       },
       {
        "side": "long",
@@ -7852,7 +8359,12 @@
        "funding": 0,
        "net_pnl": -474.14,
        "return_on_notional": -0.0474,
-       "bars_held": 9
+       "bars_held": 9,
+       "stop": null,
+       "r_multiple": null,
+       "mae": null,
+       "mfe": null,
+       "force_closed": false
       },
       {
        "side": "long",
@@ -7867,7 +8379,12 @@
        "funding": 0,
        "net_pnl": 678.07,
        "return_on_notional": 0.0678,
-       "bars_held": 3
+       "bars_held": 3,
+       "stop": null,
+       "r_multiple": null,
+       "mae": null,
+       "mfe": null,
+       "force_closed": false
       },
       {
        "side": "short",
@@ -7882,7 +8399,12 @@
        "funding": 0,
        "net_pnl": -449.56,
        "return_on_notional": -0.045,
-       "bars_held": 6
+       "bars_held": 6,
+       "stop": null,
+       "r_multiple": null,
+       "mae": null,
+       "mfe": null,
+       "force_closed": false
       },
       {
        "side": "long",
@@ -7897,7 +8419,12 @@
        "funding": 0,
        "net_pnl": 1074.51,
        "return_on_notional": 0.1075,
-       "bars_held": 14
+       "bars_held": 14,
+       "stop": null,
+       "r_multiple": null,
+       "mae": null,
+       "mfe": null,
+       "force_closed": false
       },
       {
        "side": "long",
@@ -7912,7 +8439,12 @@
        "funding": 0,
        "net_pnl": -503.91,
        "return_on_notional": -0.0504,
-       "bars_held": 12
+       "bars_held": 12,
+       "stop": null,
+       "r_multiple": null,
+       "mae": null,
+       "mfe": null,
+       "force_closed": false
       },
       {
        "side": "long",
@@ -7927,7 +8459,12 @@
        "funding": 0,
        "net_pnl": -426.1,
        "return_on_notional": -0.0426,
-       "bars_held": 4
+       "bars_held": 4,
+       "stop": null,
+       "r_multiple": null,
+       "mae": null,
+       "mfe": null,
+       "force_closed": false
       },
       {
        "side": "long",
@@ -7942,7 +8479,12 @@
        "funding": 0,
        "net_pnl": -278.59,
        "return_on_notional": -0.0279,
-       "bars_held": 5
+       "bars_held": 5,
+       "stop": null,
+       "r_multiple": null,
+       "mae": null,
+       "mfe": null,
+       "force_closed": false
       },
       {
        "side": "long",
@@ -7957,7 +8499,12 @@
        "funding": 0,
        "net_pnl": 1290.51,
        "return_on_notional": 0.1291,
-       "bars_held": 1
+       "bars_held": 1,
+       "stop": null,
+       "r_multiple": null,
+       "mae": null,
+       "mfe": null,
+       "force_closed": false
       },
       {
        "side": "long",
@@ -7972,7 +8519,12 @@
        "funding": 0,
        "net_pnl": -1703.1,
        "return_on_notional": -0.1702,
-       "bars_held": 40
+       "bars_held": 40,
+       "stop": null,
+       "r_multiple": null,
+       "mae": null,
+       "mfe": null,
+       "force_closed": false
       }
      ],
      "metrics": {
@@ -7996,7 +8548,17 @@
       "exposure": 0.42,
       "turnover": 3.1,
       "fees_paid": 214.63,
-      "funding_paid": 0
+      "funding_paid": 0,
+      "max_drawdown_intrabar": null,
+      "static_drawdown": null,
+      "static_drawdown_intrabar": null,
+      "worst_daily_loss": null,
+      "worst_daily_loss_intrabar": null,
+      "peak_leverage": null,
+      "expectancy_r": null,
+      "payoff_ratio": 2,
+      "longest_losing_streak": 4,
+      "force_closed_trades": 0
      },
      "benchmark": {
       "qty": 0.2381,
@@ -10212,11 +10774,24 @@
        "exposure": null,
        "turnover": null,
        "fees_paid": 0,
-       "funding_paid": 0
+       "funding_paid": 0,
+       "max_drawdown_intrabar": null,
+       "static_drawdown": null,
+       "static_drawdown_intrabar": null,
+       "worst_daily_loss": null,
+       "worst_daily_loss_intrabar": null,
+       "peak_leverage": null,
+       "expectancy_r": null,
+       "payoff_ratio": null,
+       "longest_losing_streak": 0,
+       "force_closed_trades": 0
       },
       "excess_return": null,
-      "correlation": null
-     }
+      "correlation": null,
+      "alpha": null,
+      "beta": null
+     },
+     "equity_extremes": []
     }
    },
    "data": {
@@ -10224,10 +10799,14 @@
     "gaps": [],
     "dropped": [],
     "tolerated": [],
+    "closures": [],
     "funding_rates": 0
    },
    "data_error": null,
-   "check": null
+   "check": null,
+   "code_hash": null,
+   "code_matches": null,
+   "data_cutoff": null
   }
  },
  "runResult": "1794312000000-0d1e2f3a"

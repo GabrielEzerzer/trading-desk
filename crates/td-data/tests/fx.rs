@@ -519,6 +519,37 @@ fn bad_quote_batches_are_refused_and_write_nothing() {
         &before,
     );
 
+    // A crossed high: the ask's high below the bid's, with its open, low and close at the bid's.
+    let b = bid(february);
+    let crossed = Candle {
+        high: b.high - 0.001,
+        volume: 0.0,
+        quote_volume: 0.0,
+        ..b
+    };
+    let (b, a) = batch(b, crossed);
+    let result = store.write_quotes(&id, &b, &a);
+    assert_refused(
+        &store,
+        &id,
+        result,
+        |e| matches!(e, DataError::CrossedQuote { field: "high", .. }),
+        &before,
+    );
+
+    // A crossed low: the ask's low below the bid's, with the rest above the bid's.
+    let mut crossed = ask(february);
+    crossed.low = bid(february).low - 0.001;
+    let (b, a) = batch(bid(february), crossed);
+    let result = store.write_quotes(&id, &b, &a);
+    assert_refused(
+        &store,
+        &id,
+        result,
+        |e| matches!(e, DataError::CrossedQuote { field: "low", .. }),
+        &before,
+    );
+
     // A minute in closed hours: Saturday 3 February, noon.
     let saturday = february + 2 * DAY;
     assert!(!InstrumentKind::Fx.is_open(saturday));
@@ -563,6 +594,54 @@ fn bad_quote_batches_are_refused_and_write_nothing() {
         store.read_month_asks(&spot, jan),
         Err(DataError::NoQuotes(_))
     ));
+    // A spot market with nothing stored: the refusal comes before the month's lock is taken, so
+    // not even its folder or a lock file is made.
+    let eth = InstrumentId {
+        symbol: "ETHUSDT".into(),
+        ..btc_spot()
+    };
+    let result = store.write_quotes(&eth, &b, &a);
+    assert!(matches!(result, Err(DataError::NoQuotes(_))), "{result:?}");
+    let folder = store.candle_path(&eth, jan).expect("a path");
+    let folder = folder.parent().expect("its folder");
+    assert!(!folder.exists(), "no folder for ETHUSDT");
+}
+
+#[test]
+fn a_write_over_two_months_with_a_later_month_bad_writes_neither() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let store = Store::new(dir.path());
+    let (fx, spot) = (usdjpy(), btc_spot());
+    let times = fx_week();
+    let jan = Month::containing(monday());
+    let feb = jan.next();
+    // January holds good quotes; February is a crypto month file copied into the FX folder, so it
+    // has no ask columns.
+    store
+        .write_quotes(&fx, &bids(&times[..60]), &asks(&times[..60]))
+        .expect("writes");
+    let january = store.candle_path(&fx, jan).expect("a path");
+    let before = fs::read(&january).expect("the file");
+    let february = parse_date("2024-02-01").expect("a date") + 12 * HOUR;
+    store
+        .write_candles(&spot, &bids(&[february]))
+        .expect("writes");
+    fs::copy(
+        store.candle_path(&spot, feb).expect("a path"),
+        store.candle_path(&fx, feb).expect("a path"),
+    )
+    .expect("copies");
+
+    let both = [times[100], february];
+    let result = store.write_quotes(&fx, &bids(&both), &asks(&both));
+    assert!(
+        matches!(result, Err(DataError::NoAskColumns { .. })),
+        "{result:?}"
+    );
+    assert!(
+        fs::read(&january).expect("the file") == before,
+        "January is untouched"
+    );
 }
 
 #[test]

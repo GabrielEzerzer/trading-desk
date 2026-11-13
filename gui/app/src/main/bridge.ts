@@ -19,6 +19,9 @@ const ROUTES: readonly Route[] = [
   { method: 'GET', path: /^\/instruments$/, query: ['venue', 'kind'] },
   { method: 'POST', path: /^\/data\/download$/, body: true },
   { method: 'GET', path: /^\/data\/coverage$/, query: ['instrument'] },
+  { method: 'GET', path: /^\/data\/stored$/ },
+  { method: 'POST', path: /^\/data\/delete$/, body: true },
+  { method: 'POST', path: /^\/data\/delete-all$/ },
   { method: 'GET', path: /^\/candles$/, query: ['instrument', 'timeframe', 'limit'] },
   { method: 'GET', path: /^\/strategies$/ },
   { method: 'GET', path: /^\/jobs$/ },
@@ -33,6 +36,8 @@ const ROUTES: readonly Route[] = [
   { method: 'POST', path: /^\/sessions$/, body: true },
   { method: 'GET', path: /^\/sessions\/[A-Za-z0-9_-]{1,64}$/ },
   { method: 'POST', path: /^\/sessions\/[A-Za-z0-9_-]{1,64}\/(?:stop|resume)$/ },
+  { method: 'POST', path: /^\/sessions\/[A-Za-z0-9_-]{1,64}\/orders$/, body: true },
+  { method: 'POST', path: /^\/sessions\/[A-Za-z0-9_-]{1,64}\/orders\/\d{1,15}\/cancel$/ },
 ]
 
 // The WebSocket topics the engine serves (crates/td-server/src/api/ws.rs). Symbols follow the

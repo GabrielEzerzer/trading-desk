@@ -19,7 +19,7 @@ use td_server::api::auth::Token;
 use td_server::api::data::GapInfo;
 use td_server::api::jobs::{JobInfo, JobRequest, JobResult, JobStatus};
 const MAX_RUN_JOBS: usize = 8;
-use td_server::api::runs::{RunDetail, check_run_data, load_run_data};
+use td_server::api::runs::{DataCutoff, RunDetail, check_run_data, load_run_data};
 use td_server::api::source::{LiveSource, MarketSource};
 use td_server::api::ws::ServerMessage;
 use td_server::api::{ApiConfig, Server};
@@ -49,6 +49,102 @@ impl MarketSource for NoSource {
         _: Millis,
     ) -> Result<DownloadReport, DataError> {
         Err(DataError::NoDataDir)
+    }
+    fn funding(
+        &self,
+        _: &Store,
+        _: &InstrumentId,
+        _: Millis,
+        _: Millis,
+    ) -> Result<usize, DataError> {
+        Err(DataError::NoDataDir)
+    }
+}
+
+/// What [`Filling`] does when a run asks it for candles.
+#[derive(Clone, Copy)]
+enum Fill {
+    /// Writes the minutes of [`minutes`] in the range asked for.
+    Minutes,
+    /// Writes nothing, as a venue that has nothing there.
+    Nothing,
+    /// Fails, as a source with no OANDA token does.
+    Fails,
+    /// Tries to delete the instrument, then writes as [`Fill::Minutes`] does; fails unless the
+    /// delete was refused because the instrument is held.
+    TriesDelete,
+    /// Waits until [`Filling::release`] is called, then writes as [`Fill::Minutes`] does.
+    Held,
+}
+
+/// A source for runs that download: it records each candle range asked of it.
+struct Filling {
+    fill: Fill,
+    asked: Mutex<Vec<(Millis, Millis)>>,
+    /// Whether a [`Fill::Held`] download may go on.
+    released: (Mutex<bool>, Condvar),
+}
+
+impl Filling {
+    fn new(fill: Fill) -> Arc<Filling> {
+        Arc::new(Filling {
+            fill,
+            asked: Mutex::new(Vec::new()),
+            released: (Mutex::new(false), Condvar::new()),
+        })
+    }
+
+    fn release(&self) {
+        *self.released.0.lock().unwrap() = true;
+        self.released.1.notify_all();
+    }
+}
+
+impl MarketSource for Filling {
+    fn instruments(&self, _: Venue, _: InstrumentKind) -> Result<InstrumentList, DataError> {
+        Err(DataError::NoDataDir)
+    }
+    fn candles(
+        &self,
+        store: &Store,
+        id: &InstrumentId,
+        from: Millis,
+        to: Millis,
+    ) -> Result<DownloadReport, DataError> {
+        self.asked.lock().unwrap().push((from, to));
+        if let Fill::Held = self.fill {
+            let (released, wake) = &self.released;
+            let guard = released.lock().unwrap();
+            // Bounded, so a test that never releases fails instead of hanging.
+            let _ = wake.wait_timeout_while(guard, WAIT, |r| !*r).unwrap();
+        }
+        let candles: Vec<Candle> = match self.fill {
+            Fill::Minutes | Fill::Held => minutes(40, 0..0)
+                .into_iter()
+                .filter(|c| (from..to).contains(&c.open_time))
+                .collect(),
+            Fill::Nothing => Vec::new(),
+            Fill::Fails => return Err(DataError::MissingOandaToken),
+            Fill::TriesDelete => match store.delete_instrument(id) {
+                Err(DataError::InstrumentBusy(_)) => minutes(40, 0..0)
+                    .into_iter()
+                    .filter(|c| (from..to).contains(&c.open_time))
+                    .collect(),
+                other => {
+                    return Err(DataError::InvalidInstrument {
+                        symbol: id.symbol.clone(),
+                        reason: format!(
+                            "the delete during the download was not refused: {other:?}"
+                        ),
+                    });
+                }
+            },
+        };
+        store.write_candles(id, &candles)?;
+        Ok(DownloadReport {
+            months: vec![(Month::containing(from), candles.len())],
+            ..DownloadReport::default()
+        })
     }
     fn funding(
         &self,
@@ -172,6 +268,11 @@ impl TestServer {
     /// A server whose store holds `days` days of minutes for BTCUSDT spot and perpetual, with a
     /// 30-minute outage at 10:00 on the second day and perpetual funding every 8 hours.
     async fn seeded(days: i64) -> TestServer {
+        TestServer::seeded_with(days, None).await
+    }
+
+    /// [`TestServer::seeded`], on a server started with a data cutoff when one is given.
+    async fn seeded_with(days: i64, cutoff: Option<&str>) -> TestServer {
         let dir = tempfile::tempdir().expect("temp dir");
         let store = Store::new(dir.path());
         let outage = t0() + DAY + 10 * HOUR..t0() + DAY + 10 * HOUR + 30 * MINUTE;
@@ -192,17 +293,39 @@ impl TestServer {
         store
             .write_funding(&instrument(InstrumentKind::Perpetual).id, &rates)
             .expect("seeds");
-        TestServer::on(dir, store).await
+        TestServer::on_with(dir, store, cutoff).await
     }
 
     /// A server on a store already seeded.
     async fn on(dir: TempDir, store: Store) -> TestServer {
+        TestServer::serve(dir, store, Arc::new(NoSource), None).await
+    }
+
+    /// [`TestServer::on`], started with `TD_DATA_CUTOFF` set to `cutoff` when one is given.
+    async fn on_with(dir: TempDir, store: Store, cutoff: Option<&str>) -> TestServer {
+        TestServer::serve(dir, store, Arc::new(NoSource), cutoff).await
+    }
+
+    /// A server on a store already seeded, downloading through `source`.
+    async fn with_source(dir: TempDir, store: Store, source: Arc<dyn MarketSource>) -> TestServer {
+        TestServer::serve(dir, store, source, None).await
+    }
+
+    /// A server on a store already seeded, downloading through `source`, with the data cutoff
+    /// `cutoff` when one is given.
+    async fn serve(
+        dir: TempDir,
+        store: Store,
+        source: Arc<dyn MarketSource>,
+        cutoff: Option<&str>,
+    ) -> TestServer {
         let server = Server::start(ApiConfig {
             store: store.clone(),
-            source: std::sync::Arc::new(NoSource),
+            source,
             live: std::sync::Arc::new(NoLive),
             token: Token::generate().expect("rng"),
             port: 0,
+            data_cutoff: cutoff.map(|c| DataCutoff::parse(c).expect("a cutoff")),
         })
         .await
         .expect("starts");
@@ -551,27 +674,37 @@ async fn sweep_out_of_sample_and_walk_forward_jobs_report_progress_and_save_thei
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_range_the_store_lacks_is_422_data_missing_and_starts_no_job() {
+async fn a_range_nothing_can_be_downloaded_for_is_422_data_missing_and_starts_no_job() {
     let t = TestServer::seeded(3).await;
-    let mut beyond = serde_json::to_value(config(InstrumentKind::Spot, 5)).unwrap();
+    // Days after now, which no venue has yet.
+    let future = parse_date("2100-01-01").unwrap();
+    let mut beyond = serde_json::to_value(BacktestConfig {
+        from: future,
+        to: future + 2 * DAY,
+        ..config(InstrumentKind::Spot, 3)
+    })
+    .unwrap();
     let (status, body) = t.post("/runs/backtest", &beyond).await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
     assert_eq!(body["error"]["code"], "data_missing");
     let message = body["error"]["message"].as_str().unwrap();
     assert!(
         message.contains("binance:BTCUSDT:spot")
-            && message.contains("from 2024-03-04 00:00 to 2024-03-06 00:00 UTC"),
+            && message.contains("from 2100-01-01 00:00 to 2100-01-03 00:00 UTC"),
         "{message}"
     );
-    // An instrument with nothing stored.
+    // An instrument with nothing stored, before the venue's earliest data.
+    let early = parse_date("2016-01-01").unwrap();
     beyond["instrument"]["id"]["symbol"] = json!("ETHUSDT");
-    beyond["to"] = json!(t0() + 3_600_000 * 5);
+    beyond["from"] = json!(early);
+    beyond["to"] = json!(early + 5 * HOUR);
     let (status, body) = t.post("/runs/backtest", &beyond).await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     assert_eq!(body["error"]["code"], "data_missing");
-    let (status, body) = t
-        .post("/runs/sweep", &sweep_spec(4, (3, 4), (10, 11)))
-        .await;
+    let mut sweep = sweep_spec(4, (3, 4), (10, 11));
+    sweep["base"]["from"] = json!(future);
+    sweep["base"]["to"] = json!(future + 4 * DAY);
+    let (status, body) = t.post("/runs/sweep", &sweep).await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     assert_eq!(body["error"]["code"], "data_missing");
 
@@ -602,6 +735,98 @@ async fn a_range_the_store_lacks_is_422_data_missing_and_starts_no_job() {
 
     let (_, jobs) = t.get("/jobs").await;
     assert_eq!(jobs, json!([]), "no job was created");
+}
+
+/// With a data cutoff in force, every run kind whose range ends after the cutoff date is a 422
+/// that names the cutoff and starts no job, though the store holds the bars; a run ending exactly
+/// at the end of the cutoff date runs, and its record says the cutoff was in force and which code
+/// it ran. `GET /health` says the cutoff is in force, and says nothing on a server without one.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_data_cutoff_refuses_runs_past_it_and_is_recorded_on_the_runs_it_allows() {
+    let t = TestServer::seeded_with(7, Some("2024-03-05")).await;
+    let sweep = sweep_spec(6, (3, 4), (10, 11));
+    let past = [
+        (
+            "/runs/backtest",
+            serde_json::to_value(config(InstrumentKind::Spot, 6)).unwrap(),
+        ),
+        ("/runs/sweep", sweep.clone()),
+        (
+            "/runs/out-of-sample",
+            json!({ "sweep": sweep, "split": { "fraction": 0.7 } }),
+        ),
+        (
+            "/runs/walk-forward",
+            json!({
+                "sweep": sweep,
+                "windows": { "train_bars": 72, "test_bars": 24, "step_bars": 24, "mode": "rolling" },
+            }),
+        ),
+    ];
+    for (path, body) in &past {
+        let (status, body) = t.post(path, body).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{path}: {body}");
+        assert_eq!(body["error"]["code"], "after_cutoff", "{path}");
+        let message = body["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains("ends at 2024-03-07 00:00 UTC")
+                && message.contains("TD_DATA_CUTOFF=2024-03-05")
+                && message.contains("End the range at 2024-03-06 00:00 UTC or earlier"),
+            "{path}: {message}"
+        );
+    }
+    let (_, jobs) = t.get("/jobs").await;
+    assert_eq!(jobs, json!([]), "no job was created");
+
+    let within = serde_json::to_value(config(InstrumentKind::Spot, 5)).unwrap();
+    let detail = saved_run(&t, "/runs/backtest", &within).await;
+    assert_eq!(detail.data_cutoff.as_deref(), Some("2024-03-05"));
+    assert_eq!(
+        detail.code_hash.as_deref(),
+        td_engine::code_hash("sma_cross")
+    );
+    assert!(detail.code_hash.is_some());
+    assert_eq!(detail.code_matches, Some(true));
+    let (status, reopened) = t.get(&format!("/runs/{}", detail.id)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(reopened["data_cutoff"], "2024-03-05");
+    assert_eq!(reopened["code_matches"], true);
+
+    let (status, health) = t.get("/health").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(health["data_cutoff"], "2024-03-05");
+    let open = TestServer::seeded(1).await;
+    let (_, health) = open.get("/health").await;
+    assert_eq!(health["data_cutoff"], Value::Null, "{health}");
+}
+
+/// A run saved before runs recorded their code, or by code that has changed since, says so on
+/// `GET /runs/{id}`: no record is unknown (null), never a match, and a different hash is false.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_saved_run_says_whether_the_code_it_ran_still_matches() {
+    let t = TestServer::seeded(3).await;
+    let body = serde_json::to_value(config(InstrumentKind::Spot, 3)).unwrap();
+    let detail = saved_run(&t, "/runs/backtest", &body).await;
+    assert_eq!(detail.data_cutoff, None, "no cutoff in force");
+    let folder = t.store.root().join("runs").join(detail.id.as_str());
+    let record = folder.join("record.json");
+    let saved: Value = serde_json::from_slice(&std::fs::read(&record).unwrap()).unwrap();
+    assert_eq!(
+        saved["code_hash"].as_str(),
+        td_engine::code_hash("sma_cross")
+    );
+
+    std::fs::write(&record, r#"{ "code_hash": "0000000000000000" }"#).unwrap();
+    let (_, changed) = t.get(&format!("/runs/{}", detail.id)).await;
+    assert_eq!(changed["code_matches"], false, "{changed}");
+    assert_eq!(changed["code_hash"], "0000000000000000");
+
+    std::fs::remove_file(&record).unwrap();
+    let (status, old) = t.get(&format!("/runs/{}", detail.id)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(old["code_matches"], Value::Null, "{old}");
+    assert_eq!(old["code_hash"], Value::Null);
+    assert_eq!(old["data_cutoff"], Value::Null);
 }
 
 /// Holds every thread of rayon's global pool until dropped.
@@ -857,19 +1082,193 @@ async fn a_queued_run_loads_its_data_only_when_it_starts() {
     std::fs::remove_file(file).unwrap();
     // One slot frees, and the queued run starts on it while the other is still held.
     cancel(&t, busy[0]).await;
-    let last = ws.follow(job).await.pop().unwrap();
+    let states = ws.follow(job).await;
     let (_, held) = t.get(&format!("/jobs/{}", busy[1])).await;
     assert_eq!(held["status"], "running", "{held}");
     cancel(&t, busy[1]).await;
-    assert_eq!(last.status, JobStatus::Failed, "{last:?}");
-    let error = last.error.expect("an error");
-    assert_eq!(error.code, "data_missing");
+    // The run finds the month gone and goes to download it, which this source refuses.
     assert!(
-        error.message.contains("changed after the run was accepted")
-            && error.message.contains("binance:BTCUSDT:spot"),
-        "{}",
-        error.message
+        states
+            .iter()
+            .any(|s| s.message == "downloading the data: binance:BTCUSDT:spot 2024-03"),
+        "{states:?}"
     );
+    let last = states.last().unwrap();
+    assert_eq!(last.status, JobStatus::Failed, "{last:?}");
+    let error = last.error.as_ref().expect("an error");
+    assert_eq!(error.message, DataError::NoDataDir.to_string());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_run_on_a_range_the_store_lacks_downloads_it_first_then_runs() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = Store::new(dir.path());
+    let id = instrument(InstrumentKind::Spot).id;
+    store.write_candles(&id, &minutes(3, 0..0)).expect("seeds");
+    let source = Filling::new(Fill::Minutes);
+    let t = TestServer::with_source(dir, store, source.clone()).await;
+    let mut ws = t.websocket().await;
+
+    // Five days, two of them not stored: accepted, as the job downloads them.
+    let body = serde_json::to_value(config(InstrumentKind::Spot, 5)).unwrap();
+    let job = t.start("/runs/backtest", &body).await;
+    let states = ws.follow(job).await;
+    let messages: Vec<&str> = states.iter().map(|s| s.message.as_str()).collect();
+    let downloading = "downloading the data: binance:BTCUSDT:spot 2024-03";
+    let at = messages.iter().position(|m| *m == downloading);
+    let ran = messages.iter().position(|m| *m == "running the backtest");
+    assert!(at.is_some() && at < ran, "{messages:?}");
+    let last = states.last().unwrap();
+    assert_eq!(last.status, JobStatus::Done, "{last:?}");
+    assert_eq!(
+        *source.asked.lock().unwrap(),
+        [(t0() + 3 * DAY, t0() + 5 * DAY)]
+    );
+    let data = t.result(job).await.data.expect("a data report");
+    assert_eq!((data.bars, data.gaps.len()), (5 * 24, 0));
+
+    // The range is stored now: a second run downloads nothing.
+    let again = t.start("/runs/backtest", &body).await;
+    assert_eq!(
+        ws.follow(again).await.last().unwrap().status,
+        JobStatus::Done
+    );
+    assert_eq!(source.asked.lock().unwrap().len(), 1);
+}
+
+/// A run's download takes the instrument's one download: a second run on the same missing range
+/// waits for it instead of fetching the same days alongside it, then finds them stored, and a
+/// `/data/download` of the instrument meanwhile is refused as for any download in progress.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_runs_on_the_same_missing_range_fetch_it_once() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = Store::new(dir.path());
+    let id = instrument(InstrumentKind::Spot).id;
+    store.write_candles(&id, &minutes(3, 0..0)).expect("seeds");
+    let source = Filling::new(Fill::Held);
+    let t = TestServer::with_source(dir, store, source.clone()).await;
+    let body = serde_json::to_value(config(InstrumentKind::Spot, 5)).unwrap();
+    let first = t.start("/runs/backtest", &body).await;
+    let deadline = Instant::now() + WAIT;
+    while source.asked.lock().unwrap().is_empty() {
+        assert!(Instant::now() < deadline, "the first run never downloaded");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let download = json!({
+        "instrument": id,
+        "from": t0() + 3 * DAY,
+        "to": t0() + 5 * DAY,
+    });
+    let (status, refused) = t.post("/data/download", &download).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+    assert_eq!(refused["error"]["code"], "conflict");
+
+    // The second run gets as far as waiting, or (without the turn) as fetching, before the first
+    // download goes on.
+    let second = t.start("/runs/backtest", &body).await;
+    let deadline = Instant::now() + WAIT;
+    let message = loop {
+        let (_, state) = t.get(&format!("/jobs/{second}")).await;
+        let message = state["message"].as_str().unwrap_or_default().to_string();
+        if message.contains("download") {
+            break message;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the second run never got to the data: {state}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    assert_eq!(
+        message,
+        "waiting to download the data: binance:BTCUSDT:spot"
+    );
+    source.release();
+    for job in [first, second] {
+        assert_eq!(finished(&t, job).await["status"], "done");
+    }
+    assert_eq!(
+        *source.asked.lock().unwrap(),
+        [(t0() + 3 * DAY, t0() + 5 * DAY)],
+        "the missing days were fetched once"
+    );
+}
+
+/// With a data cutoff and nothing stored, a run ending after the cutoff is refused as past it
+/// when it is requested, and nothing is downloaded for it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_run_past_the_cutoff_is_refused_before_anything_is_downloaded() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = Store::new(dir.path());
+    let source = Filling::new(Fill::Minutes);
+    let t = TestServer::serve(dir, store, source.clone(), Some("2024-03-05")).await;
+    let body = serde_json::to_value(config(InstrumentKind::Spot, 7)).unwrap();
+    let (status, body) = t.post("/runs/backtest", &body).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["error"]["code"], "after_cutoff");
+    let (_, jobs) = t.get("/jobs").await;
+    assert_eq!(jobs, json!([]), "no job was created");
+    assert_eq!(*source.asked.lock().unwrap(), []);
+}
+
+/// A run's download holds its instrument, so a delete of it meanwhile is refused and the stored
+/// days the run reads stay.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_delete_is_refused_while_a_run_downloads_the_instrument() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = Store::new(dir.path());
+    let id = instrument(InstrumentKind::Spot).id;
+    store.write_candles(&id, &minutes(3, 0..0)).expect("seeds");
+    let source = Filling::new(Fill::TriesDelete);
+    let t = TestServer::with_source(dir, store, source.clone()).await;
+    let mut ws = t.websocket().await;
+    let body = serde_json::to_value(config(InstrumentKind::Spot, 5)).unwrap();
+    let job = t.start("/runs/backtest", &body).await;
+    let last = ws.follow(job).await.pop().unwrap();
+    assert_eq!(last.status, JobStatus::Done, "{last:?}");
+    assert_eq!(source.asked.lock().unwrap().len(), 1);
+    let data = t.result(job).await.data.expect("a data report");
+    assert_eq!((data.bars, data.gaps.len()), (5 * 24, 0));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_or_short_download_fails_the_run_and_nothing_is_run() {
+    for (fill, code, message) in [
+        (
+            Fill::Fails,
+            "bad_request",
+            DataError::MissingOandaToken.to_string(),
+        ),
+        (
+            Fill::Nothing,
+            "data_missing",
+            "the download did not fill the range, so it was not run: the store has no \
+             binance:BTCUSDT:spot candles from 2024-03-04 00:00 to 2024-03-06 00:00 UTC; download \
+             them first"
+                .to_string(),
+        ),
+    ] {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = Store::new(dir.path());
+        let id = instrument(InstrumentKind::Spot).id;
+        store.write_candles(&id, &minutes(3, 0..0)).expect("seeds");
+        let t = TestServer::with_source(dir, store, Filling::new(fill)).await;
+        let mut ws = t.websocket().await;
+        let body = serde_json::to_value(config(InstrumentKind::Spot, 5)).unwrap();
+        let job = t.start("/runs/backtest", &body).await;
+        let states = ws.follow(job).await;
+        assert!(
+            states.iter().all(|s| s.message != "running the backtest"),
+            "{states:?}"
+        );
+        let last = states.last().unwrap();
+        assert_eq!(last.status, JobStatus::Failed, "{last:?}");
+        let error = last.error.as_ref().expect("an error");
+        assert_eq!((error.code.as_str(), &error.message), (code, &message));
+        let (_, runs) = t.get("/runs").await;
+        assert_eq!(runs, json!([]), "a failed run is not saved");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -941,8 +1340,8 @@ fn an_fx_week_with_its_weekend_closed_passes_the_data_check_with_no_gap_or_dropp
         .write_quotes(&fx.instrument.id, &bids, &asks)
         .expect("seeds");
 
-    check_run_data(&store, &fx).expect("the weekend is closed, not missing");
-    let data = load_run_data(&store, &fx).expect("loads");
+    check_run_data(&store, &fx, None).expect("the weekend is closed, not missing");
+    let data = load_run_data(&store, &fx, None).expect("loads");
     assert_eq!(data.report.gaps, []);
     assert_eq!(data.report.dropped, [] as [Millis; 0]);
     assert_eq!(data.report.bars, 5 * 24, "five open days of hourly bars");
@@ -955,7 +1354,7 @@ fn an_fx_week_with_its_weekend_closed_passes_the_data_check_with_no_gap_or_dropp
     store
         .write_candles(&spot.instrument.id, &bids)
         .expect("seeds");
-    match check_run_data(&store, &spot) {
+    match check_run_data(&store, &spot, None) {
         Err(e) => assert_eq!(e.body.code, "data_missing", "{e:?}"),
         Ok(()) => panic!("spot with the weekend missing must be refused"),
     }
@@ -1252,28 +1651,211 @@ async fn fx_sweeps_out_of_sample_and_walk_forward_runs_trade_on_the_asks() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn an_fx_run_goes_over_a_holiday_but_two_days_missing_or_a_spot_day_is_refused() {
+    // FX_DAYS days of FX minutes from Monday 8 January 2024. EURUSD lacks 25 hours of open time
+    // from Tuesday 22:00 UTC, as OANDA's minutes lack a holiday such as 25 to 26 December 2016.
+    // USDJPY lacks the hour before the weekend's close, Friday 22:00 UTC, and the 25 hours from
+    // its open, Sunday 22:00 UTC: 26 hours of open time, three days and two hours from end to end.
+    // GBPUSD lacks two days from Tuesday 00:00 UTC.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = Store::new(dir.path());
+    let (from, to) = (fx_t0(), fx_t0() + FX_DAYS * DAY);
+    let holiday = from + DAY + 22 * HOUR..from + 2 * DAY + 23 * HOUR;
+    let (close, reopen) = (from + 4 * DAY + 22 * HOUR, from + 6 * DAY + 22 * HOUR);
+    let two_days = from + DAY..from + 3 * DAY;
+    let without = |hole: std::ops::Range<Millis>| -> Vec<Millis> {
+        let open = open_minutes(from, to).into_iter();
+        open.filter(|t| !hole.contains(t)).collect()
+    };
+    write_fx(&store, "EURUSD", &without(holiday.clone()), SPREAD);
+    write_fx(
+        &store,
+        "USDJPY",
+        &without(close - HOUR..reopen + 25 * HOUR),
+        SPREAD,
+    );
+    write_fx(&store, "GBPUSD", &without(two_days), SPREAD);
+    // Three days of spot minutes from 1 March 2024, the second day missing.
+    let spot = config(InstrumentKind::Spot, 3);
+    store
+        .write_candles(&spot.instrument.id, &minutes(3, t0() + DAY..t0() + 2 * DAY))
+        .expect("seeds");
+    let t = TestServer::on(dir, store).await;
+
+    // The holiday is run through, and listed in the run's data report with its hours.
+    let (detail, _) = fx_backtest(&t, &fx_config("EURUSD", Timeframe::H1)).await;
+    let data = detail.data.expect("a data report");
+    let gap = GapInfo {
+        from: holiday.start,
+        to: holiday.end,
+        minutes: 25 * 60,
+    };
+    assert_eq!(data.gaps, [gap]);
+    assert_eq!(data.dropped.len(), 25);
+    // USDJPY's two gaps hold under two days of open time together, as the weekend between them
+    // does not count: run, and listed apart. The Friday hour is a bucket dropped as well.
+    let (detail, _) = fx_backtest(&t, &fx_config("USDJPY", Timeframe::H1)).await;
+    let data = detail.data.expect("a data report");
+    let gaps = [
+        GapInfo {
+            from: close - HOUR,
+            to: close,
+            minutes: 60,
+        },
+        GapInfo {
+            from: reopen,
+            to: reopen + 25 * HOUR,
+            minutes: 25 * 60,
+        },
+    ];
+    assert_eq!(data.gaps, gaps);
+    assert_eq!(data.dropped.len(), 26);
+
+    // Two days missing for FX, and a day for spot, are refused by the check: a run job would
+    // download them first.
+    let refused = [
+        (
+            fx_config("GBPUSD", Timeframe::H1),
+            "the store has no binance:GBPUSD:fx candles from 2024-01-09 00:00 to 2024-01-11 \
+             00:00 UTC; download them first",
+        ),
+        (
+            spot,
+            "the store has no binance:BTCUSDT:spot candles from 2024-03-02 00:00 to 2024-03-03 \
+             00:00 UTC; download them first",
+        ),
+    ];
+    for (config, message) in refused {
+        let e = check_run_data(&t.store, &config, None).expect_err("refused");
+        assert_eq!(e.body.code, "data_missing");
+        assert_eq!(e.body.message, message);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn fx_minutes_missing_either_side_of_a_weekend_are_judged_together_and_refused() {
+    // The weekend of 12 to 14 January 2024 is closed from Friday 22:00 to Sunday 22:00 UTC.
+    // EURUSD is stored from Monday 8 January to Wednesday 10 January 12:00 UTC, and USDJPY from
+    // Tuesday 16 January 12:00 to Wednesday 17 January 12:00 UTC.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = Store::new(dir.path());
+    let wednesday = fx_t0() + 2 * DAY + 12 * HOUR;
+    let tuesday = fx_t0() + 8 * DAY + 12 * HOUR;
+    let next_wednesday = fx_t0() + 9 * DAY + 12 * HOUR;
+    write_fx(&store, "EURUSD", &open_minutes(fx_t0(), wednesday), SPREAD);
+    write_fx(
+        &store,
+        "USDJPY",
+        &open_minutes(tuesday, next_wednesday),
+        SPREAD,
+    );
+    let t = TestServer::on(dir, store).await;
+
+    let refused = [
+        // To the next Wednesday 12:00: five days of open time missing from Wednesday 12:00, two
+        // days and 10 hours before the weekend and two days and 14 hours after it.
+        (
+            "EURUSD",
+            fx_t0(),
+            "the store has no binance:EURUSD:fx candles from 2024-01-10 12:00 to 2024-01-17 \
+             12:00 UTC; download them first",
+        ),
+        // From Thursday 11 January, five days and 12 hours before the stored minutes: three and
+        // a half days of open time missing, 46 hours before the weekend and 38 after it, each
+        // under two days on its own.
+        (
+            "USDJPY",
+            fx_t0() + 3 * DAY,
+            "the store has no binance:USDJPY:fx candles from 2024-01-11 00:00 to 2024-01-16 \
+             12:00 UTC; download them first",
+        ),
+    ];
+    for (symbol, from, message) in refused {
+        let config = BacktestConfig {
+            from,
+            to: next_wednesday,
+            ..fx_config(symbol, Timeframe::H1)
+        };
+        let e = check_run_data(&t.store, &config, None).expect_err("refused");
+        assert_eq!(e.body.code, "data_missing", "{symbol}");
+        assert_eq!(e.body.message, message);
+    }
+}
+
+/// Sets the ask high of the minute at `open_time` in its stored month file to `high`, past the
+/// store's checks.
+fn plant_ask_high(store: &Store, id: &InstrumentId, open_time: Millis, high: f64) {
+    use arrow::array::{Array, ArrayRef, Float64Array, Int64Array};
+    use arrow::record_batch::RecordBatch;
+    use parquet::arrow::ArrowWriter;
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+    let path = store
+        .candle_path(id, Month::containing(open_time))
+        .expect("a path");
+    let file = std::fs::File::open(&path).expect("the month file");
+    let batches: Vec<RecordBatch> = ParquetRecordBatchReaderBuilder::try_new(file)
+        .expect("parquet")
+        .build()
+        .expect("a reader")
+        .collect::<Result<_, _>>()
+        .expect("reads");
+    let mut planted = 0;
+    let batches: Vec<RecordBatch> = batches
+        .into_iter()
+        .map(|batch| {
+            let column = |name: &str| batch.column_by_name(name).expect(name).clone();
+            let times = column("open_time");
+            let times = times.as_any().downcast_ref::<Int64Array>().expect("i64");
+            let highs = column("ask_high");
+            let highs = highs.as_any().downcast_ref::<Float64Array>().expect("f64");
+            let highs: Float64Array = times
+                .values()
+                .iter()
+                .zip(highs.values())
+                .map(|(&t, &h)| {
+                    planted += usize::from(t == open_time);
+                    if t == open_time { high } else { h }
+                })
+                .collect();
+            let mut columns = batch.columns().to_vec();
+            let index = batch.schema().index_of("ask_high").expect("ask_high");
+            columns[index] = std::sync::Arc::new(highs) as ArrayRef;
+            RecordBatch::try_new(batch.schema(), columns).expect("a batch")
+        })
+        .collect();
+    assert_eq!(planted, 1);
+    let file = std::fs::File::create(&path).expect("rewrites");
+    let mut writer = ArrowWriter::try_new(file, batches[0].schema(), None).expect("a writer");
+    for batch in &batches {
+        writer.write(batch).expect("writes");
+    }
+    writer.close().expect("closes");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_crossed_stored_quote_fails_the_run_as_data_missing() {
     let dir = tempfile::tempdir().expect("temp dir");
     let store = Store::new(dir.path());
     let times = open_minutes(fx_t0(), fx_t0() + FX_DAYS * DAY);
     let bids: Vec<Candle> = times.iter().map(|&t| fx_bid(t)).collect();
     let mut asks: Vec<Candle> = times.iter().map(|&t| fx_ask(t, SPREAD)).collect();
-    // One minute's ask high below its bid high: the store checks only the open and the close, so
-    // it takes it, and the engine refuses the bar on 1m. (On 1h the other minutes' asks lift the
-    // hour's ask high back over its bid high.)
+    // One minute's ask high below its bid high. The store refuses that, so it is planted in the
+    // month file after the write, as a month written before the store checked the high would hold
+    // it; the engine refuses the bar on 1m. (On 1h the other minutes' asks lift the hour's ask
+    // high back over its bid high.)
     let crossed = fx_t0() + DAY + 10 * HOUR + 30 * MINUTE;
     let i = times.iter().position(|&t| t == crossed).unwrap();
     // The bid's open, low and close, a zero spread the store allows, and a high a tick under the
     // bid's, which is still above the open and the close.
     asks[i] = Candle {
-        high: bids[i].high - 0.01,
         volume: 0.0,
         quote_volume: 0.0,
         ..bids[i]
     };
-    store
-        .write_quotes(&fx_instrument("EURUSD").id, &bids, &asks)
-        .expect("the store takes it");
+    let id = fx_instrument("EURUSD").id;
+    store.write_quotes(&id, &bids, &asks).expect("writes");
+    plant_ask_high(&store, &id, crossed, bids[i].high - 0.01);
     let t = TestServer::on(dir, store).await;
 
     let config = fx_config("EURUSD", Timeframe::M1);

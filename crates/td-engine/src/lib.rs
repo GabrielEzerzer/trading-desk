@@ -47,8 +47,9 @@ mod verdict;
 mod private_strategies_build;
 
 pub use battery::{
-    BatteryResult, BatteryRuns, BatterySpec, Breakdown, CostStress, IntegrityReport, PlateauReport,
-    RegimeResult, SideResult, StartOffset, battery_runs, run_battery,
+    BatteryResult, BatteryRuns, BatterySpec, Breakdown, CostStress, IntegrityReport,
+    PlateauDirection, PlateauReport, RegimeResult, SideResult, StartOffset, battery_runs,
+    run_battery,
 };
 pub use broker::{AttachedStop, Broker, BrokerEvent, Order, OrderStatus, SimBroker};
 pub use error::{EngineError, OrderRejected};
@@ -62,14 +63,14 @@ pub use plan::{
     date,
 };
 pub use portfolio::Portfolio;
-pub use registry::{StrategyEntry, build_strategy, find_strategy, strategies};
+pub use registry::{StrategyEntry, build_strategy, code_hash, find_strategy, strategies};
 pub use results::{
     PlanRun, RunId, RunKind, RunSummary, SavedRun, StoreError, list, load, save, save_with_files,
 };
 pub use risk::{DayRollover, EquityRange};
 pub use runner::{
     BacktestConfig, BacktestResult, Benchmark, ENGINE_REVISION, Rerun, config_fingerprint,
-    data_fingerprint, default_slippage_bps, rerun, run,
+    data_fingerprint, default_slippage_bps, rerun, run, run_strategy,
 };
 pub use session::{
     CLOSE_OUT_TAG, EquityPoint, LIQUIDATION_TAG, MAINTENANCE_MARGIN_RATE, Session, SessionConfig,
@@ -84,12 +85,12 @@ pub use tester::{
     WindowSpec, out_of_sample, permutation_test, stitch, sweep, walk_forward,
 };
 pub use trades::{
-    BarFunding, BarStops, Trade, TradeSide, attach_stops, build_trades, build_trades_with_fills,
+    BarFunding, Trade, TradeSide, TradeStops, attach_stops, build_trades, build_trades_with_fills,
 };
 pub use verdict::{
     Comparison, Criterion, DrawdownMode, EvidenceInputs, FirmLimits, HighRiskLimits,
-    IntegrityInputs, KindInputs, Layer, MAX_DROPPED_SHARE, OosIntegrityInputs, Outcome,
-    PortfolioBenchmark, PortfolioLimits, PropFirmLimits, RuleKind, TOO_GOOD_SHARPE, Unit, Verdict,
-    VerdictRule, VerdictState, combine, evaluate, evaluate_evidence, evaluate_integrity,
+    IntegrityInputs, KindInputs, Layer, LoosenedLimit, MAX_DROPPED_SHARE, OosIntegrityInputs,
+    Outcome, PortfolioBenchmark, PortfolioLimits, PropFirmLimits, RuleKind, TOO_GOOD_SHARPE, Unit,
+    Verdict, VerdictRule, VerdictState, combine, evaluate, evaluate_evidence, evaluate_integrity,
     evaluate_oos_integrity,
 };

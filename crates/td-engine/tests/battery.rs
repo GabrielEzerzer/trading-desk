@@ -2,19 +2,24 @@
 //! `trade`, noise does not, a short range gives `not_enough_evidence`, missing bars give
 //! `invalid`, a cancel in the luck test gives an inconclusive luck line, the same seed gives the
 //! same result at any thread count, the progress count adds up, on a market with quotes the
-//! asks reach the runs, and a result saved before the drawdown bootstrap existed still reads.
+//! asks reach every run (the luck test's too) and R4 widens the spread, R5 is judged on the test
+//! windows, a position held through an unmodelled rollover is warned of, and a result saved
+//! before the drawdown bootstrap existed still reads.
 
 mod common;
 
 use std::ops::ControlFlow;
 use std::sync::Mutex;
 
-use td_core::{Candle, Instrument, InstrumentKind, Millis, Timeframe};
+use td_core::{
+    AccountCurrency, Candle, FeeSchedule, Instrument, InstrumentKind, Millis, Timeframe,
+};
 use td_engine::{
     BatteryResult, BatterySpec, Direction, DrawdownMode, EvidenceSettings, FirmLimits,
     HighRiskLimits, Layer, MAX_RUNS, Metric, Objective, Outcome, ParamAxis, ParamSpace, ParamValue,
-    Params, Period, PortfolioBenchmark, PortfolioLimits, PropFirmLimits, SweepPlan, TestPlan,
-    TesterError, VerdictRule, VerdictState, WalkForwardPlan, risk, run_battery,
+    Params, Period, PortfolioBenchmark, PortfolioLimits, PropFirmLimits, SlippageOverride,
+    SweepPlan, TestPlan, TesterError, VerdictRule, VerdictState, WalkForwardPlan, risk,
+    run_battery,
 };
 
 const HOUR: Millis = 3_600_000;
@@ -27,6 +32,8 @@ const T0: Millis = 1_704_067_200_000;
 const DAYS: i64 = 250;
 /// The sweep: 3 x 3 parameter sets.
 const PER_SWEEP: usize = 9;
+/// R5's runs counted per window: the most neighbours a set has on the 3 x 3 grid.
+const NEIGHBOURS: usize = 8;
 const PERMUTATIONS: usize = 19;
 
 /// A small xorshift generator for the synthetic noise, uniform in `[-0.5, 0.5)`.
@@ -126,6 +133,8 @@ fn plan(days: i64) -> TestPlan {
             starting_cash: 10_000.0,
             max_leverage: 1.0,
             slippage: Vec::new(),
+            account_currency: AccountCurrency::Quote,
+            fee_override: None,
         },
         sweep: SweepPlan {
             fixed: Params::new().with("allow_short", ParamValue::Bool(true)),
@@ -213,9 +222,48 @@ fn full_total(windows: usize, offset_windows: usize) -> usize {
     3 + PER_SWEEP
         + windows * PER_SWEEP
         + 3 * windows
+        + windows * NEIGHBOURS
         + windows
         + offset_windows * PER_SWEEP
         + PER_SWEEP * (PERMUTATIONS + 1)
+}
+
+/// R5's neighbours that are off the grid, over every window: a set has 8 neighbours on the 3 x 3
+/// grid when it is in the middle of both axes, and fewer at an edge. Those are counted but never
+/// run.
+fn off_grid_neighbours(r: &BatteryResult) -> usize {
+    let wf = r.walk_forward.as_ref().unwrap();
+    wf.windows
+        .iter()
+        .map(|w| {
+            let choices = |name: &str, middle: i64| {
+                if w.params.get(name) == Some(ParamValue::Int(middle)) {
+                    3
+                } else {
+                    2
+                }
+            };
+            NEIGHBOURS + 1 - choices("fast", 3) * choices("slow", 12)
+        })
+        .sum()
+}
+
+/// Checks that every run the battery made was counted once against the total: the counts are
+/// distinct, reach the total, and the only ones not reported are R5's neighbours off the grid,
+/// which R5 reports as the runs it made.
+fn assert_every_run_counted_once(r: &BatteryResult, calls: &[(usize, usize)]) {
+    assert!(calls.iter().all(|&(_, total)| total == r.runs));
+    let mut done: Vec<usize> = calls.iter().map(|&(d, _)| d).collect();
+    done.sort_unstable();
+    let reported = done.len();
+    done.dedup();
+    assert_eq!(done.len(), reported, "a count was reported twice");
+    assert_eq!(done.last(), Some(&r.runs));
+    let off_grid = off_grid_neighbours(r);
+    assert_eq!(done.len(), r.runs - off_grid);
+    let made = r.walk_forward.as_ref().unwrap().windows.len() * NEIGHBOURS - off_grid;
+    let directions = &r.plateau.as_ref().unwrap().directions;
+    assert_eq!(directions.iter().map(|d| d.windows).sum::<usize>(), made);
 }
 
 #[test]
@@ -250,9 +298,22 @@ fn a_planted_edge_reaches_trade_with_every_input_from_the_runs() {
     assert_eq!(r.evidence.stressed_return, Some(stress.total_return));
     assert!(stress.total_return < m.total_return.unwrap());
     assert_eq!(r.evidence.start_offsets_same_sign, 8);
+    // R5 is judged on the test windows: against R1's own stitched objective, with a neighbour
+    // in every direction the grid has around the sets the windows chose, each run on test bars.
     let plateau = r.plateau.as_ref().unwrap();
+    assert_eq!(plateau.best_objective, m.sharpe);
+    assert!(!plateau.directions.is_empty());
+    assert!(
+        plateau
+            .directions
+            .iter()
+            .all(|d| (1..=4).contains(&d.windows))
+    );
     assert_eq!(r.evidence.plateau_median_ratio, plateau.median_ratio);
     assert_eq!(r.evidence.plateau_positive_share, plateau.positive_share);
+    assert!(plateau.median_ratio.is_some() && plateau.positive_share.is_some());
+    // A perpetual's funding is modelled, so nothing is warned of.
+    assert!(r.verdict.warnings.is_empty());
 
     // The kind inputs too: Sharpe, drawdown, alpha against cash (the strategy's own CAGR) and the
     // bootstrap of the daily returns.
@@ -594,10 +655,7 @@ fn progress_counts_every_run_once_against_one_total() {
     // hold three.
     let offset_windows = 2 * 4 + 6 * 3;
     assert_eq!(r.runs, full_total(4, offset_windows));
-    assert!(calls.iter().all(|&(_, total)| total == r.runs));
-    let mut done: Vec<usize> = calls.iter().map(|&(d, _)| d).collect();
-    done.sort_unstable();
-    assert_eq!(done, (1..=r.runs).collect::<Vec<_>>());
+    assert_every_run_counted_once(&r, &calls);
     let windows: usize = r.start_offsets.iter().map(|o| o.windows).sum();
     assert_eq!(windows, offset_windows);
 }
@@ -708,23 +766,53 @@ fn fx_bars(spread: f64) -> (Vec<Candle>, Vec<Candle>) {
     (bars, asks)
 }
 
-fn fx_battery(bars: &[Candle], asks: &[Candle]) -> BatteryResult {
+/// FX, on the plan of the perpetual's tests over 340 days.
+fn fx_plan() -> (Instrument, TestPlan) {
     let instrument = common::instrument(InstrumentKind::Fx);
     let mut plan = plan(340);
     plan.instruments = vec![instrument.id.clone()];
+    (instrument, plan)
+}
+
+fn fx_run(
+    plan: &TestPlan,
+    bars: &[Candle],
+    asks: &[Candle],
+    progress: Option<td_engine::Progress>,
+) -> BatteryResult {
+    let instrument = common::instrument(InstrumentKind::Fx);
     let spec = BatterySpec {
         strategy: "sma_cross",
-        plan: &plan,
+        plan,
         rule: &cash_rule(),
         instrument: &instrument,
         seed: 7,
     };
-    run_battery(&spec, bars, asks, &[], None).unwrap()
+    run_battery(&spec, bars, asks, &[], progress).unwrap()
+}
+
+fn fx_battery(bars: &[Candle], asks: &[Candle]) -> BatteryResult {
+    fx_run(&fx_plan().1, bars, asks, None)
+}
+
+/// The FX plan with no fees and no slippage, so the spread is its only cost.
+fn spread_only_plan() -> TestPlan {
+    let (instrument, mut plan) = fx_plan();
+    plan.backtest.fee_override = Some(FeeSchedule {
+        maker: 0.0,
+        taker: 0.0,
+        per_unit: 0.0,
+    });
+    plan.backtest.slippage = vec![SlippageOverride {
+        instrument: instrument.id,
+        bps: 0.0,
+    }];
+    plan
 }
 
 /// The battery runs on FX with its asks: every run fills buys on the ask, so a spread lowers each
 /// swept set's return against the same bars with a zero spread. I1 leaves the closed weekend out of
-/// the buckets, and the luck test, which cannot shuffle asks yet, is inconclusive.
+/// the buckets, and the luck test rebuilds the asks on its shuffled bars.
 #[test]
 fn on_a_market_with_quotes_the_asks_reach_every_run() {
     let (bars, wide) = fx_bars(0.05);
@@ -761,20 +849,137 @@ fn on_a_market_with_quotes_the_asks_reach_every_run() {
         flat.walk_forward.as_ref().unwrap().metrics.total_return
     );
 
-    // R4 and R6 ran, and the luck test did not.
+    // R4, R6 and the luck test ran, the luck test on the asks too: its real sweep is the
+    // battery's own, spread and all.
     assert!(r.cost_stress.is_some(), "{:#?}", r.verdict.criteria);
     assert_eq!(r.start_offsets.len(), 8);
     assert_ne!(r.cost_stress, flat.cost_stress);
-    assert!(r.permutation.is_none());
-    // Skipped, not cancelled.
+    let luck = r.permutation.as_ref().expect("the luck test ran");
+    let flat_luck = flat.permutation.as_ref().unwrap();
+    assert_eq!(luck.spec.permutations, PERMUTATIONS);
+    assert_ne!(luck, flat_luck);
     assert!(!r.luck_cancelled);
-    let luck = line(&r, "luck_p");
-    assert_eq!(luck.outcome, Outcome::Inconclusive);
+    let luck_line = line(&r, "luck_p");
+    assert_eq!(luck_line.value, Some(luck.p_value));
+    assert_ne!(luck_line.outcome, Outcome::Inconclusive, "{luck_line:#?}");
+}
+
+/// A strong edge on FX reaches `trade`: with the luck test running on the asks, an FX strategy is
+/// no longer held at `not_enough_evidence` whatever its result.
+#[test]
+fn on_a_market_with_quotes_a_strong_edge_reaches_trade() {
+    let (bars, asks) = fx_bars(0.01);
+    let r = fx_run(&spread_only_plan(), &bars, &asks, None);
     assert_eq!(
-        luck.note.as_deref(),
-        Some(
-            "The luck test does not run on a market with quotes yet: it shuffles the bars and \
-             cannot shuffle the asks with them."
-        )
+        r.verdict.state,
+        VerdictState::Trade,
+        "{:#?}",
+        r.verdict.criteria
     );
+    assert_eq!(line(&r, "luck_p").outcome, Outcome::Pass);
+}
+
+/// R4 on a market with quotes widens each bar's spread: with no fees and no slippage there is
+/// nothing else to stress, and the stressed run still loses against the plain one. The plan's fee
+/// override reaches every run.
+#[test]
+fn on_a_market_with_quotes_the_cost_stress_widens_the_spread() {
+    let plan = spread_only_plan();
+    let (bars, asks) = fx_bars(0.01);
+    let r = fx_run(&plan, &bars, &asks, None);
+    let wf = r.walk_forward.as_ref().unwrap();
+    assert!(
+        wf.windows
+            .iter()
+            .all(|w| w.out_of_sample.config.fee_override == plan.backtest.fee_override)
+    );
+    assert!(
+        wf.windows
+            .iter()
+            .all(|w| w.out_of_sample.config.slippage_bps == 0.0)
+    );
+    let stress = r.cost_stress.as_ref().expect("R4 ran");
+    let plain = wf.metrics.total_return.unwrap();
+    assert!(
+        stress.total_return < plain - 0.001,
+        "stressed {} against plain {plain}",
+        stress.total_return
+    );
+
+    // With no spread either, there is nothing to stress, and the stressed run is the plain one.
+    let (_, zero) = fx_bars(0.0);
+    let r = fx_run(&plan, &bars, &zero, None);
+    let plain = r
+        .walk_forward
+        .as_ref()
+        .unwrap()
+        .metrics
+        .total_return
+        .unwrap();
+    let stressed = r.cost_stress.as_ref().unwrap().total_return;
+    assert!(
+        (stressed - plain).abs() < 1e-9,
+        "{stressed} against {plain}"
+    );
+}
+
+/// On a market with quotes the progress count is the runs made too: the luck test it counts
+/// runs, so the count no longer jumps from R6 to the total.
+#[test]
+fn on_a_market_with_quotes_every_run_is_counted_once() {
+    let (bars, asks) = fx_bars(0.01);
+    let calls = Mutex::new(Vec::new());
+    let progress = |done, total| {
+        calls.lock().unwrap().push((done, total));
+        ControlFlow::Continue(())
+    };
+    let r = fx_run(&spread_only_plan(), &bars, &asks, Some(&progress));
+    assert!(r.permutation.is_some());
+    let offset_windows: usize = r.start_offsets.iter().map(|o| o.windows).sum();
+    assert_eq!(r.runs, full_total(4, offset_windows));
+    assert_every_run_counted_once(&r, &calls.into_inner().unwrap());
+}
+
+/// FX charges a swap on a position held through the daily rollover, which the engine does not
+/// model: the moving-average cross holds for days, so the verdict names that cost.
+#[test]
+fn a_position_held_through_an_unmodelled_rollover_is_warned_of() {
+    let (bars, asks) = fx_bars(0.01);
+    let r = fx_run(&spread_only_plan(), &bars, &asks, None);
+    let trades = r.walk_forward.as_ref().unwrap().trades.len();
+    assert_eq!(r.verdict.warnings.len(), 1, "{:?}", r.verdict.warnings);
+    let warning = &r.verdict.warnings[0];
+    let named = format!("of {trades} out-of-sample trades held a position through the overnight");
+    assert!(warning.contains(&named), "{warning}");
+}
+
+/// A prop-firm rule's pass odds run to its own horizon and its breach odds to theirs: a shorter
+/// pass horizon changes the pass odds alone, and equal horizons give the odds as before.
+#[test]
+fn the_pass_odds_run_to_their_own_horizon() {
+    let bars = edge_bars(DAYS);
+    let plan = plan(DAYS);
+    let odds = |pass_horizon_days| {
+        let VerdictRule::PropFirm { firm, limits } = prop_firm_rule() else {
+            unreachable!()
+        };
+        let rule = VerdictRule::PropFirm {
+            firm,
+            limits: PropFirmLimits {
+                pass_horizon_days,
+                ..limits
+            },
+        };
+        let r = battery(&plan, &rule, &bars, 7, None).unwrap();
+        let odds = r.prop_firm_odds.unwrap();
+        assert_eq!(r.kind.pass_probability, Some(odds.pass));
+        assert_eq!(r.kind.breach_probability, Some(odds.breach));
+        odds
+    };
+    let default = PropFirmLimits::default();
+    assert_eq!(default.pass_horizon_days, 90);
+    assert_eq!(default.pass_horizon_days, default.breach_horizon_days);
+    let (same, short) = (odds(90), odds(1));
+    assert_eq!(short.breach, same.breach);
+    assert!(short.pass < same.pass, "{short:?} against {same:?}");
 }

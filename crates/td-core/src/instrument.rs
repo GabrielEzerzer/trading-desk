@@ -11,6 +11,8 @@ use crate::{CoreError, OrderRequest, OrderType};
 pub enum Venue {
     Binance,
     Bybit,
+    /// OANDA's v20 REST API on a practice account: FX bid and ask candles, no trading.
+    Oanda,
 }
 
 impl fmt::Display for Venue {
@@ -18,6 +20,7 @@ impl fmt::Display for Venue {
         f.write_str(match self {
             Venue::Binance => "binance",
             Venue::Bybit => "bybit",
+            Venue::Oanda => "oanda",
         })
     }
 }
@@ -193,10 +196,10 @@ impl Instrument {
                 min: self.min_qty,
             });
         }
-        // Venues exempt reduce-only perpetual orders from the minimum notional, so a position that
-        // has shrunk below it in value can still be closed. Whether the order really reduces a
-        // position is the broker's check.
-        let exempt = order.reduce_only && self.id.kind == InstrumentKind::Perpetual;
+        // Venues exempt reduce-only orders on margined markets (perpetuals, FX) from the minimum
+        // notional, so a position that has shrunk below it in value can still be closed. Whether
+        // the order really reduces a position is the broker's check.
+        let exempt = order.reduce_only && self.id.kind.rules().margin;
         let notional = qty * price;
         if !exempt && notional < self.min_notional * (1.0 - TOLERANCE) {
             return Err(CoreError::NotionalBelowMin {
@@ -225,7 +228,9 @@ fn positive(field: &'static str, value: f64) -> Result<f64, CoreError> {
 /// is scaled to an integer number of units first, a small epsilon absorbs the remaining error, and
 /// the result is built from integers so it is the float nearest the decimal value. The epsilon is
 /// a few units of float error in the step count, so it stays far below one step even for large
-/// counts.
+/// counts. For `Nearest` it pushes away from zero, so a value a half step off the grid in decimal
+/// rounds away from zero whichever side of the half its float lands on (1.005 and 2.675 at tick
+/// 0.01 are 100.49999999999999 and 267.5 ticks in f64).
 fn round_to_step(value: f64, step: f64, rounding: Rounding) -> f64 {
     let scale = 10f64.powi(step_decimals(step));
     let step_units = (step * scale).round();
@@ -234,7 +239,7 @@ fn round_to_step(value: f64, step: f64, rounding: Rounding) -> f64 {
     let n = match rounding {
         Rounding::Down => (steps + eps).floor(),
         Rounding::Up => (steps - eps).ceil(),
-        Rounding::Nearest => steps.round(),
+        Rounding::Nearest => (steps + eps.copysign(steps)).round(),
     };
     n * step_units / scale
 }
@@ -377,6 +382,16 @@ mod tests {
     }
 
     #[test]
+    fn half_ticks_round_away_from_zero() {
+        // In f64, 1.005 / 0.01 lands just under 100.5 and 2.675 / 0.01 exactly on 267.5.
+        let i = with_steps(0.01, 0.01);
+        assert_eq!(i.round_price(1.005, Rounding::Nearest), 1.01);
+        assert_eq!(i.round_price(2.675, Rounding::Nearest), 2.68);
+        assert_eq!(round_to_step(-1.005, 0.01, Rounding::Nearest), -1.01);
+        assert_eq!(i.round_price(1.0049, Rounding::Nearest), 1.0);
+    }
+
+    #[test]
     fn rounded_values_are_the_nearest_float_to_the_decimal() {
         // A naive 3.0 * 0.1 gives 0.30000000000000004.
         assert_eq!(with_steps(0.1, 0.1).round_qty(0.31), 0.3);
@@ -460,12 +475,24 @@ mod tests {
     }
 
     #[test]
-    fn reduce_only_perpetual_order_is_exempt_from_min_notional() {
+    fn reduce_only_margined_orders_are_exempt_from_min_notional() {
         let i = btc_perp();
         let limit = OrderType::Limit { price: 4000.0 };
         let mut o = order(0.001, limit);
         o.reduce_only = true;
         assert!(i.validate_order(&o, 65000.0).is_ok());
+
+        // FX is margined too, so a reduce-only order there is exempt as well.
+        let fx = Instrument {
+            id: InstrumentId {
+                kind: InstrumentKind::Fx,
+                ..i.id.clone()
+            },
+            ..i.clone()
+        };
+        let mut on_fx = o.clone();
+        on_fx.instrument = fx.id.clone();
+        assert!(fx.validate_order(&on_fx, 65000.0).is_ok());
 
         let spot = Instrument {
             id: InstrumentId {

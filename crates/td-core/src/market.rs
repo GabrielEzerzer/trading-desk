@@ -59,6 +59,26 @@ pub struct MarketRules {
     /// The kind needs an ask series beside its candles, which hold the bid.
     pub quotes: bool,
     pub hours: Hours,
+    /// A financing cost the market charges on held positions that the engine does not model yet,
+    /// if any. Funding (`funding`) is modelled, so it is never one.
+    pub unmodelled_carry: Option<Carry>,
+}
+
+/// A financing cost charged on a position held through a point in time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Carry {
+    /// The overnight swap, paid or received on a position held through the daily rollover at
+    /// 17:00 New York time.
+    DailyRollover,
+}
+
+impl Carry {
+    /// The cost, as a warning names it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Carry::DailyRollover => "the overnight swap at the daily rollover (17:00 New York)",
+        }
+    }
 }
 
 /// When a market is open.
@@ -81,6 +101,7 @@ impl InstrumentKind {
                 liquidation: false,
                 quotes: false,
                 hours: Hours::Always,
+                unmodelled_carry: None,
             },
             InstrumentKind::Perpetual => MarketRules {
                 margin: true,
@@ -89,9 +110,10 @@ impl InstrumentKind {
                 liquidation: true,
                 quotes: false,
                 hours: Hours::Always,
+                unmodelled_carry: None,
             },
-            // FX margin rules (margin call and stop-out) are a named gap on #44, so FX has no
-            // liquidation yet.
+            // FX margin rules (margin call and stop-out) and the overnight swap are named gaps on
+            // #44, so FX has no liquidation yet and its swap is not charged.
             InstrumentKind::Fx => MarketRules {
                 margin: true,
                 can_short: true,
@@ -99,6 +121,7 @@ impl InstrumentKind {
                 liquidation: false,
                 quotes: true,
                 hours: Hours::FxWeek,
+                unmodelled_carry: Some(Carry::DailyRollover),
             },
         }
     }
@@ -172,7 +195,9 @@ fn fx_weekend(sunday: i64) -> Range<Millis> {
 /// shortcut: this is the US rule since 2007. Before 2007 daylight saving ran from the first Sunday
 /// of April to the last Sunday of October, so FX weekends in the weeks between the two rules
 /// (mid-March to early April, and late October to early November) come out an hour off for data
-/// before 2007. Upgrade to a per-year rule when the desk backtests FX before 2007.
+/// before 2007. What keeps runs inside that limit is OANDA's earliest download date, 2007-01-01
+/// (td-server's `OANDA_EARLIEST_FROM`), which the app's downloads and charts keep to; the
+/// `td-data` CLI does not check it. Upgrade to a per-year rule before moving that date earlier.
 fn new_york_offset_hours(day: i64) -> i64 {
     let (year, _, _) = crate::civil_from_days(day);
     let first_sunday = |month: u32| {
@@ -221,6 +246,7 @@ mod tests {
         assert!(!spot.liquidation);
         assert!(!spot.quotes);
         assert_eq!(spot.hours, Hours::Always);
+        assert_eq!(spot.unmodelled_carry, None);
 
         let perp = Perpetual.rules();
         assert!(perp.margin);
@@ -229,6 +255,8 @@ mod tests {
         assert!(perp.liquidation);
         assert!(!perp.quotes);
         assert_eq!(perp.hours, Hours::Always);
+        // Funding is modelled, so a perpetual has no unmodelled carry.
+        assert_eq!(perp.unmodelled_carry, None);
 
         let fx = Fx.rules();
         assert!(fx.margin);
@@ -237,6 +265,7 @@ mod tests {
         assert!(!fx.liquidation);
         assert!(fx.quotes);
         assert_eq!(fx.hours, Hours::FxWeek);
+        assert_eq!(fx.unmodelled_carry, Some(Carry::DailyRollover));
     }
 
     /// Checks one weekend: `close` is Friday 17:00 New York in UTC and `open` Sunday 17:00.

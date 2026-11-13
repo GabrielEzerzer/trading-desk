@@ -46,7 +46,7 @@ export function serve() {
 }
 
 /** The init script that installs the bridge stub with this config before the page loads. */
-export function stubScript(config) {
+function stubScript(config) {
   const full = { hangStrategies: false, engineData, ...config }
   return `${stubSource}\ninstallBridgeStub(${JSON.stringify(full)})`
 }
@@ -93,6 +93,20 @@ export async function settle(page) {
 const chooseRow = async (page, name) => {
   await page.getByRole('button', { name }).click()
   await page.mouse.move(0, 0)
+}
+
+/** Opens the stored market data from the strategy list. */
+const openStoredData = async (page) => {
+  await chooseRow(page, /^Stored data/)
+  await page.getByRole('heading', { name: 'Market data', level: 1 }).waitFor()
+}
+
+/** Opens the stored data and asks to delete all of BTCUSDT perpetual. */
+const askDeleteBtc = async (page) => {
+  await openStoredData(page)
+  await page.getByRole('button', { name: 'Delete BTCUSDT perpetual, Binance' }).click()
+  await page.getByRole('menuitem', { name: /All of it/ }).click()
+  await page.getByRole('group', { name: 'Confirm the delete' }).waitFor()
 }
 
 // Trading. Its states carry `section: 'trading'`. Those past the engine's start run on
@@ -228,9 +242,17 @@ const placeOrder = async (page, side, size) => {
   await page.getByRole('button', { name: side, exact: true }).click()
 }
 
-/** Starts a Manual session and buys 0.05 BTC at market; the mock fills it at the next bar's open. */
-const holdBtc = async (page) => {
+/** Starts a Manual session and waits out its two bars of warm-up; like the engine, it takes no order before. */
+const startLive = async (page) => {
   await startManual(page)
+  await nextBar(page)
+  await nextBar(page)
+  await page.locator('.position-summary').filter({ hasText: 'Manual · Live' }).waitFor()
+}
+
+/** A live Manual session that buys 0.05 BTC at market; the mock fills it at the next bar's open. */
+const holdBtc = async (page) => {
+  await startLive(page)
   await placeOrder(page, 'Buy', '0.05')
   await page.getByText('Buy 0.05000 BTC at market sent.').waitFor()
   await nextBar(page)
@@ -397,6 +419,21 @@ export const STATES = [
     },
   },
   {
+    // The engine started with TD_DATA_CUTOFF, and the strategy's code changed since its saved run.
+    name: 'lab-engine-code-changed',
+    config: { engine: 'running', mock: false, dataCutoff: '2025-03-31', codeChanged: true },
+    steps: async (page) => {
+      await chooseRow(page, /SMA cross/)
+      await page.getByRole('heading', { name: 'No verdict rule yet' }).waitFor()
+      await page.getByText("The strategy's code has changed since this run", { exact: false }).waitFor()
+    },
+  },
+  {
+    name: 'lab-engine-cutoff',
+    config: { engine: 'running', mock: false, dataCutoff: '2025-03-31' },
+    steps: async (page) => page.getByText('Data cutoff in force', { exact: false }).waitFor(),
+  },
+  {
     name: 'lab-engine-null-metrics',
     config: { engine: 'running', mock: false },
     steps: async (page) => {
@@ -412,6 +449,17 @@ export const STATES = [
       await page.getByRole('heading', { name: 'No verdict rule yet' }).waitFor()
       await page.evaluate(() => document.getElementById('metrics-title')?.scrollIntoView({ block: 'start' }))
       await page.waitForFunction(() => (document.querySelector('.lab-scroll')?.scrollTop ?? 0) > 0)
+    },
+  },
+  {
+    // Nothing is stored, as after deleting all market data: the saved result shows, with the
+    // download offered under its verdict.
+    name: 'lab-engine-past-result-no-data',
+    config: { engine: 'running', mock: false, noData: true },
+    steps: async (page) => {
+      await chooseRow(page, /SMA cross/)
+      await page.getByRole('heading', { name: 'No verdict rule yet' }).waitFor()
+      await page.getByRole('button', { name: 'Download BTCUSDT history' }).waitFor()
     },
   },
   {
@@ -436,6 +484,18 @@ export const STATES = [
       await page.mouse.move(0, 0)
       await page.clock.runFor(800)
       await page.locator('[role=progressbar][aria-valuenow="50"]').waitFor()
+    },
+  },
+  {
+    // The engine started without OANDA_API_TOKEN: the stub fails every download the way the engine
+    // fails an OANDA one.
+    name: 'lab-engine-download-no-token',
+    config: { engine: 'running', mock: false, noData: true, download: 'no_token' },
+    steps: async (page) => {
+      await chooseRow(page, /Donchian breakout/)
+      await page.getByRole('button', { name: 'Download BTCUSDT history' }).click()
+      await page.mouse.move(0, 0)
+      await page.getByText('FX downloads from OANDA need an API token.', { exact: false }).waitFor()
     },
   },
   {
@@ -465,6 +525,46 @@ export const STATES = [
       await chooseRow(page, /Donchian breakout/)
       await page.getByRole('button', { name: 'Overrides' }).click()
       await page.getByRole('menuitemradio', { name: 'BTCUSDT perpetual, Binance' }).waitFor()
+    },
+  },
+  {
+    name: 'lab-data',
+    config: { engine: 'running', mock: true },
+    steps: openStoredData,
+  },
+  {
+    name: 'lab-data-empty',
+    config: { engine: 'running', mock: false, noData: true },
+    steps: async (page) => {
+      await openStoredData(page)
+      await page.getByText('Nothing stored', { exact: true }).waitFor()
+    },
+  },
+  {
+    name: 'lab-data-confirm',
+    config: { engine: 'running', mock: false },
+    steps: askDeleteBtc,
+  },
+  {
+    name: 'lab-data-confirm-range',
+    config: { engine: 'running', mock: false },
+    steps: async (page) => {
+      await openStoredData(page)
+      await page.getByRole('button', { name: 'Delete BTCUSDT perpetual, Binance' }).click()
+      await page.getByRole('menuitem', { name: 'A range of months' }).click()
+      await page.getByRole('button', { name: 'To: Jan 2024' }).click()
+      await page.getByRole('menuitemradio', { name: 'Jun 2024' }).click()
+      await page.getByText('That is 6 months.', { exact: false }).waitFor()
+    },
+  },
+  {
+    name: 'lab-data-delete-failed',
+    config: { engine: 'running', mock: false, deleteFails: true },
+    steps: async (page) => {
+      await askDeleteBtc(page)
+      await page.getByRole('button', { name: 'Delete', exact: true }).click()
+      await page.mouse.move(0, 0)
+      await page.getByText('The delete failed.', { exact: false }).waitFor()
     },
   },
   {
@@ -688,8 +788,6 @@ export const STATES = [
     clock: true,
     steps: async (page) => {
       await holdBtc(page)
-      // The second bar ends the warm-up.
-      await nextBar(page)
       await page.locator('.position-summary').filter({ hasText: 'Manual · Live' }).waitFor()
       await page.mouse.move(0, 0)
       await quiet(page)
@@ -718,7 +816,7 @@ export const STATES = [
     config: { engine: 'running', mock: true },
     clock: true,
     steps: async (page) => {
-      await startManual(page)
+      await startLive(page)
       await page.getByPlaceholder('Size').fill('0.05')
       await page.getByRole('button', { name: /^Order type:/ }).click()
       await page.getByRole('menuitemradio', { name: 'Limit' }).click()
@@ -735,10 +833,10 @@ export const STATES = [
     config: { engine: 'running', mock: true },
     clock: true,
     steps: async (page) => {
-      await startManual(page)
+      await startLive(page)
       await placeOrder(page, 'Sell', '0.05')
       await page.mouse.move(0, 0)
-      await page.getByText(/^Order rejected:/).waitFor()
+      await page.getByText(/^Spot sessions cannot sell more than they hold/).waitFor()
       await quiet(page)
     },
   },
@@ -761,11 +859,7 @@ export const STATES = [
     config: { engine: 'running', mock: true },
     clock: true,
     steps: async (page) => {
-      await startManual(page)
-      // Two bars of warm-up, then the session is live.
-      await nextBar(page)
-      await nextBar(page)
-      await page.locator('.position-summary').filter({ hasText: 'Manual · Live' }).waitFor()
+      await startLive(page)
       await page.evaluate(() => window.tdMockTrading?.dropBucket())
       await page.mouse.move(0, 0)
       await page.locator('.position-notice').waitFor()

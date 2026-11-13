@@ -414,7 +414,9 @@ pub struct PropFirmSpec {
     /// The maximum drawdown, measured as `drawdown` says. Infinity turns it off.
     pub max_drawdown: f64,
     pub drawdown: DrawdownMode,
-    /// Days per path; #35's breach rule uses 90.
+    /// Days per path. The battery runs the paths once per horizon of the `prop_firm` rule: to its
+    /// `pass_horizon_days` for the pass odds and its `breach_horizon_days` for the breach odds,
+    /// both 90 by default.
     pub horizon_days: usize,
     pub paths: usize,
     /// The mean block length; [`default_block_len`] of the number of returns is the default.
@@ -422,7 +424,8 @@ pub struct PropFirmSpec {
     pub seed: u64,
 }
 
-/// The odds of a prop-firm challenge over simulated paths.
+/// The odds of a prop-firm challenge over simulated paths. The battery takes `pass` and `breach`
+/// from runs to their own horizons, and the same run when the horizons are equal.
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct PropFirmOdds {

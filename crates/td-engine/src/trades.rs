@@ -5,6 +5,9 @@ use std::ops::Range;
 use serde::{Deserialize, Serialize};
 use td_core::{AccountCurrency, Candle, Fill, Liquidity, Millis, Side};
 
+use crate::metrics::finite;
+use crate::portfolio::next_position;
+
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -116,10 +119,12 @@ pub struct BarFunding {
     pub in_bar: f64,
 }
 
-/// The protective stops open on one bar, from which a trade that opened on it takes its stop; see
+/// The protective stops in force when one trade opened, from which it takes its stop; see
 /// [`attach_stops`].
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
-pub struct BarStops {
+pub struct TradeStops {
+    /// Open time of the bar of the fill that opened the trade.
+    pub entry_time: Millis,
     /// The highest trigger among the reduce-only sell stops: the one nearest a long position's
     /// price, which would trigger first.
     pub sell: Option<f64>,
@@ -127,7 +132,7 @@ pub struct BarStops {
     pub buy: Option<f64>,
 }
 
-impl BarStops {
+impl TradeStops {
     /// Counts a reduce-only stop on `side` with `trigger`.
     pub(crate) fn add(&mut self, side: Side, trigger: f64) {
         match side {
@@ -261,17 +266,21 @@ impl Building {
     }
 }
 
-/// `Some(x)` if `x` is finite.
-fn finite(x: f64) -> Option<f64> {
-    x.is_finite().then_some(x)
-}
-
 /// The candle a position of `pos` would close on, as the session marks it: on a market with
 /// quotes, the ask for a short and the bar, which holds the bid, for a long; without an ask, the
 /// bar.
 pub(crate) fn closing_side(bar: &Candle, ask: Option<Candle>, pos: f64) -> Candle {
     match ask {
         Some(ask) if pos < 0.0 => ask,
+        _ => *bar,
+    }
+}
+
+/// The candle a fill on `side` happened on: the ask for a buy on a market with quotes (`ask` is
+/// `Some`), the bar otherwise.
+pub(crate) fn fill_side(bar: &Candle, ask: Option<Candle>, side: Side) -> Candle {
+    match (side, ask) {
+        (Side::Buy, Some(ask)) => ask,
         _ => *bar,
     }
 }
@@ -307,7 +316,8 @@ pub(crate) fn closing_side(bar: &Candle, ask: Option<Candle>, pos: f64) -> Candl
 /// close on: the open, for a position held into the bar; the price of each fill, for the position
 /// before that fill; and the whole range, for the position after the bar's fills, since the
 /// session counts the whole range as coming after them (see [`crate::Session::on_bar`]). A fill
-/// that adds to an open trade counts at its price held to the range, since a price slipped beyond
+/// that adds to an open trade counts at its price (on a market with quotes moved by the spread at
+/// the open to the side the position closes on) held to the range, since a price slipped beyond
 /// the range is not one the market traded at; it matters because the add moves the entry price, so
 /// the range after it can count a smaller gain or loss than the smaller position met before it. A
 /// position reduced by a maker fill (a limit, which fills after the stops inside the range, in the
@@ -357,10 +367,8 @@ pub fn build_trades_with_fills(
             next += 1;
             let qty = fill.qty;
             let dq = fill.side.sign() * qty;
-            let mut new = pos + dq;
-            if new.abs() <= 1e-9 * (f64::abs(pos) + qty) {
-                new = 0.0;
-            }
+            let held_avg = current.as_ref().map_or(0.0, |t| t.avg_cost);
+            let (new, avg_after) = next_position(pos, held_avg, dq, fill.price);
             let reducing = pos != 0.0 && f64::signum(pos) != dq.signum();
             if reducing {
                 let t = current.as_mut().expect("a non-zero position has a trade");
@@ -406,17 +414,16 @@ pub fn build_trades_with_fills(
                     ));
                 }
             } else if let Some(t) = current.as_mut() {
-                // The position before the add met the fill's price, within the bar's range.
-                // shortcut: on a market with quotes the add fills on the side opposite the one the
-                // position closes on, so this holds the fill's price to the closing side's range
-                // instead of taking the closing price at that moment (the fill's price and the
-                // spread then), which the candles do not give; it overstates the position's P&L at
-                // that point by up to the spread. Take the closing side's price at the fill when
-                // the fill model records it.
+                // The position before the add met the fill's price on the side it closes on, within
+                // that side's range. On a market with quotes the add fills on the other side, so
+                // that price is one spread from the fill's, the spread at the bar's open.
+                // shortcut: the spread at the fill itself is not in the candles, so a spread that
+                // changed between the open and the fill still misstates the excursion there by the
+                // change. Take the closing side's price at the fill when the fill model records it.
                 let c = closing_side(bar, ask, pos);
-                t.excursion(fill.price.clamp(c.low, c.high), f64::abs(pos));
-                // The portfolio's average cost after the add.
-                t.avg_cost = (f64::abs(pos) * t.avg_cost + qty * fill.price) / new.abs();
+                let offset = c.open - fill_side(bar, ask, fill.side).open;
+                t.excursion((fill.price + offset).clamp(c.low, c.high), f64::abs(pos));
+                t.avg_cost = avg_after;
                 t.entry_qty += qty;
                 t.entry_notional += qty * fill.price;
                 t.fees += fill.fee;
@@ -460,13 +467,16 @@ pub fn build_trades_with_fills(
 
 /// Gives each trade the protective stop in force when it opened, and its R multiple.
 ///
-/// The rule: a trade takes its stop from the bar of its first fill (`stops[k]` for the bar
-/// `bars[k]` that opens at its `entry_time`). It is the nearest reduce-only stop on the trade's
-/// closing side, a sell stop for a long and a buy stop for a short, among those placed on that
-/// bar or filled on it from the bar's last fill that opened a position on, and those open once
-/// the strategy has handled it (see [`crate::Session::bar_stops`]). So the stop of a trade that a
-/// stop closed on the same bar does not count.
-/// So a stop attached to the entry ([`crate::Context::submit_with_stop`]) counts, since it is
+/// The rule: `stops` holds one entry per fill that opened a position (from flat, or by flipping
+/// it), in fill order, as [`crate::Session::trade_stops`] records them. Each such fill opens one
+/// trade, so the n-th trade takes the n-th entry; an entry whose `entry_time` is not the trade's
+/// is not used. A trade's stop is the nearest reduce-only stop on its closing side, a sell stop
+/// for a long and a buy stop for a short, among those resting when its opening fill happened,
+/// those placed or filled on its entry bar after that fill and before the next fill on the bar
+/// that opened a position, and, for the last trade opened on the bar, those open once the
+/// strategy has handled it. So a trade keeps its own stop when a stop closes it and another opens
+/// on the same bar, and the stop of a trade that a stop closed on its bar does not pass to the
+/// next. So a stop attached to the entry ([`crate::Context::submit_with_stop`]) counts, since it is
 /// placed the moment the entry fills, even when it fills on the same bar; so do a reduce-only stop
 /// resting from before and one the strategy submits on the entry bar's close in reaction to the
 /// fill. The nearest is the one that would trigger first: the highest sell stop, the lowest buy
@@ -482,17 +492,14 @@ pub fn build_trades_with_fills(
 /// [`build_trades`]). So a trade with one entry and one exit that exits exactly at its stop, before
 /// costs, is -1R in either currency, and one that exits elsewhere differs from its quote-currency R
 /// by the ratio of the stop price to the exit price (and the fees' conversion).
-pub fn attach_stops(
-    trades: &mut [Trade],
-    bars: &[Candle],
-    stops: &[BarStops],
-    account: AccountCurrency,
-) {
-    for t in trades {
-        let Ok(k) = bars.binary_search_by_key(&t.entry_time, |b| b.open_time) else {
+pub fn attach_stops(trades: &mut [Trade], stops: &[TradeStops], account: AccountCurrency) {
+    for (t, at) in trades.iter_mut().zip(stops) {
+        // The session and the trade list follow the same rule for what opens a position, so the
+        // entries line up; one that does not is left out rather than given another trade's stop.
+        debug_assert_eq!(t.entry_time, at.entry_time);
+        if t.entry_time != at.entry_time {
             continue;
-        };
-        let at = stops.get(k).copied().unwrap_or_default();
+        }
         t.stop = match t.side {
             TradeSide::Long => at.sell,
             TradeSide::Short => at.buy,
@@ -832,8 +839,8 @@ mod tests {
     }
 
     #[test]
-    fn bar_stops_keep_the_nearest_trigger_per_side() {
-        let mut s = BarStops::default();
+    fn trade_stops_keep_the_nearest_trigger_per_side() {
+        let mut s = TradeStops::default();
         s.add(Side::Sell, 90.0);
         s.add(Side::Sell, 95.0);
         s.add(Side::Sell, 92.0);
@@ -851,10 +858,14 @@ mod tests {
             candle(1, 102.0, 108.0, 99.0, 106.0),
             candle(2, 105.0, 109.0, 95.0, 107.0),
         ];
-        let stop = |sell: Option<f64>, buy: Option<f64>| BarStops { sell, buy };
+        let stop = |entry_bar: i64, sell: Option<f64>, buy: Option<f64>| TradeStops {
+            entry_time: entry_bar * MIN,
+            sell,
+            buy,
+        };
 
         // Long 2 @ 100 sold @ 107 with a fee of 1 at each end: net 14 - 2 = 12. A sell stop at
-        // 95 risks 2 * 5 = 10, so R = 1.2. The entry bar's stops count, not later bars'.
+        // 95 risks 2 * 5 = 10, so R = 1.2. The trade takes its own entry, not later ones.
         let fills = [
             fill(0, Side::Buy, 2.0, 100.0, 1.0),
             fill(2, Side::Sell, 2.0, 107.0, 1.0),
@@ -867,12 +878,8 @@ mod tests {
             AccountCurrency::Quote,
             None,
         );
-        let stops = [
-            stop(Some(95.0), Some(120.0)),
-            stop(Some(99.0), None),
-            stop(None, None),
-        ];
-        attach_stops(&mut t, &b, &stops, AccountCurrency::Quote);
+        let stops = [stop(0, Some(95.0), Some(120.0)), stop(1, Some(99.0), None)];
+        attach_stops(&mut t, &stops, AccountCurrency::Quote);
         assert_eq!(t[0].stop, Some(95.0));
         approx(t[0].r_multiple.unwrap(), 1.2);
 
@@ -885,12 +892,7 @@ mod tests {
             AccountCurrency::Quote,
             None,
         );
-        attach_stops(
-            &mut t,
-            &b,
-            &[stop(None, Some(90.0))],
-            AccountCurrency::Quote,
-        );
+        attach_stops(&mut t, &[stop(0, None, Some(90.0))], AccountCurrency::Quote);
         assert_eq!((t[0].stop, t[0].r_multiple), (None, None));
 
         // A stop at the entry price risks nothing: a stop, but no R.
@@ -904,8 +906,7 @@ mod tests {
         );
         attach_stops(
             &mut t,
-            &b,
-            &[stop(Some(100.0), None)],
+            &[stop(0, Some(100.0), None)],
             AccountCurrency::Quote,
         );
         assert_eq!((t[0].stop, t[0].r_multiple), (Some(100.0), None));
@@ -922,8 +923,7 @@ mod tests {
         );
         attach_stops(
             &mut t,
-            &b,
-            &[stop(Some(101.0), None)],
+            &[stop(0, Some(101.0), None)],
             AccountCurrency::Quote,
         );
         assert_eq!((t[0].stop, t[0].r_multiple), (Some(101.0), None));
@@ -944,8 +944,7 @@ mod tests {
         );
         attach_stops(
             &mut t,
-            &b,
-            &[stop(None, None), stop(Some(90.0), Some(103.0))],
+            &[stop(1, Some(90.0), Some(103.0))],
             AccountCurrency::Quote,
         );
         assert_eq!(t[0].stop, Some(103.0));
@@ -961,12 +960,7 @@ mod tests {
             AccountCurrency::Quote,
             None,
         );
-        attach_stops(
-            &mut t,
-            &b,
-            &[stop(None, None), stop(None, Some(95.0))],
-            AccountCurrency::Quote,
-        );
+        attach_stops(&mut t, &[stop(1, None, Some(95.0))], AccountCurrency::Quote);
         assert_eq!((t[0].stop, t[0].r_multiple), (Some(95.0), None));
     }
 }

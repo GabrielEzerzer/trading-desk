@@ -7,21 +7,24 @@
 //!    have no bar; I2 runs the backtest twice and compares fills and equity; I3 runs it on the
 //!    first half of the period alone and compares the orders decided there with the full run's.
 //!    If any of them fails, the verdict is `invalid` and nothing else runs.
-//! 2. **The sweep** over the full period, for the parameter plateau (R5).
+//! 2. **The sweep** over the full period, reported only.
 //! 3. **R1**, the rolling walk-forward, stitched: the out-of-sample curve every later line is
 //!    judged on. Then I2 and I3 again on each parameter set the walk-forward chose, the plan's
 //!    backtest with those parameters over the same period, since the verdict rests on them: a
 //!    plan whose fixed parameters place no orders passes I3 on its own backtest vacuously. Each
 //!    line keeps the worst result over every set checked, and a failure there makes the verdict
-//!    `invalid` too; the steps after the statistics are then skipped.
+//!    `invalid` too; the steps after the statistics are then skipped. Then R5's runs: each
+//!    window's grid neighbours of the set it chose, run on its test bars (see [`PlateauReport`]),
+//!    so the plateau is judged out of sample and never on a sweep's best row.
 //! 4. **The statistics that need no further runs:** R2, R5, R7 (a block bootstrap of the daily
 //!    returns), R8 (where the profit came from), I4, I5 and the kind rule's inputs, among them a
 //!    block bootstrap of the max drawdown over the same daily returns for the `portfolio` kind.
 //! 5. **R4**, the walk-forward's chosen parameters run again on each test window at
-//!    `cost_stress` times the fees and slippage.
+//!    `cost_stress` times the fees (the per-unit commission too) and slippage, and on a market
+//!    with quotes at `cost_stress` times each bar's spread.
 //! 6. **R6**, the walk-forward again with its windows moved by `start_offsets` different offsets.
-//! 7. **R3**, the luck test, last: the sweep repeated on shuffled bars. It does not run on a kind
-//!    whose rules have quotes, since it cannot shuffle the asks with the bars yet.
+//! 7. **R3**, the luck test, last: the sweep repeated on shuffled bars, with each bar's ask moved
+//!    with it on a market with quotes.
 //!
 //! Steps 5 to 7 run only when their lines could still change the verdict. When the lines before
 //! them already decide it (a sample below the minimum, a failed evidence line, or a failed I5),
@@ -32,13 +35,16 @@
 //!
 //! The battery reports one running total over every run it makes: the three integrity backtests,
 //! every backtest of the sweep, of the walk-forward's train sweeps, of R6's walk-forwards and of
-//! R3's sweeps, R4's runs, and three integrity runs per walk-forward window. A window whose
-//! parameters were already checked counts its three without running them again. (The tester's
-//! own extra runs, a sweep's best run again and a walk-forward's test runs, are not reported by
-//! it and so not counted.) The total is known before anything runs. On a full run every count
-//! from 1 to the total is reported once; when steps are skipped, or a walk-forward or the luck
-//! test stops early, the count jumps ahead and the battery reports the total itself at the end.
-//! (Reports come from the worker threads, so they can arrive slightly out of order.)
+//! R3's sweeps, R4's runs, three integrity runs per walk-forward window and R5's neighbour runs,
+//! on every market. A window whose parameters were already checked counts its three without
+//! running them again. R5 counts the most neighbours a set can have on the grid for each window
+//! ([`SweepSpec::max_neighbours`]); a window whose chosen set sits at the end of an axis of three
+//! or more values has fewer, and counts the rest without running them. (The tester's own extra
+//! runs, a sweep's best run again and a walk-forward's test runs, are not reported by it and so
+//! not counted.) The total is known before anything runs. On a full run every count from 1 to
+//! the total is reported once; when steps are skipped, or a walk-forward or the luck test stops
+//! early, the count jumps ahead and the battery reports the total itself at the end. (Reports
+//! come from the worker threads, so they can arrive slightly out of order.)
 //!
 //! The progress callback is also the cancel signal, as for every tester call: returning
 //! `ControlFlow::Break(())` stops the battery. Before R3, that returns
@@ -51,11 +57,12 @@
 //! tester call is deterministic, and every seeded statistic draws from a seed derived from the
 //! battery's seed and its own fixed index.
 
+use std::collections::{BTreeSet, HashMap};
 use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde::{Deserialize, Serialize};
-use td_core::{Candle, FeeSchedule, Instrument, Millis};
+use td_core::{Candle, Carry, FeeSchedule, Instrument, Millis, Timeframe};
 
 use crate::metrics::{self, DAY_MS, EquitySeries};
 use crate::plan::check_start_offsets;
@@ -66,15 +73,18 @@ use crate::stats::{
     self, BootstrapSpec, DEFAULT_RESAMPLES, DrawdownBootstrap, MeanBootstrap, PropFirmOdds,
     PropFirmSpec, RuinSpec,
 };
+use crate::strategies::direction;
+use crate::tester::stitched_headline;
 use crate::verdict::{
     IntegrityInputs, OosIntegrityInputs, evaluate_integrity, evaluate_oos_integrity,
 };
 use crate::{
-    BacktestConfig, BacktestResult, Criterion, Direction, DrawdownMode, EquityPoint,
-    EvidenceInputs, KindInputs, MAX_RUNS, Order, Outcome, Params, PermutationResult,
-    PermutationSpec, PortfolioBenchmark, Progress, SweepResult, SweepRow, SweepSpec, TestPlan,
-    TesterError, Trade, TradeSide, Verdict, VerdictRule, WalkForwardResult, WalkForwardSpec,
-    combine, evaluate, evaluate_evidence, permutation_test, run, sweep, walk_forward,
+    BacktestConfig, BacktestResult, Criterion, Direction, DrawdownMode, EngineError, EquityPoint,
+    EvidenceInputs, Headline, KindInputs, MAX_RUNS, Objective, Order, Outcome, Params,
+    PermutationResult, PermutationSpec, PortfolioBenchmark, Progress, SweepResult, SweepSpec,
+    TestPlan, TesterError, Trade, TradeSide, Verdict, VerdictRule, WalkForwardResult,
+    WalkForwardSpec, combine, evaluate, evaluate_evidence, permutation_test, run, sweep,
+    walk_forward,
 };
 
 /// The seed streams of the battery's seeded steps, derived from its seed.
@@ -109,7 +119,8 @@ pub struct BatteryResult {
     /// The inputs of the kind lines.
     pub kind: KindInputs,
     pub oos_integrity: OosIntegrityInputs,
-    /// R5's neighbours of the best parameter set on the grid.
+    /// R5: the walk-forward's chosen sets against their grid neighbours, out of sample. `None`
+    /// without a walk-forward.
     pub plateau: Option<PlateauReport>,
     /// R7: the block bootstrap of the out-of-sample daily returns.
     pub daily_bootstrap: Option<MeanBootstrap>,
@@ -118,7 +129,8 @@ pub struct BatteryResult {
     pub drawdown_bootstrap: Option<DrawdownBootstrap>,
     /// The bootstrap of the closed out-of-sample trades' net P&L, for `high_risk`'s lower bound.
     pub trade_bootstrap: Option<MeanBootstrap>,
-    /// The prop-firm challenge odds, for a `prop_firm` rule.
+    /// The prop-firm challenge odds, for a `prop_firm` rule: passing within the rule's
+    /// `pass_horizon_days`, breaching within its `breach_horizon_days`.
     pub prop_firm_odds: Option<PropFirmOdds>,
     /// R8.
     pub breakdown: Option<Breakdown>,
@@ -149,24 +161,60 @@ pub struct IntegrityReport {
     pub prefix_split: Option<Millis>,
 }
 
-/// R5: the best parameter set and its neighbours on the grid.
+/// R5, out of sample: the walk-forward's chosen parameter sets against their neighbours on the
+/// grid. A neighbour is a direction on the grid, a step of -1, 0 or 1 on each axis (not all 0).
+/// In each window it is the set that window chose moved one step that way, run on the window's
+/// test bars as its chosen set was (warmed up on the train bars, closed out at the end). Each
+/// direction is judged only on the windows where its set ran: a window where it is off the grid
+/// or the strategy refuses it is left out, never filled with the chosen set's own run, which would
+/// pull the direction towards R1. Its runs are stitched as R1's curve is, and so are the chosen
+/// sets' own runs in the same windows, its reference. A direction that ran in no window is left
+/// out.
+///
+/// The ratio is the median over the directions of each one's objective against its reference: the
+/// objective over the reference with `Maximize`, for a direction whose reference is above zero,
+/// and the reference over the objective with `Minimize`, so a ratio below 1 is worse either way.
+/// A direction with an undefined objective has the worst ratio (minus infinity with `Maximize`, 0
+/// with `Minimize`); one whose reference is undefined, or at or below zero with `Maximize`, has
+/// none and is left out of the median. The share is the directions whose stitched return is
+/// above zero.
+///
+/// A result saved before R5 moved out of sample reads with `directions` empty and its ratio and
+/// share as they were judged then, on the full-period sweep.
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PlateauReport {
-    /// The best row's grid coordinates.
-    pub best: Vec<u64>,
-    pub best_objective: f64,
-    /// The neighbours' grid coordinates and objective values, `None` where the objective is
-    /// undefined (it counts as the worst value).
-    pub neighbours: Vec<(Vec<u64>, Option<f64>)>,
+    /// R1's stitched objective; `None` when it is undefined.
+    pub best_objective: Option<f64>,
+    #[serde(default)]
+    pub directions: Vec<PlateauDirection>,
     pub median_ratio: Option<f64>,
     pub positive_share: Option<f64>,
+}
+
+/// One of R5's neighbours, stitched over the windows.
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PlateauDirection {
+    /// The step on each axis of the grid, in the order of the plan's axes.
+    pub steps: Vec<i8>,
+    /// The windows in which the stepped set ran, the only ones it is judged on.
+    pub windows: usize,
+    /// The stitched objective; `None` when it is undefined.
+    pub objective: Option<f64>,
+    pub total_return: Option<f64>,
+    /// The chosen sets' own runs in the same windows, stitched the same way: their objective.
+    /// `None` when it is undefined, or in a result saved before directions had it.
+    #[serde(default)]
+    pub reference: Option<f64>,
 }
 
 /// R4: each test window's chosen parameters run again at higher costs.
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CostStress {
+    /// The fees, the per-unit commission, slippage and, on a market with quotes, each bar's spread
+    /// are multiplied by this.
     pub multiplier: f64,
     /// Each window's return at the stressed costs.
     pub window_returns: Vec<f64>,
@@ -196,8 +244,10 @@ pub struct Breakdown {
     pub short: SideResult,
     /// Net funding paid on the stitched curve; negative when it was received.
     pub funding_paid: f64,
-    /// Windows where buy and hold rose over the test window, and the strategy's return in them,
-    /// compounded.
+    /// Windows where the instrument's price rose over the test window, and the strategy's return
+    /// in them, compounded. The price is the quote currency per unit of the base, so a long
+    /// position gained in those windows in either currency: on a dollar account trading USD/JPY,
+    /// a rising window is one where the dollar strengthened against the yen.
     pub rising: RegimeResult,
     /// Windows where it fell or stayed flat.
     pub falling: RegimeResult,
@@ -212,7 +262,7 @@ pub struct Breakdown {
 pub struct SideResult {
     /// Closed trades.
     pub trades: usize,
-    /// Their net P&L, in the quote asset.
+    /// Their net P&L, in the account currency.
     pub net_pnl: f64,
 }
 
@@ -279,9 +329,8 @@ pub struct BatterySpec<'a> {
 
 /// Runs the battery of `spec`. `bars` holds the plan's period and may hold warm-up bars before
 /// it. `bars`, `asks` and `funding` are the data as [`crate::run`] takes it: `asks` is empty for a
-/// kind whose rules have no quotes, and every run, sweep and walk-forward gets them. The luck test
-/// (R3) cannot shuffle asks with the bars yet (see [`permutation_test`]), so on a kind with quotes
-/// it does not run and its line is inconclusive with a note.
+/// kind whose rules have no quotes, and every run, sweep, walk-forward and luck test gets them
+/// (R4 with each spread widened).
 ///
 /// The instrument must be one of the plan's and the rule must pass its checks. The plan itself is
 /// not checked again with [`TestPlan::validate`]: the registry's test checks every registered
@@ -289,8 +338,8 @@ pub struct BatterySpec<'a> {
 /// a test from running a smaller battery. A period that holds too little data gives
 /// `not_enough_evidence`.
 ///
-/// Errors: a refused rule or spec, a luck test over [`MAX_RUNS`] (refused before anything runs),
-/// a data or engine error, or a cancel before R3.
+/// Errors: a refused rule or spec, a luck test, or a walk-forward with R5's neighbour runs, over
+/// [`MAX_RUNS`] (refused before anything runs), a data or engine error, or a cancel before R3.
 pub fn run_battery(
     spec: &BatterySpec,
     bars: &[Candle],
@@ -327,6 +376,7 @@ pub fn run_battery(
     let Layout {
         per_sweep,
         windows,
+        neighbours,
         offsets,
         offset_windows,
         permutations,
@@ -454,15 +504,42 @@ pub fn run_battery(
         meter.base += 3 * windows;
     }
 
+    // 3c. R5's runs: each window's grid neighbours of the set it chose, on its test bars.
+    let plateau = match &wf {
+        Some(wf) => {
+            let mut runs = Vec::with_capacity(wf.windows.len());
+            for w in &wf.windows {
+                let found = sweep_spec.neighbours(&w.params)?;
+                meter.base += neighbours - found.len();
+                let mut window = Vec::with_capacity(found.len());
+                for (steps, params) in found {
+                    let config = BacktestConfig {
+                        params,
+                        ..w.out_of_sample.config.clone()
+                    };
+                    // A set the strategy refuses is left out, as a sweep leaves its row unranked.
+                    match run(&config, bars, asks, funding) {
+                        Ok(r) => window.push((steps, r)),
+                        Err(EngineError::InvalidParam { .. }) => {}
+                        Err(e) => return Err(e.into()),
+                    }
+                    meter.tick()?;
+                }
+                runs.push(window);
+            }
+            meter.base += neighbours * (windows - wf.windows.len());
+            Some(plateau(wf, &runs, &base, sweep_spec.objective))
+        }
+        None => {
+            meter.base += neighbours * windows;
+            None
+        }
+    };
+
     // 4. The statistics that need no further runs.
     let mut evidence = EvidenceInputs::default();
     let mut kind = KindInputs::default();
     let mut oos_integrity = OosIntegrityInputs::default();
-    let plateau = plateau(
-        &swept,
-        sweep_spec.objective.metric,
-        sweep_spec.objective.direction,
-    );
     if let Some(p) = &plateau {
         evidence.plateau_median_ratio = p.median_ratio;
         evidence.plateau_positive_share = p.positive_share;
@@ -573,15 +650,29 @@ pub fn run_battery(
                     DrawdownMode::Static => stats::DrawdownMode::Static,
                     DrawdownMode::Trailing => stats::DrawdownMode::Trailing,
                 },
-                // The pass odds use the breach horizon too, so they are the chance of passing
-                // within `breach_horizon_days`: a product decision, since the firm rule sets no
-                // time limit of its own (see `FirmLimits`).
                 horizon_days: limits.breach_horizon_days as usize,
                 paths: DEFAULT_RESAMPLES,
                 mean_block: stats::default_block_len(daily.len()),
                 seed: derive_seed(seed, SEED_PROP_FIRM),
             };
-            result.prop_firm_odds = stats::prop_firm_odds(&daily, &spec).ok();
+            // The firm rule sets no time limit of its own (see `FirmLimits`), so the pass odds
+            // run to the rule's `pass_horizon_days`. With the two horizons equal, both odds come
+            // from the same paths.
+            let breach = stats::prop_firm_odds(&daily, &spec).ok();
+            let pass = if limits.pass_horizon_days == limits.breach_horizon_days {
+                breach
+            } else {
+                let spec = PropFirmSpec {
+                    horizon_days: limits.pass_horizon_days as usize,
+                    ..spec
+                };
+                stats::prop_firm_odds(&daily, &spec).ok()
+            };
+            result.prop_firm_odds = pass.zip(breach).map(|(p, b)| PropFirmOdds {
+                pass: p.pass,
+                breach: b.breach,
+                paths: b.paths,
+            });
             kind.pass_probability = result.prop_firm_odds.map(|o| o.pass);
             kind.breach_probability = result.prop_firm_odds.map(|o| o.breach);
         }
@@ -600,6 +691,7 @@ pub fn run_battery(
         // 5. R4: the chosen parameters on each test window at higher costs.
         let fees = base.fee_override.unwrap_or(instrument.fees);
         let stressed_fees = stressed(fees, ev.cost_stress);
+        let stressed_asks = widened(bars, asks, ev.cost_stress);
         let mut window_returns = Vec::with_capacity(wf.windows.len());
         let mut level = 1.0f64;
         for w in &wf.windows {
@@ -608,7 +700,7 @@ pub fn run_battery(
                 slippage_bps: w.out_of_sample.config.slippage_bps * ev.cost_stress,
                 ..w.out_of_sample.config.clone()
             };
-            let r = run(&config, bars, asks, funding)?;
+            let r = run(&config, bars, &stressed_asks, funding)?;
             meter.tick()?;
             let growth = r.equity.last().map_or(1.0, |p| p.equity / cash);
             window_returns.push(growth - 1.0);
@@ -625,7 +717,7 @@ pub fn run_battery(
         result.cost_stress = Some(stress);
 
         // 6. R6: the walk-forward with its windows moved back.
-        let main_sign = evidence.oos_return.map(sign);
+        let main_sign = evidence.oos_return.map(direction);
         for (&shift, &planned) in offsets.iter().zip(&offset_windows) {
             let mut offset = StartOffset {
                 shift_bars: shift,
@@ -657,7 +749,7 @@ pub fn run_battery(
         evidence.start_offsets_same_sign = result
             .start_offsets
             .iter()
-            .filter(|o| main_sign.is_some() && o.oos_return.map(sign) == main_sign)
+            .filter(|o| main_sign.is_some() && o.oos_return.map(direction) == main_sign)
             .count();
 
         // 7. R3: the luck test, last.
@@ -666,19 +758,7 @@ pub fn run_battery(
             permutations,
             seed: derive_seed(seed, SEED_LUCK),
         };
-        let luck = if instrument.id.kind.rules().quotes {
-            Err(None)
-        } else {
-            permutation_test(&spec, bars, funding, Some(&meter.step())).map_err(Some)
-        };
-        match luck {
-            Err(None) => {
-                result.luck_note = Some(
-                    "The luck test does not run on a market with quotes yet: it shuffles the bars \
-                     and cannot shuffle the asks with them."
-                        .into(),
-                );
-            }
+        match permutation_test(&spec, bars, asks, funding, Some(&meter.step())) {
             Ok(p) => {
                 evidence.luck_p = Some(p.p_value);
                 let smallest = 1.0 / (p.qualified_copies as f64 + 1.0);
@@ -691,7 +771,7 @@ pub fn run_battery(
                 }
                 result.permutation = Some(p);
             }
-            Err(Some(TesterError::Cancelled)) => {
+            Err(TesterError::Cancelled) => {
                 result.luck_cancelled = true;
                 result.luck_note = Some(
                     "The luck test was cancelled, so it gave no p-value; run the battery again \
@@ -699,10 +779,10 @@ pub fn run_battery(
                         .into(),
                 );
             }
-            Err(Some(e @ TesterError::NoQualifyingRun { .. })) => {
+            Err(e @ TesterError::NoQualifyingRun { .. }) => {
                 result.luck_note = Some(format!("The luck test could not run: {e}."));
             }
-            Err(Some(e)) => return Err(e),
+            Err(e) => return Err(e),
         }
         meter.base += per_sweep * (permutations + 1);
     }
@@ -726,7 +806,17 @@ pub fn run_battery(
     criteria.extend(kind_lines);
     meter.finish();
 
-    result.verdict = Verdict::new(instrument.id, criteria);
+    let carry = instrument.id.kind.rules().unmodelled_carry;
+    let warnings = match (&wf, carry) {
+        (Some(wf), Some(carry)) => carry_warning(carry, &wf.trades, plan.timeframe)
+            .into_iter()
+            .collect(),
+        _ => Vec::new(),
+    };
+    result.verdict = Verdict {
+        warnings,
+        ..Verdict::new(instrument.id, criteria)
+    };
     result.sweep = Some(swept);
     result.walk_forward = wf;
     result.walk_forward_error = wf_error;
@@ -768,6 +858,8 @@ pub fn battery_runs(spec: &BatterySpec, bars: &[Candle]) -> Result<BatteryRuns, 
 struct Layout {
     per_sweep: usize,
     windows: usize,
+    /// R5's runs counted per window: [`SweepSpec::max_neighbours`].
+    neighbours: usize,
     offsets: Vec<usize>,
     offset_windows: Vec<usize>,
     permutations: usize,
@@ -782,6 +874,7 @@ fn layout(
 ) -> Result<Layout, TesterError> {
     let ev = &plan.evidence;
     let per_sweep = sweep_spec.runs()?;
+    let neighbours = sweep_spec.max_neighbours()?;
     let window_count = |bars: usize| wf_spec.windows.windows(bars).map_or(0, |w| w.len());
     let windows = window_count(traded);
     let offsets = start_offset_shifts(wf_spec.windows.test_bars, ev.start_offsets as usize);
@@ -792,22 +885,28 @@ fn layout(
     let permutations = ev.luck.permutations as usize;
     // R3 runs last but is refused up front, before the hours of runs ahead of it.
     let luck_runs = per_sweep as u128 * (permutations as u128 + 1);
-    if luck_runs > MAX_RUNS as u128 {
-        return Err(TesterError::TooManyRuns {
-            runs: luck_runs,
-            limit: MAX_RUNS,
-        });
+    // So are R1's train sweeps with R5's neighbour runs, before the integrity runs and the sweep.
+    let wf_runs = windows as u128 * (per_sweep as u128 + neighbours as u128);
+    for runs in [luck_runs, wf_runs] {
+        if runs > MAX_RUNS as u128 {
+            return Err(TesterError::TooManyRuns {
+                runs,
+                limit: MAX_RUNS,
+            });
+        }
     }
     let total = 3
         + per_sweep
         + windows * per_sweep
         + 3 * windows
+        + windows * neighbours
         + windows
         + offset_windows.iter().sum::<usize>() * per_sweep
         + per_sweep * (permutations + 1);
     Ok(Layout {
         per_sweep,
         windows,
+        neighbours,
         offsets,
         offset_windows,
         permutations,
@@ -854,17 +953,6 @@ fn start_offset_shifts(test_bars: usize, n: usize) -> Vec<usize> {
     (1..=n).map(|k| k * test_bars / (n + 1)).collect()
 }
 
-/// -1, 0 or 1.
-fn sign(x: f64) -> i8 {
-    if x > 0.0 {
-        1
-    } else if x < 0.0 {
-        -1
-    } else {
-        0
-    }
-}
-
 /// I1: the buckets of `config`'s period that are not wholly inside the market's closed hours,
 /// and how many of them have no bar among `traded`, the bars of the period in time order.
 fn bucket_counts(config: &BacktestConfig, traded: &[Candle]) -> (usize, usize) {
@@ -883,6 +971,59 @@ fn bucket_counts(config: &BacktestConfig, traded: &[Candle]) -> (usize, usize) {
         t += step;
     }
     (open, dropped)
+}
+
+/// R4's asks on a market with quotes: each ask moved away from its bar so that the spread at each
+/// of its four prices is `multiplier` times the bar's own, then its high and low widened to hold
+/// its open and close, since the spread at the high or low can be narrower than at the open or
+/// close. With `multiplier` at least 1 the ask stays at or above its bar, so the stressed quotes
+/// pass the same checks as the real ones. Empty when `asks` is: a market without quotes pays no
+/// spread.
+fn widened(bars: &[Candle], asks: &[Candle], multiplier: f64) -> Vec<Candle> {
+    let bids: HashMap<Millis, &Candle> = bars.iter().map(|b| (b.open_time, b)).collect();
+    let widen = |bid: f64, ask: f64| bid + multiplier * (ask - bid);
+    asks.iter()
+        .map(|a| match bids.get(&a.open_time) {
+            Some(b) => {
+                let (open, close) = (widen(b.open, a.open), widen(b.close, a.close));
+                Candle {
+                    open,
+                    high: widen(b.high, a.high).max(open).max(close),
+                    low: widen(b.low, a.low).min(open).min(close),
+                    close,
+                    ..*a
+                }
+            }
+            // An ask with no bar is never read: the run looks asks up by their bar.
+            None => *a,
+        })
+        .collect()
+}
+
+/// The warning for a market whose rules name a financing cost the engine does not model
+/// (`MarketRules::unmodelled_carry`), when any of `trades` held its position through a point
+/// where that cost is charged. A trade's times are the opens of the bars it opened and closed in,
+/// on `timeframe`, so a trade counts as held through a rollover that falls after its entry bar's
+/// open and before its exit bar's end: a stop can fill anywhere inside the exit bar, and its time
+/// does not say whether that was before the rollover or after it.
+fn carry_warning(carry: Carry, trades: &[Trade], timeframe: Timeframe) -> Option<String> {
+    let held = match carry {
+        Carry::DailyRollover => trades
+            .iter()
+            .filter(|t| {
+                DayRollover::NewYork1700.next_after(t.entry_time)
+                    < t.exit_time + timeframe.duration_ms()
+            })
+            .count(),
+    };
+    (held > 0).then(|| {
+        format!(
+            "{held} of {} out-of-sample trades held a position through {}, which the engine does \
+             not charge yet, so their results leave that cost out.",
+            trades.len(),
+            carry.name()
+        )
+    })
 }
 
 /// R4's fees: every fee of `fees`, the per-unit commission too, times `multiplier`.
@@ -968,74 +1109,74 @@ fn prefix_differences(full: &[Order], prefix: &[Order], split: Millis) -> usize 
     differing + before.len().abs_diff(prefix.len())
 }
 
-/// R5 on the sweep: the best row's neighbours are the rows that ran (the strategy did not refuse
-/// them) and sit at most one step from it on every axis of the grid. An undefined objective counts
-/// as the worst value. With `Maximize` the ratio is the neighbours' median over the best, defined
-/// when the best is above zero; with `Minimize` it is the best over the median, so a ratio below 1
-/// is worse either way. `None` when no row qualified.
+/// R5 from the walk-forward and `runs`, each window's neighbour runs with their steps (see
+/// [`PlateauReport`]).
 fn plateau(
-    swept: &SweepResult,
-    metric: crate::Metric,
-    direction: Direction,
-) -> Option<PlateauReport> {
-    let best = swept.rows.first().filter(|r| r.qualified)?;
-    let best_objective = best.metrics.and_then(|m| m.value(metric))?;
-    let near = |r: &SweepRow| {
-        r.coords.len() == best.coords.len()
-            && r.coords
+    wf: &WalkForwardResult,
+    runs: &[Vec<(Vec<i8>, BacktestResult)>],
+    base: &BacktestConfig,
+    objective: Objective,
+) -> PlateauReport {
+    let steps: BTreeSet<&Vec<i8>> = runs.iter().flatten().map(|(s, _)| s).collect();
+    let directions: Vec<PlateauDirection> = steps
+        .into_iter()
+        .map(|steps| {
+            // Only the windows where this direction ran, with the chosen set's run beside each.
+            let (own, moved): (Vec<&BacktestResult>, Vec<&BacktestResult>) = wf
+                .windows
                 .iter()
-                .zip(&best.coords)
-                .all(|(a, b)| a.abs_diff(*b) <= 1)
-    };
-    let neighbours: Vec<&SweepRow> = swept
-        .rows
-        .iter()
-        .filter(|r| r.index != best.index && r.error.is_none() && near(r))
-        .collect();
-    let objective = |r: &SweepRow| r.metrics.and_then(|m| m.value(metric));
-    let positive_share = (!neighbours.is_empty()).then(|| {
-        neighbours
-            .iter()
-            .filter(|r| {
-                r.metrics
-                    .and_then(|m| m.total_return)
-                    .is_some_and(|x| x > 0.0)
-            })
-            .count() as f64
-            / neighbours.len() as f64
-    });
-    let worst = match direction {
-        Direction::Maximize => f64::NEG_INFINITY,
-        Direction::Minimize => f64::INFINITY,
-    };
-    let mut values: Vec<f64> = neighbours
-        .iter()
-        .map(|r| objective(r).unwrap_or(worst))
-        .collect();
-    values.sort_by(f64::total_cmp);
-    let median = match values.len() {
-        0 => None,
-        n if n % 2 == 1 => Some(values[n / 2]),
-        n => Some((values[n / 2 - 1] + values[n / 2]) / 2.0),
-    };
-    let median_ratio = median
-        .and_then(|m| match direction {
-            Direction::Maximize if best_objective > 0.0 => Some(m / best_objective),
-            Direction::Minimize if m > 0.0 => Some(best_objective / m),
-            Direction::Minimize if m == 0.0 && best_objective == 0.0 => Some(1.0),
-            _ => None,
+                .zip(runs)
+                .filter_map(|(w, found)| {
+                    let (_, r) = found.iter().find(|(s, _)| s == steps)?;
+                    Some((&w.out_of_sample, r))
+                })
+                .unzip();
+            let h = stitched_headline(base, &moved);
+            PlateauDirection {
+                steps: steps.clone(),
+                windows: moved.len(),
+                objective: h.value(objective.metric),
+                total_return: h.total_return,
+                reference: stitched_headline(base, &own).value(objective.metric),
+            }
         })
-        .filter(|r| r.is_finite());
-    Some(PlateauReport {
-        best: best.coords.clone(),
+        .collect();
+    let best_objective = Headline::new(&wf.metrics).value(objective.metric);
+    let (median_ratio, positive_share) = plateau_numbers(&directions, objective.direction);
+    PlateauReport {
         best_objective,
-        neighbours: neighbours
-            .iter()
-            .map(|r| (r.coords.clone(), objective(r)))
-            .collect(),
+        directions,
         median_ratio,
         positive_share,
-    })
+    }
+}
+
+/// R5's ratio and share from the directions, each with its reference (see [`PlateauReport`]).
+/// Both are `None` without directions, and the ratio also when no direction has one.
+fn plateau_numbers(
+    directions: &[PlateauDirection],
+    direction: Direction,
+) -> (Option<f64>, Option<f64>) {
+    let positive_share = (!directions.is_empty()).then(|| {
+        directions
+            .iter()
+            .filter(|d| d.total_return.is_some_and(|x| x > 0.0))
+            .count() as f64
+            / directions.len() as f64
+    });
+    let ratio = |d: &PlateauDirection| match (direction, d.reference, d.objective) {
+        (Direction::Maximize, Some(r), Some(o)) if r > 0.0 => Some(o / r),
+        (Direction::Maximize, Some(r), None) if r > 0.0 => Some(f64::NEG_INFINITY),
+        (Direction::Maximize, _, _) => None,
+        (Direction::Minimize, Some(r), Some(o)) if o > 0.0 => Some(r / o),
+        // Neither drew down: as good as each other. Only the neighbour drew down nothing: better.
+        (Direction::Minimize, Some(r), Some(_)) => Some(if r == 0.0 { 1.0 } else { f64::INFINITY }),
+        (Direction::Minimize, Some(_), None) => Some(0.0),
+        (Direction::Minimize, None, _) => None,
+    };
+    let values: Vec<f64> = directions.iter().filter_map(ratio).collect();
+    let median_ratio = metrics::median(&values);
+    (median_ratio, positive_share)
 }
 
 /// The returns from one UTC day's end to the next of an equity series. A day that starts with no
@@ -1358,117 +1499,152 @@ mod tests {
         assert_eq!(done, (1..=20).chain([r.runs]).collect::<Vec<_>>());
     }
 
-    /// A row of a hand-built 3 x 3 sweep: its grid coordinates, its objective (Sharpe or max
-    /// drawdown, as the test reads it) and its total return.
-    fn row(coords: [u64; 2], objective: Option<f64>, total_return: f64) -> SweepRow {
-        let headline = crate::Headline {
+    /// One of R5's neighbours, with its objective (Sharpe or max drawdown, as the test reads it),
+    /// the chosen sets' objective over the same windows and its total return.
+    fn direction(
+        steps: [i8; 2],
+        objective: Option<f64>,
+        reference: Option<f64>,
+        total_return: f64,
+    ) -> PlateauDirection {
+        PlateauDirection {
+            steps: steps.to_vec(),
+            windows: 1,
+            objective,
             total_return: Some(total_return),
-            cagr: None,
-            sharpe: objective,
-            sortino: None,
-            calmar: None,
-            profit_factor: None,
-            win_rate: None,
-            max_drawdown: objective,
-            trades: 10,
-        };
-        SweepRow {
-            index: coords[0] * 3 + coords[1],
-            coords: coords.to_vec(),
-            params: crate::Params::new(),
-            qualified: objective.is_some(),
-            metrics: Some(headline),
-            error: None,
-        }
-    }
-
-    /// Rows best first, as a sweep returns them.
-    fn swept(rows: Vec<SweepRow>) -> SweepResult {
-        SweepResult {
-            spec: crate::SweepSpec {
-                base: test_config(),
-                axes: Vec::new(),
-                mode: crate::SweepMode::Grid,
-                objective: crate::Objective {
-                    metric: crate::Metric::Sharpe,
-                    direction: Direction::Maximize,
-                },
-                min_trades: 0,
-            },
-            engine_version: String::new(),
-            data_fingerprint: String::new(),
-            rows,
-            best: None,
+            reference,
         }
     }
 
     #[test]
-    fn the_plateau_reads_the_best_sets_neighbours_on_the_grid() {
-        use crate::Metric::{MaxDrawdown, Sharpe};
-        // The best set in the corner (0, 0) has three neighbours: (0, 1), (1, 0) and (1, 1).
-        // (1, 0)'s objective is undefined and counts as the worst; (0, 2) is refused and (2, 2),
-        // better than every neighbour, is two steps away; neither counts.
-        let mut refused = row([0, 2], None, 0.0);
-        refused.metrics = None;
-        refused.error = Some("slow must be more than fast".into());
-        let rows = |best: f64| {
+    fn the_plateau_reads_each_neighbour_against_its_own_windows() {
+        use Direction::{Maximize, Minimize};
+        // (1, 1)'s objective is undefined and has the worst ratio.
+        let directions = |second: Option<f64>, reference: Option<f64>| {
             vec![
-                row([0, 0], Some(best), 0.4),
-                row([2, 2], Some(1.9), 0.3),
-                row([1, 1], Some(1.5), 0.2),
-                row([0, 1], Some(1.0), 0.1),
-                row([1, 2], Some(0.5), 0.05),
-                row([1, 0], None, -0.05),
-                refused.clone(),
+                direction([0, 1], Some(1.5), reference, 0.2),
+                direction([1, 0], second, reference, 0.1),
+                direction([1, 1], None, reference, -0.05),
             ]
         };
-        let p = plateau(&swept(rows(2.0)), Sharpe, Direction::Maximize).unwrap();
-        assert_eq!(p.best, vec![0, 0]);
-        assert_eq!(p.best_objective, 2.0);
+        // Ratios [-inf, 0.5, 0.75] against a reference of 2.0: the median is 0.5. Two of three
+        // neighbours made money.
         assert_eq!(
-            p.neighbours,
-            vec![
-                (vec![1, 1], Some(1.5)),
-                (vec![0, 1], Some(1.0)),
-                (vec![1, 0], None),
-            ]
+            plateau_numbers(&directions(Some(1.0), Some(2.0)), Maximize),
+            (Some(0.5), Some(2.0 / 3.0))
         );
-        // Sorted [-inf, 1.0, 1.5]: the median is 1.0, half the best. Two of three neighbours
-        // made money.
-        assert_eq!(p.median_ratio, Some(0.5));
-        assert_eq!(p.positive_share, Some(2.0 / 3.0));
-
-        // With the best at or below zero a ratio would read backwards, so there is none; the
-        // share still counts.
-        for best in [0.0, -0.5] {
-            let p = plateau(&swept(rows(best)), Sharpe, Direction::Maximize).unwrap();
-            assert_eq!(p.median_ratio, None, "best {best}");
-            assert_eq!(p.positive_share, Some(2.0 / 3.0));
-        }
-
-        // Two undefined neighbours of three put the median at the worst value: no finite ratio.
-        let mut two_undefined = rows(2.0);
-        two_undefined[3] = row([0, 1], None, 0.1);
-        let p = plateau(&swept(two_undefined), Sharpe, Direction::Maximize).unwrap();
-        assert_eq!(p.median_ratio, None);
-
-        // Minimize, on max drawdown: the best is the smallest, an undefined neighbour counts as
-        // the largest, and the ratio is the best over the median, so below 1 is worse here too.
-        // Sorted [0.2, 0.3, inf]: the median is 0.3.
-        let min_rows = vec![
-            row([0, 0], Some(0.1), 0.4),
-            row([0, 1], Some(0.2), 0.1),
-            row([1, 1], Some(0.3), 0.2),
-            row([2, 2], Some(0.4), 0.3),
-            row([1, 0], None, -0.05),
+        // Each against its own reference: 1.5 / 1.5 and 1.0 / 4.0, and the undefined one.
+        let own = [
+            direction([0, 1], Some(1.5), Some(1.5), 0.2),
+            direction([1, 0], Some(1.0), Some(4.0), 0.1),
+            direction([1, 1], None, Some(2.0), -0.05),
         ];
-        let p = plateau(&swept(min_rows), MaxDrawdown, Direction::Minimize).unwrap();
-        assert_eq!(p.median_ratio, Some(0.1 / 0.3));
-        assert_eq!(p.positive_share, Some(2.0 / 3.0));
+        assert_eq!(plateau_numbers(&own, Maximize).0, Some(0.25));
+        // With a reference at or below zero, or undefined, a ratio would read backwards or not at
+        // all, so the direction has none; the share still counts it.
+        for reference in [Some(0.0), Some(-0.5), None] {
+            assert_eq!(
+                plateau_numbers(&directions(Some(1.0), reference), Maximize),
+                (None, Some(2.0 / 3.0)),
+                "reference {reference:?}"
+            );
+        }
+        let mixed = [
+            own[0].clone(),
+            direction([1, 0], Some(-1.0), Some(-0.5), -0.1),
+        ];
+        assert_eq!(plateau_numbers(&mixed, Maximize), (Some(1.0), Some(0.5)));
+        // Two undefined neighbours of three put the median at the worst ratio: no finite ratio.
+        assert_eq!(
+            plateau_numbers(&directions(None, Some(2.0)), Maximize).0,
+            None
+        );
+        // Minimize, on max drawdown: the ratio is the reference over the objective, so below 1 is
+        // worse here too, and an undefined neighbour has a ratio of 0. Sorted [0, 1/3, 1/2]: the
+        // median is 0.1 / 0.3.
+        let min = vec![
+            direction([0, 1], Some(0.2), Some(0.1), 0.1),
+            direction([1, 1], Some(0.3), Some(0.1), 0.2),
+            direction([1, 0], None, Some(0.1), -0.05),
+        ];
+        assert_eq!(
+            plateau_numbers(&min, Minimize),
+            (Some(0.1 / 0.3), Some(2.0 / 3.0))
+        );
+        // No neighbours: nothing to judge.
+        assert_eq!(plateau_numbers(&[], Maximize), (None, None));
+    }
 
-        // No qualified best: no plateau.
-        let none = vec![row([0, 0], None, 0.1), row([0, 1], None, 0.1)];
-        assert_eq!(plateau(&swept(none), Sharpe, Direction::Maximize), None);
+    #[test]
+    fn the_cost_stress_widens_each_spread_and_keeps_the_ask_valid() {
+        let bid = Candle {
+            open_time: 7,
+            open: 100.0,
+            high: 101.0,
+            low: 99.0,
+            close: 100.5,
+            volume: 1.0,
+            quote_volume: 100.0,
+        };
+        // Spreads of 0.25 at the open and close, 0 at the high and 0.5 at the low.
+        let ask = Candle {
+            open: 100.25,
+            high: 101.0,
+            low: 99.5,
+            close: 100.75,
+            ..bid
+        };
+        // Three times each spread; the high, whose spread was 0, is raised to the new close.
+        let w = widened(&[bid], &[ask], 3.0);
+        assert_eq!(
+            w,
+            vec![Candle {
+                open: 100.75,
+                high: 101.25,
+                low: 100.5,
+                close: 101.25,
+                ..ask
+            }]
+        );
+        assert!(w[0].low >= bid.low && w[0].high >= bid.high);
+        // At 1 the asks are the real ones, and a market without quotes has none to widen.
+        assert_eq!(widened(&[bid], &[ask], 1.0), vec![ask]);
+        assert!(widened(&[bid], &[], 3.0).is_empty());
+    }
+
+    #[test]
+    fn a_position_held_through_the_rollover_warns_of_the_unmodelled_swap() {
+        // Keyed on the rules, not the kind: a market whose carry is not modelled has one named.
+        let carry = InstrumentKind::Fx.rules().unmodelled_carry.unwrap();
+        // 2024-01-10 is in US standard time, so the rollover is at 22:00 UTC.
+        let day = td_core::days_from_civil(2024, 1, 10) * DAY_MS;
+        let held = |entry_hour: Millis, exit_hour: Millis| Trade {
+            entry_time: day + entry_hour * HOUR,
+            exit_time: day + exit_hour * HOUR,
+            ..trade(0, 0.0, false)
+        };
+        let h1 = td_core::Timeframe::H1;
+        // In at 01:00 and out in the bar that opens at 21:00 and ends at the rollover: intraday,
+        // no warning.
+        assert_eq!(carry_warning(carry, &[held(1, 21)], h1), None);
+        // In at 20:00 and out at 01:00 the next day: held through the rollover.
+        let warning = carry_warning(carry, &[held(1, 21), held(20, 25)], h1).unwrap();
+        assert_eq!(
+            warning,
+            "1 of 2 out-of-sample trades held a position through the overnight swap at the daily \
+             rollover (17:00 New York), which the engine does not charge yet, so their results \
+             leave that cost out."
+        );
+        // Closed in the bar that opens at the rollover: counted, as it may have filled after it.
+        assert!(carry_warning(carry, &[held(20, 22)], h1).is_some());
+        // On four-hour bars, in at 12:00 and stopped out inside the bar that opens at 20:00: that
+        // bar holds the 22:00 rollover, and the stop may have filled after it.
+        let h4 = td_core::Timeframe::H4;
+        assert!(carry_warning(carry, &[held(12, 20)], h4).is_some());
+        assert_eq!(carry_warning(carry, &[held(12, 16)], h4), None);
+        // Perpetual funding is modelled, so a perpetual has no carry to warn of.
+        assert_eq!(InstrumentKind::Perpetual.rules().unmodelled_carry, None);
+        assert_eq!(InstrumentKind::Spot.rules().unmodelled_carry, None);
     }
 
     #[test]
@@ -1552,4 +1728,251 @@ mod tests {
 
     /// 1,482 of 2,000 paths, seed 3.
     const PINNED_HAND_RUIN: f64 = 0.741;
+
+    fn ints(v: &[i64]) -> crate::ParamSpace {
+        crate::ParamSpace::Values {
+            values: v.iter().map(|&x| crate::ParamValue::Int(x)).collect(),
+        }
+    }
+
+    /// sma_cross's plan on 250 days of four-hour bars of a triangle wave, as the battery's
+    /// integration tests use, swept over `axes`: four 45-day test windows after a 60-day train
+    /// window.
+    fn sma_plan(axes: Vec<crate::ParamAxis>) -> (TestPlan, Vec<Candle>) {
+        let step = 4 * HOUR;
+        let count = 250 * 6;
+        let mut plan = crate::find_strategy("sma_cross").unwrap().plan;
+        plan.instruments = vec![test_instrument().id];
+        plan.timeframe = td_core::Timeframe::H4;
+        plan.period = crate::Period {
+            from: 0,
+            to: count as Millis * step,
+        };
+        plan.walk_forward = crate::WalkForwardPlan {
+            train_days: 60,
+            test_days: 45,
+        };
+        plan.out_of_sample = None;
+        plan.sweep.axes = axes;
+        plan.sweep.min_trades = 3;
+        plan.evidence.luck.permutations = 19;
+        let bars = (0..count)
+            .map(|i| {
+                let x = i as f64 / 60.0;
+                let close = 100.0 + 10.0 * (4.0 * (x - x.floor() - 0.5).abs() - 1.0);
+                Candle {
+                    open_time: i as Millis * step,
+                    open: close,
+                    high: close * 1.001,
+                    low: close * 0.999,
+                    close,
+                    volume: 1.0,
+                    quote_volume: close,
+                }
+            })
+            .collect();
+        (plan, bars)
+    }
+
+    /// The 3 x 3 grid of fast and slow periods.
+    fn sma_axes() -> Vec<crate::ParamAxis> {
+        vec![
+            crate::ParamAxis {
+                name: "fast".into(),
+                space: ints(&[2, 3, 4]),
+            },
+            crate::ParamAxis {
+                name: "slow".into(),
+                space: ints(&[8, 12, 16]),
+            },
+        ]
+    }
+
+    fn sma_battery(plan: &TestPlan, bars: &[Candle], seed: u64) -> BatteryResult {
+        let rule = VerdictRule::Portfolio {
+            benchmark: PortfolioBenchmark::Cash,
+            limits: crate::PortfolioLimits::default(),
+        };
+        let spec = BatterySpec {
+            strategy: "sma_cross",
+            plan,
+            rule: &rule,
+            instrument: &test_instrument(),
+            seed,
+        };
+        run_battery(&spec, bars, &[], &[], None).unwrap()
+    }
+
+    /// The drawdown bootstrap draws from its own seed stream, not R7's: swapped, its paths would
+    /// repeat R7's draws exactly.
+    #[test]
+    fn the_drawdown_bootstrap_draws_from_its_own_seed_stream() {
+        let (plan, bars) = sma_plan(sma_axes());
+        let seed = 7;
+        let r = sma_battery(&plan, &bars, seed);
+
+        let wf = r.walk_forward.as_ref().unwrap();
+        let cash = plan.backtest.starting_cash;
+        let daily = daily_returns(&EquitySeries::new(cash, &wf.equity, plan.timeframe));
+        let drawn = |stream| {
+            stats::bootstrap_drawdown(
+                &daily,
+                DEFAULT_RESAMPLES,
+                stats::default_block_len(daily.len()),
+                derive_seed(seed, stream),
+            )
+            .ok()
+        };
+        assert!(r.drawdown_bootstrap.is_some());
+        assert_eq!(r.drawdown_bootstrap, drawn(SEED_DRAWDOWN_BOOTSTRAP));
+        assert_ne!(r.drawdown_bootstrap, drawn(SEED_DAILY_BOOTSTRAP));
+    }
+
+    /// A decimal parameter swept over whole numbers: the chosen sets hold `equity_fraction` as the
+    /// decimal 1.0, not the listed 1, and R5 still finds them on the grid and runs their
+    /// neighbours.
+    #[test]
+    fn r5_runs_on_a_decimal_parameter_swept_over_whole_numbers() {
+        let mut axes = sma_axes();
+        axes.push(crate::ParamAxis {
+            name: "equity_fraction".into(),
+            space: ints(&[0, 1]),
+        });
+        let (plan, bars) = sma_plan(axes);
+        let r = sma_battery(&plan, &bars, 7);
+
+        let wf = r.walk_forward.as_ref().unwrap();
+        for w in &wf.windows {
+            assert_eq!(
+                w.params.get("equity_fraction"),
+                Some(crate::ParamValue::Float(1.0))
+            );
+        }
+        let plateau = r.plateau.as_ref().unwrap();
+        assert!(!plateau.directions.is_empty());
+        assert!(plateau.directions.iter().all(|d| d.windows > 0));
+    }
+
+    /// Each of R5's neighbours runs on its window's test bars with the window's own test config:
+    /// every direction's numbers are its runs stitched by hand from those configs, over the
+    /// windows where it ran, against the chosen sets' runs in the same windows.
+    #[test]
+    fn r5_runs_each_neighbour_on_its_windows_test_config() {
+        let (plan, bars) = sma_plan(sma_axes());
+        let r = sma_battery(&plan, &bars, 7);
+
+        let wf = r.walk_forward.as_ref().unwrap();
+        let plateau = r.plateau.as_ref().unwrap();
+        let base = plan.backtest_config("sma_cross", test_instrument());
+        let metric = plan.sweep.objective.metric;
+        assert!(!plateau.directions.is_empty());
+        for d in &plateau.directions {
+            let (mut moved, mut own) = (Vec::new(), Vec::new());
+            for w in &wf.windows {
+                let found = wf.spec.sweep.neighbours(&w.params).unwrap();
+                let Some((_, params)) = found.into_iter().find(|(s, _)| *s == d.steps) else {
+                    continue;
+                };
+                let config = BacktestConfig {
+                    params,
+                    ..w.out_of_sample.config.clone()
+                };
+                moved.push(run(&config, &bars, &[], &[]).unwrap());
+                own.push(&w.out_of_sample);
+            }
+            let h = stitched_headline(&base, &moved.iter().collect::<Vec<_>>());
+            assert_eq!(d.windows, moved.len(), "{d:?}");
+            assert_eq!(d.objective, h.value(metric), "{d:?}");
+            assert_eq!(d.total_return, h.total_return, "{d:?}");
+            assert_eq!(d.reference, stitched_headline(&base, &own).value(metric));
+        }
+    }
+
+    /// A cliff on one side of the chosen sets fails R5. One direction ran only in the even
+    /// windows, exactly as the chosen set did there; the other only in the odd windows, where it
+    /// lost to fees of 20% a fill. Each is judged on its own windows alone: filling the other
+    /// windows with the chosen set's run would hide most of the cliff.
+    #[test]
+    fn a_cliff_on_one_side_fails_the_plateau() {
+        let (plan, bars) = sma_plan(sma_axes());
+        let r = sma_battery(&plan, &bars, 7);
+        let wf = r.walk_forward.as_ref().unwrap();
+        assert_eq!(wf.windows.len(), 4);
+
+        let costly = |w: &crate::WindowResult| {
+            let config = BacktestConfig {
+                fee_override: Some(FeeSchedule {
+                    maker: 0.2,
+                    taker: 0.2,
+                    per_unit: 0.0,
+                }),
+                ..w.out_of_sample.config.clone()
+            };
+            run(&config, &bars, &[], &[]).unwrap()
+        };
+        let runs: Vec<Vec<(Vec<i8>, BacktestResult)>> = wf
+            .windows
+            .iter()
+            .enumerate()
+            .map(|(k, w)| match k % 2 {
+                0 => vec![(vec![-1, 0], w.out_of_sample.clone())],
+                _ => vec![(vec![1, 0], costly(w))],
+            })
+            .collect();
+        let base = plan.backtest_config("sma_cross", test_instrument());
+        let p = plateau(wf, &runs, &base, plan.sweep.objective);
+
+        let [flat, cliff] = p.directions.as_slice() else {
+            panic!("{:?}", p.directions)
+        };
+        assert_eq!(
+            (flat.steps.as_slice(), flat.windows),
+            ([-1, 0].as_slice(), 2)
+        );
+        assert_eq!(flat.objective, flat.reference);
+        let odd: Vec<&BacktestResult> = runs.iter().skip(1).step_by(2).map(|w| &w[0].1).collect();
+        let h = stitched_headline(&base, &odd);
+        assert_eq!((cliff.windows, cliff.total_return), (2, h.total_return));
+        assert!(h.total_return.unwrap() < 0.0, "{h:?}");
+        let settings = &plan.evidence.plateau;
+        assert!(
+            p.positive_share.unwrap() < settings.min_positive_share,
+            "{p:?}"
+        );
+        assert!(p.median_ratio.unwrap() < settings.min_median_ratio, "{p:?}");
+    }
+
+    /// A plateau saved before R5 moved out of sample, with its ratio and share, no directions and
+    /// no warnings on its verdict, still reads.
+    #[test]
+    fn a_plateau_saved_before_the_directions_still_reads() {
+        let old = serde_json::json!({
+            "best_objective": 1.25,
+            "median_ratio": 0.8,
+            "positive_share": 0.9,
+        });
+        let p: PlateauReport = serde_json::from_value(old).unwrap();
+        assert_eq!(
+            p,
+            PlateauReport {
+                best_objective: Some(1.25),
+                directions: Vec::new(),
+                median_ratio: Some(0.8),
+                positive_share: Some(0.9),
+            }
+        );
+        let direction: PlateauDirection = serde_json::from_value(serde_json::json!({
+            "steps": [1, 0],
+            "windows": 2,
+            "objective": 0.5,
+            "total_return": 0.1,
+        }))
+        .unwrap();
+        assert_eq!(direction.reference, None);
+        let mut verdict =
+            serde_json::to_value(Verdict::new(test_instrument().id, Vec::new())).unwrap();
+        verdict.as_object_mut().unwrap().remove("warnings");
+        let verdict: Verdict = serde_json::from_value(verdict).unwrap();
+        assert!(verdict.warnings.is_empty());
+    }
 }

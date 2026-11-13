@@ -6,12 +6,12 @@
 //! [`td_engine::VerdictRule::validate`]), the subset, each instrument's trading rules and the
 //! store's data for each instrument over the plan's period, so a refusal is an HTTP error, not a
 //! job that fails later. The store is never filled in: a range it lacks is a 422 `data_missing`
-//! naming the instrument and the missing span, as for the other runs.
+//! naming the instrument and the missing span, where a single run's job downloads it first.
 //!
 //! Each instrument's data is loaded the way the other run jobs load theirs
 //! ([`super::runs::load_run_data`]) over the plan's backtest configuration: the bars, a market
 //! with quotes' ask bars beside them, and a perpetual's funding. Every run of the battery trades
-//! on those asks, except the luck test (R3), which the battery skips on a market with quotes. That
+//! on those asks, the luck test's (R3) shuffled copies too. That
 //! configuration has no `warmup_from`: the engine reads no bars before the period, and the
 //! walk-forward warms each test window up from the bars before it inside the period.
 //!
@@ -30,10 +30,17 @@
 //! before it stay saved and are in the failed job's result.
 //!
 //! Each kept instrument is saved as its own run (kind `plan`, a [`PlanRun`]) under the runs folder,
-//! with the [`super::runs::DataReport`] in `data.json` and a small `verdict.json` ([`VerdictRecord`]) that
-//! `GET /verdicts` reads instead of the whole result.
+//! with the [`super::runs::DataReport`] in `data.json`, the [`RunRecord`] in `record.json`, and a
+//! small `verdict.json` ([`VerdictRecord`]) that `GET /verdicts` reads instead of the whole result.
+//!
+//! A verdict is current only when the engine revision, the plan and rule, and the strategy's
+//! source file ([`td_engine::code_hash`]) are all still the ones it was judged under; the verdict
+//! list flags each and sums them up in `stale`. It also lists the limits of the rule that are
+//! looser than the kind's defaults ([`td_engine::VerdictRule::loosened`]), and counts the distinct
+//! versions of the strategy's code that have been through the battery on the instrument, so many
+//! edits until one version passes show.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
 use std::path::Path;
@@ -48,8 +55,8 @@ use serde_json::Value;
 use td_core::{Instrument, InstrumentId, Millis};
 use td_data::Store;
 use td_engine::{
-    BatterySpec, ENGINE_REVISION, PlanRun, RunId, RunKind, SavedRun, StrategyEntry, TesterError,
-    Verdict,
+    BatterySpec, ENGINE_REVISION, LoosenedLimit, PlanRun, RunId, RunKind, SavedRun, StrategyEntry,
+    TesterError, Verdict, VerdictRule,
 };
 use ts_rs::TS;
 
@@ -58,12 +65,12 @@ use super::data::instrument_list;
 use super::error::ApiError;
 use super::jobs::{JobCreated, JobCtx, JobError, JobRequest, JobResult};
 use super::runs::{
-    RunData, changed_since_accepted, check_run_data, load_run_data, own_pool, save_run,
-    tester_error,
+    DataCutoff, RECORD_FILE, RunData, RunRecord, changed_since_accepted, check_run_data,
+    code_matches, load_run_data, own_pool, save_run, tester_error,
 };
 
 /// The file beside a plan run's `result.json` that `GET /verdicts` reads.
-pub const VERDICT_FILE: &str = "verdict.json";
+const VERDICT_FILE: &str = "verdict.json";
 
 /// `POST /runs/plan`: run a strategy's test plan.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
@@ -103,7 +110,7 @@ pub struct PlanInstrumentDone {
 /// that lacks a field (written before it existed) or does not parse is read from the run's
 /// `result.json` instead.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct VerdictRecord {
+struct VerdictRecord {
     pub strategy: String,
     pub instrument: InstrumentId,
     pub seed: u64,
@@ -117,6 +124,10 @@ pub struct VerdictRecord {
     pub rule: Value,
     /// False when a cancel stopped the luck test (R3), so the verdict lacks it.
     pub complete: bool,
+    /// The hash of the strategy's source file the battery ran with ([`td_engine::code_hash`]);
+    /// `None` in a record written before hashes were recorded.
+    #[serde(default)]
+    pub code_hash: Option<String>,
 }
 
 /// One row of `GET /verdicts`: the latest verdict of a strategy on an instrument, the newest
@@ -139,12 +150,29 @@ pub struct VerdictSummary {
     /// False when the strategy is no longer registered, its plan or rule has changed since the
     /// battery ran, or the plan no longer tests the instrument: run the plan again.
     pub plan_matches: bool,
+    /// Whether the strategy's source file is still the one the battery ran with: false when it has
+    /// been edited since, `null` when that is unknown (a battery saved before code hashes were
+    /// recorded, or a strategy no longer registered). The hash covers the strategy's own file only,
+    /// not shared helpers it calls, so a change to a shared helper leaves this true.
+    pub code_matches: Option<bool>,
+    /// True unless `engine_matches`, `plan_matches` and `code_matches` are all true: the verdict
+    /// may not be what this engine, plan, rule and code would give, so run the plan again.
+    pub stale: bool,
+    /// Every limit of the rule the verdict was judged under that is looser than its kind's default,
+    /// with both values; empty when none is, or when the saved rule no longer reads as a rule
+    /// (`plan_matches` is then false). Tightened limits are not listed.
+    pub loosened: Vec<LoosenedLimit>,
     /// False when a cancel stopped the battery's luck test, so its luck line is inconclusive.
     pub complete: bool,
     pub seed: u64,
     /// How many batteries have been saved for this strategy on this instrument, this one included.
-    /// An instrument a cancel stopped before the luck test saved none and is not counted.
+    /// An instrument a cancel stopped before the luck test saved none and is not counted. Keyed by
+    /// strategy name: renaming a strategy starts the count again.
     pub runs: usize,
+    /// How many distinct versions of the strategy's source file have been through the battery on
+    /// this instrument, this one included; batteries saved before code hashes were recorded count
+    /// together as one version. Keyed by strategy name like `runs`.
+    pub code_versions: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -156,7 +184,7 @@ pub(super) struct VerdictsQuery {
 /// data and engine gives the same verdict, and running it again cannot draw a luckier luck test.
 /// FNV-1a over `strategy|venue:symbol:kind`, kept to its low 53 bits so it stays exact as a
 /// JavaScript number in the GUI.
-pub fn plan_seed(strategy: &str, instrument: &InstrumentId) -> u64 {
+fn plan_seed(strategy: &str, instrument: &InstrumentId) -> u64 {
     let hash = format!("{strategy}|{instrument}")
         .bytes()
         .fold(0xcbf2_9ce4_8422_2325, |h: u64, b| {
@@ -262,12 +290,14 @@ pub(super) async fn start(
         instruments.push(instrument);
     }
 
-    // The store must hold each instrument's period; nothing is downloaded.
+    // The store must hold each instrument's period, and the period must end by the data cutoff;
+    // nothing is downloaded.
     let (store, checked) = (state.store.clone(), entry.clone());
-    let to_check = instruments.clone();
+    let (to_check, cutoff) = (instruments.clone(), state.data_cutoff.clone());
     tokio::task::spawn_blocking(move || {
         to_check.into_iter().try_for_each(|i| {
-            check_run_data(&store, &checked.plan.backtest_config(checked.name, i))
+            let config = checked.plan.backtest_config(checked.name, i);
+            check_run_data(&store, &config, cutoff.as_ref())
         })
     })
     .await
@@ -278,8 +308,16 @@ pub(super) async fn start(
         strategy: request.strategy,
         instruments: Some(ids),
     });
+    let cutoff = state.data_cutoff.clone();
     let job = state.jobs.submit(job_request, move |ctx| {
-        execute(&entry, &instruments, &store, &runs_dir, ctx)
+        execute(
+            &entry,
+            &instruments,
+            &store,
+            cutoff.as_ref(),
+            &runs_dir,
+            ctx,
+        )
     })?;
     Ok((StatusCode::ACCEPTED, Json(JobCreated { job_id: job.id })))
 }
@@ -289,6 +327,7 @@ fn execute(
     entry: &StrategyEntry,
     instruments: &[Instrument],
     store: &Store,
+    cutoff: Option<&DataCutoff>,
     runs_dir: &Path,
     ctx: &JobCtx,
 ) -> Result<JobResult, JobError> {
@@ -298,7 +337,7 @@ fn execute(
     let mut totals = Vec::with_capacity(instruments.len());
     for instrument in instruments {
         let config = entry.plan.backtest_config(entry.name, instrument.clone());
-        let data = load_run_data(store, &config).map_err(changed_since_accepted)?;
+        let data = load_run_data(store, &config, cutoff).map_err(changed_since_accepted)?;
         let spec = battery_spec(entry, instrument);
         totals.push(td_engine::battery_runs(&spec, &data.bars).map_err(tester_error)?);
         loaded.push(data);
@@ -333,8 +372,8 @@ fn execute(
             }
             std::ops::ControlFlow::Continue(())
         };
-        // The asks are empty for a kind without quotes; for one with quotes the battery trades
-        // on them and skips the luck test.
+        // The asks are empty for a kind without quotes; for one with quotes every run of the
+        // battery trades on them.
         let outcome = own_pool(|| {
             td_engine::run_battery(
                 &spec,
@@ -354,7 +393,7 @@ fn execute(
             }
             Err(e) => return Err(failed(done, e)),
         };
-        match save_plan_run(entry, instrument, battery, data, runs_dir) {
+        match save_plan_run(entry, instrument, battery, data, cutoff, runs_dir) {
             Ok(saved) => done.instruments.push(saved),
             Err(e) => return Err(failed(done, e)),
         }
@@ -403,8 +442,10 @@ fn save_plan_run(
     instrument: &Instrument,
     battery: td_engine::BatteryResult,
     data: &RunData,
+    cutoff: Option<&DataCutoff>,
     runs_dir: &Path,
 ) -> Result<PlanInstrumentDone, JobError> {
+    let run_record = RunRecord::new(entry.name, cutoff);
     let record = VerdictRecord {
         strategy: entry.name.to_string(),
         instrument: instrument.id.clone(),
@@ -413,9 +454,9 @@ fn save_plan_run(
         verdict: battery.verdict.clone(),
         plan: to_json(&entry.plan)?,
         rule: to_json(&entry.rule)?,
-        // Only a cancel during the luck test leaves a battery incomplete; a luck test skipped on a
-        // market with quotes is not one.
+        // Only a cancel during the luck test leaves a battery incomplete.
         complete: !battery.luck_cancelled,
+        code_hash: run_record.code_hash.clone(),
     };
     let run = PlanRun::new(
         &battery_spec(entry, instrument),
@@ -431,6 +472,7 @@ fn save_plan_run(
     let run_id = save_run(
         &saved,
         &data.report,
+        &run_record,
         &[(VERDICT_FILE, record_json.as_slice())],
         runs_dir,
     )?;
@@ -524,6 +566,11 @@ fn read_record(dir: &Path) -> Option<VerdictRecord> {
         plan: run.plan,
         rule: run.rule,
         complete: !run.battery.luck_cancelled,
+        // The result does not hold the hash; record.json beside it does when it was saved with one.
+        code_hash: fs::read(dir.join(RECORD_FILE))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<RunRecord>(&bytes).ok())
+            .and_then(|r| r.code_hash),
     })
 }
 
@@ -568,10 +615,11 @@ fn ran_under(entry: &StrategyEntry, record: &VerdictRecord, saved_view: &Value) 
 }
 
 /// The latest verdict per strategy and instrument (the newest complete one, or the newest when none
-/// is complete), with how many batteries each pair has saved, ordered by strategy and then
-/// instrument. Only `strategy`'s when it is given. Each verdict's plan and rule are compared with
-/// those of the registered `strategies`.
-pub fn latest_verdicts(
+/// is complete), with how many batteries and code versions each pair has saved, ordered by strategy
+/// and then instrument. Only `strategy`'s when it is given. Each verdict's plan and rule are
+/// compared with those of the registered `strategies`, and its code hash with the registered
+/// strategy's ([`td_engine::code_hash`]).
+fn latest_verdicts(
     runs_dir: &Path,
     strategies: &[StrategyEntry],
     strategy: Option<&str>,
@@ -584,6 +632,8 @@ pub fn latest_verdicts(
         }
     };
     let mut latest: BTreeMap<(String, String), VerdictSummary> = BTreeMap::new();
+    // Each pair's code hashes; `None` stands for every battery saved without one.
+    let mut versions: BTreeMap<(String, String), BTreeSet<Option<String>>> = BTreeMap::new();
     for entry in entries {
         let entry =
             entry.map_err(|e| ApiError::internal(format!("{}: {e}", runs_dir.display())))?;
@@ -607,6 +657,15 @@ pub fn latest_verdicts(
             .map(|id| instrument_view(record.plan.take(), &id));
         let plan_matches =
             saved_view.is_some_and(|view| strategies.iter().any(|e| ran_under(e, &record, &view)));
+        let engine_matches = record.engine_revision == ENGINE_REVISION;
+        let code_matches = code_matches(&record.strategy, record.code_hash.as_deref());
+        let loosened = serde_json::from_value::<VerdictRule>(record.rule.clone())
+            .map(|rule| rule.loosened())
+            .unwrap_or_default();
+        versions
+            .entry(key.clone())
+            .or_default()
+            .insert(record.code_hash.clone());
         let row = VerdictSummary {
             strategy: record.strategy,
             instrument: record.instrument,
@@ -614,11 +673,15 @@ pub fn latest_verdicts(
             created_at: id.created_at(),
             run_id: id,
             engine_revision: record.engine_revision,
-            engine_matches: record.engine_revision == ENGINE_REVISION,
+            engine_matches,
             plan_matches,
+            code_matches,
+            stale: !(engine_matches && plan_matches && code_matches == Some(true)),
+            loosened,
             complete: record.complete,
             seed: record.seed,
             runs,
+            code_versions: 0,
         };
         // A complete run beats an incomplete one; between two of the same, the newer wins.
         match latest.get_mut(&key) {
@@ -630,7 +693,13 @@ pub fn latest_verdicts(
             }
         }
     }
-    Ok(latest.into_values().collect())
+    Ok(latest
+        .into_iter()
+        .map(|(key, mut row)| {
+            row.code_versions = versions.get(&key).map_or(0, BTreeSet::len);
+            row
+        })
+        .collect())
 }
 
 /// `GET /verdicts?strategy=`.

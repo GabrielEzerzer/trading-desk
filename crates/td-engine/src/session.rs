@@ -9,8 +9,8 @@ use td_core::{
 use crate::broker::ENTRY_CANCELLED;
 use crate::runner::match_asks;
 use crate::{
-    BarFunding, BarStops, Broker, BrokerEvent, CandleFillModel, Context, EngineError, Order,
-    OrderStatus, Portfolio, SimBroker, Strategy,
+    BarFunding, Broker, BrokerEvent, CandleFillModel, Context, EngineError, Order, OrderStatus,
+    Portfolio, SimBroker, Strategy, TradeStops,
 };
 
 /// Why [`Session::close_out`] cancels the open orders.
@@ -80,7 +80,9 @@ pub struct Session {
     fills: Vec<Fill>,
     equity: Vec<EquityPoint>,
     bar_funding: Vec<BarFunding>,
-    bar_stops: Vec<BarStops>,
+    trade_stops: Vec<TradeStops>,
+    /// The reason the strategy stopped the run on the bar being fed ([`Context::fail`]).
+    failure: Option<String>,
 }
 
 impl Session {
@@ -157,7 +159,8 @@ impl Session {
             fills: Vec::new(),
             equity: Vec::new(),
             bar_funding: Vec::new(),
-            bar_stops: Vec::new(),
+            trade_stops: Vec::new(),
+            failure: None,
         })
     }
 
@@ -165,9 +168,11 @@ impl Session {
     /// in the gap since the previous bar.
     ///
     /// The bar must be valid, on a timeframe boundary and later than the previous bar; gaps are
-    /// allowed. On an error nothing changes. Then, in order: funding due at the bar's open, or in
-    /// the gap between the previous bar's end and this bar's open, is charged on the position held
-    /// going into the bar, at the open price; open orders are checked against this bar; a
+    /// allowed. On an error nothing changes, except on [`EngineError::StrategyFailed`], which is
+    /// returned after the bar has been fed in full, with its fills, portfolio changes and equity
+    /// point. Then, in order: funding due at the bar's open, or in the gap between the previous
+    /// bar's end and this bar's open, is charged on the position held going into the bar, at the
+    /// open price; open orders are checked against this bar; a
     /// perpetual position is checked for liquidation; funding due later in the bar is charged on
     /// the position after this bar's fills, at the close; equity is marked at the close; and the
     /// strategy is called. The first bar fed takes no funding from before its open.
@@ -243,9 +248,16 @@ impl Session {
         let first_new_fill = self.fills.len();
         let instrument = &self.instrument;
         let breached = |book: &Portfolio| liquidation_trigger(instrument, book, &bar, funding);
-        // The protective stops placed or filled on this bar since the last fill that opened a
-        // position, then those open after it.
-        let mut stops = BarStops::default();
+        // The stops resting as the bar's fills go, for the stops in force when a trade opens.
+        let mut resting: Vec<(OrderId, Side, f64)> = self
+            .broker
+            .open_orders()
+            .iter()
+            .filter_map(|o| stop_of(o).map(|(side, trigger)| (o.id, side, trigger)))
+            .collect();
+        // The stops of the last trade opened on this bar: those resting when it opened, then
+        // those placed or filled after it, until the next fill that opens a position.
+        let mut opened: Option<TradeStops> = None;
         for event in self
             .broker
             .on_bar(&bar, &ask_bar, &self.portfolio, &breached)
@@ -256,24 +268,39 @@ impl Session {
                     self.portfolio
                         .apply_fill(fill.side, fill.qty, fill.price, fill.fee);
                     let after = self.portfolio.position();
+                    resting.retain(|&(id, ..)| id != fill.order_id);
                     // A fill that opens a position, from flat or by flipping it, starts a new
-                    // trade: the stops of the trade it follows (one that closed it on this bar,
-                    // since stops fill before limits) are not its stops. A stop still resting is
-                    // counted again below with the open orders.
+                    // trade, which keeps its own stops apart from those of the trade before it.
                     // `signum` of 0.0 is 1.0, so flat is checked on its own.
                     if after != 0.0 && (before == 0.0 || after.signum() != before.signum()) {
-                        stops = BarStops::default();
+                        self.trade_stops.extend(opened.take());
+                        let mut stops = TradeStops {
+                            entry_time: fill.time,
+                            ..TradeStops::default()
+                        };
+                        for &(_, side, trigger) in &resting {
+                            stops.add(side, trigger);
+                        }
+                        opened = Some(stops);
                     }
                     let order = self.order_mut(fill.order_id);
                     order.status = OrderStatus::Filled;
-                    add_stop(&mut stops, order);
+                    if let Some(stops) = opened.as_mut() {
+                        add_stop(stops, order);
+                    }
                     self.fills.push(fill);
                 }
                 BrokerEvent::Cancelled { id, reason } => {
+                    resting.retain(|&(resting_id, ..)| resting_id != id);
                     self.order_mut(id).status = OrderStatus::Cancelled(reason);
                 }
                 BrokerEvent::Placed(order) => {
-                    add_stop(&mut stops, &order);
+                    if let Some(stops) = opened.as_mut() {
+                        add_stop(stops, &order);
+                    }
+                    if let Some((side, trigger)) = stop_of(&order) {
+                        resting.push((order.id, side, trigger));
+                    }
                     let id = order.id;
                     *self.order_mut(id) = order;
                 }
@@ -305,11 +332,15 @@ impl Session {
         self.bars.push(bar);
         self.ask = ask;
         self.call_strategy(&bar, first_new_fill, false);
-        for order in self.broker.open_orders() {
-            add_stop(&mut stops, order);
+        // The last trade opened on the bar also takes the stops open once the strategy has handled
+        // the bar, such as one sent in reaction to its fill.
+        if let Some(mut stops) = opened {
+            for order in self.broker.open_orders() {
+                add_stop(&mut stops, order);
+            }
+            self.trade_stops.push(stops);
         }
-        self.bar_stops.push(stops);
-        Ok(())
+        self.strategy_failure()
     }
 
     /// Feeds a closed bar that only adds to the strategy's history, before the first live bar.
@@ -330,7 +361,16 @@ impl Session {
         self.check_bar(&bar, funding)?;
         self.bars.push(bar);
         self.call_strategy(&bar, self.fills.len(), true);
-        Ok(())
+        self.strategy_failure()
+    }
+
+    /// The error for a strategy that called [`Context::fail`] on the bar just fed. The bar itself
+    /// has been fed in full, so the session's state is that of a session that saw it.
+    fn strategy_failure(&mut self) -> Result<(), EngineError> {
+        match self.failure.take() {
+            Some(reason) => Err(EngineError::StrategyFailed(reason)),
+            None => Ok(()),
+        }
     }
 
     /// Closes out at the end of a run, after the second-to-last bar: cancels every open order
@@ -427,6 +467,7 @@ impl Session {
             broker: &mut *self.broker,
             orders: &mut self.orders,
             warming_up: false,
+            failure: &mut self.failure,
         }
     }
 
@@ -590,6 +631,7 @@ impl Session {
             broker: &mut *self.broker,
             orders: &mut self.orders,
             warming_up,
+            failure: &mut self.failure,
         };
         if ctx.bars.len() == 1 {
             self.strategy.on_start(&mut ctx);
@@ -630,15 +672,16 @@ impl Session {
         &self.bar_funding
     }
 
-    /// The protective stops of each live bar, one entry per bar fed with [`Session::on_bar`], like
-    /// [`Session::equity`]: the nearest reduce-only stop on each side (by trigger, for stop-limits
-    /// too) among those placed on the bar (an entry's attached stop is placed when it fills) or
-    /// filled on it after the bar's last fill that opened a position (from flat, or by flipping
-    /// it), and those open after the strategy has handled the bar. So a trade that opens on the bar
-    /// a stop closed the one before does not take that stop. A trade takes its stop from the entry
-    /// for the bar it opened on; see [`crate::attach_stops`].
-    pub fn bar_stops(&self) -> &[BarStops] {
-        &self.bar_stops
+    /// The protective stops of each trade, one entry per fill that opened a position (from flat,
+    /// or by flipping it), in fill order: the nearest reduce-only stop on each side (by trigger,
+    /// for stop-limits too) among those resting when the fill happened, those placed (an entry's
+    /// attached stop is placed when it fills) or filled on its bar after it and before the bar's
+    /// next fill that opened a position, and, for the last such fill on the bar, those open after
+    /// the strategy has handled the bar. So a trade that opens on the bar a stop closed the one
+    /// before does not take that stop, and that one keeps its own. A trade takes the entry of the
+    /// fill that opened it; see [`crate::attach_stops`].
+    pub fn trade_stops(&self) -> &[TradeStops] {
+        &self.trade_stops
     }
 
     pub fn fills(&self) -> &[Fill] {
@@ -675,13 +718,21 @@ pub(crate) fn check_quote(bar: &Candle, ask: &Candle) -> Result<(), EngineError>
 }
 
 /// Counts `order` in `stops` if it is a reduce-only stop or stop-limit.
-fn add_stop(stops: &mut BarStops, order: &Order) {
-    let req = &order.request;
-    if !req.reduce_only {
-        return;
+fn add_stop(stops: &mut TradeStops, order: &Order) {
+    if let Some((side, trigger)) = stop_of(order) {
+        stops.add(side, trigger);
     }
-    if let OrderType::Stop { trigger } | OrderType::StopLimit { trigger, .. } = req.order_type {
-        stops.add(req.side, trigger);
+}
+
+/// The side and trigger of `order` when it is a reduce-only stop, the kind a trade counts among
+/// its stops.
+fn stop_of(order: &Order) -> Option<(Side, f64)> {
+    let req = &order.request;
+    match req.order_type {
+        OrderType::Stop { trigger } | OrderType::StopLimit { trigger, .. } if req.reduce_only => {
+            Some((req.side, trigger))
+        }
+        _ => None,
     }
 }
 
@@ -855,6 +906,66 @@ mod tests {
 
     impl Strategy for Idle {
         fn on_bar(&mut self, _ctx: &mut Context, _bar: &Candle) {}
+    }
+
+    /// Fails on the bar with the given number of bars seen, twice, to show the first reason is
+    /// the one kept.
+    struct FailOn(usize);
+
+    impl Strategy for FailOn {
+        fn on_bar(&mut self, ctx: &mut Context, _bar: &Candle) {
+            if ctx.bars().len() == self.0 {
+                ctx.fail("first reason");
+                ctx.fail("second reason");
+            }
+        }
+    }
+
+    /// A strategy's `fail` turns the bar it was called on into an error, on a live bar and on a
+    /// warm-up bar, and the bars before it are fed as usual.
+    #[test]
+    fn a_strategy_that_fails_stops_the_run_with_its_reason() {
+        let config = SessionConfig {
+            starting_cash: 10_000.0,
+            slippage_bps: 0.0,
+            fees: None,
+            max_leverage: 1.0,
+            account_currency: AccountCurrency::Quote,
+        };
+        let bars: Vec<Candle> = (0..4).map(|i| bar(i, 100.0)).collect();
+        let failed = EngineError::StrategyFailed("first reason".into());
+        let err = run_backtest(
+            Box::new(FailOn(3)),
+            perp(),
+            Timeframe::M1,
+            &bars,
+            &[],
+            &[],
+            config,
+        )
+        .err();
+        assert_eq!(err, Some(failed.clone()));
+        let mut s = Session::new(Box::new(FailOn(3)), perp(), Timeframe::M1, config).unwrap();
+        s.on_bar(bars[0], &[]).unwrap();
+        s.on_bar(bars[1], &[]).unwrap();
+        assert_eq!(s.on_bar(bars[2], &[]), Err(failed.clone()));
+        assert_eq!(s.equity().len(), 3);
+        let mut s = Session::new(Box::new(FailOn(2)), perp(), Timeframe::M1, config).unwrap();
+        s.warm_up(bars[0], &[]).unwrap();
+        assert_eq!(s.warm_up(bars[1], &[]), Err(failed));
+        // A strategy that never fails runs to the end.
+        assert!(
+            run_backtest(
+                Box::new(FailOn(9)),
+                perp(),
+                Timeframe::M1,
+                &bars,
+                &[],
+                &[],
+                config
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -1167,7 +1278,7 @@ mod tests {
             AccountCurrency::Quote,
             None,
         );
-        crate::attach_stops(&mut t, s.bars(), s.bar_stops(), AccountCurrency::Quote);
+        crate::attach_stops(&mut t, s.trade_stops(), AccountCurrency::Quote);
         t
     }
 
@@ -1194,11 +1305,38 @@ mod tests {
         let prices: Vec<f64> = s.fills().iter().map(|f| f.price).collect();
         assert_eq!(prices, [100.0, 90.0, 93.0]);
         assert_eq!(s.portfolio().position(), 1.0);
-        assert_eq!(s.bar_stops()[2].sell, Some(85.0));
+        assert_eq!(s.trade_stops()[1].sell, Some(85.0));
         let t = trades_of(&s);
         assert_eq!(t.len(), 2);
         assert_eq!(t[1].entry_price, 93.0);
         // B risks 93 - 85 = 8, not A's 93 - 90 = 3.
+        assert_eq!(t[1].stop, Some(85.0));
+    }
+
+    #[test]
+    fn a_trade_a_stop_closes_on_the_bar_it_opened_keeps_its_stop_when_another_opens() {
+        // On bar 1's close: a market buy with a sell stop at 95 attached, and a buy limit at 93
+        // with a stop at 85 attached.
+        let s = run_script(
+            |ctx, n| {
+                if n == 2 {
+                    ctx.submit_with_stop(buy(ctx, OrderType::Market), 95.0)
+                        .unwrap();
+                    let limit = buy(ctx, OrderType::Limit { price: 93.0 });
+                    ctx.submit_with_stop(limit, 85.0).unwrap();
+                }
+            },
+            // Bar 2 opens at 100, where A buys and its stop at 95 is placed. The bar falls to 92:
+            // stops fill before limits, so A's stop closes it at 95, then the limit opens B at 93
+            // from flat, and B's stop at 85 is placed and rests.
+            candle(2, 100.0, 101.0, 92.0, 94.0),
+        );
+        let prices: Vec<f64> = s.fills().iter().map(|f| f.price).collect();
+        assert_eq!(prices, [100.0, 95.0, 93.0]);
+        let t = trades_of(&s);
+        assert_eq!(t.len(), 2);
+        // A risked 100 - 95 = 5, not 100 - 85 = 15 from B's stop.
+        assert_eq!(t[0].stop, Some(95.0));
         assert_eq!(t[1].stop, Some(85.0));
     }
 
@@ -1225,14 +1363,14 @@ mod tests {
         let prices: Vec<f64> = s.fills().iter().map(|f| f.price).collect();
         assert_eq!(prices, [100.0, 90.0, 95.0]);
         assert_eq!(s.portfolio().position(), 1.0);
-        assert_eq!(s.bar_stops()[2].sell, Some(88.0));
+        assert_eq!(s.trade_stops()[1].sell, Some(88.0));
         let t = trades_of(&s);
         assert_eq!(t.len(), 2);
         assert_eq!(t[1].stop, Some(88.0));
     }
 
     #[test]
-    fn bar_stops_hold_the_stops_placed_filled_or_open_on_each_bar() {
+    fn trade_stops_hold_the_stops_placed_filled_or_open_for_each_trade() {
         let inst = Instrument {
             id: InstrumentId {
                 venue: Venue::Binance,
@@ -1263,22 +1401,18 @@ mod tests {
         for (i, &open) in opens.iter().enumerate() {
             s.on_bar(bar(i as i64, open), &[]).unwrap();
         }
-        let stops = s.bar_stops();
-        assert_eq!(stops.len(), 5);
-        assert_eq!(stops[0], BarStops::default());
+        // Two trades open, on bars 1 and 2; bars 3 and 4 open none.
+        let stops = s.trade_stops();
+        assert_eq!(stops.len(), 2);
         // Bar 1: the entry fills at the open, which places its stop at 99.5, and the bar's low,
-        // 99, fills that stop on the same bar. It still counts for the bar.
+        // 99, fills that stop on the same bar. It still counts for the trade.
         assert_eq!(s.orders()[1].status, OrderStatus::Filled);
-        assert_eq!(stops[1].sell, Some(99.5));
+        assert_eq!((stops[0].entry_time, stops[0].sell), (60_000, Some(99.5)));
         // Bar 2: the second entry has no stop until the strategy rests one on the bar's close.
-        assert_eq!(stops[2].sell, Some(90.0));
-        // Bar 3: the stop is still open.
-        assert_eq!(stops[3].sell, Some(90.0));
-        // Bar 4 opens below it, at 89: it fills at the open, so it is neither placed on the bar
-        // nor open after it, and counts as filled on it.
+        assert_eq!((stops[1].entry_time, stops[1].sell), (120_000, Some(90.0)));
+        // Bar 4 opens below the stop, at 89, and it closes the trade there.
         assert_eq!(s.portfolio().position(), 0.0);
         assert_eq!(s.fills().last().unwrap().price, 89.0);
-        assert_eq!(stops[4].sell, Some(90.0));
         assert!(stops.iter().all(|x| x.buy.is_none()));
     }
 }

@@ -33,7 +33,7 @@ use td_server::api::data::read_coverage;
 use td_server::api::error::ApiError;
 use td_server::api::jobs::JobError;
 use td_server::api::runs::{
-    RunData, RunDone, check_run, check_run_data, load_run_data, read_run, save_run,
+    RunData, RunDone, RunRecord, check_run, check_run_data, load_run_data, read_run, save_run,
 };
 
 /// Every dataset starts at 2022-01-01T00:00Z.
@@ -57,6 +57,10 @@ struct Args {
     /// The workloads file (default: `harness/evals/perf-workloads.json` in the workspace).
     #[arg(long)]
     workloads: Option<PathBuf>,
+    /// Write the one chosen workload's dataset into this data directory, keep it, and time
+    /// nothing. The GUI's engine integration test seeds its data folder this way.
+    #[arg(long)]
+    seed: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -129,7 +133,8 @@ struct Measured {
     /// something the first one had to make.
     first_ms: f64,
     median_ms: f64,
-    /// SHA-256 of the result's JSON, in hex; the same on every repetition.
+    /// SHA-256 of the result's JSON without `engine_revision`, in hex; the same on every
+    /// repetition.
     checksum: String,
     /// For `lab_backtest`, each phase's time in the fastest repetition.
     phases: Option<Phases>,
@@ -174,12 +179,6 @@ fn bench_all(args: &Args) -> Result<(), String> {
     let text = fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
     let file: WorkloadFile =
         serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
-    // Fresh for every run, so no dataset an older binary wrote is ever timed; removed when the
-    // run ends, with an error too.
-    let data_dir = tempfile::Builder::new()
-        .prefix("td-bench-data-")
-        .tempdir()
-        .map_err(|e| format!("cannot make the data directory: {e}"))?;
     let chosen: Vec<&Workload> = file
         .workloads
         .iter()
@@ -193,6 +192,23 @@ fn bench_all(args: &Args) -> Result<(), String> {
     if chosen.is_empty() {
         return Err("no workload matches the split and filter".into());
     }
+    if let Some(dir) = &args.seed {
+        let [w] = chosen[..] else {
+            return Err(format!(
+                "--seed writes one dataset, and {} workloads match",
+                chosen.len()
+            ));
+        };
+        let (from, to) = dataset_range(w.months);
+        eprintln!("writing dataset {} into {}", w.name, dir.display());
+        return write_dataset(&Store::new(dir), w.kind, w.seed, from, to);
+    }
+    // Fresh for every run, so no dataset an older binary wrote is ever timed; removed when the
+    // run ends, with an error too.
+    let data_dir = tempfile::Builder::new()
+        .prefix("td-bench-data-")
+        .tempdir()
+        .map_err(|e| format!("cannot make the data directory: {e}"))?;
     let mut lines = Vec::new();
     let mut total_ms = 0.0;
     let mut checksums = String::new();
@@ -274,7 +290,7 @@ fn bench(
     // Loaded once, outside the timed section, for the modes that time only the engine.
     let data = match w.mode {
         Mode::Load | Mode::LabBacktest => None,
-        _ => Some(load_run_data(store, &config).map_err(api_error)?),
+        _ => Some(load_run_data(store, &config, None).map_err(api_error)?),
     };
     for rep in 0..reps {
         // A store of its own for each repetition, as after an app start: whatever a store comes
@@ -291,8 +307,8 @@ fn bench(
             }
             (Mode::Load, _) => {
                 let start = Instant::now();
-                check_run_data(store, &config).map_err(api_error)?;
-                let loaded = load_run_data(store, &config).map_err(api_error)?;
+                check_run_data(store, &config, None).map_err(api_error)?;
+                let loaded = load_run_data(store, &config, None).map_err(api_error)?;
                 let ms = elapsed_ms(start);
                 eprintln!(
                     "  rep {rep}: {} bars, {} funding rates",
@@ -301,7 +317,7 @@ fn bench(
                 );
                 (
                     ms,
-                    to_json(&(&loaded.bars, &loaded.funding, &loaded.report))?,
+                    result_json(&(&loaded.bars, &loaded.funding, &loaded.report))?,
                 )
             }
             (Mode::Backtest, Some(data)) => {
@@ -309,7 +325,7 @@ fn bench(
                 let result = engine_run(&config, data).map_err(|e| e.to_string())?;
                 let ms = elapsed_ms(start);
                 eprintln!("  rep {rep}: {} trades", result.trades.len());
-                (ms, to_json(&result)?)
+                (ms, result_json(&result)?)
             }
             (Mode::Sweep { sweep }, Some(data)) => {
                 let spec = sweep_spec(&config, sweep);
@@ -329,7 +345,7 @@ fn bench(
                     "  rep {rep}: {} runs, {trading} with trades, {errors} refused",
                     result.rows.len()
                 );
-                (ms, to_json(&result)?)
+                (ms, result_json(&result)?)
             }
             (Mode::WalkForward { sweep, windows }, Some(data)) => {
                 let spec = WalkForwardSpec {
@@ -355,7 +371,7 @@ fn bench(
                     result.windows.len(),
                     result.trades.len()
                 );
-                (ms, to_json(&result)?)
+                (ms, result_json(&result)?)
             }
             (_, None) => unreachable!("data is loaded for every engine-only mode"),
         };
@@ -434,15 +450,16 @@ fn lab_backtest(
     let mut coverage = read_coverage(store, config.instrument.id.clone()).map_err(api_error)?;
     to_json(&coverage)?;
     split(&mut p.coverage);
-    check_run_data(store, config).map_err(api_error)?;
+    check_run_data(store, config, None).map_err(api_error)?;
     split(&mut p.check);
-    let data = load_run_data(store, config).map_err(api_error)?;
+    let data = load_run_data(store, config, None).map_err(api_error)?;
     split(&mut p.load);
     let result = engine_run(config, &data).map_err(|e| e.to_string())?;
     split(&mut p.run);
     let trades = result.trades.len();
     let saved = SavedRun::Backtest(Box::new(result));
-    let id = save_run(&saved, &data.report, &[], runs.path()).map_err(job_error)?;
+    let record = RunRecord::new(&config.strategy, None);
+    let id = save_run(&saved, &data.report, &record, &[], runs.path()).map_err(job_error)?;
     let done = RunDone {
         summary: saved.summary(id.clone()),
         run_id: id,
@@ -465,7 +482,7 @@ fn lab_backtest(
     }
     Ok((
         p,
-        to_json(&(
+        result_json(&(
             &coverage,
             &detail.run,
             &detail.data,
@@ -484,6 +501,26 @@ fn elapsed_ms(start: Instant) -> f64 {
 
 fn to_json(value: &impl Serialize) -> Result<Vec<u8>, String> {
     serde_json::to_vec(value).map_err(|e| format!("cannot serialise the result: {e}"))
+}
+
+/// The JSON a workload's checksum is taken over: the result without any `engine_revision` field,
+/// so a revision bump alone does not move the checksum and the check shows whether a bump moved
+/// a number.
+fn result_json(value: &impl Serialize) -> Result<Vec<u8>, String> {
+    fn strip(v: &mut serde_json::Value) {
+        match v {
+            serde_json::Value::Object(map) => {
+                map.remove("engine_revision");
+                map.values_mut().for_each(strip);
+            }
+            serde_json::Value::Array(items) => items.iter_mut().for_each(strip),
+            _ => {}
+        }
+    }
+    let mut v =
+        serde_json::to_value(value).map_err(|e| format!("cannot serialise the result: {e}"))?;
+    strip(&mut v);
+    to_json(&v)
 }
 
 fn api_error(e: ApiError) -> String {
@@ -813,6 +850,13 @@ mod tests {
             assert!(hashed[data]["bars"].as_u64().unwrap() > 0);
             assert!(hashed[error].is_null());
         }
+    }
+
+    #[test]
+    fn the_checksummed_json_leaves_out_the_engine_revision() {
+        let value = serde_json::json!([{ "engine_revision": 4, "run": { "engine_revision": 4, "x": 1.5 } }]);
+        let json = result_json(&value).unwrap();
+        assert_eq!(json, br#"[{"run":{"x":1.5}}]"#);
     }
 
     #[test]

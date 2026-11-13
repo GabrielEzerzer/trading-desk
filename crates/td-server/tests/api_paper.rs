@@ -112,12 +112,15 @@ fn frame(c: &Candle) -> String {
     )
 }
 
-/// Lists the one test instrument, as the kind asked for, for any venue; downloads are not used
-/// here.
-struct Venues;
+/// Lists the one test instrument, as the kind asked for, for any venue, and counts the lists it
+/// gave; downloads are not used here.
+struct Venues {
+    lists: Arc<AtomicUsize>,
+}
 
 impl MarketSource for Venues {
     fn instruments(&self, _: Venue, kind: InstrumentKind) -> Result<InstrumentList, DataError> {
+        self.lists.fetch_add(1, Ordering::SeqCst);
         let mut listed = instrument();
         listed.id.kind = kind;
         Ok(InstrumentList {
@@ -282,6 +285,8 @@ impl LiveSource for Live {
 struct Api {
     server: Server,
     client: reqwest::Client,
+    /// The instrument lists the venue gave.
+    lists: Arc<AtomicUsize>,
 }
 
 impl Api {
@@ -293,18 +298,23 @@ impl Api {
                 now: venue.now.clone(),
             }),
         };
+        let lists = Arc::new(AtomicUsize::new(0));
         let server = Server::start(ApiConfig {
             store: Store::new(dir.path()),
-            source: Arc::new(Venues),
+            source: Arc::new(Venues {
+                lists: lists.clone(),
+            }),
             live: Arc::new(live),
             token: Token::generate().expect("rng"),
             port: 0,
+            data_cutoff: None,
         })
         .await
         .expect("starts");
         Api {
             server,
             client: reqwest::Client::new(),
+            lists,
         }
     }
 
@@ -1410,7 +1420,8 @@ async fn a_manual_order_is_refused_while_catching_up_and_takes_effect_from_the_f
 }
 
 /// A market quoted as a bid and an ask has no live ask feed, so a paper session on it is refused
-/// before anything is made, rather than started to fail on its first bar.
+/// before anything is made, rather than started to fail on its first bar, and before the venue is
+/// asked for its instruments.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_paper_session_on_a_quoted_market_is_400_and_creates_nothing() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -1425,6 +1436,11 @@ async fn a_paper_session_on_a_quoted_market_is_400_and_creates_nothing() {
         refused["error"]["message"],
         "binance:TESTUSDT:fx is quoted as a bid and an ask, and there is no live ask feed yet, so \
          it cannot be paper traded"
+    );
+    assert_eq!(
+        api.lists.load(Ordering::SeqCst),
+        0,
+        "the venue is not asked"
     );
     let (_, sessions) = api.get("/sessions").await;
     assert_eq!(sessions, json!([]));

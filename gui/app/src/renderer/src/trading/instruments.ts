@@ -1,6 +1,7 @@
 // Finding instruments in the switcher's menu.
 
 import type { Instrument, InstrumentId, InstrumentKind } from '@td/shared'
+import { formatVenue } from '../lab/format'
 
 export type KindFilter = 'all' | InstrumentKind
 
@@ -8,10 +9,8 @@ export type KindFilter = 'all' | InstrumentKind
 // ever wanted.
 export const MAX_ROWS = 60
 
-const VENUES = { binance: 'Binance', bybit: 'Bybit' } as const
-
 export function venueLabel(id: InstrumentId): string {
-  return `${VENUES[id.venue]} ${id.kind}`
+  return `${formatVenue(id.venue)} ${id.kind}`
 }
 
 /** Symbol matches first by prefix, then anywhere; "btc/usdt" and "btc usdt" find BTCUSDT. */

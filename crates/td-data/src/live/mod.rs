@@ -184,6 +184,15 @@ pub enum FeedEvent {
     Bar(Candle),
     /// The bucket opening at this time had too many minutes missing and gives no bar.
     Dropped(Millis),
+    /// The bar of the bucket opening at `open_time`, sent just before, was built with this many
+    /// minutes missing, within the resampling rule's tolerance.
+    Tolerated {
+        open_time: Millis,
+        missing_minutes: u32,
+    },
+    /// This many stream frames were dropped because the feed fell behind the stream. A closed
+    /// minute among them shows up as a gap, which is backfilled.
+    FramesDropped { count: u64 },
     /// A REST backfill failed; the feed retries it after a backoff and emits nothing newer
     /// meanwhile.
     BackfillFailed { error: String },
@@ -202,9 +211,9 @@ pub enum ChartEvent {
     /// joined it after it started). The closed [`FeedEvent::Bar`] of the same open time, when it
     /// comes, comes after it and replaces it. Display only.
     ///
-    /// shortcut: a bucket whose closed bar never comes (the one joined late, or one the builder
-    /// dropped for a missing minute) keeps its last forming bar on the chart; send a correction
-    /// when the bucket ends if a chart is seen holding a wrong bar.
+    /// shortcut: a bucket with no closed bar whose last minute the venue never delivers, on the
+    /// stream or over REST, keeps its last forming bar on the chart, which may show that minute in
+    /// progress; send a correction when a later bucket starts if a chart is seen holding one.
     Forming(Candle),
 }
 
@@ -270,7 +279,7 @@ impl SharedStream {
                     Inbound::Disconnected { .. } | Inbound::ConnectFailed { .. } => {
                         flag.store(false, Ordering::SeqCst);
                     }
-                    Inbound::Text(_) => {}
+                    Inbound::Text(_) | Inbound::Dropped(_) => {}
                 }
                 // No feed listening is fine; one that falls behind loses frames, recovered as a gap.
                 let _ = out.send(inbound);
@@ -321,8 +330,8 @@ pub fn run_feed_on(
 
 /// [`run_feed_on`] for a chart: the same events, wrapped in [`ChartEvent::Feed`], and the bar still
 /// forming as [`ChartEvent::Forming`]. When the stream was joined after the current bucket started,
-/// the bucket's earlier minutes are fetched over REST once, so the forming bar covers the whole
-/// bucket.
+/// the bucket's earlier minutes are fetched over REST, so the forming bar covers the whole bucket;
+/// a failed fetch is tried once more when the bucket ends.
 pub fn run_chart_feed_on(
     stream: Arc<SharedStream>,
     timeframe: Timeframe,
@@ -330,7 +339,7 @@ pub fn run_chart_feed_on(
     rest: Arc<dyn Rest>,
     tx: mpsc::Sender<ChartEvent>,
 ) -> impl Future<Output = ()> + Send + 'static {
-    let forming = FormingBar::new(timeframe);
+    let forming = Box::new(FormingBar::new(timeframe));
     run_on(stream, timeframe, start, rest, Out::Chart { tx, forming })
 }
 
@@ -371,7 +380,7 @@ fn run_on(
                 Ok(inbound) => inbound,
                 // The frames it missed show up as a gap at the next closed minute, which is
                 // backfilled.
-                Err(RecvError::Lagged(_)) => continue,
+                Err(RecvError::Lagged(count)) => Inbound::Dropped(count),
                 Err(RecvError::Closed) => break,
             };
             if feed.handle(inbound).await.is_err() {
@@ -400,7 +409,7 @@ enum Out {
     /// A chart feed: the same events and the bar still forming.
     Chart {
         tx: mpsc::Sender<ChartEvent>,
-        forming: FormingBar,
+        forming: Box<FormingBar>,
     },
 }
 
@@ -418,6 +427,7 @@ impl Feed {
             Inbound::Connected => self.send(FeedEvent::Connected).await,
             Inbound::ConnectFailed { error } => self.send(FeedEvent::ConnectFailed { error }).await,
             Inbound::Disconnected { reason } => self.send(FeedEvent::Disconnected { reason }).await,
+            Inbound::Dropped(count) => self.send(FeedEvent::FramesDropped { count }).await,
             Inbound::Text(text) => match self.source.live().and_then(|live| live.parse(&text)) {
                 Err(e) => {
                     let error = e.to_string();
@@ -448,22 +458,26 @@ impl Feed {
             Placement::Next => {}
         }
         let built = self.builder.push(minute);
-        // A chart's bucket that ends without a closed bar (joined late, so the builder drops it)
-        // gets its forming bar once more, now whole, so the chart does not keep a stale one.
-        let unclosed = match &mut self.out {
-            Out::Chart { forming, .. } => {
-                forming.push(minute, true)
-                    && forming.ends_bucket(minute.open_time)
-                    && forming
-                        .bucket()
-                        .is_some_and(|b| !built.candles.iter().any(|bar| bar.open_time == b))
-            }
-            Out::Feed(_) => false,
-        };
-        if unclosed {
-            self.send_forming().await?;
-        }
+        self.forming_closed(minute, &built).await?;
         self.emit(built).await
+    }
+
+    /// Takes a closed minute, which the builder has taken and from which it built `built`, into a
+    /// chart's forming bar. A bucket that ends without a closed bar (joined late, or dropped for a
+    /// missing minute) gets its forming bar once more, now whole, so the chart does not keep a
+    /// stale one. It is the minute's own bucket, even when the stream has already started the next.
+    async fn forming_closed(&mut self, minute: Candle, built: &LoadedCandles) -> Result<(), Gone> {
+        let Out::Chart { forming, .. } = &mut self.out else {
+            return Ok(());
+        };
+        let unclosed = forming.push(minute, true).filter(|&bucket| {
+            forming.ends_bucket(minute.open_time)
+                && !built.candles.iter().any(|bar| bar.open_time == bucket)
+        });
+        match unclosed {
+            Some(bucket) => self.send_forming(bucket).await,
+            None => Ok(()),
+        }
     }
 
     /// Takes an update of the minute in progress. Only a chart feed uses it: it updates the bar
@@ -473,34 +487,37 @@ impl Feed {
         let Out::Chart { forming, .. } = &mut self.out else {
             return Ok(());
         };
-        if check_minute(&minute).is_err() || !forming.push(minute, false) {
+        if check_minute(&minute).is_err() {
             return Ok(());
         }
-        self.send_forming().await
+        match forming.push(minute, false) {
+            Some(bucket) => self.send_forming(bucket).await,
+            None => Ok(()),
+        }
     }
 
-    /// Sends a chart feed's bar still forming, first fetching the bucket's minutes before the first
-    /// one seen when it was joined after it started.
-    async fn send_forming(&mut self) -> Result<(), Gone> {
+    /// Sends a chart feed's bar of the bucket opening at `bucket`, first fetching the bucket's
+    /// minutes before the first one seen when it was joined after it started. A failed fetch is
+    /// tried once more when the bucket's last minute closes.
+    async fn send_forming(&mut self, bucket: Millis) -> Result<(), Gone> {
         let Out::Chart { tx, forming } = &mut self.out else {
             return Ok(());
         };
-        if let Some((from, to)) = forming.missing_start() {
+        if let Some((from, to)) = forming.missing_start(bucket) {
             let rest = Arc::clone(&self.rest);
             let id = self.id.clone();
             let fetched =
                 tokio::task::spawn_blocking(move || rest.klines(&id, Timeframe::M1, from, to))
                     .await;
-            // shortcut: one try per bucket. The bucket a chart joins late gets no closed bar, so
-            // after a failed fetch its bar lacks its first minutes for as long as the chart stays
-            // open; retry at the end of the bucket if that shows on the charts.
-            let minutes = match fetched {
-                Ok(Ok(minutes)) => minutes,
-                _ => Vec::new(),
-            };
-            forming.fill(minutes.into_iter().filter(|m| check_minute(m).is_ok()));
+            match fetched {
+                Ok(Ok(minutes)) => {
+                    let minutes = minutes.into_iter().filter(|m| check_minute(m).is_ok());
+                    forming.fill(bucket, minutes);
+                }
+                _ => forming.fetch_failed(bucket),
+            }
         }
-        match forming.bar() {
+        match forming.bar(bucket) {
             Some(bar) => tx.send(ChartEvent::Forming(bar)).await.map_err(|_| Gone),
             None => Ok(()),
         }
@@ -509,22 +526,12 @@ impl Feed {
     /// Fetches the minutes `[from, to)` over REST and takes them, retrying with backoff until the
     /// venue answers. Minutes the venue does not have are treated as missing.
     async fn backfill(&mut self, from: Millis, to: Millis) -> Result<(), Gone> {
-        let mut backoff = INITIAL_BACKOFF;
-        let minutes = loop {
-            let rest = Arc::clone(&self.rest);
-            let id = self.id.clone();
-            let fetched =
-                tokio::task::spawn_blocking(move || rest.klines(&id, Timeframe::M1, from, to))
-                    .await;
-            let error = match fetched {
-                Ok(Ok(minutes)) => break minutes,
-                Ok(Err(e)) => e.to_string(),
-                Err(e) => format!("the backfill task failed: {e}"),
-            };
-            self.send(FeedEvent::BackfillFailed { error }).await?;
-            tokio::time::sleep(backoff).await;
-            backoff = (backoff * 2).min(MAX_BACKOFF);
-        };
+        let (rest, id) = (Arc::clone(&self.rest), self.id.clone());
+        let minutes = retry_rest(
+            move || rest.klines(&id, Timeframe::M1, from, to),
+            |error| self.send(FeedEvent::BackfillFailed { error }),
+        )
+        .await?;
         let mut minutes: Vec<Candle> = minutes
             .into_iter()
             .filter(|m| (from..to).contains(&m.open_time))
@@ -541,16 +548,14 @@ impl Feed {
                 self.emit(built).await?;
             }
             let built = self.builder.push(minute);
-            if let Out::Chart { forming, .. } = &mut self.out {
-                forming.push(minute, true);
-            }
+            self.forming_closed(minute, &built).await?;
             self.emit(built).await?;
         }
         let built = self.builder.settle(to);
         self.emit(built).await
     }
 
-    /// Sends the bars and dropped buckets in time order.
+    /// Sends the bars and dropped buckets in time order, each tolerated bucket after its bar.
     async fn emit(&self, built: LoadedCandles) -> Result<(), Gone> {
         let mut events: Vec<(Millis, FeedEvent)> = built
             .candles
@@ -562,7 +567,15 @@ impl Feed {
                     .into_iter()
                     .map(|t| (t, FeedEvent::Dropped(t))),
             )
+            .chain(built.tolerated.into_iter().map(|(open_time, missing)| {
+                let event = FeedEvent::Tolerated {
+                    open_time,
+                    missing_minutes: missing,
+                };
+                (open_time, event)
+            }))
             .collect();
+        // Stable, so a tolerated bucket stays after its bar.
         events.sort_by_key(|(t, _)| *t);
         for (_, event) in events {
             self.send(event).await?;
@@ -576,6 +589,31 @@ impl Feed {
             Out::Chart { tx, .. } => tx.send(ChartEvent::Feed(event)).await.is_ok(),
         };
         if sent { Ok(()) } else { Err(Gone) }
+    }
+}
+
+/// Runs a blocking REST call off the async threads until it succeeds, waiting from 1 s up to 30 s
+/// between tries. Each failure is first handed to `failed`, whose error stops the retries.
+pub async fn retry_rest<T, E, Fut>(
+    call: impl Fn() -> Result<T, DataError> + Send + Sync + 'static,
+    mut failed: impl FnMut(String) -> Fut,
+) -> Result<T, E>
+where
+    T: Send + 'static,
+    Fut: Future<Output = Result<(), E>>,
+{
+    let call = Arc::new(call);
+    let mut backoff = INITIAL_BACKOFF;
+    loop {
+        let attempt = Arc::clone(&call);
+        let error = match tokio::task::spawn_blocking(move || attempt()).await {
+            Ok(Ok(value)) => return Ok(value),
+            Ok(Err(e)) => e.to_string(),
+            Err(e) => format!("the REST task failed: {e}"),
+        };
+        failed(error).await?;
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(MAX_BACKOFF);
     }
 }
 

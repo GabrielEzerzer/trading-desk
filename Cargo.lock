@@ -2341,6 +2341,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "td-core",
+ "td-data",
  "tempfile",
  "thiserror",
  "ts-rs",
@@ -2350,10 +2351,12 @@ dependencies = [
 name = "td-server"
 version = "0.1.0"
 dependencies = [
+ "arrow",
  "axum",
  "clap",
  "futures-util",
  "getrandom 0.3.4",
+ "parquet",
  "rayon",
  "reqwest",
  "serde",

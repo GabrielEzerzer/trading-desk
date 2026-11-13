@@ -18,9 +18,10 @@ use crate::source::{DataSource, MinuteHistory};
 use crate::time::{ROUNDING_PAD, funding_on_the_minute, now_ms, round_to_minute};
 use crate::{DataError, InstrumentList};
 
-// Base-tier fees: the non-VIP rates from Bybit's "Trading Fee Structure" help article. Written on
-// 2026-11-10 from the rates as known then; the page could not be fetched that day to re-check
-// them, so check before relying on them.
+// Base-tier fees: the VIP 0 rates from Bybit's "Trading Fee Structure" help article,
+// https://www.bybit.com/en/help-center/article/Trading-Fee-Structure (last updated 2026-11-05),
+// read on 2026-11-13: spot 0.1000% maker and taker; perpetuals and futures 0.0200% maker, 0.0550%
+// taker.
 
 /// Bybit spot: 0.1% maker, 0.1% taker.
 pub const BYBIT_SPOT_FEES: FeeSchedule = FeeSchedule {
@@ -138,6 +139,7 @@ impl LiveStream for Bybit {
                 id.symbol
             )),
             heartbeat: Some((PING_EVERY, r#"{"op":"ping"}"#.into())),
+            pong: Some(is_pong),
         }
     }
 
@@ -501,6 +503,7 @@ struct BybitFrame {
     data: Option<serde_json::Value>,
     success: Option<bool>,
     ret_msg: Option<String>,
+    op: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -514,6 +517,15 @@ struct BybitKline {
     volume: String,
     turnover: String,
     confirm: bool,
+}
+
+/// Whether a frame is Bybit's answer to a ping: `"ret_msg":"pong"` on the public streams,
+/// `"op":"pong"` on others.
+pub fn is_pong(text: &str) -> bool {
+    text.contains("pong")
+        && serde_json::from_str::<BybitFrame>(text).is_ok_and(|frame| {
+            frame.ret_msg.as_deref() == Some("pong") || frame.op.as_deref() == Some("pong")
+        })
 }
 
 /// Reads a Bybit v5 public frame: `kline.1.<SYMBOL>` data, or an operation response, where
@@ -565,6 +577,16 @@ pub fn parse_stream_frame(text: &str) -> Result<Vec<KlineUpdate>, DataError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_answer_to_a_ping_is_a_pong() {
+        let public = r#"{"success":true,"ret_msg":"pong","conn_id":"x","op":"ping"}"#;
+        let other = r#"{"req_id":"","op":"pong","args":["1675418560633"],"conn_id":"x"}"#;
+        assert!(is_pong(public) && is_pong(other));
+        let ack = r#"{"success":true,"ret_msg":"","conn_id":"x","op":"subscribe"}"#;
+        let kline = r#"{"topic":"kline.1.PONGUSDT","data":[],"ts":1,"type":"snapshot"}"#;
+        assert!(!is_pong(ack) && !is_pong(kline));
+    }
 
     #[test]
     fn a_full_page_that_does_not_move_back_is_an_error() {
