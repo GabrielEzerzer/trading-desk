@@ -3,7 +3,9 @@
 //! Ctrl-C.
 //!
 //! stdout carries exactly one line, `{"port":<n>,"token":"<hex>"}`; logs go to stderr. Set
-//! `TD_TOKEN` to fix the token for scripts, and `TD_DATA_DIR` to choose the data directory.
+//! `TD_TOKEN` to fix the token for scripts, `TD_DATA_DIR` to choose the data directory, and
+//! `TD_DATA_CUTOFF=YYYY-MM-DD` to refuse every run that reads bars after that UTC date; a value
+//! that is not a date stops the engine at start.
 
 use std::io::{Read, Write};
 use std::process::ExitCode;
@@ -12,6 +14,7 @@ use std::sync::Arc;
 use clap::Parser;
 use td_data::Store;
 use td_server::api::auth::Token;
+use td_server::api::runs::DataCutoff;
 use td_server::api::source::{VenueLive, VenueSource};
 use td_server::api::{ApiConfig, JOB_GRACE, Server};
 use tokio::sync::oneshot;
@@ -52,6 +55,7 @@ fn main() -> ExitCode {
 }
 
 async fn run(cli: Cli) -> Result<(), String> {
+    let data_cutoff = DataCutoff::from_env()?;
     let token = match std::env::var("TD_TOKEN") {
         Ok(value) if !value.is_empty() => {
             Token::from_value(&value).map_err(|e| format!("TD_TOKEN: {e}"))?
@@ -66,6 +70,7 @@ async fn run(cli: Cli) -> Result<(), String> {
         live: Arc::new(VenueLive),
         token,
         port: cli.port,
+        data_cutoff: data_cutoff.clone(),
     })
     .await
     .map_err(|e| format!("cannot listen on 127.0.0.1:{}: {e}", cli.port))?;
@@ -80,6 +85,12 @@ async fn run(cli: Cli) -> Result<(), String> {
         server.addr(),
         data_dir.display()
     );
+    if let Some(cutoff) = &data_cutoff {
+        eprintln!(
+            "td-server: data cutoff {}: runs that read bars after it are refused",
+            cutoff.date()
+        );
+    }
 
     let reason = tokio::select! {
         () = stdin_closed() => "stdin closed",

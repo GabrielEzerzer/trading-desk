@@ -280,6 +280,152 @@ impl VerdictRule {
     }
 }
 
+/// A limit of a strategy's rule that is looser than its kind's default (#113), so a verdict
+/// judged under it can say so. A tightened limit is not listed.
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LoosenedLimit {
+    /// The limit's field in the kind's limits, such as `min_sharpe`.
+    pub name: String,
+    /// The rule's value.
+    pub value: f64,
+    /// The kind's default.
+    pub default: f64,
+}
+
+/// Which way a limit loosens.
+#[derive(Clone, Copy)]
+enum Looser {
+    /// A lower value lets more through: a minimum, or a horizon the bad outcome must happen in.
+    Lower,
+    /// A higher value lets more through: a maximum, or a horizon the good outcome may take.
+    Higher,
+}
+
+impl VerdictRule {
+    /// Every limit of the rule's kind that is looser than the kind's default, in the order of the
+    /// limits' fields. The firm's own limits in a prop-firm rule and a portfolio's benchmark have
+    /// no default and are never listed.
+    pub fn loosened(&self) -> Vec<LoosenedLimit> {
+        use Looser::{Higher, Lower};
+        let limits: Vec<(&str, f64, f64, Looser)> = match self {
+            VerdictRule::PropFirm { limits: l, .. } => {
+                let d = PropFirmLimits::default();
+                vec![
+                    (
+                        "share_of_firm_limits",
+                        l.share_of_firm_limits,
+                        d.share_of_firm_limits,
+                        Higher,
+                    ),
+                    (
+                        "min_pass_probability",
+                        l.min_pass_probability,
+                        d.min_pass_probability,
+                        Lower,
+                    ),
+                    // More days to reach the target raise the pass odds.
+                    (
+                        "pass_horizon_days",
+                        f64::from(l.pass_horizon_days),
+                        f64::from(d.pass_horizon_days),
+                        Higher,
+                    ),
+                    (
+                        "max_breach_probability",
+                        l.max_breach_probability,
+                        d.max_breach_probability,
+                        Higher,
+                    ),
+                    // Fewer days to breach in lower the breach odds.
+                    (
+                        "breach_horizon_days",
+                        f64::from(l.breach_horizon_days),
+                        f64::from(d.breach_horizon_days),
+                        Lower,
+                    ),
+                ]
+            }
+            VerdictRule::Portfolio { limits: l, .. } => {
+                let d = PortfolioLimits::default();
+                vec![
+                    ("min_sharpe", l.min_sharpe, d.min_sharpe, Lower),
+                    ("max_drawdown", l.max_drawdown, d.max_drawdown, Higher),
+                    (
+                        "max_drawdown_vs_benchmark",
+                        l.max_drawdown_vs_benchmark,
+                        d.max_drawdown_vs_benchmark,
+                        Higher,
+                    ),
+                    ("min_alpha", l.min_alpha, d.min_alpha, Lower),
+                    (
+                        "max_p_mean_not_positive",
+                        l.max_p_mean_not_positive,
+                        d.max_p_mean_not_positive,
+                        Higher,
+                    ),
+                    (
+                        "max_resampled_drawdown",
+                        l.max_resampled_drawdown,
+                        d.max_resampled_drawdown,
+                        Higher,
+                    ),
+                ]
+            }
+            VerdictRule::HighRisk { limits: l } => {
+                let d = HighRiskLimits::default();
+                vec![
+                    (
+                        "min_trades",
+                        f64::from(l.min_trades),
+                        f64::from(d.min_trades),
+                        Lower,
+                    ),
+                    ("min_expectancy", l.min_expectancy, d.min_expectancy, Lower),
+                    (
+                        "min_expectancy_lower_bound",
+                        l.min_expectancy_lower_bound,
+                        d.min_expectancy_lower_bound,
+                        Lower,
+                    ),
+                    (
+                        "min_profit_factor",
+                        l.min_profit_factor,
+                        d.min_profit_factor,
+                        Lower,
+                    ),
+                    (
+                        "max_risk_of_ruin",
+                        l.max_risk_of_ruin,
+                        d.max_risk_of_ruin,
+                        Higher,
+                    ),
+                    // A deeper fall counted as ruin makes ruin rarer.
+                    ("ruin_drawdown", l.ruin_drawdown, d.ruin_drawdown, Higher),
+                    (
+                        "min_return_without_best_trade",
+                        l.min_return_without_best_trade,
+                        d.min_return_without_best_trade,
+                        Lower,
+                    ),
+                ]
+            }
+        };
+        limits
+            .into_iter()
+            .filter(|&(_, value, default, looser)| match looser {
+                Lower => value < default,
+                Higher => value > default,
+            })
+            .map(|(name, value, default, _)| LoosenedLimit {
+                name: name.to_string(),
+                value,
+                default,
+            })
+            .collect()
+    }
+}
+
 fn finite(name: &str, v: f64) -> Result<(), PlanError> {
     if v.is_finite() {
         Ok(())
@@ -1155,6 +1301,81 @@ mod tests {
 
     fn ids(lines: &[Criterion]) -> Vec<&str> {
         lines.iter().map(|c| c.id.as_str()).collect()
+    }
+
+    // Loosened limits
+
+    /// A minimum lowered and a maximum raised are listed with both values; the same limits
+    /// tightened, and the defaults themselves, are not.
+    #[test]
+    fn only_limits_looser_than_the_default_are_listed() {
+        let rule = |limits| VerdictRule::Portfolio {
+            benchmark: PortfolioBenchmark::BuyAndHold,
+            limits,
+        };
+        assert!(portfolio(PortfolioBenchmark::Cash).loosened().is_empty());
+        let loose = rule(PortfolioLimits {
+            min_sharpe: 0.5,
+            max_drawdown: 0.4,
+            ..PortfolioLimits::default()
+        });
+        assert_eq!(
+            loose.loosened(),
+            [
+                LoosenedLimit {
+                    name: "min_sharpe".into(),
+                    value: 0.5,
+                    default: 1.0
+                },
+                LoosenedLimit {
+                    name: "max_drawdown".into(),
+                    value: 0.4,
+                    default: 0.30
+                },
+            ]
+        );
+        let tight = rule(PortfolioLimits {
+            min_sharpe: 1.5,
+            max_drawdown: 0.2,
+            ..PortfolioLimits::default()
+        });
+        assert!(tight.loosened().is_empty(), "{:?}", tight.loosened());
+    }
+
+    /// Integer limits and horizons go the right way too: fewer trades and a longer pass horizon
+    /// loosen, a longer breach horizon tightens and a shorter one loosens.
+    #[test]
+    fn counts_and_horizons_loosen_in_their_own_direction() {
+        let high_risk = VerdictRule::HighRisk {
+            limits: HighRiskLimits {
+                min_trades: 30,
+                max_risk_of_ruin: 0.01,
+                ..HighRiskLimits::default()
+            },
+        };
+        let names = |rule: VerdictRule| -> Vec<String> {
+            rule.loosened().into_iter().map(|l| l.name).collect()
+        };
+        assert_eq!(names(high_risk), ["min_trades"]);
+        let firm = FirmLimits {
+            daily_loss: 0.05,
+            max_drawdown: 0.1,
+            drawdown: DrawdownMode::Static,
+            profit_target: 0.08,
+        };
+        let prop = |limits| VerdictRule::PropFirm { firm, limits };
+        let longer = prop(PropFirmLimits {
+            pass_horizon_days: 180,
+            breach_horizon_days: 180,
+            ..PropFirmLimits::default()
+        });
+        assert_eq!(names(longer), ["pass_horizon_days"]);
+        let shorter = prop(PropFirmLimits {
+            pass_horizon_days: 30,
+            breach_horizon_days: 30,
+            ..PropFirmLimits::default()
+        });
+        assert_eq!(names(shorter), ["breach_horizon_days"]);
     }
 
     // Portfolio

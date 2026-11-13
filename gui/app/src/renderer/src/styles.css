@@ -833,6 +833,19 @@ button {
   font-size: var(--text-label);
 }
 
+/* What a result or the Lab was judged under, said once in the secondary grey. */
+.result-note {
+  max-width: 56ch;
+  margin: calc(var(--space-2) - var(--space-6)) 0 var(--space-6);
+  color: var(--grey-1);
+}
+
+.cutoff-note {
+  margin: 0 0 var(--space-5);
+  color: var(--grey-1);
+  font-size: var(--text-label);
+}
+
 /* Trading: the chart fills the sheet; the switcher floats at its top left, and the position line
    and order composer at its bottom centre. */
 

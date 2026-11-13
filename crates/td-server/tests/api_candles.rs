@@ -184,6 +184,7 @@ impl Api {
             live: Arc::new(Live(rest.clone())),
             token: Token::generate().expect("rng"),
             port: 0,
+            data_cutoff: None,
         })
         .await
         .expect("starts");
