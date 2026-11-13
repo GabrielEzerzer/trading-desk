@@ -1,6 +1,8 @@
 // The install check's hook (gui/scripts/install-check.mjs), on only when TD_SMOKE=1: the app ends
-// itself once the engine's handshake has arrived and the window has loaded, and fails if either
-// fails or both have not happened within the time limit. Kept free of Electron so it can be tested.
+// itself once the engine's handshake has arrived and the window's page has asked main for the
+// engine's status through window.td (so the preload and the renderer both run), and fails if the
+// engine fails, the page fails to load, or both have not happened within the time limit. Kept free
+// of Electron so it can be tested.
 
 import type { EngineStatus } from '@td/shared'
 
@@ -13,6 +15,7 @@ export interface SmokeDeps {
 
 export interface Smoke {
   engine(status: EngineStatus): void
+  /** The page called window.td.status(); called on every such call, only the first counts. */
   loaded(): void
   loadFailed(reason: string): void
 }
@@ -33,7 +36,7 @@ export function createSmoke(deps: SmokeDeps, timeoutMs = SMOKE_TIMEOUT_MS): Smok
     else deps.fail(reason)
   }
   const timer = setTimeout(() => {
-    const missing = [engineUp ? null : 'the engine handshake', windowUp ? null : 'the window load'].filter(Boolean)
+    const missing = [engineUp ? null : 'the engine handshake', windowUp ? null : "the page's first call through window.td"].filter(Boolean)
     finish(`waited ${timeoutMs / 1000} s for ${missing.join(' and ')}`)
   }, timeoutMs)
   const check = () => {

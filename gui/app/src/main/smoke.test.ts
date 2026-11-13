@@ -40,6 +40,6 @@ describe('createSmoke', () => {
     const { smoke, calls } = setup()
     smoke.engine({ state: 'running' })
     vi.advanceTimersByTime(1_000)
-    expect(calls).toEqual(['fail waited 1 s for the window load'])
+    expect(calls).toEqual(["fail waited 1 s for the page's first call through window.td"])
   })
 })

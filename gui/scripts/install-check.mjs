@@ -1,8 +1,9 @@
 // Proves the Windows installer works on a fresh profile. It installs the built installer silently
 // into a temporary folder, checks that the installed engine starts on an empty data folder and
 // answers what Strategy Lab asks for first, launches the installed app once with TD_SMOKE=1 (the
-// app quits by itself once the engine's handshake has arrived and its window has loaded), then
-// kills whatever is left, uninstalls silently and deletes the temporary folders. Prints one line,
+// app quits by itself once the engine's handshake has arrived and its page has called main through
+// window.td), then kills whatever is left, uninstalls silently and deletes the temporary folders.
+// Prints one line,
 // INSTALL-CHECK PASS or INSTALL-CHECK FAIL: <reason>, and exits 0 or 1; install-verdict.mjs says
 // how the launch is read, including the pass with a note when the quit watchdog ends the app.
 //
@@ -62,6 +63,9 @@ function cleanEnv(extra) {
 async function checkEngine(bin) {
   const dataDir = join(temp, 'engine-data')
   const engine = spawn(bin, [], { env: cleanEnv({ TD_DATA_DIR: dataDir }), stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true })
+  // An exe that cannot start (blocked by Defender or Smart App Control, say) emits 'error'; without
+  // a listener that would crash this script before it uninstalls.
+  engine.on('error', () => {})
   const stderr = []
   createInterface({ input: engine.stderr }).on('line', (line) => stderr.push(line))
   try {
@@ -72,6 +76,7 @@ async function checkEngine(bin) {
         resolve(l)
       })
       engine.once('exit', (code) => reject(new Error(`exited with code ${code}: ${stderr.join(' | ')}`)))
+      engine.once('error', (e) => reject(new Error(`cannot start the installed engine: ${e.message}`)))
     })
     const { port, token } = JSON.parse(line)
     const get = async (path) => {
@@ -87,9 +92,11 @@ async function checkEngine(bin) {
     if (!Array.isArray(coverage.months) || coverage.months.length !== 0) throw new Error('GET /data/coverage was not empty on an empty data folder')
     step(`installed engine started on an empty data folder: ${strategies.length} strategies, no runs, no data`)
   } finally {
-    engine.stdin.end()
-    await Promise.race([new Promise((r) => engine.once('exit', r)), delay(ENGINE_LIMIT_MS)])
-    if (engine.exitCode === null) engine.kill()
+    if (engine.pid !== undefined) {
+      engine.stdin.end()
+      await Promise.race([new Promise((r) => engine.once('exit', r)), delay(ENGINE_LIMIT_MS)])
+      if (engine.exitCode === null) engine.kill()
+    }
   }
 }
 
@@ -99,10 +106,15 @@ async function launch(exe, dataDir, profileDir) {
     env: cleanEnv({ TD_SMOKE: '1', TD_DATA_DIR: dataDir, TD_USER_DATA_DIR: profileDir }),
     stdio: ['ignore', 'pipe', 'pipe'],
   })
+  // As for the engine: a blocked exe must fail the check, not crash it before cleanup.
+  app.on('error', () => {})
   const output = []
   for (const stream of [app.stdout, app.stderr]) createInterface({ input: stream }).on('line', (line) => line && output.push(line))
   const code = await Promise.race([
-    new Promise((r) => app.once('exit', (c) => r(c))),
+    new Promise((resolve, reject) => {
+      app.once('exit', (c) => resolve(c))
+      app.once('error', (e) => reject(new Error(`cannot start the installed app: ${e.message}`)))
+    }),
     delay(LAUNCH_LIMIT_MS).then(() => 'timeout'),
   ])
   // Let the last lines drain.
@@ -138,7 +150,7 @@ async function waitInstalledGone(ms) {
 /** Kills the app's tree if it still runs, gives its helpers a moment to exit, kills what is left
  * running from the install folder and waits until it is gone, so the uninstaller finds no file in use. */
 async function killAll() {
-  if (app && app.exitCode === null && app.signalCode === null) {
+  if (app && app.pid !== undefined && app.exitCode === null && app.signalCode === null) {
     spawnSync('taskkill', ['/T', '/F', '/PID', String(app.pid)], { stdio: 'ignore' })
   }
   for (const line of await waitInstalledGone(5_000)) {
@@ -171,12 +183,17 @@ async function uninstall() {
 async function main() {
   if (process.platform !== 'win32') throw new Error('the installer is Windows only')
   if (!existsSync(installer)) throw new Error(`no installer at ${installer}; run pnpm dist`)
-  // NSIS takes /D= unquoted, so the folder must not contain spaces.
-  if (/\s/.test(installDir)) throw new Error(`the temporary folder ${installDir} has a space in it`)
   // A real install shares the uninstall entry; uninstalling at the end would remove it.
   if (registeredInstalls()) throw new Error(`${productName} is already installed for this user; uninstall it first`)
 
-  const install = spawnSync(installer, ['/S', `/D=${installDir}`], { stdio: 'ignore', timeout: 180_000 })
+  // NSIS takes /D= last and unquoted, spaces and all, and Node would quote a path with a space, so
+  // the command line is passed verbatim, with only the installer's own path quoted.
+  const install = spawnSync(installer, ['/S', `/D=${installDir}`], {
+    argv0: `"${installer}"`,
+    windowsVerbatimArguments: true,
+    stdio: 'ignore',
+    timeout: 180_000,
+  })
   installed = true
   if (install.status !== 0) throw new Error(`the installer exited with ${install.status ?? install.error?.message}`)
   const exe = join(installDir, `${productName}.exe`)
@@ -192,7 +209,7 @@ async function main() {
   for (const line of output) step(`app: ${line}`)
   passNote = launchVerdict({ code, output, engineBin, dataDir })
   if (!existsSync(profileDir) || readdirSync(profileDir).length === 0) throw new Error(`the app did not use the fresh profile ${profileDir}`)
-  step(`the installed app started its own engine, loaded its window, stopped the engine cleanly and exited with code ${code}`)
+  step(`the installed app started its own engine, its page reached main through window.td, it stopped the engine cleanly and exited with code ${code}`)
 
   await killAll()
   await uninstall()

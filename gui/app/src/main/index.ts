@@ -113,6 +113,8 @@ function registerIpc(): void {
   })
   ipcMain.handle(IPC.status, (event) => {
     checkSender(event)
+    // The renderer asks on start through window.td, so this proves the preload and the page run.
+    smoke?.loaded()
     return engine.status
   })
   ipcMain.handle(IPC.restartEngine, async (event, ...args: unknown[]) => {
@@ -145,10 +147,7 @@ function createWindow(): void {
   })
   window = win
   win.once('ready-to-show', () => win.show())
-  if (smoke) {
-    win.webContents.once('did-finish-load', () => smoke.loaded())
-    win.webContents.once('did-fail-load', (_event, code, description) => smoke.loadFailed(`${description} (${code})`))
-  }
+  if (smoke) win.webContents.once('did-fail-load', (_event, code, description) => smoke.loadFailed(`${description} (${code})`))
   win.on('closed', () => {
     window = null
   })

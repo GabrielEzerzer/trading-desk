@@ -31,7 +31,7 @@ The engine's own tests run with `cargo test --workspace` from the repository roo
 
 ### Installing
 
-There is an installer for Windows. A GitHub release will attach it later; until then, build it from `gui/` with `pnpm dist`, which builds the engine, the app and the installer and writes `gui/app/dist/Trading Desk Setup <version>.exe`.
+There is an installer for Windows. A GitHub release will attach it later; until then, build it from `gui/` with `pnpm dist`, which builds the engine, the app and the installer and writes `gui/app/dist/Trading Desk Setup <version>.exe`. The installer ships the engine built from your checkout, so if `crates/td-engine/src/strategies/private/` exists, your private strategies are compiled into it: do not share an installer built that way. Release installers are built from a clean checkout with no private folder.
 
 The installer installs the app for the current Windows user only, so it needs no administrator rights. It puts the app, with the engine beside it, in `%LOCALAPPDATA%\Programs\trading-desk`, and adds a Start menu entry and a desktop shortcut. The installer is not signed, so the first time it runs Windows SmartScreen says it protected your PC; choose "More info", then "Run anyway". The app does not update itself: to update, run a newer installer.
 
