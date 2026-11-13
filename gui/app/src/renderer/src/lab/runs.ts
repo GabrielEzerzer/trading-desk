@@ -11,14 +11,14 @@ import type {
   StoredResponse,
   Timeframe,
 } from '@td/shared'
+import { TIMEFRAME_MS } from '../trading/candles'
 import type { EquityPoint, FinishedRun, LastRun, Millis, VerdictPreview } from './source'
 import { RunCancelled } from './source'
 
 const MINUTE = 60_000
-const HOUR = 60 * MINUTE
-const DAY = 24 * HOUR
-
-const TIMEFRAME_MS: Partial<Record<Timeframe, number>> = { '1h': HOUR, '4h': 4 * HOUR, '1d': 24 * HOUR }
+const DAY = 24 * 60 * MINUTE
+/** Weekly bars open on Mondays, counted from Monday 1970-01-05 (td_core's `FIRST_MONDAY`). */
+const FIRST_MONDAY = 4 * DAY
 
 /** The timeframes the overrides menu offers, the default first. */
 export const TIMEFRAMES = ['1h', '4h', '1d'] as const satisfies readonly Timeframe[]
@@ -90,11 +90,12 @@ export function datasetRange(
   const step = TIMEFRAME_MS[timeframe]
   const first = coverage.months[0]?.first
   const last = coverage.months.at(-1)?.last
-  if (!step || first === undefined || last === undefined) return null
-  // Hours and days are aligned to the epoch (td_core::Timeframe::floor).
-  const from = Math.ceil(first / step) * step
+  if (first === undefined || last === undefined) return null
+  // Bars are aligned to the epoch, weeks to the first Monday (td_core::Timeframe::floor).
+  const origin = timeframe === '1w' ? FIRST_MONDAY : 0
+  const from = origin + Math.ceil((first - origin) / step) * step
   const end = Math.min(last + MINUTE, until ?? Number.POSITIVE_INFINITY)
-  const to = Math.floor(end / step) * step
+  const to = origin + Math.floor((end - origin) / step) * step
   return to > from ? { from, to } : null
 }
 
