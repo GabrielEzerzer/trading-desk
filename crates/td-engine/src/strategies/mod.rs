@@ -58,7 +58,7 @@ fn affordable_qty(ctx: &Context, budget: f64, price: f64) -> f64 {
 }
 
 /// -1, 0 or 1. Unlike `f64::signum`, zero maps to zero.
-fn direction(x: f64) -> f64 {
+pub(crate) fn direction(x: f64) -> f64 {
     if x > 0.0 {
         1.0
     } else if x < 0.0 {

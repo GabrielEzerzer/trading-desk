@@ -289,7 +289,7 @@ pub fn report_with(
 }
 
 /// `Some(x)` if `x` is finite; NaN and the infinities are `None`.
-fn finite(x: f64) -> Option<f64> {
+pub(crate) fn finite(x: f64) -> Option<f64> {
     x.is_finite().then_some(x)
 }
 

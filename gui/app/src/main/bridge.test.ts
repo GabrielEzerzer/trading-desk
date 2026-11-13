@@ -1,5 +1,51 @@
+import { type Client, createClient, type InstrumentId } from '@td/shared'
 import { describe, expect, it } from 'vitest'
 import { RefusedRequest, validateRequest, validateTopic } from './bridge'
+
+const btc: InstrumentId = { venue: 'binance', symbol: 'BTCUSDT', kind: 'spot' }
+const sessionId = '1762790400000-0a1b2c3d'
+
+// Arguments for every client method. The type makes a method added to the client fail typecheck
+// until it has a sample here, so the test below sends it through main's checks too.
+const SAMPLES: { [K in keyof Client]: Parameters<Client[K]> } = {
+  health: [],
+  instruments: ['bybit', 'perpetual'],
+  downloadData: [{ instrument: btc, from: 1, to: 2 }],
+  coverage: [btc],
+  stored: [],
+  deleteData: [{ instrument: btc, from: '2024-01', to: '2024-02' }],
+  deleteAllData: [],
+  candles: [btc, '5m', 500],
+  strategies: [],
+  jobs: [],
+  job: [12],
+  cancelJob: [12],
+  jobResult: [12],
+  startBacktest: [{} as Parameters<Client['startBacktest']>[0]],
+  runs: [],
+  run: ['1794242520000-0a1b2c3d'],
+  sessions: [],
+  session: [sessionId],
+  startSession: [{} as Parameters<Client['startSession']>[0]],
+  stopSession: [sessionId],
+  resumeSession: [sessionId],
+  placeOrder: [sessionId, {} as Parameters<Client['placeOrder']>[1]],
+  cancelOrder: [sessionId, 3],
+}
+
+describe('the client and main agree', () => {
+  it('passes every request the client makes', async () => {
+    const client = createClient(async (request) => {
+      validateRequest(request)
+      return { ok: true, status: 200, body: {} }
+    })
+    for (const [name, method] of Object.entries(client)) {
+      const args = (SAMPLES as Record<string, unknown[] | undefined>)[name]
+      expect(args, `a sample for ${name}`).toBeDefined()
+      await expect((method as (...a: unknown[]) => Promise<unknown>)(...args!), name).resolves.toBeDefined()
+    }
+  })
+})
 
 describe('validateRequest', () => {
   it('passes the routes the app may call, as clean copies', () => {

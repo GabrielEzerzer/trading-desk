@@ -3,24 +3,28 @@
 //! - Equity recorded at each close equals cash plus the position marked at that close, where cash
 //!   and position are rebuilt independently from the fills and funding. Funding due at a bar's
 //!   open is owed by the position before that bar's fills, at the open; funding due later in the
-//!   bar by the position after them, at the close.
+//!   bar by the position after them, at the close. On a market with quotes (FX) every bar has an
+//!   ask one random spread above the bid, and a short is marked at the ask close. On a dollar
+//!   (base currency) account each fill's fee and realised P&L are converted at its price, and the
+//!   open position's P&L at the mark.
 //! - No order fills on the bar it was submitted on, and every fill lands on a bar's open time.
 //! - Spot positions and spot cash never go below zero.
-//! - Equity never goes below zero: perpetuals run with random leverage caps and sizes, so some
-//!   runs are liquidated, and a perpetual account left flat with a negative balance is floored at
-//!   zero.
+//! - Equity never goes below zero on spot and perpetuals: perpetuals run with random leverage caps
+//!   and sizes, so some runs are liquidated, and a perpetual account left flat with a negative
+//!   balance is floored at zero. FX has no liquidation yet (#44), so its equity is not checked.
 //! - An attached stop waits exactly while its entry is open, and fills only once its entry has.
 
 mod common;
 
 use common::*;
 use proptest::prelude::*;
-use td_core::{Candle, InstrumentKind, OrderType, Side, Timeframe};
+use td_core::{AccountCurrency, Candle, InstrumentKind, OrderType, Side, Timeframe};
 use td_engine::{Context, OrderStatus, Session, SessionConfig, Strategy as EngineStrategy};
 
-fn leverage_config(slippage: f64, max_leverage: f64) -> SessionConfig {
+fn leverage_config(slippage: f64, max_leverage: f64, account: AccountCurrency) -> SessionConfig {
     SessionConfig {
         max_leverage,
+        account_currency: account,
         ..config(slippage)
     }
 }
@@ -148,25 +152,48 @@ fn build_bars(specs: &[BarSpec]) -> Vec<Candle> {
         .collect()
 }
 
+/// The ask candle `spread` above the bid candle `b`.
+fn ask_above(b: &Candle, spread: f64) -> Candle {
+    Candle {
+        open: b.open + spread,
+        high: b.high + spread,
+        low: b.low + spread,
+        close: b.close + spread,
+        ..*b
+    }
+}
+
+/// Runs the random strategy and checks the invariants. On a market with quotes each bar's ask is
+/// `spreads[k]` above its bid; `spreads` is ignored on one without.
 fn check(
     kind: InstrumentKind,
+    account: AccountCurrency,
     slippage: f64,
     max_leverage: f64,
     size: f64,
     specs: Vec<BarSpec>,
+    spreads: &[f64],
 ) -> Result<(), TestCaseError> {
     let bars = build_bars(&specs);
+    let asks: Vec<Candle> = if kind.rules().quotes {
+        bars.iter()
+            .zip(spreads)
+            .map(|(b, &s)| ask_above(b, s))
+            .collect()
+    } else {
+        bars.clone()
+    };
     let actions = specs.iter().map(|s| s.5.clone()).collect();
     let inst = instrument(kind);
     let mut session = Session::new(
         Box::new(Random { actions, size }),
         inst,
         Timeframe::M1,
-        leverage_config(slippage, max_leverage),
+        leverage_config(slippage, max_leverage, account),
     )
     .unwrap();
     let mut funding = Vec::new();
-    for (b, spec) in bars.iter().zip(&specs) {
+    for ((b, ask), spec) in bars.iter().zip(&asks).zip(&specs) {
         let (at_open, later) = spec.4;
         let events: Vec<(i64, f64)> = if kind.rules().funding {
             (at_open.map(|rate| (b.open_time, rate)).into_iter())
@@ -175,15 +202,22 @@ fn check(
         } else {
             vec![]
         };
-        session.on_bar(*b, &events).unwrap();
+        let ask = kind.rules().quotes.then_some(*ask);
+        session.on_bar_with_ask(*b, ask, &events).unwrap();
         funding.push(events);
     }
 
-    // Rebuild cash (spot-style: buys pay the notional) and position from fills and funding.
+    // Rebuild cash and position from fills and funding. On a quote account cash is rebuilt
+    // spot-style (buys pay the notional), so equity is cash plus the position's value. On a base
+    // account it is rebuilt margin-style from an average cost: each fill pays its fee and books
+    // the P&L it closes, converted at its price, and equity adds the open P&L converted at the
+    // mark.
+    let base = account == AccountCurrency::Base;
     let mut cash = 10_000.0;
-    let mut position = 0.0;
+    let mut position: f64 = 0.0;
+    let mut avg = 0.0;
     let fills = session.fills();
-    for (t, b) in bars.iter().enumerate() {
+    for (t, (b, ask)) in bars.iter().zip(&asks).enumerate() {
         for &(time, rate) in &funding[t] {
             if time == b.open_time {
                 cash -= position * b.open * rate;
@@ -191,8 +225,23 @@ fn check(
         }
         for f in fills.iter().filter(|f| f.time == b.open_time) {
             let dq = f.side.sign() * f.qty;
-            cash -= dq * f.price + f.fee;
-            position += dq;
+            if base {
+                cash -= f.fee;
+                if position * dq < 0.0 {
+                    let closed = f.qty.min(position.abs());
+                    cash += closed * (f.price - avg) * position.signum() / f.price;
+                }
+                let new = position + dq;
+                if new * position <= 0.0 {
+                    avg = f.price;
+                } else if new.abs() > position.abs() {
+                    avg = (position.abs() * avg + f.qty * f.price) / new.abs();
+                }
+                position = new;
+            } else {
+                cash -= dq * f.price + f.fee;
+                position += dq;
+            }
         }
         // A perpetual account left flat with a negative balance after the bar's fills is floored
         // at zero. Flat, the spot-style cash rebuilt here equals the wallet balance.
@@ -204,13 +253,21 @@ fn check(
                 cash -= position * b.close * rate;
             }
         }
-        let expected = cash + position * b.close;
+        // A short closes with a buy, at the ask.
+        let mark = if position < 0.0 { ask.close } else { b.close };
+        let expected = if base {
+            cash + position * (mark - avg) / mark
+        } else {
+            cash + position * mark
+        };
         let recorded = session.equity()[t].equity;
         prop_assert!(
             (recorded - expected).abs() <= 1e-7 * (1.0 + expected.abs()),
             "bar {t}: recorded {recorded}, rebuilt {expected}"
         );
-        prop_assert!(recorded >= 0.0, "bar {t}: equity {recorded}");
+        if kind.rules().liquidation || !kind.rules().margin {
+            prop_assert!(recorded >= 0.0, "bar {t}: equity {recorded}");
+        }
         if kind == InstrumentKind::Spot {
             prop_assert!(position >= -1e-9, "bar {t}: spot position {position}");
             prop_assert!(cash >= 0.0, "bar {t}: spot cash {cash}");
@@ -269,7 +326,7 @@ proptest! {
         size in 1.0..30.0f64,
         specs in prop::collection::vec(bar_spec(), 1..60),
     ) {
-        check(InstrumentKind::Spot, slippage, 1.0, size, specs)?;
+        check(InstrumentKind::Spot, AccountCurrency::Quote, slippage, 1.0, size, specs, &[])?;
     }
 
     #[test]
@@ -279,6 +336,28 @@ proptest! {
         size in 1.0..200.0f64,
         specs in prop::collection::vec(bar_spec(), 1..60),
     ) {
-        check(InstrumentKind::Perpetual, slippage, max_leverage, size, specs)?;
+        check(InstrumentKind::Perpetual, AccountCurrency::Quote, slippage, max_leverage, size, specs, &[])?;
+    }
+
+    #[test]
+    fn fx_books_balance_and_never_fill_early(
+        slippage in 0.0..20.0f64,
+        max_leverage in 0.5..50.0f64,
+        size in 1.0..200.0f64,
+        specs in prop::collection::vec(bar_spec(), 1..60),
+        spreads in prop::collection::vec(0.0..0.5f64, 60),
+    ) {
+        check(InstrumentKind::Fx, AccountCurrency::Quote, slippage, max_leverage, size, specs, &spreads)?;
+    }
+
+    #[test]
+    fn fx_dollar_account_books_balance_and_never_fill_early(
+        slippage in 0.0..20.0f64,
+        max_leverage in 0.5..50.0f64,
+        size in 1.0..200.0f64,
+        specs in prop::collection::vec(bar_spec(), 1..60),
+        spreads in prop::collection::vec(0.0..0.5f64, 60),
+    ) {
+        check(InstrumentKind::Fx, AccountCurrency::Base, slippage, max_leverage, size, specs, &spreads)?;
     }
 }
