@@ -354,6 +354,52 @@ test.describe('running on the engine', () => {
     await confirm.getByRole('button', { name: 'Cancel' }).click()
     await expect(confirm).toBeHidden()
   })
+
+  test('the view and each confirmation read the store again, so they name data td-data added since', async ({ page, open }) => {
+    // A download with the td-data command line tool, which the app does not see happen.
+    const downloaded = (id: string) =>
+      page.evaluate((id) => (window as unknown as { __stubDownloaded(id: string): void }).__stubDownloaded(id), id)
+    await open(engine)
+    await expect(page.getByRole('button', { name: /^Stored data/ })).toContainText('32.8 MB in 2 instruments')
+
+    await downloaded('binance:SOLUSDT:perpetual')
+    await page.getByRole('button', { name: /^Stored data/ }).click()
+    const rows = page.locator('.data-table tbody tr')
+    await expect(rows).toHaveCount(3)
+    await expect(rows.filter({ hasText: 'SOLUSDT' })).toHaveCount(1)
+
+    await downloaded('bybit:ADAUSDT:spot')
+    await page.getByRole('button', { name: 'Delete all market data' }).click()
+    const confirm = page.getByRole('group', { name: 'Confirm the delete' })
+    await expect(confirm).toContainText('Delete all market data, 4 instruments? Saved runs and paper sessions stay.')
+    await expect(confirm).toContainText('This frees 95.8 MB.')
+    await expect(rows.filter({ hasText: 'ADAUSDT' })).toHaveCount(1)
+  })
+
+  test('a delete that stops part-way says why, and the list shows what it removed', async ({ page, open }) => {
+    await open({ ...engine, deleteStops: true })
+    await page.getByRole('button', { name: /^Stored data/ }).click()
+    await page.getByRole('button', { name: 'Delete BTCUSDT perpetual, Binance' }).click()
+    await page.getByRole('menuitem', { name: /All of it/ }).click()
+    const confirm = page.getByRole('group', { name: 'Confirm the delete' })
+    await expect(confirm).toContainText('all 18 months and its funding rates?')
+    await confirm.getByRole('button', { name: 'Delete', exact: true }).click()
+    await expect(page.getByRole('alert')).toContainText('The delete failed.')
+    await expect(page.getByRole('alert')).toContainText('the delete stopped; files removed before it: 1,')
+    // The month it removed before it stopped is gone from the list and from the question.
+    await expect(confirm).toContainText('all 17 months and its funding rates?')
+    await expect(page.locator('.data-table tbody tr').first()).toContainText('Feb 2024')
+  })
+
+  test('a perpetual with only its funding rates stored is asked about as that', async ({ page, open }) => {
+    await open(engine)
+    await page.evaluate(() => (window as unknown as { __stubFundingOnly(id: string): void }).__stubFundingOnly('bybit:XRPUSDT:perpetual'))
+    await page.getByRole('button', { name: /^Stored data/ }).click()
+    await page.getByRole('button', { name: 'Delete XRPUSDT perpetual, Bybit' }).click()
+    await page.getByRole('menuitem', { name: /All of it/ }).click()
+    const confirm = page.getByRole('group', { name: 'Confirm the delete' })
+    await expect(confirm).toContainText('Delete the funding rates of XRPUSDT perpetual, Bybit?')
+  })
 })
 
 test.describe('trading', () => {

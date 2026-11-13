@@ -18,6 +18,8 @@ export interface StubConfig {
   noData?: boolean
   /** Every delete answers 409, as when a download holds the instrument. */
   deleteFails?: boolean
+  /** A delete removes its first month, then fails as the engine does when a file cannot be removed. */
+  deleteStops?: boolean
   /** How POST /runs/backtest answers. */
   backtest?: 'ok' | 'data_missing' | 'too_many_runs' | 'fails'
   /** How POST /data/download's job ends: done, or failed for a missing OANDA token. */

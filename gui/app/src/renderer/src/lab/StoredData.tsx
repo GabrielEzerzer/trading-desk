@@ -12,9 +12,10 @@ type Asking = { kind: 'instrument'; key: string } | { kind: 'range'; key: string
 
 interface Props {
   stored: StoredResponse
-  /** Why the list could not be read again after a change, or null. */
+  /** Why the list could not be read again, or null. */
   refreshError: string | null
-  onRetry(): void
+  /** Reads the list again; resolves false when that failed (`refreshError` then says why). */
+  onReload(): Promise<boolean>
   /** Deletes `target` and reads the list again; rejects when the engine refuses. */
   onDelete(target: DeleteTarget): Promise<DeleteResult>
   onOpenFolder(): Promise<void>
@@ -58,22 +59,37 @@ function plan(asking: Asking, stored: StoredResponse): Plan | null {
  * and size, and deletes of one instrument, a range of its months or all of it. Each delete asks
  * first, in place, naming what goes and the space it frees.
  */
-export function StoredData({ stored, refreshError, onRetry, onDelete, onOpenFolder, headingRef }: Props) {
+export function StoredData({ stored, refreshError, onReload, onDelete, onOpenFolder, headingRef }: Props) {
   const [asking, setAsking] = useState<Asking | null>(null)
   const [deleting, setDeleting] = useState(false)
   const [deleteError, setDeleteError] = useState<string | null>(null)
   const [done, setDone] = useState<string | null>(null)
   const [folderError, setFolderError] = useState<string | null>(null)
   const doneRef = useRef<HTMLParagraphElement>(null)
+  // Counts confirmations asked for, so only the latest one opens once its read of the list is back.
+  const opening = useRef(0)
 
   const total = stored.instruments.reduce((sum, i) => sum + i.bytes, 0)
   const count = stored.instruments.length
 
+  /** Changes or closes the open confirmation, such as its range of months. */
   const ask = (next: Asking | null) => {
     if (deleting) return
+    opening.current += 1
     setAsking(next)
     setDeleteError(null)
     setDone(null)
+  }
+
+  /**
+   * Opens a confirmation once the list is read again, so it names what is stored now and not what
+   * was stored when the view opened. When that read fails, the error shows with Retry instead.
+   */
+  const openConfirmation = async (next: Asking) => {
+    if (deleting) return
+    ask(null)
+    const n = opening.current
+    if ((await onReload()) && n === opening.current) setAsking(next)
   }
 
   const confirm = async (p: Plan) => {
@@ -138,7 +154,7 @@ export function StoredData({ stored, refreshError, onRetry, onDelete, onOpenFold
       {refreshError && (
         <div className="data-note" role="alert">
           <p className="state-text">The list did not load again. {refreshError}</p>
-          <button type="button" className="button-small" onClick={onRetry}>
+          <button type="button" className="button-small" onClick={() => void onReload()}>
             Retry
           </button>
         </div>
@@ -178,7 +194,7 @@ export function StoredData({ stored, refreshError, onRetry, onDelete, onOpenFold
                     key={key}
                     info={info}
                     disabled={deleting}
-                    onAsk={ask}
+                    onAsk={(next) => void openConfirmation(next)}
                     confirmation={open && confirmation(<Question info={info} asking={open} onRange={ask} disabled={deleting} />)}
                   />
                 )
@@ -193,7 +209,7 @@ export function StoredData({ stored, refreshError, onRetry, onDelete, onOpenFold
                 </p>,
               )
             ) : (
-              <button type="button" className="button-small" onClick={() => ask({ kind: 'all' })} aria-disabled={deleting}>
+              <button type="button" className="button-small" onClick={() => void openConfirmation({ kind: 'all' })} aria-disabled={deleting}>
                 Delete all market data
               </button>
             )}
@@ -281,6 +297,9 @@ interface QuestionProps {
 function Question({ info, asking, onRange, disabled }: QuestionProps) {
   const name = formatInstrument(info.instrument)
   const funding = info.funding_bytes !== null
+  if (asking.kind === 'instrument' && info.months.length === 0) {
+    return <p className="confirm-text">Delete the funding rates of {name}?</p>
+  }
   if (asking.kind === 'instrument') {
     return (
       <p className="confirm-text">

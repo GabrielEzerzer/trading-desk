@@ -6,7 +6,7 @@
 // whose changes arrive on the `jobs` topic like the engine's. Never part of the app bundle.
 //
 // `config`: { engine: 'starting' | 'failed' | 'running', mock: boolean, hangStrategies: boolean,
-//             engineData: engine.json, noData?: boolean, deleteFails?: boolean,
+//             engineData: engine.json, noData?: boolean, deleteFails?: boolean, deleteStops?: boolean,
 //             backtest?: 'ok' | 'data_missing' | 'too_many_runs' | 'fails', download?: 'ok' | 'no_token',
 //             stepMs?: number,
 //             instruments?: Instrument[], hangInstruments?: boolean, failInstruments?: boolean,
@@ -21,7 +21,11 @@
 // instrument. GET /data/stored lists them with each month's size and, for a perpetual, a funding
 // file; POST /data/delete and /data/delete-all remove months as the engine's store does (a range
 // keeps the funding file). With `config.deleteFails` every delete answers the engine's 409 for an
-// instrument that a download holds. `openDataFolder` counts its calls in `window.__stubOpened`.
+// instrument that a download holds. With `config.deleteStops` a delete removes its first month, then
+// fails as the engine does when a file cannot be removed. `window.__stubDownloaded(id)` stores an
+// instrument as td-data on the command line would, without the app knowing, and
+// `window.__stubFundingOnly(id)` stores a perpetual's funding file with no months.
+// `openDataFolder` counts its calls in `window.__stubOpened`.
 //
 // For Trading in engine mode it answers GET /instruments from `config.instruments` (else the
 // engine.json fixtures), GET /sessions and GET /sessions/{id} from `config.session`, and on a
@@ -59,6 +63,8 @@ function installBridgeStub(config) {
     stored.set(id, { months, funding: id.endsWith(':perpetual') })
   }
   if (!config.noData) Object.keys(data.coverage).forEach(store)
+  window.__stubDownloaded = store
+  window.__stubFundingOnly = (id) => stored.set(id, { months: [], funding: true })
   const FUNDING_BYTES = 52_000
   let backtest = config.backtest ?? 'ok'
   const jobs = new Map()
@@ -247,6 +253,13 @@ function installBridgeStub(config) {
       }
       const ids = path === '/data/delete' ? [key(body.instrument)] : [...stored.keys()]
       const removed = { files: 0, bytes: 0 }
+      if (config.deleteStops) {
+        const [first] = stored.get(ids[0])?.months ?? []
+        if (first) deleteStored(ids[0], first.month, first.month, removed)
+        // The engine's words (td-data store.rs, remove_locked) for a file it could not remove.
+        const file = String.raw`C:\Users\trader\AppData\Local\trading-desk\candles\binance\perpetual\BTCUSDT\2024-02.parquet`
+        return fail(500, 'internal', `${file}: Access is denied. (os error 5) (the delete stopped; files removed before it: ${removed.files}, ${removed.bytes} bytes)`)
+      }
       for (const id of ids) deleteStored(id, body?.from, body?.to, removed)
       return ok(removed)
     }

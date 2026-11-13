@@ -128,26 +128,35 @@ export function StrategyLab() {
   const openData = () => {
     setSelectedName(null)
     setDataOpen(true)
+    // The list shown is read now: the td-data tool or another program may have changed the store
+    // since the Lab loaded.
+    void refreshStored()
     scroller.current?.scrollTo({ top: 0 })
     requestAnimationFrame(() => dataHeading.current?.focus({ preventScroll: true }))
   }
 
+  /** Reads the stored list again; false when that failed, which `storedError` then says. */
   const refreshStored = async () => {
-    if (!source) return
+    if (!source) return false
     try {
       setStored(await source.stored())
       setStoredError(null)
+      return true
     } catch (e) {
       setStoredError(message(e))
+      return false
     }
   }
 
-  // The list is read again after the delete, which has happened even when that read fails.
+  // The list is read again after every delete, finished or not: one that stopped part-way has
+  // still removed files. A failed read leaves the delete's own result or error as it was.
   const deleteData = async (target: DeleteTarget) => {
     if (!source) throw new Error('The Lab has not loaded.')
-    const result = await source.deleteData(target)
-    await refreshStored()
-    return result
+    try {
+      return await source.deleteData(target)
+    } finally {
+      await refreshStored()
+    }
   }
 
   const start = () => {
@@ -241,7 +250,7 @@ export function StrategyLab() {
       <StoredData
         stored={stored}
         refreshError={storedError}
-        onRetry={() => void refreshStored()}
+        onReload={refreshStored}
         onDelete={deleteData}
         onOpenFolder={() => source.openDataFolder()}
         headingRef={dataHeading}
