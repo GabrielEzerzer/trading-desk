@@ -4,5 +4,5 @@
 # bump alone does not move it: a bump that moves a value here moved a result. A change that means
 # to move results updates these values in the same PR, beside the ENGINE_REVISION bump in
 # crates/td-engine/src/runner.rs.
-dev f04dfffdc660f965
-test a1b60a9cf3baa2a5
+dev c1ad6b64d1a62ad0
+test 9bd8ed6281880a1c
