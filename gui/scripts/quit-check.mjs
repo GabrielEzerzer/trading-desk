@@ -7,7 +7,8 @@
 //
 // Needs target/release/td-server(.exe), or TD_SERVER_BIN.
 
-import { existsSync, mkdtempSync, rmSync } from 'node:fs'
+import { existsSync, mkdtempSync } from 'node:fs'
+import { rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -28,8 +29,9 @@ if (section !== 'lab' && section !== 'trading') {
 }
 const QUIT_WITHIN_MS = 5_000
 const dataDir = mkdtempSync(join(tmpdir(), 'td-quit-'))
-// A killed td-server can hold files for a moment on Windows, so retry on EBUSY and EPERM.
-const removeDataDir = () => rmSync(dataDir, { recursive: true, force: true, maxRetries: 10 })
+// A killed td-server can hold files for a moment on Windows, so retry. The promise version, since
+// rmSync on Node 24 does not retry a Windows sharing violation.
+const removeDataDir = () => rm(dataDir, { recursive: true, force: true, maxRetries: 10 })
 
 const app = await electron.launch({
   args: [join(gui, 'app')],
@@ -46,9 +48,9 @@ if (section === 'trading') {
   // without ever running the live stream that hangs the quit.
   const empty = page.locator('.chart-empty')
   if ((await empty.count()) > 0) {
-    console.error(`quit-check: FAIL, the Trading chart has no data: ${(await empty.first().innerText()).replace(/\s+/g, ' ')}`)
+    console.error(`quit-check: FAIL, the Trading chart has no data: ${(await empty.first().innerText({ timeout: 1_000 }).catch(() => '')).replace(/\s+/g, ' ')}`)
     killAll(processTree(app.process().pid))
-    removeDataDir()
+    await removeDataDir()
     process.exit(2)
   }
 }
@@ -69,9 +71,9 @@ const ms = Date.now() - started
 if (left.length > 0) {
   console.error(`quit-check: FAIL, still running ${QUIT_WITHIN_MS} ms after close: ${left.map((p) => `${p.name} ${p.pid}`).join(', ')}`)
   killAll(left)
-  removeDataDir()
+  await removeDataDir()
   process.exit(1)
 }
-removeDataDir()
+await removeDataDir()
 console.log(`quit-check: PASS, all ${tree.length} processes exited ${ms} ms after the window closed`)
 process.exit(0)
