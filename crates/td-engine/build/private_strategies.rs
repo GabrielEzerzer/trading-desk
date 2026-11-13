@@ -13,10 +13,11 @@ use sha2::{Digest, Sha256};
 /// a checkout that converts line endings hashes the same as one that does not. A saved run and
 /// verdict record it, so a verdict can tell when its strategy's code has changed.
 ///
-/// shortcut: the hash covers the strategy's own file only, not the shared helpers it calls (such
-/// as `strategies/mod.rs`, `gotobi_calendar.rs` or the engine itself), so a change to a shared
-/// helper leaves `code_matches` true. Hash a strategy's helpers too if strategies come to share
-/// logic that decides their trades.
+/// shortcut: the hash covers the strategy's own file only. Any other file it uses is not hashed:
+/// shared helpers (such as `strategies/mod.rs`, `gotobi_calendar.rs` or the engine itself), and
+/// also a file of its own that it pulls in with `#[path]` or `include!`. A change to any of those
+/// alone leaves `code_matches` true and `code_versions` unchanged. Hash those files too if
+/// strategies come to keep logic that decides their trades outside their own file.
 pub fn source_hash(path: &Path) -> Result<String, String> {
     let bytes = fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let mut normalised = Vec::with_capacity(bytes.len());
