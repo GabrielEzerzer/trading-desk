@@ -320,9 +320,10 @@ struct Quote {
 /// - a run of [`CLOSURE_MINUTES`] or more open minutes with no candle, up to the next candle or
 ///   closed hours, is a closure or an outage, such as a market holiday: it is left missing whole,
 ///   and nothing is filled again until the next candle that is kept. The download records it
-///   beside the month ([`crate::Store::record_closures`]); a short one, or one of up to a day
-///   over the year-end holidays, then counts as closed, and a longer one shows in the download's gaps and in coverage. A crossed
-///   candle still ends such a run, as OANDA was quoting then.
+///   beside the month ([`crate::Store::record_closures`]); a short one, or one of up to
+///   [`crate::LONGEST_CLOSURE`] over the year-end holidays, then counts as closed, and any other
+///   shows in the download's gaps and in coverage. A crossed candle still ends such a run, as
+///   OANDA was quoting then.
 ///
 /// The minutes are open by [`InstrumentKind::is_open`], which agrees with the closed spans the
 /// store's coverage counts open minutes by.

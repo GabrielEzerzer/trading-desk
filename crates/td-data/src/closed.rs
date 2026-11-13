@@ -198,9 +198,9 @@ impl Store {
     }
 
     /// The closures recorded over `[from, to)`: each stretch of recorded spans, joined where they
-    /// meet at a month's end or across closed hours, that holds at most [`LONGEST_CLOSURE`] of open
-    /// time. The months either side of the range are read too, so a stretch the range cuts is
-    /// judged whole. Nothing for a kind that never closes.
+    /// meet at a month's end or across closed hours, that counts as closed by the rule in this
+    /// module's doc. The months either side of the range are read too, so a stretch the range cuts
+    /// is judged whole. Nothing for a kind that never closes.
     pub fn closures(
         &self,
         id: &InstrumentId,
@@ -467,6 +467,17 @@ mod tests {
         let june = coverage_without(&store, "2025-06", late);
         assert_eq!(june.gaps, []);
         assert_eq!(june.minutes, june.open_minutes as usize);
+    }
+
+    #[test]
+    fn the_year_end_window_runs_from_24_december_to_the_end_of_2_january() {
+        let dec24 = parse_date("2024-12-24").expect("a date");
+        let jan3 = parse_date("2025-01-03").expect("a date");
+        assert!(!in_year_end(dec24 - HOUR, dec24));
+        assert!(in_year_end(dec24 - HOUR, dec24 + MINUTE));
+        assert!(in_year_end(jan3 - MINUTE, jan3 + HOUR));
+        assert!(!in_year_end(jan3, jan3 + HOUR));
+        assert!(!in_year_end(jan3, jan3 + 300 * DAY));
     }
 
     #[test]
