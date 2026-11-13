@@ -3,7 +3,8 @@
 // answers what Strategy Lab asks for first, launches the installed app once with TD_SMOKE=1 (the
 // app quits by itself once the engine's handshake has arrived and its window has loaded), then
 // kills whatever is left, uninstalls silently and deletes the temporary folders. Prints one line,
-// INSTALL-CHECK PASS or INSTALL-CHECK FAIL: <reason>, and exits 0 or 1.
+// INSTALL-CHECK PASS or INSTALL-CHECK FAIL: <reason>, and exits 0 or 1; install-verdict.mjs says
+// how the launch is read, including the pass with a note when the quit watchdog ends the app.
 //
 //   pnpm dist && pnpm install-check          from gui/
 //
@@ -15,6 +16,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { createInterface } from 'node:readline'
 import { fileURLToPath } from 'node:url'
+import { launchVerdict } from './install-verdict.mjs'
 
 const gui = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const { productName, version } = JSON.parse(readFileSync(join(gui, 'app', 'package.json'), 'utf8'))
@@ -28,6 +30,8 @@ const temp = mkdtempSync(join(tmpdir(), 'td-install-'))
 const installDir = join(temp, 'app')
 let app = null
 let installed = false
+// '' or the watchdog note for the pass line (install-verdict.mjs).
+let passNote = ''
 
 function step(line) {
   console.log(`install-check: ${line}`)
@@ -186,19 +190,9 @@ async function main() {
   const profileDir = join(temp, 'profile')
   const { code, output } = await launch(exe, dataDir, profileDir)
   for (const line of output) step(`app: ${line}`)
-  if (code === 'timeout') throw new Error(`the app was still running ${LAUNCH_LIMIT_MS / 1000} s after it started`)
-  const fail = output.find((line) => line.startsWith('TD_SMOKE fail:'))
-  if (fail) throw new Error(fail)
-  if (code !== 0) throw new Error(`the app exited with code ${code}`)
-  const ok = output.find((line) => line.startsWith('TD_SMOKE ok engine='))
-  if (!ok) throw new Error('the app exited 0 without reporting the smoke result')
-  const ran = ok.slice('TD_SMOKE ok engine='.length)
-  if (ran.toLowerCase() !== engineBin.toLowerCase()) throw new Error(`the app started the engine at ${ran}, not ${engineBin}`)
-  if (!output.some((line) => line.includes('td-server: listening on') && line.includes(dataDir))) {
-    throw new Error(`the engine did not report the fresh data folder ${dataDir}`)
-  }
+  passNote = launchVerdict({ code, output, engineBin, dataDir })
   if (!existsSync(profileDir) || readdirSync(profileDir).length === 0) throw new Error(`the app did not use the fresh profile ${profileDir}`)
-  step('the installed app started its own engine, loaded its window and quit with code 0')
+  step(`the installed app started its own engine, loaded its window, stopped the engine cleanly and exited with code ${code}`)
 
   await killAll()
   await uninstall()
@@ -233,5 +227,5 @@ if (failure) {
   console.log(`INSTALL-CHECK FAIL: ${failure}`)
   process.exit(1)
 }
-console.log('INSTALL-CHECK PASS')
+console.log(`INSTALL-CHECK PASS${passNote}`)
 process.exit(0)

@@ -7,7 +7,7 @@ import type { EngineStatus } from '@td/shared'
 export interface SmokeDeps {
   /** Both arrived: quit the normal way, which exits with code 0. */
   pass(): void
-  /** Exit with a non-zero code. */
+  /** Exit with SMOKE_FAIL_CODE. */
   fail(reason: string): void
 }
 
@@ -18,6 +18,8 @@ export interface Smoke {
 }
 
 export const SMOKE_TIMEOUT_MS = 30_000
+/** The smoke's failure exit code, apart from the 1 the quit watchdog's kill gives on Windows. */
+export const SMOKE_FAIL_CODE = 2
 
 export function createSmoke(deps: SmokeDeps, timeoutMs = SMOKE_TIMEOUT_MS): Smoke {
   let engineUp = false

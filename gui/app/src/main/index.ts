@@ -15,7 +15,7 @@ import { createEngine } from './engine'
 import { isExternalLink } from './links'
 import { createQuit } from './quit'
 import { Sidecar, sidecarBin } from './sidecar'
-import { createSmoke } from './smoke'
+import { SMOKE_FAIL_CODE, createSmoke } from './smoke'
 import { EngineSocket } from './socket'
 import { spawnWatchdog } from './watchdog'
 
@@ -38,7 +38,7 @@ const smoke =
         },
         fail: (reason) => {
           console.error(`TD_SMOKE fail: ${reason}`)
-          app.exit(1)
+          app.exit(SMOKE_FAIL_CODE)
         },
       })
     : null
