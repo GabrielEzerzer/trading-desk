@@ -2613,41 +2613,33 @@ fn later_entry_closed_at_market() -> (usize, Act) {
 }
 
 #[test]
-fn an_entry_that_closes_unfilled_while_its_stop_of_unknown_outcome_is_not_at_the_venue_carries_on()
-{
-    let (mut rig, _) = entry_closed_unfilled_with_unsettled_stop(
-        Fault::DropBeforeApply,
-        vec![later_entry_closed_at_market()],
-    );
+fn an_entry_that_closes_unfilled_while_the_venue_shows_its_stop_of_unknown_outcome_closed_unfilled_carries_on()
+ {
+    let (mut rig, _) = entry_closed_unfilled_with_unsettled_stop(Fault::DropAfterApply, vec![]);
+    // The stop reached the venue, which closed it with nothing filled.
+    rig.mock.cancel_after_partial_fill("t-o2", 0.0);
     let sends = rig.sends();
     rig.bar();
     assert_eq!(rig.handle.fault(), None);
     assert!(matches!(rig.status(1), OrderStatus::Cancelled(_)));
     assert!(matches!(rig.status(2), OrderStatus::Cancelled(_)));
-    assert!(rig.mock.orders_with_link_id("t-o2").is_empty());
     assert_eq!(rig.sends(), sends, "nothing sent for it");
-    // It carries on: the later entry is sent and its refused stop closed at market.
-    rig.mock.set_price(SYMBOL, 63500.0);
-    rig.bar();
-    rig.bar();
-    assert_eq!(rig.handle.fault(), None);
-    assert_eq!(rig.mock.orders_with_link_id("t-c4")[0].status, "Filled");
-    assert_eq!(rig.status(3), OrderStatus::Filled);
-    assert_eq!(rig.status(4), OrderStatus::Filled);
-    assert_eq!(rig.session.portfolio().position(), 0.0);
-    assert_eq!(rig.mock.position(SYMBOL), 0.0);
 }
 
 #[test]
-fn after_a_restart_an_entry_that_closes_unfilled_while_its_stop_of_unknown_outcome_is_not_at_the_venue_carries_on()
+fn after_a_restart_an_entry_that_closes_unfilled_while_the_venue_shows_its_stop_of_unknown_outcome_closed_unfilled_carries_on()
  {
     let (rig, records) = entry_closed_unfilled_with_unsettled_stop(
-        Fault::DropBeforeApply,
+        Fault::DropAfterApply,
         vec![later_entry_closed_at_market()],
     );
+    // The stop reached the venue, which closed it with nothing filled. Going live's reads leave
+    // it out, as a list that lags would, so it stays unsettled and carried over the restart.
+    rig.mock.cancel_after_partial_fill("t-o2", 0.0);
+    rig.mock.hide("t-o2", 600_000);
     let (mut session, handle) = replayed(&rig, &records);
-    // Going live does not find the stop, so it stays unsettled and carried over the restart.
     handle.go_live().unwrap();
+    rig.mock.hide("t-o2", 0);
     let sends = rig.sends();
     session.on_bar(rig.candle(1, PRICE), &[]).unwrap();
     assert_eq!(handle.fault(), None);
@@ -2705,6 +2697,7 @@ fn an_entry_that_closes_unfilled_while_its_stop_of_unknown_outcome_rests_or_cann
             assert!(
                 fault.message.contains("t-o1 closed unfilled")
                     && fault.message.contains("t-o2")
+                    && fault.message.contains("could not be read")
                     && fault.message.contains("may rest at the venue"),
                 "{fault}"
             );
@@ -2712,6 +2705,49 @@ fn an_entry_that_closes_unfilled_while_its_stop_of_unknown_outcome_rests_or_cann
         }
         assert_eq!(rig.sends(), sends, "nothing sent, rests {rests}");
     }
+}
+
+#[test]
+fn after_a_restart_an_entry_that_closes_unfilled_while_lagging_lists_leave_out_its_resting_stop_of_unknown_outcome_faults()
+ {
+    let (rig, records) = entry_closed_unfilled_with_unsettled_stop(
+        Fault::DropAfterApply,
+        vec![later_entry_closed_at_market()],
+    );
+    // The stop rests at the venue, whose open orders and lookups by id leave it out, as lists
+    // that lag would, through going live and the bars after.
+    rig.mock.hide("t-o2", 600_000);
+    let (mut session, handle) = replayed(&rig, &records);
+    handle.go_live().unwrap();
+    let sends = rig.sends();
+    session.on_bar(rig.candle(1, PRICE), &[]).unwrap();
+    let fault = handle.fault().expect("faulted");
+    assert_eq!(fault.kind, FaultKind::UnresolvedOrder, "{fault}");
+    assert!(
+        fault.message.contains("t-o1 closed unfilled")
+            && fault.message.contains("t-o2")
+            && fault.message.contains("its outcome is unknown")
+            && fault.message.contains("may rest at the venue"),
+        "{fault}"
+    );
+    assert_eq!(rig.sends(), sends, "nothing sent");
+    assert_eq!(
+        rig.mock.orders_with_link_id("t-o2")[0].status,
+        "Untriggered",
+        "it rests"
+    );
+    // The stop stays unsettled and carried over the restart.
+    let record = serde_json::to_value(handle.take_record()).unwrap();
+    let stop = &record["book"]["orders"]["2"];
+    assert_eq!(stop["at"], "Unsettled", "{record}");
+    assert_eq!(stop["carried"], true, "{record}");
+    // The later entry's stop, which the venue would refuse, is not closed at market: nothing
+    // goes out.
+    rig.mock.set_price(SYMBOL, 63500.0);
+    session.on_bar(rig.candle(2, PRICE), &[]).unwrap();
+    session.on_bar(rig.candle(3, PRICE), &[]).unwrap();
+    assert!(rig.mock.orders_with_link_id("t-c4").is_empty(), "no close");
+    assert_eq!(rig.sends(), sends, "nothing sent");
 }
 
 #[test]

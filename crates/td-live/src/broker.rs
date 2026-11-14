@@ -207,11 +207,11 @@ struct Tracked {
     /// outcome was unknown, or an entry's stop sent with an unknown outcome
     /// ([`At::Unsettled`]), from when going live starts until the venue settles it. An entry is
     /// settled once the venue shows it or two looks find nothing (it is then refused); a stop
-    /// once the venue shows it, or once its entry closes unfilled and the venue shows the stop
-    /// neither resting nor filled (it is then dropped). While its entry may still fill, not
-    /// finding the stop does not show that it never rested. While any order is carried, no
-    /// close at market goes out (`Core::restart_unresolved`). A record made before this field
-    /// existed loads it as false.
+    /// only once the venue shows it (one whose entry closed unfilled is then dropped if the venue
+    /// shows it closed with nothing filled). Not finding the stop does not show that it never
+    /// rested, since a list that lags can leave out a stop that rests. While any order is
+    /// carried, no close at market goes out (`Core::restart_unresolved`). A record made before
+    /// this field existed loads it as false.
     #[serde(default)]
     carried: bool,
 }
@@ -1889,14 +1889,17 @@ impl Core {
     }
 
     /// Entry `cid` closed with nothing filled (`status`) while its attached stop `stop` was sent
-    /// under its `o` id with an unknown outcome. The venue is asked about the stop before the
-    /// close is taken as ordinary: the fault when `open`, the venue's open orders, lists it, its
-    /// lookup shows it open or filled, or the venue cannot be asked; `None` when the lookup shows
-    /// it closed with nothing filled or two looks find nothing.
+    /// under its `o` id with an unknown outcome. The close is taken as ordinary (`None`) only
+    /// when the venue's lookup shows the stop closed with nothing filled. Otherwise it is the
+    /// fault: when `open`, the venue's open orders, lists the stop or its lookup shows it open or
+    /// filled; when the venue cannot be asked; and when neither the open orders nor two looks
+    /// show it.
     ///
-    /// Finding nothing is enough here, unlike for a fill (`Core::settle_stop`): nothing goes out
-    /// on it, and a stop that rests after all is listed as an open order this session does not
-    /// hold, or fills under an id it no longer tracks, and either faults the broker.
+    /// Not finding the stop does not show that it never rested: a list that lags can leave out a
+    /// stop that rests. Dropping it then would leave a stop resting that the session no longer
+    /// holds, which could close a later position before a bar's reads saw it, and would clear its
+    /// mark of being carried over a restart, which keeps every close at market from going out.
+    /// So it stays unsettled, as for a fill (`Core::settle_stop`), and the broker faults.
     fn unsettled_at_venue(
         &self,
         stop: OrderId,
@@ -1908,7 +1911,18 @@ impl Core {
         let found = match open.iter().find(|o| o.client_id == scid.as_str()) {
             Some(listed) => listed.clone(),
             None => match self.find(stop) {
-                Ok(found) => found?,
+                Ok(Some(found)) => found,
+                Ok(None) => {
+                    return Some((
+                        FaultKind::UnresolvedOrder,
+                        format!(
+                            "entry {cid} closed unfilled ({status}), and its stop {scid}, sent \
+                             with an unknown outcome, is neither in the venue's open orders nor \
+                             found in two lookups by id, so its outcome is unknown and it may \
+                             rest at the venue"
+                        ),
+                    ));
+                }
                 Err(e) => {
                     return Some((
                         FaultKind::UnresolvedOrder,

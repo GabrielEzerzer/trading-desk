@@ -232,6 +232,18 @@ impl State {
         }
     }
 
+    pub fn hide(&mut self, link_id: &str, ms: i64) {
+        let until = self.now() + ms;
+        for o in &mut self.orders {
+            if o.link_id == link_id {
+                o.lagged = Some(Lagged {
+                    until,
+                    before: None,
+                });
+            }
+        }
+    }
+
     pub fn cancel_after_partial_fill(&mut self, link_id: &str, qty: f64) {
         let i = self
             .orders
@@ -1609,6 +1621,47 @@ mod tests {
         assert_eq!(listed(&s, None), ["l1", "l1", "l2"]);
         assert_eq!(listed(&s, Some("l1")), ["l1"]);
         assert_eq!(listed(&s, Some("l2")), ["l2"]);
+    }
+
+    #[test]
+    fn a_hidden_order_is_left_out_of_the_lists_while_it_rests_until_shown_again() {
+        let mut s = state();
+        let order = |link: &str, side: &str| {
+            json!({
+                "category": "linear", "symbol": "BTCUSDT", "side": side, "orderType": "Market",
+                "qty": "0.010", "positionIdx": 0, "orderLinkId": link,
+            })
+        };
+        s.create(&order("l0", "Buy"), None).unwrap();
+        let mut stop = order("l1", "Sell");
+        stop["reduceOnly"] = json!(true);
+        stop["triggerPrice"] = json!("60000.0");
+        stop["triggerDirection"] = json!(2);
+        s.create(&stop, None).unwrap();
+        let listed = |s: &State, link: Option<&str>| {
+            let mut p: HashMap<String, String> = [
+                ("category".into(), "linear".into()),
+                ("symbol".into(), "BTCUSDT".into()),
+            ]
+            .into();
+            if let Some(link) = link {
+                p.insert("orderLinkId".into(), link.into());
+            }
+            s.realtime(&p).unwrap()["list"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|o| o["orderLinkId"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(listed(&s, None), ["l1"]);
+        s.hide("l1", 60_000);
+        assert!(listed(&s, None).is_empty());
+        assert!(listed(&s, Some("l1")).is_empty());
+        assert_eq!(s.orders[1].status, "Untriggered", "it still rests");
+        s.hide("l1", 0);
+        assert_eq!(listed(&s, None), ["l1"]);
+        assert_eq!(listed(&s, Some("l1")), ["l1"]);
     }
 
     #[test]

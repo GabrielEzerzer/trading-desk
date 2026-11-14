@@ -32,9 +32,11 @@
 //!   own id then; if its outcome is unknown, the venue is asked about it on the first confirmed
 //!   fill (see "Unknown outcomes"). A stop the venue shows closed with nothing filled is treated
 //!   as one it refused. An entry that closes unfilled owes nothing for a stop that did not rest.
-//!   When that stop's outcome is unknown, the venue is asked about it by its id first: the
-//!   broker faults if the stop rests or filled there or the venue cannot be asked, and
-//!   otherwise (closed with nothing filled, or not found in two looks) the close is ordinary.
+//!   When that stop's outcome is unknown, the venue is asked about it by its id first, and the
+//!   close is ordinary only when the venue shows the stop closed with nothing filled. The broker
+//!   faults if the stop rests or filled there, if the venue cannot be asked, or if neither its
+//!   open orders nor two looks show the stop, since a list that lags can leave out a stop that
+//!   rests; the stop then stays unresolved.
 //!   For a confirmed fill, a stop the venue does not take now is replaced by a reduce-only market
 //!   order, since flat is the safe side (not while an order carried over a restart is
 //!   unresolved; see "Records"); if the close fails or is not sent, the broker faults. A stop that
