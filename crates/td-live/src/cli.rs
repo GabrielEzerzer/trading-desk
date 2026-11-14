@@ -120,6 +120,15 @@ fn parse_rollover(s: &str) -> Result<DayRollover, String> {
     }
 }
 
+/// `rollover` as `--rollover` takes it.
+fn rollover_flag(rollover: DayRollover) -> String {
+    match rollover {
+        DayRollover::Utc { offset_minutes: 0 } => "utc".into(),
+        DayRollover::Utc { offset_minutes } => format!("utc:{offset_minutes}"),
+        DayRollover::NewYork1700 => "new-york-17".into(),
+    }
+}
+
 /// A stream of an instrument's live bars, opened once the session has warmed up.
 pub type OpenStream = Arc<dyn Fn(InstrumentId) -> Arc<SharedStream> + Send + Sync>;
 
@@ -178,6 +187,7 @@ fn run(cli: Cli, env: &Env, out: &mut dyn FnMut(&str)) -> Result<u8, String> {
                 args.id,
                 live.dir().display()
             ));
+            out(&limits(&live));
             Ok(guarded(live, env, out))
         }
         Command::Resume(args) => {
@@ -186,6 +196,7 @@ fn run(cli: Cli, env: &Env, out: &mut dyn FnMut(&str)) -> Result<u8, String> {
             match LiveSession::open(&data, &args.id, client.clone(), env.build) {
                 Ok(live) => {
                     out(&format!("resumed session {}", args.id));
+                    out(&limits(&live));
                     Ok(guarded(live, env, out))
                 }
                 Err(LiveError::StopFired(fired)) => {
@@ -226,6 +237,24 @@ fn run(cli: Cli, env: &Env, out: &mut dyn FnMut(&str)) -> Result<u8, String> {
             Ok(0)
         }
     }
+}
+
+/// The line `start` and `resume` print with the limits the session runs with, so an edit of its
+/// saved files is seen. It reads the stop state the guard checks, which `resume` restores only
+/// when `config.json` gives the same rules and starting balance. It holds no key and no equity
+/// but the starting balance.
+fn limits(live: &LiveSession) -> String {
+    let state = &live.stops.state;
+    let rules = state.rules();
+    format!(
+        "limits: daily loss {} and maximum loss {} of the starting balance of {} {SETTLE_COIN}, \
+         notional cap {} {SETTLE_COIN}, day rollover {}",
+        rules.daily_loss_share,
+        rules.max_loss_share,
+        state.starting_balance(),
+        rules.open_notional_cap,
+        rollover_flag(rules.rollover),
+    )
 }
 
 fn guarded(live: LiveSession, env: &Env, out: &mut dyn FnMut(&str)) -> u8 {
@@ -507,5 +536,12 @@ mod tests {
         );
         assert_eq!(parse_rollover("new-york-17"), Ok(DayRollover::NewYork1700));
         assert!(parse_rollover("noon").is_err());
+    }
+
+    #[test]
+    fn rollover_prints_as_the_flag_takes_it() {
+        for flag in ["utc", "utc:-60", "utc:1380", "new-york-17"] {
+            assert_eq!(rollover_flag(parse_rollover(flag).unwrap()), flag);
+        }
     }
 }

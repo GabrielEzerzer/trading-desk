@@ -31,17 +31,21 @@
 //! - **When a stop fires**, in this order: the fired state is saved to `stops.json` (a save that
 //!   fails does not hold the flatten back; it is tried again at the start of each round, before
 //!   each close and when the flatten ends, and the outcome names a save that never went
-//!   through); the broker stops sending and the run is asked to halt; every open order on the
-//!   instrument with the session's prefix is cancelled and the venue's position is closed with a
-//!   reduce-only market order for the size the venue reports, through the route directly (not the
-//!   broker, whose "send nothing once faulted" rule stays as it is); then the venue is read again,
-//!   and the cancel and close repeat, a pause apart and for a bounded number of rounds, until the
-//!   run has finished, the position is flat and no order of the session rests. Each step is
-//!   recorded in `stops.json`. A close whose outcome is unknown is settled by reading the venue on
-//!   the next round, never by sending it again. Each close carries a new `f` id whose number is
-//!   saved before it is sent, so a crash and a retry do not reuse an id while the disk takes the
-//!   save, and a reduce-only order can never take the position past flat. The session's status
-//!   becomes [`State::Ended`].
+//!   through); the broker's gate stops passing anything and the run is asked to halt; every open
+//!   order on the instrument with the session's prefix is cancelled and the venue's position is
+//!   closed with a reduce-only market order for the size the venue reports, through the route
+//!   directly (not the broker, whose "send nothing once faulted" rule stays as it is); then the
+//!   venue is read again, and the cancel and close repeat, a pause apart and for a bounded number
+//!   of rounds, until the run has finished, the position is flat and no order of the session
+//!   rests. A send of the bar in hand that passed its check before the gate stopped can still go
+//!   out: an order that is not reduce-only has then passed the cap, and a protective stop is
+//!   reduce-only. The flatten cannot end flat before the run has finished and reads the venue
+//!   again after that, so it cancels or closes what such a send left. Each step is recorded in
+//!   `stops.json`. A close whose outcome is unknown is settled by reading the venue on the next
+//!   round, never by sending it again. Each close carries a new `f` id whose number is saved
+//!   before it is sent, so a crash and a retry do not reuse an id while the disk takes the save,
+//!   and a reduce-only order can never take the position past flat. The session's status becomes
+//!   [`State::Ended`].
 //! - **After the run ends** for another reason (a halt, a fault, a feed that ended), the guard
 //!   keeps checking while the process lives and the venue position is not known to be flat.
 //!
@@ -148,7 +152,8 @@ impl StopHandle {
     }
 
     /// Asks the guarded run to stop. A running session is stopped cleanly and what it holds stays
-    /// at the venue; a flatten already under way finishes first.
+    /// at the venue; a flatten already under way finishes first, and a stop the bar in hand fires
+    /// before the run has stopped is flattened before the command returns.
     pub fn stop(&self) {
         self.wake.set(|f| f.stop = true);
     }
@@ -200,10 +205,15 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 /// The broker's gate: every order it places passes here first. It holds the session's rules for
 /// the pre-trade notional cap and the guard's two levels of stopping: a halt on a venue it cannot
-/// read, after which only reduce-only orders go out, and a fired stop, after which nothing does.
+/// read, after which only reduce-only orders go out, and a fired stop, after which it passes
+/// nothing.
 pub(crate) struct SendGate {
     rules: StopRules,
-    /// Set when a stop fires: the broker sends nothing more, its protective stops included.
+    /// Set when a stop fires: from then on the gate passes no order, and the broker starts no
+    /// protective stop or close of its own. A send that passed its check before this was set can
+    /// still go out: an order that is not reduce-only has then passed the cap, and a protective
+    /// stop or close is reduce-only. The guard's flatten cannot report flat until the run has
+    /// ended and reads the venue again after that, so it cancels or closes what such a send left.
     stopped: Mutex<Option<String>>,
     /// Set when the venue could not be read for the bound: orders that are not reduce-only are
     /// refused, and the broker's protective stops and closes still go out.
@@ -224,7 +234,9 @@ impl SendGate {
         }
     }
 
-    /// Stops all sending through the broker; the first reason given is kept.
+    /// Stops the gate passing anything, and the broker starting a protective stop or close; the
+    /// first reason given is kept. A send already past its check can still go out (see the
+    /// `stopped` field).
     pub fn stop(&self, reason: &str) {
         lock(&self.stopped).get_or_insert_with(|| reason.to_string());
     }
@@ -567,8 +579,9 @@ impl Guard {
     }
 
     /// The reason a check gives the run to halt, or `None` to go on. A fired stop also stops the
-    /// broker sending anything; the last allowed failure stops it sending anything that is not
-    /// reduce-only, so an entry already filled still gets its protective stop.
+    /// gate passing anything (see [`SendGate::stop`] for a send already past it); the last allowed
+    /// failure stops it passing anything that is not reduce-only, so an entry already filled still
+    /// gets its protective stop.
     fn halt_reason(&self, check: &Check) -> Option<String> {
         match check {
             Check::Fired(fired) => {
@@ -637,8 +650,10 @@ impl Flattener<'_> {
     /// `done(wait)` says whether the run has finished; with `wait` it first waits for it to. It is
     /// asked before each round's reads, so an order the run had in flight when it was halted shows
     /// in them. A round that finds the venue clean while the run is still ending waits for it
-    /// (the run has been halted and sending has stopped, so it is finishing at most one route
-    /// call, which the route's timeouts bound) and reads again.
+    /// (the run has been halted and the gate passes nothing, so it is finishing the bar in hand,
+    /// whose route calls the route's timeouts bound; a send that passed its check before the gate
+    /// stopped can still go out in it) and reads again, so what such a send left is cancelled or
+    /// closed.
     fn run(
         &self,
         record: &mut StopRecord,
@@ -898,9 +913,6 @@ where
     let mut run = Some(live.run(rest, stream, after_bar));
     // Why the run ended, once it has, and the session it gave back. Set when `run` is taken.
     let mut ended: Option<(String, LiveSession)> = None;
-    let why_ended = |ended: Option<(String, LiveSession)>| {
-        ended.map_or_else(|| "the run ended".to_string(), |(reason, _)| reason)
-    };
     let mut halted = false;
     let mut next_check = Instant::now() + timing.interval;
     loop {
@@ -922,20 +934,7 @@ where
             ended = Some((reason, session));
         }
         if stopping {
-            let Some(run) = run.take() else {
-                out("stopped: the loss limits are not enforced while td-live is not running");
-                return Outcome::Halted(why_ended(ended.take()));
-            };
-            let (_session, result) = run.stop();
-            out(
-                "stopped: the position and its resting orders stay at the venue, and the loss \
-                 limits are not enforced while td-live is not running; `td-live flatten` closes \
-                 the position",
-            );
-            return match result {
-                Ok(()) => Outcome::Stopped,
-                Err(e) => Outcome::Halted(e.to_string()),
-            };
+            return stop_guarded(&guard, &prefix, run.take(), ended.take(), &rx, out);
         }
         if Instant::now() < next_check {
             continue;
@@ -965,7 +964,51 @@ where
     }
 }
 
-/// A fired stop: stops sending, halts the run, flattens, and records how it ended.
+/// Why a run ended, from what the guard kept when it took the run.
+fn why_ended(ended: Option<(String, LiveSession)>) -> String {
+    ended.map_or_else(|| "the run ended".to_string(), |(reason, _)| reason)
+}
+
+/// The owner's stop of a guarded run: stops `run` if it is still going (`ended` holds what a run
+/// already taken gave back), then flattens a stop that fired, or else leaves what the session
+/// holds at the venue.
+///
+/// The fired state is read once the run has ended, when no check but this thread's can change
+/// it. So a stop the run's last bar fired after the loop last read the state, while the owner was
+/// stopping the command or as the run finished, is flattened before the command returns.
+fn stop_guarded(
+    guard: &Guard,
+    prefix: &str,
+    run: Option<crate::LiveRun>,
+    ended: Option<(String, LiveSession)>,
+    rx: &mpsc::Receiver<String>,
+    out: &mut dyn FnMut(&str),
+) -> Outcome {
+    let stopped = run.map(crate::LiveRun::stop);
+    // Bound first: an `if let` on the lock would hold it through `fire`, which takes it.
+    let fired = lock(&guard.inner).record.state.fired().copied();
+    if let Some(fired) = fired {
+        let session = match stopped {
+            Some((session, _)) => Some(session),
+            None => ended.map(|(_, session)| session),
+        };
+        return fire(guard, prefix, fired, None, session, rx, out);
+    }
+    let Some((_session, result)) = stopped else {
+        out("stopped: the loss limits are not enforced while td-live is not running");
+        return Outcome::Halted(why_ended(ended));
+    };
+    out(
+        "stopped: the position and its resting orders stay at the venue, and the loss limits are \
+         not enforced while td-live is not running; `td-live flatten` closes the position",
+    );
+    match result {
+        Ok(()) => Outcome::Stopped,
+        Err(e) => Outcome::Halted(e.to_string()),
+    }
+}
+
+/// A fired stop: stops the gate, halts the run, flattens, and records how it ended.
 fn fire(
     guard: &Guard,
     prefix: &str,
@@ -980,9 +1023,13 @@ fn fire(
     if let Some(run) = &run {
         // shortcut: the run takes the halt between bars, so a bar it is already reading reads
         // the venue while the flatten works, sees a cancel or an `f` close the broker does not
-        // hold, and faults. The fault sends nothing and the flatten goes on to flat, but the
-        // `faulted` marker is left on a session the flatten ends. Wait for the bar in hand to
-        // end before the first send if that marker misleads in practice.
+        // hold, and faults. The fault sends nothing more. That bar can still send an order or a
+        // protective stop that passed its check before the gate stopped (an order that is not
+        // reduce-only has then passed the cap); the flatten cannot report flat until the run has
+        // ended and reads the venue again after that, so it cancels or closes what such a send
+        // left. The flatten goes on to flat, but the `faulted` marker is left on a session the
+        // flatten ends. Wait for the bar in hand to end before the first send if that marker
+        // misleads in practice.
         run.halt(reason.clone());
     }
     out(&format!("stop fired: {fired}"));
@@ -1485,5 +1532,72 @@ mod tests {
         gate.halt("the venue could not be read");
         assert_eq!(gate.refusal(&client, &instrument(), &stop, PRICE), None);
         assert_eq!(mock.requests().len(), reads, "nothing is read for it");
+    }
+
+    /// The owner's stop finds the run already ended and taken, its last bar having fired a stop
+    /// after the loop last read the state: the stop is still flattened. The run cannot be made to
+    /// end between those two reads on purpose, so this calls the stop with the run already taken.
+    #[test]
+    fn the_owner_s_stop_flattens_a_stop_the_run_fired_before_it_was_taken() {
+        let (mock, client, gate) = gate_at(QTY);
+        let prefix = "t1";
+        let mut stop = market(Side::Sell, QTY, true);
+        stop.order_type = OrderType::Stop { trigger: 60_000.0 };
+        let cid = ids::client_id(prefix, Role::Order, OrderId(2));
+        client
+            .place(&instrument(), &stop, &cid, PRICE)
+            .expect("the session's stop rests");
+        let now = client.server_now();
+        let mut state = StopState::start(gate.rules, 100_000.0, now).unwrap();
+        assert!(
+            state.check(now, 1.0, 0.0).unwrap().is_some(),
+            "a stop fired"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, rx) = mpsc::channel();
+        let guard = Guard {
+            dir: dir.path().to_path_buf(),
+            client: Arc::new(client),
+            instrument: instrument(),
+            gate: Arc::new(gate),
+            timing: GuardTiming {
+                interval: Duration::from_secs(600),
+                pause: Duration::from_millis(50),
+                rounds: 6,
+                unreadable: 4,
+            },
+            inner: Mutex::new(Inner {
+                record: StopRecord::new(state),
+                failures: 0,
+                last_time: Millis::MIN,
+                shown_clear: false,
+                unsaved: None,
+            }),
+            wake: Arc::default(),
+            events: Mutex::new(tx),
+        };
+        let mut lines = Vec::new();
+        let outcome = stop_guarded(&guard, prefix, None, None, &rx, &mut |l| {
+            lines.push(l.to_string())
+        });
+        let text = lines.join("\n");
+        assert!(
+            matches!(
+                outcome,
+                Outcome::Fired {
+                    left: None,
+                    unsaved: None,
+                    ..
+                }
+            ),
+            "{outcome:?}\n{text}"
+        );
+        assert_eq!(mock.position(SYMBOL), 0.0, "{text}");
+        let resting: Vec<_> = mock
+            .orders()
+            .into_iter()
+            .filter(|o| ["New", "Untriggered", "PartiallyFilled"].contains(&o.status.as_str()))
+            .collect();
+        assert!(resting.is_empty(), "{resting:?}\n{text}");
     }
 }

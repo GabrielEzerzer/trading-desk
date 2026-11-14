@@ -885,18 +885,65 @@ fn crash_after_fire(rig: &Rig, id: &str, last_id: u64) {
     rig.write_json(id, "stops.json", &file);
 }
 
-/// Runs the command with `args` on this rig and returns its exit code and output.
+/// Runs the command with `args` on this rig and returns its exit code and output. A command still
+/// running after 30 s is stopped, as Ctrl-C would, so one that wrongly starts a run comes back
+/// with its exit code and output rather than hanging the test.
 fn td_live(rig: &Rig, feed: &Feed, args: &[&str]) -> (u8, String) {
     let cli = Cli::try_parse_from(std::iter::once("td-live").chain(args.iter().copied())).unwrap();
-    let mut lines = Vec::new();
-    let code = execute(cli, &rig.env(feed, quick()), &mut |l| {
-        lines.push(l.to_string())
+    let env = rig.env(feed, quick());
+    let (returned, bound) = std::sync::mpsc::channel::<()>();
+    let stop = env.stop.clone();
+    let bound = std::thread::spawn(move || {
+        // The sender is dropped once the command returns, which ends this wait at once.
+        if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
+            bound.recv_timeout(Duration::from_secs(30))
+        {
+            stop.stop();
+        }
     });
+    let mut lines = Vec::new();
+    let code = execute(cli, &env, &mut |l| lines.push(l.to_string()));
+    drop(returned);
+    bound.join().expect("the bound's thread");
     (code, lines.join("\n"))
 }
 
 fn resume(rig: &Rig, id: &str, feed: &Feed) -> (u8, String) {
     td_live(rig, feed, &["resume", "--id", id])
+}
+
+/// Runs `cli` on this rig until the guard's first check has passed, stops it as Ctrl-C would, and
+/// returns its exit code and output.
+fn until_checked(rig: &Rig, feed: &Feed, cli: Cli) -> (u8, String) {
+    let env = rig.env(feed, quick());
+    let stop = env.stop.clone();
+    let lines = Arc::new(Mutex::new(Vec::<String>::new()));
+    let out = lines.clone();
+    let thread = std::thread::spawn(move || {
+        execute(cli, &env, &mut |l| out.lock().unwrap().push(l.to_string()))
+    });
+    let text = || lines.lock().unwrap().join("\n");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !text().contains("check: no stop fired") {
+        assert!(
+            Instant::now() < deadline && !thread.is_finished(),
+            "{}",
+            text()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    stop.stop();
+    let code = thread.join().expect("the command's thread");
+    (code, text())
+}
+
+/// The line after the first line of `text` that starts with `first`.
+fn line_after(text: &str, first: &str) -> String {
+    text.lines()
+        .skip_while(|l| !l.starts_with(first))
+        .nth(1)
+        .unwrap_or_default()
+        .to_string()
 }
 
 /// The command line that starts session `id` in `data` with the script strategy and `params`.
@@ -1212,6 +1259,40 @@ fn the_command_starts_a_session_and_no_key_reaches_a_file_or_the_output() {
     assert!(text.contains("created session cmd"), "{text}");
     assert_ended_flat(&rig, "cmd", StopRule::MaxLoss);
     assert_no_credential(&rig, "cmd", &format!("{refused}\n{text}"));
+}
+
+/// `start` and `resume` print the limits they run with next to the session's first line, so an
+/// edit that changes both saved files together, which `resume` accepts, is seen.
+#[test]
+fn start_and_resume_print_the_limits_they_run_with() {
+    let rig = Rig::new();
+    let (code, started) =
+        until_checked(&rig, &rig.feed(), start_cli("shown", rig.data(), NO_TRADES));
+    assert_eq!(code, 0, "{started}");
+    assert_eq!(
+        line_after(&started, "created session shown"),
+        "limits: daily loss 0.05 and maximum loss 0.1 of the starting balance of 100000 USDT, \
+         notional cap 1000 USDT, day rollover utc",
+        "{started}"
+    );
+    // A looser maximum loss and a higher cap, written into both files alike.
+    let mut config = rig.json("shown", "config.json");
+    config["stops"]["max_loss_share"] = 0.2.into();
+    config["stops"]["open_notional_cap"] = 2500.0.into();
+    rig.write_json("shown", "config.json", &config);
+    let mut stops = rig.json("shown", "stops.json");
+    stops["stops"]["rules"]["max_loss_share"] = 0.2.into();
+    stops["stops"]["rules"]["open_notional_cap"] = 2500.0.into();
+    rig.write_json("shown", "stops.json", &stops);
+    let resume = Cli::try_parse_from(["td-live", "resume", "--id", "shown"]).unwrap();
+    let (code, resumed) = until_checked(&rig, &rig.feed(), resume);
+    assert_eq!(code, 0, "{resumed}");
+    assert_eq!(
+        line_after(&resumed, "resumed session shown"),
+        "limits: daily loss 0.05 and maximum loss 0.2 of the starting balance of 100000 USDT, \
+         notional cap 2500 USDT, day rollover utc",
+        "{resumed}"
+    );
 }
 
 #[test]
@@ -1809,6 +1890,34 @@ fn a_bar_read_while_the_flatten_works_faults_the_broker_which_sends_nothing() {
         State::Ended { .. }
     ));
     assert!(matches!(rig.open("race"), Err(LiveError::StillFaulted(_))));
+}
+
+/// The owner stops the command while the bar in hand is still reading the venue, and that bar's
+/// after-bar check fires a stop once the guard has read the state and asked the run to stop. The
+/// stop is still flattened before the command returns.
+#[test]
+fn a_stop_the_bar_in_hand_fires_while_the_owner_stops_is_flattened() {
+    let rig = Rig::new();
+    let feed = rig.feed();
+    let run = rig.entered("stopping", wide(), &feed, bars_only());
+    run.wait_line(&format!("bar fed: {}", rig.bar(0)));
+    // Bar 1 is held in its first read, before its after-bar check reads the equity, while the
+    // account loses past the maximum loss and the owner stops the command.
+    let reads = rig.mock.request_count(EXECUTIONS);
+    rig.mock
+        .inject(EXECUTIONS, Fault::Hang(Duration::from_millis(1200)));
+    feed.minute(rig.bar(2));
+    rig.wait("bar 1's first read", |r| {
+        r.mock.request_count(EXECUTIONS) > reads
+    });
+    rig.lose(11_000.0);
+    let (outcome, text) = run.stop();
+    assert!(
+        matches!(&outcome, Outcome::Fired { fired, left: None, unsaved: None } if fired.rule == StopRule::MaxLoss),
+        "{outcome:?}\n{text}"
+    );
+    assert!(!text.contains("stay at the venue"), "{text}");
+    assert_ended_flat(&rig, "stopping", StopRule::MaxLoss);
 }
 
 #[test]
