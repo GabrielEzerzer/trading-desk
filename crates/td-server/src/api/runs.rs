@@ -1147,9 +1147,15 @@ pub fn check_run(store: &Store, run: &SavedRun) -> RunCheck {
         .ok()
         .and_then(|d| {
             let references = read_references(store, base).ok()?;
-            // Rows known after the run's last bar are not in its fingerprint, so the cutoff it
-            // was made under does not matter here.
-            let series = read_series(store, base, None).ok()?;
+            // Only rows known by the close of the run's last bar are in its fingerprint, and that
+            // close is at or before `to`, so reading stops at `to`: a later row, malformed or not,
+            // is not read, and the cutoff the run was made under does not matter here.
+            let series = base
+                .series
+                .iter()
+                .map(|name| td_engine::read_series(store.root(), name, Some(base.to)))
+                .collect::<Result<Vec<_>, _>>()
+                .ok()?;
             config_fingerprint_with_references(
                 base,
                 &d.loaded.candles,

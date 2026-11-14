@@ -131,6 +131,8 @@ pub fn read_series(
             Err(e) => return Err(bad(format!("cannot read {}: {e}", p.display()))),
         }
     }
+    // shortcut: the whole file is read into memory and parsed as JSON before `until` stops the
+    // rows, upgrade to a streaming read if series files grow large.
     let bytes = fs::read(&path).map_err(|e| bad(format!("cannot read {}: {e}", path.display())))?;
     parse(name, &bytes, until)
 }
