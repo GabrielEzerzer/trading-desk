@@ -1568,6 +1568,50 @@ mod tests {
     }
 
     #[test]
+    fn an_order_listed_twice_shows_twice_among_the_open_orders_and_once_by_id() {
+        let mut s = state();
+        let order = |link: &str, side: &str, trigger: Option<&str>| {
+            let mut o = json!({
+                "category": "linear", "symbol": "BTCUSDT", "side": side, "orderType": "Market",
+                "qty": "0.010", "positionIdx": 0, "orderLinkId": link,
+            });
+            if let Some(t) = trigger {
+                o["reduceOnly"] = json!(true);
+                o["triggerPrice"] = json!(t);
+                o["triggerDirection"] = json!(2);
+            }
+            o
+        };
+        s.create(&order("l0", "Buy", None), None).unwrap();
+        s.create(&order("l1", "Sell", Some("60000.0")), None)
+            .unwrap();
+        s.create(&order("l2", "Sell", Some("59000.0")), None)
+            .unwrap();
+        s.listed_twice = Some("l1".into());
+        let listed = |s: &State, link: Option<&str>| {
+            let mut p: HashMap<String, String> = [
+                ("category".into(), "linear".into()),
+                ("symbol".into(), "BTCUSDT".into()),
+            ]
+            .into();
+            if let Some(link) = link {
+                p.insert("orderLinkId".into(), link.into());
+            }
+            let mut links: Vec<String> = s.realtime(&p).unwrap()["list"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|o| o["orderLinkId"].as_str().unwrap().to_string())
+                .collect();
+            links.sort();
+            links
+        };
+        assert_eq!(listed(&s, None), ["l1", "l1", "l2"]);
+        assert_eq!(listed(&s, Some("l1")), ["l1"]);
+        assert_eq!(listed(&s, Some("l2")), ["l2"]);
+    }
+
+    #[test]
     fn grid_reading_refuses_noise_and_off_grid_values() {
         assert_eq!(on_grid("0.3", 0.1), Some(0.3));
         assert_eq!(on_grid("0.30000000000000004", 0.1), None);
