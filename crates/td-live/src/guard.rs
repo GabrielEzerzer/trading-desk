@@ -817,7 +817,7 @@ where
     let (tx, rx) = mpsc::channel();
     let guard = Arc::new(Guard {
         dir: live.dir().to_path_buf(),
-        client: live.client(),
+        client: live.client().clone(),
         instrument: live.config().config.instrument.clone(),
         gate: live.gate.clone(),
         timing,
@@ -1309,6 +1309,7 @@ mod tests {
             request_timeout: Duration::from_millis(1500),
             recv_window: Duration::from_millis(1000),
             settle: Duration::from_millis(50),
+            operation_budget: Duration::from_secs(5),
         };
         let keys = DemoKeys::for_loopback(TEST_KEY, TEST_SECRET).unwrap();
         let client = Client::with_timing(Endpoint::Loopback(mock.port()), keys, timing).unwrap();

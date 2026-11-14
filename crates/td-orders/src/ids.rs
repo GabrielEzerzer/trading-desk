@@ -15,20 +15,21 @@
 //! - Create, amend and cancel are asynchronous: an acknowledgement means the request was accepted,
 //!   not that the order is in its final state, and order history "may delay".
 //!
-//! The resend rule is built so that it does not depend on the unstated window:
+//! The route does not depend on the unstated scope of that uniqueness:
 //!
 //! 1. One [`crate::Client`] refuses to send an id it has already sent (locally, before any
 //!    request), so a caller bug cannot place the same id twice in one process. Across processes the
 //!    caller's per-session prefix keeps ids apart.
-//! 2. A request whose answer never arrived is resent only after the venue has twice answered, a
-//!    settle pause apart, that it holds no order and no execution for the id, and only after the
-//!    original request's receive window has passed, so the venue would refuse the original as
-//!    expired if it arrived late.
-//! 3. A resend answered `110072` means the original got through after all: the order is looked up
-//!    and returned, never placed again.
+//! 2. A create is sent once. An answer that leaves open whether the venue took it is resolved by
+//!    asking the venue about the id, never by sending the id again; only a rate-limit (10006) or
+//!    timestamp (10002) refusal, documented as a refusal before processing, is sent again (the
+//!    `client` module). A lookup that finds nothing leaves the id spent.
+//! 3. A `110072` answer to the create is [`crate::Error::DuplicateClientId`]: the venue holds the
+//!    id already.
 //!
-//! The smoke example (`examples/demo-smoke.rs`) resends a filled order's id and expects `110072`,
-//! which checks on the live demo service that the venue also refuses closed orders' ids.
+//! The smoke example (`examples/demo-smoke.rs`) sends a filled order's id again and records whether
+//! the venue answers `110072`. That is an observation of the live demo service only; the route
+//! relies on it nowhere.
 
 use std::fmt;
 

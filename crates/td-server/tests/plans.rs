@@ -1380,3 +1380,61 @@ async fn a_plan_on_fx_trades_on_the_stored_asks_in_every_step() {
         "{rows:?}"
     );
 }
+
+/// A plan request naming a reference instrument gives every run of the battery that instrument's
+/// stored bars: the saved plan run's configuration names it and its data still match, and the
+/// verdict list says which references the verdict was judged with. A plan naming a reference the
+/// store lacks is a 422 that starts no job.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_plan_naming_a_reference_instrument_judges_with_it_and_records_it() {
+    let t = TestServer::seeded(vec![entry(49)]).await;
+    let other = InstrumentId {
+        venue: Venue::Binance,
+        symbol: "ETHUSDT".into(),
+        kind: InstrumentKind::Spot,
+    };
+    let stored = tokio::task::spawn_blocking(minutes).await.unwrap();
+    t.store.write_candles(&other, &stored).unwrap();
+
+    let absent = InstrumentId {
+        symbol: "SOLUSDT".into(),
+        ..other.clone()
+    };
+    let (status, answer) = t
+        .post(
+            "/runs/plan",
+            &json!({ "strategy": "sma_cross", "instruments": [id(InstrumentKind::Spot)], "references": [absent] }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{answer}");
+    assert_eq!(answer["error"]["code"], "data_missing");
+    let (_, jobs) = t.get("/jobs").await;
+    assert_eq!(jobs, json!([]), "no job was created");
+
+    let mut ws = t.websocket().await;
+    let job = t
+        .start_plan(&json!({
+            "strategy": "sma_cross",
+            "instruments": [id(InstrumentKind::Spot)],
+            "references": [other],
+        }))
+        .await;
+    let done = ws.follow(job).await.pop().unwrap();
+    assert_eq!(done.status, JobStatus::Done, "{:?}", done.error);
+    let kept = &plan_done(&done).instruments[0];
+    let (status, body) = t.get(&format!("/runs/{}", kept.run_id)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["check"],
+        json!({ "data_matches": true, "engine_matches": true })
+    );
+    let detail: RunDetail = serde_json::from_value(body).unwrap();
+    let SavedRun::Plan(run) = &detail.run else {
+        panic!("a plan run");
+    };
+    assert_eq!(run.config.references, vec![other.clone()]);
+    let rows = t.verdicts("").await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].run_id, kept.run_id);
+    assert_eq!(rows[0].references, vec![other]);
+}

@@ -1,6 +1,6 @@
 use td_core::{
-    Candle, FeeSchedule, Fill, Instrument, Millis, OrderId, OrderRequest, OrderType, Rounding,
-    Side, Timeframe,
+    Candle, FeeSchedule, Fill, Instrument, InstrumentId, Millis, OrderId, OrderRequest, OrderType,
+    Rounding, Side, Timeframe,
 };
 
 use crate::broker::ENTRY_CANCELLED;
@@ -30,6 +30,10 @@ pub struct Context<'a> {
     pub(crate) slippage_bps: f64,
     pub(crate) max_leverage: f64,
     pub(crate) portfolio: &'a Portfolio,
+    /// The funding events fed with the bars so far, oldest first; see [`Context::funding`].
+    pub(crate) funding: &'a [(Millis, f64)],
+    /// Each reference instrument's bars, one slot per bar in `bars`; see [`Context::reference`].
+    pub(crate) references: &'a [(InstrumentId, Vec<Option<Candle>>)],
     pub(crate) broker: &'a mut dyn Broker,
     pub(crate) orders: &'a mut Vec<Order>,
     pub(crate) warming_up: bool,
@@ -103,6 +107,48 @@ impl Context<'_> {
         self.portfolio
             .account()
             .from_quote(quote_amount, self.bar().close)
+    }
+
+    /// The funding rates settled on this instrument so far, as `(time, rate)`, oldest first: every
+    /// event fed to the session with a bar, warm-up bars included. From the first live bar on,
+    /// that is the series the cost model charges (a rate charged on a flat position is still
+    /// here); the warm-up bars' events, and those in a gap between the last warm-up bar and the
+    /// first live bar, are only history, since nothing is held before the first live bar. The time
+    /// is the settlement time, in a backtest and in a paper or live session alike, so a paper or
+    /// live session shows a strategy the series a backtest of the same bars shows it, a rate due in
+    /// a gap between bars included. The one difference: a rate the venue has not yet published
+    /// when the bar it is due in closes reaches a paper or live session's strategy late, on a later
+    /// bar, timed at that bar's open or, when bars are missing before it, at the end of the last
+    /// bar fed, and the session warns on the bar it was due in and again when it arrives.
+    ///
+    /// The series runs from the first bar fed, warm-up or live, which takes no funding from before
+    /// its open (see [`crate::Session::on_bar`]), to the last settlement strictly before the
+    /// current bar's close, the current bar's `open_time` plus the timeframe: a bar takes the
+    /// events in its own window and in the gap before it, and a settlement due exactly at the close
+    /// is the next bar's open, so it is visible on the next bar. A backtest feeds every event from
+    /// its first warm-up bar's open, and a paper or live session the venue's rates from its first
+    /// warm-up bar. It is empty for a kind without funding (spot, FX).
+    pub fn funding(&self) -> &[(Millis, f64)] {
+        self.funding
+    }
+
+    /// The closed bars of `instrument`, one of the reference instruments the run names
+    /// ([`crate::BacktestConfig::references`]), aligned to [`Context::bars`]: one slot per bar
+    /// there, warm-up bars included, holding the reference bar that opens at that bar's open time,
+    /// or `None` where the reference instrument has no bar. Both are on the run's timeframe, so the
+    /// last slot is the reference bar that closed with the current bar, and no slot holds a bar
+    /// that closes after it. A missing bar stays `None`; it is never filled from the one before. A
+    /// reference bar at a time the run has no bar of its own is not shown. `None` when the run does
+    /// not name `instrument`, as in a run that names no references.
+    ///
+    /// A reference instrument is only read: an order for it is rejected, since orders, fills,
+    /// costs and the account stay on [`Context::instrument`]. Backtests, sweeps, out-of-sample and
+    /// walk-forward runs and the battery supply it; a paper session names none (see the README).
+    pub fn reference(&self, instrument: &InstrumentId) -> Option<&[Option<Candle>]> {
+        self.references
+            .iter()
+            .find(|(id, _)| id == instrument)
+            .map(|(_, slots)| slots.as_slice())
     }
 
     pub fn open_orders(&self) -> &[Order] {

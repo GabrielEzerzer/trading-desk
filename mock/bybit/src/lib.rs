@@ -69,7 +69,8 @@ pub enum Fault {
     /// Answer 302 with this `Location`.
     Redirect(String),
     /// Answer this `retCode` without applying the request, with the venue's documented message
-    /// for 40004, 10014, 110079, 429 and 10429.
+    /// for 40004, 10014, 110079, 429 and 10429. `Answer(0)` acknowledges a request it never
+    /// applies.
     Answer(i64),
     /// Check the request, then answer `retCode` `answer` (or close the connection when `None`)
     /// at once and apply the request `after` later, as a venue still processing it would.
@@ -194,7 +195,8 @@ impl MockVenue {
     }
 
     /// Fills `qty` of the open order with `link_id` at the last price and cancels the rest, as the
-    /// venue does to an order cancelled after a partial fill.
+    /// venue does to an order cancelled after a partial fill. With `qty` zero the order ends
+    /// `Cancelled` unfilled.
     pub fn cancel_after_partial_fill(&self, link_id: &str, qty: f64) {
         self.state
             .lock()
@@ -211,6 +213,28 @@ impl MockVenue {
     /// Makes every error message carry the API key and the request's signature.
     pub fn set_echo_credentials(&self, on: bool) {
         self.state.lock().unwrap().echo_credentials = on;
+    }
+
+    /// Gives the orders with `link_id` this `orderStatus`, as a venue that sends a status the
+    /// client does not know would. The mock counts any status but its own open ones as closed,
+    /// except that the real-time list shows an order with a status the mock does not know among
+    /// the open ones, as the venue would show an order it still counts open.
+    pub fn set_order_status(&self, link_id: &str, status: &'static str) {
+        for o in &mut self.state.lock().unwrap().orders {
+            if o.link_id == link_id {
+                o.status = status;
+            }
+        }
+    }
+
+    /// Gives the executions with `link_id` this `execType`, as a venue that sends a type the
+    /// client does not know would.
+    pub fn set_exec_type(&self, link_id: &str, exec_type: &'static str) {
+        for e in &mut self.state.lock().unwrap().execs {
+            if e.link_id == link_id {
+                e.exec_type = exec_type;
+            }
+        }
     }
 
     /// Injects `fault` into the next request on `path`.
@@ -238,9 +262,21 @@ impl MockVenue {
     }
 
     /// Makes the next market order fill only `qty`; it then rests `PartiallyFilled` until
-    /// [`MockVenue::fill_rest`].
+    /// [`MockVenue::fill_rest`], or `New` and unfilled when `qty` is zero.
     pub fn cap_next_fill(&self, qty: f64) {
         self.state.lock().unwrap().cap_next_fill = Some(qty);
+    }
+
+    /// Makes the market order with `link_id`, when it is created, fill only `qty` and close the
+    /// rest `PartiallyFilledCanceled`, as an immediate-or-cancel order the venue fills in part.
+    pub fn cap_ioc(&self, link_id: &str, qty: f64) {
+        self.state.lock().unwrap().cap_ioc = Some((link_id.to_string(), qty));
+    }
+
+    /// Makes the real-time list of open orders show the open order with `link_id` twice, as a
+    /// venue listing an order wrongly would. A lookup by id still finds it once.
+    pub fn list_twice(&self, link_id: &str) {
+        self.state.lock().unwrap().listed_twice = Some(link_id.into());
     }
 
     /// Fills the rest of the partially filled order with `link_id` at the current price.

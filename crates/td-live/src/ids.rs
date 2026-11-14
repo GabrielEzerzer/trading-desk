@@ -6,8 +6,15 @@
 //! - `o`: the engine order `n` itself: a strategy's order, a manual order through
 //!   `Session::submit`, or an attached stop once its entry fills.
 //! - `c`: the reduce-only market order sent in place of stop `n` when the venue will not take the
-//!   stop (its trigger is already through the market). Its executions are reported as fills of
-//!   order `n`.
+//!   stop (its trigger is already through the market, or it refuses the stop for a confirmed
+//!   fill), or when stop `n`'s outcome is unknown and the venue refuses the `s` stop too. Its
+//!   executions are reported as fills of order `n`.
+//! - `s`: a second reduce-only stop for an entry's fill, sent at most once: for the part of the
+//!   fill stop `n` does not cover when resizing stop `n` fails, just before the broker faults; for
+//!   the confirmed fill when stop `n`'s create ended with its outcome unknown and the venue does
+//!   not show it, just before the broker faults; or for the first confirmed fill when stop `n`
+//!   did not rest: the venue refused it, shows it closed with nothing filled, or did not show it
+//!   to going live after a restart.
 //! - `f`: the stop guard's own orders when a loss limit fires or the owner flattens the session
 //!   (`crate::guard`): a reduce-only market order that closes the venue's position. Here `n` is
 //!   the guard's own counter, saved in the session's stop-state file before each send, not an
@@ -41,6 +48,9 @@ const _: () = assert!(PREFIX_MAX_LEN + 2 + MAX_DIGITS <= CLIENT_ID_MAX_LEN);
 pub(crate) enum Role {
     Order,
     Close,
+    /// A second stop for an entry's fill: the part stop `n` does not cover, or all of it when stop
+    /// `n` did not rest or its outcome is unknown.
+    Cover,
     /// A flatten order the stop guard sends; `n` is the guard's counter.
     Flatten,
     /// Reserved; never sent by this crate.
@@ -52,6 +62,7 @@ impl Role {
         match self {
             Role::Order => 'o',
             Role::Close => 'c',
+            Role::Cover => 's',
             Role::Flatten => 'f',
             Role::Session => 'x',
         }
@@ -94,6 +105,7 @@ pub(crate) fn parse(prefix: &str, id: &str) -> Option<(Role, OrderId)> {
     let role = match chars.next()? {
         'o' => Role::Order,
         'c' => Role::Close,
+        's' => Role::Cover,
         'f' => Role::Flatten,
         'x' => Role::Session,
         _ => return None,
@@ -132,11 +144,18 @@ mod tests {
 
     #[test]
     fn ids_round_trip_and_other_ids_are_not_ours() {
-        for role in [Role::Order, Role::Close, Role::Flatten, Role::Session] {
+        for role in [
+            Role::Order,
+            Role::Close,
+            Role::Cover,
+            Role::Flatten,
+            Role::Session,
+        ] {
             let id = client_id("s1", role, OrderId(42));
             assert_eq!(parse("s1", id.as_str()), Some((role, OrderId(42))));
         }
         assert_eq!(client_id("s1", Role::Order, OrderId(3)).as_str(), "s1-o3");
+        assert_eq!(client_id("s1", Role::Cover, OrderId(2)).as_str(), "s1-s2");
         // Another session whose prefix starts with this one's.
         assert_eq!(parse("s1", "s12-o3"), None);
         assert_eq!(parse("s12", "s1-o3"), None);

@@ -10,7 +10,8 @@
 //!   fee. A reduce-only market order is cut to the position's size.
 //! - The minimum notional applies to orders that are not reduce-only.
 //! - A test can cap the next market order's fill ([`crate::MockVenue::cap_next_fill`]); the order
-//!   then rests `PartiallyFilled` until [`crate::MockVenue::fill_rest`] fills the rest.
+//!   then rests `PartiallyFilled` until [`crate::MockVenue::fill_rest`] fills the rest. A cap of
+//!   zero leaves it `New` and unfilled.
 //! - Instruments info lists every instrument as a `Trading` `LinearPerpetual` settled in its quote
 //!   coin, and the ticker's mark price is the last price.
 
@@ -68,6 +69,15 @@ pub(crate) struct Lagged {
 impl Order {
     pub fn is_open(&self) -> bool {
         matches!(self.status, "New" | "PartiallyFilled" | "Untriggered")
+    }
+
+    /// Whether the order holds one of the mock's own closed statuses, rather than one a test set
+    /// that the mock does not know.
+    fn is_known_closed(&self) -> bool {
+        matches!(
+            self.status,
+            "Filled" | "Cancelled" | "Deactivated" | "Rejected" | "PartiallyFilledCanceled"
+        )
     }
 }
 
@@ -128,6 +138,11 @@ pub(crate) struct State {
     pub next: u64,
     /// The quantity the next market order fills, when a test caps it.
     pub cap_next_fill: Option<f64>,
+    /// The order link id whose market order fills only the quantity given and closes the rest,
+    /// as the venue does to an immediate-or-cancel order it cannot fill in full.
+    pub cap_ioc: Option<(String, f64)>,
+    /// The order link id the real-time list of open orders shows twice.
+    pub listed_twice: Option<String>,
 }
 
 impl State {
@@ -154,6 +169,8 @@ impl State {
             log: Vec::new(),
             next: 1,
             cap_next_fill: None,
+            cap_ioc: None,
+            listed_twice: None,
         }
     }
 
@@ -217,6 +234,14 @@ impl State {
             .iter()
             .position(|o| o.link_id == link_id && o.is_open())
             .expect("no open order with that link id");
+        if qty <= 0.0 {
+            self.touch(i);
+            let now = self.now();
+            let o = &mut self.orders[i];
+            o.status = "Cancelled";
+            o.updated = now;
+            return;
+        }
         let price = self.markets[&self.orders[i].symbol].price;
         self.fill(i, price, qty);
         self.orders[i].status = "PartiallyFilledCanceled";
@@ -508,6 +533,7 @@ fn respond(status: u16, mut headers: Vec<(String, String)>, body: String) -> Rep
 /// 2026-11-14).
 fn answer_message(code: i64) -> &'static str {
     match code {
+        0 => "OK",
         40004 => {
             "the order is modified during the process of replacing , please check the order status \
              again"
@@ -784,10 +810,17 @@ impl State {
         });
         if trigger.is_none() && reject.is_none() {
             let i = self.orders.len() - 1;
+            if let Some((_, cap)) = self.cap_ioc.take_if(|(l, _)| l.as_str() == link) {
+                self.fill(i, price, cap);
+                self.orders[i].status = "PartiallyFilledCanceled";
+                return Ok(json!({ "orderId": order_id, "orderLinkId": link }));
+            }
             match self.cap_next_fill.take() {
                 Some(cap) if cap < fill_qty => {
-                    self.fill(i, price, cap);
-                    self.orders[i].status = "PartiallyFilled";
+                    if cap > 0.0 {
+                        self.fill(i, price, cap);
+                        self.orders[i].status = "PartiallyFilled";
+                    }
                 }
                 _ => self.fill(i, price, fill_qty),
             }
@@ -897,11 +930,20 @@ impl State {
                 } else if !link.is_empty() {
                     o.link_id == link && (o.is_open() || self.closed_cache)
                 } else {
-                    o.is_open()
+                    // Open, or a status a test set that the mock does not know.
+                    !o.is_known_closed()
                 }
             })
             .collect();
         list.sort_by_key(|o| std::cmp::Reverse(o.created));
+        if id.is_empty() && link.is_empty() {
+            let twice = self.listed_twice.as_deref();
+            let doubled = list
+                .iter()
+                .copied()
+                .find(|o| Some(o.link_id.as_str()) == twice);
+            list.extend(doubled);
+        }
         let items: Vec<Value> = list.iter().map(|o| self.order_json(o, false)).collect();
         page(items, p, 20, 50)
     }

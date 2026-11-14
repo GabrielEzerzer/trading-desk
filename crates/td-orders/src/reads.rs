@@ -21,6 +21,7 @@
 //!   (<https://bybit-exchange.github.io/docs/v5/demo>).
 
 use std::collections::HashSet;
+use std::time::Instant;
 
 use td_core::{Instrument, Millis};
 
@@ -94,7 +95,20 @@ impl Client {
             ("limit", "50".into()),
         ];
         let raws: Vec<RawOrder> = self.all_pages(REALTIME, query)?;
-        raws.into_iter().map(|r| r.into_order(REALTIME)).collect()
+        raws.into_iter().map(|r| self.order(r, REALTIME)).collect()
+    }
+
+    /// An order as the venue lists it. A status the route does not know and the reject reason
+    /// are venue text that reaches the caller and the operations' errors, so each is scrubbed
+    /// like a venue message, whole, before it is cut.
+    fn order(&self, raw: RawOrder, path: &'static str) -> Result<VenueOrder, Error> {
+        raw.into_order(path, |text| self.scrub(text))
+    }
+
+    /// An execution as the venue lists it, with a type the route does not know scrubbed the same
+    /// way.
+    fn execution(&self, raw: RawExecution) -> Result<Execution, Error> {
+        raw.into_execution(EXECUTIONS, |text| self.scrub(text))
     }
 
     /// The order with client id `id`, open or closed: the real-time list first, then the order
@@ -106,14 +120,16 @@ impl Client {
         id: &ClientOrderId,
     ) -> Result<Option<VenueOrder>, Error> {
         check_instrument(instrument)?;
-        self.order_by_client_id_with(instrument, id, false)
+        self.order_by_client_id_with(instrument, id, None)
     }
 
+    /// [`Client::order_by_client_id`] without the instrument check. With a `deadline`, each
+    /// request is sent once and within it, for the lookups of an order operation.
     pub(crate) fn order_by_client_id_with(
         &self,
         instrument: &Instrument,
         id: &ClientOrderId,
-        once: bool,
+        deadline: Option<Instant>,
     ) -> Result<Option<VenueOrder>, Error> {
         for path in [REALTIME, HISTORY] {
             let query = vec![
@@ -121,15 +137,14 @@ impl Client {
                 ("symbol", instrument.id.symbol.clone()),
                 ("orderLinkId", id.as_str().to_string()),
             ];
-            let value = if once {
-                self.get_once(path, query)?
-            } else {
-                self.get(path, query)?
+            let value = match deadline {
+                Some(deadline) => self.get_once(path, query, deadline)?,
+                None => self.get(path, query)?,
             };
             let page: Page<RawOrder> = wire::from_value(path, value)?;
             // Asked by orderLinkId the venue lists that order only; check rather than trust it.
             if let Some(raw) = page.list.into_iter().next() {
-                let order = raw.into_order(path)?;
+                let order = self.order(raw, path)?;
                 if order.client_id == id.as_str() {
                     return Ok(Some(order));
                 }
@@ -138,11 +153,12 @@ impl Client {
         Ok(None)
     }
 
-    /// The executions for one client id in the last 7 days, one request.
+    /// The executions for one client id in the last 7 days, one request within `deadline`.
     pub(crate) fn executions_for_id(
         &self,
         instrument: &Instrument,
         id: &ClientOrderId,
+        deadline: Instant,
     ) -> Result<Vec<Execution>, Error> {
         let query = vec![
             ("category", CATEGORY.to_string()),
@@ -150,10 +166,10 @@ impl Client {
             ("orderLinkId", id.as_str().to_string()),
         ];
         let page: Page<RawExecution> =
-            wire::from_value(EXECUTIONS, self.get_once(EXECUTIONS, query)?)?;
+            wire::from_value(EXECUTIONS, self.get_once(EXECUTIONS, query, deadline)?)?;
         page.list
             .into_iter()
-            .map(|r| r.into_execution(EXECUTIONS))
+            .map(|r| self.execution(r))
             .filter(|e| e.as_ref().map_or(true, |e| e.client_id == id.as_str()))
             .collect()
     }
@@ -192,7 +208,7 @@ impl Client {
             ];
             let raws: Vec<RawExecution> = self.all_pages(EXECUTIONS, query)?;
             for raw in raws {
-                let e = raw.into_execution(EXECUTIONS)?;
+                let e = self.execution(raw)?;
                 if e.time >= since && seen.insert(e.exec_id.clone()) {
                     out.push(e);
                 }
@@ -321,5 +337,73 @@ fn one<T>(endpoint: &'static str, list: Vec<T>) -> Result<T, Error> {
             endpoint,
             reason: "the answer does not list exactly one entry".into(),
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use td_core::{FeeSchedule, Instrument, InstrumentId, InstrumentKind, Venue};
+    use td_mock_bybit::{MockVenue, TEST_KEY, TEST_SECRET};
+
+    use crate::{Client, ClientOrderId, DemoKeys, Endpoint, ExecKind};
+
+    fn instrument() -> Instrument {
+        Instrument {
+            id: InstrumentId {
+                venue: Venue::Bybit,
+                symbol: "BTCUSDT".into(),
+                kind: InstrumentKind::Perpetual,
+            },
+            base: "BTC".into(),
+            quote: "USDT".into(),
+            tick_size: 0.1,
+            lot_size: 0.001,
+            min_qty: 0.002,
+            min_notional: 100.0,
+            fees: FeeSchedule {
+                maker: 0.0002,
+                taker: 0.00055,
+                per_unit: 0.0,
+            },
+        }
+    }
+
+    #[test]
+    fn an_unknown_execution_type_with_a_credential_at_the_cut_is_withheld_by_both_reads() {
+        let i = instrument();
+        for credential in [TEST_KEY, TEST_SECRET] {
+            let mock = MockVenue::start();
+            mock.add_instrument(&i, 65000.0);
+            let now = mock.now();
+            mock.seed_trades("BTCUSDT", 1, now, 0);
+            let link = mock.executions()[0].link_id.clone();
+            // 182 visible characters, then the credential across the 200-character cut.
+            mock.set_exec_type(&link, format!("{}{credential}", "x".repeat(182)).leak());
+            let keys = DemoKeys::for_loopback(TEST_KEY, TEST_SECRET).unwrap();
+            let client = Client::new(Endpoint::Loopback(mock.port()), keys).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let by_id = client.executions_for_id(&i, &ClientOrderId::new(link).unwrap(), deadline);
+            let since = client.executions_since(&i, now - 1000);
+            let text = format!("{by_id:?} {since:?}");
+            for part in credential.as_bytes().windows(8) {
+                let part = std::str::from_utf8(part).unwrap();
+                assert!(!text.contains(part), "{text}");
+            }
+            let kinds: Vec<ExecKind> = by_id
+                .unwrap()
+                .into_iter()
+                .chain(since.unwrap())
+                .map(|e| e.kind)
+                .collect();
+            assert_eq!(kinds.len(), 2, "{kinds:?}");
+            for kind in kinds {
+                assert!(
+                    matches!(&kind, ExecKind::Other(t) if t.contains("withheld")),
+                    "{kind:?}"
+                );
+            }
+        }
     }
 }

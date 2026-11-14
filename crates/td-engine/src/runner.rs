@@ -3,13 +3,15 @@
 use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 
 use td_core::{
-    AccountCurrency, Candle, FeeSchedule, Fill, Instrument, InstrumentKind, Millis, OrderId, Side,
-    Timeframe,
+    AccountCurrency, Candle, FeeSchedule, Fill, Instrument, InstrumentId, InstrumentKind, Millis,
+    OrderId, Side, Timeframe,
 };
 
 use crate::metrics::{self, DAY_MS, DAYS_PER_YEAR, EquitySeries, MetricsReport};
+use crate::reference::{Aligned, ReferenceBars, align, row};
 use crate::risk::{self, EquityRange, Intrabar};
 use crate::session::{check_quote, funding_ranges, sorted_funding};
 use crate::{
@@ -47,7 +49,7 @@ pub fn default_slippage_bps(instrument: &Instrument) -> f64 {
 /// in the same change. `tests/revision.rs` records the checksums and the fixture each revision
 /// gave, and fails when either moves without a new row there; a row at a new revision needs this
 /// bump.
-pub const ENGINE_REVISION: u32 = 8;
+pub const ENGINE_REVISION: u32 = 13;
 
 /// Everything that defines a backtest apart from the data itself.
 ///
@@ -106,6 +108,38 @@ pub struct BacktestConfig {
     /// (FX only; see [`Session::new`]). Left out of the saved result when it is the default.
     #[serde(default, skip_serializing_if = "AccountCurrency::is_quote")]
     pub account_currency: AccountCurrency,
+    /// Instruments on the same venue whose closed bars at `timeframe` the strategy can read beside
+    /// its own, aligned to them ([`crate::Context::reference`]). They are read-only: orders,
+    /// fills, costs and the account stay on `instrument`. Their bars are given to the run with
+    /// [`run_with_references`] and are part of the data fingerprint. Left out of the saved result
+    /// when there are none, the default.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub references: Vec<InstrumentId>,
+}
+
+impl BacktestConfig {
+    /// Refuses reference instruments on another venue than `instrument`'s, `instrument` itself as
+    /// a reference, and one named twice.
+    pub fn check_references(&self) -> Result<(), EngineError> {
+        let traded = &self.instrument.id;
+        for (i, id) in self.references.iter().enumerate() {
+            let refuse = |why: String| Err(EngineError::InvalidReferences(why));
+            if id.venue != traded.venue {
+                return refuse(format!(
+                    "{id} is on another venue than {traded}; a reference instrument must be on the same venue"
+                ));
+            }
+            if id == traded {
+                return refuse(format!(
+                    "{id} is the traded instrument, so it cannot also be a reference"
+                ));
+            }
+            if self.references[..i].contains(id) {
+                return refuse(format!("{id} is named twice"));
+            }
+        }
+        Ok(())
+    }
 }
 
 impl<'de> Deserialize<'de> for BacktestConfig {
@@ -133,6 +167,8 @@ impl<'de> Deserialize<'de> for BacktestConfig {
             close_at_end: bool,
             #[serde(default)]
             account_currency: AccountCurrency,
+            #[serde(default)]
+            references: Vec<InstrumentId>,
         }
         let g = Given::deserialize(deserializer)?;
         Ok(BacktestConfig {
@@ -151,6 +187,7 @@ impl<'de> Deserialize<'de> for BacktestConfig {
             warmup_from: g.warmup_from,
             close_at_end: g.close_at_end,
             account_currency: g.account_currency,
+            references: g.references,
         })
     }
 }
@@ -210,8 +247,8 @@ pub struct BacktestResult {
     pub engine_version: String,
     /// The [`ENGINE_REVISION`] that produced the result.
     pub engine_revision: u32,
-    /// SHA-256 of the bars (warm-up bars first), asks and funding the run used; see
-    /// [`data_fingerprint`].
+    /// SHA-256 of the bars (warm-up bars first), asks and funding the run used, the funding being
+    /// every event the strategy could see; see [`data_fingerprint`].
     pub data_fingerprint: String,
     /// Equity at each bar's close.
     pub equity: Vec<EquityPoint>,
@@ -249,7 +286,9 @@ pub struct Rerun {
 /// a warm-up bar as on a traded one.
 /// `funding` is `(time, rate)` in any order. An event in a gap between traded bars is charged at
 /// the next bar's open, like one due at that open; events before the first traded bar or from the
-/// last traded bar's end on are ignored.
+/// last traded bar's end on are not charged. The strategy sees every event from the first warm-up
+/// bar's open (the first traded bar's without warm-up) up to the close of the bar it is called on
+/// (see [`crate::Context::funding`]), and those are what the data fingerprint hashes.
 ///
 /// The strategy is built through the registry and run on a [`Session`], then the trade list,
 /// metrics and buy-and-hold benchmark are derived from the session's record.
@@ -262,7 +301,22 @@ pub fn run(
     asks: &[Candle],
     funding: &[(Millis, f64)],
 ) -> Result<BacktestResult, EngineError> {
-    run_built(config, bars, asks, funding, || {
+    run_with_references(config, bars, asks, funding, &[])
+}
+
+/// [`run`] for a configuration that names reference instruments
+/// ([`BacktestConfig::references`]), with the bars of each at the run's timeframe. The strategy
+/// reads them through [`crate::Context::reference`], aligned to its own bars by open time, and the
+/// data fingerprint covers the reference bars it was shown. [`run`] is this with none given, so it
+/// refuses a configuration that names references.
+pub fn run_with_references(
+    config: &BacktestConfig,
+    bars: &[Candle],
+    asks: &[Candle],
+    funding: &[(Millis, f64)],
+    references: &[ReferenceBars],
+) -> Result<BacktestResult, EngineError> {
+    run_built(config, bars, asks, funding, references, || {
         build_strategy(&config.strategy, &config.params)
     })
 }
@@ -278,7 +332,7 @@ pub fn run_strategy(
     asks: &[Candle],
     funding: &[(Millis, f64)],
 ) -> Result<BacktestResult, EngineError> {
-    run_built(config, bars, asks, funding, || Ok(strategy))
+    run_built(config, bars, asks, funding, &[], || Ok(strategy))
 }
 
 /// The metrics [`run`] would report, without the parts of its result a sweep row does not keep:
@@ -288,8 +342,9 @@ pub(crate) fn run_metrics(
     bars: &[Candle],
     asks: &[Candle],
     funding: &[(Millis, f64)],
+    references: &[ReferenceBars],
 ) -> Result<MetricsReport, EngineError> {
-    let sim = simulate(config, bars, asks, funding, || {
+    let sim = simulate(config, bars, asks, funding, references, || {
         build_strategy(&config.strategy, &config.params)
     })?;
     Ok(sim.report)
@@ -297,11 +352,12 @@ pub(crate) fn run_metrics(
 
 /// The backtest of [`run`], building the strategy with `build` once the data has been checked, so
 /// a bad range or ask is reported before an unknown strategy, as it always was.
-fn run_built(
+pub(crate) fn run_built(
     config: &BacktestConfig,
     bars: &[Candle],
     asks: &[Candle],
     funding: &[(Millis, f64)],
+    references: &[ReferenceBars],
     build: impl FnOnce() -> Result<Box<dyn Strategy>, EngineError>,
 ) -> Result<BacktestResult, EngineError> {
     let Simulated {
@@ -311,13 +367,15 @@ fn run_built(
         warmup_asks,
         funding,
         ranges,
+        seen,
+        references,
         session,
         fills,
         trades,
         series,
         intrabar,
         report,
-    } = simulate(config, bars, asks, funding, build)?;
+    } = simulate(config, bars, asks, funding, references, build)?;
     let benchmark = benchmark(
         config,
         &bars,
@@ -334,17 +392,12 @@ fn run_built(
         .chain(traded_asks)
         .flatten()
         .collect();
-    // The funding events charged: those of each traded bar, in order.
-    let used_funding: Vec<(Millis, f64)> = ranges
-        .iter()
-        .flat_map(|r| funding[r.clone()].iter().copied())
-        .collect();
 
     Ok(BacktestResult {
         config: config.clone(),
         engine_version: env!("CARGO_PKG_VERSION").to_string(),
         engine_revision: ENGINE_REVISION,
-        data_fingerprint: data_fingerprint(&used_bars, &used_asks, &used_funding),
+        data_fingerprint: fingerprint(&used_bars, &used_asks, &funding[seen], &references),
         equity: session.equity().to_vec(),
         orders: session.orders().to_vec(),
         fills,
@@ -366,8 +419,12 @@ struct Simulated {
     warmup_asks: Vec<Option<Candle>>,
     /// All the funding events given, sorted.
     funding: Vec<(Millis, f64)>,
-    /// The range of `funding` charged on each traded bar.
-    ranges: Vec<std::ops::Range<usize>>,
+    /// The range of `funding` fed with each traded bar; see [`fed_funding`].
+    ranges: Vec<Range<usize>>,
+    /// The range of `funding` the strategy has seen by the last bar.
+    seen: Range<usize>,
+    /// The reference instruments' bars, aligned to the warm-up and traded bars.
+    references: Aligned,
     session: Session,
     fills: Vec<Fill>,
     trades: Vec<Trade>,
@@ -382,9 +439,11 @@ fn simulate(
     bars: &[Candle],
     asks: &[Candle],
     funding: &[(Millis, f64)],
+    references: &[ReferenceBars],
     build: impl FnOnce() -> Result<Box<dyn Strategy>, EngineError>,
 ) -> Result<Simulated, EngineError> {
     let (warmup, traded) = select_bars(config, bars)?;
+    let references = align_used(config, &warmup, &traded, references)?;
     let warmup_asks = match_asks(config.instrument.id.kind, bars, asks, &warmup)?;
     let traded_asks = match_asks(config.instrument.id.kind, bars, asks, &traded)?;
     // The session checks each traded bar's ask as it is fed, but warm-up bars are fed without one.
@@ -392,7 +451,7 @@ fn simulate(
     let bars = traded;
     let tf = config.timeframe;
     let funding = sorted_funding(funding);
-    let ranges = funding_ranges(tf, &bars, &funding);
+    let (warmup_ranges, ranges, seen) = fed_funding(tf, &warmup, &bars, &funding);
 
     let strategy = build()?;
     let session_config = SessionConfig {
@@ -403,22 +462,25 @@ fn simulate(
         account_currency: config.account_currency,
     };
     let mut session = Session::new(strategy, config.instrument.clone(), tf, session_config)?;
-    for bar in &warmup {
-        session.warm_up(*bar, &[])?;
+    session.name_references(references.iter().map(|(id, _)| id.clone()).collect());
+    for (j, (bar, range)) in warmup.iter().zip(warmup_ranges).enumerate() {
+        session.feed(*bar, None, &funding[range], &row(&references, j), true)?;
     }
     let mut positions = Vec::with_capacity(bars.len());
     // The bar whose close decides the close-out, so it fills at the last bar's open.
     let close_out_at = bars.len().checked_sub(2).filter(|_| config.close_at_end);
     for (i, ((bar, ask), range)) in bars.iter().zip(&traded_asks).zip(&ranges).enumerate() {
         let events = &funding[range.clone()];
-        session.on_bar_with_ask(*bar, *ask, events)?;
+        let slots = row(&references, warmup.len() + i);
+        session.feed(*bar, *ask, events, &slots, false)?;
         positions.push(session.portfolio().position());
         if close_out_at == Some(i) {
             session.close_out();
         }
     }
 
-    let fills = session.fills().to_vec();
+    let mut fills = session.fills().to_vec();
+    mark_close_outs(&mut fills, session.orders());
     let account = config.account_currency;
     let pip = config.instrument.pip_size();
     let mut trades = build_trades(
@@ -430,7 +492,7 @@ fn simulate(
         pip,
     );
     attach_stops(&mut trades, session.trade_stops(), account);
-    mark_forced_closes(&mut trades, &fills, session.orders());
+    mark_forced_closes(&mut trades, &fills);
     let series = EquitySeries::new(config.starting_cash, session.equity(), tf);
     let intrabar = risk::intrabar(
         config.starting_cash,
@@ -457,6 +519,8 @@ fn simulate(
         warmup_asks,
         funding,
         ranges,
+        seen,
+        references,
         session,
         fills,
         trades,
@@ -466,16 +530,63 @@ fn simulate(
     })
 }
 
-/// Marks the trade each fill of the end-of-run close-out order closed (see
-/// [`Session::close_out`]) as force-closed: the last closed trade that exits on the fill's bar.
-fn mark_forced_closes(trades: &mut [Trade], fills: &[Fill], orders: &[Order]) {
+/// The bars given for `config`'s reference instruments, aligned to its warm-up and traded bars
+/// (see [`align`]); empty, without copying the bars, when it names none and none are given.
+fn align_used(
+    config: &BacktestConfig,
+    warmup: &[Candle],
+    traded: &[Candle],
+    references: &[ReferenceBars],
+) -> Result<Aligned, EngineError> {
+    if config.references.is_empty() && references.is_empty() {
+        return Ok(Vec::new());
+    }
+    let used: Vec<Candle> = warmup.iter().chain(traded).copied().collect();
+    align(config, &used, references)
+}
+
+/// How [`simulate`] feeds sorted `funding` with the bars: the range of it taken with each warm-up
+/// bar, then with each traded bar, and the range the strategy has seen by the last bar. Each bar
+/// takes the events inside it and in the gap since the bar before, warm-up or traded, as
+/// [`Session::on_bar`] checks, and the first bar fed takes none from before its open. Only the
+/// traded bars' events are charged. Those in a gap before the first traded bar are charged at its
+/// open on the position warm-up leaves, which is always flat, so they cost nothing, and the
+/// buy-and-hold benchmark, flat at that open too, pays nothing for them either.
+fn fed_funding(
+    timeframe: Timeframe,
+    warmup: &[Candle],
+    traded: &[Candle],
+    funding: &[(Millis, f64)],
+) -> (Vec<Range<usize>>, Vec<Range<usize>>, Range<usize>) {
+    let warmup = funding_ranges(timeframe, warmup, funding);
+    let mut traded = funding_ranges(timeframe, traded, funding);
+    if let (Some(last), Some(first)) = (warmup.last(), traded.first_mut()) {
+        first.start = last.end;
+    }
+    let start = warmup.first().or(traded.first()).map_or(0, |r| r.start);
+    let end = traded.last().map_or(start, |r| r.end);
+    (warmup, traded, start..end)
+}
+
+/// Marks each fill of the end-of-run close-out order (see [`Session::close_out`]) as a
+/// close-out ([`Fill::close_out`]).
+fn mark_close_outs(fills: &mut [Fill], orders: &[Order]) {
     for fill in fills {
         let order = fill
             .order_id
             .0
             .checked_sub(1)
             .and_then(|i| orders.get(i as usize));
-        if order.is_some_and(|o| o.request.client_tag.as_deref() == Some(CLOSE_OUT_TAG))
+        fill.close_out =
+            order.is_some_and(|o| o.request.client_tag.as_deref() == Some(CLOSE_OUT_TAG));
+    }
+}
+
+/// Marks the trade each close-out fill closed as force-closed: the last closed trade that exits
+/// on the fill's bar.
+fn mark_forced_closes(trades: &mut [Trade], fills: &[Fill]) {
+    for fill in fills {
+        if fill.close_out
             && let Some(t) = trades
                 .iter_mut()
                 .rev()
@@ -579,19 +690,30 @@ pub fn config_fingerprint(
     asks: &[Candle],
     funding: &[(Millis, f64)],
 ) -> Result<String, EngineError> {
-    let (mut used, traded) = select_bars(config, bars)?;
-    let mut used_asks = match_asks(config.instrument.id.kind, bars, asks, &used)?;
+    config_fingerprint_with_references(config, bars, asks, funding, &[])
+}
+
+/// [`config_fingerprint`] for a configuration that names reference instruments, with their bars
+/// as [`run_with_references`] takes them: the fingerprint that run would record.
+pub fn config_fingerprint_with_references(
+    config: &BacktestConfig,
+    bars: &[Candle],
+    asks: &[Candle],
+    funding: &[(Millis, f64)],
+    references: &[ReferenceBars],
+) -> Result<String, EngineError> {
+    let (warmup, traded) = select_bars(config, bars)?;
+    let references = align_used(config, &warmup, &traded, references)?;
+    let mut used_asks = match_asks(config.instrument.id.kind, bars, asks, &warmup)?;
     used_asks.extend(match_asks(config.instrument.id.kind, bars, asks, &traded)?);
+    let funding = sorted_funding(funding);
+    let (_, _, seen) = fed_funding(config.timeframe, &warmup, &traded, &funding);
+    let mut used = warmup;
     used.extend_from_slice(&traded);
     // No session runs here to check the traded bars' asks, so every ask is checked.
     check_quotes(&used, &used_asks)?;
     let used_asks: Vec<Candle> = used_asks.into_iter().flatten().collect();
-    let funding = sorted_funding(funding);
-    let used_funding: Vec<(Millis, f64)> = funding_ranges(config.timeframe, &traded, &funding)
-        .into_iter()
-        .flat_map(|r| funding[r].iter().copied())
-        .collect();
-    Ok(data_fingerprint(&used, &used_asks, &used_funding))
+    Ok(fingerprint(&used, &used_asks, &funding[seen], &references))
 }
 
 /// Runs a saved result's configuration again on `bars`, `asks` and `funding`, as [`run`] takes
@@ -758,6 +880,7 @@ fn hold(
                 qty,
                 fee: account.from_quote(fees.fee(price, qty, fees.taker), price),
                 liquidity: td_core::Liquidity::Taker,
+                close_out: false,
             };
             portfolio.apply_fill(fill.side, fill.qty, fill.price, fill.fee);
             fills.push(fill);
@@ -839,14 +962,30 @@ fn annualised_alpha_beta(times: &[Millis], returns: &(Vec<f64>, Vec<f64>)) -> Op
 /// count and each ask in the same form as a bar follow. Without asks nothing is added, so a
 /// fingerprint from before asks existed is unchanged.
 pub fn data_fingerprint(bars: &[Candle], asks: &[Candle], funding: &[(Millis, f64)]) -> String {
+    fingerprint(bars, asks, funding, &[])
+}
+
+/// [`data_fingerprint`], followed, when a run names reference instruments, by each one's id as
+/// `venue:symbol:kind` (its byte length as a little-endian u64, then its UTF-8 bytes), its slot
+/// count, and per slot a 0 byte for a missing bar or a 1 byte and the bar in the form above.
+/// Without references nothing is added, so a fingerprint is what it was before they existed.
+fn fingerprint(
+    bars: &[Candle],
+    asks: &[Candle],
+    funding: &[(Millis, f64)],
+    references: &[(InstrumentId, Vec<Option<Candle>>)],
+) -> String {
     let mut h = Sha256::new();
+    let candle = |h: &mut Sha256, b: &Candle| {
+        h.update(b.open_time.to_le_bytes());
+        for v in [b.open, b.high, b.low, b.close, b.volume, b.quote_volume] {
+            h.update(v.to_bits().to_le_bytes());
+        }
+    };
     let candles = |h: &mut Sha256, candles: &[Candle]| {
         h.update((candles.len() as u64).to_le_bytes());
         for b in candles {
-            h.update(b.open_time.to_le_bytes());
-            for v in [b.open, b.high, b.low, b.close, b.volume, b.quote_volume] {
-                h.update(v.to_bits().to_le_bytes());
-            }
+            candle(h, b);
         }
     };
     candles(&mut h, bars);
@@ -857,6 +996,21 @@ pub fn data_fingerprint(bars: &[Candle], asks: &[Candle], funding: &[(Millis, f6
     }
     if !asks.is_empty() {
         candles(&mut h, asks);
+    }
+    for (id, slots) in references {
+        let id = id.to_string();
+        h.update((id.len() as u64).to_le_bytes());
+        h.update(id.as_bytes());
+        h.update((slots.len() as u64).to_le_bytes());
+        for slot in slots {
+            match slot {
+                Some(b) => {
+                    h.update([1u8]);
+                    candle(&mut h, b);
+                }
+                None => h.update([0u8]),
+            }
+        }
     }
     hex(&h.finalize())
 }
@@ -922,11 +1076,12 @@ mod tests {
             warmup_from: Some(20 * HOUR),
             close_at_end: true,
             account_currency: AccountCurrency::Quote,
+            references: Vec::new(),
         };
         let full = run(&config, &bars, &[], &funding).unwrap();
         assert!(full.metrics.trades > 2, "{:?}", full.metrics);
         assert_eq!(
-            run_metrics(&config, &bars, &[], &funding).unwrap(),
+            run_metrics(&config, &bars, &[], &funding, &[]).unwrap(),
             full.metrics
         );
 
@@ -938,11 +1093,266 @@ mod tests {
             "{refused:?}"
         );
         assert_eq!(
-            run_metrics(&config, &bars, &[], &funding)
+            run_metrics(&config, &bars, &[], &funding, &[])
                 .unwrap_err()
                 .to_string(),
             refused.to_string()
         );
+    }
+
+    fn flat_bar(i: i64) -> Candle {
+        Candle {
+            open_time: i * HOUR,
+            open: 100.0,
+            high: 101.0,
+            low: 99.0,
+            close: 100.0,
+            volume: 1.0,
+            quote_volume: 100.0,
+        }
+    }
+
+    fn test_instrument(kind: InstrumentKind) -> Instrument {
+        Instrument {
+            id: td_core::InstrumentId {
+                venue: td_core::Venue::Binance,
+                symbol: "TESTUSDT".into(),
+                kind,
+            },
+            base: "TEST".into(),
+            quote: "USDT".into(),
+            tick_size: 0.01,
+            lot_size: 0.001,
+            min_qty: 0.001,
+            min_notional: 1.0,
+            fees: FeeSchedule {
+                maker: 0.001,
+                taker: 0.002,
+                per_unit: 0.0,
+            },
+        }
+    }
+
+    /// What `SeesFunding` saw on each bar of a backtest.
+    type Seen = Vec<(Millis, bool, Vec<(Millis, f64)>)>;
+
+    /// A backtest of `SeesFunding` on hourly bars: warm-up bars at 0h and 1h, traded bars from 3h
+    /// to 10h, with no bar at 2h, between the two, or at 6h.
+    fn funding_run(
+        kind: InstrumentKind,
+        funding: &[(Millis, f64)],
+    ) -> (Vec<Candle>, BacktestResult, Seen) {
+        use crate::strategies::test_only::{FundingSeen, SeesFunding};
+        let bars: Vec<Candle> = (0..10)
+            .filter(|&i| i != 2 && i != 6)
+            .map(flat_bar)
+            .collect();
+        let config = BacktestConfig {
+            strategy: "sees_funding".into(),
+            params: Params::new(),
+            instrument: test_instrument(kind),
+            timeframe: Timeframe::H1,
+            from: 3 * HOUR,
+            to: 10 * HOUR,
+            starting_cash: 10_000.0,
+            slippage_bps: 2.0,
+            fee_override: None,
+            max_leverage: 1.0,
+            warmup_from: Some(0),
+            close_at_end: false,
+            account_currency: AccountCurrency::Quote,
+            references: Vec::new(),
+        };
+        let seen = FundingSeen::default();
+        let strategy = Box::new(SeesFunding(seen.clone()));
+        let result = run_strategy(&config, strategy, &bars, &[], funding).unwrap();
+        let seen = seen.lock().unwrap().clone();
+        (bars, result, seen)
+    }
+
+    #[test]
+    fn a_strategy_sees_the_funding_from_its_first_warm_up_bar_up_to_the_bar_it_is_called_on() {
+        const MINUTE: Millis = 60_000;
+        // Out of order, as a run may be given them.
+        let warm_up = [
+            // Before the first warm-up bar: never seen.
+            (-30 * MINUTE, 0.0010),
+            // Inside the first warm-up bar.
+            (30 * MINUTE, 0.0008),
+            // The first warm-up bar's close, which is the second's open.
+            (HOUR, 0.0001),
+            // In the gap between the last warm-up bar and the first traded bar.
+            (2 * HOUR + 30 * MINUTE, 0.0009),
+        ];
+        let traded = [
+            // The last bar's close: never charged.
+            (10 * HOUR, 0.0007),
+            // Inside the 4h bar.
+            (4 * HOUR + 30 * MINUTE, 0.0003),
+            // The 4h bar's close, which is the 5h bar's open.
+            (5 * HOUR, -0.0004),
+            // The first traded bar's open.
+            (3 * HOUR, 0.0002),
+            // In the gap where the 6h bar is missing: charged at the 7h bar's open.
+            (6 * HOUR + 30 * MINUTE, 0.0005),
+            // Inside the last bar.
+            (10 * HOUR - MINUTE, -0.0006),
+        ];
+        let funding: Vec<(Millis, f64)> = traded.iter().chain(&warm_up).copied().collect();
+        let (bars, result, seen) = funding_run(InstrumentKind::Perpetual, &funding);
+        let mut sorted = funding.clone();
+        sorted.sort_by_key(|&(time, _)| time);
+
+        let times: Vec<Millis> = seen.iter().map(|&(time, ..)| time).collect();
+        let bar_times: Vec<Millis> = bars.iter().map(|b| b.open_time).collect();
+        assert_eq!(times, bar_times);
+        assert_eq!(seen.iter().filter(|(_, warm, _)| *warm).count(), 2);
+        for (open_time, _, series) in &seen {
+            // From the first warm-up bar's open up to but not including the close, on warm-up
+            // and traded bars alike.
+            let close = open_time + HOUR;
+            let expected: Vec<(Millis, f64)> = sorted
+                .iter()
+                .copied()
+                .filter(|&(time, _)| (0..close).contains(&time))
+                .collect();
+            assert_eq!(series, &expected, "on the bar at {open_time}");
+        }
+
+        // The bound, one settlement either side, on a warm-up bar as on a traded one: the one due
+        // at a bar's close is seen from the next bar on, while the one inside the bar is seen on it.
+        let on = |hour: Millis| &seen.iter().find(|s| s.0 == hour * HOUR).unwrap().2;
+        assert_eq!(on(0).last(), Some(&(30 * MINUTE, 0.0008)));
+        assert_eq!(on(1).last(), Some(&(HOUR, 0.0001)));
+        assert_eq!(on(4).last(), Some(&(4 * HOUR + 30 * MINUTE, 0.0003)));
+        assert_eq!(on(5).last(), Some(&(5 * HOUR, -0.0004)));
+        // The first traded bar sees the warm-up bars' settlements and the gap's.
+        assert_eq!(
+            on(3)[..3],
+            [
+                (30 * MINUTE, 0.0008),
+                (HOUR, 0.0001),
+                (2 * HOUR + 30 * MINUTE, 0.0009)
+            ]
+        );
+
+        // The fingerprint covers everything the strategy saw by the last bar.
+        let last = &seen.last().unwrap().2;
+        assert_eq!(last.len(), 8);
+        assert_eq!(data_fingerprint(&bars, &[], last), result.data_fingerprint);
+
+        // Seen but never charged: the run holds a position from the 4h bar, so it pays funding,
+        // and every amount is as in a run whose data lacks the settlements before the first
+        // traded bar.
+        let (_, without, _) = funding_run(InstrumentKind::Perpetual, &traded);
+        assert!(result.metrics.funding_paid != 0.0);
+        assert!(!result.fills.is_empty());
+        assert_eq!(result.equity, without.equity);
+        assert_eq!(result.fills, without.fills);
+        assert_eq!(result.trades, without.trades);
+        assert_eq!(result.metrics, without.metrics);
+        assert_eq!(result.benchmark, without.benchmark);
+        assert_eq!(result.equity_extremes, without.equity_extremes);
+        assert_ne!(result.data_fingerprint, without.data_fingerprint);
+    }
+
+    #[test]
+    fn a_strategy_on_a_market_without_funding_sees_none() {
+        let (_, _, seen) = funding_run(InstrumentKind::Spot, &[]);
+        assert_eq!(seen.len(), 8);
+        assert!(seen.iter().all(|(_, _, series)| series.is_empty()));
+    }
+
+    #[test]
+    fn a_session_shows_its_strategy_the_funding_fed_with_every_bar_in_time_order() {
+        use crate::strategies::test_only::{FundingSeen, SeesFunding};
+        let config = SessionConfig {
+            starting_cash: 10_000.0,
+            slippage_bps: 0.0,
+            fees: None,
+            max_leverage: 1.0,
+            account_currency: AccountCurrency::Quote,
+        };
+        let seen = FundingSeen::default();
+        let strategy = Box::new(SeesFunding(seen.clone()));
+        let instrument = test_instrument(InstrumentKind::Perpetual);
+        let mut session = Session::new(strategy, instrument, Timeframe::H1, config).unwrap();
+        // Funding fed with a warm-up bar is seen, though not charged.
+        session
+            .warm_up(flat_bar(0), &[(HOUR / 2, 0.0001), (HOUR / 4, 0.0005)])
+            .unwrap();
+        let first = [(HOUR + 20, 0.0003), (HOUR + 10, 0.0002)];
+        session.on_bar(flat_bar(1), &first).unwrap();
+        session.on_bar(flat_bar(2), &[(2 * HOUR, 0.0004)]).unwrap();
+        let seen: Vec<Vec<(Millis, f64)>> =
+            seen.lock().unwrap().iter().map(|s| s.2.clone()).collect();
+        let warm = vec![(HOUR / 4, 0.0005), (HOUR / 2, 0.0001)];
+        let first = [warm.clone(), vec![(HOUR + 10, 0.0002), (HOUR + 20, 0.0003)]].concat();
+        let second = [first.clone(), vec![(2 * HOUR, 0.0004)]].concat();
+        assert_eq!(seen, vec![warm, first, second]);
+    }
+
+    /// A walk-forward test run is warmed up on its train bars, and its strategy sees their
+    /// funding from the first test bar on.
+    #[test]
+    fn a_walk_forward_test_run_sees_the_funding_of_its_train_bars() {
+        use crate::{
+            Direction, Metric, Objective, SweepMode, SweepSpec, WalkForwardSpec, WindowMode,
+            WindowSpec, walk_forward,
+        };
+        let bars: Vec<Candle> = (0..60).map(flat_bar).collect();
+        let funding: Vec<(Millis, f64)> = (0..8).map(|k| (k * 8 * HOUR, 0.0001)).collect();
+        let spec = WalkForwardSpec {
+            sweep: SweepSpec {
+                base: BacktestConfig {
+                    strategy: "test_tells_funding".into(),
+                    params: Params::new(),
+                    instrument: test_instrument(InstrumentKind::Perpetual),
+                    timeframe: Timeframe::H1,
+                    from: 0,
+                    to: 60 * HOUR,
+                    starting_cash: 10_000.0,
+                    slippage_bps: 2.0,
+                    fee_override: None,
+                    max_leverage: 1.0,
+                    warmup_from: None,
+                    close_at_end: false,
+                    account_currency: AccountCurrency::Quote,
+                    references: Vec::new(),
+                },
+                axes: Vec::new(),
+                mode: SweepMode::Grid,
+                objective: Objective {
+                    metric: Metric::TotalReturn,
+                    direction: Direction::Maximize,
+                },
+                min_trades: 0,
+            },
+            windows: WindowSpec {
+                train_bars: 24,
+                test_bars: 12,
+                step_bars: 12,
+                mode: WindowMode::Rolling,
+            },
+        };
+        let result = walk_forward(&spec, &bars, &[], &funding, None).unwrap();
+        assert_eq!(result.windows.len(), 3);
+        for w in &result.windows {
+            let told = &w.out_of_sample.orders[0];
+            assert_eq!(told.submitted_at, w.test_from);
+            let expected: Vec<String> = funding
+                .iter()
+                .filter(|&&(time, _)| (w.train_from..w.test_from + HOUR).contains(&time))
+                .map(|(time, _)| time.to_string())
+                .collect();
+            assert!(expected.len() > 1, "settlements in the train bars");
+            assert_eq!(
+                told.request.client_tag.as_deref(),
+                Some(expected.join(" ").as_str()),
+                "the window testing from {}",
+                w.test_from
+            );
+        }
     }
 
     #[test]

@@ -15,11 +15,11 @@ use td_core::{
     AccountCurrency, Candle, FeeSchedule, Instrument, InstrumentKind, Millis, Timeframe,
 };
 use td_engine::{
-    AttemptTerms, BatteryResult, BatterySpec, Direction, DrawdownMode, EvidenceSettings,
-    FirmLimits, HighRiskLimits, Layer, MAX_RUNS, Metric, Objective, Outcome, ParamAxis, ParamSpace,
-    ParamValue, Params, Period, PortfolioBenchmark, PortfolioLimits, PropFirmLimits,
-    SlippageOverride, SweepPlan, TestPlan, TesterError, VerdictRule, VerdictState, WalkForwardPlan,
-    risk, run_battery,
+    AttemptTerms, BatteryResult, BatterySpec, DayRollover, Direction, DrawdownMode,
+    EvidenceSettings, FirmLimits, HighRiskLimits, Layer, MAX_RUNS, Metric, Objective, Outcome,
+    ParamAxis, ParamSpace, ParamValue, Params, Period, PortfolioBenchmark, PortfolioLimits,
+    PropFirmLimits, SlippageOverride, SweepPlan, TestPlan, TesterError, VerdictRule, VerdictState,
+    WalkForwardPlan, metrics, risk, run_battery,
 };
 
 const HOUR: Millis = 3_600_000;
@@ -192,6 +192,7 @@ fn prop_firm_rule() -> VerdictRule {
             day_target_share: None,
             trading_day: None,
             trailing_floor_lock: None,
+            day_rollover: None,
         },
         limits: PropFirmLimits::default(),
         attempt: None,
@@ -420,13 +421,19 @@ fn the_other_kinds_get_their_inputs_from_the_same_runs() {
 
     let prop = battery(&plan, &prop_firm_rule(), &bars, 7, None).unwrap();
     let cash = plan.backtest.starting_cash;
-    let trailing =
-        risk::trailing_drawdown(cash, &prop.walk_forward.as_ref().unwrap().equity_extremes)
-            .unwrap()
-            .amount
-            / cash;
-    assert!(trailing > 0.0);
-    assert_eq!(prop.kind.intrabar_drawdown_trailing, Some(trailing));
+    let extremes = &prop.walk_forward.as_ref().unwrap().equity_extremes;
+    // The first 90 of the 180 days are one of the attempts the drawdown line reads, so the worst
+    // attempt falls at least as far as the bars of its first 80 days do.
+    let first_attempt = extremes.len() * 80 / 180;
+    let first = risk::trailing_drawdown(cash, &extremes[..first_attempt])
+        .unwrap()
+        .amount
+        / cash;
+    let trailing = prop.kind.intrabar_drawdown_trailing.unwrap();
+    assert!(
+        first > 0.0 && trailing >= first,
+        "{trailing} against {first}"
+    );
     // The firm in this rule trails, so its drawdown line reads the trailing value.
     assert_eq!(line(&prop, "max_drawdown").value, Some(trailing));
     let odds = prop.prop_firm_odds.unwrap();
@@ -434,16 +441,15 @@ fn the_other_kinds_get_their_inputs_from_the_same_runs() {
     assert_eq!(prop.kind.breach_probability, Some(odds.breach));
     let worst = prop.kind.worst_daily_loss.unwrap();
     assert!(worst >= 0.0);
-    // The worse of the two day rollovers is at least the UTC day's, which the metrics report.
+    // The worse of the two day rollovers is at least the UTC day's, each day's fall read as a
+    // share of that day's starting balance.
+    let wf = prop.walk_forward.as_ref().unwrap();
+    let series = metrics::EquitySeries::new(cash, &wf.equity, plan.timeframe);
+    let utc = risk::daily_pnl(&series, Some(extremes), DayRollover::default());
+    let utc_worst = risk::worst_daily_loss_intraday_own(&utc).unwrap();
     assert!(
-        worst
-            >= prop
-                .walk_forward
-                .unwrap()
-                .metrics
-                .worst_daily_loss_intrabar
-                .unwrap()
-                - 1e-12
+        utc_worst > 0.0 && worst >= utc_worst,
+        "{worst} against {utc_worst}"
     );
     assert!(prop.kind.risk_of_ruin.is_none());
 }
@@ -1019,11 +1025,13 @@ fn attempt_terms_price_an_attempt_and_add_the_value_line() {
         refund_fee_with_first_payout: true,
         profit_split: 0.8,
         days_to_first_payout: 10,
+        calendar_days_to_first_payout: None,
         payout_interval_days: 10,
         min_payout: 50.0,
         payout_cap: None,
         max_payouts: None,
         payout_locks_floor: false,
+        payout_resets_balance: false,
         funded_horizon_days: 90,
         evaluation_size: 1.0,
         funded_size: 1.0,
@@ -1042,7 +1050,9 @@ fn attempt_terms_price_an_attempt_and_add_the_value_line() {
         line(&priced, "attempt_value").value,
         Some(attempt.reduced.value)
     );
-    // The odds are the same with or without terms: the attempt draws from its own seed stream.
+    // The attempt draws from its own seed stream, so the pass odds are the same with or without
+    // terms. The breach odds walk the funded account with the terms' payouts; on these days every
+    // path breaches either way.
     assert_eq!(priced.prop_firm_odds, plain.prop_firm_odds);
     // With no passing fee, an attempt loses at most its evaluation fee.
     for f in [attempt.full, attempt.reduced] {

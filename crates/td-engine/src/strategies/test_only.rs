@@ -1,11 +1,15 @@
-//! Strategies only the crate's own tests can build, each broken on purpose so a test can show
-//! that a check catches it. [`crate::find_strategy`] finds them in the crate's tests; they are not
-//! listed and do not exist outside them.
+//! Strategies only the crate's own tests can build. The registered ones are broken on purpose so
+//! a test can show that a check catches it, or report what they see where a test can read it:
+//! [`crate::find_strategy`] finds them in the crate's tests; they are not listed and do not exist
+//! outside them. [`SeesFunding`] is not registered: a test builds it and runs it with
+//! [`crate::run_strategy`].
 
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use td_core::{
-    AccountCurrency, Candle, InstrumentId, InstrumentKind, OrderType, Side, Timeframe, Venue,
+    AccountCurrency, Candle, InstrumentId, InstrumentKind, Millis, OrderType, Side, Timeframe,
+    Venue,
 };
 
 use crate::strategies::{affordable_qty, order};
@@ -16,7 +20,7 @@ use crate::{
 };
 
 pub(crate) fn entries() -> Vec<StrategyEntry> {
-    vec![unrepeatable(), one_hour()]
+    vec![unrepeatable(), one_hour(), tells_funding(), rests_limits()]
 }
 
 /// How many `Unrepeatable` strategies have been built in this process.
@@ -179,5 +183,103 @@ fn plan() -> TestPlan {
         },
         out_of_sample: None,
         evidence: EvidenceSettings::default(),
+    }
+}
+
+/// Never trades. On its first live bar it sends an order for nothing, which is rejected and kept
+/// in the result, tagged with the times of the funding [`Context::funding`] gives it there, space
+/// separated, so a test can read what a strategy the testers build from the registry sees.
+pub struct TellsFunding {
+    told: bool,
+}
+
+fn tells_funding() -> StrategyEntry {
+    let mut plan = plan();
+    plan.sweep.axes = Vec::new();
+    StrategyEntry {
+        name: "test_tells_funding",
+        description: "Tags a rejected order with the funding it sees on its first live bar.",
+        params: Vec::new(),
+        build: |_| Ok(Box::new(TellsFunding { told: false })),
+        plan,
+        rule: VerdictRule::Portfolio {
+            benchmark: PortfolioBenchmark::Cash,
+            limits: PortfolioLimits::default(),
+        },
+    }
+}
+
+impl Strategy for TellsFunding {
+    fn on_bar(&mut self, ctx: &mut Context, _bar: &Candle) {
+        if ctx.is_warming_up() || self.told {
+            return;
+        }
+        self.told = true;
+        let times: Vec<String> = ctx.funding().iter().map(|(t, _)| t.to_string()).collect();
+        let mut request = order(ctx, Side::Buy, 0.0, OrderType::Market, false);
+        request.client_tag = Some(times.join(" "));
+        let _ = ctx.submit(request);
+    }
+}
+
+/// Rests one limit at a time: while flat, a buy of one unit one price unit under the close it
+/// decides on; while long, a reduce-only sell one unit over it. Each stays until it fills, so a
+/// test can read how the fills of resting limits are reported.
+pub struct RestsLimits;
+
+fn rests_limits() -> StrategyEntry {
+    let mut plan = plan();
+    plan.sweep.axes = Vec::new();
+    StrategyEntry {
+        name: "test_rests_limits",
+        description: "Rests a buy limit under the close while flat and a sell limit over it while long.",
+        params: Vec::new(),
+        build: |_| Ok(Box::new(RestsLimits)),
+        plan,
+        rule: VerdictRule::Portfolio {
+            benchmark: PortfolioBenchmark::Cash,
+            limits: PortfolioLimits::default(),
+        },
+    }
+}
+
+impl Strategy for RestsLimits {
+    fn on_bar(&mut self, ctx: &mut Context, bar: &Candle) {
+        if ctx.is_warming_up() || !ctx.open_orders().is_empty() {
+            return;
+        }
+        let request = if ctx.position() == 0.0 {
+            let price = bar.close - 1.0;
+            order(ctx, Side::Buy, 1.0, OrderType::Limit { price }, false)
+        } else {
+            let price = bar.close + 1.0;
+            order(
+                ctx,
+                Side::Sell,
+                ctx.position(),
+                OrderType::Limit { price },
+                true,
+            )
+        };
+        let _ = ctx.submit(request);
+    }
+}
+
+/// What [`SeesFunding`] saw on each bar it was called on, in order: the bar's open time, whether
+/// it was a warm-up bar, and [`Context::funding`].
+pub(crate) type FundingSeen = Arc<Mutex<Vec<(Millis, bool, Vec<(Millis, f64)>)>>>;
+
+/// Records what [`Context::funding`] gives it on each bar, so a test can compare it with the
+/// funding the run was given. On its first live bar it buys one unit at market and holds it, so a
+/// perpetual run pays funding.
+pub(crate) struct SeesFunding(pub FundingSeen);
+
+impl Strategy for SeesFunding {
+    fn on_bar(&mut self, ctx: &mut Context, bar: &Candle) {
+        let seen = (bar.open_time, ctx.is_warming_up(), ctx.funding().to_vec());
+        self.0.lock().unwrap().push(seen);
+        if !ctx.is_warming_up() && ctx.position() == 0.0 && ctx.open_orders().is_empty() {
+            let _ = ctx.submit(order(ctx, Side::Buy, 1.0, OrderType::Market, false));
+        }
     }
 }

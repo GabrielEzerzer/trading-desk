@@ -84,6 +84,7 @@ fn client_for(mock: &MockVenue) -> Arc<Client> {
         request_timeout: Duration::from_millis(1500),
         recv_window: Duration::from_millis(1000),
         settle: Duration::from_millis(50),
+        operation_budget: Duration::from_secs(5),
     };
     let keys = DemoKeys::for_loopback(TEST_KEY, TEST_SECRET).unwrap();
     Arc::new(Client::with_timing(Endpoint::Loopback(mock.port()), keys, timing).unwrap())

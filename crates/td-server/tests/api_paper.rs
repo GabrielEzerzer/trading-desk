@@ -582,10 +582,18 @@ fn reference_by_hand(
     (dir, paper)
 }
 
-/// Asserts the API's state of a session is the reference's, apart from its id and status.
+/// Asserts the API's state of a session is the reference's, apart from its id, status and link.
+/// The API links each strategy session it starts and the reference is built without one, so the
+/// link is only checked to be there exactly when the session runs a strategy.
 fn assert_same_state(api: &Value, reference: &PaperSession) {
-    let mut expected = serde_json::to_value(SessionState::of(reference)).expect("serializes");
+    let mut expected = serde_json::to_value(SessionState::of(reference, &[])).expect("serializes");
     let mut actual = api.clone();
+    let linked = actual
+        .as_object_mut()
+        .expect("an object")
+        .remove("link")
+        .is_some();
+    assert_eq!(linked, reference.config().strategy != MANUAL_STRATEGY);
     for state in [&mut expected, &mut actual] {
         let object = state.as_object_mut().expect("an object");
         object.remove("id");
@@ -1047,11 +1055,93 @@ async fn unknown_sessions_are_404_and_bad_starts_are_400() {
         assert!(status.is_client_error(), "{case}: {status} {answer}");
         assert!(answer["error"]["message"].is_string(), "{answer}");
     }
+    // A verdict named for a manual session, and a run id that is not one, are refused.
+    let manual = bad(&|b| {
+        b["strategy"] = json!(MANUAL_STRATEGY);
+        b["params"] = json!({});
+        b["verdict_run_id"] = json!("1700000000000-0000000a");
+    });
+    let malformed = bad(&|b| b["verdict_run_id"] = json!("../../etc"));
+    for case in [manual, malformed] {
+        let (status, answer) = api.post("/sessions", &case).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{case}: {answer}");
+        assert_eq!(answer["error"]["code"], "invalid_verdict", "{answer}");
+    }
     body["timeframe"] = json!("2m");
     let (status, _) = api.post("/sessions", &body.to_string()).await;
     assert!(status.is_client_error());
     assert_eq!(api.get("/sessions").await.1, json!([]), "nothing started");
     assert_eq!(venue.accepted.load(Ordering::SeqCst), 0);
+    api.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_compares_with_a_backtest_on_its_own_bars_and_one_without_live_bars_cannot() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    // Stopped sessions, each warmed up on the hour before T0: a strategy session and a manual one
+    // fed 30 live minutes, and a strategy session with no live bar yet.
+    for (id, cfg, live) in [
+        ("fed", config(), 0..30),
+        ("by-hand", manual_config(), 0..30),
+        ("fresh", config(), 0..0),
+    ] {
+        let mut paper = PaperSession::create(dir.path(), id, cfg).expect("creates");
+        for bar in minutes(-60..0) {
+            paper.feed(bar, Vec::new(), true).expect("warm-up bar");
+        }
+        for bar in minutes(live) {
+            paper.feed(bar, Vec::new(), false).expect("live bar");
+        }
+    }
+    let venue = Exchange::start().await;
+    let api = Api::start(&dir, &venue).await;
+
+    let (status, compared) = api.get("/sessions/fed/comparison").await;
+    assert_eq!(status, StatusCode::OK, "{compared}");
+    let backtest = &compared["backtest"];
+    assert_eq!(backtest["strategy"], "sma_cross");
+    assert_eq!(
+        backtest["params"],
+        json!({ "fast": 2, "slow": 5, "allow_short": true })
+    );
+    let range = (&backtest["warmup_from"], &backtest["from"], &backtest["to"]);
+    assert_eq!(
+        range,
+        (&json!(T0 - 60 * MIN), &json!(T0), &json!(T0 + 30 * MIN))
+    );
+    assert_eq!(
+        compared["bars"],
+        json!({
+            "warm_up_bars": 60,
+            "live_bars": 30,
+            "dropped": [],
+            "funding_events": 0,
+            "late_funding": 0,
+        })
+    );
+    assert_eq!(compared["manual_orders"], 0);
+    let comparison = &compared["comparison"];
+    assert_eq!(comparison["differences"], json!([]), "{comparison}");
+    let fills = comparison["fills"].as_array().expect("paired fills");
+    assert!(fills.len() > 2, "the strategy trades: {comparison}");
+    for side in ["session", "backtest"] {
+        assert_eq!(comparison[side]["fills"], fills.len(), "{side}");
+    }
+    assert_eq!(comparison["pnl_ratio"], 1.0);
+    for unpaired in [
+        "session_only_fills",
+        "backtest_only_fills",
+        "session_only_orders",
+        "backtest_only_orders",
+    ] {
+        assert_eq!(comparison[unpaired], json!([]), "{unpaired}");
+    }
+
+    for id in ["by-hand", "fresh"] {
+        let (status, body) = api.get(&format!("/sessions/{id}/comparison")).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{id}: {body}");
+        assert_eq!(body["error"]["code"], "nothing_to_compare", "{id}");
+    }
     api.shutdown().await;
 }
 

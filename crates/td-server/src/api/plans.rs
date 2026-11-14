@@ -39,6 +39,12 @@
 //! looser than the kind's defaults ([`td_engine::VerdictRule::loosened`]), and counts the distinct
 //! versions of the strategy's code that have been through the battery on the instrument, so many
 //! edits until one version passes show.
+//!
+//! A paper session is linked to the verdict it was started from (#115): [`SessionLink`] records,
+//! when the session starts, the hash of the strategy's source file, its plan and rule, and that
+//! verdict, and [`LinkState`] checks it against the strategy as it is now whenever the session's
+//! state is read: with the same checks the verdict list makes when it has a verdict, and against
+//! what the session started with when it has none.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -56,7 +62,7 @@ use td_core::{Instrument, InstrumentId, Millis};
 use td_data::Store;
 use td_engine::{
     BatterySpec, ENGINE_REVISION, LoosenedLimit, PlanRun, RunId, RunKind, SavedRun, StrategyEntry,
-    TesterError, Verdict, VerdictRule,
+    TesterError, Verdict, VerdictRule, VerdictState,
 };
 use ts_rs::TS;
 
@@ -82,6 +88,14 @@ pub struct PlanRequest {
     #[serde(default)]
     #[ts(optional)]
     pub instruments: Option<Vec<InstrumentId>>,
+    /// Reference instruments every run of each battery names
+    /// ([`td_engine::BacktestConfig::references`]): the strategy reads their bars beside its own
+    /// but trades only the plan's instrument. Each must be on the venue of every instrument run,
+    /// and the store must hold their bars over the plan's period; they are not downloaded. None
+    /// when left out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub references: Option<Vec<InstrumentId>>,
 }
 
 /// What a plan job kept: one entry per instrument whose battery finished or reached the luck test
@@ -128,6 +142,9 @@ struct VerdictRecord {
     /// `None` in a record written before hashes were recorded.
     #[serde(default)]
     pub code_hash: Option<String>,
+    /// The reference instruments the battery's runs named; empty, and left out, when none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub references: Vec<InstrumentId>,
 }
 
 /// One row of `GET /verdicts`: the latest verdict of a strategy on an instrument, the newest
@@ -173,6 +190,10 @@ pub struct VerdictSummary {
     /// this instrument, this one included; batteries saved before code hashes were recorded count
     /// together as one version. Keyed by strategy name like `runs`.
     pub code_versions: usize,
+    /// The reference instruments the battery's runs named; left out when none. A verdict with
+    /// references and one without share a row, the newer winning as above.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub references: Vec<InstrumentId>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -268,6 +289,7 @@ pub(super) async fn start(
         )
     })?;
     let ids = chosen_instruments(&entry, request.instruments.as_deref())?;
+    let references = request.references.clone().unwrap_or_default();
 
     // The trading rules of each instrument, from the venue's list as `GET /instruments` gives it
     // (cached per server run).
@@ -294,9 +316,11 @@ pub(super) async fn start(
     // nothing is downloaded.
     let (store, checked) = (state.store.clone(), entry.clone());
     let (to_check, cutoff) = (instruments.clone(), state.data_cutoff.clone());
+    let named = references.clone();
     tokio::task::spawn_blocking(move || {
         to_check.into_iter().try_for_each(|i| {
-            let config = checked.plan.backtest_config(checked.name, i);
+            let mut config = checked.plan.backtest_config(checked.name, i);
+            config.references = named.clone();
             check_run_data(&store, &config, cutoff.as_ref())
         })
     })
@@ -307,12 +331,14 @@ pub(super) async fn start(
     let job_request = JobRequest::Plan(PlanRequest {
         strategy: request.strategy,
         instruments: Some(ids),
+        references: request.references,
     });
     let cutoff = state.data_cutoff.clone();
     let job = state.jobs.submit(job_request, move |ctx| {
         execute(
             &entry,
             &instruments,
+            &references,
             &store,
             cutoff.as_ref(),
             &runs_dir,
@@ -326,6 +352,7 @@ pub(super) async fn start(
 fn execute(
     entry: &StrategyEntry,
     instruments: &[Instrument],
+    references: &[InstrumentId],
     store: &Store,
     cutoff: Option<&DataCutoff>,
     runs_dir: &Path,
@@ -336,7 +363,8 @@ fn execute(
     let mut loaded: Vec<RunData> = Vec::with_capacity(instruments.len());
     let mut totals = Vec::with_capacity(instruments.len());
     for instrument in instruments {
-        let config = entry.plan.backtest_config(entry.name, instrument.clone());
+        let mut config = entry.plan.backtest_config(entry.name, instrument.clone());
+        config.references = references.to_vec();
         let data = load_run_data(store, &config, cutoff).map_err(changed_since_accepted)?;
         let spec = battery_spec(entry, instrument);
         totals.push(td_engine::battery_runs(&spec, &data.bars).map_err(tester_error)?);
@@ -375,11 +403,12 @@ fn execute(
         // The asks are empty for a kind without quotes; for one with quotes every run of the
         // battery trades on them.
         let outcome = own_pool(|| {
-            td_engine::run_battery(
+            td_engine::run_battery_with_references(
                 &spec,
                 &data.bars,
                 &data.asks,
                 &data.funding,
+                &data.references,
                 Some(&progress),
             )
         });
@@ -457,13 +486,19 @@ fn save_plan_run(
         // Only a cancel during the luck test leaves a battery incomplete.
         complete: !battery.luck_cancelled,
         code_hash: run_record.code_hash.clone(),
+        references: data
+            .references
+            .iter()
+            .map(|r| r.instrument.clone())
+            .collect(),
     };
-    let run = PlanRun::new(
+    let run = PlanRun::with_references(
         &battery_spec(entry, instrument),
         battery,
         &data.bars,
         &data.asks,
         &data.funding,
+        &data.references,
     )
     .map_err(|e| ApiError::internal(e.to_string()))?;
     let record_json = serde_json::to_vec_pretty(&record)
@@ -518,6 +553,8 @@ struct PlanResultFields {
 #[derive(Deserialize)]
 struct ConfigHead {
     instrument: InstrumentHead,
+    #[serde(default)]
+    references: Vec<InstrumentId>,
 }
 
 #[derive(Deserialize)]
@@ -571,6 +608,7 @@ fn read_record(dir: &Path) -> Option<VerdictRecord> {
             .ok()
             .and_then(|bytes| serde_json::from_slice::<RunRecord>(&bytes).ok())
             .and_then(|r| r.code_hash),
+        references: run.config.references,
     })
 }
 
@@ -597,21 +635,39 @@ fn instrument_view(mut plan: Value, instrument: &Value) -> Value {
     plan
 }
 
-/// Whether the battery saved in `record` ran under `entry`'s current plan and rule, as far as
-/// they concern the record's instrument, and the plan still tests it. JSON numbers compare exactly:
-/// serde_json's `float_roundtrip` reads each saved float back to the value it was written from.
-fn ran_under(entry: &StrategyEntry, record: &VerdictRecord, saved_view: &Value) -> bool {
-    if entry.name != record.strategy || !entry.plan.instruments.contains(&record.instrument) {
-        return false;
-    }
-    let (Ok(plan), Ok(rule), Ok(id)) = (
+/// Whether a battery of `strategy` on `instrument`, saved with `rule` and the plan whose
+/// [`instrument_view`] is `saved_view`, ran under `entry`'s current plan and rule, as far as they
+/// concern that instrument, and the plan still tests it.
+fn ran_under(
+    entry: &StrategyEntry,
+    strategy: &str,
+    instrument: &InstrumentId,
+    rule: &Value,
+    saved_view: &Value,
+) -> bool {
+    entry.name == strategy
+        && entry.plan.instruments.contains(instrument)
+        && same_plan(entry, instrument, rule, saved_view)
+}
+
+/// Whether `rule` and the plan whose [`instrument_view`] on `instrument` is `saved_view` are
+/// `entry`'s current rule and plan, as far as they concern that instrument. JSON numbers compare
+/// exactly: serde_json's `float_roundtrip` reads each saved float back to the value it was
+/// written from.
+fn same_plan(
+    entry: &StrategyEntry,
+    instrument: &InstrumentId,
+    rule: &Value,
+    saved_view: &Value,
+) -> bool {
+    let (Ok(plan), Ok(current_rule), Ok(id)) = (
         serde_json::to_value(&entry.plan),
         serde_json::to_value(entry.rule),
-        serde_json::to_value(&record.instrument),
+        serde_json::to_value(instrument),
     ) else {
         return false;
     };
-    rule == record.rule && &instrument_view(plan, &id) == saved_view
+    &current_rule == rule && &instrument_view(plan, &id) == saved_view
 }
 
 /// The latest verdict per strategy and instrument (the newest complete one, or the newest when none
@@ -655,8 +711,11 @@ fn latest_verdicts(
         let saved_view = serde_json::to_value(&record.instrument)
             .ok()
             .map(|id| instrument_view(record.plan.take(), &id));
-        let plan_matches =
-            saved_view.is_some_and(|view| strategies.iter().any(|e| ran_under(e, &record, &view)));
+        let plan_matches = saved_view.is_some_and(|view| {
+            strategies
+                .iter()
+                .any(|e| ran_under(e, &record.strategy, &record.instrument, &record.rule, &view))
+        });
         let engine_matches = record.engine_revision == ENGINE_REVISION;
         let code_matches = code_matches(&record.strategy, record.code_hash.as_deref());
         let loosened = serde_json::from_value::<VerdictRule>(record.rule.clone())
@@ -682,6 +741,7 @@ fn latest_verdicts(
             seed: record.seed,
             runs,
             code_versions: 0,
+            references: record.references,
         };
         // A complete run beats an incomplete one; between two of the same, the newer wins.
         match latest.get_mut(&key) {
@@ -700,6 +760,206 @@ fn latest_verdicts(
             row
         })
         .collect())
+}
+
+/// What a session was started from: the strategy's code, plan and rule when it started, and the
+/// verdict of the strategy on the session's instrument it was started from. Fixed when the session
+/// starts and saved with its config; [`LinkState`] shows it with its checks.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+pub struct SessionLink {
+    /// The hash of the strategy's source file when the session started
+    /// ([`td_engine::code_hash`]); `null` for a strategy without one.
+    pub code_hash: Option<String>,
+    /// The strategy's test plan ([`td_engine::TestPlan`]) when the session started, as JSON, so a
+    /// session saved before a field of it changed still reads.
+    #[ts(type = "unknown")]
+    pub plan: Value,
+    /// The strategy's verdict rule ([`td_engine::VerdictRule`]) when the session started, as JSON
+    /// like `plan`.
+    #[ts(type = "unknown")]
+    pub rule: Value,
+    /// The verdict the session was started from: the one named when it was started, or else the
+    /// strategy's latest verdict on the instrument as `GET /verdicts` gives it. `null` when the
+    /// strategy had none there.
+    pub verdict: Option<LinkedVerdict>,
+}
+
+/// The verdict a session was started from, with what its checks compare.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+pub struct LinkedVerdict {
+    /// The saved plan run, at `GET /runs/{run_id}`.
+    pub run_id: RunId,
+    pub state: VerdictState,
+    /// False when a cancel stopped the battery's luck test.
+    pub complete: bool,
+    /// The engine revision that produced the verdict.
+    pub engine_revision: u32,
+    /// The hash of the strategy's source file the battery ran with; `null` for a battery saved
+    /// before code hashes were recorded.
+    pub code_hash: Option<String>,
+    /// The plan the battery ran under, as its verdict record holds it.
+    #[ts(type = "unknown")]
+    pub plan: Value,
+    /// The rule the battery ran under, as its verdict record holds it.
+    #[ts(type = "unknown")]
+    pub rule: Value,
+}
+
+/// A session's [`SessionLink`] with its checks against the strategy as it is now, made when the
+/// session's state is read. With a verdict, each check compares the verdict with this engine and
+/// the strategy now, and is the one `GET /verdicts` makes for that verdict. Without one, the plan
+/// and code checks compare what the session started with (the link's `plan`, `rule` and
+/// `code_hash`) with the strategy now, and there is no engine check. A check that cannot be made is
+/// `null`, and counts as not matching for `stale`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+pub struct LinkState {
+    #[serde(flatten)]
+    pub link: SessionLink,
+    /// With a verdict, whether this engine has the verdict's engine revision; `null` without one.
+    pub engine_matches: Option<bool>,
+    /// With a verdict, whether the strategy's plan and rule are still the ones the verdict was
+    /// judged under, as far as they concern the session's instrument, and the plan still tests
+    /// it; false when the strategy is no longer registered. Without one, whether they are still
+    /// the ones the session started with, as far as they concern the session's instrument; `null`
+    /// when the strategy is no longer registered.
+    pub plan_matches: Option<bool>,
+    /// With a verdict, whether the strategy's source file is still the one the verdict was judged
+    /// with; without one, whether it is still the one the session started with. `null` when that
+    /// is unknown: no hash was saved, or the strategy is no longer registered. The session replays
+    /// and trades with the current file, so this compares the code it runs now. The hash covers
+    /// the strategy's own file only, not shared helpers it calls.
+    pub code_matches: Option<bool>,
+    /// True unless each check made is true: all three with a verdict, `plan_matches` and
+    /// `code_matches` without one. With a verdict: the code, plan or engine the session runs on
+    /// may no longer be the one that verdict judged. Without one: the code or plan may have
+    /// changed since the session started.
+    pub stale: bool,
+}
+
+impl LinkState {
+    /// `link`'s checks for a session of `strategy` on `instrument`, against `strategies`, the
+    /// server's registered strategies that `GET /verdicts` also reads.
+    pub fn of(
+        link: &SessionLink,
+        strategy: &str,
+        instrument: &InstrumentId,
+        strategies: &[StrategyEntry],
+    ) -> LinkState {
+        let entry = strategies.iter().find(|e| e.name == strategy);
+        let view = |plan: &Value| {
+            serde_json::to_value(instrument)
+                .ok()
+                .map(|id| instrument_view(plan.clone(), &id))
+        };
+        let Some(verdict) = &link.verdict else {
+            let plan_matches = entry.map(|e| {
+                view(&link.plan).is_some_and(|v| same_plan(e, instrument, &link.rule, &v))
+            });
+            let code_matches = code_matches(strategy, link.code_hash.as_deref());
+            return LinkState {
+                link: link.clone(),
+                engine_matches: None,
+                plan_matches,
+                code_matches,
+                stale: !(plan_matches == Some(true) && code_matches == Some(true)),
+            };
+        };
+        let engine_matches = verdict.engine_revision == ENGINE_REVISION;
+        let plan_matches = view(&verdict.plan).is_some_and(|v| {
+            entry.is_some_and(|e| ran_under(e, strategy, instrument, &verdict.rule, &v))
+        });
+        let code_matches = code_matches(strategy, verdict.code_hash.as_deref());
+        LinkState {
+            link: link.clone(),
+            engine_matches: Some(engine_matches),
+            plan_matches: Some(plan_matches),
+            code_matches,
+            stale: !(engine_matches && plan_matches && code_matches == Some(true)),
+        }
+    }
+}
+
+/// The link of a session of `entry` on `instrument` started now, from the verdict saved as run
+/// `verdict`, or from the strategy's latest verdict on the instrument when it is `None`. 400
+/// `invalid_verdict` for a run that is not a saved verdict of this strategy on this instrument, or
+/// one judged with reference instruments, which a paper session cannot feed its strategy: it would
+/// be a different test from the one the verdict judged. That holds for the latest verdict too, so
+/// a session of a strategy last judged with references does not start unless the request names a
+/// verdict judged without them.
+pub(crate) fn session_link(
+    runs_dir: &Path,
+    entry: &StrategyEntry,
+    instrument: &InstrumentId,
+    verdict: Option<&RunId>,
+) -> Result<SessionLink, ApiError> {
+    let bad = |message: String| invalid("invalid_verdict", message);
+    let record = match verdict {
+        Some(id) => {
+            // A run id from the request has not had its format checked, and it names a path.
+            let checked =
+                RunId::parse(id.as_str()).map_err(|_| bad(format!("{id:?} is not a run id")))?;
+            let record = read_record(&runs_dir.join(checked.as_str()))
+                .ok_or_else(|| bad(format!("run {id} is not a saved verdict")))?;
+            if record.strategy != entry.name || record.instrument != *instrument {
+                return Err(bad(format!(
+                    "run {id} is the verdict of {} on {}, not of {} on {instrument}",
+                    record.strategy, record.instrument, entry.name
+                )));
+            }
+            if !record.references.is_empty() {
+                return Err(bad(paper_cannot_feed(id, &record.references)));
+            }
+            Some((checked, record))
+        }
+        None => {
+            let latest = latest_verdicts(runs_dir, std::slice::from_ref(entry), Some(entry.name))?
+                .into_iter()
+                .find(|row| row.instrument == *instrument);
+            match latest {
+                // Judged from the row, so a record that cannot be read again does not let the
+                // session start unlinked.
+                Some(row) if !row.references.is_empty() => {
+                    return Err(bad(format!(
+                        "{}; it is the strategy's latest verdict on {instrument}, so name a verdict judged without them in `verdict_run_id`, or run a test without them first",
+                        paper_cannot_feed(&row.run_id, &row.references)
+                    )));
+                }
+                Some(row) => read_record(&runs_dir.join(row.run_id.as_str()))
+                    .map(|record| (row.run_id, record)),
+                None => None,
+            }
+        }
+    };
+    let json = |value: Result<Value, serde_json::Error>| {
+        value.map_err(|e| ApiError::internal(format!("cannot record the session's link: {e}")))
+    };
+    Ok(SessionLink {
+        code_hash: td_engine::code_hash(entry.name).map(String::from),
+        plan: json(serde_json::to_value(&entry.plan))?,
+        rule: json(serde_json::to_value(entry.rule))?,
+        verdict: record.map(|(run_id, record)| LinkedVerdict {
+            run_id,
+            state: record.verdict.state,
+            complete: record.complete,
+            engine_revision: record.engine_revision,
+            code_hash: record.code_hash,
+            plan: record.plan,
+            rule: record.rule,
+        }),
+    })
+}
+
+/// Why a paper session cannot be linked to verdict `id`, judged with `references`.
+///
+/// shortcut: a paper session feeds no reference instruments, so it cannot run the test a verdict
+/// with references judged; feed their live bars beside the session's own when a strategy that
+/// reads them is paper traded.
+fn paper_cannot_feed(id: &RunId, references: &[InstrumentId]) -> String {
+    let names: Vec<String> = references.iter().map(ToString::to_string).collect();
+    format!(
+        "run {id} was judged with the reference instruments {}, and a paper session cannot feed reference instruments yet",
+        names.join(", ")
+    )
 }
 
 /// `GET /verdicts?strategy=`.
@@ -729,6 +989,229 @@ mod tests {
             symbol: symbol.into(),
             kind,
         }
+    }
+
+    /// A verdict of `entry` on `instrument` as it is now, saved as run `run_id` under `runs_dir`.
+    fn save_verdict(runs_dir: &Path, run_id: &str, entry: &StrategyEntry, on: &InstrumentId) {
+        save_verdict_with(runs_dir, run_id, entry, on, Vec::new());
+    }
+
+    /// [`save_verdict`] for a battery whose runs named `references`.
+    fn save_verdict_with(
+        runs_dir: &Path,
+        run_id: &str,
+        entry: &StrategyEntry,
+        on: &InstrumentId,
+        references: Vec<InstrumentId>,
+    ) {
+        let record = VerdictRecord {
+            strategy: entry.name.into(),
+            instrument: on.clone(),
+            seed: 1,
+            engine_revision: ENGINE_REVISION,
+            verdict: Verdict::new(on.clone(), Vec::new()),
+            plan: serde_json::to_value(&entry.plan).unwrap(),
+            rule: serde_json::to_value(entry.rule).unwrap(),
+            complete: true,
+            code_hash: td_engine::code_hash(entry.name).map(String::from),
+            references,
+        };
+        let dir = runs_dir.join(run_id);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(VERDICT_FILE), serde_json::to_vec(&record).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_session_is_linked_to_the_verdict_it_names_or_else_the_latest() {
+        let dir = tempfile::tempdir().unwrap();
+        let entry = td_engine::find_strategy("sma_cross").unwrap();
+        let on = entry.plan.instruments[0].clone();
+        let (older, newer) = ("1700000000000-0000000a", "1700000000001-0000000b");
+        save_verdict(dir.path(), older, &entry, &on);
+        save_verdict(dir.path(), newer, &entry, &on);
+
+        let latest = session_link(dir.path(), &entry, &on, None).unwrap();
+        assert_eq!(
+            latest.code_hash.as_deref(),
+            td_engine::code_hash("sma_cross")
+        );
+        assert_eq!(latest.plan, serde_json::to_value(&entry.plan).unwrap());
+        assert_eq!(latest.verdict.as_ref().unwrap().run_id.as_str(), newer);
+
+        let named = RunId::parse(older).unwrap();
+        let link = session_link(dir.path(), &entry, &on, Some(&named)).unwrap();
+        assert_eq!(link.verdict.unwrap().run_id, named);
+
+        // Another instrument has no verdict to link to.
+        let other = id("NOPEUSDT", InstrumentKind::Spot);
+        let none = session_link(dir.path(), &entry, &other, None).unwrap();
+        assert_eq!(none.verdict, None);
+        // A verdict of another instrument, a run that is not a verdict and an id that is not one
+        // are refused.
+        let refused = |run: &str| {
+            let run: RunId = serde_json::from_value(Value::String(run.into())).unwrap();
+            session_link(dir.path(), &entry, &other, Some(&run)).unwrap_err()
+        };
+        for run in [newer, "1700000000002-0000000c", "../../etc"] {
+            assert_eq!(refused(run).body.code, "invalid_verdict", "{run}");
+        }
+    }
+
+    /// A paper session feeds no reference instruments, so it is never linked to a verdict judged
+    /// with them: one named is refused, and so is a session left to the latest verdict when that
+    /// is such a one, since it would run without the bars its strategy was judged on.
+    #[test]
+    fn a_session_is_never_linked_to_a_verdict_judged_with_reference_instruments() {
+        let dir = tempfile::tempdir().unwrap();
+        let entry = td_engine::find_strategy("sma_cross").unwrap();
+        let on = entry.plan.instruments[0].clone();
+        let reference = InstrumentId {
+            symbol: "OTHERUSDT".into(),
+            ..on.clone()
+        };
+        let (older, newer) = ("1700000000000-0000000a", "1700000000001-0000000b");
+        save_verdict(dir.path(), older, &entry, &on);
+        save_verdict_with(dir.path(), newer, &entry, &on, vec![reference.clone()]);
+
+        let named = RunId::parse(newer).unwrap();
+        let refused = session_link(dir.path(), &entry, &on, Some(&named)).unwrap_err();
+        assert_eq!(refused.body.code, "invalid_verdict");
+        assert!(
+            refused
+                .body
+                .message
+                .contains("cannot feed reference instruments"),
+            "{}",
+            refused.body.message
+        );
+        let latest = session_link(dir.path(), &entry, &on, None).unwrap_err();
+        assert_eq!(latest.body.code, "invalid_verdict");
+        assert!(
+            latest.body.message.contains("latest verdict"),
+            "{}",
+            latest.body.message
+        );
+        // A verdict judged without them still links.
+        let plain = RunId::parse(older).unwrap();
+        let link = session_link(dir.path(), &entry, &on, Some(&plain)).unwrap();
+        assert_eq!(link.verdict.unwrap().run_id, plain);
+
+        // The verdict list says which references the latest verdict was judged with.
+        let rows = latest_verdicts(dir.path(), std::slice::from_ref(&entry), None).unwrap();
+        assert_eq!(rows[0].references, vec![reference]);
+        let row = serde_json::to_value(&rows[0]).unwrap();
+        assert!(row.get("references").is_some());
+    }
+
+    #[test]
+    fn a_session_link_goes_stale_when_the_code_plan_or_engine_no_longer_matches_its_verdict() {
+        let entry = td_engine::find_strategy("sma_cross").unwrap();
+        let on = entry.plan.instruments[0].clone();
+        let current = LinkedVerdict {
+            run_id: RunId::parse("1700000000000-0000000a").unwrap(),
+            state: VerdictState::Trade,
+            complete: true,
+            engine_revision: ENGINE_REVISION,
+            code_hash: td_engine::code_hash("sma_cross").map(String::from),
+            plan: serde_json::to_value(&entry.plan).unwrap(),
+            rule: serde_json::to_value(entry.rule).unwrap(),
+        };
+        let link = |verdict: Option<LinkedVerdict>| SessionLink {
+            code_hash: td_engine::code_hash("sma_cross").map(String::from),
+            plan: current.plan.clone(),
+            rule: current.rule.clone(),
+            verdict,
+        };
+        let registered = std::slice::from_ref(&entry);
+        let check = |verdict: LinkedVerdict| {
+            LinkState::of(&link(Some(verdict)), "sma_cross", &on, registered)
+        };
+
+        let fresh = check(current.clone());
+        let flags = (fresh.engine_matches, fresh.plan_matches, fresh.code_matches);
+        assert_eq!(flags, (Some(true), Some(true), Some(true)));
+        assert!(!fresh.stale);
+
+        let edited = check(LinkedVerdict {
+            code_hash: Some("0000000000000000".into()),
+            ..current.clone()
+        });
+        assert_eq!((edited.code_matches, edited.stale), (Some(false), true));
+
+        let mut plan = current.plan.clone();
+        plan["period"]["from"] = (entry.plan.period.from - 86_400_000).into();
+        let replanned = check(LinkedVerdict {
+            plan,
+            ..current.clone()
+        });
+        assert_eq!(
+            (replanned.plan_matches, replanned.stale),
+            (Some(false), true)
+        );
+
+        let old_engine = check(LinkedVerdict {
+            engine_revision: ENGINE_REVISION - 1,
+            ..current.clone()
+        });
+        assert_eq!(
+            (old_engine.engine_matches, old_engine.stale),
+            (Some(false), true)
+        );
+
+        let unhashed = check(LinkedVerdict {
+            code_hash: None,
+            ..current.clone()
+        });
+        assert_eq!((unhashed.code_matches, unhashed.stale), (None, true));
+
+        // A strategy the server no longer registers fails the plan check, as on `GET /verdicts`.
+        let unregistered = LinkState::of(&link(Some(current.clone())), "sma_cross", &on, &[]);
+        assert_eq!(
+            (unregistered.plan_matches, unregistered.stale),
+            (Some(false), true)
+        );
+    }
+
+    #[test]
+    fn a_session_link_without_a_verdict_goes_stale_when_the_code_or_plan_changes_after_it_starts() {
+        let entry = td_engine::find_strategy("sma_cross").unwrap();
+        let registered = std::slice::from_ref(&entry);
+        // An instrument the plan does not test, so it has no verdict.
+        let on = id("NOPEUSDT", InstrumentKind::Spot);
+        let started = SessionLink {
+            code_hash: td_engine::code_hash("sma_cross").map(String::from),
+            plan: serde_json::to_value(&entry.plan).unwrap(),
+            rule: serde_json::to_value(entry.rule).unwrap(),
+            verdict: None,
+        };
+        let checks = |state: &LinkState| {
+            let flags = (state.engine_matches, state.plan_matches, state.code_matches);
+            (flags, state.stale)
+        };
+
+        let unchanged = LinkState::of(&started, "sma_cross", &on, registered);
+        assert_eq!(checks(&unchanged), ((None, Some(true), Some(true)), false));
+
+        let edited = SessionLink {
+            code_hash: Some("0000000000000000".into()),
+            ..started.clone()
+        };
+        let edited = LinkState::of(&edited, "sma_cross", &on, registered);
+        assert_eq!(checks(&edited), ((None, Some(true), Some(false)), true));
+
+        let mut plan = started.plan.clone();
+        plan["period"]["from"] = (entry.plan.period.from - 86_400_000).into();
+        let replanned = SessionLink {
+            plan,
+            ..started.clone()
+        };
+        let replanned = LinkState::of(&replanned, "sma_cross", &on, registered);
+        assert_eq!(checks(&replanned), ((None, Some(false), Some(true)), true));
+
+        // When the server no longer registers the strategy its plan cannot be checked: `null`,
+        // and stale, not "not stale".
+        let unregistered = LinkState::of(&started, "sma_cross", &on, &[]);
+        assert_eq!(checks(&unregistered), ((None, None, Some(true)), true));
     }
 
     #[test]

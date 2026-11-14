@@ -69,7 +69,9 @@ pub fn find_strategy(name: &str) -> Option<StrategyEntry> {
 
 #[cfg(test)]
 fn test_only() -> Vec<StrategyEntry> {
-    crate::strategies::test_only::entries()
+    let mut entries = crate::strategies::test_only::entries();
+    entries.extend(crate::reference::tests::test_entries());
+    entries
 }
 
 #[cfg(not(test))]
