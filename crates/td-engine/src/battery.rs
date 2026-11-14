@@ -739,7 +739,10 @@ pub fn run_battery_with_references(
             // their sum. Each plateau direction's stitched return and objective compound, and so
             // does R1's objective they are judged against. The lowest equity line reads the
             // stitched lows, above zero after two windows of -60% where this curve is below it, a
-            // test that already fails the return. The Sharpe warning reads the stitched days,
+            // test that already fails the return. Where the compounded account is gone and this
+            // one is not, the stitched figures leave the later windows out: the lowest equity line
+            // reads zero and fails a test whose return can pass, and the trade count leaves those
+            // windows' trades out. The Sharpe warning reads the stitched days,
             // whose returns differ from this curve's by each window's own level, so only a figure
             // near its limit can move. Shown but not judged by this kind: the daily bootstrap,
             // likewise, and the trade bootstrap and breakdown, whose stitched trades carry the
@@ -796,10 +799,15 @@ pub fn run_battery_with_references(
             // firm's test, or with any fill without one.
             let step = plan.timeframe.duration_ms();
             let ends: Vec<Millis> = days.iter().map(|d| d.end).collect();
-            // The windows' own fills, so a trade's value is judged at the size tested.
+            // The windows' own fills, so a trade's value is judged at the size tested, from the
+            // windows the curve the lines read counts.
+            let fills = match per_cash {
+                Some(_) => tester::fixed_size_fills(cash, &wf.windows),
+                None => tester::tested_fills(cash, &wf.windows),
+            };
             let traded = traded_days(
                 &ends,
-                &tester::tested_fills(cash, &wf.windows),
+                &fills,
                 step,
                 firm.trading_day.as_ref(),
                 cash,
@@ -1296,25 +1304,29 @@ fn stressed(fees: FeeSchedule, multiplier: f64) -> FeeSchedule {
 }
 
 /// R4's total return from each stressed test window's last equity (`None` for a window with no
-/// equity, which changes nothing). The windows compound, as the stitched curve compounds them.
-/// With `fixed_size`, each window's own money change is added to the starting cash instead, as
-/// [`tester::stitch_fixed_size`] adds them, and the total is that over the starting cash, less
-/// one. Either way, once the compounded account is at or below zero, later windows add nothing,
-/// as in both curves: the account is gone.
+/// equity, which changes nothing). The windows compound, as the stitched curve compounds them,
+/// and once the compounded account is at or below zero later windows add nothing: the account is
+/// gone. With `fixed_size`, each window's own money change is added to the starting cash instead,
+/// as [`tester::stitch_fixed_size`] adds them, and the total is that over the starting cash, less
+/// one; there the added money decides when the account is gone, as on that curve. That total is
+/// not floored at -100%, as the fixed-size out-of-sample return is not, because the window that
+/// empties the account is counted in full.
 fn stressed_total_return(cash: f64, ends: &[Option<f64>], fixed_size: bool) -> f64 {
-    let (mut level, mut money) = (1.0f64, cash);
+    if fixed_size {
+        let mut money = cash;
+        for &end in ends {
+            if money > 0.0 {
+                money += end.map_or(0.0, |e| e - cash);
+            }
+        }
+        return money / cash - 1.0;
+    }
+    let mut level = 1.0f64;
     for &end in ends {
         let growth = end.map_or(1.0, |e| e / cash);
-        if level > 0.0 {
-            money += end.map_or(0.0, |e| e - cash);
-        }
         level = if level > 0.0 { level * growth } else { 0.0 };
     }
-    if fixed_size {
-        money / cash - 1.0
-    } else {
-        level.max(0.0) - 1.0
-    }
+    level.max(0.0) - 1.0
 }
 
 /// The data a battery's runs are given: bars, asks, funding and reference bars.
@@ -2318,8 +2330,8 @@ mod tests {
 
     /// The return at higher costs compounds its windows, unless the strategy sizes from the
     /// starting cash: then it is the starting cash plus each window's own money change, over the
-    /// starting cash, less one, so it never reads above the return it stresses from compounding
-    /// alone. Every figure here is exact in binary.
+    /// starting cash, less one, so it is read like the out-of-sample return it is compared with.
+    /// Every figure here is exact in binary.
     #[test]
     fn the_return_at_higher_costs_adds_the_windows_when_sized_from_the_starting_cash() {
         let cash = 128.0;
@@ -2336,9 +2348,20 @@ mod tests {
             total(&[Some(144.0), Some(113.0)]),
             (-0.0068359375, 0.0078125)
         );
-        // A window that takes the compounded account to zero leaves later windows flat on
-        // either reading, as both stitched curves do.
-        assert_eq!(total(&[Some(256.0), Some(0.0), Some(192.0)]), (-1.0, 0.0));
+        // A window that takes the compounded account to zero leaves later windows flat there,
+        // but the fixed-size account is at 128 after it and goes on to 192.
+        assert_eq!(total(&[Some(256.0), Some(0.0), Some(192.0)]), (-1.0, 0.5));
+        // Two windows of -62.5% leave the fixed-size account at -32, gone, so the +150% after
+        // them adds nothing there, while the compounded account still holds some of its cash.
+        assert_eq!(
+            total(&[Some(48.0), Some(48.0), Some(320.0)]),
+            (-0.6484375, -1.25)
+        );
+        // Exactly zero is gone too.
+        assert_eq!(
+            total(&[Some(64.0), Some(64.0), Some(192.0)]),
+            (-0.625, -1.0)
+        );
         // A window with no equity changes nothing.
         assert_eq!(total(&[None, Some(160.0)]), (0.25, 0.25));
     }
@@ -3816,6 +3839,62 @@ mod tests {
         let same = on.start_offsets.iter();
         let same = same.filter(|o| o.oos_return.map(crate::strategies::direction) == sign);
         assert_eq!(on.evidence.start_offsets_same_sign, same.count());
+    }
+
+    /// The fills a rule sized from the starting cash reads span the windows the fixed-size curve
+    /// counts, not those the compounding curve gives weight: on windows that each start at
+    /// 10,000, each holding one fill marked by its price.
+    #[test]
+    fn the_fixed_size_fills_span_the_windows_the_fixed_size_curve_counts() {
+        let config = test_config();
+        let bars: Vec<Candle> = (0..20)
+            .map(|i| Candle {
+                open_time: i * HOUR,
+                open: 100.0,
+                high: 100.1,
+                low: 99.9,
+                close: 100.0,
+                volume: 1.0,
+                quote_volume: 100.0,
+            })
+            .collect();
+        let template = run(&config, &bars, &[], &[]).unwrap();
+        let cash = 10_000.0;
+        let marked = |i: usize| day_fill(1, Side::Buy, 1.0, 100.0 + i as f64);
+        let windows = |ends: &[f64]| -> Vec<crate::WindowResult> {
+            ends.iter()
+                .enumerate()
+                .map(|(i, &end)| window(&template, end, vec![marked(i)]))
+                .collect()
+        };
+        let curve = |w: &[crate::WindowResult]| -> Vec<f64> {
+            let (equity, _) = tester::stitch_fixed_size(cash, w);
+            equity.iter().map(|p| p.equity).collect()
+        };
+        // The compounded account is gone after the second window; the fixed-size one is at
+        // 10,000 and trades on in the third.
+        let w = windows(&[20_000.0, 0.0, 15_000.0]);
+        assert_eq!(
+            curve(&w),
+            [10_000.0, 20_000.0, 20_000.0, 10_000.0, 10_000.0, 15_000.0]
+        );
+        assert_eq!(
+            tester::fixed_size_fills(cash, &w),
+            [marked(0), marked(1), marked(2)]
+        );
+        assert_eq!(tester::tested_fills(cash, &w), [marked(0), marked(1)]);
+        // Two windows of -62.5% leave the fixed-size account at -2,500, gone, so the third window
+        // stays flat and its fill is left out, while the compounded account keeps it.
+        let w = windows(&[3_750.0, 3_750.0, 25_000.0]);
+        assert_eq!(
+            curve(&w),
+            [10_000.0, 3_750.0, 3_750.0, -2_500.0, -2_500.0, -2_500.0]
+        );
+        assert_eq!(tester::fixed_size_fills(cash, &w), [marked(0), marked(1)]);
+        assert_eq!(
+            tester::tested_fills(cash, &w),
+            [marked(0), marked(1), marked(2)]
+        );
     }
 
     /// A rule sized from the starting cash judges the return of the account that trades the

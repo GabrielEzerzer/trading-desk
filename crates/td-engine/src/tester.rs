@@ -1758,15 +1758,55 @@ pub fn stitch(starting_cash: f64, segments: &[&[EquityPoint]]) -> Vec<EquityPoin
 /// its value against the starting balance reads these, since the stitched fills' value is the
 /// tested value times the stitched curve's level at that window.
 pub(crate) fn tested_fills(starting_cash: f64, windows: &[WindowResult]) -> Vec<Fill> {
-    let segments: Vec<&[EquityPoint]> = windows
+    let counted = segment_scales(starting_cash, &test_curves(windows))
+        .into_iter()
+        .map(|s| s != 0.0);
+    counted_fills(windows, counted)
+}
+
+/// [`tested_fills`] for a strategy that trades a fixed size set from the starting cash: each
+/// window's own fills, with the windows [`stitch_fixed_size`] holds flat left out, those after
+/// that curve reached zero, so the fills span the windows that curve counts.
+pub(crate) fn fixed_size_fills(starting_cash: f64, windows: &[WindowResult]) -> Vec<Fill> {
+    counted_fills(
+        windows,
+        fixed_size_counted(starting_cash, &test_curves(windows)),
+    )
+}
+
+/// Each window's test equity.
+fn test_curves(windows: &[WindowResult]) -> Vec<&[EquityPoint]> {
+    windows
         .iter()
         .map(|w| &w.out_of_sample.equity[..])
-        .collect();
-    segment_scales(starting_cash, &segments)
+        .collect()
+}
+
+/// The fills of the windows `counted` marks, in order.
+fn counted_fills(windows: &[WindowResult], counted: impl IntoIterator<Item = bool>) -> Vec<Fill> {
+    counted
         .into_iter()
         .zip(windows)
-        .filter(|&(s, _)| s != 0.0)
+        .filter(|&(c, _)| c)
         .flat_map(|(_, w)| w.out_of_sample.fills.iter().cloned())
+        .collect()
+}
+
+/// Whether each segment counts on the fixed-size curve: while that curve's level before it, the
+/// starting cash plus the money changes of the segments counted before it, is above zero. The
+/// segment that takes the level to zero or below counts in full; every later one does not, as
+/// the account is gone and stays gone.
+fn fixed_size_counted(starting_cash: f64, segments: &[&[EquityPoint]]) -> Vec<bool> {
+    let mut level = starting_cash;
+    segments
+        .iter()
+        .map(|seg| {
+            let counted = level > 0.0;
+            if let (true, Some(last)) = (counted, seg.last()) {
+                level += last.equity - starting_cash;
+            }
+            counted
+        })
         .collect()
 }
 
@@ -1775,10 +1815,12 @@ pub(crate) fn tested_fills(starting_cash: f64, windows: &[WindowResult]) -> Vec<
 /// previous window ended, so each window adds its own money changes where [`stitch`] compounds
 /// them. Each window is its own backtest from the starting cash, so a change on this curve is
 /// what an account at the starting balance trading that window's fixed size made, where the same
-/// change on the stitched curve is that times the stitched curve's level at the window. The
-/// windows [`stitch`] gives no weight, those after the stitched equity reached zero, stay flat
-/// here, so both curves and [`tested_fills`] span the same windows. The ranges are empty unless
-/// every window has one per point, as on the stitched curve.
+/// change on the stitched curve is that times the stitched curve's level at the window. This
+/// curve's own level decides whether the account is gone, not the stitched curve's: once it is at
+/// or below zero, every later window stays flat, and the window that took it there counts in
+/// full, as [`stitch`] counts its own. [`fixed_size_fills`] spans the windows this curve counts,
+/// as [`tested_fills`] spans those of [`stitch`]. The ranges are empty unless every window has
+/// one per point, as on the stitched curve.
 pub(crate) fn stitch_fixed_size(
     starting_cash: f64,
     windows: &[WindowResult],
@@ -1804,13 +1846,15 @@ fn add_segments(
     let has_ranges = segments.iter().all(|(e, r)| r.len() == e.len());
     let (mut equity, mut ranges) = (Vec::new(), Vec::new());
     let mut level = starting_cash;
-    for (&(points, extremes), scale) in segments.iter().zip(segment_scales(starting_cash, &curves))
+    for (&(points, extremes), counted) in segments
+        .iter()
+        .zip(fixed_size_counted(starting_cash, &curves))
     {
         let moved = |x: f64| {
-            if scale == 0.0 {
-                level
-            } else {
+            if counted {
                 level + (x - starting_cash)
+            } else {
+                level
             }
         };
         equity.extend(points.iter().map(|p| EquityPoint {
@@ -2462,7 +2506,8 @@ mod tests {
         // A window without a range per point leaves the ranges out.
         let (_, ranges) = add_segments(100.0, &[(&a, &a_ranges), (&b, &b_ranges[..1])]);
         assert!(ranges.is_empty());
-        // A window after the stitched equity reached zero has no weight there, and stays flat.
+        // A window that takes the stitched equity to zero leaves this account at 20, so the
+        // window after it still counts here, and adds nothing because it is flat.
         let ruin = [point(2, 0.0)];
         let (equity, ranges) = add_segments(
             100.0,
@@ -2475,6 +2520,34 @@ mod tests {
         let values: Vec<f64> = equity.iter().map(|p| p.equity).collect();
         assert_eq!(values, [110.0, 120.0, 20.0, 20.0]);
         assert_eq!(ranges[3], range(20.0, 20.0));
+    }
+
+    /// The fixed-size curve's own level decides whether the account is gone, not the compounding
+    /// curve's. Every figure here is exact in binary.
+    #[test]
+    fn the_fixed_size_account_is_gone_only_when_its_own_level_reaches_zero() {
+        let values = |ends: &[f64]| {
+            let curves: Vec<[EquityPoint; 1]> = ends
+                .iter()
+                .enumerate()
+                .map(|(i, &e)| [point(i as Millis, e)])
+                .collect();
+            let segments: Vec<(&[EquityPoint], &[EquityRange])> =
+                curves.iter().map(|c| (&c[..], &[][..])).collect();
+            let (equity, _) = add_segments(128.0, &segments);
+            equity.iter().map(|p| p.equity).collect::<Vec<f64>>()
+        };
+        // The compounded account is gone after the second window; this one is at 128 and goes on.
+        assert_eq!(values(&[256.0, 0.0, 192.0]), [256.0, 128.0, 192.0]);
+        // Two windows of -62.5% take this account to -32, gone, and the +150% after them stays
+        // flat, while the compounded account still holds some of its cash.
+        assert_eq!(values(&[48.0, 48.0, 320.0]), [48.0, -32.0, -32.0]);
+        assert_eq!(
+            segment_scales(128.0, &[&[point(0, 48.0)], &[point(1, 48.0)]]),
+            [1.0, 0.375]
+        );
+        // Exactly zero is gone too, and stays gone.
+        assert_eq!(values(&[64.0, 64.0, 192.0, 192.0]), [64.0, 0.0, 0.0, 0.0]);
     }
 
     #[test]

@@ -1309,9 +1309,10 @@ breach_horizon_days: number,
  * simulated attempts add each day's profit and loss as a share of the starting cash instead
  * of compounding a return on the balance, both read on each walk-forward test window's own
  * money changes. The evidence layer's out-of-sample return reads the same added curve, its
- * last value over the starting cash less one. `false`, the default, reads every fall and
- * every day as a share of the balance it starts from, which is exact for a strategy whose
- * size grows with its balance. `false` is left out of JSON.
+ * last value over the starting cash less one, and so do the return at higher costs and each
+ * start offset's return, each on its own run's windows. `false`, the default, reads every
+ * fall and every day as a share of the balance it starts from, which is exact for a strategy
+ * whose size grows with its balance. `false` is left out of JSON.
  */
 sizes_from_starting_cash?: boolean, };
 
@@ -1637,7 +1638,9 @@ windows: number,
 luck_p: number | null, 
 /**
  * R4: the out-of-sample return with fees, the per-unit commission, slippage and on a market
- * with quotes each bar's spread multiplied by the cost stress.
+ * with quotes each bar's spread multiplied by the cost stress. For a `prop_firm` rule with
+ * `sizes_from_starting_cash`, read like `oos_return`: the stressed windows' own money changes
+ * added to the starting cash.
  */
 stressed_return: number | null, 
 /**
@@ -1650,7 +1653,9 @@ plateau_median_ratio: number | null,
  */
 plateau_positive_share: number | null, 
 /**
- * R6: how many start offsets gave a result of the same sign as the main run.
+ * R6: how many start offsets gave a result of the same sign as the main run. For a
+ * `prop_firm` rule with `sizes_from_starting_cash`, each offset's result is read like
+ * `oos_return`, on its own windows' money changes added.
  */
 start_offsets_same_sign: number, };
 
