@@ -203,9 +203,11 @@ struct Tracked {
     cancel_asked: bool,
     /// An order carried over a restart whose outcome the venue has not settled: an entry whose
     /// outcome was unknown, or an entry's stop sent with an unknown outcome
-    /// ([`At::Unsettled`]), from when going live starts until the venue settles it. While any
-    /// order is carried, no close at market goes out (`Core::restart_unresolved`). A record made
-    /// before this field existed loads it as false.
+    /// ([`At::Unsettled`]), from when going live starts until the venue settles it. An entry is
+    /// settled once the venue shows it or two looks find nothing (it is then refused); a stop
+    /// only once the venue shows it, since not finding it does not show that it never rested.
+    /// While any order is carried, no close at market goes out (`Core::restart_unresolved`). A
+    /// record made before this field existed loads it as false.
     #[serde(default)]
     carried: bool,
 }
@@ -228,7 +230,8 @@ enum At {
     Unplaced,
     /// An entry's attached stop sent under its `o` id whose outcome is unknown: it may rest. On
     /// the first fill the venue confirms, the venue is asked about it before anything else goes
-    /// out for the fill (`Core::settle_stop`); going live after a restart asks at once.
+    /// out for the fill (`Core::settle_stop`); going live after a restart asks at once, and keeps
+    /// it unsettled when the venue does not show it.
     Unsettled,
     /// An entry's attached stop at the venue under its `s` id.
     Cover,
@@ -410,10 +413,12 @@ impl VenueHandle {
             .push_back(record);
     }
 
-    /// Ends a replay: resolves the orders whose request outcome was lost, the stops sent with an
-    /// unknown outcome and the orders the session submitted past the record by asking the venue,
-    /// and reconciles the venue with the recorded state. An order the venue holds is adopted, with
+    /// Ends a replay: asks the venue about the orders whose request outcome was lost, the stops
+    /// sent with an unknown outcome and the orders the session submitted past the record, and
+    /// reconciles the venue with the recorded state. An order the venue holds is adopted, with
     /// any protective stop it already holds for it; one it does not hold is refused, never sent.
+    /// A stop of unknown outcome the venue does not show stays unresolved, and its entry's first
+    /// confirmed fill asks about it again (see the crate documentation, "Unknown outcomes").
     /// The only orders this sends are reduce-only stops, and their resizes, for fills the venue
     /// lists. Every record must have been replayed. A fault the records carry is restored, and
     /// then nothing is sent and the fault is returned. Does nothing more on a broker that is not
@@ -2327,22 +2332,17 @@ impl Core {
                 Err(_) => self.tracked(id).at = At::Unknown { tries: 1 },
             }
         }
-        // A stop whose outcome is unknown is taken if the venue holds it and held as unplaced if
-        // two looks find nothing, so the entry's first confirmed fill finds it settled. One the
-        // venue cannot be asked about stays carried, and that fill asks again.
+        // A stop whose outcome is unknown is taken if the venue holds it, which settles it. One
+        // that two looks do not find, or that the venue cannot be asked about, stays unsettled
+        // and carried: not finding it does not show that it never rested. The entry's first
+        // confirmed fill then asks again (`Core::settle_stop`), and while the stop is carried a
+        // cover the venue refuses closes nothing.
+        // shortcut: a carried stop whose entry never fills is never asked about again, so it
+        // stays carried and no close at market goes out for the rest of the session. Ask about it
+        // on each bar's reads, as for an entry of unknown outcome, if that matters in practice.
         for (entry, id) in unsettled {
-            match self.find(id) {
-                Ok(Some(found)) => {
-                    self.take_stop(entry, Role::Order, &found);
-                }
-                Ok(None) => {
-                    self.unplaced(id);
-                    self.tracked(id).carried = false;
-                }
-                // shortcut: one whose entry never fills is never asked about again, so it stays
-                // carried and no close at market goes out for the rest of the session. Ask about
-                // it on each bar's reads, as for an entry of unknown outcome, if that matters.
-                Err(_) => {}
+            if let Ok(Some(found)) = self.find(id) {
+                self.take_stop(entry, Role::Order, &found);
             }
         }
         // A venue that cannot be read now is reconciled on the next bar, as any bar's reads.
