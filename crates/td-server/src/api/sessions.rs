@@ -65,7 +65,8 @@ pub struct StartSessionRequest {
     pub fees: Option<FeeSchedule>,
     /// The saved verdict (a plan run's id) the session is started from: a verdict of the same
     /// strategy on the same instrument. Left out, the strategy's latest verdict on the instrument
-    /// as `GET /verdicts` gives it, if it has one. Refused on a manual session.
+    /// as `GET /verdicts` gives it, if it has one. Refused on a manual session, and for a verdict
+    /// judged with reference instruments, named or latest, since a session cannot feed them.
     #[serde(default)]
     #[ts(optional)]
     pub verdict_run_id: Option<RunId>,

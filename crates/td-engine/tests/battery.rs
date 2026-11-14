@@ -1049,7 +1049,9 @@ fn attempt_terms_price_an_attempt_and_add_the_value_line() {
         line(&priced, "attempt_value").value,
         Some(attempt.reduced.value)
     );
-    // The odds are the same with or without terms: the attempt draws from its own seed stream.
+    // The attempt draws from its own seed stream, so the pass odds are the same with or without
+    // terms. The breach odds walk the funded account with the terms' payouts; on these days every
+    // path breaches either way.
     assert_eq!(priced.prop_firm_odds, plain.prop_firm_odds);
     // With no passing fee, an attempt loses at most its evaluation fee.
     for f in [attempt.full, attempt.reduced] {

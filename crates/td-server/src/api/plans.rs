@@ -883,8 +883,9 @@ impl LinkState {
 /// `verdict`, or from the strategy's latest verdict on the instrument when it is `None`. 400
 /// `invalid_verdict` for a run that is not a saved verdict of this strategy on this instrument, or
 /// one judged with reference instruments, which a paper session cannot feed its strategy: it would
-/// be a different test from the one the verdict judged. When the latest verdict is such a one, the
-/// session is linked to no verdict.
+/// be a different test from the one the verdict judged. That holds for the latest verdict too, so
+/// a session of a strategy last judged with references does not start unless the request names a
+/// verdict judged without them.
 pub(crate) fn session_link(
     runs_dir: &Path,
     entry: &StrategyEntry,
@@ -910,14 +911,24 @@ pub(crate) fn session_link(
             }
             Some((checked, record))
         }
-        None => latest_verdicts(runs_dir, std::slice::from_ref(entry), Some(entry.name))?
-            .into_iter()
-            .find(|row| row.instrument == *instrument)
-            .and_then(|row| {
-                let record = read_record(&runs_dir.join(row.run_id.as_str()))?;
-                Some((row.run_id, record))
-            })
-            .filter(|(_, record)| record.references.is_empty()),
+        None => {
+            let latest = latest_verdicts(runs_dir, std::slice::from_ref(entry), Some(entry.name))?
+                .into_iter()
+                .find(|row| row.instrument == *instrument);
+            match latest {
+                // Judged from the row, so a record that cannot be read again does not let the
+                // session start unlinked.
+                Some(row) if !row.references.is_empty() => {
+                    return Err(bad(format!(
+                        "{}; it is the strategy's latest verdict on {instrument}, so name a verdict judged without them in `verdict_run_id`, or run a test without them first",
+                        paper_cannot_feed(&row.run_id, &row.references)
+                    )));
+                }
+                Some(row) => read_record(&runs_dir.join(row.run_id.as_str()))
+                    .map(|record| (row.run_id, record)),
+                None => None,
+            }
+        }
     };
     let json = |value: Result<Value, serde_json::Error>| {
         value.map_err(|e| ApiError::internal(format!("cannot record the session's link: {e}")))
@@ -1047,7 +1058,8 @@ mod tests {
     }
 
     /// A paper session feeds no reference instruments, so it is never linked to a verdict judged
-    /// with them: one named is refused, and a latest one leaves the session without a verdict.
+    /// with them: one named is refused, and so is a session left to the latest verdict when that
+    /// is such a one, since it would run without the bars its strategy was judged on.
     #[test]
     fn a_session_is_never_linked_to_a_verdict_judged_with_reference_instruments() {
         let dir = tempfile::tempdir().unwrap();
@@ -1072,9 +1084,12 @@ mod tests {
             "{}",
             refused.body.message
         );
-        assert_eq!(
-            session_link(dir.path(), &entry, &on, None).unwrap().verdict,
-            None
+        let latest = session_link(dir.path(), &entry, &on, None).unwrap_err();
+        assert_eq!(latest.body.code, "invalid_verdict");
+        assert!(
+            latest.body.message.contains("latest verdict"),
+            "{}",
+            latest.body.message
         );
         // A verdict judged without them still links.
         let plain = RunId::parse(older).unwrap();
