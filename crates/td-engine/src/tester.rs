@@ -1835,21 +1835,18 @@ fn placed_peak_leverage(exposures: &[Exposure], moved: f64) -> f64 {
         .fold(0.0, f64::max)
 }
 
-/// The largest open notional, in the account currency, of the test windows the account stitched
-/// with `sizing` counts ([`segment_factors`]): each counted window's own largest notional at the
-/// points its run's intrabar measures evaluate (`held`, one list per window, from
-/// [`crate::runner::run_exposures`]). Each window is its own backtest from the starting cash, so
-/// this is the notional of an account started at the starting cash, at a fixed size or
-/// compounding alike: when compounding it is not scaled by the stitched curve's level, as each
-/// attempt a `prop_firm` rule's other lines read starts again from its own balance. 0 when no
-/// counted window held a position.
+/// The largest open notional, in the account currency, of the test windows the fixed-size account
+/// counts (see [`Sizing::FixedSize`]): each counted window's own largest notional at the points
+/// its run's intrabar measures evaluate (`held`, one list per window, from
+/// [`crate::runner::run_exposures`]). At a fixed size the account holds each window's own
+/// position whatever its balance, so this is its notional at every such point. 0 when no counted
+/// window held a position.
 pub(crate) fn peak_open_notional(
     starting_cash: f64,
     windows: &[WindowResult],
     held: &[Vec<Exposure>],
-    sizing: Sizing,
 ) -> f64 {
-    segment_factors(starting_cash, &test_curves(windows), sizing)
+    segment_factors(starting_cash, &test_curves(windows), Sizing::FixedSize)
         .into_iter()
         .zip(held)
         .filter(|&(f, _)| f != 0.0)
@@ -2868,31 +2865,33 @@ mod tests {
         assert_eq!(peak(Sizing::Compounding), Some(1.5));
     }
 
-    /// The largest open notional of the windows the account counts, each window's own, whether
-    /// the account compounds or trades a fixed size. The first window doubles the starting cash,
-    /// so the stitched curve stands at 20,000 where the second starts; the second's own 8,000 is
-    /// read as 8,000, not as the 16,000 the curve's level would scale it to.
+    /// The largest open notional of the windows the fixed-size account counts, each window's own.
+    /// That account adds each window's money change to the starting cash: 10,000 less 5,000 and
+    /// then less 6,000 takes it below zero in the second window, so the second counts in full and
+    /// the third is not read, though the compounding curve, at 10,000 times a half times four
+    /// tenths, is still above zero there.
     #[test]
-    fn the_peak_open_notional_reads_each_counted_window_at_its_own_size() {
-        let mut doubled = rising_window(0, 20);
-        doubled.out_of_sample.equity.last_mut().unwrap().equity = 20_000.0;
+    fn the_peak_open_notional_reads_the_windows_the_fixed_size_account_counts() {
+        let template = rising_window(0, 20);
+        let ending = |end: f64| {
+            let mut w = template.clone();
+            w.out_of_sample.equity.last_mut().unwrap().equity = end;
+            w
+        };
         let at = |notional| Exposure {
             notional,
             equity: 10_000.0,
         };
-        let held = [vec![at(5_000.0), at(6_000.0)], vec![at(8_000.0)]];
-        let windows = [doubled, rising_window(20, 40)];
-        let peak =
-            |windows: &[WindowResult], sizing| peak_open_notional(10_000.0, windows, &held, sizing);
-        for sizing in [Sizing::FixedSize, Sizing::Compounding] {
-            assert_eq!(peak(&windows, sizing), 8_000.0);
-        }
-        // A window after the account is gone is not counted, so its notional is not read.
-        let mut gone = windows.clone();
-        gone[0].out_of_sample.equity.last_mut().unwrap().equity = 0.0;
-        for sizing in [Sizing::FixedSize, Sizing::Compounding] {
-            assert_eq!(peak(&gone, sizing), 6_000.0);
-        }
+        let held = [
+            vec![at(5_000.0), at(6_000.0)],
+            vec![at(7_000.0)],
+            vec![at(9_000.0)],
+        ];
+        let gone = [ending(5_000.0), ending(4_000.0), ending(12_000.0)];
+        assert_eq!(peak_open_notional(10_000.0, &gone, &held), 7_000.0);
+        // With the account still above zero after the second window, the third is read.
+        let kept = [ending(15_000.0), ending(4_000.0), ending(12_000.0)];
+        assert_eq!(peak_open_notional(10_000.0, &kept, &held), 9_000.0);
     }
 
     #[test]

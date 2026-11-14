@@ -582,13 +582,10 @@ pub fn run_battery_with_references(
         false => Sizing::Compounding,
     };
     // Each window's open positions inside its bars, which its result does not keep, from its test
-    // run made again: the peak leverage at a fixed size and the open-notional line read them.
-    let notional_limit = match rule {
-        VerdictRule::PropFirm { limits, .. } => limits.max_open_notional_multiple,
-        _ => None,
-    };
+    // run made again: the peak leverage and the open-notional line, both at a fixed size, read
+    // them.
     let held = match &wf {
-        Some(wf) if sizes_from_cash || notional_limit.is_some() => Some(
+        Some(wf) if sizes_from_cash => Some(
             wf.windows
                 .iter()
                 .map(|w| {
@@ -762,11 +759,13 @@ pub fn run_battery_with_references(
             // changes, added from window to window, and its lines on the starting-cash reading;
             // otherwise on the stitched curve, and its lines on each fall's own start.
             let per_cash = sizes_from_cash.then_some(cash);
-            if let (Some(_), Some(held)) = (notional_limit, &held) {
+            // The limit needs `sizes_from_starting_cash` (`VerdictRule::validate`), so `held` is
+            // read whenever it is set.
+            if let (Some(_), Some(held)) = (limits.max_open_notional_multiple, &held) {
                 // The evaluation and the funded account each trade their terms' size, a multiple
                 // of the size tested; the larger is the one that can breach the limit.
                 let size = attempt.map_or(1.0, |t| t.evaluation_size.max(t.funded_size));
-                let peak = tester::peak_open_notional(cash, &wf.windows, held, sizing);
+                let peak = tester::peak_open_notional(cash, &wf.windows, held);
                 kind.peak_open_notional = Some(peak / cash * size);
             }
             let (series, ranges) = (&series, &wf.equity_extremes[..]);
@@ -3626,21 +3625,20 @@ mod tests {
         }
     }
 
-    /// A limit on open notional is judged on the largest notional of the windows the account the
-    /// other lines read counts, each window's own over the starting cash, compounding or at a
-    /// fixed size, and never scaled by the stitched curve's level. A limit below the figure fails
-    /// the line, one above passes it, and a rule without the limit has the lines it had. With
-    /// `attempt` terms the figure is taken at the larger of the evaluation and funded sizes.
+    /// A limit on open notional, which needs a plan sized from the starting cash, is judged on the
+    /// largest open notional of the windows the fixed-size account counts, each window's own over
+    /// the starting cash. A limit below the figure fails the line, one above passes it, and a rule
+    /// without the limit has the lines it had. With `attempt` terms the figure is taken at the
+    /// larger of the evaluation and funded sizes. At a compounding size the battery refuses it.
     #[test]
-    fn a_limit_on_open_notional_is_judged_on_the_account_the_lines_read() {
+    fn a_limit_on_open_notional_is_judged_on_the_fixed_size_account() {
         let (plan, bars) = sma_plan(sma_axes());
         let cash = plan.backtest.starting_cash;
-        let battery = |sized: bool, cap: Option<f64>| {
-            let VerdictRule::PropFirm { firm, limits, .. } =
-                firm_rule(DrawdownMode::Static, 10, None)
-            else {
-                unreachable!()
-            };
+        let VerdictRule::PropFirm { firm, limits, .. } = firm_rule(DrawdownMode::Static, 10, None)
+        else {
+            unreachable!()
+        };
+        let battery = |sized: bool, cap: Option<f64>, attempt: Option<crate::AttemptTerms>| {
             let rule = VerdictRule::PropFirm {
                 firm,
                 limits: crate::PropFirmLimits {
@@ -3648,7 +3646,7 @@ mod tests {
                     max_open_notional_multiple: cap,
                     ..limits
                 },
-                attempt: None,
+                attempt,
             };
             let spec = BatterySpec {
                 strategy: "sma_cross",
@@ -3657,7 +3655,7 @@ mod tests {
                 instrument: &test_instrument(),
                 seed: 7,
             };
-            run_battery(&spec, &bars, &[], &[], None).unwrap()
+            run_battery(&spec, &bars, &[], &[], None)
         };
         let line = |r: &BatteryResult| {
             r.verdict
@@ -3666,71 +3664,54 @@ mod tests {
                 .find(|l| l.id == "open_notional")
                 .cloned()
         };
-        let mut figures = Vec::new();
-        for sized in [false, true] {
-            let off = battery(sized, None);
-            assert!(line(&off).is_none());
-            assert_eq!(off.kind.peak_open_notional, None);
-            // The stitched curve's level where each window starts, which the figure is not scaled
-            // by: each window is its own run from the starting cash.
-            let wf = off.walk_forward.as_ref().unwrap();
-            // The account at a fixed size adds each window's money change; its peak leverage is
-            // each window's notional over the window's equity moved by that account's level at
-            // the window's start less the starting cash.
-            let (mut level, mut fixed, mut end) = (cash, cash, 0);
-            let (mut largest, mut scaled, mut leverage) = (0.0f64, 0.0f64, 0.0f64);
-            for w in &wf.windows {
-                assert!(level > 0.0 && fixed > 0.0);
-                let r = &w.out_of_sample;
-                let held = crate::runner::run_exposures(&r.config, &bars, &[], &[], &[]).unwrap();
-                largest = held.iter().map(|x| x.notional).fold(largest, f64::max);
-                scaled = held
-                    .iter()
-                    .map(|x| x.notional * level / cash)
-                    .fold(scaled, f64::max);
-                leverage = held
-                    .iter()
-                    .map(|x| (x.notional, x.equity + (fixed - cash)))
-                    .filter(|&(_, e)| e > 0.0)
-                    .map(|(n, e)| n / e)
-                    .fold(leverage, f64::max);
-                end += r.equity.len();
-                level = wf.equity[end - 1].equity;
-                fixed += r.equity.last().unwrap().equity - cash;
-            }
-            if sized {
-                assert_eq!(off.oos_integrity.peak_leverage, Some(leverage));
-            } else {
-                // The stitched curve leaves the starting cash on these bars, so a figure scaled by
-                // its level would read otherwise.
-                assert_ne!(scaled, largest);
-            }
-            let figure = largest / cash;
-            assert!(figure > 0.0);
-            figures.push(figure);
-            for (cap, outcome) in [(figure / 2.0, Outcome::Fail), (figure * 2.0, Outcome::Pass)] {
-                let capped = battery(sized, Some(cap));
-                let l = line(&capped).unwrap();
-                assert_eq!((l.value, l.outcome), (Some(figure), outcome), "{sized}");
-                let rest: Vec<_> = capped
-                    .verdict
-                    .criteria
-                    .into_iter()
-                    .filter(|l| l.id != "open_notional")
-                    .collect();
-                assert_eq!(rest, off.verdict.criteria);
-            }
+        let Err(TesterError::InvalidSpec(refused)) = battery(false, Some(1.0), None) else {
+            panic!("a limit on open notional at a compounding size was accepted")
+        };
+        assert!(
+            refused.contains("limits.sizes_from_starting_cash"),
+            "{refused}"
+        );
+        let off = battery(true, None, None).unwrap();
+        assert!(line(&off).is_none());
+        assert_eq!(off.kind.peak_open_notional, None);
+        // The account at a fixed size adds each window's money change and counts every window
+        // here. It holds each window's own position, so its largest notional is the largest of
+        // the windows' own, and its peak leverage is each window's notional over the window's
+        // equity moved by that account's level at the window's start less the starting cash.
+        let wf = off.walk_forward.as_ref().unwrap();
+        let mut fixed = cash;
+        let (mut largest, mut leverage) = (0.0f64, 0.0f64);
+        for w in &wf.windows {
+            assert!(fixed > 0.0);
+            let r = &w.out_of_sample;
+            let held = crate::runner::run_exposures(&r.config, &bars, &[], &[], &[]).unwrap();
+            largest = held.iter().map(|x| x.notional).fold(largest, f64::max);
+            leverage = held
+                .iter()
+                .map(|x| (x.notional, x.equity + (fixed - cash)))
+                .filter(|&(_, e)| e > 0.0)
+                .map(|(n, e)| n / e)
+                .fold(leverage, f64::max);
+            fixed += r.equity.last().unwrap().equity - cash;
         }
-        // Both accounts count every window here, so they read the same figure.
-        assert_eq!(figures[0], figures[1]);
-        let figure = figures[0];
+        assert_eq!(off.oos_integrity.peak_leverage, Some(leverage));
+        let figure = largest / cash;
+        assert!(figure > 0.0);
+        for (cap, outcome) in [(figure / 2.0, Outcome::Fail), (figure * 2.0, Outcome::Pass)] {
+            let capped = battery(true, Some(cap), None).unwrap();
+            let l = line(&capped).unwrap();
+            assert_eq!((l.value, l.outcome), (Some(figure), outcome));
+            let rest: Vec<_> = capped
+                .verdict
+                .criteria
+                .into_iter()
+                .filter(|l| l.id != "open_notional")
+                .collect();
+            assert_eq!(rest, off.verdict.criteria);
+        }
         // With attempt terms, the larger of the two sizes: a funded account at twice the size
         // tested reads twice the figure, and an evaluation at three times it reads three times,
         // so a limit of two and a half times fails on the evaluation alone.
-        let VerdictRule::PropFirm { firm, limits, .. } = firm_rule(DrawdownMode::Static, 10, None)
-        else {
-            unreachable!()
-        };
         let at_sizes = |evaluation_size, funded_size| crate::AttemptTerms {
             account_size: 100_000.0,
             evaluation_fee: 500.0,
@@ -3754,22 +3735,7 @@ mod tests {
             (at_sizes(1.0, 2.0), 2.0, Outcome::Pass),
             (at_sizes(3.0, 2.0), 3.0, Outcome::Fail),
         ] {
-            let rule = VerdictRule::PropFirm {
-                firm,
-                limits: crate::PropFirmLimits {
-                    max_open_notional_multiple: Some(figure * 2.5),
-                    ..limits
-                },
-                attempt: Some(terms),
-            };
-            let spec = BatterySpec {
-                strategy: "sma_cross",
-                plan: &plan,
-                rule: &rule,
-                instrument: &test_instrument(),
-                seed: 7,
-            };
-            let priced = run_battery(&spec, &bars, &[], &[], None).unwrap();
+            let priced = battery(true, Some(figure * 2.5), Some(terms)).unwrap();
             let l = line(&priced).unwrap();
             assert_eq!((l.value, l.outcome), (Some(figure * size), outcome));
         }
