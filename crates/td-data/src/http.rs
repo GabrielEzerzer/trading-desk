@@ -8,23 +8,33 @@ use reqwest::blocking::Client;
 use reqwest::header::{HeaderMap, RETRY_AFTER};
 
 use crate::DataError;
+use crate::time::now_ms;
 
 /// The user agent on every request. Nothing identifying goes in headers, URLs or payloads.
 const USER_AGENT: &str = "trading-desk";
 
-/// How many times a request answered 429 or 5xx is tried again before its answer is returned.
+/// How many times a request answered with a rate limit or a 5xx is tried again before it fails.
 const RETRIES: u32 = 4;
 
-/// The longest pause before a retry, whatever a `Retry-After` header asks for.
+/// The longest pause before a retry, whatever the venue asks for. With [`RETRIES`], a request
+/// waits at most four minutes in all before it fails.
 const LONGEST_PAUSE: Duration = Duration::from_secs(60);
+
+/// Bybit's header giving, in milliseconds since the epoch, when its rate-limit window resets
+/// (<https://bybit-exchange.github.io/docs/v5/rate-limit>).
+const BYBIT_LIMIT_RESET: &str = "x-bapi-limit-reset-timestamp";
 
 /// A blocking HTTP client for the venues' public endpoints. Cheap to clone; the connection pool is
 /// shared. Every request sends `Accept-Encoding: gzip` and a gzipped body is decoded before it is
 /// read: Binance's spot exchangeInfo is about 52 KB that way instead of 2.5 MB.
 ///
-/// A GET for text or a file answered 429 or 5xx is tried again up to four times, after the pause a
-/// `Retry-After` header gives in seconds, or else after a pause that starts at a second and doubles
-/// each time, both at most a minute.
+/// A GET for text or a file answered with a rate limit (HTTP 429, or a 2xx body a venue client
+/// names as one, such as Bybit's `retCode` 10006) or a 5xx is tried again up to four times. Each pause
+/// is the longer of a pause that starts at a second and doubles each time and the wait the venue
+/// asks for (a `Retry-After` header in seconds, or Bybit's limit reset time), and at most a
+/// minute: 15 s in all when the venue asks for nothing, four minutes at most. A rate limit still
+/// there after the last try fails with [`DataError::RateLimited`], which says how long it waited;
+/// a 5xx fails with its status.
 #[derive(Debug, Clone)]
 pub struct Http {
     client: Client,
@@ -48,18 +58,34 @@ impl Http {
         })
     }
 
+    /// A client whose pauses before a retry start at a millisecond, for tests.
+    #[cfg(test)]
+    pub(crate) fn with_short_pauses() -> Self {
+        Http {
+            backoff: Duration::from_millis(1),
+            ..Http::new().expect("an HTTP client")
+        }
+    }
+
     /// GETs `url` with `query` and returns the body as text; a non-2xx status is an error.
     pub(crate) fn get_text(
         &self,
         url: &str,
         query: &[(&str, String)],
     ) -> Result<String, DataError> {
-        let response = self.send(url, query)?;
-        let status = response.status();
-        let body = response.text().map_err(|source| DataError::Http {
-            url: url.to_string(),
-            source,
-        })?;
+        self.get_text_limited(url, query, |_| false)
+    }
+
+    /// [`Http::get_text`] for a venue that answers its rate limit with a 2xx body: a body that
+    /// `limited` says is that answer is waited out and tried again as a 429 is.
+    pub(crate) fn get_text_limited(
+        &self,
+        url: &str,
+        query: &[(&str, String)],
+        limited: fn(&[u8]) -> bool,
+    ) -> Result<String, DataError> {
+        let (status, body) = self.send(url, query, limited)?;
+        let body = String::from_utf8_lossy(&body).into_owned();
         if !status.is_success() {
             return Err(DataError::Status {
                 url: url.to_string(),
@@ -72,8 +98,7 @@ impl Http {
 
     /// GETs `url` and returns the body, or `None` when the server answers 404.
     pub(crate) fn get_bytes(&self, url: &str) -> Result<Option<Vec<u8>>, DataError> {
-        let response = self.send(url, &[])?;
-        let status = response.status();
+        let (status, body) = self.send(url, &[], |_| false)?;
         if status == StatusCode::NOT_FOUND {
             return Ok(None);
         }
@@ -84,11 +109,7 @@ impl Http {
                 body: String::new(),
             });
         }
-        let bytes = response.bytes().map_err(|source| DataError::Http {
-            url: url.to_string(),
-            source,
-        })?;
-        Ok(Some(bytes.to_vec()))
+        Ok(Some(body))
     }
 
     /// GETs `url` with `headers` and returns the status and the body, whatever the status, without
@@ -110,30 +131,52 @@ impl Http {
         Ok((status, body.to_vec()))
     }
 
-    /// GETs `url` with `query`, trying again on a 429 or a 5xx as [`Http`] says.
+    /// GETs `url` with `query` and returns the status and body of the answer, trying again on a
+    /// rate limit (a 429, or a 2xx body `limited` names) or a 5xx as [`Http`] says.
     fn send(
         &self,
         url: &str,
         query: &[(&str, String)],
-    ) -> Result<reqwest::blocking::Response, DataError> {
+        limited: fn(&[u8]) -> bool,
+    ) -> Result<(StatusCode, Vec<u8>), DataError> {
         let mut pause = self.backoff;
-        for _ in 0..RETRIES {
+        let mut waited = Duration::ZERO;
+        let mut tries = 0;
+        loop {
             let response = self.send_once(url, query)?;
+            tries += 1;
             let status = response.status();
-            if status != StatusCode::TOO_MANY_REQUESTS && !status.is_server_error() {
-                return Ok(response);
+            let asked = asked_wait(response.headers());
+            let body = response
+                .bytes()
+                .map_err(|source| DataError::Http {
+                    url: url.to_string(),
+                    source,
+                })?
+                .to_vec();
+            let rate_limited =
+                status == StatusCode::TOO_MANY_REQUESTS || (status.is_success() && limited(&body));
+            if !rate_limited && !status.is_server_error() {
+                return Ok((status, body));
             }
-            // A Retry-After given as a date rather than seconds falls back to the doubling pause.
-            let asked = response
-                .headers()
-                .get(RETRY_AFTER)
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.trim().parse().ok())
-                .map(Duration::from_secs);
-            std::thread::sleep(asked.unwrap_or(pause).min(LONGEST_PAUSE));
+            if tries > RETRIES {
+                if !rate_limited {
+                    return Ok((status, body));
+                }
+                return Err(DataError::RateLimited {
+                    url: url.to_string(),
+                    tries,
+                    waited,
+                    answer: String::from_utf8_lossy(&body).chars().take(200).collect(),
+                });
+            }
+            let wait = asked
+                .map_or(pause, |asked| asked.max(pause))
+                .min(LONGEST_PAUSE);
+            std::thread::sleep(wait);
+            waited += wait;
             pause *= 2;
         }
-        self.send_once(url, query)
     }
 
     fn send_once(
@@ -150,6 +193,20 @@ impl Http {
                 source,
             })
     }
+}
+
+/// The wait an answer asks for before the next request: a `Retry-After` in seconds, or the time
+/// until Bybit's limit resets. A `Retry-After` given as a date, or a reset already passed by the
+/// local clock, asks for none.
+fn asked_wait(headers: &HeaderMap) -> Option<Duration> {
+    let number = |name: &str| headers.get(name)?.to_str().ok()?.trim().parse::<u64>().ok();
+    number(RETRY_AFTER.as_str())
+        .map(Duration::from_secs)
+        .or_else(|| {
+            let reset = i64::try_from(number(BYBIT_LIMIT_RESET)?).ok()?;
+            let ms = reset.saturating_sub(now_ms());
+            (ms > 0).then(|| Duration::from_millis(ms as u64))
+        })
 }
 
 /// A one-shot HTTP server on 127.0.0.1 for tests: it answers one request with a fixed response and
@@ -334,6 +391,41 @@ mod tests {
         assert_eq!(
             server.join().expect("the server").len(),
             RETRIES as usize + 1
+        );
+    }
+
+    /// A venue that never lifts its rate limit fails after the last retry, saying how many tries
+    /// and how long it waited: the doubling pauses alone, 1 + 2 + 4 + 8 at the test's scale.
+    #[test]
+    fn a_rate_limit_that_outlasts_the_retries_fails_saying_how_long_it_waited() {
+        let limited = stub::response("429 Too Many Requests", &[], b"slow down", 9);
+        let (base, server) = stub::serve_each(vec![limited; RETRIES as usize + 1]);
+        let url = format!("{base}/x");
+        let error = Http::with_short_pauses()
+            .get_text(&url, &[])
+            .expect_err("the limit never lifts");
+        assert_eq!(
+            server.join().expect("the server").len(),
+            RETRIES as usize + 1
+        );
+        let DataError::RateLimited {
+            tries,
+            waited,
+            ref answer,
+            ..
+        } = error
+        else {
+            panic!("{error:?}");
+        };
+        assert_eq!(tries, RETRIES + 1);
+        assert_eq!(waited, Duration::from_millis(15));
+        assert_eq!(answer, "slow down");
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "{url} still answered with its rate limit after 5 tries and 0.0 s of waiting: \
+                 slow down"
+            )
         );
     }
 

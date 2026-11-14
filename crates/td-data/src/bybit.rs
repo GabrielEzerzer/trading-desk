@@ -72,7 +72,7 @@ impl DataSource for Bybit {
             if !cursor.is_empty() {
                 query.push(("cursor", cursor.clone()));
             }
-            let body = http.get_text(INSTRUMENTS_URL, &query)?;
+            let body = http.get_text_limited(INSTRUMENTS_URL, &query, rate_limited)?;
             let page = bybit_page(INSTRUMENTS_URL, &body)?;
             add_bybit(&mut list, kind, page.list);
             if page.next_page_cursor.is_empty() {
@@ -238,6 +238,18 @@ pub fn fetch_klines(
     from: Millis,
     to: Millis,
 ) -> Result<Vec<Candle>, DataError> {
+    klines_from(http, KLINE_URL, id, timeframe, from, to)
+}
+
+/// [`fetch_klines`] from the kline endpoint at `url`, so a test can point it at a fake venue.
+fn klines_from(
+    http: &Http,
+    url: &str,
+    id: &InstrumentId,
+    timeframe: Timeframe,
+    from: Millis,
+    to: Millis,
+) -> Result<Vec<Candle>, DataError> {
     let category = category(id.kind)?;
     let end = to.min(timeframe.floor(now_ms())) - 1;
     let open_time = |c: &Candle| c.open_time;
@@ -250,7 +262,7 @@ pub fn fetch_klines(
             ("end", page_end.to_string()),
             ("limit", KLINE_LIMIT.to_string()),
         ];
-        let page = parse_kline_page(&http.get_text(KLINE_URL, &query)?)?;
+        let page = parse_kline_page(&http.get_text_limited(url, &query, rate_limited)?)?;
         std::thread::sleep(DELAY);
         Ok(page)
     })
@@ -345,6 +357,17 @@ pub fn fetch_funding(
     from: Millis,
     to: Millis,
 ) -> Result<Vec<(Millis, f64)>, DataError> {
+    funding_from(http, FUNDING_URL, symbol, from, to)
+}
+
+/// [`fetch_funding`] from the funding endpoint at `url`, so a test can point it at a fake venue.
+fn funding_from(
+    http: &Http,
+    url: &str,
+    symbol: &str,
+    from: Millis,
+    to: Millis,
+) -> Result<Vec<(Millis, f64)>, DataError> {
     read_funding(from, to, |start, page_end| {
         let query = [
             ("category", "linear".to_string()),
@@ -353,7 +376,7 @@ pub fn fetch_funding(
             ("endTime", page_end.to_string()),
             ("limit", FUNDING_LIMIT.to_string()),
         ];
-        let page = parse_funding_stamps(&http.get_text(FUNDING_URL, &query)?)?;
+        let page = parse_funding_stamps(&http.get_text_limited(url, &query, rate_limited)?)?;
         std::thread::sleep(DELAY);
         Ok(page)
     })
@@ -426,6 +449,22 @@ struct BybitLotFilter {
     qty_step: Option<String>,
     /// Linear's minimum order value.
     min_notional_value: Option<String>,
+}
+
+/// Bybit's rate-limit answer, which comes on HTTP 200: `retCode` 10006, "Too many visits!", with
+/// `X-Bapi-Limit-Reset-Timestamp` saying when the window resets
+/// (<https://bybit-exchange.github.io/docs/v5/rate-limit>, quoted in
+/// `mock/bybit/fixtures/error-rate-limit.json`).
+const RATE_LIMIT_CODE: i64 = 10006;
+
+/// Whether `body` is Bybit's rate-limit answer, for [`Http::get_text_limited`] to wait out.
+fn rate_limited(body: &[u8]) -> bool {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Code {
+        ret_code: i64,
+    }
+    serde_json::from_slice::<Code>(body).is_ok_and(|c| c.ret_code == RATE_LIMIT_CODE)
 }
 
 /// Unwraps a Bybit v5 response, turning a non-zero `retCode` into an error.
@@ -577,6 +616,97 @@ pub fn parse_stream_frame(text: &str) -> Result<Vec<KlineUpdate>, DataError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::http::stub;
+
+    /// Bybit's documented rate-limit answer, as the mock venue serves it.
+    const LIMITED: &str = include_str!("../../../mock/bybit/fixtures/error-rate-limit.json");
+    const KLINES: &str = include_str!("../tests/fixtures/bybit_kline_page.json");
+    const FUNDING: &str = include_str!("../tests/fixtures/bybit_funding.json");
+    /// 2024-01-01 00:00 UTC, the first minute of the kline fixture and its oldest funding rate.
+    const JAN_1: Millis = 1_704_067_200_000;
+
+    /// An HTTP 200 answer with `body` and `headers`.
+    fn ok(body: &str, headers: &[(&str, &str)]) -> Vec<u8> {
+        stub::response("200 OK", headers, body.as_bytes(), body.len())
+    }
+
+    fn btc(kind: InstrumentKind) -> InstrumentId {
+        InstrumentId {
+            venue: Venue::Bybit,
+            symbol: "BTCUSDT".into(),
+            kind,
+        }
+    }
+
+    /// The five minutes of the kline fixture, fetched from a venue answering `answers` in turn.
+    /// The server is not joined: a client that stops asking early would leave it waiting for good,
+    /// and the result shows whether every answer was read.
+    fn klines_answering(answers: Vec<Vec<u8>>) -> Result<Vec<Candle>, DataError> {
+        let (base, _server) = stub::serve_each(answers);
+        let id = btc(InstrumentKind::Spot);
+        let url = format!("{base}/v5/market/kline");
+        let http = Http::with_short_pauses();
+        klines_from(&http, &url, &id, Timeframe::M1, JAN_1, JAN_1 + 5 * 60_000)
+    }
+
+    /// Two rate-limit answers are waited out, the first until the reset its header gives, and the
+    /// klines read after them are the ones a venue with no limit gives.
+    #[test]
+    fn klines_wait_out_the_rate_limit_and_come_back_the_same() {
+        let plain = klines_answering(vec![ok(KLINES, &[])]).expect("klines");
+        assert_eq!(plain.len(), 5);
+        let reset = (now_ms() + 300).to_string();
+        let start = std::time::Instant::now();
+        let limited = klines_answering(vec![
+            ok(LIMITED, &[("X-Bapi-Limit-Reset-Timestamp", &reset)]),
+            ok(LIMITED, &[]),
+            ok(KLINES, &[]),
+        ])
+        .expect("klines once the limit lifts");
+        assert_eq!(limited, plain);
+        assert!(
+            start.elapsed() >= Duration::from_millis(300),
+            "the reset time was not waited for"
+        );
+    }
+
+    /// A venue whose limit never lifts fails with the rate-limit error after the last retry.
+    #[test]
+    fn klines_from_a_venue_that_stays_rate_limited_fail_saying_how_long_they_waited() {
+        let error = klines_answering(vec![ok(LIMITED, &[]); 5]).expect_err("never lifts");
+        assert!(
+            matches!(&error, DataError::RateLimited { tries: 5, answer, .. }
+                if answer.contains("10006")),
+            "{error:?}"
+        );
+        assert!(error.to_string().contains("s of waiting"), "{error}");
+    }
+
+    /// The funding history waits out the rate limit the same way.
+    #[test]
+    fn funding_waits_out_the_rate_limit_and_comes_back_the_same() {
+        // Not joined, as in `klines_answering`.
+        let funding_answering = |answers| {
+            let (base, _server) = stub::serve_each(answers);
+            let url = format!("{base}/v5/market/funding/history");
+            let to = JAN_1 + 5 * 8 * 3_600_000;
+            funding_from(&Http::with_short_pauses(), &url, "BTCUSDT", JAN_1, to)
+        };
+        let plain = funding_answering(vec![ok(FUNDING, &[])]).expect("rates");
+        assert_eq!(plain.len(), 5);
+        let limited = funding_answering(vec![ok(LIMITED, &[]), ok(LIMITED, &[]), ok(FUNDING, &[])])
+            .expect("rates once the limit lifts");
+        assert_eq!(limited, plain);
+    }
+
+    #[test]
+    fn only_the_rate_limit_code_is_a_rate_limit() {
+        assert!(rate_limited(LIMITED.as_bytes()));
+        assert!(!rate_limited(KLINES.as_bytes()));
+        let refused = r#"{"retCode":10001,"retMsg":"params error","result":{}}"#;
+        assert!(!rate_limited(refused.as_bytes()));
+        assert!(!rate_limited(b"not json"));
+    }
 
     #[test]
     fn only_the_answer_to_a_ping_is_a_pong() {
