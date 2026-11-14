@@ -21,7 +21,7 @@ use crate::metrics::MetricsReport;
 use crate::runner::hex;
 use crate::{
     BacktestConfig, BacktestResult, BatteryResult, ENGINE_REVISION, EngineError, OosResult,
-    SweepResult, TestPlan, VerdictRule, WalkForwardResult, config_fingerprint,
+    SweepResult, TestPlan, VerdictRule, WalkForwardResult,
 };
 
 const CONFIG_FILE: &str = "config.json";
@@ -157,12 +157,29 @@ impl PlanRun {
         asks: &[td_core::Candle],
         funding: &[(Millis, f64)],
     ) -> Result<PlanRun, EngineError> {
-        let config = spec
+        PlanRun::with_references(spec, battery, bars, asks, funding, &[])
+    }
+
+    /// [`PlanRun::new`] for a battery run with reference instruments
+    /// ([`crate::run_battery_with_references`]): its configuration names them and its data
+    /// fingerprint covers their bars.
+    pub fn with_references(
+        spec: &crate::BatterySpec,
+        battery: BatteryResult,
+        bars: &[td_core::Candle],
+        asks: &[td_core::Candle],
+        funding: &[(Millis, f64)],
+        references: &[crate::ReferenceBars],
+    ) -> Result<PlanRun, EngineError> {
+        let mut config = spec
             .plan
             .backtest_config(spec.strategy, spec.instrument.clone());
+        config.references = references.iter().map(|r| r.instrument.clone()).collect();
         Ok(PlanRun {
             strategy: spec.strategy.to_string(),
-            data_fingerprint: config_fingerprint(&config, bars, asks, funding)?,
+            data_fingerprint: crate::config_fingerprint_with_references(
+                &config, bars, asks, funding, references,
+            )?,
             config,
             plan: spec.plan.clone(),
             rule: *spec.rule,
@@ -181,6 +198,9 @@ struct PlanConfig<'a> {
     plan: &'a TestPlan,
     rule: &'a VerdictRule,
     seed: u64,
+    /// The reference instruments the battery's runs named; left out when none.
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    references: &'a [InstrumentId],
 }
 
 impl SavedRun {
@@ -306,6 +326,7 @@ pub fn save_with_files(
                 plan: &r.plan,
                 rule: &r.rule,
                 seed: r.battery.seed,
+                references: &r.config.references,
             },
             runs_dir,
         )?,

@@ -726,6 +726,7 @@ fn crypto_backtest(n: usize) -> td_engine::BacktestConfig {
         warmup_from: None,
         close_at_end: false,
         account_currency: AccountCurrency::Quote,
+        references: Vec::new(),
     }
 }
 

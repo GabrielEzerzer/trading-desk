@@ -88,6 +88,14 @@ pub struct PlanRequest {
     #[serde(default)]
     #[ts(optional)]
     pub instruments: Option<Vec<InstrumentId>>,
+    /// Reference instruments every run of each battery names
+    /// ([`td_engine::BacktestConfig::references`]): the strategy reads their bars beside its own
+    /// but trades only the plan's instrument. Each must be on the venue of every instrument run,
+    /// and the store must hold their bars over the plan's period; they are not downloaded. None
+    /// when left out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub references: Option<Vec<InstrumentId>>,
 }
 
 /// What a plan job kept: one entry per instrument whose battery finished or reached the luck test
@@ -134,6 +142,9 @@ struct VerdictRecord {
     /// `None` in a record written before hashes were recorded.
     #[serde(default)]
     pub code_hash: Option<String>,
+    /// The reference instruments the battery's runs named; empty, and left out, when none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub references: Vec<InstrumentId>,
 }
 
 /// One row of `GET /verdicts`: the latest verdict of a strategy on an instrument, the newest
@@ -179,6 +190,10 @@ pub struct VerdictSummary {
     /// this instrument, this one included; batteries saved before code hashes were recorded count
     /// together as one version. Keyed by strategy name like `runs`.
     pub code_versions: usize,
+    /// The reference instruments the battery's runs named; left out when none. A verdict with
+    /// references and one without share a row, the newer winning as above.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub references: Vec<InstrumentId>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -274,6 +289,7 @@ pub(super) async fn start(
         )
     })?;
     let ids = chosen_instruments(&entry, request.instruments.as_deref())?;
+    let references = request.references.clone().unwrap_or_default();
 
     // The trading rules of each instrument, from the venue's list as `GET /instruments` gives it
     // (cached per server run).
@@ -300,9 +316,11 @@ pub(super) async fn start(
     // nothing is downloaded.
     let (store, checked) = (state.store.clone(), entry.clone());
     let (to_check, cutoff) = (instruments.clone(), state.data_cutoff.clone());
+    let named = references.clone();
     tokio::task::spawn_blocking(move || {
         to_check.into_iter().try_for_each(|i| {
-            let config = checked.plan.backtest_config(checked.name, i);
+            let mut config = checked.plan.backtest_config(checked.name, i);
+            config.references = named.clone();
             check_run_data(&store, &config, cutoff.as_ref())
         })
     })
@@ -313,12 +331,14 @@ pub(super) async fn start(
     let job_request = JobRequest::Plan(PlanRequest {
         strategy: request.strategy,
         instruments: Some(ids),
+        references: request.references,
     });
     let cutoff = state.data_cutoff.clone();
     let job = state.jobs.submit(job_request, move |ctx| {
         execute(
             &entry,
             &instruments,
+            &references,
             &store,
             cutoff.as_ref(),
             &runs_dir,
@@ -332,6 +352,7 @@ pub(super) async fn start(
 fn execute(
     entry: &StrategyEntry,
     instruments: &[Instrument],
+    references: &[InstrumentId],
     store: &Store,
     cutoff: Option<&DataCutoff>,
     runs_dir: &Path,
@@ -342,7 +363,8 @@ fn execute(
     let mut loaded: Vec<RunData> = Vec::with_capacity(instruments.len());
     let mut totals = Vec::with_capacity(instruments.len());
     for instrument in instruments {
-        let config = entry.plan.backtest_config(entry.name, instrument.clone());
+        let mut config = entry.plan.backtest_config(entry.name, instrument.clone());
+        config.references = references.to_vec();
         let data = load_run_data(store, &config, cutoff).map_err(changed_since_accepted)?;
         let spec = battery_spec(entry, instrument);
         totals.push(td_engine::battery_runs(&spec, &data.bars).map_err(tester_error)?);
@@ -381,11 +403,12 @@ fn execute(
         // The asks are empty for a kind without quotes; for one with quotes every run of the
         // battery trades on them.
         let outcome = own_pool(|| {
-            td_engine::run_battery(
+            td_engine::run_battery_with_references(
                 &spec,
                 &data.bars,
                 &data.asks,
                 &data.funding,
+                &data.references,
                 Some(&progress),
             )
         });
@@ -463,13 +486,19 @@ fn save_plan_run(
         // Only a cancel during the luck test leaves a battery incomplete.
         complete: !battery.luck_cancelled,
         code_hash: run_record.code_hash.clone(),
+        references: data
+            .references
+            .iter()
+            .map(|r| r.instrument.clone())
+            .collect(),
     };
-    let run = PlanRun::new(
+    let run = PlanRun::with_references(
         &battery_spec(entry, instrument),
         battery,
         &data.bars,
         &data.asks,
         &data.funding,
+        &data.references,
     )
     .map_err(|e| ApiError::internal(e.to_string()))?;
     let record_json = serde_json::to_vec_pretty(&record)
@@ -524,6 +553,8 @@ struct PlanResultFields {
 #[derive(Deserialize)]
 struct ConfigHead {
     instrument: InstrumentHead,
+    #[serde(default)]
+    references: Vec<InstrumentId>,
 }
 
 #[derive(Deserialize)]
@@ -577,6 +608,7 @@ fn read_record(dir: &Path) -> Option<VerdictRecord> {
             .ok()
             .and_then(|bytes| serde_json::from_slice::<RunRecord>(&bytes).ok())
             .and_then(|r| r.code_hash),
+        references: run.config.references,
     })
 }
 
@@ -709,6 +741,7 @@ fn latest_verdicts(
             seed: record.seed,
             runs,
             code_versions: 0,
+            references: record.references,
         };
         // A complete run beats an incomplete one; between two of the same, the newer wins.
         match latest.get_mut(&key) {
@@ -848,7 +881,10 @@ impl LinkState {
 
 /// The link of a session of `entry` on `instrument` started now, from the verdict saved as run
 /// `verdict`, or from the strategy's latest verdict on the instrument when it is `None`. 400
-/// `invalid_verdict` for a run that is not a saved verdict of this strategy on this instrument.
+/// `invalid_verdict` for a run that is not a saved verdict of this strategy on this instrument, or
+/// one judged with reference instruments, which a paper session cannot feed its strategy: it would
+/// be a different test from the one the verdict judged. When the latest verdict is such a one, the
+/// session is linked to no verdict.
 pub(crate) fn session_link(
     runs_dir: &Path,
     entry: &StrategyEntry,
@@ -869,6 +905,9 @@ pub(crate) fn session_link(
                     record.strategy, record.instrument, entry.name
                 )));
             }
+            if !record.references.is_empty() {
+                return Err(bad(paper_cannot_feed(id, &record.references)));
+            }
             Some((checked, record))
         }
         None => latest_verdicts(runs_dir, std::slice::from_ref(entry), Some(entry.name))?
@@ -877,7 +916,8 @@ pub(crate) fn session_link(
             .and_then(|row| {
                 let record = read_record(&runs_dir.join(row.run_id.as_str()))?;
                 Some((row.run_id, record))
-            }),
+            })
+            .filter(|(_, record)| record.references.is_empty()),
     };
     let json = |value: Result<Value, serde_json::Error>| {
         value.map_err(|e| ApiError::internal(format!("cannot record the session's link: {e}")))
@@ -896,6 +936,19 @@ pub(crate) fn session_link(
             rule: record.rule,
         }),
     })
+}
+
+/// Why a paper session cannot be linked to verdict `id`, judged with `references`.
+///
+/// shortcut: a paper session feeds no reference instruments, so it cannot run the test a verdict
+/// with references judged; feed their live bars beside the session's own when a strategy that
+/// reads them is paper traded.
+fn paper_cannot_feed(id: &RunId, references: &[InstrumentId]) -> String {
+    let names: Vec<String> = references.iter().map(ToString::to_string).collect();
+    format!(
+        "run {id} was judged with the reference instruments {}, and a paper session cannot feed reference instruments yet",
+        names.join(", ")
+    )
 }
 
 /// `GET /verdicts?strategy=`.
@@ -929,6 +982,17 @@ mod tests {
 
     /// A verdict of `entry` on `instrument` as it is now, saved as run `run_id` under `runs_dir`.
     fn save_verdict(runs_dir: &Path, run_id: &str, entry: &StrategyEntry, on: &InstrumentId) {
+        save_verdict_with(runs_dir, run_id, entry, on, Vec::new());
+    }
+
+    /// [`save_verdict`] for a battery whose runs named `references`.
+    fn save_verdict_with(
+        runs_dir: &Path,
+        run_id: &str,
+        entry: &StrategyEntry,
+        on: &InstrumentId,
+        references: Vec<InstrumentId>,
+    ) {
         let record = VerdictRecord {
             strategy: entry.name.into(),
             instrument: on.clone(),
@@ -939,6 +1003,7 @@ mod tests {
             rule: serde_json::to_value(entry.rule).unwrap(),
             complete: true,
             code_hash: td_engine::code_hash(entry.name).map(String::from),
+            references,
         };
         let dir = runs_dir.join(run_id);
         fs::create_dir_all(&dir).unwrap();
@@ -979,6 +1044,48 @@ mod tests {
         for run in [newer, "1700000000002-0000000c", "../../etc"] {
             assert_eq!(refused(run).body.code, "invalid_verdict", "{run}");
         }
+    }
+
+    /// A paper session feeds no reference instruments, so it is never linked to a verdict judged
+    /// with them: one named is refused, and a latest one leaves the session without a verdict.
+    #[test]
+    fn a_session_is_never_linked_to_a_verdict_judged_with_reference_instruments() {
+        let dir = tempfile::tempdir().unwrap();
+        let entry = td_engine::find_strategy("sma_cross").unwrap();
+        let on = entry.plan.instruments[0].clone();
+        let reference = InstrumentId {
+            symbol: "OTHERUSDT".into(),
+            ..on.clone()
+        };
+        let (older, newer) = ("1700000000000-0000000a", "1700000000001-0000000b");
+        save_verdict(dir.path(), older, &entry, &on);
+        save_verdict_with(dir.path(), newer, &entry, &on, vec![reference.clone()]);
+
+        let named = RunId::parse(newer).unwrap();
+        let refused = session_link(dir.path(), &entry, &on, Some(&named)).unwrap_err();
+        assert_eq!(refused.body.code, "invalid_verdict");
+        assert!(
+            refused
+                .body
+                .message
+                .contains("cannot feed reference instruments"),
+            "{}",
+            refused.body.message
+        );
+        assert_eq!(
+            session_link(dir.path(), &entry, &on, None).unwrap().verdict,
+            None
+        );
+        // A verdict judged without them still links.
+        let plain = RunId::parse(older).unwrap();
+        let link = session_link(dir.path(), &entry, &on, Some(&plain)).unwrap();
+        assert_eq!(link.verdict.unwrap().run_id, plain);
+
+        // The verdict list says which references the latest verdict was judged with.
+        let rows = latest_verdicts(dir.path(), std::slice::from_ref(&entry), None).unwrap();
+        assert_eq!(rows[0].references, vec![reference]);
+        let row = serde_json::to_value(&rows[0]).unwrap();
+        assert!(row.get("references").is_some());
     }
 
     #[test]

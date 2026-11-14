@@ -642,6 +642,7 @@ impl Sessions {
             close_at_end: false,
             // Paper sessions are on a quote-currency account (see `paper::build_session`).
             account_currency: AccountCurrency::Quote,
+            references: Vec::new(),
         };
         let result = td_engine::run(&backtest, &bars, &[], &due).map_err(|e| {
             ApiError::internal(format!("the backtest beside the session failed: {e}"))
