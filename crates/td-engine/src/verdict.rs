@@ -1602,8 +1602,9 @@ pub struct Verdict {
     pub state: VerdictState,
     /// Every line of every layer that was judged, integrity first.
     pub criteria: Vec<Criterion>,
-    /// Costs the runs behind the verdict leave out, each named, so a verdict that rests on one is
-    /// visible. They do not change the state. Empty in a verdict saved before warnings existed.
+    /// Costs the runs behind the verdict leave out, and assumptions a line passed on that the
+    /// engine cannot check, each named, so a verdict that rests on one is visible. They do not
+    /// change the state. Empty in a verdict saved before warnings existed.
     #[serde(default)]
     pub warnings: Vec<String>,
 }

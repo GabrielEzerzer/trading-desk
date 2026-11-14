@@ -1390,8 +1390,9 @@ export type Verdict = { instrument: InstrumentId, state: VerdictState,
  */
 criteria: Array<Criterion>, 
 /**
- * Costs the runs behind the verdict leave out, each named, so a verdict that rests on one is
- * visible. They do not change the state. Empty in a verdict saved before warnings existed.
+ * Costs the runs behind the verdict leave out, and assumptions a line passed on that the
+ * engine cannot check, each named, so a verdict that rests on one is visible. They do not
+ * change the state. Empty in a verdict saved before warnings existed.
  */
 warnings: Array<string>, };
 
