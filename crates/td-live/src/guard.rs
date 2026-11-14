@@ -21,8 +21,8 @@
 //!   and once with the sells, since each of them may or may not have filled. It is refused,
 //!   before sending, when either position's notional is above the cap and above the notional
 //!   before the order. So an order that only reduces the position is never refused by the cap
-//!   while no earlier order of the bar is pending, and the orders of one bar are counted
-//!   together.
+//!   while no earlier order of the bar has been let through, and the orders of one bar are
+//!   counted together.
 //! - **A venue that cannot be read** is never a pass. After [`GuardTiming::unreadable`] failed
 //!   checks in a row the guard halts the run, and the broker refuses every order that is not
 //!   reduce-only; its protective stops still go out, so an entry already filled is still
@@ -267,8 +267,8 @@ impl SendGate {
     /// valued at the position's mark price (or at `last`, the order's last known price, when the
     /// venue gives no mark). It is refused when either notional is above the cap and above the
     /// notional before it, or when the position cannot be read. So an order that shrinks the
-    /// position is never refused by the cap while no earlier order of the bar is pending, whether
-    /// or not it is reduce-only.
+    /// position is never refused by the cap while no earlier order of the bar has been let
+    /// through, whether or not it is reduce-only.
     pub fn refusal(
         &self,
         client: &Client,
