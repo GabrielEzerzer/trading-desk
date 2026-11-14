@@ -1498,6 +1498,11 @@ fn a_feed_that_ends_halts_the_run() {
     );
     wait_until(&run, "running", |s| s.state == State::Running);
     feed.text("boom".into());
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !run.is_finished() {
+        assert!(Instant::now() < deadline, "the run did not halt");
+        std::thread::sleep(Duration::from_millis(20));
+    }
     let (live, ended) = run.wait();
     let Err(LiveError::Halted(reason)) = ended else {
         panic!("not halted: {ended:?}");
