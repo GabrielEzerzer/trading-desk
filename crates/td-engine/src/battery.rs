@@ -73,9 +73,9 @@ use crate::metrics::{self, DAY_MS, EquitySeries};
 use crate::plan::check_start_offsets;
 use crate::portfolio::next_position;
 use crate::reference::ReferenceBars;
-use crate::risk::{self, DayRollover};
+use crate::risk::{self, DayRollover, Exposure};
 use crate::rng::derive_seed;
-use crate::runner::select_bars;
+use crate::runner::{self, select_bars};
 use crate::stats::{
     self, BootstrapSpec, DEFAULT_RESAMPLES, DrawdownBootstrap, MeanBootstrap, PropFirmAttempt,
     PropFirmOdds, PropFirmSpec, RuinSpec,
@@ -581,8 +581,23 @@ pub fn run_battery_with_references(
         true => Sizing::FixedSize,
         false => Sizing::Compounding,
     };
+    // Each window's open positions inside its bars, which its result does not keep, from its test
+    // run made again: the peak leverage and the open-notional line, both at a fixed size, read
+    // them.
+    let held = match &wf {
+        Some(wf) if sizes_from_cash => Some(
+            wf.windows
+                .iter()
+                .map(|w| {
+                    let config = &w.out_of_sample.config;
+                    runner::run_exposures(config, bars, asks, funding, references)
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
+        _ => None,
+    };
     // The walk-forward as the verdict judges it, which steps 3c to 6 read.
-    let judged = wf.as_ref().map(|wf| as_judged(wf, sizing));
+    let judged = wf.as_ref().map(|wf| as_judged(wf, sizing, held.as_deref()));
 
     // 3c. R5's runs: each window's grid neighbours of the set it chose, on its test bars.
     let plateau = match judged.as_deref() {
@@ -729,6 +744,7 @@ pub fn run_battery_with_references(
             breach_probability: None,
             attempt_value: None,
             limits_inside_day: false,
+            peak_open_notional: None,
         };
         if let VerdictRule::PropFirm {
             firm,
@@ -743,6 +759,15 @@ pub fn run_battery_with_references(
             // changes, added from window to window, and its lines on the starting-cash reading;
             // otherwise on the stitched curve, and its lines on each fall's own start.
             let per_cash = sizes_from_cash.then_some(cash);
+            // The limit needs `sizes_from_starting_cash` (`VerdictRule::validate`), so `held` is
+            // read whenever it is set.
+            if let (Some(_), Some(held)) = (limits.max_open_notional_multiple, &held) {
+                // The evaluation and the funded account each trade their terms' size, a multiple
+                // of the size tested; the larger is the one that can breach the limit.
+                let size = attempt.map_or(1.0, |t| t.evaluation_size.max(t.funded_size));
+                let peak = tester::peak_open_notional(cash, &wf.windows, held);
+                kind.peak_open_notional = Some(peak / cash * size);
+            }
             let (series, ranges) = (&series, &wf.equity_extremes[..]);
             let judged = |f: Fall| if per_cash.is_some() { f.cash } else { f.own };
             let daily_loss = worst_daily_loss(series, ranges, cash, firm.day_rollover);
@@ -929,7 +954,7 @@ pub fn run_battery_with_references(
                     references,
                     Some(&meter.step()),
                 ) {
-                    Ok(r) => offset.oos_return = as_judged(&r, sizing).metrics.total_return,
+                    Ok(r) => offset.oos_return = as_judged(&r, sizing, None).metrics.total_return,
                     Err(
                         e @ (TesterError::NoQualifyingRun { .. } | TesterError::InvalidSpec(_)),
                     ) => {
@@ -1393,11 +1418,17 @@ fn prefix_differences(full: &[Order], prefix: &[Order], split: Millis) -> usize 
 /// The walk-forward as a verdict judges it: as [`walk_forward`](crate::walk_forward) stitched it,
 /// or with [`Sizing::FixedSize`], for a `prop_firm` rule sized from the starting cash, its
 /// windows' own runs added at a fixed size: the curve, its ranges, the metrics, the trades and the
-/// fills. The windows and the benchmark are the walk-forward's own either way.
-fn as_judged(wf: &WalkForwardResult, sizing: Sizing) -> Cow<'_, WalkForwardResult> {
+/// fills. The windows and the benchmark are the walk-forward's own either way. `held` is each
+/// window's open positions ([`crate::runner::run_exposures`]), which the peak leverage at a fixed
+/// size reads; without it that figure is `None`.
+fn as_judged<'a>(
+    wf: &'a WalkForwardResult,
+    sizing: Sizing,
+    held: Option<&[Vec<Exposure>]>,
+) -> Cow<'a, WalkForwardResult> {
     match sizing {
         Sizing::Compounding => Cow::Borrowed(wf),
-        Sizing::FixedSize => Cow::Owned(tester::with_windows(wf, wf.windows.clone(), sizing)),
+        Sizing::FixedSize => Cow::Owned(tester::with_windows(wf, wf.windows.clone(), sizing, held)),
     }
 }
 
@@ -3594,6 +3625,122 @@ mod tests {
         }
     }
 
+    /// A limit on open notional, which needs a plan sized from the starting cash, is judged on the
+    /// largest open notional of the windows the fixed-size account counts, each window's own over
+    /// the starting cash. A limit below the figure fails the line, one above passes it, and a rule
+    /// without the limit has the lines it had. With `attempt` terms the figure is taken at the
+    /// larger of the evaluation and funded sizes. At a compounding size the battery refuses it.
+    #[test]
+    fn a_limit_on_open_notional_is_judged_on_the_fixed_size_account() {
+        let (plan, bars) = sma_plan(sma_axes());
+        let cash = plan.backtest.starting_cash;
+        let VerdictRule::PropFirm { firm, limits, .. } = firm_rule(DrawdownMode::Static, 10, None)
+        else {
+            unreachable!()
+        };
+        let battery = |sized: bool, cap: Option<f64>, attempt: Option<crate::AttemptTerms>| {
+            let rule = VerdictRule::PropFirm {
+                firm,
+                limits: crate::PropFirmLimits {
+                    sizes_from_starting_cash: sized,
+                    max_open_notional_multiple: cap,
+                    ..limits
+                },
+                attempt,
+            };
+            let spec = BatterySpec {
+                strategy: "sma_cross",
+                plan: &plan,
+                rule: &rule,
+                instrument: &test_instrument(),
+                seed: 7,
+            };
+            run_battery(&spec, &bars, &[], &[], None)
+        };
+        let line = |r: &BatteryResult| {
+            r.verdict
+                .criteria
+                .iter()
+                .find(|l| l.id == "open_notional")
+                .cloned()
+        };
+        let Err(TesterError::InvalidSpec(refused)) = battery(false, Some(1.0), None) else {
+            panic!("a limit on open notional at a compounding size was accepted")
+        };
+        assert!(
+            refused.contains("limits.sizes_from_starting_cash"),
+            "{refused}"
+        );
+        let off = battery(true, None, None).unwrap();
+        assert!(line(&off).is_none());
+        assert_eq!(off.kind.peak_open_notional, None);
+        // The account at a fixed size adds each window's money change and counts every window
+        // here. It holds each window's own position, so its largest notional is the largest of
+        // the windows' own, and its peak leverage is each window's notional over the window's
+        // equity moved by that account's level at the window's start less the starting cash.
+        let wf = off.walk_forward.as_ref().unwrap();
+        let mut fixed = cash;
+        let (mut largest, mut leverage) = (0.0f64, 0.0f64);
+        for w in &wf.windows {
+            assert!(fixed > 0.0);
+            let r = &w.out_of_sample;
+            let held = crate::runner::run_exposures(&r.config, &bars, &[], &[], &[]).unwrap();
+            largest = held.iter().map(|x| x.notional).fold(largest, f64::max);
+            leverage = held
+                .iter()
+                .map(|x| (x.notional, x.equity + (fixed - cash)))
+                .filter(|&(_, e)| e > 0.0)
+                .map(|(n, e)| n / e)
+                .fold(leverage, f64::max);
+            fixed += r.equity.last().unwrap().equity - cash;
+        }
+        assert_eq!(off.oos_integrity.peak_leverage, Some(leverage));
+        let figure = largest / cash;
+        assert!(figure > 0.0);
+        for (cap, outcome) in [(figure / 2.0, Outcome::Fail), (figure * 2.0, Outcome::Pass)] {
+            let capped = battery(true, Some(cap), None).unwrap();
+            let l = line(&capped).unwrap();
+            assert_eq!((l.value, l.outcome), (Some(figure), outcome));
+            let rest: Vec<_> = capped
+                .verdict
+                .criteria
+                .into_iter()
+                .filter(|l| l.id != "open_notional")
+                .collect();
+            assert_eq!(rest, off.verdict.criteria);
+        }
+        // With attempt terms, the larger of the two sizes: a funded account at twice the size
+        // tested reads twice the figure, and an evaluation at three times it reads three times,
+        // so a limit of two and a half times fails on the evaluation alone.
+        let at_sizes = |evaluation_size, funded_size| crate::AttemptTerms {
+            account_size: 100_000.0,
+            evaluation_fee: 500.0,
+            pass_fee: 0.0,
+            refund_fee_with_first_payout: false,
+            profit_split: 0.8,
+            days_to_first_payout: 1,
+            calendar_days_to_first_payout: None,
+            payout_interval_days: 1,
+            min_payout: 0.0,
+            payout_cap: None,
+            max_payouts: None,
+            payout_locks_floor: false,
+            payout_resets_balance: false,
+            funded_horizon_days: 30,
+            evaluation_size,
+            funded_size,
+            reduced_edge_factor: 0.5,
+        };
+        for (terms, size, outcome) in [
+            (at_sizes(1.0, 2.0), 2.0, Outcome::Pass),
+            (at_sizes(3.0, 2.0), 3.0, Outcome::Fail),
+        ] {
+            let priced = battery(true, Some(figure * 2.5), Some(terms)).unwrap();
+            let l = line(&priced).unwrap();
+            assert_eq!((l.value, l.outcome), (Some(figure * size), outcome));
+        }
+    }
+
     /// With `sizes_from_starting_cash`, the battery reads the test windows' own money changes,
     /// added from window to window: the drawdown and daily-loss lines judge each fall as a share
     /// of the starting cash, the odds walk each day's money change over the starting cash, and no
@@ -3676,7 +3823,7 @@ mod tests {
                 None,
             ));
             // The fixed-size account, which the field reads.
-            let fixed = as_judged(wf, Sizing::FixedSize);
+            let fixed = as_judged(wf, Sizing::FixedSize, None);
             let ranges = &fixed.equity_extremes[..];
             let series = EquitySeries::new(cash, &fixed.equity, plan.timeframe);
             let falls = attempt_drawdowns(&series, ranges, utc, 10, None);
@@ -3879,7 +4026,7 @@ mod tests {
                 assert!(o.error.is_some() && f.error.is_some(), "{o:?}");
                 continue;
             };
-            let fixed = as_judged(&r, Sizing::FixedSize).metrics.total_return;
+            let fixed = as_judged(&r, Sizing::FixedSize, None).metrics.total_return;
             assert_eq!(o.oos_return, fixed, "{o:?}");
             assert_eq!(f.oos_return, r.metrics.total_return, "{f:?}");
             differ += usize::from(fixed != r.metrics.total_return);
@@ -4036,8 +4183,8 @@ mod tests {
         windows: Vec<crate::WindowResult>,
         sizing: Sizing,
     ) -> crate::WalkForwardResult {
-        let wf = tester::with_windows(&sma_walk_forward(), windows, Sizing::Compounding);
-        as_judged(&wf, sizing).into_owned()
+        let wf = tester::with_windows(&sma_walk_forward(), windows, Sizing::Compounding, None);
+        as_judged(&wf, sizing, None).into_owned()
     }
 
     /// Test windows on 10,000 from [`nth_window`], one per `(end, low)`: each holds the starting
@@ -4206,7 +4353,15 @@ mod tests {
             .collect();
         let base = plan.backtest_config("sma_cross", test_instrument());
         let objective = plan.sweep.objective;
-        let p = |sizing| plateau(&as_judged(&wf, sizing), &runs, &base, objective, sizing);
+        let p = |sizing| {
+            plateau(
+                &as_judged(&wf, sizing, None),
+                &runs,
+                &base,
+                objective,
+                sizing,
+            )
+        };
         let (on, off) = (p(Sizing::FixedSize), p(Sizing::Compounding));
         let ([a], [b]) = (on.directions.as_slice(), off.directions.as_slice()) else {
             panic!("{on:?}")
@@ -4240,7 +4395,7 @@ mod tests {
     fn the_plateau_ratio_reads_the_fixed_size_account_when_sized_from_the_starting_cash() {
         let template = flat_run();
         let windows = (0..2).map(|k| nth_window(&template, k, 10_500.0)).collect();
-        let wf = tester::with_windows(&sma_walk_forward(), windows, Sizing::Compounding);
+        let wf = tester::with_windows(&sma_walk_forward(), windows, Sizing::Compounding, None);
         let runs: Vec<Vec<(Vec<i8>, BacktestResult)>> = [13_000.0, 8_000.0]
             .into_iter()
             .enumerate()
@@ -4251,7 +4406,15 @@ mod tests {
             direction: Direction::Maximize,
         };
         let base = wf.spec.sweep.base.clone();
-        let p = |sizing| plateau(&as_judged(&wf, sizing), &runs, &base, objective, sizing);
+        let p = |sizing| {
+            plateau(
+                &as_judged(&wf, sizing, None),
+                &runs,
+                &base,
+                objective,
+                sizing,
+            )
+        };
         let (on, off) = (p(Sizing::FixedSize), p(Sizing::Compounding));
         let ([a], [b]) = (on.directions.as_slice(), off.directions.as_slice()) else {
             panic!("{on:?}")
@@ -4296,7 +4459,7 @@ mod tests {
             with_trade(0, 11_000.0, 1_000.0),
             with_trade(1, 9_000.0, -1_000.0),
         ];
-        let wf = tester::with_windows(&sma_walk_forward(), windows, Sizing::Compounding);
+        let wf = tester::with_windows(&sma_walk_forward(), windows, Sizing::Compounding, None);
         let runs: Vec<Vec<(Vec<i8>, BacktestResult)>> = [(15_000.0, 5_000.0), (8_000.0, -2_000.0)]
             .into_iter()
             .enumerate()
@@ -4307,7 +4470,15 @@ mod tests {
             direction: Direction::Maximize,
         };
         let base = wf.spec.sweep.base.clone();
-        let p = |sizing| plateau(&as_judged(&wf, sizing), &runs, &base, objective, sizing);
+        let p = |sizing| {
+            plateau(
+                &as_judged(&wf, sizing, None),
+                &runs,
+                &base,
+                objective,
+                sizing,
+            )
+        };
         let (on, off) = (p(Sizing::FixedSize), p(Sizing::Compounding));
         let ([a], [b]) = (on.directions.as_slice(), off.directions.as_slice()) else {
             panic!("{on:?}")

@@ -1261,6 +1261,7 @@ mod tests {
                 range(97.0, 112.0),
             ],
             peak_leverage: Some(2.5),
+            exposures: Vec::new(),
         };
         let trades = [
             trade(10.0, Some(2.0), false, false),
@@ -1309,6 +1310,7 @@ mod tests {
         let short = Intrabar {
             ranges: intrabar.ranges[..3].to_vec(),
             peak_leverage: Some(2.5),
+            exposures: Vec::new(),
         };
         for without in [
             report_with(

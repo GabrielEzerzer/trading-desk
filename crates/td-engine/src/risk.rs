@@ -39,6 +39,18 @@ pub struct Intrabar {
     /// where equity is at or below zero are skipped: the account is bankrupt there, which the
     /// drawdowns show.
     pub peak_leverage: Option<f64>,
+    /// Every one of those points where a position is open, in path order, bankrupt ones too, when
+    /// asked for ([`intrabar_with`]); empty otherwise.
+    pub exposures: Vec<Exposure>,
+}
+
+/// An open position at one point [`intrabar`] evaluates: its notional in the account currency at
+/// that point's price, and the equity there. `notional / equity` is that point's leverage, and an
+/// account holding the same position on a balance moved by `d` has `notional / (equity + d)`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Exposure {
+    pub notional: f64,
+    pub equity: f64,
 }
 
 /// The equity each bar reached inside its range, and the peak leverage, from a run's bars, their
@@ -85,8 +97,34 @@ pub fn intrabar(
     funding: &[BarFunding],
     account: AccountCurrency,
 ) -> Intrabar {
+    intrabar_with(
+        starting_cash,
+        bars,
+        asks,
+        equity,
+        fills,
+        funding,
+        account,
+        false,
+    )
+}
+
+/// [`intrabar`], also keeping [`Intrabar::exposures`] when `keep_exposures` is set. Only
+/// [`crate::runner::run_exposures`] asks for them, so every other run keeps none.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn intrabar_with(
+    starting_cash: f64,
+    bars: &[Candle],
+    asks: &[Option<Candle>],
+    equity: &[EquityPoint],
+    fills: &[Fill],
+    funding: &[BarFunding],
+    account: AccountCurrency,
+    keep_exposures: bool,
+) -> Intrabar {
     let mut ranges = Vec::with_capacity(bars.len());
     let mut peak: Option<f64> = (!bars.is_empty()).then_some(0.0);
+    let mut exposures = Vec::new();
     let (mut pos, mut next) = (0.0, 0);
     // The position's average entry, by the portfolio's rule; a base account values it with it.
     let mut avg = 0.0;
@@ -110,9 +148,18 @@ pub fn intrabar(
         let mut see = |q: f64, price: f64, e: f64| {
             low = low.min(e);
             high = high.max(e);
-            if q != 0.0
-                && e > 0.0
-                && let Some(lev) = finite(account.from_quote(q.abs() * price, price) / e)
+            if q == 0.0 {
+                return;
+            }
+            let notional = account.from_quote(q.abs() * price, price);
+            if keep_exposures {
+                exposures.push(Exposure {
+                    notional,
+                    equity: e,
+                });
+            }
+            if e > 0.0
+                && let Some(lev) = finite(notional / e)
             {
                 peak = Some(peak.map_or(lev, |p| p.max(lev)));
             }
@@ -171,6 +218,7 @@ pub fn intrabar(
     Intrabar {
         ranges,
         peak_leverage: peak,
+        exposures,
     }
 }
 
@@ -562,6 +610,27 @@ mod tests {
         // least equity: 2 * 104 / 1007.8 on bar 0 (0.20639) against 2 * 99 / 997.3 at bar 1's
         // open (0.19854) and 2 * 106 / 1011.3 at its fill (0.20963).
         approx(x.peak_leverage.unwrap(), 2.0 * 106.0 / 1011.3);
+        // The open positions are kept only when asked for, and asking changes nothing else.
+        assert!(x.exposures.is_empty());
+        let kept = intrabar_with(
+            1000.0,
+            &bars,
+            &[],
+            &equity,
+            &fills,
+            &funding,
+            AccountCurrency::Quote,
+            true,
+        );
+        assert_eq!((&kept.ranges, kept.peak_leverage), (r, x.peak_leverage));
+        // Every point with the position open is recorded, in path order, and none while flat:
+        // bar 0's low, high and close after the entry, then bar 1's open, the exit's price with
+        // the position before it, and the maker exit's adverse low.
+        let notionals: Vec<f64> = kept.exposures.iter().map(|p| p.notional).collect();
+        let held = [97.0, 104.0, 102.0, 99.0, 106.0, 95.0].map(|price| 2.0 * price);
+        assert_eq!(notionals, held);
+        let peak = kept.exposures.iter().map(|p| p.notional / p.equity);
+        approx(peak.fold(0.0, f64::max), x.peak_leverage.unwrap());
     }
 
     #[test]

@@ -1328,7 +1328,20 @@ breach_horizon_days: number,
  * from, which is exact for a strategy whose size grows with its balance. `false` is left out
  * of JSON.
  */
-sizes_from_starting_cash?: boolean, };
+sizes_from_starting_cash?: boolean, 
+/**
+ * The most open notional the firm allows, as a multiple of the account size, the starting
+ * cash. It needs `sizes_from_starting_cash`: at that fixed size the position does not depend
+ * on the account's balance, so the figure is the largest open notional of any walk-forward
+ * test window the battery's account counts, in that window's own run, over the starting
+ * cash. It is read at the points the run's intrabar measures evaluate, as the peak leverage
+ * is, so at bar resolution. With `attempt` terms it is taken at the larger of their
+ * `evaluation_size` and `funded_size`, so a phase traded at either size that breaches the
+ * limit fails the line. A rule that sets it at a compounding size is refused, since the open
+ * notional there depends on each attempt's balance, which this figure does not follow.
+ * `None`, the default, sets no limit and is left out of JSON.
+ */
+max_open_notional_multiple?: number | null, };
 
 export type PortfolioBenchmark = "buy_and_hold" | "cash";
 
@@ -1774,7 +1787,15 @@ attempt_value: number | null,
  * only, because the curve had no equity inside its bars, and for the other kinds. Left out
  * when false, so a result saved before it existed reads as checked at closes, as it was.
  */
-limits_inside_day?: boolean, };
+limits_inside_day?: boolean, 
+/**
+ * The largest open notional inside any bar of a test window the fixed-size account counts, in
+ * that window's own run, over the starting cash, at the larger of the evaluation and funded
+ * sizes when the rule has `attempt` terms. Read for a `prop_firm` rule with
+ * `max_open_notional_multiple`, which needs `sizes_from_starting_cash`, and `None` otherwise
+ * (see that field). Left out when `None`.
+ */
+peak_open_notional?: number | null, };
 
 /**
  * The integrity checks read on the stitched walk-forward out-of-sample curve (I4 and I5),
@@ -1788,7 +1809,9 @@ export type OosIntegrityInputs = {
 sharpe: number | null, 
 /**
  * I5: the highest notional over equity inside any bar. For a `prop_firm` rule with
- * `sizes_from_starting_cash`, the highest of the counted windows' own.
+ * `sizes_from_starting_cash`, the notional over the equity of the account at a fixed size:
+ * each counted window's own position on its own equity moved by where that account stood at
+ * the window's start less the starting cash, at each point the window's run evaluated.
  */
 peak_leverage: number | null, 
 /**
