@@ -1379,12 +1379,23 @@ fn worst_daily_loss(
 /// starts there and rises with each bar's high ([`risk::trailing_drawdown`]'s amount). Scaling to
 /// the day's starting equity is what the attempt walks do: they compound each day's return on a
 /// fresh balance of 1. An attempt started fewer than `horizon` days before the curve ends runs to
-/// its end, so a curve shorter than `horizon` is one attempt from the start, the whole-curve
-/// figure. A day that starts with no equity left starts no attempt. `None` without equity ranges,
-/// with ranges that do not match the curve, or when no attempt holds a bar.
+/// its end. So on a curve shorter than `horizon` the first day's attempt is the whole curve, and
+/// every later day still starts an attempt of its own to the end, from its own equity: the result
+/// is at least the whole-curve figure, and more when a later attempt falls further as a share of
+/// its own start (100, then 120, then 105 never falls below the first balance, but the attempt
+/// started at 120 loses 12.5% of its start). A day that starts with no equity left starts no
+/// attempt. `None` without equity ranges, with ranges that do not match the curve, or when no
+/// attempt holds a bar.
 ///
 /// shortcut: each attempt rescans its bars, O(days x bars per attempt); fold each day to its low,
 /// high and own fall once if this shows in a battery's run time.
+///
+/// shortcut: a fall as a share of the attempt's own starting equity assumes the position size
+/// grows with equity, as in the attempt walks. For a strategy sized as a fixed quantity or
+/// notional from the starting cash, an attempt that starts after gains reads lower than a fresh
+/// account at the starting balance would lose (11 of 120 is 9.2%, where the same fall of 11 on a
+/// fresh account of 100 is 11%), and one that starts after losses reads higher; measure each fall
+/// against the starting cash for such a strategy if one is judged on this line.
 fn attempt_drawdowns(
     series: &EquitySeries,
     ranges: &[crate::EquityRange],
@@ -2271,12 +2282,24 @@ mod tests {
         assert_eq!(line(&spike, DrawdownMode::Static).1, Outcome::Pass);
         near(line(&spike, DrawdownMode::Static), 11.0 / 120.0);
 
-        // A curve shorter than one attempt is one attempt from the start: the whole-curve figures.
+        // On a curve shorter than one attempt, the first day's attempt is the whole curve. A
+        // straight decline falls furthest from its first day, so it reads the whole-curve figures.
         let (series, ranges) = curve(10 * DAY_MS, DAY_MS, &slide[..8]);
         let (fixed, trailing) = whole(&slide[..8]);
         assert_eq!(
             attempt_drawdowns(&series, &ranges, utc, 10),
             (Some(fixed), Some(trailing))
+        );
+        // Every later day still starts an attempt to the end: 100, then 120, then 105 never falls
+        // below the first balance, but the attempt started at 120 loses 15 of its 120, 12.5%. The
+        // trailing figure stays the first day's, which is the whole curve's.
+        let peak = [100.0, 120.0, 105.0];
+        let (series, ranges) = curve(10 * DAY_MS, DAY_MS, &peak);
+        let (fixed, trailing) = whole(&peak);
+        assert_eq!(fixed, 0.0);
+        assert_eq!(
+            attempt_drawdowns(&series, &ranges, utc, 10),
+            (Some(0.125), Some(trailing))
         );
         // Without ranges, or with ranges that do not match the curve, there is no figure.
         assert_eq!(attempt_drawdowns(&series, &[], utc, 10), (None, None));

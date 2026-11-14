@@ -297,6 +297,8 @@ pub struct PropFirmLimits {
     pub pass_horizon_days: u32,
     /// The chance of breaching a limit within `breach_horizon_days` must be at most this.
     pub max_breach_probability: f64,
+    /// Days a simulated attempt runs for the breach odds, and the length of each attempt the
+    /// max-drawdown line reads on the test's curve.
     pub breach_horizon_days: u32,
 }
 
@@ -452,7 +454,7 @@ impl VerdictRule {
                     non_negative("firm.trailing_floor_lock", lock)?;
                 }
                 if let Some(DayRollover::Utc { offset_minutes }) = firm.day_rollover
-                    && offset_minutes.abs() >= MINUTES_PER_DAY
+                    && offset_minutes.unsigned_abs() >= MINUTES_PER_DAY.unsigned_abs()
                 {
                     return Err(PlanError(format!(
                         "firm.day_rollover.offset_minutes must be less than a day either side of \
@@ -592,7 +594,8 @@ impl VerdictRule {
                         d.max_breach_probability,
                         Higher,
                     ),
-                    // Fewer days to breach in lower the breach odds.
+                    // Fewer days to breach in lower the breach odds, and shorten the attempts the
+                    // drawdown line reads, which can only lower its figure.
                     (
                         "breach_horizon_days",
                         f64::from(l.breach_horizon_days),
@@ -3131,6 +3134,18 @@ mod tests {
             let original: serde_json::Value = serde_json::from_str(&text).unwrap();
             assert_eq!(serde_json::to_value(firm).unwrap(), original);
         }
+        // A key the rollover's kind does not have does not read, on either kind, so a misspelt
+        // key is refused rather than lost.
+        for json in [
+            r#"{"kind":"new_york1700","offset_minutes":60}"#,
+            r#"{"kind":"utc","offset_minutes":0,"offset_mins":60}"#,
+        ] {
+            let text = format!(
+                r#"{{"daily_loss":0.05,"max_drawdown":0.1,"drawdown":"static",
+                "profit_target":0.08,"day_rollover":{json}}}"#
+            );
+            assert!(serde_json::from_str::<FirmLimits>(&text).is_err(), "{json}");
+        }
         // Set, they read and write back; a test's fields that are off are left out of it too.
         let set = r#"{"daily_loss":0.05,"max_drawdown":0.1,"drawdown":"static",
             "profit_target":0.08,"day_target_share":0.4,
@@ -3166,7 +3181,7 @@ mod tests {
     #[test]
     fn each_new_field_out_of_range_is_refused_by_name() {
         type Tweak = fn(&mut FirmLimits, &mut AttemptTerms);
-        let cases: [(&str, Tweak); 29] = [
+        let cases: [(&str, Tweak); 31] = [
             ("firm.day_rollover.offset_minutes", |f, _| {
                 f.day_rollover = Some(DayRollover::Utc {
                     offset_minutes: 24 * 60,
@@ -3175,6 +3190,18 @@ mod tests {
             ("firm.day_rollover.offset_minutes", |f, _| {
                 f.day_rollover = Some(DayRollover::Utc {
                     offset_minutes: -24 * 60,
+                })
+            }),
+            // The extremes a rule read from JSON can carry, where taking the absolute value of
+            // i32::MIN would overflow.
+            ("firm.day_rollover.offset_minutes", |f, _| {
+                f.day_rollover = Some(DayRollover::Utc {
+                    offset_minutes: i32::MIN,
+                })
+            }),
+            ("firm.day_rollover.offset_minutes", |f, _| {
+                f.day_rollover = Some(DayRollover::Utc {
+                    offset_minutes: i32::MAX,
                 })
             }),
             ("firm.second_target", |f, _| f.second_target = Some(0.0)),

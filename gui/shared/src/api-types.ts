@@ -1266,7 +1266,12 @@ pass_horizon_days: number,
 /**
  * The chance of breaching a limit within `breach_horizon_days` must be at most this.
  */
-max_breach_probability: number, breach_horizon_days: number, };
+max_breach_probability: number, 
+/**
+ * Days a simulated attempt runs for the breach odds, and the length of each attempt the
+ * max-drawdown line reads on the test's curve.
+ */
+breach_horizon_days: number, };
 
 export type PortfolioBenchmark = "buy_and_hold" | "cash";
 
