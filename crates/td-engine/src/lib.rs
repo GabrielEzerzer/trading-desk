@@ -21,6 +21,7 @@
 
 mod battery;
 mod broker;
+mod compare;
 mod error;
 mod fill;
 pub mod metrics;
@@ -52,6 +53,10 @@ pub use battery::{
     run_battery,
 };
 pub use broker::{AttachedStop, Broker, BrokerEvent, Order, OrderStatus, SimBroker};
+pub use compare::{
+    Difference, DifferenceKind, FillPair, OrderPair, Recorded, SessionComparison, SideSummary,
+    compare_with_backtest,
+};
 pub use error::{EngineError, OrderRejected};
 pub use fill::{CandleFillModel, FillCheck, FillModel};
 pub use metrics::MetricsReport;

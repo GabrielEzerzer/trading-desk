@@ -800,6 +800,7 @@ mod tests {
             qty,
             fee: 0.0,
             liquidity: td_core::Liquidity::Taker,
+            close_out: false,
         };
         // Traded 1000 + 1100 over an average equity of 1050.
         let fills = [fill(10.0, 100.0), fill(10.0, 110.0)];
@@ -848,6 +849,7 @@ mod tests {
             qty: 1e300,
             fee: 0.0,
             liquidity: td_core::Liquidity::Taker,
+            close_out: false,
         };
         assert_eq!(turnover(&[fill], &[1.0], AccountCurrency::Quote), None);
     }
