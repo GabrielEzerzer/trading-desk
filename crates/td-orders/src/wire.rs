@@ -80,23 +80,36 @@ pub enum OrderStatus {
     /// A conditional order cancelled before it triggered.
     Deactivated,
     /// A status this route does not know, kept as the venue spelled it, without hidden characters
-    /// ([`hidden`]) and cut to 200 characters.
+    /// ([`hidden`]) and cut to 200 characters; the client's reads withhold it when it carries a
+    /// credential.
     Other(String),
 }
 
 /// Text from the venue as the crate keeps it: hidden characters removed, at most 200 characters.
-pub(crate) fn venue_text(text: &str) -> String {
+/// It does not look for credentials; a venue message that may echo one goes through the client's
+/// scrub instead.
+pub fn venue_text(text: &str) -> String {
     text.chars().filter(|&c| !hidden(c)).take(200).collect()
 }
 
-/// A character that changes how text shows without showing itself: control characters, and the
-/// zero-width, line and paragraph separator, bidirectional, invisible-operator and byte-order
-/// format characters, which could hide or reorder text in a log or a terminal.
+/// A character that changes how text shows without showing itself: control characters, the soft
+/// hyphen, the combining grapheme joiner, the Arabic letter mark, the Mongolian vowel separator,
+/// tag characters, and the zero-width, line and paragraph separator, bidirectional,
+/// invisible-operator and byte-order format characters, which could hide or reorder text in a log
+/// or a terminal.
 pub(crate) fn hidden(c: char) -> bool {
     c.is_control()
         || matches!(
             c,
-            '\u{200B}'..='\u{200F}' | '\u{2028}'..='\u{202E}' | '\u{2060}'..='\u{206F}' | '\u{FEFF}'
+            '\u{AD}'
+                | '\u{34F}'
+                | '\u{61C}'
+                | '\u{180E}'
+                | '\u{200B}'..='\u{200F}'
+                | '\u{2028}'..='\u{202E}'
+                | '\u{2060}'..='\u{206F}'
+                | '\u{FEFF}'
+                | '\u{E0000}'..='\u{E007F}'
         )
 }
 
@@ -230,7 +243,8 @@ pub enum ExecKind {
     Settle,
     BlockTrade,
     MovePosition,
-    /// A type this route does not know, kept as the venue spelled it.
+    /// A type this route does not know, kept as the venue spelled it, without hidden characters
+    /// ([`hidden`]) and cut to 200 characters.
     Other(String),
 }
 
@@ -245,7 +259,7 @@ impl ExecKind {
             "Settle" => Self::Settle,
             "BlockTrade" => Self::BlockTrade,
             "MovePosition" => Self::MovePosition,
-            other => Self::Other(other.to_string()),
+            other => Self::Other(venue_text(other)),
         }
     }
 }
@@ -763,7 +777,7 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_status_is_kept_without_control_characters_and_cut_short() {
+    fn an_unknown_status_or_execution_type_is_kept_without_control_characters_and_cut_short() {
         let raw = format!("Odd\u{1b}[2J\r\n{}", "y".repeat(500));
         let OrderStatus::Other(kept) = OrderStatus::parse(&raw) else {
             panic!("not kept as Other");
@@ -772,12 +786,19 @@ mod tests {
         assert_eq!(kept.chars().count(), 200);
         assert!(kept.starts_with("Odd[2J"), "{kept:?}");
         assert!(OrderStatus::parse(&raw).is_open());
+        let ExecKind::Other(kept) = ExecKind::parse(&raw) else {
+            panic!("not kept as Other");
+        };
+        assert!(!kept.chars().any(char::is_control), "{kept:?}");
+        assert_eq!(kept.chars().count(), 200);
     }
 
     #[test]
     fn venue_text_drops_zero_width_bidirectional_and_byte_order_characters() {
         let raw = "a\u{200B}b\u{200F}c\u{2028}d\u{202E}e\u{2060}f\u{206F}g\u{FEFF}h\u{7}i";
         assert_eq!(venue_text(raw), "abcdefghi");
+        let raw = "a\u{AD}b\u{61C}c\u{180E}d\u{34F}e\u{E0000}f\u{E0041}g\u{E007F}h";
+        assert_eq!(venue_text(raw), "abcdefgh");
         // Visible text outside those ranges is kept.
         assert_eq!(
             venue_text("\u{394} 100 \u{2013} ok"),

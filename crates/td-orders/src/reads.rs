@@ -27,8 +27,8 @@ use td_core::{Instrument, Millis};
 
 use crate::orders::{CATEGORY, check_instrument};
 use crate::wire::{
-    self, Equity, Execution, InstrumentInfo, Page, Position, RawExecution, RawInstrument, RawOrder,
-    RawPosition, RawTicker, RawWallet, Ticker, VenueOrder,
+    self, Equity, Execution, InstrumentInfo, OrderStatus, Page, Position, RawExecution,
+    RawInstrument, RawOrder, RawPosition, RawTicker, RawWallet, Ticker, VenueOrder,
 };
 use crate::{Client, ClientOrderId, Error};
 
@@ -95,7 +95,17 @@ impl Client {
             ("limit", "50".into()),
         ];
         let raws: Vec<RawOrder> = self.all_pages(REALTIME, query)?;
-        raws.into_iter().map(|r| r.into_order(REALTIME)).collect()
+        raws.into_iter().map(|r| self.order(r, REALTIME)).collect()
+    }
+
+    /// An order as the venue lists it. A status the route does not know is venue text that
+    /// reaches the caller and the operations' errors, so it is scrubbed like a venue message.
+    fn order(&self, raw: RawOrder, path: &'static str) -> Result<VenueOrder, Error> {
+        let mut order = raw.into_order(path)?;
+        if let OrderStatus::Other(text) = &order.status {
+            order.status = OrderStatus::Other(self.scrub(text));
+        }
+        Ok(order)
     }
 
     /// The order with client id `id`, open or closed: the real-time list first, then the order
@@ -131,7 +141,7 @@ impl Client {
             let page: Page<RawOrder> = wire::from_value(path, value)?;
             // Asked by orderLinkId the venue lists that order only; check rather than trust it.
             if let Some(raw) = page.list.into_iter().next() {
-                let order = raw.into_order(path)?;
+                let order = self.order(raw, path)?;
                 if order.client_id == id.as_str() {
                     return Ok(Some(order));
                 }

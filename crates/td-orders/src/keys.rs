@@ -81,18 +81,25 @@ impl DemoKeys {
     }
 
     /// Replaces a venue message that contains the key, the secret or `signature` (the venue's
-    /// signature error can echo the signed text, which holds the key), and trims the rest.
-    /// Hidden characters ([`wire::hidden`]) go first, so a credential split by one is found
-    /// whole, and the cut to length comes last, so a credential at the cut is found whole too.
+    /// signature error can echo the signed text, which holds the key), and trims the rest
+    /// ([`wire::venue_text`]). The key and secret are visible ASCII and the signature is hex, so
+    /// they are looked for in the message reduced to its visible ASCII characters: a credential
+    /// split by anything else (a space, a hidden or format character) is found whole. The
+    /// signature is compared without regard to case. The cut to length comes last, so a
+    /// credential at the cut is found whole too.
     pub(crate) fn scrub(&self, message: &str, signature: &str) -> String {
-        let plain: String = message.chars().filter(|&c| !wire::hidden(c)).collect();
-        let leaks = [self.key.as_str(), self.secret.as_str(), signature]
+        let visible: String = message.chars().filter(char::is_ascii_graphic).collect();
+        let leaks = [self.key.as_str(), self.secret.as_str()]
             .iter()
-            .any(|s| !s.is_empty() && plain.contains(s));
+            .any(|s| !s.is_empty() && visible.contains(s))
+            || (!signature.is_empty()
+                && visible
+                    .to_ascii_lowercase()
+                    .contains(&signature.to_ascii_lowercase()));
         if leaks {
             return "(message withheld: it contained a credential)".into();
         }
-        wire::venue_text(&plain)
+        wire::venue_text(message)
     }
 }
 
@@ -182,6 +189,29 @@ mod tests {
         // A key that straddles the 200-character cut is withheld, not cut in half.
         let shown = keys.scrub(&format!("{}KEYVALUE123", "x".repeat(195)), "");
         assert!(!shown.contains("KEYVA"), "{shown:?}");
+    }
+
+    #[test]
+    fn scrub_finds_a_credential_split_by_any_character_that_is_not_visible_ascii() {
+        let keys = DemoKeys::for_loopback("KEYVALUE123", "SECRETVALUE456").unwrap();
+        for split in [
+            "KEYV\u{AD}ALUE123",
+            "KEYV ALUE123",
+            "KEY\u{61C}VALUE123",
+            "KEY\u{180E}VALUE\u{34F}123",
+            "SECRET\u{E0041}VALUE456",
+            "SECRET\u{FE0F}VALUE\u{E0100}456",
+            "K E Y V A L U E 1 2 3",
+        ] {
+            let shown = keys.scrub(&format!("error {split} end"), "");
+            assert!(shown.contains("withheld"), "{split:?}: {shown:?}");
+        }
+        // The signature is hex; an echo in capitals or split by a space is found too.
+        let shown = keys.scrub("sig ABC 123DEF", "abc123def");
+        assert!(shown.contains("withheld"), "{shown:?}");
+        // A message that shares only fragments of a credential is kept.
+        let ordinary = "KEY VALUE 12 is not SECRET; VALUE456? no";
+        assert_eq!(keys.scrub(ordinary, "abc123def"), ordinary);
     }
 
     #[test]

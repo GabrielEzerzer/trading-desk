@@ -564,18 +564,154 @@ fn answers_that_ask_for_a_retry_are_sent_again_only_where_that_is_safe() {
 }
 
 #[test]
-fn a_duplicate_id_after_a_rate_limit_refusal_is_the_venues_own() {
-    // A 10006 is a refusal before processing, so the 110072 to the resend is about an order the
-    // venue already held, not about the refused attempt.
-    let (mock, client) = setup();
+fn a_refusal_after_a_resend_is_looked_up() {
     let i = instrument();
+    // The first send was applied although the venue answered 10006 or 10002, so the resend is
+    // refused because of it: the lookup finds the order the first send made.
+    for (first, second) in [(10006, 110072), (10006, 110007), (10002, 110072)] {
+        let (mock, client) = setup();
+        let link = format!("s1-{first}-{second}");
+        mock.inject(
+            CREATE,
+            Fault::ApplyLater {
+                after: Duration::ZERO,
+                answer: Some(first),
+            },
+        );
+        mock.inject(CREATE, Fault::Answer(second));
+        let placed = client
+            .place(&i, &market(Side::Buy, 0.002, false), &id(&link), PRICE)
+            .unwrap();
+        let orders = mock.orders_with_link_id(&link);
+        assert_eq!(orders.len(), 1, "{first} then {second}");
+        assert_eq!(placed.order_id, orders[0].order_id, "{first} then {second}");
+        assert_eq!(mock.request_count(CREATE), 2);
+    }
+
+    // Neither send was applied: the lookup finds nothing, so the outcome is unknown and the id
+    // stays spent.
+    let (mock, client) = setup();
     mock.inject(CREATE, Fault::RateLimit { reset_after_ms: 10 });
     mock.inject(CREATE, Fault::Answer(110072));
-    let err = client
-        .place(&i, &market(Side::Buy, 0.002, false), &id("s1-d"), PRICE)
-        .unwrap_err();
-    assert!(matches!(err, Error::DuplicateClientId { .. }), "{err}");
+    let order = market(Side::Buy, 0.002, false);
+    let err = client.place(&i, &order, &id("s1-d"), PRICE).unwrap_err();
+    assert!(is_unknown(&err, Action::Place), "{err}");
+    assert!(err.to_string().contains("110072"), "{err}");
     assert_eq!(mock.request_count(CREATE), 2);
+    let again = client.place(&i, &order, &id("s1-d"), PRICE).unwrap_err();
+    assert!(
+        matches!(again, Error::ClientIdAlreadyUsed { .. }),
+        "{again}"
+    );
+
+    // A cancel and an amend whose first send was applied, and whose resend is refused with a code
+    // that is not "order not open": looked up, and confirmed.
+    let (mock, client) = setup();
+    long_with_stop(&mock, &client, "s1-c");
+    let applied_but_limited = || Fault::ApplyLater {
+        after: Duration::ZERO,
+        answer: Some(10006),
+    };
+    mock.inject(CANCEL, applied_but_limited());
+    mock.inject(CANCEL, Fault::Answer(10001));
+    assert_eq!(
+        client.cancel(&i, &id("s1-c")).unwrap(),
+        CancelOutcome::Cancelled
+    );
+    assert_eq!(mock.request_count(CANCEL), 2);
+
+    let (mock, client) = setup();
+    long_with_stop(&mock, &client, "s1-a");
+    mock.inject(AMEND, applied_but_limited());
+    mock.inject(AMEND, Fault::Answer(10001));
+    client
+        .amend_stop(&i, &id("s1-a"), Some(61000.0), None)
+        .unwrap();
+    assert_eq!(mock.request_count(AMEND), 2);
+    assert_eq!(mock.orders_with_link_id("s1-a")[0].trigger, Some(61000.0));
+}
+
+#[test]
+fn an_accepted_create_whose_order_id_cannot_be_read_is_looked_up() {
+    // The venue answers 0 with an empty result and applies the create a moment later.
+    let (mock, client) = setup();
+    let i = instrument();
+    mock.inject(
+        CREATE,
+        Fault::ApplyLater {
+            after: Duration::from_millis(200),
+            answer: Some(0),
+        },
+    );
+    let placed = client
+        .place(&i, &market(Side::Buy, 0.002, false), &id("ack-p"), PRICE)
+        .unwrap();
+    assert_eq!(
+        placed.order_id,
+        mock.orders_with_link_id("ack-p")[0].order_id
+    );
+    assert_eq!(mock.request_count(CREATE), 1);
+}
+
+#[test]
+fn a_cancel_acknowledged_while_the_order_fills_is_already_closed() {
+    // The stop triggers and fills; the venue then acknowledges a cancel it cannot apply.
+    let (mock, client) = setup();
+    let i = instrument();
+    long_with_stop(&mock, &client, "ack-f");
+    mock.set_price(SYMBOL, 59000.0);
+    mock.inject(CANCEL, Fault::Answer(0));
+    assert_eq!(
+        client.cancel(&i, &id("ack-f")).unwrap(),
+        CancelOutcome::AlreadyClosed(OrderStatus::Filled)
+    );
+    assert_eq!(mock.request_count(CANCEL), 1);
+}
+
+#[test]
+fn an_unknown_order_status_never_carries_a_credential() {
+    let (mock, client) = setup();
+    let i = instrument();
+    long_with_stop(&mock, &client, "st-1");
+    mock.set_order_status("st-1", TEST_KEY);
+    let order = client.order_by_client_id(&i, &id("st-1")).unwrap().unwrap();
+    assert!(matches!(order.status, OrderStatus::Other(_)), "{order:?}");
+    let shown = format!("{order:?} {}", order.status);
+    assert!(!shown.contains(TEST_KEY), "{shown}");
+    // The status counts as open, so a cancel and an amend the venue refuses as not open are
+    // refusals; their errors do not carry it either.
+    let err = client.cancel(&i, &id("st-1")).unwrap_err();
+    let shown = format!("{err} {err:?}");
+    assert!(!shown.contains(TEST_KEY), "{shown}");
+    let err = client
+        .amend_stop(&i, &id("st-1"), Some(61000.0), None)
+        .unwrap_err();
+    let shown = format!("{err} {err:?}");
+    assert!(!shown.contains(TEST_KEY), "{shown}");
+}
+
+#[test]
+fn a_lookup_window_is_not_moved_by_a_clock_resync() {
+    // The create is lost. While it is looked up the venue's clock falls 20 s behind, so a lookup
+    // is refused with 10002 and the clock offset is measured again. The window still ends a
+    // receive window after the send, not 20 s later.
+    let (mock, client) = setup();
+    let i = instrument();
+    mock.inject(CREATE, Fault::DropBeforeApply);
+    let started = Instant::now();
+    let err = std::thread::scope(|s| {
+        s.spawn(|| {
+            std::thread::sleep(Duration::from_millis(300));
+            mock.set_skew(-20_000);
+        });
+        client
+            .place(&i, &market(Side::Buy, 0.002, false), &id("clk-1"), PRICE)
+            .unwrap_err()
+    });
+    let elapsed = started.elapsed();
+    assert!(is_unknown(&err, Action::Place), "{err}");
+    assert!(mock.request_count("/v5/market/time") >= 2, "resynced");
+    assert!(elapsed < Duration::from_secs(10), "{elapsed:?}");
 }
 
 #[test]
@@ -616,6 +752,9 @@ fn an_amend_acknowledged_and_applied_late_is_confirmed() {
     assert_eq!((o.trigger, o.qty), (Some(61000.0), 0.003));
 }
 
+/// How far past its budget an operation may end on a loaded test machine.
+const MARGIN: Duration = Duration::from_millis(300);
+
 #[test]
 fn an_operation_ends_within_its_budget() {
     let budget = Duration::from_secs(2);
@@ -623,7 +762,7 @@ fn an_operation_ends_within_its_budget() {
         operation_budget: budget,
         ..timing()
     };
-    // Sent, and every answer stalls: unknown, within the budget and one request timeout.
+    // Sent, and every answer stalls: unknown, within the budget.
     let mock = MockVenue::start();
     mock.add_instrument(&instrument(), PRICE);
     let client = Client::with_timing(Endpoint::Loopback(mock.port()), keys(), tight).unwrap();
@@ -636,12 +775,12 @@ fn an_operation_ends_within_its_budget() {
         .unwrap_err();
     let elapsed = started.elapsed();
     assert!(is_unknown(&err, Action::Place), "{err}");
-    assert!(elapsed < budget + tight.request_timeout, "{elapsed:?}");
+    assert!(elapsed < budget + MARGIN, "{elapsed:?}");
     assert_eq!(mock.request_count(CREATE), 1);
     mock.clear_faults();
 
-    // Never sent: the rate limit's reset does not fit in what is left, so the not-sent error,
-    // and the id is free again.
+    // Sent once and refused with 10006. After the 2 s reset less than a request timeout of the
+    // budget is left, so the create is not sent again: the not-sent error, and the id is free.
     let budget = Duration::from_secs(3);
     let tight = Timing {
         operation_budget: budget,
@@ -654,27 +793,83 @@ fn an_operation_ends_within_its_budget() {
             reset_after_ms: 2000,
         },
     );
+    let creates = mock.request_count(CREATE);
     let started = Instant::now();
     let err = client
         .place(&i, &market(Side::Buy, 0.002, false), &id("bud-2"), PRICE)
         .unwrap_err();
     let elapsed = started.elapsed();
     assert!(
-        matches!(
-            err,
-            Error::RateLimited {
-                ip_block: false,
-                ..
-            }
-        ),
+        matches!(&err, Error::Transport { reason, .. } if reason.contains("time budget")),
         "{err}"
     );
-    assert!(elapsed < budget + tight.request_timeout, "{elapsed:?}");
+    assert!(elapsed < budget + MARGIN, "{elapsed:?}");
+    assert_eq!(mock.request_count(CREATE), creates + 1);
     assert!(mock.orders_with_link_id("bud-2").is_empty());
     mock.clear_faults();
     client
         .place(&i, &market(Side::Buy, 0.002, false), &id("bud-2"), PRICE)
         .unwrap();
+
+    // The first send of each operation goes even when the whole budget, at its smallest, is
+    // shorter than a request timeout; only a send again needs a whole request timeout left.
+    let shortest = Timing {
+        operation_budget: Duration::from_secs(1),
+        ..timing()
+    };
+    let (mock, _) = setup();
+    let client = Client::with_timing(Endpoint::Loopback(mock.port()), keys(), shortest).unwrap();
+    long_with_stop(&mock, &client, "bud-3");
+    client
+        .amend_stop(&i, &id("bud-3"), Some(61000.0), None)
+        .unwrap();
+    assert_eq!(
+        client.cancel(&i, &id("bud-3")).unwrap(),
+        CancelOutcome::Cancelled
+    );
+}
+
+#[test]
+fn a_cancel_or_amend_is_not_sent_again_without_time_to_settle_it() {
+    // The first send is lost and its lookup, a 2 s receive window, still shows the order open.
+    // Less than a request timeout of the 3 s budget is then left, so it is not sent again.
+    let budget = Duration::from_secs(3);
+    let tight = Timing {
+        operation_budget: budget,
+        recv_window: Duration::from_secs(2),
+        ..timing()
+    };
+    let i = instrument();
+    for path in [CANCEL, AMEND] {
+        let mock = MockVenue::start();
+        mock.add_instrument(&instrument(), PRICE);
+        let client = Client::with_timing(Endpoint::Loopback(mock.port()), keys(), tight).unwrap();
+        long_with_stop(&mock, &client, "bud-s");
+        mock.inject(path, Fault::DropBeforeApply);
+        let started = Instant::now();
+        let err = if path == CANCEL {
+            client.cancel(&i, &id("bud-s")).unwrap_err()
+        } else {
+            client
+                .amend_stop(&i, &id("bud-s"), Some(61000.0), None)
+                .unwrap_err()
+        };
+        let elapsed = started.elapsed();
+        let action = if path == CANCEL {
+            Action::Cancel
+        } else {
+            Action::Amend
+        };
+        assert!(is_unknown(&err, action), "{err}");
+        assert!(err.to_string().contains("time budget"), "{err}");
+        assert!(elapsed < budget + MARGIN, "{elapsed:?}");
+        assert_eq!(mock.request_count(path), 1);
+        let o = &mock.orders_with_link_id("bud-s")[0];
+        assert_eq!(
+            (o.status.as_str(), o.trigger),
+            ("Untriggered", Some(60000.0))
+        );
+    }
 }
 
 #[test]
@@ -1056,6 +1251,11 @@ fn a_timestamp_rejection_resyncs_the_clock_and_retries_once() {
         .unwrap_err();
     assert!(matches!(err, Error::TimestampRejected { .. }), "{err}");
     assert!(mock.orders_with_link_id("ts-2").is_empty());
+    // Both sends were refused before processing, so the id is free again.
+    mock.clear_faults();
+    client
+        .place(&i, &market(Side::Buy, 0.002, false), &id("ts-2"), PRICE)
+        .unwrap();
 }
 
 #[test]

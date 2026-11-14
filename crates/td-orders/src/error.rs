@@ -76,14 +76,23 @@ pub enum Error {
     OrderClosed { id: String, status: String },
 
     /// A create whose answer left its outcome open, found on the venue with status `Rejected`.
-    /// The create was sent once, so the record is that create's.
+    /// Every send of the create carried the same order and id, so the record is this order's.
     #[error("the venue lists order {id} as rejected (reason {reason})")]
     OrderRejected { id: String, reason: String },
 
     /// The venue may or may not have applied the request, and asking it did not settle which.
-    /// After a `place` the id stays spent: ask later with `Client::order_by_client_id` (or the
-    /// executions) and never send the id again; an empty answer does not prove the order was not
-    /// placed. After a `cancel` or `amend_stop`, read the order before acting on it.
+    ///
+    /// After a `place`, the order may be live and the id stays spent. The caller:
+    /// - keeps the unresolved order and its original id, across a restart too;
+    /// - keeps asking the venue about that id (`Client::order_by_client_id`, the executions)
+    ///   until it shows the order or the order's fate is otherwise settled;
+    /// - counts the order's possible fill in its exposure meanwhile;
+    /// - never takes an empty lookup as permission to send the same order again under another
+    ///   id: the venue's lists can lag, and an empty answer does not prove the order was not
+    ///   placed.
+    ///
+    /// A timeout or a spent time budget does not withdraw the request; the venue may still apply
+    /// it. After a `cancel` or `amend_stop`, read the order before acting on it.
     #[error("the outcome of the {action} request for {id} is unknown: {reason}")]
     OutcomeUnknown {
         action: Action,

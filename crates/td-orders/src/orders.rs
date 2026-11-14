@@ -21,8 +21,10 @@
 //!   110079, and the rest the `client` module lists) is looked up, never sent again. An order
 //!   record or an execution for the id means it was placed; a record the venue rejected is
 //!   [`Error::OrderRejected`]; nothing found, or a venue that cannot be asked, is
-//!   [`Error::OutcomeUnknown`], never "not placed", and the id stays spent. A `110072` (duplicate
-//!   id) answer to the one send is [`Error::DuplicateClientId`].
+//!   [`Error::OutcomeUnknown`], never "not placed", and the id stays spent. A refusal of a create
+//!   sent once is final: `110072` (duplicate id) is [`Error::DuplicateClientId`], any other code
+//!   [`Error::Rejected`]. A refusal of a create sent again after a rate-limit or timestamp refusal
+//!   is looked up like any unknown answer, since the venue may have applied the first send.
 //! - Cancel and amend cannot create an order, and an amend sets absolute values, so they may be
 //!   sent again while the order is still listed open with its old values, at most [`RESENDS`]
 //!   times. The venue's acknowledgement is not taken as done: after it, a cancel is done when a
@@ -30,20 +32,22 @@
 //!   quantity. Unconfirmed within the lookup is [`Error::OutcomeUnknown`]. Once an attempt's
 //!   outcome is unknown, an answer that attempt could have caused (a refusal, an order the lists
 //!   do not show, a record still open after the venue said it is not) is
-//!   [`Error::OutcomeUnknown`], never a final refusal or "not found". Executions with no order
-//!   record say the order traded but not whether it is still open, so they are also
+//!   [`Error::OutcomeUnknown`], never a final refusal or "not found". A refusal of a request sent
+//!   again after a rate-limit or timestamp refusal is such an attempt too. Executions with no
+//!   order record say the order traded but not whether it is still open, so they are also
 //!   [`Error::OutcomeUnknown`], with the executed quantity.
 //!
 //! Each operation runs within [`crate::Timing::operation_budget`]. When it runs out before the
 //! first request is sent, the answer is the not-sent error; once a request has been sent, it is
-//! [`Error::OutcomeUnknown`] unless a lookup has settled the outcome.
+//! [`Error::OutcomeUnknown`] unless a lookup has settled the outcome. A request is sent again only
+//! while a whole request timeout is left.
 
 use std::time::Instant;
 
 use serde_json::{Value, json};
 use td_core::{
-    CoreError, Instrument, InstrumentKind, Millis, OrderRequest, OrderType, Rounding, Side,
-    TimeInForce, Venue,
+    CoreError, Instrument, InstrumentKind, OrderRequest, OrderType, Rounding, Side, TimeInForce,
+    Venue,
 };
 
 use crate::client::{Failure, Method, pause};
@@ -164,8 +168,10 @@ impl Client {
     /// the venue refuses an id it holds ([`Error::DuplicateClientId`]). An answer that leaves open
     /// whether the venue took the order is resolved by asking the venue, as the module
     /// documentation describes; when that does not settle it, the answer is
-    /// [`Error::OutcomeUnknown`] and the id stays spent: the caller asks again later with
-    /// [`Client::order_by_client_id`] and never sends the id again.
+    /// [`Error::OutcomeUnknown`] and the id stays spent. The caller then treats the order as
+    /// possibly live, as [`Error::OutcomeUnknown`] describes: it keeps the id across a restart,
+    /// asks again later with [`Client::order_by_client_id`], counts a possible fill in its
+    /// exposure, and never sends the same order again under another id.
     pub fn place(
         &self,
         instrument: &Instrument,
@@ -181,11 +187,13 @@ impl Client {
             order_id,
             client_id: id.clone(),
         };
-        let (reason, sent_at) = match self.call(CREATE, &body, Some(deadline)) {
+        // `call` reports a refusal of a create it sent more than once as unknown, so a venue
+        // refusal here answers the one send.
+        let (reason, sent) = match self.call(CREATE, &body, Some(deadline)) {
             Ok(v) => match wire::from_value::<Ack>(CREATE, v) {
                 Ok(ack) => return Ok(placed(ack.order_id)),
                 // Accepted, but the id was unreadable: find it like any unknown outcome.
-                Err(e) => (e.to_string(), self.server_now()),
+                Err(e) => (e.to_string(), Instant::now()),
             },
             Err(Failure::Venue {
                 code: RET_DUPLICATE_ID,
@@ -198,17 +206,17 @@ impl Client {
                 self.release_id(id);
                 return Err(e);
             }
-            Err(Failure::Unknown { reason, sent_at }) => (reason, sent_at),
+            Err(Failure::Unknown { reason, sent }) => (reason, sent),
         };
         let unknown = |why: String| Error::OutcomeUnknown {
             action: Action::Place,
             id: id.to_string(),
             reason: format!("{reason}; {why}"),
         };
-        let watched = self.watch(instrument, id, self.window_end(sent_at), deadline, |_| true);
+        let watched = self.watch(instrument, id, self.window_end(sent), deadline, |_| true);
         match watched.latest {
             Latest::Seen(Seen::Order(o)) if o.status == OrderStatus::Rejected => {
-                // The create was sent once, so the record is that create's.
+                // Every send carried the same order and id, so the record is this order's.
                 Err(Error::OrderRejected {
                     id: id.to_string(),
                     reason: match o.reject_reason.as_str() {
@@ -258,12 +266,12 @@ impl Client {
         };
         let mut earlier: Option<String> = None;
         for send in 0..=RESENDS {
-            if send > 0 && Instant::now() >= deadline {
+            if send > 0 && !self.room_to_resend(deadline) {
                 break;
             }
             let reason = match self.call(CANCEL, &body, Some(deadline)) {
                 Ok(_) => {
-                    let until = self.window_end(self.server_now());
+                    let until = self.window_end(Instant::now());
                     let w = self.watch(instrument, id, until, deadline, Seen::closed);
                     return match w.latest {
                         Latest::Seen(seen) => match seen.state() {
@@ -291,7 +299,7 @@ impl Client {
                 }
                 Err(Failure::Venue { code, message }) if RET_NOT_OPEN.contains(&code) => {
                     let refused = Error::Rejected { code, message };
-                    let w = self.watch(instrument, id, self.server_now(), deadline, Seen::closed);
+                    let w = self.watch(instrument, id, Instant::now(), deadline, Seen::closed);
                     return match w.latest {
                         Latest::Seen(seen) => match seen.state() {
                             State::Closed(s) => Ok(outcome(s)),
@@ -317,8 +325,8 @@ impl Client {
                     ));
                 }
                 Err(Failure::NotSent(e)) => return Err(unless_earlier(&earlier, e, unknown)),
-                Err(Failure::Unknown { reason, sent_at }) => {
-                    let until = self.window_end(sent_at);
+                Err(Failure::Unknown { reason, sent }) => {
+                    let until = self.window_end(sent);
                     let w = self.watch(instrument, id, until, deadline, Seen::closed);
                     match w.latest {
                         Latest::Seen(seen) => match seen.state() {
@@ -346,7 +354,8 @@ impl Client {
             earlier = Some(reason);
         }
         Err(unknown(format!(
-            "{}; the order was still listed open when the resends or the time budget ran out",
+            "{}; the order was still listed open when the resends ran out or too little of the \
+             time budget was left to send again",
             earlier.unwrap_or_default()
         )))
     }
@@ -402,12 +411,12 @@ impl Client {
         };
         let mut earlier: Option<String> = None;
         for send in 0..=RESENDS {
-            if send > 0 && Instant::now() >= deadline {
+            if send > 0 && !self.room_to_resend(deadline) {
                 break;
             }
             let reason = match self.call(AMEND, &body, Some(deadline)) {
                 Ok(_) => {
-                    let until = self.window_end(self.server_now());
+                    let until = self.window_end(Instant::now());
                     let w = self.watch(instrument, id, until, deadline, settled);
                     return match w.latest {
                         Latest::Seen(Seen::Order(o)) if o.status.is_open() && amended(&o) => Ok(()),
@@ -436,7 +445,7 @@ impl Client {
                 }
                 Err(Failure::Venue { code, message }) if RET_NOT_OPEN.contains(&code) => {
                     let refused = Error::Rejected { code, message };
-                    let w = self.watch(instrument, id, self.server_now(), deadline, Seen::closed);
+                    let w = self.watch(instrument, id, Instant::now(), deadline, Seen::closed);
                     return Err(match w.latest {
                         Latest::Seen(seen) => match seen.state() {
                             State::Closed(s) => closed(s),
@@ -462,8 +471,8 @@ impl Client {
                     ));
                 }
                 Err(Failure::NotSent(e)) => return Err(unless_earlier(&earlier, e, unknown)),
-                Err(Failure::Unknown { reason, sent_at }) => {
-                    let until = self.window_end(sent_at);
+                Err(Failure::Unknown { reason, sent }) => {
+                    let until = self.window_end(sent);
                     let w = self.watch(instrument, id, until, deadline, settled);
                     match w.latest {
                         Latest::Seen(Seen::Order(o)) if o.status.is_open() && amended(&o) => {
@@ -494,28 +503,28 @@ impl Client {
             earlier = Some(reason);
         }
         Err(unknown(format!(
-            "{}; the order still had its old values when the resends or the time budget ran out",
+            "{}; the order still had its old values when the resends ran out or too little of the \
+             time budget was left to send again",
             earlier.unwrap_or_default()
         )))
     }
 
-    /// The venue time after which it refuses a request signed at `sent_at` as expired, plus the
-    /// settle margin for clock error.
-    fn window_end(&self, sent_at: Millis) -> Millis {
-        sent_at
-            .saturating_add(self.timing.recv_window.as_millis() as Millis)
-            .saturating_add(self.timing.settle.as_millis() as Millis)
+    /// When the venue refuses, as expired, a request stamped at local instant `sent`, plus the
+    /// settle margin for clock error. Measured on the local clock, so a clock resync during the
+    /// lookup cannot move it.
+    fn window_end(&self, sent: Instant) -> Instant {
+        sent + self.timing.recv_window + self.timing.settle
     }
 
     /// Asks the venue about `id` in rounds a settle pause apart, until `done` accepts what it
-    /// sees, or at least [`LOOKUP_ROUNDS`] rounds have run and the venue's time has reached
-    /// `until`, or the next pause would pass `deadline`. The latest answer wins: a round that
-    /// could not ask the venue does not replace what an earlier round saw.
+    /// sees, or at least [`LOOKUP_ROUNDS`] rounds have run and `until` has passed, or the next
+    /// pause would pass `deadline`. The latest answer wins: a round that could not ask the venue
+    /// does not replace what an earlier round saw.
     fn watch(
         &self,
         instrument: &Instrument,
         id: &ClientOrderId,
-        until: Millis,
+        until: Instant,
         deadline: Instant,
         done: impl Fn(&Seen) -> bool,
     ) -> Watched {
@@ -539,7 +548,7 @@ impl Client {
                     last_error = e.to_string();
                 }
             }
-            if rounds >= LOOKUP_ROUNDS && self.server_now() >= until {
+            if rounds >= LOOKUP_ROUNDS && Instant::now() >= until {
                 break;
             }
             if !pause(self.timing.settle, Some(deadline)) {
