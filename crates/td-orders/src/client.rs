@@ -518,7 +518,18 @@ impl Client {
                     let Some(timeout) = self.timeout_within(deadline) else {
                         return Err(out_of_time());
                     };
-                    self.sync_clock(timeout).map_err(Failure::NotSent)?;
+                    // The request was refused before processing, so a failed resync leaves it
+                    // not sent. It is reported on the request's own endpoint as the documented
+                    // not-sent error, whatever the time endpoint answered.
+                    self.sync_clock(timeout).map_err(|e| {
+                        Failure::NotSent(Error::Transport {
+                            endpoint: path,
+                            reason: format!(
+                                "the venue refused the request timestamp, and the clock resync \
+                                 failed: {e}"
+                            ),
+                        })
+                    })?;
                 }
                 RET_TIMESTAMP => {
                     return Err(Failure::NotSent(Error::TimestampRejected {

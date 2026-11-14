@@ -1276,6 +1276,40 @@ fn rate_limits_wait_and_go_again_but_an_ip_block_is_returned() {
 }
 
 #[test]
+fn a_failed_clock_resync_after_a_timestamp_rejection_leaves_the_order_not_sent() {
+    let (mock, client) = setup();
+    let i = instrument();
+    mock.inject(CREATE, Fault::TimestampReject);
+    mock.inject("/v5/market/time", Fault::ServerError);
+    let err = client
+        .place(
+            &i,
+            &market(Side::Buy, 0.002, false),
+            &id("ts-sync-1"),
+            PRICE,
+        )
+        .unwrap_err();
+    // The documented not-sent error, on the order's own endpoint, not the time endpoint's error.
+    assert!(
+        matches!(&err, Error::Transport { endpoint, reason }
+            if *endpoint == CREATE && reason.contains("clock resync failed")),
+        "{err}"
+    );
+    assert_eq!(mock.request_count(CREATE), 1);
+    assert!(mock.orders_with_link_id("ts-sync-1").is_empty());
+    // The one send was refused before processing, so the id is free again.
+    client
+        .place(
+            &i,
+            &market(Side::Buy, 0.002, false),
+            &id("ts-sync-1"),
+            PRICE,
+        )
+        .unwrap();
+    assert_eq!(mock.orders_with_link_id("ts-sync-1").len(), 1);
+}
+
+#[test]
 fn a_timestamp_rejection_resyncs_the_clock_and_retries_once() {
     let (mock, client) = setup();
     let i = instrument();
