@@ -50,12 +50,18 @@ impl DemoKeys {
     }
 
     /// Keys for a test against the mock venue on 127.0.0.1. A client built with them for the demo
-    /// service refuses to start.
+    /// service refuses to start, and keys from the environment are refused by the loopback one.
     pub fn for_loopback(key: &str, secret: &str) -> Result<Self, Error> {
+        Self::from_values(key, secret, true)
+    }
+
+    /// Keys from given values, so a unit test can make keys that are not loopback-only without
+    /// reading the environment.
+    pub(crate) fn from_values(key: &str, secret: &str, loopback_only: bool) -> Result<Self, Error> {
         Ok(DemoKeys {
             key: check_value(KEY_VAR, key.to_string())?,
             secret: check_value(SECRET_VAR, secret.to_string())?,
-            loopback_only: true,
+            loopback_only,
         })
     }
 

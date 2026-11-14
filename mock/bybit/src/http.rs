@@ -47,7 +47,7 @@ pub(crate) enum Reply {
     Respond {
         status: u16,
         headers: Vec<(String, String)>,
-        body: String,
+        body: Vec<u8>,
         /// Hold the answer this long before writing it.
         delay: Duration,
     },
@@ -119,11 +119,13 @@ fn serve(stream: TcpStream, handler: &(dyn Fn(Request) -> Reply + Send + Sync)) 
                 out.push_str(&format!("{n}: {v}\r\n"));
             }
             out.push_str(&format!(
-                "Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                "Content-Length: {}\r\nConnection: close\r\n\r\n",
                 body.len()
             ));
+            let mut out = out.into_bytes();
+            out.extend_from_slice(&body);
             let mut stream = stream;
-            let _ = stream.write_all(out.as_bytes());
+            let _ = stream.write_all(&out);
             let _ = stream.flush();
         }
     }

@@ -2376,6 +2376,7 @@ dependencies = [
 name = "td-mock-bybit"
 version = "0.1.0"
 dependencies = [
+ "flate2",
  "hmac",
  "serde_json",
  "sha2",
