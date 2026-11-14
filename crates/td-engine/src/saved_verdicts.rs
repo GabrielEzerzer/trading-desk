@@ -498,8 +498,7 @@ impl LinkState {
 
 /// The link of a session of `entry` on `instrument` started now, from the verdict saved as run
 /// `verdict`, or from the strategy's latest verdict on the instrument when it is `None`.
-/// `references` are the reference instruments the session feeds its strategy, in any order, or
-/// `None` for a session that cannot feed any (a live session, today).
+/// `references` are the reference instruments the session feeds its strategy, in any order.
 ///
 /// [`VerdictError::Invalid`] for a run that is not a saved verdict of this strategy on this
 /// instrument, or one judged with other reference instruments than the session feeds: it would be
@@ -515,15 +514,11 @@ pub fn session_link(
     entry: &StrategyEntry,
     instrument: &InstrumentId,
     verdict: Option<&str>,
-    references: Option<&[InstrumentId]>,
+    references: &[InstrumentId],
     name_one: &str,
 ) -> Result<SessionLink, VerdictError> {
     let bad = VerdictError::Invalid;
-    let mismatch = |id: &RunId, judged: &[InstrumentId]| match references {
-        None if judged.is_empty() => None,
-        None => Some(cannot_feed(id, judged)),
-        Some(fed) => references_differ(id, judged, fed),
-    };
+    let mismatch = |id: &RunId, judged: &[InstrumentId]| references_differ(id, judged, references);
     let record = match verdict {
         Some(id) => {
             let checked = RunId::parse(id).map_err(|_| bad(format!("{id:?} is not a run id")))?;
@@ -545,13 +540,14 @@ pub fn session_link(
                 .into_iter()
                 .find(|row| row.instrument == *instrument);
             let latest_refused = |why: String| {
-                let instead = match references {
-                    Some(fed) if !fed.is_empty() => format!(
-                        "name a verdict judged with the reference instruments the session feeds {name_one}, or run a test with them first"
-                    ),
-                    _ => format!(
+                let instead = if references.is_empty() {
+                    format!(
                         "name a verdict judged without them {name_one}, or run a test without them first"
-                    ),
+                    )
+                } else {
+                    format!(
+                        "name a verdict judged with the reference instruments the session feeds {name_one}, or run a test with them first"
+                    )
                 };
                 bad(format!(
                     "{why}; it is the strategy's latest verdict on {instrument}, so {instead}"
@@ -597,19 +593,6 @@ pub fn session_link(
             rule: record.rule,
         }),
     })
-}
-
-/// Why a session that cannot feed reference instruments cannot be linked to verdict `id`, judged
-/// with `references`.
-///
-/// shortcut: a live session feeds no reference instruments yet, so it cannot run the test a
-/// verdict with references judged; take up [`crate::LiveReferences`] in the live session when a
-/// strategy that reads them is traded live.
-fn cannot_feed(id: &RunId, references: &[InstrumentId]) -> String {
-    format!(
-        "run {id} was judged with the reference instruments {}, and a live session cannot feed reference instruments yet",
-        names(references)
-    )
 }
 
 /// Why a session that feeds the reference instruments `fed` cannot be linked to verdict `id`,

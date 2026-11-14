@@ -8,26 +8,43 @@
 //! difference is a rate the venue has not published when the bar it is due in closes: it comes on
 //! a later bar, with a warning on the bar it was due in and another when it arrives.
 //!
+//! Reference instruments (`LiveConfig::references`) are fed as a paper session feeds them, through
+//! the engine's [`LiveReferences`]: warmed up over the same span as the traded instrument, from
+//! the store and then the venue, and each given a live feed of its own by the same feed code, from
+//! the same bar. A traded bar is held until every reference has delivered its bar opening at the
+//! same time, or a later one, or reported that bucket as dropped; in the last two cases the
+//! strategy sees no bar of that reference there, and the session warns. Nothing is filled
+//! forward. While a bar is held the strategy is not stepped and nothing is sent for it; the stop
+//! guard's checks between bars go on as before, from their own thread. Queued feed events are
+//! taken before a held bar's deadline, so a reference bar already delivered never loses to it.
+//! A released bar goes through the broker as any bar does, so the broker's rule on stale
+//! decisions applies to it: an order decided on a bar released more than one bar length after
+//! its close is not sent.
+//!
 //! The run halts, sending and cancelling nothing more, when the venue's trading rules for the
 //! instrument (tick size, quantity step, minimum quantity, minimum notional) differ from the ones
 //! saved at creation or cannot be read, which is checked before anything else goes out, when the
 //! broker faults, when the warm-up or a funding read fails after its bounded retries, when the
-//! log or the status cannot be written, when the feed ends, when the run panics, or when the
-//! owner asks it to. A fault writes the session's `faulted` marker, and a fault or a panic leaves a
-//! session that is never run again. A stop leaves the position and resting orders at the venue as
-//! they are. A resumed session skips warm-up and continues from the bar after its last one; the
-//! feed backfills the bars missed while it was down, and they are fed as live bars.
+//! log or the status cannot be written, when the feed ends, when a traded bar is held longer than
+//! the reference wait (`td_engine::REFERENCE_WAIT`) or a reference feed ends, when the run
+//! panics, or when the owner asks it to. A fault writes the session's `faulted` marker, and a
+//! fault or a panic leaves a session that is never run again. A stop leaves the position and
+//! resting orders at the venue as they are. A resumed session skips warm-up and continues from
+//! the bar after its last one; every feed backfills the bars missed while it was down, and they
+//! are fed as live bars.
 
+use std::collections::VecDeque;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard, mpsc};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use td_core::{Candle, InstrumentId, Millis, Timeframe};
 use td_data::Store;
 use td_data::live::{FeedEvent, Rest, SharedStream, run_feed_on};
 use td_data::time::{format_minute, round_to_minute};
+use td_engine::LiveReferences;
 
 use crate::VenueHandle;
 use crate::session::{Funding, LiveError, LiveSession, LiveStatus, State, panic_message};
@@ -66,12 +83,45 @@ enum Signal {
     Halt(String),
 }
 
+/// Starts a live feed of an instrument's closed bars at the session's timeframe from the bar
+/// opening at the given time, sending its events on the channel until the receiver is dropped,
+/// and gives its task. The run calls it inside its own runtime once it is ready for live bars,
+/// once for the session's instrument and once for each reference instrument.
+pub type OpenFeed = Box<
+    dyn Fn(
+            &InstrumentId,
+            Millis,
+            tokio::sync::mpsc::Sender<FeedEvent>,
+        ) -> tokio::task::JoinHandle<()>
+        + Send,
+>;
+
+/// The feeds of a run on `stream`'s streams: each instrument's closed bars by the same feed code,
+/// backfilled from `rest`.
+pub(crate) fn stream_feeds<S>(stream: S, rest: Arc<dyn Rest>, timeframe: Timeframe) -> OpenFeed
+where
+    S: Fn(&InstrumentId) -> Arc<SharedStream> + Send + 'static,
+{
+    Box::new(move |id, start, tx| {
+        tokio::spawn(run_feed_on(
+            stream(id),
+            timeframe,
+            Some(start),
+            rest.clone(),
+            tx,
+        ))
+    })
+}
+
+/// Which feed an event is from: `None` for the traded instrument's, `Some(i)` for reference `i`'s.
+type Lane = Option<usize>;
+
 enum Msg {
-    Feed(FeedEvent),
+    Feed(Lane, FeedEvent),
     /// A signal is waiting.
     Wake,
-    /// The feed's task returned or panicked: no more events will come.
-    FeedEnded,
+    /// The feed's task returned or panicked: no more events will come from it.
+    FeedEnded(Lane),
 }
 
 struct Control {
@@ -110,16 +160,22 @@ impl LiveSession {
     /// panicked ends at once with [`LiveError::StillFaulted`] or [`LiveError::StillPanicked`],
     /// sending nothing.
     ///
-    /// `rest` reads warm-up bars, missed minutes and funding rates. `stream` opens the live
-    /// minute stream; it is called on the run's thread, inside the run's own async runtime, once
-    /// warm-up is done. `after_bar` is called after each live bar is fed, logged and its status
+    /// `rest` reads warm-up bars and funding rates. `open` starts the live feed of the traded
+    /// instrument and of each reference instrument; it is called on the run's thread, inside the
+    /// run's own async runtime, once warm-up is done. A traded bar is held for its reference bars
+    /// for at most `wait`. `after_bar` is called after each live bar is fed, logged and its status
     /// written, before the next bar: returning a reason halts the run with it.
     ///
     /// This run has no loss checks; only [`crate::run_guarded`] runs a session outside this
     /// crate's tests.
-    pub(crate) fn run<S, A>(self, rest: Arc<dyn Rest>, stream: S, after_bar: A) -> LiveRun
+    pub(crate) fn run<A>(
+        self,
+        rest: Arc<dyn Rest>,
+        open: OpenFeed,
+        wait: Duration,
+        after_bar: A,
+    ) -> LiveRun
     where
-        S: FnOnce() -> Arc<SharedStream> + Send + 'static,
         A: FnMut(&LiveStatus, &VenueHandle) -> Option<String> + Send + 'static,
     {
         let handle = self.handle().clone();
@@ -133,7 +189,7 @@ impl LiveSession {
             let (session, control) = (session.clone(), control.clone());
             std::thread::spawn(move || {
                 let ran = catch_unwind(AssertUnwindSafe(|| {
-                    drive(&session, &control, wake, msgs, rest, stream, after_bar)
+                    drive(&session, &control, wake, msgs, rest, open, wait, after_bar)
                 }));
                 ran.unwrap_or_else(|panic| {
                     halt(
@@ -157,17 +213,17 @@ impl LiveSession {
 /// turns on for its tests alone, builds it.
 #[doc(hidden)]
 #[cfg(feature = "test-run")]
-pub fn run_unguarded<S, A>(
+pub fn run_unguarded<A>(
     live: LiveSession,
     rest: Arc<dyn Rest>,
-    stream: S,
+    open: OpenFeed,
+    wait: Duration,
     after_bar: A,
 ) -> LiveRun
 where
-    S: FnOnce() -> Arc<SharedStream> + Send + 'static,
     A: FnMut(&LiveStatus, &VenueHandle) -> Option<String> + Send + 'static,
 {
-    live.run(rest, stream, after_bar)
+    live.run(rest, open, wait, after_bar)
 }
 
 impl LiveRun {
@@ -261,20 +317,21 @@ fn halt(s: &mut LiveSession, error: LiveError) -> Result<(), LiveError> {
     Err(error)
 }
 
-fn drive<S, A>(
+#[allow(clippy::too_many_arguments)]
+fn drive<A>(
     shared: &Mutex<LiveSession>,
     control: &Control,
     wake: mpsc::Sender<Msg>,
     msgs: mpsc::Receiver<Msg>,
     rest: Arc<dyn Rest>,
-    stream: S,
+    open: OpenFeed,
+    wait: Duration,
     mut after_bar: A,
 ) -> Result<(), LiveError>
 where
-    S: FnOnce() -> Arc<SharedStream>,
     A: FnMut(&LiveStatus, &VenueHandle) -> Option<String>,
 {
-    let (id, timeframe, data_dir, next, live, handle) = {
+    let (id, timeframe, data_dir, next, live, handle, references) = {
         let mut s = lock(shared);
         // A session that faulted or panicked stays halted, in this process as after a restart.
         if let Some(refused) = s.refusal() {
@@ -299,8 +356,10 @@ where
             s.next_bar_time(),
             s.live_from().is_some(),
             s.handle().clone(),
+            config.references.clone(),
         )
     };
+    let mut held_references = LiveReferences::new(&references);
     // A warm-up that reads the funding rates gives the clock its start from the same rates, and
     // leaves the rates after its last bar for the first live bar.
     let mut warmed = None;
@@ -320,6 +379,23 @@ where
                 Ok(bars) => bars,
                 Err(reason) => return halt(&mut lock(shared), LiveError::Halted(reason)),
             };
+            // Each reference's history over the same span; a bucket it has no bar for is missing.
+            for (i, reference) in references.iter().enumerate() {
+                let reference_bars =
+                    warm_up_bars(shared, &data_dir, &*rest, reference, timeframe, from, end);
+                match reference_bars {
+                    Ok(reference_bars) => {
+                        for bar in reference_bars {
+                            held_references.bar(i, bar);
+                        }
+                    }
+                    Err(reason) => {
+                        let reason = format!("the reference instrument {reference}: {reason}");
+                        return halt(&mut lock(shared), LiveError::Halted(reason));
+                    }
+                }
+                held_references.reached(i, end - timeframe.duration_ms());
+            }
             // As a paper session: the strategy sees every rate from where its bars begin, the end
             // of the log or the first warm-up bar, each fed at its due time with the bar it falls
             // in or the next, uncharged, as a backtest of the same bars feeds it.
@@ -341,9 +417,14 @@ where
                 let bar_end = bar.open_time + timeframe.duration_ms();
                 let due = std::iter::from_fn(|| rates.next_if(|&(time, _)| time < bar_end));
                 let from = s.next_bar_time().unwrap_or(bar.open_time);
-                if let Err(e) = s.feed(bar, funding_at(due, from), true) {
+                // Every reference has reached the end of the span, so no slot is behind.
+                let slots = held_references
+                    .slots(bar.open_time)
+                    .unwrap_or_else(|_| vec![None; references.len()]);
+                if let Err(e) = s.feed(bar, funding_at(due, from), slots, true) {
                     return halt(&mut s, e);
                 }
+                held_references.fed(bar.open_time);
             }
             after_warm_up.extend(rates);
             end
@@ -386,27 +467,32 @@ where
             return halt(&mut lock(shared), LiveError::Halted(reason));
         }
     };
-    let (tx, mut rx) = tokio::sync::mpsc::channel(256);
     {
         let _inside = runtime.enter();
-        runtime.spawn(run_feed_on(
-            stream(),
-            timeframe,
-            Some(start),
-            rest.clone(),
-            tx,
-        ));
-    }
-    runtime.spawn(async move {
-        while let Some(event) = rx.recv().await {
-            if wake.send(Msg::Feed(event)).is_err() {
-                return;
-            }
+        // Every feed's events on the run's channel, each with its lane.
+        let lanes = std::iter::once((None, &id))
+            .chain(references.iter().enumerate().map(|(i, r)| (Some(i), r)));
+        for (lane, feed_id) in lanes {
+            let (tx, mut rx) = tokio::sync::mpsc::channel(256);
+            // The feed's task ends with the runtime.
+            drop(open(feed_id, start, tx));
+            let wake = wake.clone();
+            runtime.spawn(async move {
+                while let Some(event) = rx.recv().await {
+                    if wake.send(Msg::Feed(lane, event)).is_err() {
+                        return;
+                    }
+                }
+                // Every sender is gone: the feed's task returned or panicked.
+                let _ = wake.send(Msg::FeedEnded(lane));
+            });
         }
-        // Every sender is gone: the feed's task returned or panicked.
-        let _ = wake.send(Msg::FeedEnded);
-    });
+    }
+    drop(wake);
 
+    // Traded bars waiting for their reference bars, oldest first, each with when it arrived.
+    // Without references a bar's slots are known at once, so it is fed on the turn it arrives.
+    let mut held: VecDeque<(Candle, Instant)> = VecDeque::new();
     let ended = loop {
         if let Some(signal) = control.take() {
             let mut s = lock(shared);
@@ -415,30 +501,152 @@ where
                 Signal::Stop => stop(&mut s),
             };
         }
-        // The control keeps a sender, so this only waits.
-        let event = match msgs.recv() {
-            Ok(Msg::Feed(event)) => event,
-            Ok(Msg::FeedEnded) => {
+        // The oldest held bar, once every reference's slot for it is known. One bar a turn, so a
+        // signal asked for meanwhile is taken before the next.
+        if let Some(&(bar, _)) = held.front()
+            && let Ok(slots) = held_references.slots(bar.open_time)
+        {
+            held.pop_front();
+            {
+                let mut s = lock(shared);
+                for (reference, _) in references.iter().zip(&slots).filter(|(_, s)| s.is_none()) {
+                    s.warn(format!(
+                        "the strategy sees no bar of the reference instrument {reference} opening \
+                         at {}: its feed left that bucket out or went past it",
+                        format_minute(bar.open_time)
+                    ));
+                }
+            }
+            let fed = live_bar(
+                shared,
+                &*rest,
+                &id,
+                timeframe,
+                funding.as_mut(),
+                &mut after_warm_up,
+                bar,
+                slots,
+                &handle,
+                &mut after_bar,
+            );
+            if fed.is_err() {
+                break fed;
+            }
+            held_references.fed(bar.open_time);
+            continue;
+        }
+        let msg = match held.front() {
+            // Queued events first: after the run has been busy feeding earlier bars, the wait of
+            // the bar in front may have run out with its reference bar already queued. The wait
+            // halts the run only once nothing is queued.
+            Some(&(bar, arrived)) => match msgs.try_recv() {
+                Ok(msg) => msg,
+                Err(_) => {
+                    let left = (arrived + wait).saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        let behind: Vec<String> = held_references
+                            .slots(bar.open_time)
+                            .err()
+                            .unwrap_or_default()
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect();
+                        let reason = format!(
+                            "no bar of the reference instrument {} opening at {} came within {} s \
+                             of the traded bar, so that bar was not fed and nothing was sent for \
+                             it; any position and resting orders stay at the venue as they are, \
+                             and resuming the session backfills every feed from its last bar",
+                            behind.join(", "),
+                            format_minute(bar.open_time),
+                            wait.as_secs()
+                        );
+                        break halt(&mut lock(shared), LiveError::Halted(reason));
+                    }
+                    match msgs.recv_timeout(left) {
+                        Ok(msg) => msg,
+                        // Tried again from the top: a signal, then the queue, then the wait.
+                        Err(_) => continue,
+                    }
+                }
+            },
+            // The control keeps a sender, so this only waits.
+            None => match msgs.recv() {
+                Ok(msg) => msg,
+                Err(_) => continue,
+            },
+        };
+        let (lane, event) = match msg {
+            Msg::Feed(lane, event) => (lane, event),
+            Msg::Wake => continue,
+            Msg::FeedEnded(None) => {
                 break halt(&mut lock(shared), LiveError::Halted(FEED_ENDED.into()));
             }
-            Ok(Msg::Wake) | Err(_) => continue,
+            Msg::FeedEnded(Some(i)) => {
+                let mut s = lock(shared);
+                let at = held
+                    .front()
+                    .map(|(bar, _)| bar.open_time)
+                    .or(s.next_bar_time())
+                    .unwrap_or(start);
+                let reason = format!(
+                    "the live feed of the reference instrument {} ended, so the bar at {} cannot \
+                     be fed with its reference bar and nothing was sent for it; any position and \
+                     resting orders stay at the venue as they are, and resuming the session \
+                     backfills every feed from its last bar",
+                    references[i],
+                    format_minute(at)
+                );
+                break halt(&mut s, LiveError::Halted(reason));
+            }
         };
+        if let Some(i) = lane {
+            let reference = &references[i];
+            let warning = match event {
+                FeedEvent::Bar(bar) => {
+                    held_references.bar(i, bar);
+                    None
+                }
+                // The strategy sees no bar of the reference there; the bar it goes with warns.
+                FeedEvent::Dropped(open_time) => {
+                    held_references.reached(i, open_time);
+                    None
+                }
+                // A reference that cannot connect holds back the next traded bar until the wait
+                // runs out.
+                FeedEvent::Connected => None,
+                FeedEvent::ConnectFailed { error } => Some(format!(
+                    "the feed of the reference instrument {reference} could not connect: {error}"
+                )),
+                FeedEvent::Disconnected { reason } => Some(format!(
+                    "the feed of the reference instrument {reference} disconnected: {reason}"
+                )),
+                FeedEvent::BackfillFailed { error } => Some(format!(
+                    "the backfill of the reference instrument {reference} failed, retrying: \
+                     {error}"
+                )),
+                FeedEvent::BadMessage { error } => Some(format!(
+                    "the feed of the reference instrument {reference}: {error}"
+                )),
+                FeedEvent::Tolerated {
+                    open_time,
+                    missing_minutes,
+                } => Some(format!(
+                    "the bar of the reference instrument {reference} at {open_time} was built \
+                     with {missing_minutes} of its minutes missing"
+                )),
+                FeedEvent::FramesDropped { count } => Some(format!(
+                    "{count} stream frames of the reference instrument {reference} were dropped \
+                     while its feed was behind; the closed minutes among them are backfilled"
+                )),
+            };
+            if let Some(warning) = warning {
+                lock(shared).warn(warning);
+            }
+            continue;
+        }
         let warning = match event {
             FeedEvent::Bar(bar) => {
-                let fed = live_bar(
-                    shared,
-                    &*rest,
-                    &id,
-                    timeframe,
-                    funding.as_mut(),
-                    &mut after_warm_up,
-                    bar,
-                    &handle,
-                    &mut after_bar,
-                );
-                if fed.is_err() {
-                    break fed;
-                }
+                held.push_back((bar, Instant::now()));
                 None
             }
             FeedEvent::Connected => None,
@@ -470,9 +678,9 @@ where
     ended
 }
 
-/// Feeds one live bar with the funding due in it, and on the first live bar the rates due after
-/// the last warm-up bar, then reads the venue, checks the broker's fault, writes the status and
-/// calls the owner's check.
+/// Feeds one live bar with its reference bars and the funding due in it, and on the first live bar
+/// the rates due after the last warm-up bar, then reads the venue, checks the broker's fault,
+/// writes the status and calls the owner's check.
 #[allow(clippy::too_many_arguments)]
 fn live_bar<A>(
     shared: &Mutex<LiveSession>,
@@ -482,6 +690,7 @@ fn live_bar<A>(
     clock: Option<&mut FundingClock>,
     after_warm_up: &mut Vec<(Millis, f64)>,
     bar: Candle,
+    references: Vec<Option<Candle>>,
     handle: &VenueHandle,
     after_bar: &mut A,
 ) -> Result<(), LiveError>
@@ -505,7 +714,7 @@ where
         }
     }
     let mut s = lock(shared);
-    let fed = s.feed(bar, charged, false);
+    let fed = s.feed(bar, charged, references, false);
     s.read_venue();
     if let Some(fault) = handle.fault() {
         return halt(&mut s, LiveError::Faulted(fault.to_string()));

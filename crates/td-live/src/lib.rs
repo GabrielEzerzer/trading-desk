@@ -126,12 +126,15 @@ mod session;
 mod stop_file;
 
 pub use broker::{BrokerFault, BrokerRecord, FaultKind, VenueBroker, VenueHandle};
+#[doc(hidden)]
+#[cfg(feature = "test-run")]
+pub use guard::run_guarded_on;
 pub use guard::{GuardTiming, Outcome, StopHandle, flatten_session, run_guarded, saved_files};
 pub use ids::{InvalidPrefix, PREFIX_MAX_LEN};
 pub use run::LiveRun;
 #[doc(hidden)]
 #[cfg(feature = "test-run")]
-pub use run::run_unguarded;
+pub use run::{OpenFeed, run_unguarded};
 pub use session::{
     BuildStrategy, Funding, LiveConfig, LiveError, LiveSession, LiveStatus, SavedConfig, State,
     VenueRead, live_dir,
