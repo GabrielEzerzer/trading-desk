@@ -450,14 +450,14 @@ impl Rig {
 fn wait_until(run: &LiveRun, what: &str, done: impl Fn(&LiveStatus) -> bool) {
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
+        // Whether the run had ended is read before its status, so a status written just before
+        // it ended, such as a halt, is still read once after the end.
+        let finished = run.is_finished();
         let status = run.status();
         if done(&status) {
             return;
         }
-        assert!(
-            !run.is_finished(),
-            "the run ended before {what}: {status:?}"
-        );
+        assert!(!finished, "the run ended before {what}: {status:?}");
         assert!(
             Instant::now() < deadline,
             "no {what} within 20 s: {status:?}"
@@ -830,9 +830,10 @@ fn a_venue_that_cannot_be_read_gets_no_adding_order_and_halts_the_session_on_the
     ] {
         rig.mock.inject_always(path, Fault::DropBeforeApply);
     }
-    let creates = rig.mock.request_count(CREATE);
+    let sent = || [CREATE, CANCEL, AMEND].map(|p| rig.mock.request_count(p));
+    let before = sent();
 
-    // One bar without a read: a warning, still running, nothing sent.
+    // One bar without a read: a warning, still running, nothing sent, cancelled or amended.
     feed.minute(rig.bar(3));
     wait_for_bar(&run, rig.bar(2));
     let status = run.status();
@@ -844,7 +845,7 @@ fn a_venue_that_cannot_be_read_gets_no_adding_order_and_halts_the_session_on_the
             .any(|w| w.contains("the venue could not be read")),
         "{status:?}"
     );
-    assert_eq!(rig.mock.request_count(CREATE), creates, "nothing sent");
+    assert_eq!(sent(), before, "creates, cancels and amends");
 
     // Two more: the third halts the run on the broker's fault.
     feed.minute(rig.bar(5));
@@ -866,8 +867,9 @@ fn a_venue_that_cannot_be_read_gets_no_adding_order_and_halts_the_session_on_the
     assert!(error.to_string().contains(fault.as_str()), "{error}");
     assert_eq!(live.status().last_bar, Some(rig.bar(4)));
 
-    // The venue received no order while it could not be read, so nothing added to the position.
-    assert_eq!(rig.mock.request_count(CREATE), creates, "nothing sent");
+    // The venue received no order, cancel or amend while it could not be read, so nothing added
+    // to the position and the stop was left as it was.
+    assert_eq!(sent(), before, "creates, cancels and amends");
     assert_eq!(rig.mock.orders().len(), 2);
     assert_eq!(rig.mock.position(SYMBOL), QTY);
     // The adds the strategy decided were cancelled with the broker's reason, never sent.
@@ -894,6 +896,55 @@ fn a_venue_that_cannot_be_read_gets_no_adding_order_and_halts_the_session_on_the
         matches!(&refused, LiveError::StillFaulted(f) if f == fault),
         "{refused}"
     );
+}
+
+/// The other half of the broker's rule for a venue it cannot read, seen through a running session:
+/// a reduce-only order the strategy decides still goes out, so a position can be closed while the
+/// venue's reads fail.
+#[test]
+fn a_reduce_only_order_still_goes_out_while_the_venue_cannot_be_read() {
+    let rig = Rig::new();
+    let feed = rig.feed();
+    feed.minute(rig.bar(2));
+    let run = rig.run(
+        rig.create("close", config(0, 3, false)).expect("creates"),
+        &feed,
+    );
+
+    // Bar 0 bought; by the end of bar 1 the venue holds the position.
+    wait_for_bar(&run, rig.bar(1));
+    assert_eq!(rig.mock.position(SYMBOL), QTY);
+    assert_eq!(rig.mock.orders().len(), 1);
+
+    // From bar 2 on the venue cannot be read; bar 3 sells the position reduce-only.
+    for path in [
+        "/v5/execution/list",
+        "/v5/order/realtime",
+        "/v5/position/list",
+        WALLET,
+    ] {
+        rig.mock.inject_always(path, Fault::DropBeforeApply);
+    }
+    feed.minute(rig.bar(4));
+    wait_for_bar(&run, rig.bar(3));
+    let status = run.status();
+    let (_live, ended) = run.stop();
+    ended.expect("stopped cleanly");
+
+    assert_eq!(status.state, State::Running);
+    assert!(
+        status
+            .warnings
+            .iter()
+            .any(|w| w.contains("the venue could not be read")),
+        "{status:?}"
+    );
+    let orders = rig.mock.orders();
+    assert_eq!(orders.len(), 2, "{orders:?}");
+    assert_eq!(orders[1].side, Side::Sell);
+    assert!(orders[1].reduce_only);
+    assert_eq!(orders[1].qty, QTY);
+    assert_eq!(rig.mock.position(SYMBOL), 0.0);
 }
 
 #[test]
