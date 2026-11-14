@@ -400,7 +400,7 @@ impl Rig {
     }
 
     fn create(&self, id: &str, config: LiveConfig) -> Result<LiveSession, LiveError> {
-        LiveSession::create(self.data(), id, config, self.client.clone(), build)
+        LiveSession::create(self.data(), id, config, None, self.client.clone(), build)
     }
 
     fn open(&self, id: &str) -> Result<LiveSession, LiveError> {
@@ -2142,4 +2142,266 @@ fn warnings_are_trimmed_when_a_status_is_loaded() {
     assert_eq!(warnings.len(), 100);
     assert_eq!(warnings[0], "warning 51");
     assert!(warnings.iter().all(|w| w.chars().count() <= 1001));
+}
+
+// ---- the link to what a session was started from, and `td-live status` ----
+
+/// The registered strategy the link tests start: it trades nothing on the rig's flat bars.
+const LINKED: &str = "sma_cross";
+const LINKED_PARAMS: &str = r#"{"fast":10,"slow":30}"#;
+
+impl Rig {
+    /// An `Env` for the command on this rig. Its stop is asked for before the command runs, so a
+    /// `start` or `resume` creates or opens the session and stops it cleanly.
+    fn env(&self, feed: &Feed) -> td_live::cli::Env {
+        let client = self.client.clone();
+        let (url, data) = (feed.url.clone(), self.data().to_path_buf());
+        let stop = StopHandle::new();
+        stop.stop();
+        td_live::cli::Env {
+            connect: Box::new(move || Ok(client.clone())),
+            rest: self.rest.clone(),
+            stream: Arc::new(move |id| Arc::new(SharedStream::open(id, url.clone()))),
+            build,
+            data_dir: Box::new(move || Ok(data.clone())),
+            timing: GuardTiming {
+                interval: Duration::from_millis(100),
+                pause: Duration::from_millis(50),
+                rounds: 6,
+                unreadable: 4,
+            },
+            stop,
+        }
+    }
+
+    /// Runs `td-live` with `args` on this rig and returns its exit code and output.
+    fn td_live(&self, feed: &Feed, args: &[&str]) -> (u8, String) {
+        use clap::Parser;
+        let cli = td_live::cli::Cli::try_parse_from(
+            std::iter::once("td-live").chain(args.iter().copied()),
+        )
+        .expect("parses");
+        let mut lines = Vec::new();
+        let code = td_live::cli::execute(cli, &self.env(feed), &mut |l| lines.push(l.to_string()));
+        (code, lines.join("\n"))
+    }
+
+    /// `td-live start` of [`LINKED`] as session `id`, with `extra` arguments.
+    fn start_linked(&self, feed: &Feed, id: &str, extra: &[&str]) -> (u8, String) {
+        let mut args = vec![
+            "start",
+            "--id",
+            id,
+            "--strategy",
+            LINKED,
+            "--params",
+            LINKED_PARAMS,
+            "--symbol",
+            SYMBOL,
+            "--timeframe",
+            "1h",
+            "--daily-loss",
+            "1",
+            "--max-loss",
+            "1",
+            "--notional-cap",
+            "1000000000000",
+        ];
+        args.extend_from_slice(extra);
+        self.td_live(feed, &args)
+    }
+
+    fn config_json(&self, id: &str) -> serde_json::Value {
+        serde_json::from_str(&fs::read_to_string(self.path(id, "config.json")).expect("config"))
+            .expect("config reads")
+    }
+
+    fn write_config_json(&self, id: &str, config: &serde_json::Value) {
+        fs::write(
+            self.path(id, "config.json"),
+            serde_json::to_vec_pretty(config).expect("json"),
+        )
+        .expect("write");
+    }
+
+    /// Saves a verdict of [`LINKED`] on `on`, as its plan and rule are now, as run `run_id` in the
+    /// runs folder, judged with `references`.
+    fn save_verdict(&self, run_id: &str, on: &InstrumentId, references: Vec<InstrumentId>) {
+        let entry = td_engine::find_strategy(LINKED).expect("registered");
+        let record = td_engine::VerdictRecord {
+            strategy: LINKED.into(),
+            instrument: on.clone(),
+            seed: 1,
+            engine_revision: td_engine::ENGINE_REVISION,
+            verdict: td_engine::Verdict::new(on.clone(), Vec::new()),
+            plan: serde_json::to_value(&entry.plan).unwrap(),
+            rule: serde_json::to_value(entry.rule).unwrap(),
+            complete: true,
+            code_hash: td_engine::code_hash(LINKED).map(String::from),
+            references,
+        };
+        let dir = self.data().join(td_engine::RUNS_DIR).join(run_id);
+        fs::create_dir_all(&dir).expect("run folder");
+        fs::write(
+            dir.join(td_engine::VERDICT_FILE),
+            serde_json::to_vec(&record).expect("json"),
+        )
+        .expect("verdict");
+    }
+}
+
+const OLDER: &str = "1700000000000-0000000a";
+const NEWER: &str = "1700000000001-0000000b";
+
+/// The status lines that start with `link`.
+fn link_status(rig: &Rig, feed: &Feed, id: &str) -> String {
+    let (code, text) = rig.td_live(feed, &["status", "--id", id]);
+    assert_eq!(code, 0, "{text}");
+    text.lines()
+        .filter(|l| l.starts_with("link"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn start_links_the_session_to_the_latest_verdict_or_the_one_named_and_status_checks_it() {
+    let rig = Rig::new();
+    let feed = rig.feed();
+    let on = instrument().id;
+    rig.save_verdict(OLDER, &on, Vec::new());
+    rig.save_verdict(NEWER, &on, Vec::new());
+
+    let (code, text) = rig.start_linked(&feed, "latest", &[]);
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("created session latest"), "{text}");
+    let link = &rig.config_json("latest")["link"];
+    assert_eq!(link["verdict"]["run_id"], NEWER);
+    assert_eq!(
+        link["code_hash"].as_str(),
+        td_engine::code_hash(LINKED),
+        "the hash of the strategy's file"
+    );
+    let entry = td_engine::find_strategy(LINKED).unwrap();
+    assert_eq!(link["plan"], serde_json::to_value(&entry.plan).unwrap());
+    assert_eq!(link["rule"], serde_json::to_value(entry.rule).unwrap());
+
+    // The verdict's engine and code are this engine's and the strategy's. The strategy's plan does
+    // not test this venue's perpetual, so the plan check fails and the link is stale, as the
+    // verdict list would show it.
+    let status = link_status(&rig, &feed, "latest");
+    assert!(
+        status.contains(&format!(
+            "link: started from verdict {NEWER} of {LINKED} on {on}"
+        )),
+        "{status}"
+    );
+    assert!(
+        status.contains(
+            "link checks against the verdict: engine revision matches, plan and rule does not \
+             match, code matches"
+        ),
+        "{status}"
+    );
+    assert!(status.contains("link: stale"), "{status}");
+
+    // An older engine revision shows in its own check.
+    let mut config = rig.config_json("latest");
+    config["link"]["verdict"]["engine_revision"] = (td_engine::ENGINE_REVISION - 1).into();
+    rig.write_config_json("latest", &config);
+    let status = link_status(&rig, &feed, "latest");
+    assert!(
+        status.contains("engine revision does not match, plan and rule does not match"),
+        "{status}"
+    );
+
+    // A verdict named with --verdict is the one linked, in a data folder of its own.
+    let other = tempfile::tempdir().expect("temp dir");
+    let runs = other.path().join(td_engine::RUNS_DIR);
+    fs::create_dir_all(&runs).unwrap();
+    for run in [OLDER, NEWER] {
+        let from = rig.data().join(td_engine::RUNS_DIR).join(run);
+        fs::create_dir_all(runs.join(run)).unwrap();
+        fs::copy(
+            from.join(td_engine::VERDICT_FILE),
+            runs.join(run).join(td_engine::VERDICT_FILE),
+        )
+        .unwrap();
+    }
+    let data = other.path().to_str().unwrap();
+    let (code, text) = rig.start_linked(&feed, "named", &["--verdict", OLDER, "--data-dir", data]);
+    assert_eq!(code, 0, "{text}");
+    let config: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(live_dir(other.path(), "named").join("config.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(config["link"]["verdict"]["run_id"], OLDER);
+}
+
+#[test]
+fn a_link_without_a_verdict_is_current_until_the_code_or_plan_it_started_with_changes() {
+    let rig = Rig::new();
+    let feed = rig.feed();
+    let (code, text) = rig.start_linked(&feed, "unjudged", &[]);
+    assert_eq!(code, 0, "{text}");
+    let started = rig.config_json("unjudged");
+    assert!(started["link"]["verdict"].is_null(), "{started}");
+
+    let status = link_status(&rig, &feed, "unjudged");
+    let on = instrument().id;
+    assert_eq!(
+        status,
+        format!(
+            "link: started with no saved verdict of {LINKED} on {on}; the strategy's code hash was {}\n\
+             link checks against what the session started with: plan and rule matches, code matches\n\
+             link: current",
+            td_engine::code_hash(LINKED).unwrap()
+        )
+    );
+
+    // As if the strategy's file had been edited since the session started.
+    let mut edited = started.clone();
+    edited["link"]["code_hash"] = "0000000000000000".into();
+    rig.write_config_json("unjudged", &edited);
+    let status = link_status(&rig, &feed, "unjudged");
+    assert!(
+        status.contains("plan and rule matches, code does not match\nlink: stale; the code or plan may have changed since the session started"),
+        "{status}"
+    );
+
+    // As if its plan had been changed since.
+    let mut replanned = started.clone();
+    let from = replanned["link"]["plan"]["period"]["from"]
+        .as_i64()
+        .unwrap();
+    replanned["link"]["plan"]["period"]["from"] = (from - 86_400_000).into();
+    rig.write_config_json("unjudged", &replanned);
+    let status = link_status(&rig, &feed, "unjudged");
+    assert!(
+        status.contains("plan and rule does not match, code matches\nlink: stale"),
+        "{status}"
+    );
+}
+
+#[test]
+fn a_session_saved_without_a_link_loads_resumes_and_shows_status() {
+    let rig = Rig::new();
+    let feed = rig.feed();
+    // The test double is not registered, so its session has no link, and its config.json is the
+    // one a session saved before links were recorded holds: the same fields, with no `link`.
+    drop(rig.create("old", config(-1, -1, false)).expect("creates"));
+    let config = rig.config_json("old");
+    assert!(config.get("link").is_none(), "{config}");
+    let saved: td_live::SavedConfig = serde_json::from_value(config).expect("reads");
+    assert_eq!(saved.link, None);
+
+    let status = link_status(&rig, &feed, "old");
+    assert_eq!(
+        status,
+        "link: none recorded; the session was created before links were recorded, or its \
+         strategy is not registered"
+    );
+    drop(rig.open("old").expect("opens"));
+    let (code, text) = rig.td_live(&feed, &["resume", "--id", "old"]);
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("resumed session old"), "{text}");
 }

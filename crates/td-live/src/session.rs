@@ -3,8 +3,8 @@
 //!
 //! The folder holds these files:
 //! - `config.json`, written once at creation: the [`LiveConfig`] with its stop rules, the starting
-//!   balance read from the venue, the client-id prefix, the engine revision and the creation time
-//!   ([`SavedConfig`]).
+//!   balance read from the venue, the client-id prefix, the engine revision, the creation time and
+//!   what the session was started from ([`SavedConfig`]).
 //! - `stops.json`, the stop state and the stop guard's flatten record (`crate::stop_file`),
 //!   written at creation and by the guard whenever it changes. A session whose stop has fired is
 //!   never opened to trade again.
@@ -54,7 +54,7 @@ use serde::{Deserialize, Serialize};
 use td_core::{AccountCurrency, Candle, FeeSchedule, Instrument, Millis, OrderId, Timeframe};
 use td_engine::{
     Broker, BrokerEvent, ENGINE_REVISION, EngineError, Order, Params, Portfolio, Session,
-    SessionConfig, StopError, StopRules, StopState, Strategy,
+    SessionConfig, SessionLink, StopError, StopRules, StopState, Strategy,
 };
 use td_orders::Client;
 
@@ -132,6 +132,12 @@ pub struct SavedConfig {
     pub engine_revision: u32,
     /// The venue's time when the session was created.
     pub created_at: Millis,
+    /// What the session was started from: the strategy's code hash, test plan and verdict rule
+    /// then, and the saved verdict it was started from ([`td_engine::session_link`]). Fixed at
+    /// creation and only read for the status. `None` for a strategy that is not registered, and in
+    /// a session saved before links were recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link: Option<SessionLink>,
 }
 
 /// A funding rate fed with a bar.
@@ -395,12 +401,13 @@ impl LiveSession {
     /// taken, the stop rules or the strategy or settings do not check, the venue cannot be read,
     /// or the account holds a position or open orders on the instrument. The starting balance is
     /// the account's equity read here, the stop state starts from it, and the client-id prefix is
-    /// made from the creation time. When writing the folder fails part way, what was written is
-    /// removed, so the id can be used again.
+    /// made from the creation time. `link` is saved as it is. When writing the folder fails part
+    /// way, what was written is removed, so the id can be used again.
     pub fn create(
         data_dir: &Path,
         id: &str,
         config: LiveConfig,
+        link: Option<SessionLink>,
         client: Arc<Client>,
         build: BuildStrategy,
     ) -> Result<LiveSession, LiveError> {
@@ -431,6 +438,7 @@ impl LiveSession {
             prefix: base36(created_at),
             engine_revision: ENGINE_REVISION,
             created_at,
+            link,
         };
         let config_path = dir.join(CONFIG_FILE);
         let log_path = dir.join(EVENTS_FILE);
@@ -1470,9 +1478,15 @@ mod tests {
     fn an_order_made_after_the_log_breaks_is_not_sent_and_is_cancelled_in_the_engine() {
         let mock = mock();
         let data = tempfile::tempdir().unwrap();
-        let mut live =
-            LiveSession::create(data.path(), "broken", config(1), client_for(&mock), build)
-                .unwrap();
+        let mut live = LiveSession::create(
+            data.path(),
+            "broken",
+            config(1),
+            None,
+            client_for(&mock),
+            build,
+        )
+        .unwrap();
         let start = Timeframe::H1.floor(mock.now()) - HOUR;
         live.feed(flat(start), Vec::new(), false).expect("bar 0");
         let lines = fs::read_to_string(live.dir().join(EVENTS_FILE)).unwrap();
@@ -1499,8 +1513,15 @@ mod tests {
         let mock = mock();
         let data = tempfile::tempdir().unwrap();
         let client = client_for(&mock);
-        let mut live =
-            LiveSession::create(data.path(), "pending", config(0), client.clone(), build).unwrap();
+        let mut live = LiveSession::create(
+            data.path(),
+            "pending",
+            config(0),
+            None,
+            client.clone(),
+            build,
+        )
+        .unwrap();
         let start = Timeframe::H1.floor(mock.now()) - HOUR;
         live.feed(flat(start), Vec::new(), false).expect("bar 0");
         assert_eq!(mock.request_count(CREATE), 1);

@@ -5,6 +5,13 @@
 //! from `td_orders::DemoKeys` in the environment and the demo endpoint only. [`execute`] runs one
 //! parsed command against an [`Env`] the binary (or a test) builds, writes one line per event to
 //! `out`, and returns the exit code.
+//!
+//! `start` links the session to what it was started from, as a paper session is linked
+//! ([`td_engine::session_link`]): the strategy's code hash, plan and rule, and the saved verdict
+//! `--verdict` names, or else the strategy's latest verdict on the instrument, read from the runs
+//! folder under the data folder. A verdict judged with reference instruments is refused before
+//! anything is written or sent: a live session feeds its strategy none. `status` shows the link
+//! with its checks against the strategy as it is now ([`td_engine::LinkState`]).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -12,13 +19,18 @@ use std::sync::Arc;
 use clap::{Args, Parser, Subcommand};
 use td_core::{Instrument, InstrumentId, InstrumentKind, Timeframe, Venue};
 use td_data::live::{Rest, SharedStream};
-use td_engine::{DayRollover, Params, StopRules, default_slippage_bps};
+use td_engine::{
+    DayRollover, LinkState, Params, RUNS_DIR, SessionLink, StopRules, default_slippage_bps,
+};
 use td_orders::{Client, SETTLE_COIN};
 
 use crate::guard::{
     GuardTiming, Outcome, StopHandle, flatten_session, flatten_unfinished, run_guarded, saved_files,
 };
-use crate::session::{BuildStrategy, LiveConfig, LiveError, LiveSession, refuse_unended};
+use crate::session::{
+    BuildStrategy, CONFIG_FILE, LiveConfig, LiveError, LiveSession, SavedConfig, live_dir,
+    read_json, refuse_unended,
+};
 
 /// Runs a strategy on a venue's demo-trading account with loss limits the engine enforces.
 #[derive(Debug, Parser)]
@@ -71,6 +83,10 @@ pub struct StartArgs {
     /// `new-york-17` (17:00 in New York).
     #[arg(long, value_parser = parse_rollover, default_value = "utc")]
     pub rollover: DayRollover,
+    /// The saved verdict the session is started from, by its run id; the default is the
+    /// strategy's latest verdict on the instrument, or none when it has none there.
+    #[arg(long)]
+    pub verdict: Option<String>,
     /// The data folder; the default is the desk's data folder.
     #[arg(long)]
     pub data_dir: Option<PathBuf>,
@@ -138,9 +154,22 @@ fn run(cli: Cli, env: &Env, out: &mut dyn FnMut(&str)) -> Result<u8, String> {
         Command::Start(args) => {
             let data = data_dir(args.data_dir.clone())?;
             refuse_unended(&data).map_err(|e| e.to_string())?;
+            // Before the venue is asked anything, so a refused verdict sends nothing.
+            let linked_on = InstrumentId {
+                venue: Venue::Bybit,
+                symbol: args.symbol.clone(),
+                kind: InstrumentKind::Perpetual,
+            };
+            let link = start_link(&data, &args, &linked_on)?;
             let client = (env.connect)()?;
             let config = start_config(&args, &client)?;
-            let live = LiveSession::create(&data, &args.id, config, client, env.build)
+            if config.instrument.id != linked_on {
+                return Err(format!(
+                    "the venue lists {} as {}; give the symbol as the venue writes it",
+                    args.symbol, config.instrument.id.symbol
+                ));
+            }
+            let live = LiveSession::create(&data, &args.id, config, link, client, env.build)
                 .map_err(|e| e.to_string())?;
             out(&format!(
                 "created session {} at {}",
@@ -177,6 +206,11 @@ fn run(cli: Cli, env: &Env, out: &mut dyn FnMut(&str)) -> Result<u8, String> {
             let pretty = |v| serde_json::to_string_pretty(&v).unwrap_or_default();
             out(&format!("status: {}", pretty(status)));
             out(&format!("stops: {}", pretty(stops)));
+            let saved: SavedConfig = read_json(&live_dir(&data, &args.id).join(CONFIG_FILE))
+                .map_err(|e| e.to_string())?;
+            for line in link_lines(&saved) {
+                out(&line);
+            }
             Ok(0)
         }
         Command::Flatten(args) => {
@@ -213,6 +247,106 @@ fn flatten(
     let outcome: Outcome =
         flatten_session(data, id, client, env.timing, out).map_err(|e| e.to_string())?;
     Ok(outcome.exit_code())
+}
+
+/// The link of a session started with `args` on `instrument`: from the verdict `--verdict` names,
+/// or the strategy's latest on the instrument. `None` for a strategy that is not registered, which
+/// has no saved verdicts; naming a verdict for one is refused.
+fn start_link(
+    data: &Path,
+    args: &StartArgs,
+    instrument: &InstrumentId,
+) -> Result<Option<SessionLink>, String> {
+    let Some(entry) = td_engine::strategies()
+        .into_iter()
+        .find(|e| e.name == args.strategy)
+    else {
+        return match &args.verdict {
+            Some(_) => Err(format!(
+                "--verdict names a verdict, but {} is not a registered strategy, so it has none",
+                args.strategy
+            )),
+            None => Ok(None),
+        };
+    };
+    td_engine::session_link(
+        &data.join(RUNS_DIR),
+        &entry,
+        instrument,
+        args.verdict.as_deref(),
+        "with --verdict",
+    )
+    .map(Some)
+    .map_err(|e| e.to_string())
+}
+
+/// The status lines on what the session was started from, with the link's checks against the
+/// strategy as it is now; each check and `stale` mean what they mean in [`LinkState`].
+fn link_lines(saved: &SavedConfig) -> Vec<String> {
+    let (strategy, instrument) = (&saved.config.strategy, &saved.config.instrument.id);
+    let Some(link) = &saved.link else {
+        return vec![
+            "link: none recorded; the session was created before links were recorded, or its \
+             strategy is not registered"
+                .into(),
+        ];
+    };
+    let state = LinkState::of(link, strategy, instrument, &td_engine::strategies());
+    let check = |m: Option<bool>| match m {
+        Some(true) => "matches",
+        Some(false) => "does not match",
+        None => "unknown",
+    };
+    let code = link.code_hash.as_deref().unwrap_or("none");
+    let mut lines = Vec::new();
+    match &link.verdict {
+        Some(v) => {
+            let state_name = serde_json::to_value(v.state)
+                .ok()
+                .and_then(|s| s.as_str().map(String::from))
+                .unwrap_or_default();
+            let stopped = if v.complete {
+                ""
+            } else {
+                " (its luck test was stopped)"
+            };
+            lines.push(format!(
+                "link: started from verdict {} of {strategy} on {instrument}: {state_name}{stopped}, \
+                 judged by engine revision {}; the strategy's code hash was {code}",
+                v.run_id, v.engine_revision,
+            ));
+            lines.push(format!(
+                "link checks against the verdict: engine revision {}, plan and rule {}, code {}",
+                check(state.engine_matches),
+                check(state.plan_matches),
+                check(state.code_matches),
+            ));
+            lines.push(if state.stale {
+                "link: stale; the code, plan or engine the session runs on may no longer be the \
+                 one that verdict judged"
+                    .into()
+            } else {
+                "link: current".into()
+            });
+        }
+        None => {
+            lines.push(format!(
+                "link: started with no saved verdict of {strategy} on {instrument}; the \
+                 strategy's code hash was {code}"
+            ));
+            lines.push(format!(
+                "link checks against what the session started with: plan and rule {}, code {}",
+                check(state.plan_matches),
+                check(state.code_matches),
+            ));
+            lines.push(if state.stale {
+                "link: stale; the code or plan may have changed since the session started".into()
+            } else {
+                "link: current".into()
+            });
+        }
+    }
+    lines
 }
 
 /// The session's config: the instrument from the venue's own listing, which must be a linear
