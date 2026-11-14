@@ -6,22 +6,22 @@
 //! those, and so can any other session that keeps the same records, such as one whose orders go
 //! to a venue, so the comparison does not depend on how the session's orders were filled.
 //!
-//! Orders and fills are paired the way the NautilusTrader cross-check (`harness/crosscheck`) pairs
-//! fills: by a key and side, in the order they happened, merging the two lists sorted by that key,
-//! so an item with no partner on the other side is left over rather than shifting every pair after
-//! it. The key here is the open time of the bar the order was decided on
-//! ([`Order::submitted_at`]): both sides decide on the same bars, while the time a fill lands can
-//! differ between them. A fill's key is that of its order, or its own time when its order is not
-//! in the record.
+//! Orders are paired the way the NautilusTrader cross-check (`harness/crosscheck`) pairs fills: by
+//! a key and side, in the order they happened, merging the two lists sorted by that key, so an
+//! order with no partner on the other side is left over rather than shifting every pair after it.
+//! The key here is the open time of the bar the order was decided on ([`Order::submitted_at`]):
+//! both sides decide on the same bars, while the time a fill lands can differ between them. Fills
+//! are paired through their orders: a paired order's fills with its partner's, in the order they
+//! happened. The fills of an order without a partner, or of one not in the record, have none.
 //!
-//! shortcut: one fill per order is assumed for the pairing; an order filled in parts on one side
-//! leaves its later parts unmatched. Pair by order and sum the parts when a venue session fills in
-//! parts.
+//! shortcut: an order's fills are paired by position, not by quantity, so an order filled in two
+//! parts on one side and in one on the other pairs the first part with the whole fill and leaves
+//! the second over. Sum each order's parts before pairing when a venue session fills in parts.
 
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
-use td_core::{Fill, Millis, Side};
+use td_core::{Fill, Millis, OrderId, Side};
 
 use crate::{BacktestResult, EquityPoint, Order, OrderStatus, Session};
 
@@ -75,7 +75,7 @@ pub struct SessionComparison {
     /// The session's P&L over the backtest's; `null` when the backtest's P&L is zero. Negative
     /// when one made money and the other lost it.
     pub pnl_ratio: Option<f64>,
-    /// Fills paired one to one, in the order of their key.
+    /// Fills paired one to one through their orders, in the order of the orders' key.
     pub fills: Vec<FillPair>,
     /// Fills of the session with no partner in the backtest.
     pub session_only_fills: Vec<Fill>,
@@ -147,7 +147,8 @@ pub enum DifferenceKind {
     SessionOnlyFill,
     /// A fill of the backtest has no partner in the session.
     BacktestOnlyFill,
-    /// A paired order asked for another quantity, type, price or reduce-only setting.
+    /// A paired order asked for another quantity, type, price, time in force or reduce-only
+    /// setting.
     OrderRequest,
     /// A paired order ended in another state: filled on one side and cancelled on the other, say.
     OrderStatus,
@@ -178,26 +179,29 @@ pub fn compare_with_backtest(session: Recorded, backtest: Recorded) -> SessionCo
     let mut note = |kind, message: String| differences.push(Difference { kind, message });
 
     let (order_pairs, session_only_orders, backtest_only_orders) =
-        pair_by_key(session.orders, backtest.orders, order_key, order_key);
+        pair_orders(session.orders, backtest.orders);
     let mut orders = Vec::with_capacity(order_pairs.len());
-    for (s, b) in order_pairs {
+    for &(s, b) in &order_pairs {
         let at = s.submitted_at;
         let (sr, br) = (&s.request, &b.request);
         if !(same(sr.qty, br.qty)
             && sr.order_type == br.order_type
+            && sr.tif == br.tif
             && sr.reduce_only == br.reduce_only)
         {
             note(
                 DifferenceKind::OrderRequest,
                 format!(
-                    "the {} order decided on the bar at {at} asks for {} {:?}{} in the session \
-                     and {} {:?}{} in the backtest",
+                    "the {} order decided on the bar at {at} asks for {} {:?} {:?}{} in the \
+                     session and {} {:?} {:?}{} in the backtest",
                     side_name(sr.side),
                     sr.qty,
                     sr.order_type,
+                    sr.tif,
                     if sr.reduce_only { " reduce-only" } else { "" },
                     br.qty,
                     br.order_type,
+                    br.tif,
                     if br.reduce_only { " reduce-only" } else { "" },
                 ),
             );
@@ -246,21 +250,31 @@ pub fn compare_with_backtest(session: Recorded, backtest: Recorded) -> SessionCo
         );
     }
 
-    let session_key = decision_times(session.orders);
-    let backtest_key = decision_times(backtest.orders);
-    let key = |times: &HashMap<u64, Millis>, f: &Fill| {
-        (times.get(&f.order_id.0).copied().unwrap_or(f.time), f.side)
-    };
-    // Each side's fills are keyed by its own orders.
-    let (fill_pairs, session_only_fills, backtest_only_fills) = pair_by_key(
-        session.fills,
-        backtest.fills,
-        |f| key(&session_key, f),
-        |f| key(&backtest_key, f),
+    // Each paired order's fills pair with its partner's, in the order they happened; the rest,
+    // and the fills of unpaired orders, are left over.
+    let (session_fills, backtest_fills) = (
+        fills_by_order(session.fills),
+        fills_by_order(backtest.fills),
     );
+    let (mut session_paired, mut backtest_paired) = (HashMap::new(), HashMap::new());
+    let mut fill_pairs = Vec::new();
+    for (s, b) in &order_pairs {
+        let none = Vec::new();
+        let ours = session_fills.get(&s.id).unwrap_or(&none);
+        let theirs = backtest_fills.get(&b.id).unwrap_or(&none);
+        fill_pairs.extend(
+            ours.iter()
+                .zip(theirs)
+                .map(|(&x, &y)| (s.submitted_at, x, y)),
+        );
+        let paired = ours.len().min(theirs.len());
+        session_paired.insert(s.id, paired);
+        backtest_paired.insert(b.id, paired);
+    }
+    let session_only_fills = left_over(session.fills, session_paired);
+    let backtest_only_fills = left_over(backtest.fills, backtest_paired);
     let mut fills = Vec::with_capacity(fill_pairs.len());
-    for (s, b) in fill_pairs {
-        let decided_at = key(&session_key, s).0;
+    for (decided_at, s, b) in fill_pairs {
         let what = format!(
             "the {} fill of the order decided on the bar at {decided_at}",
             side_name(s.side)
@@ -269,10 +283,12 @@ pub fn compare_with_backtest(session: Recorded, backtest: Recorded) -> SessionCo
             note(
                 DifferenceKind::FillTime,
                 format!(
-                    "{what} landed at {} in the session and {} in the backtest, {} ms apart",
+                    "{what} landed at {} in the session and {} in the backtest, {} ms {} in the \
+                     session",
                     s.time,
                     b.time,
-                    s.time - b.time
+                    (s.time - b.time).abs(),
+                    if s.time < b.time { "earlier" } else { "later" },
                 ),
             );
         }
@@ -380,40 +396,49 @@ pub fn compare_with_backtest(session: Recorded, backtest: Recorded) -> SessionCo
     }
 }
 
-fn order_key(order: &Order) -> (Millis, Side) {
-    (order.submitted_at, order.request.side)
+/// Each order's fills, by order id, in the order they happened.
+fn fills_by_order(fills: &[Fill]) -> HashMap<OrderId, Vec<&Fill>> {
+    let mut by_order: HashMap<OrderId, Vec<&Fill>> = HashMap::new();
+    for f in fills {
+        by_order.entry(f.order_id).or_default().push(f);
+    }
+    by_order
 }
 
-/// The open time of the bar each order was decided on, by order id.
-fn decision_times(orders: &[Order]) -> HashMap<u64, Millis> {
-    orders.iter().map(|o| (o.id.0, o.submitted_at)).collect()
+/// The fills left without a partner, in the order they happened: every fill but the first
+/// `paired[order]` of each order's.
+fn left_over(fills: &[Fill], mut paired: HashMap<OrderId, usize>) -> Vec<&Fill> {
+    fills
+        .iter()
+        .filter(|f| match paired.get_mut(&f.order_id) {
+            Some(n) if *n > 0 => {
+                *n -= 1;
+                false
+            }
+            _ => true,
+        })
+        .collect()
 }
 
-/// Pairs `a` with `b` by `(time, side)` keys, `key_a` giving `a`'s and `key_b` giving `b`'s, in
-/// order: each list is sorted by its key, keeping
-/// the order items of one key happened in, then merged, the first unpaired item of a key pairing
-/// with the first of the same key on the other side. Returns the pairs and the items of each side
-/// left without a partner.
+/// Pairs orders `a` with `b` by the open time of the bar each was decided on and its side, in
+/// order: each list is sorted by that key, keeping the order orders of one key were submitted in,
+/// then merged, the first unpaired order of a key pairing with the first of the same key on the
+/// other side. Returns the pairs and the orders of each side left without a partner.
 #[allow(clippy::type_complexity)]
-fn pair_by_key<'a, T>(
-    a: &'a [T],
-    b: &'a [T],
-    key_a: impl Fn(&T) -> (Millis, Side),
-    key_b: impl Fn(&T) -> (Millis, Side),
-) -> (Vec<(&'a T, &'a T)>, Vec<&'a T>, Vec<&'a T>) {
-    let sorted = |items: &'a [T], key: &dyn Fn(&T) -> (Millis, Side)| {
-        let mut keyed: Vec<((Millis, u8), &'a T)> = items
+fn pair_orders<'a>(
+    a: &'a [Order],
+    b: &'a [Order],
+) -> (Vec<(&'a Order, &'a Order)>, Vec<&'a Order>, Vec<&'a Order>) {
+    let sorted = |orders: &'a [Order]| {
+        let mut keyed: Vec<((Millis, u8), &'a Order)> = orders
             .iter()
-            .map(|item| {
-                let (time, side) = key(item);
-                ((time, side_rank(side)), item)
-            })
+            .map(|o| ((o.submitted_at, side_rank(o.request.side)), o))
             .collect();
-        // Stable, so items of one key keep the order they happened in.
+        // Stable, so orders of one key keep the order they were submitted in.
         keyed.sort_by_key(|&(k, _)| k);
         keyed
     };
-    let (a, b) = (sorted(a, &key_a), sorted(b, &key_b));
+    let (a, b) = (sorted(a), sorted(b));
     let (mut pairs, mut only_a, mut only_b) = (Vec::new(), Vec::new(), Vec::new());
     let (mut i, mut j) = (0, 0);
     while i < a.len() && j < b.len() {
@@ -600,12 +625,62 @@ mod tests {
     }
 
     #[test]
+    fn fills_pair_through_their_orders_when_two_orders_share_a_bar_and_side() {
+        use OrderStatus::{Filled, Rejected};
+        // On bar 1 both sides submit a market buy and then a limit buy. The session's market buy
+        // is rejected; the backtest's fills on the next bar.
+        let limit = |n, status| {
+            let mut o = order(n, Side::Buy, 1, status);
+            o.request.order_type = OrderType::Limit { price: 99.0 };
+            o
+        };
+        let s_orders = [
+            order(1, Side::Buy, 1, Rejected("no margin".into())),
+            limit(2, Filled),
+        ];
+        let s_fills = [fill(2, Side::Buy, 3 * MIN, 99.0)];
+        let b_orders = [order(1, Side::Buy, 1, Filled), limit(2, Filled)];
+        let b_fills = [
+            fill(1, Side::Buy, 2 * MIN, 100.0),
+            fill(2, Side::Buy, 3 * MIN, 99.0),
+        ];
+        let c = compare_with_backtest(
+            record(&s_orders, &s_fills, &[], 0.0),
+            record(&b_orders, &b_fills, &[], 0.0),
+        );
+        let order_ids: Vec<(u64, u64)> = c
+            .orders
+            .iter()
+            .map(|p| (p.session.id.0, p.backtest.id.0))
+            .collect();
+        assert_eq!(order_ids, [(1, 1), (2, 2)]);
+        // The limit fills pair with each other, with no time or price difference.
+        assert_eq!(c.fills.len(), 1);
+        let pair = &c.fills[0];
+        assert_eq!((&pair.session, &pair.backtest), (&s_fills[0], &b_fills[1]));
+        assert_eq!((pair.time_diff_ms, pair.price_diff), (0, 0.0));
+        // The market fill is the backtest's alone.
+        assert!(c.session_only_fills.is_empty());
+        assert_eq!(c.backtest_only_fills, [b_fills[0].clone()]);
+        assert_eq!(
+            kinds(&c),
+            [
+                DifferenceKind::OrderStatus,
+                DifferenceKind::BacktestOnlyFill,
+                DifferenceKind::Fees,
+            ]
+        );
+    }
+
+    #[test]
     fn every_kind_of_difference_is_named() {
         use OrderStatus::{Cancelled, Filled};
         let mut bigger = order(2, Side::Sell, 2, Filled);
         bigger.request.qty = 2.0;
+        let mut at_once = order(1, Side::Buy, 1, Filled);
+        at_once.request.tif = TimeInForce::Ioc;
         let s_orders = [
-            order(1, Side::Buy, 1, Filled),
+            at_once,
             bigger,
             order(3, Side::Buy, 3, Cancelled("by hand".into())),
             order(4, Side::Buy, 5, Filled),
@@ -666,13 +741,23 @@ mod tests {
         assert!((first.fee_diff - 0.0005).abs() < 1e-12);
         assert_eq!((c.session.pnl, c.backtest.pnl), (-10.0, 10.0));
         assert_eq!(c.pnl_ratio, Some(-1.0));
-        let cancelled = "the buy order decided on the bar at 180000 is cancelled in the session \
-                         and filled in the backtest";
-        assert!(
-            c.differences.iter().any(|d| d.message == cancelled),
-            "{:#?}",
-            c.differences
-        );
+        // Bar 1's buy asked to fill at once in the session only, and bar 2's sell filled a
+        // millisecond earlier in the session.
+        let messages = [
+            "the buy order decided on the bar at 180000 is cancelled in the session and filled in \
+             the backtest",
+            "the buy order decided on the bar at 60000 asks for 1 Market Ioc in the session and 1 \
+             Market Gtc in the backtest",
+            "the sell fill of the order decided on the bar at 120000 landed at 180000 in the \
+             session and 180001 in the backtest, 1 ms earlier in the session",
+        ];
+        for message in messages {
+            assert!(
+                c.differences.iter().any(|d| d.message == message),
+                "{message:?} not in {:#?}",
+                c.differences
+            );
+        }
     }
 
     /// Buys on its second bar and sells on its fourth.

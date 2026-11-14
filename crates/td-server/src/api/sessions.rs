@@ -27,7 +27,8 @@ use serde::{Deserialize, Serialize};
 use td_core::{AccountCurrency, Candle, FeeSchedule, InstrumentId, Millis, OrderId, Timeframe};
 use td_data::time::now_ms;
 use td_engine::{
-    BacktestConfig, EquityPoint, Params, Recorded, RunId, SessionComparison, compare_with_backtest,
+    BacktestConfig, EquityPoint, Params, Recorded, RunId, SessionComparison, StrategyEntry,
+    compare_with_backtest,
 };
 use tokio::sync::{broadcast, oneshot, watch};
 use tokio::task::JoinHandle;
@@ -123,16 +124,17 @@ pub struct SessionState {
     /// The latest problems that did not stop the session.
     pub warnings: Vec<String>,
     /// The strategy's code, plan and rule when the session started and the verdict it was started
-    /// from, with whether that verdict still matches the strategy as it is now (`stale`). Left out
-    /// for a manual session and for one started before links were recorded.
+    /// from, with whether the strategy as it is now still matches that verdict or, without one,
+    /// what the session started with (`stale`). Left out for a manual session and for one started
+    /// before links were recorded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub link: Option<LinkState>,
 }
 
 impl SessionState {
-    /// The state of a paper session, as the API shows it.
-    pub fn of(paper: &PaperSession) -> SessionState {
+    /// The state of a paper session, as the API shows it, its link checked against `strategies`.
+    pub fn of(paper: &PaperSession, strategies: &[StrategyEntry]) -> SessionState {
         let portfolio = paper.portfolio();
         SessionState {
             id: paper.id().to_string(),
@@ -160,7 +162,7 @@ impl SessionState {
             warnings: paper.warnings().to_vec(),
             link: paper.link().map(|link| {
                 let config = paper.config();
-                LinkState::of(link, &config.strategy, &config.instrument.id)
+                LinkState::of(link, &config.strategy, &config.instrument.id, strategies)
             }),
         }
     }
@@ -194,6 +196,12 @@ pub struct ComparedBars {
     /// charged on a later bar, because it was not yet published when its own bar closed, lands
     /// on another bar there; one due before the first live bar is not charged there at all.
     pub funding_events: usize,
+    /// How many of those rates the session charged on a later bar than the one they were due in.
+    /// Each moves funding, and the equity after it, to another bar in the backtest, so it shows as
+    /// a funding and a result difference and, for a strategy that sizes its orders on equity, as
+    /// order and fill quantity differences: none of these is then a difference in how orders were
+    /// filled.
+    pub late_funding: usize,
 }
 
 fn summary(paper: &PaperSession) -> SessionSummary {
@@ -243,6 +251,9 @@ struct Entry {
 pub(crate) struct Sessions {
     data_dir: PathBuf,
     streams: Arc<Streams>,
+    /// The server's strategies, the list `GET /verdicts` reads, that each session's link is checked
+    /// against.
+    strategies: Arc<Vec<StrategyEntry>>,
     entries: Mutex<BTreeMap<String, Entry>>,
     /// Starts, stops and resumes go one at a time, so two cannot race on one session.
     ops: tokio::sync::Mutex<Ops>,
@@ -273,7 +284,11 @@ impl Sessions {
     ///
     /// shortcut: a session whose files do not read is left out with a line on stderr, and every
     /// log is replayed at start; list broken sessions and replay lazily if either starts to matter.
-    pub(crate) fn load(data_dir: &Path, streams: Arc<Streams>) -> Sessions {
+    pub(crate) fn load(
+        data_dir: &Path,
+        streams: Arc<Streams>,
+        strategies: Arc<Vec<StrategyEntry>>,
+    ) -> Sessions {
         let mut entries = BTreeMap::new();
         let folder = data_dir.join("paper");
         let names: Vec<String> = std::fs::read_dir(&folder)
@@ -302,6 +317,7 @@ impl Sessions {
         Sessions {
             data_dir: data_dir.to_path_buf(),
             streams,
+            strategies,
             entries: Mutex::new(entries),
             ops: tokio::sync::Mutex::new(Ops::default()),
             generations: AtomicU64::new(0),
@@ -322,7 +338,7 @@ impl Sessions {
     pub(crate) fn state(&self, id: &str) -> Option<SessionState> {
         self.entries()
             .get(id)
-            .map(|e| SessionState::of(&lock(&e.session)))
+            .map(|e| SessionState::of(&lock(&e.session), &self.strategies))
     }
 
     fn summary_of(&self, id: &str) -> Result<SessionSummary, ApiError> {
@@ -341,7 +357,10 @@ impl Sessions {
         let entries = self.entries();
         let entry = entries.get(id)?;
         let paper = lock(&entry.session);
-        Some((entry.events.subscribe(), SessionState::of(&paper)))
+        Some((
+            entry.events.subscribe(),
+            SessionState::of(&paper, &self.strategies),
+        ))
     }
 
     /// The sender of a session's current channel, to put events on it in tests.
@@ -622,6 +641,11 @@ impl Sessions {
         };
         let comparison = compare_with_backtest(recorded, Recorded::of_backtest(&result));
         let warm_up_bars = bars.iter().filter(|b| b.open_time < live_from).count();
+        let bar_of = |t| config.timeframe.floor(t);
+        let late_funding = funding
+            .iter()
+            .filter(|f| bar_of(f.due) < bar_of(f.time))
+            .count();
         Ok(SessionComparisonResponse {
             backtest,
             bars: ComparedBars {
@@ -629,6 +653,7 @@ impl Sessions {
                 live_bars: bars.len() - warm_up_bars,
                 dropped,
                 funding_events: funding.len(),
+                late_funding,
             },
             manual_orders: manual,
             comparison,
@@ -978,7 +1003,11 @@ pub(crate) mod tests {
         };
         PaperSession::create(dir.path(), "s", config).expect("creates");
         let streams = Arc::new(Streams::new(Arc::new(Nowhere)));
-        let sessions = Arc::new(Sessions::load(dir.path(), streams));
+        let sessions = Arc::new(Sessions::load(
+            dir.path(),
+            streams,
+            Arc::new(td_engine::strategies()),
+        ));
         (dir, sessions)
     }
 
@@ -1109,6 +1138,7 @@ pub(crate) mod tests {
         Arc::new(Sessions::load(
             dir,
             Arc::new(Streams::new(Arc::new(Nowhere))),
+            Arc::new(td_engine::strategies()),
         ))
     }
 
@@ -1124,7 +1154,7 @@ pub(crate) mod tests {
         assert_eq!(c.pnl_ratio, Some(1.0));
         let bars = &compared.bars;
         assert_eq!((bars.warm_up_bars, bars.live_bars), (5, 60));
-        assert_eq!(bars.funding_events, 8);
+        assert_eq!((bars.funding_events, bars.late_funding), (8, 0));
         let backtest = &compared.backtest;
         assert_eq!(backtest.warmup_from, Some(0));
         assert_eq!((backtest.from, backtest.to), (5 * 60_000, 65 * 60_000));
@@ -1149,6 +1179,8 @@ pub(crate) mod tests {
             "{kinds:?}"
         );
         assert!(c.session_only_fills.is_empty() && c.backtest_only_fills.is_empty());
+        let bars = &compared.bars;
+        assert_eq!((bars.funding_events, bars.late_funding), (8, 8));
     }
 
     #[test]

@@ -1992,7 +1992,7 @@ export type SessionComparison = { session: SideSummary, backtest: SideSummary,
  */
 pnl_ratio: number | null, 
 /**
- * Fills paired one to one, in the order of their key.
+ * Fills paired one to one through their orders, in the order of the orders' key.
  */
 fills: Array<FillPair>, 
 /**
@@ -2842,8 +2842,9 @@ dropped: Array<number>,
 warnings: Array<string>, 
 /**
  * The strategy's code, plan and rule when the session started and the verdict it was started
- * from, with whether that verdict still matches the strategy as it is now (`stale`). Left out
- * for a manual session and for one started before links were recorded.
+ * from, with whether the strategy as it is now still matches that verdict or, without one,
+ * what the session started with (`stale`). Left out for a manual session and for one started
+ * before links were recorded.
  */
 link?: LinkState, };
 
@@ -2907,29 +2908,38 @@ rule: unknown, };
 
 /**
  * A session's [`SessionLink`] with its checks against the strategy as it is now, made when the
- * session's state is read. Each check is the one `GET /verdicts` makes for the verdict, and is
- * `null` when the session has no verdict.
+ * session's state is read. With a verdict, each check compares the verdict with this engine and
+ * the strategy now, and is the one `GET /verdicts` makes for that verdict. Without one, the plan
+ * and code checks compare what the session started with (the link's `plan`, `rule` and
+ * `code_hash`) with the strategy now, and there is no engine check. A check that cannot be made is
+ * `null`, and counts as not matching for `stale`.
  */
 export type LinkState = { 
 /**
- * Whether this engine has the verdict's engine revision.
+ * With a verdict, whether this engine has the verdict's engine revision; `null` without one.
  */
 engine_matches: boolean | null, 
 /**
- * Whether the strategy's plan and rule are still the ones the verdict was judged under, as
- * far as they concern the session's instrument, and the plan still tests it.
+ * With a verdict, whether the strategy's plan and rule are still the ones the verdict was
+ * judged under, as far as they concern the session's instrument, and the plan still tests
+ * it; false when the strategy is no longer registered. Without one, whether they are still
+ * the ones the session started with, as far as they concern the session's instrument; `null`
+ * when the strategy is no longer registered.
  */
 plan_matches: boolean | null, 
 /**
- * Whether the strategy's source file is still the one the verdict was judged with; also
- * `null` when that is unknown. The session replays and trades with the current file, so this
- * compares the code it runs now with the verdict's. The hash covers the strategy's own file
- * only, not shared helpers it calls.
+ * With a verdict, whether the strategy's source file is still the one the verdict was judged
+ * with; without one, whether it is still the one the session started with. `null` when that
+ * is unknown: no hash was saved, or the strategy is no longer registered. The session replays
+ * and trades with the current file, so this compares the code it runs now. The hash covers
+ * the strategy's own file only, not shared helpers it calls.
  */
 code_matches: boolean | null, 
 /**
- * True when the session has a verdict and any of the three checks is not true: the code, plan
- * or engine it runs on is no longer the one that verdict judged.
+ * True unless each check made is true: all three with a verdict, `plan_matches` and
+ * `code_matches` without one. With a verdict: the code, plan or engine the session runs on
+ * may no longer be the one that verdict judged. Without one: the code or plan may have
+ * changed since the session started.
  */
 stale: boolean, 
 /**
@@ -2986,7 +2996,15 @@ dropped: Array<number>,
  * charged on a later bar, because it was not yet published when its own bar closed, lands
  * on another bar there; one due before the first live bar is not charged there at all.
  */
-funding_events: number, };
+funding_events: number, 
+/**
+ * How many of those rates the session charged on a later bar than the one they were due in.
+ * Each moves funding, and the equity after it, to another bar in the backtest, so it shows as
+ * a funding and a result difference and, for a strategy that sizes its orders on equity, as
+ * order and fill quantity differences: none of these is then a difference in how orders were
+ * filled.
+ */
+late_funding: number, };
 
 /**
  * What a session reports as it runs, once [`PaperSession::set_events`] gives it a channel. Sent

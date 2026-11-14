@@ -115,7 +115,8 @@
 //!   - `GET /sessions`: every session, oldest first, with its status and equity.
 //!   - `GET /sessions/{id}`: a session's full state: status, position, cash, equity curve, open
 //!     orders, fills and trades so far, and its `link` when it has one, with `stale` set when its
-//!     code, plan or engine no longer matches the linked verdict.
+//!     code, plan or engine no longer matches the linked verdict or, without a verdict, when its
+//!     code or plan has changed since the session started.
 //!   - `GET /sessions/{id}/comparison`: a backtest of the session's strategy and parameters on
 //!     the session's own logged bars, compared with what the session recorded: fills paired one
 //!     to one, the fills and orders only one side has, fees, funding and result per side, the
@@ -281,11 +282,20 @@ impl Server {
         let (shutdown, shutdown_rx) = watch::channel(false);
         let jobs = Arc::new(Jobs::default());
         let streams = Arc::new(Streams::new(config.live));
-        let (data_dir, loading) = (config.store.root().to_path_buf(), streams.clone());
-        let sessions = tokio::task::spawn_blocking(move || Sessions::load(&data_dir, loading))
-            .await
-            .map(Arc::new)
-            .map_err(|e| io::Error::other(format!("loading the paper sessions stopped: {e}")))?;
+        // The sessions check their links against the same list `GET /verdicts` reads.
+        let strategies = Arc::new(strategies);
+        let (data_dir, loading, checked) = (
+            config.store.root().to_path_buf(),
+            streams.clone(),
+            strategies.clone(),
+        );
+        let sessions =
+            tokio::task::spawn_blocking(move || Sessions::load(&data_dir, loading, checked))
+                .await
+                .map(Arc::new)
+                .map_err(|e| {
+                    io::Error::other(format!("loading the paper sessions stopped: {e}"))
+                })?;
         let state = Arc::new(AppState {
             token: config.token.clone(),
             port: addr.port(),
@@ -295,7 +305,7 @@ impl Server {
             sessions: sessions.clone(),
             streams,
             instruments: Mutex::new(HashMap::new()),
-            strategies: Arc::new(strategies),
+            strategies,
             shutdown: shutdown_rx.clone(),
             data_cutoff: config.data_cutoff,
         });
@@ -533,16 +543,17 @@ mod tests {
         let token = Token::generate().unwrap();
         let unused = std::env::temp_dir().join("td-server-unused");
         let streams = Arc::new(Streams::new(Arc::new(source::VenueLive)));
+        let strategies = Arc::new(td_engine::strategies());
         let state = Arc::new(AppState {
             token: token.clone(),
             port,
             store: Store::new(&unused),
             source: Arc::new(NoSource),
             jobs: Arc::new(Jobs::default()),
-            sessions: Arc::new(Sessions::load(&unused, streams.clone())),
+            sessions: Arc::new(Sessions::load(&unused, streams.clone(), strategies.clone())),
             streams,
             instruments: Mutex::new(HashMap::new()),
-            strategies: Arc::new(td_engine::strategies()),
+            strategies,
             shutdown: watch::channel(false).1,
             data_cutoff: None,
         });
