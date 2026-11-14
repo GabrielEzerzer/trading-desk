@@ -12,14 +12,14 @@ use td_core::{
     Candle, FeeSchedule, Instrument, InstrumentId, InstrumentKind, Millis, OrderRequest, OrderType,
     Side, TimeInForce, Timeframe, Venue,
 };
-use td_data::DataError;
-use td_data::live::{Rest, SharedStream};
+use td_data::live::{Greeting, KlineUpdate, Rest, SharedStream};
+use td_data::{DataError, DataSource, Http, InstrumentList, LiveStream, MinuteHistory};
 use td_engine::{Context, EngineError, ParamValue, Params, Strategy};
 use td_live::{
     LiveConfig, LiveError, LiveRun, LiveSession, LiveStatus, State, VenueHandle, live_dir,
 };
 use td_mock_bybit::{Fault, MockVenue, TEST_KEY, TEST_SECRET};
-use td_orders::{Client, DemoKeys, Endpoint, Timing};
+use td_orders::{Client, ClientOrderId, DemoKeys, Endpoint, Timing};
 use tokio::net::TcpListener;
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
@@ -84,15 +84,22 @@ fn market(side: Side, qty: f64, reduce_only: bool) -> OrderRequest {
 
 /// The test double. On its live bar `buy_on` (warm-up bars do not count, the first live bar is 0)
 /// it buys [`QTY`], with an attached stop at `stop` when that is above zero. On live bar
-/// `close_on` it cancels its open orders and sells its position. `eager` instead submits a buy on
-/// every bar, warm-up bars included, while it is flat with no open orders.
+/// `close_on` it cancels its open orders and sells its position. On live bar `panic_on` it
+/// panics, and on `fail_on` it fails the bar ([`Context::fail`]), each after anything else it does
+/// on that bar. `eager` instead submits a buy on every bar, warm-up bars included, while it is
+/// flat with no open orders.
 struct Double {
     buy_on: i64,
     close_on: i64,
+    panic_on: i64,
+    fail_on: i64,
     stop: f64,
     eager: bool,
     bar: i64,
 }
+
+const PANIC: &str = "the double panicked on purpose";
+const FAILED: &str = "the double failed the bar on purpose";
 
 impl Strategy for Double {
     fn on_bar(&mut self, ctx: &mut Context, _bar: &Candle) {
@@ -123,6 +130,12 @@ impl Strategy for Double {
                     .expect("sell");
             }
         }
+        if self.bar == self.panic_on {
+            panic!("{PANIC}");
+        }
+        if self.bar == self.fail_on {
+            ctx.fail(FAILED);
+        }
         self.bar += 1;
     }
 }
@@ -134,6 +147,8 @@ fn build(name: &str, params: &Params) -> Result<Box<dyn Strategy>, EngineError> 
     Ok(Box::new(Double {
         buy_on: params.int("buy_on")?,
         close_on: params.int("close_on")?,
+        panic_on: params.int("panic_on")?,
+        fail_on: params.int("fail_on")?,
         stop: params.float("stop")?,
         eager: params.bool("eager")?,
         bar: 0,
@@ -145,6 +160,8 @@ fn config(buy_on: i64, close_on: i64, stop: bool) -> LiveConfig {
     let params = Params::new()
         .with("buy_on", ParamValue::Int(buy_on))
         .with("close_on", ParamValue::Int(close_on))
+        .with("panic_on", ParamValue::Int(-1))
+        .with("fail_on", ParamValue::Int(-1))
         .with("stop", ParamValue::Float(if stop { STOP } else { 0.0 }))
         .with("eager", ParamValue::Bool(false));
     LiveConfig {
@@ -176,12 +193,15 @@ fn flat(open_time: Millis) -> Candle {
     }
 }
 
-/// Minutes from `start` on, [`WARM_UP`] hourly bars before it, no funding, and a clock fixed at
-/// `start`.
+/// Minutes from `start` on, [`WARM_UP`] hourly bars before it, the funding `rates`, and a clock
+/// fixed at `start`. Funding reads after the first `funding_works_for` fail.
 struct FakeRest {
     start: Millis,
     warm_up_failures: Mutex<u32>,
     warm_up_reads: AtomicU32,
+    rates: Mutex<Vec<(Millis, f64)>>,
+    funding_reads: AtomicU32,
+    funding_works_for: AtomicU32,
 }
 
 impl Rest for FakeRest {
@@ -225,10 +245,22 @@ impl Rest for FakeRest {
     fn funding(
         &self,
         _: &InstrumentId,
-        _: Millis,
-        _: Millis,
+        from: Millis,
+        to: Millis,
     ) -> Result<Vec<(Millis, f64)>, DataError> {
-        Ok(Vec::new())
+        let read = self.funding_reads.fetch_add(1, Ordering::SeqCst);
+        if read >= self.funding_works_for.load(Ordering::SeqCst) {
+            return Err(DataError::Api {
+                url: "fake".into(),
+                message: "unavailable".into(),
+            });
+        }
+        let rates = self.rates.lock().unwrap();
+        Ok(rates
+            .iter()
+            .copied()
+            .filter(|&(t, _)| from <= t && t < to)
+            .collect())
     }
 
     fn now(&self) -> Millis {
@@ -286,6 +318,11 @@ impl Feed {
             r#"{{"topic":"kline.1.{SYMBOL}","data":[{{"start":{t},"end":{},"interval":"1","open":"{PRICE}","close":"{PRICE}","high":"{PRICE}","low":"{PRICE}","volume":"1","turnover":"{PRICE}","confirm":true,"timestamp":{t}}}],"ts":{t},"type":"snapshot"}}"#,
             t + MIN - 1
         );
+        self.text(frame);
+    }
+
+    /// Sends one text frame as it is.
+    fn text(&self, frame: String) {
         self.tx.send(frame).expect("feed server");
     }
 
@@ -326,6 +363,9 @@ impl Rig {
                 start,
                 warm_up_failures: Mutex::new(0),
                 warm_up_reads: AtomicU32::new(0),
+                rates: Mutex::new(Vec::new()),
+                funding_reads: AtomicU32::new(0),
+                funding_works_for: AtomicU32::new(u32::MAX),
             }),
             runtime: Runtime::new().expect("runtime"),
             start,
@@ -943,4 +983,631 @@ fn no_key_or_secret_is_written_to_the_saved_files() {
         assert!(!text.contains(TEST_KEY), "{file} holds the key");
         assert!(!text.contains(TEST_SECRET), "{file} holds the secret");
     }
+}
+
+/// Rewrites the saved status with `state`, as a hand edit would.
+fn rewrite_state(rig: &Rig, id: &str, state: State) {
+    let mut status = rig.saved_status(id);
+    status.state = state;
+    let json = serde_json::to_vec_pretty(&status).expect("json");
+    fs::write(rig.path(id, "status.json"), json).expect("write");
+}
+
+fn stopped(note: &str) -> State {
+    State::Stopped { note: note.into() }
+}
+
+#[test]
+fn a_faulted_session_stays_refused_after_its_status_is_rewritten() {
+    let rig = Rig::new();
+    let feed = rig.feed();
+    feed.minute(rig.bar(1));
+    let run = rig.run(
+        rig.create("marked", config(0, 99, false)).expect("creates"),
+        &feed,
+    );
+    wait_for_bar(&run, rig.bar(0));
+    let (live, ended) = run.stop();
+    ended.expect("stopped cleanly");
+    drop(live);
+
+    rig.mock.set_position(SYMBOL, 0.01, PRICE);
+    let live = rig.open("marked").expect("reopens");
+    let (live, ended) = rig.run(live, &rig.feed()).wait();
+    let Err(LiveError::Faulted(fault)) = ended else {
+        panic!("not faulted: {ended:?}");
+    };
+    let marker = fs::read_to_string(rig.path("marked", "faulted")).expect("the marker");
+    assert!(marker.contains("position mismatch"), "{marker}");
+
+    // The session handed back cannot be run again in this process either.
+    let sends = rig.sends();
+    let feed = rig.feed();
+    let (live, again) = rig.run(live, &feed).wait();
+    assert!(
+        matches!(&again, Err(LiveError::StillFaulted(f)) if *f == fault),
+        "{again:?}"
+    );
+    assert_eq!(rig.sends(), sends);
+    assert!(!feed.opened.load(Ordering::SeqCst));
+    drop(live);
+
+    // A status edited to say it stopped does not lift the marker.
+    rig.mock.set_position(SYMBOL, QTY, PRICE);
+    rewrite_state(&rig, "marked", stopped("edited"));
+    let refused = rig.open("marked").err().expect("refused");
+    assert!(
+        matches!(&refused, LiveError::StillFaulted(f) if f.contains("position mismatch")),
+        "{refused}"
+    );
+}
+
+#[test]
+fn a_torn_last_line_is_cut_and_the_session_resumes_whole() {
+    let rig = Rig::new();
+    let feed = rig.feed();
+    feed.minute(rig.bar(2));
+    let run = rig.run(
+        rig.create("torn", config(0, 99, false)).expect("creates"),
+        &feed,
+    );
+    wait_for_bar(&run, rig.bar(1));
+    let (live, ended) = run.stop();
+    ended.expect("stopped cleanly");
+    drop(live);
+
+    // The process died part way through writing bar 2's line.
+    let path = rig.path("torn", "events.jsonl");
+    let whole = fs::read(&path).expect("log");
+    let text = String::from_utf8(whole.clone()).expect("text");
+    let next = text
+        .lines()
+        .last()
+        .expect("a line")
+        .replace(&rig.bar(1).to_string(), &rig.bar(2).to_string());
+    let mut torn = whole.clone();
+    torn.extend_from_slice(&next.as_bytes()[..next.len() / 2]);
+    fs::write(&path, &torn).expect("tear");
+
+    let live = rig.open("torn").expect("reopens");
+    assert_eq!(
+        fs::read(&path).expect("log"),
+        whole,
+        "the torn line was cut"
+    );
+    assert!(
+        live.status()
+            .warnings
+            .iter()
+            .any(|w| w.contains("cut a torn last line")),
+        "{:?}",
+        live.status().warnings
+    );
+    assert_eq!(live.status().last_bar, Some(rig.bar(1)));
+    assert_eq!(live.session().portfolio().position(), QTY);
+
+    let feed = rig.feed();
+    feed.minute(rig.bar(3));
+    let run = rig.run(live, &feed);
+    wait_for_bar(&run, rig.bar(2));
+    let (live, ended) = run.stop();
+    ended.expect("stopped cleanly");
+    assert_eq!(rig.mock.request_count(CREATE), 1);
+    drop(live);
+    let reopened = rig.open("torn").expect("the log replays whole");
+    assert_eq!(reopened.status().last_bar, Some(rig.bar(2)));
+}
+
+/// Runs a session that buys on bar 0 through bar 1 and stops it.
+fn two_bars(rig: &Rig, id: &str) {
+    let feed = rig.feed();
+    feed.minute(rig.bar(2));
+    let run = rig.run(
+        rig.create(id, config(0, 99, false)).expect("creates"),
+        &feed,
+    );
+    wait_for_bar(&run, rig.bar(1));
+    let (live, ended) = run.stop();
+    ended.expect("stopped cleanly");
+    drop(live);
+}
+
+#[test]
+fn a_line_that_does_not_read_is_refused_before_a_torn_tail_is_cut() {
+    let rig = Rig::new();
+    two_bars(&rig, "garbled");
+    let path = rig.path("garbled", "events.jsonl");
+    let text = fs::read_to_string(&path).expect("log");
+    let mut lines: Vec<&str> = text.lines().collect();
+    lines[3] = "not a line of the log";
+    let edited = format!("{}\n{{\"torn", lines.join("\n"));
+    fs::write(&path, &edited).expect("write");
+
+    let requests = rig.mock.requests().len();
+    let refused = rig.open("garbled").err().expect("refused");
+    assert!(
+        matches!(&refused, LiveError::BadLog { reason, .. } if reason.starts_with("line 4")),
+        "{refused}"
+    );
+    assert_eq!(
+        fs::read_to_string(&path).expect("log"),
+        edited,
+        "left as it is"
+    );
+    assert_eq!(rig.mock.requests().len(), requests);
+}
+
+#[test]
+fn a_sending_line_followed_by_another_bar_is_refused() {
+    let rig = Rig::new();
+    two_bars(&rig, "spliced");
+    let path = rig.path("spliced", "events.jsonl");
+    let text = fs::read_to_string(&path).expect("log");
+    let lines: Vec<&str> = text.lines().collect();
+    let sending = lines
+        .iter()
+        .position(|l| l.contains("\"sending\":true"))
+        .expect("bar 0's sending line");
+    // Bar 0's own line is gone, so bar 1's follows the sending line.
+    let spliced: Vec<&str> = lines
+        .iter()
+        .enumerate()
+        .filter(|&(i, _)| i != sending + 1)
+        .map(|(_, l)| *l)
+        .collect();
+    fs::write(&path, format!("{}\n", spliced.join("\n"))).expect("write");
+
+    let refused = rig.open("spliced").err().expect("refused");
+    assert!(
+        matches!(&refused, LiveError::BadLog { reason, .. }
+            if reason.contains("a sending line is not followed by its bar")),
+        "{refused}"
+    );
+}
+
+#[test]
+fn a_strategy_that_panics_after_its_first_send_halts_and_open_refuses_without_unwinding() {
+    let rig = Rig::new();
+    let mut cfg = config(1, 99, false);
+    cfg.params.set("panic_on", ParamValue::Int(1));
+    let feed = rig.feed();
+    feed.minute(rig.bar(2));
+    let (live, ended) = rig
+        .run(rig.create("panics", cfg).expect("creates"), &feed)
+        .wait();
+    assert!(
+        matches!(&ended, Err(LiveError::Panicked(p)) if p.contains(PANIC)),
+        "{ended:?}"
+    );
+    assert_eq!(rig.mock.request_count(CREATE), 1, "the buy went out first");
+    assert!(
+        matches!(&live.status().state, State::Panicked { panic } if panic.contains(PANIC)),
+        "{:?}",
+        live.status().state
+    );
+    assert_eq!(rig.saved_status("panics").state, live.status().state);
+
+    let feed = rig.feed();
+    let (live, again) = rig.run(live, &feed).wait();
+    assert!(
+        matches!(again, Err(LiveError::StillPanicked(_))),
+        "{again:?}"
+    );
+    assert!(!feed.opened.load(Ordering::SeqCst));
+    drop(live);
+
+    let refused = rig.open("panics").err().expect("refused");
+    assert!(
+        matches!(&refused, LiveError::StillPanicked(p) if p.contains(PANIC)),
+        "{refused}"
+    );
+    assert!(refused.to_string().contains("panicked"), "{refused}");
+
+    // With the status edited, the replay runs into the same panic, which open returns.
+    rewrite_state(&rig, "panics", stopped("edited"));
+    let refused = rig.open("panics").err().expect("refused");
+    assert!(
+        matches!(&refused, LiveError::BadLog { reason, .. }
+            if reason.contains("panicked") && reason.contains(PANIC)),
+        "{refused}"
+    );
+    assert_eq!(rig.mock.request_count(CREATE), 1);
+}
+
+#[test]
+fn a_bar_the_strategy_fails_is_logged_halts_and_replays_on_resume() {
+    let rig = Rig::new();
+    let mut cfg = config(0, 99, false);
+    cfg.params.set("fail_on", ParamValue::Int(1));
+    let feed = rig.feed();
+    feed.minute(rig.bar(2));
+    let (live, ended) = rig
+        .run(rig.create("fails", cfg).expect("creates"), &feed)
+        .wait();
+    assert!(
+        ended
+            .as_ref()
+            .is_err_and(|e| e.to_string().contains(FAILED)),
+        "{ended:?}"
+    );
+    assert!(
+        matches!(&live.status().state, State::Halted { reason } if reason.contains(FAILED)),
+        "{:?}",
+        live.status().state
+    );
+    assert_eq!(
+        live.status().last_bar,
+        Some(rig.bar(1)),
+        "bar 1 was fed in full"
+    );
+    assert_eq!(rig.saved_status("fails").state, live.status().state);
+    drop(live);
+    let records = rig
+        .log("fails")
+        .iter()
+        .filter(|l| l["record"].is_object() && l["sending"] != true)
+        .count();
+    assert_eq!(records, 2, "bars 0 and 1 are logged");
+
+    let live = rig.open("fails").expect("a halt resumes");
+    assert_eq!(live.status().last_bar, Some(rig.bar(1)));
+    assert_eq!(live.session().portfolio().position(), QTY);
+    let feed = rig.feed();
+    feed.minute(rig.bar(3));
+    let run = rig.run(live, &feed);
+    wait_for_bar(&run, rig.bar(2));
+    let (_live, ended) = run.stop();
+    ended.expect("stopped cleanly");
+    assert_eq!(rig.mock.request_count(CREATE), 1);
+}
+
+/// Funding every 8 hours, the first live one due at the open of live bar 1.
+fn eight_hourly(rig: &Rig) {
+    let rates = (0..9)
+        .map(|k| (rig.bar(1) - k * 8 * HOUR, 0.0001))
+        .collect();
+    *rig.rest.rates.lock().unwrap() = rates;
+}
+
+#[test]
+fn a_funding_rate_is_charged_once_across_a_restart() {
+    let rig = Rig::new();
+    eight_hourly(&rig);
+    let feed = rig.feed();
+    feed.minute(rig.bar(2));
+    let run = rig.run(
+        rig.create("funded", config(0, 99, false)).expect("creates"),
+        &feed,
+    );
+    wait_for_bar(&run, rig.bar(1));
+    let (live, ended) = run.stop();
+    ended.expect("stopped cleanly");
+    assert_eq!(live.funding().len(), 1);
+    assert_eq!(live.funding()[0].due, rig.bar(1));
+    drop(live);
+
+    let live = rig.open("funded").expect("reopens");
+    assert_eq!(live.funding().len(), 1, "replayed from the log");
+    let feed = rig.feed();
+    feed.minute(rig.bar(4));
+    let run = rig.run(live, &feed);
+    wait_for_bar(&run, rig.bar(3));
+    let (live, ended) = run.stop();
+    ended.expect("stopped cleanly");
+    assert_eq!(live.funding().len(), 1, "not charged again");
+    let charged: usize = rig
+        .log("funded")
+        .iter()
+        .map(|l| l["funding"].as_array().map_or(0, Vec::len))
+        .sum();
+    assert_eq!(charged, 1);
+}
+
+#[test]
+fn a_funding_read_that_keeps_failing_halts_the_run() {
+    let rig = Rig::new();
+    eight_hourly(&rig);
+    // The history read before going live works; every read for a bar fails.
+    rig.rest.funding_works_for.store(1, Ordering::SeqCst);
+    let feed = rig.feed();
+    feed.minute(rig.bar(1));
+    let live = rig
+        .create("unfunded", config(0, 99, false))
+        .expect("creates");
+    let (live, ended) = rig.run(live, &feed).wait();
+    let Err(LiveError::Halted(reason)) = ended else {
+        panic!("not halted: {ended:?}");
+    };
+    let expected = format!("funding for the bar at {} could not be read", rig.bar(0));
+    assert!(reason.contains(&expected), "{reason}");
+    assert_eq!(rig.rest.funding_reads.load(Ordering::SeqCst), 1 + 4);
+    assert_eq!(live.status().last_bar, None, "bar 0 was not fed");
+    assert_eq!(rig.sends(), 0);
+}
+
+#[test]
+fn a_fresh_start_is_refused_when_the_account_holds_only_open_orders() {
+    let rig = Rig::new();
+    let stop = OrderRequest {
+        order_type: OrderType::Stop { trigger: STOP },
+        ..market(Side::Sell, QTY, true)
+    };
+    let id = ClientOrderId::new("manual-1").expect("id");
+    rig.client
+        .place(&instrument(), &stop, &id, PRICE)
+        .expect("placed");
+    assert_eq!(rig.mock.position(SYMBOL), 0.0);
+
+    let refused = rig
+        .create("orders", config(0, 99, false))
+        .err()
+        .expect("refused");
+    assert!(
+        matches!(refused, LiveError::NotFlat { open_orders: 1, .. }),
+        "{refused}"
+    );
+    assert!(!live_dir(rig.data(), "orders").exists());
+}
+
+/// Makes `link` point at the folder `target`: a symlink, or on Windows without the right to make
+/// one, a junction. Returns why neither could be made.
+fn link_dir(target: &Path, link: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    return std::os::unix::fs::symlink(target, link).map_err(|e| e.to_string());
+    #[cfg(windows)]
+    {
+        if std::os::windows::fs::symlink_dir(target, link).is_ok() {
+            return Ok(());
+        }
+        let made = std::process::Command::new("cmd")
+            .arg("/C")
+            .arg("mklink")
+            .arg("/J")
+            .arg(link)
+            .arg(target)
+            .output()
+            .map_err(|e| e.to_string())?;
+        if made.status.success() {
+            Ok(())
+        } else {
+            Err(String::from_utf8_lossy(&made.stderr).into_owned())
+        }
+    }
+}
+
+fn link_file(target: &Path, link: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    return std::os::unix::fs::symlink(target, link).map_err(|e| e.to_string());
+    #[cfg(windows)]
+    return std::os::windows::fs::symlink_file(target, link).map_err(|e| e.to_string());
+}
+
+#[test]
+fn a_link_in_place_of_the_session_folder_or_its_log_is_refused() {
+    let rig = Rig::new();
+    drop(rig.create("real", config(0, 99, false)).expect("creates"));
+
+    match link_dir(
+        &live_dir(rig.data(), "real"),
+        &live_dir(rig.data(), "linked"),
+    ) {
+        Ok(()) => {
+            let refused = rig.open("linked").err().expect("refused");
+            assert!(matches!(refused, LiveError::Link(_)), "{refused}");
+            let refused = rig
+                .create("linked", config(0, 99, false))
+                .err()
+                .expect("refused");
+            assert!(matches!(refused, LiveError::Exists(_)), "{refused}");
+        }
+        Err(why) => println!("skipped the folder link: it could not be made: {why}"),
+    }
+
+    let log = rig.path("real", "events.jsonl");
+    let outside = rig.data().join("elsewhere");
+    fs::create_dir_all(&outside).expect("folder");
+    let target = outside.join("events.jsonl");
+    fs::rename(&log, &target).expect("move the log out");
+    match link_file(&target, &log) {
+        Ok(()) => {
+            let refused = rig.open("real").err().expect("refused");
+            assert!(matches!(refused, LiveError::Link(_)), "{refused}");
+        }
+        Err(why) => println!("skipped the log link: it could not be made: {why}"),
+    }
+}
+
+/// A Bybit source whose stream parser panics on the frame `boom`, which ends the feed's task.
+struct Panicky;
+
+static PANICKY: Panicky = Panicky;
+
+fn bybit() -> &'static dyn DataSource {
+    td_data::source(Venue::Bybit)
+}
+
+impl DataSource for Panicky {
+    fn venue(&self) -> Venue {
+        bybit().venue()
+    }
+
+    fn kinds(&self) -> &'static [InstrumentKind] {
+        bybit().kinds()
+    }
+
+    fn instruments(&self, http: &Http, kind: InstrumentKind) -> Result<InstrumentList, DataError> {
+        bybit().instruments(http, kind)
+    }
+
+    fn default_fees(&self, kind: InstrumentKind) -> Result<FeeSchedule, DataError> {
+        bybit().default_fees(kind)
+    }
+
+    fn minute_history(
+        &self,
+        http: &Http,
+        id: &InstrumentId,
+        from: Millis,
+        to: Millis,
+        now: Millis,
+    ) -> Result<MinuteHistory, DataError> {
+        bybit().minute_history(http, id, from, to, now)
+    }
+
+    fn live(&self) -> Result<&dyn LiveStream, DataError> {
+        Ok(self)
+    }
+}
+
+impl LiveStream for Panicky {
+    fn url(&self, id: &InstrumentId) -> String {
+        bybit().live().expect("a stream").url(id)
+    }
+
+    fn greeting(&self, id: &InstrumentId) -> Greeting {
+        bybit().live().expect("a stream").greeting(id)
+    }
+
+    fn parse(&self, text: &str) -> Result<Vec<KlineUpdate>, DataError> {
+        assert_ne!(text, "boom", "the stream's parser broke on purpose");
+        bybit().live()?.parse(text)
+    }
+
+    fn klines(
+        &self,
+        http: &Http,
+        id: &InstrumentId,
+        timeframe: Timeframe,
+        from: Millis,
+        to: Millis,
+    ) -> Result<Vec<Candle>, DataError> {
+        bybit().live()?.klines(http, id, timeframe, from, to)
+    }
+}
+
+#[test]
+fn a_feed_that_ends_halts_the_run() {
+    let rig = Rig::new();
+    let feed = rig.feed();
+    let url = feed.url.clone();
+    let live = rig.create("ended", config(0, 99, false)).expect("creates");
+    let run = live.run(
+        rig.rest.clone(),
+        move || Arc::new(SharedStream::open_on(&PANICKY, instrument().id, url)),
+        |_, _| None,
+    );
+    wait_until(&run, "running", |s| s.state == State::Running);
+    feed.text("boom".into());
+    let (live, ended) = run.wait();
+    let Err(LiveError::Halted(reason)) = ended else {
+        panic!("not halted: {ended:?}");
+    };
+    assert!(reason.contains("the feed ended"), "{reason}");
+    assert_eq!(rig.saved_status("ended").state, live.status().state);
+    drop(live);
+    rig.open("ended").expect("a halt resumes");
+}
+
+#[test]
+fn a_status_that_cannot_be_written_still_halts_the_run_in_memory() {
+    let rig = Rig::new();
+    let live = rig
+        .create("unwritable", config(0, 99, false))
+        .expect("creates");
+    // A folder in the way of the status's temporary file.
+    fs::create_dir(rig.path("unwritable", "status.json.tmp")).expect("folder");
+    let feed = rig.feed();
+    let (live, ended) = rig.run(live, &feed).wait();
+    let error = ended.expect_err("halted");
+    assert!(error.to_string().contains("status.json.tmp"), "{error}");
+    assert!(
+        matches!(&live.status().state,
+            State::Halted { reason } if reason.contains("status.json.tmp")),
+        "{:?}",
+        live.status()
+    );
+    assert!(
+        live.status()
+            .warnings
+            .iter()
+            .any(|w| w.contains("the status could not be written")),
+        "{:?}",
+        live.status().warnings
+    );
+    assert!(!feed.opened.load(Ordering::SeqCst));
+    assert_eq!(rig.rest.warm_up_reads.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn a_status_left_running_by_a_process_that_died_reads_as_stopped() {
+    let rig = Rig::new();
+    two_bars(&rig, "died");
+    rewrite_state(&rig, "died", State::Running);
+    let live = rig.open("died").expect("reopens");
+    assert!(
+        matches!(&live.status().state,
+            State::Stopped { note } if note.contains("ended without stopping")),
+        "{:?}",
+        live.status().state
+    );
+    assert_eq!(
+        rig.saved_status("died").state,
+        live.status().state,
+        "saved too"
+    );
+}
+
+#[test]
+fn a_folder_with_its_config_and_no_status_opens_as_not_started_only_while_its_log_is_empty() {
+    let rig = Rig::new();
+    drop(rig.create("half", config(0, 99, false)).expect("creates"));
+    fs::remove_file(rig.path("half", "status.json")).expect("remove");
+    fs::remove_file(rig.path("half", "events.jsonl")).expect("remove");
+    let live = rig.open("half").expect("opens");
+    assert_eq!(live.status().state, stopped("created; not started"));
+    drop(live);
+
+    two_bars(&rig, "bars");
+    fs::remove_file(rig.path("bars", "status.json")).expect("remove");
+    let refused = rig.open("bars").err().expect("refused");
+    assert!(matches!(refused, LiveError::BadFile { .. }), "{refused}");
+}
+
+#[test]
+fn a_config_whose_prefix_was_edited_is_refused_without_asking_the_venue() {
+    let rig = Rig::new();
+    drop(rig.create("prefix", config(0, 99, false)).expect("creates"));
+    let path = rig.path("prefix", "config.json");
+    let mut saved: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&path).expect("config")).expect("json");
+    saved["prefix"] = "zzz".into();
+    fs::write(&path, serde_json::to_vec(&saved).expect("json")).expect("write");
+
+    let requests = rig.mock.requests().len();
+    let refused = rig.open("prefix").err().expect("refused");
+    assert!(
+        matches!(&refused, LiveError::BadFile { reason, .. } if reason.contains("prefix")),
+        "{refused}"
+    );
+    assert_eq!(rig.mock.requests().len(), requests);
+}
+
+#[test]
+fn warnings_are_trimmed_when_a_status_is_loaded() {
+    let rig = Rig::new();
+    drop(rig.create("noisy", config(0, 99, false)).expect("creates"));
+    let mut status = rig.saved_status("noisy");
+    status.warnings = (0..150).map(|i| format!("warning {i}")).collect();
+    status.warnings.push("x".repeat(10_000));
+    fs::write(
+        rig.path("noisy", "status.json"),
+        serde_json::to_vec(&status).expect("json"),
+    )
+    .expect("write");
+
+    let live = rig.open("noisy").expect("opens");
+    let warnings = &live.status().warnings;
+    assert_eq!(warnings.len(), 100);
+    assert_eq!(warnings[0], "warning 51");
+    assert!(warnings.iter().all(|w| w.chars().count() <= 1001));
 }

@@ -3,10 +3,12 @@
 //! run's own thread.
 //!
 //! The run halts, sending and cancelling nothing more, when the broker faults, when the warm-up
-//! or a funding read fails after its bounded retries, when the log cannot be written, or when the
-//! owner asks it to. A stop leaves the position and resting orders at the venue as they are. A
-//! resumed session skips warm-up and continues from the bar after its last one; the feed
-//! backfills the bars missed while it was down, and they are fed as live bars.
+//! or a funding read fails after its bounded retries, when the log or the status cannot be
+//! written, when the feed ends, when the run panics, or when the owner asks it to. A fault
+//! writes the session's `faulted` marker, and a fault or a panic leaves a session that is never
+//! run again. A stop leaves the position and resting orders at the venue as they are. A resumed
+//! session skips warm-up and continues from the bar after its last one; the feed backfills the
+//! bars missed while it was down, and they are fed as live bars.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
@@ -20,7 +22,7 @@ use td_data::live::{FeedEvent, Rest, SharedStream, run_feed_on};
 use td_data::time::round_to_minute;
 
 use crate::VenueHandle;
-use crate::session::{Funding, LiveError, LiveSession, LiveStatus, State};
+use crate::session::{Funding, LiveError, LiveSession, LiveStatus, State, panic_message};
 
 /// How many bars of history the strategy sees before it trades, as a paper session.
 ///
@@ -39,6 +41,7 @@ const DEFAULT_FUNDING_INTERVAL: Millis = 8 * HOUR;
 /// Retries of a funding read that failed, or of a rate due in the bar and not yet published.
 const FUNDING_RETRIES: u32 = 3;
 const FUNDING_RETRY_DELAY: Duration = Duration::from_secs(5);
+const FEED_ENDED: &str = "the feed ended, so no more bars can come";
 
 /// What the owner asked for.
 enum Signal {
@@ -50,6 +53,8 @@ enum Msg {
     Feed(FeedEvent),
     /// A signal is waiting.
     Wake,
+    /// The feed's task returned or panicked: no more events will come.
+    FeedEnded,
 }
 
 struct Control {
@@ -84,7 +89,9 @@ pub struct LiveRun {
 }
 
 impl LiveSession {
-    /// Runs the session on a thread of its own and returns at once.
+    /// Runs the session on a thread of its own and returns at once. A session that faulted or
+    /// panicked ends at once with [`LiveError::StillFaulted`] or [`LiveError::StillPanicked`],
+    /// sending nothing.
     ///
     /// `rest` reads warm-up bars, missed minutes and funding rates. `stream` opens the live
     /// minute stream; it is called on the run's thread, inside the run's own async runtime, once
@@ -109,12 +116,10 @@ impl LiveSession {
                     drive(&session, &control, wake, msgs, rest, stream, after_bar)
                 }));
                 ran.unwrap_or_else(|panic| {
-                    let message = panic
-                        .downcast_ref::<&str>()
-                        .map(|s| s.to_string())
-                        .or_else(|| panic.downcast_ref::<String>().cloned())
-                        .unwrap_or_else(|| "unknown panic".into());
-                    halt(&mut lock(&session), LiveError::Panicked(message))
+                    halt(
+                        &mut lock(&session),
+                        LiveError::Panicked(panic_message(&*panic)),
+                    )
                 })
             })
         };
@@ -185,11 +190,16 @@ impl Drop for LiveRun {
     }
 }
 
-/// Records why the run ended in the status and returns the error.
+/// Records why the run ended in the status and returns the error. A broker fault also writes
+/// the `faulted` marker, first, so the session stays halted even when the status cannot be
+/// written or is edited.
 fn halt(s: &mut LiveSession, error: LiveError) -> Result<(), LiveError> {
     let state = match &error {
         LiveError::Faulted(fault) => State::Faulted {
             fault: fault.clone(),
+        },
+        LiveError::Panicked(panic) => State::Panicked {
+            panic: panic.clone(),
         },
         LiveError::Halted(reason) => State::Halted {
             reason: reason.clone(),
@@ -198,8 +208,18 @@ fn halt(s: &mut LiveSession, error: LiveError) -> Result<(), LiveError> {
             reason: other.to_string(),
         },
     };
-    // A status that cannot be written leaves the old one; the caller still gets the error.
-    let _ = s.set_state(state);
+    let fault = match &error {
+        LiveError::Faulted(fault) => Some(fault.clone()),
+        _ => s.handle().fault().map(|fault| fault.to_string()),
+    };
+    if let Some(fault) = fault {
+        s.mark_faulted(&fault);
+    }
+    // The state is set in memory whatever the write does, so the status read is the truth; a
+    // write that fails leaves the old file, and the caller still gets the error.
+    if let Err(e) = s.set_state(state) {
+        s.warn(format!("the status could not be written: {e}"));
+    }
     Err(error)
 }
 
@@ -218,6 +238,10 @@ where
 {
     let (id, timeframe, data_dir, next, live, handle) = {
         let mut s = lock(shared);
+        // A session that faulted or panicked stays halted, in this process as after a restart.
+        if let Some(refused) = s.refusal() {
+            return Err(refused);
+        }
         // Ends a replay: a fault here halts before a single bar is fed.
         if let Err(e) = s.go_live() {
             s.read_venue();
@@ -237,7 +261,10 @@ where
         Some(next) if live => next,
         // Never live: warm up, or finish a warm-up the log holds part of, then go live from now.
         _ => {
-            lock(shared).set_state(State::WarmingUp)?;
+            let warming = lock(shared).set_state(State::WarmingUp);
+            if let Err(e) = warming {
+                return halt(&mut lock(shared), e);
+            }
             let end = timeframe.floor(rest.now());
             let earliest = end - WARM_UP_BARS * timeframe.duration_ms();
             let from = next.map_or(earliest, |n| n.max(earliest));
@@ -275,7 +302,9 @@ where
     {
         let mut s = lock(shared);
         s.read_venue();
-        s.set_state(State::Running)?;
+        if let Err(e) = s.set_state(State::Running) {
+            return halt(&mut s, e);
+        }
     }
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .worker_threads(1)
@@ -302,9 +331,11 @@ where
     runtime.spawn(async move {
         while let Some(event) = rx.recv().await {
             if wake.send(Msg::Feed(event)).is_err() {
-                break;
+                return;
             }
         }
+        // Every sender is gone: the feed's task returned or panicked.
+        let _ = wake.send(Msg::FeedEnded);
     });
 
     let ended = loop {
@@ -316,8 +347,12 @@ where
             };
         }
         // The control keeps a sender, so this only waits.
-        let Ok(Msg::Feed(event)) = msgs.recv() else {
-            continue;
+        let event = match msgs.recv() {
+            Ok(Msg::Feed(event)) => event,
+            Ok(Msg::FeedEnded) => {
+                break halt(&mut lock(shared), LiveError::Halted(FEED_ENDED.into()));
+            }
+            Ok(Msg::Wake) | Err(_) => continue,
         };
         let warning = match event {
             FeedEvent::Bar(bar) => {
