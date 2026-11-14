@@ -885,13 +885,26 @@ fn crash_after_fire(rig: &Rig, id: &str, last_id: u64) {
     rig.write_json(id, "stops.json", &file);
 }
 
-/// Runs the command with `args` on this rig and returns its exit code and output.
+/// Runs the command with `args` on this rig and returns its exit code and output. A command still
+/// running after 30 s is stopped, as Ctrl-C would, so one that wrongly starts a run comes back
+/// with its exit code and output rather than hanging the test.
 fn td_live(rig: &Rig, feed: &Feed, args: &[&str]) -> (u8, String) {
     let cli = Cli::try_parse_from(std::iter::once("td-live").chain(args.iter().copied())).unwrap();
-    let mut lines = Vec::new();
-    let code = execute(cli, &rig.env(feed, quick()), &mut |l| {
-        lines.push(l.to_string())
+    let env = rig.env(feed, quick());
+    let (returned, bound) = std::sync::mpsc::channel::<()>();
+    let stop = env.stop.clone();
+    let bound = std::thread::spawn(move || {
+        // The sender is dropped once the command returns, which ends this wait at once.
+        if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
+            bound.recv_timeout(Duration::from_secs(30))
+        {
+            stop.stop();
+        }
     });
+    let mut lines = Vec::new();
+    let code = execute(cli, &env, &mut |l| lines.push(l.to_string()));
+    drop(returned);
+    bound.join().expect("the bound's thread");
     (code, lines.join("\n"))
 }
 
