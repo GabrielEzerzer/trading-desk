@@ -2005,6 +2005,86 @@ at_least_as_good: number,
 p_value: number, };
 
 /**
+ * A session beside its backtest.
+ */
+export type SessionComparison = { session: SideSummary, backtest: SideSummary, 
+/**
+ * The session's P&L over the backtest's; `null` when the backtest's P&L is zero. Negative
+ * when one made money and the other lost it.
+ */
+pnl_ratio: number | null, 
+/**
+ * Fills paired one to one through their orders, in the order of the orders' key.
+ */
+fills: Array<FillPair>, 
+/**
+ * Fills of the session with no partner in the backtest.
+ */
+session_only_fills: Array<Fill>, 
+/**
+ * Fills of the backtest with no partner in the session.
+ */
+backtest_only_fills: Array<Fill>, 
+/**
+ * Orders paired one to one, in the order of their key.
+ */
+orders: Array<OrderPair>, session_only_orders: Array<Order>, backtest_only_orders: Array<Order>, 
+/**
+ * Every difference found, each named; empty when the two sides agree.
+ */
+differences: Array<Difference>, };
+
+/**
+ * One side's costs and result.
+ */
+export type SideSummary = { 
+/**
+ * Orders submitted, rejected ones included.
+ */
+orders: number, fills: number, 
+/**
+ * Sum of fill fees; negative if rebates outweighed fees.
+ */
+fees: number, 
+/**
+ * Net funding paid; negative when the position received funding.
+ */
+funding: number, starting_equity: number, 
+/**
+ * Equity at the last live bar's close, or the starting equity before the first.
+ */
+final_equity: number, 
+/**
+ * `final_equity - starting_equity`.
+ */
+pnl: number, };
+
+/**
+ * A session fill and the backtest fill paired with it, with the session's value less the
+ * backtest's for each field.
+ */
+export type FillPair = { 
+/**
+ * The open time of the bar the fills' orders were decided on.
+ */
+decided_at: number, session: Fill, backtest: Fill, time_diff_ms: number, price_diff: number, qty_diff: number, fee_diff: number, };
+
+/**
+ * A session order and the backtest order paired with it.
+ */
+export type OrderPair = { session: Order, backtest: Order, };
+
+/**
+ * What a [`Difference`] is about.
+ */
+export type DifferenceKind = "fill_time" | "fill_price" | "fill_qty" | "fill_fee" | "session_only_fill" | "backtest_only_fill" | "order_request" | "order_status" | "session_only_order" | "backtest_only_order" | "fees" | "funding" | "result";
+
+/**
+ * One difference between the session and the backtest, in a plain sentence.
+ */
+export type Difference = { kind: DifferenceKind, message: string, };
+
+/**
  * The line the binary prints to stdout once it listens, for the app that started it.
  */
 export type Handshake = { port: number, token: string, };
@@ -2539,7 +2619,13 @@ strategy: string, params: Params, instrument: InstrumentId, timeframe: Timeframe
 /**
  * Replaces the instrument's fee schedule when set.
  */
-fees?: FeeSchedule, };
+fees?: FeeSchedule, 
+/**
+ * The saved verdict (a plan run's id) the session is started from: a verdict of the same
+ * strategy on the same instrument. Left out, the strategy's latest verdict on the instrument
+ * as `GET /verdicts` gives it, if it has one. Refused on a manual session.
+ */
+verdict_run_id?: RunId, };
 
 /**
  * A session as `GET /sessions` lists it.
@@ -2775,7 +2861,172 @@ dropped: Array<number>,
 /**
  * The latest problems that did not stop the session.
  */
-warnings: Array<string>, };
+warnings: Array<string>, 
+/**
+ * The strategy's code, plan and rule when the session started and the verdict it was started
+ * from, with whether the strategy as it is now still matches that verdict or, without one,
+ * what the session started with (`stale`). Left out for a manual session and for one started
+ * before links were recorded.
+ */
+link?: LinkState, };
+
+/**
+ * What a session was started from: the strategy's code, plan and rule when it started, and the
+ * verdict of the strategy on the session's instrument it was started from. Fixed when the session
+ * starts and saved with its config; [`LinkState`] shows it with its checks.
+ */
+export type SessionLink = { 
+/**
+ * The hash of the strategy's source file when the session started
+ * ([`td_engine::code_hash`]); `null` for a strategy without one.
+ */
+code_hash: string | null, 
+/**
+ * The strategy's test plan ([`td_engine::TestPlan`]) when the session started, as JSON, so a
+ * session saved before a field of it changed still reads.
+ */
+plan: unknown, 
+/**
+ * The strategy's verdict rule ([`td_engine::VerdictRule`]) when the session started, as JSON
+ * like `plan`.
+ */
+rule: unknown, 
+/**
+ * The verdict the session was started from: the one named when it was started, or else the
+ * strategy's latest verdict on the instrument as `GET /verdicts` gives it. `null` when the
+ * strategy had none there.
+ */
+verdict: LinkedVerdict | null, };
+
+/**
+ * The verdict a session was started from, with what its checks compare.
+ */
+export type LinkedVerdict = { 
+/**
+ * The saved plan run, at `GET /runs/{run_id}`.
+ */
+run_id: RunId, state: VerdictState, 
+/**
+ * False when a cancel stopped the battery's luck test.
+ */
+complete: boolean, 
+/**
+ * The engine revision that produced the verdict.
+ */
+engine_revision: number, 
+/**
+ * The hash of the strategy's source file the battery ran with; `null` for a battery saved
+ * before code hashes were recorded.
+ */
+code_hash: string | null, 
+/**
+ * The plan the battery ran under, as its verdict record holds it.
+ */
+plan: unknown, 
+/**
+ * The rule the battery ran under, as its verdict record holds it.
+ */
+rule: unknown, };
+
+/**
+ * A session's [`SessionLink`] with its checks against the strategy as it is now, made when the
+ * session's state is read. With a verdict, each check compares the verdict with this engine and
+ * the strategy now, and is the one `GET /verdicts` makes for that verdict. Without one, the plan
+ * and code checks compare what the session started with (the link's `plan`, `rule` and
+ * `code_hash`) with the strategy now, and there is no engine check. A check that cannot be made is
+ * `null`, and counts as not matching for `stale`.
+ */
+export type LinkState = { 
+/**
+ * With a verdict, whether this engine has the verdict's engine revision; `null` without one.
+ */
+engine_matches: boolean | null, 
+/**
+ * With a verdict, whether the strategy's plan and rule are still the ones the verdict was
+ * judged under, as far as they concern the session's instrument, and the plan still tests
+ * it; false when the strategy is no longer registered. Without one, whether they are still
+ * the ones the session started with, as far as they concern the session's instrument; `null`
+ * when the strategy is no longer registered.
+ */
+plan_matches: boolean | null, 
+/**
+ * With a verdict, whether the strategy's source file is still the one the verdict was judged
+ * with; without one, whether it is still the one the session started with. `null` when that
+ * is unknown: no hash was saved, or the strategy is no longer registered. The session replays
+ * and trades with the current file, so this compares the code it runs now. The hash covers
+ * the strategy's own file only, not shared helpers it calls.
+ */
+code_matches: boolean | null, 
+/**
+ * True unless each check made is true: all three with a verdict, `plan_matches` and
+ * `code_matches` without one. With a verdict: the code, plan or engine the session runs on
+ * may no longer be the one that verdict judged. Without one: the code or plan may have
+ * changed since the session started.
+ */
+stale: boolean, 
+/**
+ * The hash of the strategy's source file when the session started
+ * ([`td_engine::code_hash`]); `null` for a strategy without one.
+ */
+code_hash: string | null, 
+/**
+ * The strategy's test plan ([`td_engine::TestPlan`]) when the session started, as JSON, so a
+ * session saved before a field of it changed still reads.
+ */
+plan: unknown, 
+/**
+ * The strategy's verdict rule ([`td_engine::VerdictRule`]) when the session started, as JSON
+ * like `plan`.
+ */
+rule: unknown, 
+/**
+ * The verdict the session was started from: the one named when it was started, or else the
+ * strategy's latest verdict on the instrument as `GET /verdicts` gives it. `null` when the
+ * strategy had none there.
+ */
+verdict: LinkedVerdict | null, };
+
+/**
+ * `GET /sessions/{id}/comparison`: a session beside a backtest of the same strategy, parameters,
+ * instrument, timeframe and money settings over the same bars.
+ */
+export type SessionComparisonResponse = { 
+/**
+ * The backtest that was run: from the session's first live bar (`from`) to the end of its
+ * last bar (`to`), warmed up from its first warm-up bar (`warmup_from`).
+ */
+backtest: BacktestConfig, bars: ComparedBars, 
+/**
+ * Manual orders placed on the session. The backtest has none, so they, their fills and what
+ * they changed show as differences.
+ */
+manual_orders: number, comparison: SessionComparison, };
+
+/**
+ * The bars the backtest ran on: the session's own, as its log holds them, warm-up bars included.
+ * Nothing is downloaded and nothing is read from the store, so both sides saw exactly the same
+ * prices.
+ */
+export type ComparedBars = { warm_up_bars: number, live_bars: number, 
+/**
+ * Buckets the session's live feed left out; the backtest lacks them too.
+ */
+dropped: Array<number>, 
+/**
+ * The funding rates the session was charged. The backtest is given each at the venue's
+ * funding time (`due`), as a backtest from stored data would be, so a rate the session was
+ * charged on a later bar, because it was not yet published when its own bar closed, lands
+ * on another bar there; one due before the first live bar is not charged there at all.
+ */
+funding_events: number, 
+/**
+ * How many of those rates the session charged on a later bar than the one they were due in.
+ * Each moves funding, and the equity after it, to another bar in the backtest, so it shows as
+ * a funding and a result difference and, for a strategy that sizes its orders on equity, as
+ * order and fill quantity differences: none of these is then a difference in how orders were
+ * filled.
+ */
+late_funding: number, };
 
 /**
  * What a session reports as it runs, once [`PaperSession::set_events`] gives it a channel. Sent
