@@ -7,15 +7,22 @@ publish.workspace = true
 license.workspace = true
 
 # The broker that sends a session's orders through the order route to a venue's demo-trading
-# environment, so the strategy code a backtest runs can trade there.
+# environment, and the live session that runs a strategy on it from live bars and survives a
+# restart, so the strategy code a backtest runs can trade there.
 
 [dependencies]
 serde.workspace = true
+# Exact float round trips, so a replayed bar or broker record is the one that was saved.
+serde_json = { workspace = true, features = ["float_roundtrip"] }
 td-core.workspace = true
+td-data.workspace = true
 td-engine.workspace = true
 td-orders.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
 
 [dev-dependencies]
-serde_json.workspace = true
+futures-util.workspace = true
+tempfile.workspace = true
 td-mock-bybit.workspace = true
+tokio-tungstenite.workspace = true

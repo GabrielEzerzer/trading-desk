@@ -1,6 +1,15 @@
-//! A [`td_engine::Broker`] that sends a session's orders through the order route (`td-orders`)
-//! to a venue's demo-trading environment and reports what the venue did, so the strategy code a
-//! backtest runs can trade there unchanged.
+//! A live session on a venue's demo-trading environment, and the broker under it.
+//!
+//! [`LiveSession`] (the `session` and `run` modules) runs a strategy on live closed bars through a
+//! [`VenueBroker`], saves every bar with the broker's record under `<data_dir>/live/<id>/`, and
+//! resumes after a restart by replaying that log without touching the venue. Make one with
+//! [`LiveSession::create`] (it must start flat), reopen it with [`LiveSession::open`], and run it
+//! with [`LiveSession::run`], which returns a [`LiveRun`] to stop, halt or watch it. The library
+//! never reads the environment: the caller builds the order route's `Client`.
+//!
+//! The broker is a [`td_engine::Broker`] that sends a session's orders through the order route
+//! (`td-orders`) to a venue's demo-trading environment and reports what the venue did, so the
+//! strategy code a backtest runs can trade there unchanged.
 //!
 //! Build a [`VenueBroker`] for one instrument with [`VenueBroker::new`], hand it to
 //! `Session::with_broker`, and keep the [`VenueHandle`] it returns: the handle reads the broker's
@@ -79,6 +88,13 @@
 
 mod broker;
 mod ids;
+mod run;
+mod session;
 
 pub use broker::{BrokerFault, BrokerRecord, FaultKind, VenueBroker, VenueHandle};
 pub use ids::{InvalidPrefix, PREFIX_MAX_LEN};
+pub use run::LiveRun;
+pub use session::{
+    BuildStrategy, Funding, LiveConfig, LiveError, LiveSession, LiveStatus, SavedConfig, State,
+    VenueRead, live_dir,
+};
