@@ -198,10 +198,12 @@ fn flat(open_time: Millis) -> Candle {
     }
 }
 
-/// Minutes from `start` on, [`WARM_UP`] hourly bars before it, the funding `rates`, and a clock
-/// fixed at `start`. Funding reads after the first `funding_works_for` fail.
+/// Minutes from `start` on, [`WARM_UP`] hourly bars before it less those opening at a time in
+/// `missing`, the funding `rates`, and a clock fixed at `start`. Funding reads after the first
+/// `funding_works_for` fail.
 struct FakeRest {
     start: Millis,
+    missing: Mutex<Vec<Millis>>,
     warm_up_failures: Mutex<u32>,
     warm_up_reads: AtomicU32,
     rates: Mutex<Vec<(Millis, f64)>>,
@@ -236,10 +238,11 @@ impl Rest for FakeRest {
         } else {
             to.min(self.start)
         };
+        let missing = self.missing.lock().unwrap();
         let mut t = from.max(first).div_euclid(step) * step;
         let mut out = Vec::new();
         while t < to {
-            if t >= from {
+            if t >= from && (step == MIN || !missing.contains(&t)) {
                 out.push(flat(t));
             }
             t += step;
@@ -366,6 +369,7 @@ impl Rig {
             dir: tempfile::tempdir().expect("temp dir"),
             rest: Arc::new(FakeRest {
                 start,
+                missing: Mutex::new(Vec::new()),
                 warm_up_failures: Mutex::new(0),
                 warm_up_reads: AtomicU32::new(0),
                 rates: Mutex::new(Vec::new()),
@@ -1542,6 +1546,133 @@ fn a_live_session_shows_its_strategy_the_funding_a_backtest_of_its_bars_shows() 
         (first_live.0, &first_live.2[..]),
         (rig.bar(0), &funding[1..4])
     );
+}
+
+/// With the last warm-up bar missing at the venue, a rate inside it is shown with the first live
+/// bar, at its own time, as a backtest of the same bars shows it.
+#[test]
+fn a_rate_inside_a_missing_last_warm_up_bar_reaches_the_first_live_bar() {
+    let rig = Rig::new();
+    rig.rest.missing.lock().unwrap().push(rig.bar(-1));
+    // Every half hour from inside the first warm-up bar to inside the second live bar, two of
+    // them at the missing bar's open and inside it.
+    let funding: Vec<(Millis, f64)> = (1..10)
+        .map(|k| (rig.bar(-3) + k * 30 * MIN, 0.0001 * k as f64))
+        .collect();
+    *rig.rest.rates.lock().unwrap() = funding.clone();
+    let cfg = config(-1, -1, false);
+    let feed = rig.feed();
+    feed.minute(rig.bar(2));
+    let run = rig.run(rig.create("gap", cfg.clone()).expect("creates"), &feed);
+    wait_for_bar(&run, rig.bar(1));
+    let (live, ended) = run.stop();
+    ended.expect("stopped cleanly");
+    assert!(live.status().warnings.is_empty(), "{:?}", live.status());
+
+    let in_live = seen_live(&rig, "gap", &cfg);
+    let bars = live.session().bars();
+    let opens: Vec<Millis> = bars.iter().map(|b| b.open_time).collect();
+    assert_eq!(
+        opens,
+        [rig.bar(-3), rig.bar(-2), rig.bar(0), rig.bar(1)],
+        "the missing bar is not fed"
+    );
+    assert_eq!(in_live, seen_in_backtest(&cfg, bars, rig.bar(0), &funding));
+    let first_live = in_live.iter().find(|s| !s.1).expect("a live bar");
+    // On the first live bar: every rate from the first warm-up bar's open to its own end.
+    assert_eq!(
+        (first_live.0, &first_live.2[..]),
+        (rig.bar(0), &funding[..7])
+    );
+    assert_eq!(rig.sends(), 0);
+}
+
+/// A warm-up the log holds part of, left by a process that ended, is finished on resume from the
+/// end of the log: the rates the log holds are not shown again, those after it are shown once,
+/// and the strategy sees what a backtest of the same bars shows it.
+#[test]
+fn a_resumed_part_finished_warm_up_shows_each_rate_once() {
+    let rig = Rig::new();
+    // Every half hour from inside the first warm-up bar to inside the second live bar.
+    let funding: Vec<(Millis, f64)> = (1..10)
+        .map(|k| (rig.bar(-3) + k * 30 * MIN, 0.0001 * k as f64))
+        .collect();
+    *rig.rest.rates.lock().unwrap() = funding.clone();
+    let cfg = config(-1, -1, false);
+    let run = rig.run(
+        rig.create("part", cfg.clone()).expect("creates"),
+        &rig.feed(),
+    );
+    wait_until(&run, "running", |s| s.state == State::Running);
+    let (live, ended) = run.stop();
+    ended.expect("stopped cleanly");
+    drop(live);
+    // The process ended after the first warm-up bar's line: the later warm-up lines are not synced.
+    let path = rig.path("part", "events.jsonl");
+    let text = fs::read_to_string(&path).expect("log");
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), WARM_UP as usize);
+    fs::write(&path, format!("{}\n", lines[0])).expect("cut the log");
+    rewrite_state(&rig, "part", State::WarmingUp);
+
+    let live = rig.open("part").expect("reopens");
+    assert_eq!(live.session().bars().len(), 1);
+    let feed = rig.feed();
+    feed.minute(rig.bar(2));
+    let run = rig.run(live, &feed);
+    wait_for_bar(&run, rig.bar(1));
+    let (live, ended) = run.stop();
+    ended.expect("stopped cleanly");
+    // The status keeps the first run's warnings, such as its feed's disconnect when it stopped.
+    let warnings = &live.status().warnings;
+    assert!(
+        !warnings.iter().any(|w| w.contains("funding")),
+        "{warnings:?}"
+    );
+
+    let in_live = seen_live(&rig, "part", &cfg);
+    let bars = live.session().bars();
+    assert_eq!(bars.len(), WARM_UP as usize + 2);
+    assert_eq!(in_live, seen_in_backtest(&cfg, bars, rig.bar(0), &funding));
+    let logged: Vec<Millis> = rig
+        .log("part")
+        .iter()
+        .filter(|l| l["sending"] != true)
+        .flat_map(|l| l["funding"].as_array().cloned().unwrap_or_default())
+        .map(|f| f["time"].as_i64().expect("time"))
+        .collect();
+    let times: Vec<Millis> = funding.iter().map(|f| f.0).collect();
+    assert_eq!(logged, times, "each rate is logged once");
+    assert_eq!(rig.sends(), 0);
+}
+
+/// Warm-up does not feed a bar without the funding rates it would show: a funding read that fails
+/// after its retries halts the run before any bar is fed, and it does not go live.
+#[test]
+fn a_funding_read_that_fails_during_warm_up_halts_before_a_bar_and_sends_nothing() {
+    let rig = Rig::new();
+    eight_hourly(&rig);
+    rig.rest.funding_works_for.store(0, Ordering::SeqCst);
+    let feed = rig.feed();
+    feed.minute(rig.bar(1));
+    let live = rig
+        .create("unfunded-warm", config(0, 99, false))
+        .expect("creates");
+    let (live, ended) = rig.run(live, &feed).wait();
+    let Err(LiveError::Halted(reason)) = ended else {
+        panic!("not halted: {ended:?}");
+    };
+    assert!(
+        reason.contains("funding rates could not be read after 3 retries"),
+        "{reason}"
+    );
+    assert_eq!(rig.rest.funding_reads.load(Ordering::SeqCst), 1 + 3);
+    assert_eq!(live.status().state, State::Halted { reason });
+    assert_eq!(live.status().last_bar, None);
+    assert!(live.session().bars().is_empty(), "no warm-up bar was fed");
+    assert!(rig.log("unfunded-warm").is_empty());
+    assert!(!feed.opened.load(Ordering::SeqCst), "it did not go live");
+    assert_eq!(rig.sends(), 0);
 }
 
 #[test]
