@@ -148,7 +148,8 @@ impl StopHandle {
     }
 
     /// Asks the guarded run to stop. A running session is stopped cleanly and what it holds stays
-    /// at the venue; a flatten already under way finishes first.
+    /// at the venue; a flatten already under way finishes first, and a stop the bar in hand fires
+    /// before the run has stopped is flattened before the command returns.
     pub fn stop(&self) {
         self.wake.set(|f| f.stop = true);
     }
@@ -898,9 +899,6 @@ where
     let mut run = Some(live.run(rest, stream, after_bar));
     // Why the run ended, once it has, and the session it gave back. Set when `run` is taken.
     let mut ended: Option<(String, LiveSession)> = None;
-    let why_ended = |ended: Option<(String, LiveSession)>| {
-        ended.map_or_else(|| "the run ended".to_string(), |(reason, _)| reason)
-    };
     let mut halted = false;
     let mut next_check = Instant::now() + timing.interval;
     loop {
@@ -922,20 +920,7 @@ where
             ended = Some((reason, session));
         }
         if stopping {
-            let Some(run) = run.take() else {
-                out("stopped: the loss limits are not enforced while td-live is not running");
-                return Outcome::Halted(why_ended(ended.take()));
-            };
-            let (_session, result) = run.stop();
-            out(
-                "stopped: the position and its resting orders stay at the venue, and the loss \
-                 limits are not enforced while td-live is not running; `td-live flatten` closes \
-                 the position",
-            );
-            return match result {
-                Ok(()) => Outcome::Stopped,
-                Err(e) => Outcome::Halted(e.to_string()),
-            };
+            return stop_guarded(&guard, &prefix, run.take(), ended.take(), &rx, out);
         }
         if Instant::now() < next_check {
             continue;
@@ -962,6 +947,50 @@ where
             }
             Check::Clear { .. } => {}
         }
+    }
+}
+
+/// Why a run ended, from what the guard kept when it took the run.
+fn why_ended(ended: Option<(String, LiveSession)>) -> String {
+    ended.map_or_else(|| "the run ended".to_string(), |(reason, _)| reason)
+}
+
+/// The owner's stop of a guarded run: stops `run` if it is still going (`ended` holds what a run
+/// already taken gave back), then flattens a stop that fired, or else leaves what the session
+/// holds at the venue.
+///
+/// The fired state is read once the run has ended, when no check but this thread's can change
+/// it. So a stop the run's last bar fired after the loop last read the state, while the owner was
+/// stopping the command or as the run finished, is flattened before the command returns.
+fn stop_guarded(
+    guard: &Guard,
+    prefix: &str,
+    run: Option<crate::LiveRun>,
+    ended: Option<(String, LiveSession)>,
+    rx: &mpsc::Receiver<String>,
+    out: &mut dyn FnMut(&str),
+) -> Outcome {
+    let stopped = run.map(crate::LiveRun::stop);
+    // Bound first: an `if let` on the lock would hold it through `fire`, which takes it.
+    let fired = lock(&guard.inner).record.state.fired().copied();
+    if let Some(fired) = fired {
+        let session = match stopped {
+            Some((session, _)) => Some(session),
+            None => ended.map(|(_, session)| session),
+        };
+        return fire(guard, prefix, fired, None, session, rx, out);
+    }
+    let Some((_session, result)) = stopped else {
+        out("stopped: the loss limits are not enforced while td-live is not running");
+        return Outcome::Halted(why_ended(ended));
+    };
+    out(
+        "stopped: the position and its resting orders stay at the venue, and the loss limits are \
+         not enforced while td-live is not running; `td-live flatten` closes the position",
+    );
+    match result {
+        Ok(()) => Outcome::Stopped,
+        Err(e) => Outcome::Halted(e.to_string()),
     }
 }
 
@@ -1485,5 +1514,72 @@ mod tests {
         gate.halt("the venue could not be read");
         assert_eq!(gate.refusal(&client, &instrument(), &stop, PRICE), None);
         assert_eq!(mock.requests().len(), reads, "nothing is read for it");
+    }
+
+    /// The owner's stop finds the run already ended and taken, its last bar having fired a stop
+    /// after the loop last read the state: the stop is still flattened. The run cannot be made to
+    /// end between those two reads on purpose, so this calls the stop with the run already taken.
+    #[test]
+    fn the_owner_s_stop_flattens_a_stop_the_run_fired_before_it_was_taken() {
+        let (mock, client, gate) = gate_at(QTY);
+        let prefix = "t1";
+        let mut stop = market(Side::Sell, QTY, true);
+        stop.order_type = OrderType::Stop { trigger: 60_000.0 };
+        let cid = ids::client_id(prefix, Role::Order, OrderId(2));
+        client
+            .place(&instrument(), &stop, &cid, PRICE)
+            .expect("the session's stop rests");
+        let now = client.server_now();
+        let mut state = StopState::start(gate.rules, 100_000.0, now).unwrap();
+        assert!(
+            state.check(now, 1.0, 0.0).unwrap().is_some(),
+            "a stop fired"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, rx) = mpsc::channel();
+        let guard = Guard {
+            dir: dir.path().to_path_buf(),
+            client: Arc::new(client),
+            instrument: instrument(),
+            gate: Arc::new(gate),
+            timing: GuardTiming {
+                interval: Duration::from_secs(600),
+                pause: Duration::from_millis(50),
+                rounds: 6,
+                unreadable: 4,
+            },
+            inner: Mutex::new(Inner {
+                record: StopRecord::new(state),
+                failures: 0,
+                last_time: Millis::MIN,
+                shown_clear: false,
+                unsaved: None,
+            }),
+            wake: Arc::default(),
+            events: Mutex::new(tx),
+        };
+        let mut lines = Vec::new();
+        let outcome = stop_guarded(&guard, prefix, None, None, &rx, &mut |l| {
+            lines.push(l.to_string())
+        });
+        let text = lines.join("\n");
+        assert!(
+            matches!(
+                outcome,
+                Outcome::Fired {
+                    left: None,
+                    unsaved: None,
+                    ..
+                }
+            ),
+            "{outcome:?}\n{text}"
+        );
+        assert_eq!(mock.position(SYMBOL), 0.0, "{text}");
+        let resting: Vec<_> = mock
+            .orders()
+            .into_iter()
+            .filter(|o| ["New", "Untriggered", "PartiallyFilled"].contains(&o.status.as_str()))
+            .collect();
+        assert!(resting.is_empty(), "{resting:?}\n{text}");
     }
 }

@@ -1811,6 +1811,34 @@ fn a_bar_read_while_the_flatten_works_faults_the_broker_which_sends_nothing() {
     assert!(matches!(rig.open("race"), Err(LiveError::StillFaulted(_))));
 }
 
+/// The owner stops the command while the bar in hand is still reading the venue, and that bar's
+/// after-bar check fires a stop once the guard has read the state and asked the run to stop. The
+/// stop is still flattened before the command returns.
+#[test]
+fn a_stop_the_bar_in_hand_fires_while_the_owner_stops_is_flattened() {
+    let rig = Rig::new();
+    let feed = rig.feed();
+    let run = rig.entered("stopping", wide(), &feed, bars_only());
+    run.wait_line(&format!("bar fed: {}", rig.bar(0)));
+    // Bar 1 is held in its first read, before its after-bar check reads the equity, while the
+    // account loses past the maximum loss and the owner stops the command.
+    let reads = rig.mock.request_count(EXECUTIONS);
+    rig.mock
+        .inject(EXECUTIONS, Fault::Hang(Duration::from_millis(1200)));
+    feed.minute(rig.bar(2));
+    rig.wait("bar 1's first read", |r| {
+        r.mock.request_count(EXECUTIONS) > reads
+    });
+    rig.lose(11_000.0);
+    let (outcome, text) = run.stop();
+    assert!(
+        matches!(&outcome, Outcome::Fired { fired, left: None, unsaved: None } if fired.rule == StopRule::MaxLoss),
+        "{outcome:?}\n{text}"
+    );
+    assert!(!text.contains("stay at the venue"), "{text}");
+    assert_ended_flat(&rig, "stopping", StopRule::MaxLoss);
+}
+
 #[test]
 fn a_resume_of_a_record_without_the_quantity_owed_is_refused_and_status_and_flatten_still_work() {
     let rig = Rig::new();
