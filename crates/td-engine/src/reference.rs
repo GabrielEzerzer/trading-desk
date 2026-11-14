@@ -768,8 +768,7 @@ pub(crate) mod tests {
         let refs = tester_reference();
         let spec = sweep_spec(0, 60 * HOUR);
 
-        let swept =
-            crate::sweep_with_references(&spec, &bars, &[], &[], &refs, &[], None).unwrap();
+        let swept = crate::sweep_with_references(&spec, &bars, &[], &[], &refs, &[], None).unwrap();
         let best = swept.best.expect("one qualifying run");
         let last = best.orders.last().unwrap();
         assert_eq!(

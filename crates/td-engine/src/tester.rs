@@ -633,7 +633,9 @@ pub fn sweep_with_references(
     progress: Option<Progress>,
 ) -> Result<SweepResult, TesterError> {
     let plan = Plan::new(spec)?;
-    sweep_planned(spec, &plan, bars, asks, funding, references, series, progress)
+    sweep_planned(
+        spec, &plan, bars, asks, funding, references, series, progress,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -649,7 +651,9 @@ fn sweep_planned(
 ) -> Result<SweepResult, TesterError> {
     let data_fingerprint =
         config_fingerprint_with_references(&spec.base, bars, asks, funding, references, series)?;
-    let rows = ranked_rows(spec, plan, bars, asks, funding, references, series, progress)?;
+    let rows = ranked_rows(
+        spec, plan, bars, asks, funding, references, series, progress,
+    )?;
     let best = match rows.first() {
         Some(top) if top.qualified => Some(run_with_references(
             &with_params(&spec.base, &top.params),
@@ -1158,8 +1162,7 @@ pub fn out_of_sample_with_references(
         close_at_end: true,
         ..with_params(base, &best.config.params)
     };
-    let out_of_sample =
-        run_with_references(&oos_config, bars, asks, funding, references, series)?;
+    let out_of_sample = run_with_references(&oos_config, bars, asks, funding, references, series)?;
 
     let degradation = degradation(
         spec.sweep.objective.metric,

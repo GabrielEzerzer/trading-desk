@@ -117,7 +117,7 @@ pub struct BacktestConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub references: Vec<InstrumentId>,
     /// The series, by name, whose rows the strategy can read beside its bars, each row from the
-    /// close of the first bar at or after the time it became known ([`crate::Context::series`]).
+    /// first bar whose close is at or after the time it became known ([`crate::Context::series`]).
     /// Their rows are given to the run with [`run_with_references`] and the rows the run could
     /// read are part of the data fingerprint. Left out of the saved result when there are none,
     /// the default.
@@ -308,7 +308,7 @@ pub fn run(
 /// ([`BacktestConfig::references`]) or series ([`BacktestConfig::series`]), with the bars of each
 /// reference at the run's timeframe and the rows of each series. The strategy reads the references
 /// through [`crate::Context::reference`], aligned to its own bars by open time, and the series
-/// through [`crate::Context::series`], each row from the close of the first bar at or after the
+/// through [`crate::Context::series`], each row from the first bar whose close is at or after the
 /// time it became known. The data fingerprint covers the reference bars it was shown and the
 /// series rows known by its last bar's close. [`run`] is this with none given, so it refuses a
 /// configuration that names either.
@@ -337,9 +337,16 @@ pub(crate) fn run_exposures(
     references: &[ReferenceBars],
     series: &[Series],
 ) -> Result<Vec<Exposure>, EngineError> {
-    let sim = simulate(config, bars, asks, funding, references, series, true, || {
-        build_strategy(&config.strategy, &config.params)
-    })?;
+    let sim = simulate(
+        config,
+        bars,
+        asks,
+        funding,
+        references,
+        series,
+        true,
+        || build_strategy(&config.strategy, &config.params),
+    )?;
     Ok(sim.intrabar.exposures)
 }
 
@@ -383,9 +390,16 @@ pub(crate) fn run_metrics(
     references: &[ReferenceBars],
     series: &[Series],
 ) -> Result<MetricsReport, EngineError> {
-    let sim = simulate(config, bars, asks, funding, references, series, false, || {
-        build_strategy(&config.strategy, &config.params)
-    })?;
+    let sim = simulate(
+        config,
+        bars,
+        asks,
+        funding,
+        references,
+        series,
+        false,
+        || build_strategy(&config.strategy, &config.params),
+    )?;
     Ok(sim.report)
 }
 
@@ -416,7 +430,9 @@ pub(crate) fn run_built(
         series: equity_series,
         intrabar,
         report,
-    } = simulate(config, bars, asks, funding, references, series, false, build)?;
+    } = simulate(
+        config, bars, asks, funding, references, series, false, build,
+    )?;
     let benchmark = benchmark(
         config,
         &bars,
@@ -440,13 +456,7 @@ pub(crate) fn run_built(
         config: config.clone(),
         engine_version: env!("CARGO_PKG_VERSION").to_string(),
         engine_revision: ENGINE_REVISION,
-        data_fingerprint: fingerprint(
-            &used_bars,
-            &used_asks,
-            &funding[seen],
-            &references,
-            &known,
-        ),
+        data_fingerprint: fingerprint(&used_bars, &used_asks, &funding[seen], &references, &known),
         equity: session.equity().to_vec(),
         orders: session.orders().to_vec(),
         fills,

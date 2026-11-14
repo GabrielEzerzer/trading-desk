@@ -3699,8 +3699,7 @@ mod tests {
         for w in &wf.windows {
             assert!(fixed > 0.0);
             let r = &w.out_of_sample;
-            let held =
-                crate::runner::run_exposures(&r.config, &bars, &[], &[], &[], &[]).unwrap();
+            let held = crate::runner::run_exposures(&r.config, &bars, &[], &[], &[], &[]).unwrap();
             largest = held.iter().map(|x| x.notional).fold(largest, f64::max);
             leverage = held
                 .iter()
