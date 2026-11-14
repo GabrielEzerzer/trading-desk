@@ -1598,8 +1598,8 @@ fn refuse_short_train_bars(spec: &WalkForwardSpec) -> Result<(), TesterError> {
 }
 
 /// [`refuse_short_train_bars`]'s rule on a first train window of `bars` bars without gaps, named
-/// `window` in the message. A test plan, which knows its period, checks an anchored plan's first
-/// train window at its exact length with it.
+/// `window` in the message. A test plan checks an anchored plan's first train window at its
+/// shortest with it: `train_days` alone, which a start-offset run of the battery can leave it at.
 pub(crate) fn refuse_short_first_train(
     spec: &WalkForwardSpec,
     bars: usize,

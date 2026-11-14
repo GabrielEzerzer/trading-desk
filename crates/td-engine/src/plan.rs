@@ -526,13 +526,16 @@ impl TestPlan {
                     min.windows, min.days
                 ));
             }
-            // The tester checks an anchored first train window at its longest, without the
-            // period; here the period fixes it: `train_days` and the bars left over before the
-            // first test window.
+            // The tester checks an anchored first train window at its longest: `train_days` and
+            // the bars left over before the first test window. A start-offset run ends earlier, so
+            // it has fewer bars left over, down to none. `train_days` alone is the shortest the
+            // first train window gets in any run of the battery, so it has to be long enough.
             if ws.mode == WindowMode::Anchored {
-                let first = ws.train_bars + (bars - ws.train_bars - ws.test_bars) % ws.step_bars;
-                let window = format!("on {id} the first train window, {first} {tf} bars,");
-                refuse_short_first_train(&wf, first, &window)
+                let shortest = ws.train_bars;
+                let window = format!(
+                    "on {id} the first train window, {shortest} {tf} bars at its shortest,"
+                );
+                refuse_short_first_train(&wf, shortest, &window)
                     .map_err(|e| PlanError(e.to_string()))?;
             }
         }
@@ -751,22 +754,27 @@ mod tests {
 
     /// The tester checks an anchored first train window at its longest, up to a test window less
     /// one bar past `train_days`, since it cannot know the bars left over before the first test
-    /// window. A plan knows its period, so it checks the first train window at its length: 20 days
-    /// with nothing left over is too short for a Sharpe objective, 20 days with 10 left over is
-    /// not.
+    /// window. A start-offset run of the battery ends earlier and has fewer bars left over, so a
+    /// plan checks the first train window at its shortest, `train_days` alone: 20 days is too
+    /// short for a Sharpe objective with nothing left over and with 10 days left over, which a
+    /// start-offset run would cut into; 30 days is not.
     #[test]
-    fn an_anchored_first_train_window_is_checked_at_its_length_in_the_period() {
+    fn an_anchored_first_train_window_is_checked_at_its_shortest() {
         let mut plan = example_plan();
         plan.walk_forward.train_days = 20;
         plan.period.to = plan.period.from + (20 + 4 * 60) * DAY_MS;
         let err = plan.validate("sma_cross").unwrap_err();
         assert!(err.0.contains("a train window of 480"), "{err}");
         plan.walk_forward.mode = WindowMode::Anchored;
-        let err = plan.validate("sma_cross").unwrap_err();
         let first = format!("on {} the first train window, 480 ", plan.instruments[0]);
-        assert!(err.0.contains(&first), "{err}");
-        assert!(err.0.contains("Sharpe"), "{err}");
-        plan.period.to += 10 * DAY_MS;
+        for left_over in [0, 10] {
+            plan.period.to = plan.period.from + (20 + 4 * 60 + left_over) * DAY_MS;
+            let err = plan.validate("sma_cross").unwrap_err();
+            assert!(err.0.contains(&first), "{left_over}: {err}");
+            assert!(err.0.contains("at its shortest"), "{left_over}: {err}");
+            assert!(err.0.contains("Sharpe"), "{left_over}: {err}");
+        }
+        plan.walk_forward.train_days = 30;
         assert_eq!(plan.validate("sma_cross"), Ok(()));
     }
 
