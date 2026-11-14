@@ -102,45 +102,47 @@ impl Session {
         timeframe: Timeframe,
         config: SessionConfig,
     ) -> Result<Session, EngineError> {
-        if !(config.starting_cash.is_finite() && config.starting_cash >= 0.0) {
-            return Err(EngineError::InvalidConfig(
-                "starting cash must be a finite number, zero or more",
-            ));
-        }
-        if !(config.slippage_bps.is_finite() && (0.0..10_000.0).contains(&config.slippage_bps)) {
-            return Err(EngineError::InvalidConfig(
-                "slippage must be at least 0 and below 10000 basis points",
-            ));
-        }
-        if !(config.max_leverage.is_finite() && config.max_leverage > 0.0) {
-            return Err(EngineError::InvalidConfig(
-                "max leverage must be a finite number above zero",
-            ));
-        }
-        let rules = instrument.id.kind.rules();
-        if config.account_currency == AccountCurrency::Base {
-            if !rules.margin {
-                return Err(EngineError::InvalidConfig(
-                    "a base-currency account needs a margined market: spot pays for what it buys \
-                     in the quote currency",
-                ));
-            }
-            if rules.funding || rules.liquidation {
-                return Err(EngineError::InvalidConfig(
-                    "a base-currency account is not modelled on a market with funding or \
-                     liquidation (a perpetual), whose margin is in the quote currency",
-                ));
-            }
-        }
-        let fees = config.fees.unwrap_or(instrument.fees);
-        if !(fees.maker.is_finite() && fees.taker.is_finite() && fees.per_unit.is_finite()) {
-            return Err(EngineError::InvalidConfig("fees must be finite numbers"));
-        }
+        let fees = check_config(&instrument, &config)?;
         let model = CandleFillModel {
             slippage_bps: config.slippage_bps,
         };
         let broker = SimBroker::new(instrument.clone(), fees, model);
-        Ok(Session {
+        Ok(Session::build(
+            strategy,
+            instrument,
+            timeframe,
+            config,
+            fees,
+            Box::new(broker),
+        ))
+    }
+
+    /// A session that sends its orders to `broker` instead of the simulated broker, such as a
+    /// venue's order route. The config is checked as in [`Session::new`]; its fees and slippage
+    /// still price the strategy's checks at submission ([`Context::submit`]), while fills, fees
+    /// and slippage come from the broker's events.
+    pub fn with_broker(
+        strategy: Box<dyn Strategy>,
+        instrument: Instrument,
+        timeframe: Timeframe,
+        config: SessionConfig,
+        broker: Box<dyn Broker>,
+    ) -> Result<Session, EngineError> {
+        let fees = check_config(&instrument, &config)?;
+        Ok(Session::build(
+            strategy, instrument, timeframe, config, fees, broker,
+        ))
+    }
+
+    fn build(
+        strategy: Box<dyn Strategy>,
+        instrument: Instrument,
+        timeframe: Timeframe,
+        config: SessionConfig,
+        fees: FeeSchedule,
+        broker: Box<dyn Broker>,
+    ) -> Session {
+        Session {
             strategy,
             portfolio: Portfolio::new_in(
                 instrument.id.kind,
@@ -152,7 +154,7 @@ impl Session {
             fees,
             slippage_bps: config.slippage_bps,
             max_leverage: config.max_leverage,
-            broker: Box::new(broker),
+            broker,
             bars: Vec::new(),
             ask: None,
             orders: Vec::new(),
@@ -161,7 +163,7 @@ impl Session {
             bar_funding: Vec::new(),
             trade_stops: Vec::new(),
             failure: None,
-        })
+        }
     }
 
     /// Feeds the next closed bar, with the funding events (`(time, rate)`) that fall inside it or
@@ -700,6 +702,49 @@ impl Session {
     pub fn portfolio(&self) -> &Portfolio {
         &self.portfolio
     }
+}
+
+/// Checks a session's config against its instrument, as [`Session::new`] describes, and returns
+/// the fee schedule it trades on.
+fn check_config(
+    instrument: &Instrument,
+    config: &SessionConfig,
+) -> Result<FeeSchedule, EngineError> {
+    if !(config.starting_cash.is_finite() && config.starting_cash >= 0.0) {
+        return Err(EngineError::InvalidConfig(
+            "starting cash must be a finite number, zero or more",
+        ));
+    }
+    if !(config.slippage_bps.is_finite() && (0.0..10_000.0).contains(&config.slippage_bps)) {
+        return Err(EngineError::InvalidConfig(
+            "slippage must be at least 0 and below 10000 basis points",
+        ));
+    }
+    if !(config.max_leverage.is_finite() && config.max_leverage > 0.0) {
+        return Err(EngineError::InvalidConfig(
+            "max leverage must be a finite number above zero",
+        ));
+    }
+    let rules = instrument.id.kind.rules();
+    if config.account_currency == AccountCurrency::Base {
+        if !rules.margin {
+            return Err(EngineError::InvalidConfig(
+                "a base-currency account needs a margined market: spot pays for what it buys \
+                     in the quote currency",
+            ));
+        }
+        if rules.funding || rules.liquidation {
+            return Err(EngineError::InvalidConfig(
+                "a base-currency account is not modelled on a market with funding or \
+                     liquidation (a perpetual), whose margin is in the quote currency",
+            ));
+        }
+    }
+    let fees = config.fees.unwrap_or(instrument.fees);
+    if !(fees.maker.is_finite() && fees.taker.is_finite() && fees.per_unit.is_finite()) {
+        return Err(EngineError::InvalidConfig("fees must be finite numbers"));
+    }
+    Ok(fees)
 }
 
 /// Checks that `ask`, whose open time matches, can be the ask candle of the bid candle `bar`: a
