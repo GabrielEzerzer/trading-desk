@@ -6,7 +6,9 @@
 //! [`LiveSession::create`] (it must start flat), reopen it with [`LiveSession::open`], and run it
 //! with [`run_guarded`], which runs it with its stop rules enforced (the `guard` module) until it
 //! ends. The library never reads the environment: the caller builds the order route's `Client`.
-//! The `td-live` command ([`cli`]) is the only thing in the app that starts a live session.
+//! The `td-live` command ([`cli`]) is the only thing in the app that starts a live session. Its
+//! `compare` (the `compare` module) sets a session's fills beside a backtest over the bars saved
+//! in its folder, reading only that folder.
 //!
 //! The broker is a [`td_engine::Broker`] that sends a session's orders through the order route
 //! (`td-orders`) to a venue's demo-trading environment and reports what the venue did, so the
