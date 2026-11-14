@@ -1,9 +1,13 @@
 //! [`LiveSession`]: a strategy on a [`VenueBroker`], saved under `<data_dir>/live/<id>/` so it
 //! survives a restart.
 //!
-//! The folder holds four files:
-//! - `config.json`, written once at creation: the [`LiveConfig`], the starting balance read from
-//!   the venue, the client-id prefix, the engine revision and the creation time ([`SavedConfig`]).
+//! The folder holds five files:
+//! - `config.json`, written once at creation: the [`LiveConfig`] with its stop rules, the starting
+//!   balance read from the venue, the client-id prefix, the engine revision and the creation time
+//!   ([`SavedConfig`]).
+//! - `stops.json`, the stop state and the stop guard's flatten record (`crate::stop_file`),
+//!   written at creation and by the guard whenever it changes. A session whose stop has fired is
+//!   never opened to trade again.
 //! - `events.jsonl`, one [`Line`] per bar fed: the bar, the funding charged with it, whether it was
 //!   a warm-up bar, and for a live bar the broker's record ([`VenueHandle::take_record`]). A live
 //!   bar's line is synced to disk before the next bar is fed.
@@ -32,15 +36,17 @@ use serde::{Deserialize, Serialize};
 use td_core::{AccountCurrency, Candle, FeeSchedule, Instrument, Millis, OrderId, Timeframe};
 use td_engine::{
     Broker, BrokerEvent, ENGINE_REVISION, EngineError, Order, Params, Portfolio, Session,
-    SessionConfig, Strategy,
+    SessionConfig, StopError, StopRules, StopState, Strategy,
 };
 use td_orders::Client;
 
+use crate::guard::SendGate;
+use crate::stop_file::StopRecord;
 use crate::{BrokerRecord, VenueBroker, VenueHandle};
 
-const CONFIG_FILE: &str = "config.json";
+pub(crate) const CONFIG_FILE: &str = "config.json";
 const EVENTS_FILE: &str = "events.jsonl";
-const STATUS_FILE: &str = "status.json";
+pub(crate) const STATUS_FILE: &str = "status.json";
 const LOCK_FILE: &str = "lock";
 
 /// Builds a strategy by name from its parameters: `td_engine::build_strategy` for the registered
@@ -64,6 +70,10 @@ pub struct LiveConfig {
     pub fees: Option<FeeSchedule>,
     /// The largest position allowed, as its notional over equity: 1.0 means 1x.
     pub max_leverage: f64,
+    /// The loss limits and the open-notional cap, required and fixed when the session is created.
+    /// Nothing changes them afterwards: they are written once in `config.json`, and the stop
+    /// state is restored only against them.
+    pub stops: StopRules,
 }
 
 /// What `config.json` holds.
@@ -126,6 +136,11 @@ pub enum State {
     Stopped {
         note: String,
     },
+    /// Halted for good: a stop fired, or the owner flattened the session. `reason` says which and
+    /// what was done at the venue. A resume is refused.
+    Ended {
+        reason: String,
+    },
 }
 
 /// The venue's position and equity as last read.
@@ -186,6 +201,14 @@ pub enum LiveError {
     StillFaulted(String),
     #[error("the session halted: {0}")]
     Halted(String),
+    #[error("the stop rules are refused: {0}")]
+    InvalidStops(#[from] StopError),
+    #[error("{}: the stop state cannot be used, so the session is not opened: {reason}", path.display())]
+    StopFile { path: PathBuf, reason: String },
+    #[error("a stop fired, so the session never trades again: {0}")]
+    StopFired(String),
+    #[error("the session has ended and cannot be resumed: {0}")]
+    Ended(String),
     #[error("{}: {reason}; nothing was sent", path.display())]
     BadLog { path: PathBuf, reason: String },
     #[error("{}: {reason}", path.display())]
@@ -237,15 +260,20 @@ pub struct LiveSession {
     funding: Vec<Funding>,
     /// A `sending` line the log ends with: its bar's line is written after `go_live`.
     pending: Option<(Candle, Vec<Funding>)>,
+    /// The stop state as created or restored; the stop guard takes it over before the run.
+    pub(crate) stops: StopRecord,
+    /// The broker's send gate: the pre-trade cap, and the stop that ends all sending.
+    pub(crate) gate: Arc<SendGate>,
     /// Held locked while the session is open.
     _lock: File,
 }
 
 impl LiveSession {
     /// Makes a new session in `<data_dir>/live/<id>/`. Nothing is written or sent when the id is
-    /// taken, the strategy or settings do not check, the venue cannot be read, or the account
-    /// holds a position or open orders on the instrument. The starting balance is the account's
-    /// equity read here, and the client-id prefix is made from the creation time.
+    /// taken, the stop rules or the strategy or settings do not check, the venue cannot be read,
+    /// or the account holds a position or open orders on the instrument. The starting balance is
+    /// the account's equity read here, the stop state starts from it, and the client-id prefix is
+    /// made from the creation time.
     pub fn create(
         data_dir: &Path,
         id: &str,
@@ -254,6 +282,7 @@ impl LiveSession {
         build: BuildStrategy,
     ) -> Result<LiveSession, LiveError> {
         check_id(id)?;
+        config.stops.validate()?;
         let dir = live_dir(data_dir, id);
         if dir.exists() {
             return Err(LiveError::Exists(dir));
@@ -270,6 +299,7 @@ impl LiveSession {
             });
         }
         let created_at = client.server_now();
+        let stops = StopRecord::new(StopState::start(config.stops, equity.equity, created_at)?);
         let saved = SavedConfig {
             config,
             starting_balance: equity.equity,
@@ -279,7 +309,8 @@ impl LiveSession {
         };
         let config_path = dir.join(CONFIG_FILE);
         let log_path = dir.join(EVENTS_FILE);
-        let parts = Parts::build(&saved, client.clone(), strategy, &config_path)?;
+        let gate = Arc::new(SendGate::new(saved.config.stops));
+        let parts = Parts::build(&saved, client.clone(), strategy, &config_path, &gate)?;
 
         fs::create_dir_all(&dir).map_err(LiveError::io(&dir))?;
         let lock = take_lock(&dir)?;
@@ -291,6 +322,7 @@ impl LiveSession {
             reason: e.to_string(),
         })?;
         write_synced(&dir, CONFIG_FILE, &json)?;
+        stops.save(&dir)?;
         let file = OpenOptions::new()
             .create(true)
             .truncate(true)
@@ -327,6 +359,8 @@ impl LiveSession {
             next_bar: None,
             funding: Vec::new(),
             pending: None,
+            stops,
+            gate,
             _lock: lock,
         };
         live.save_status()?;
@@ -335,7 +369,8 @@ impl LiveSession {
 
     /// Opens a saved session to resume it: checks the engine revision, takes the lock, and
     /// replays the log through a fresh session and broker without touching the venue. A session
-    /// that halted on a broker fault is refused with that fault.
+    /// whose stop state is missing, unreadable or refused, whose stop has fired, that halted on a
+    /// broker fault, or that has ended, is refused.
     ///
     /// A last line without its newline was torn by a crash mid-write: it is cut from the file and
     /// noted in the warnings, and its bar is fetched again when the session runs. Any other line
@@ -360,13 +395,20 @@ impl LiveSession {
             });
         }
         let lock = take_lock(&dir)?;
+        let stops = StopRecord::load(&dir, &saved)?;
+        if let Some(fired) = stops.state.fired() {
+            return Err(LiveError::StopFired(fired.to_string()));
+        }
         let mut status: LiveStatus = read_json(&dir.join(STATUS_FILE))?;
-        if let State::Faulted { fault } = &status.state {
-            return Err(LiveError::StillFaulted(fault.clone()));
+        match &status.state {
+            State::Faulted { fault } => return Err(LiveError::StillFaulted(fault.clone())),
+            State::Ended { reason } => return Err(LiveError::Ended(reason.clone())),
+            _ => {}
         }
 
         let strategy = build(&saved.config.strategy, &saved.config.params)?;
-        let parts = Parts::build(&saved, client.clone(), strategy, &config_path)?;
+        let gate = Arc::new(SendGate::new(saved.config.stops));
+        let parts = Parts::build(&saved, client.clone(), strategy, &config_path, &gate)?;
         let log_path = dir.join(EVENTS_FILE);
         let bytes = fs::read(&log_path).map_err(LiveError::io(&log_path))?;
         let complete = bytes.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
@@ -415,6 +457,8 @@ impl LiveSession {
             next_bar: None,
             funding: Vec::new(),
             pending: None,
+            stops,
+            gate,
             _lock: lock,
         };
         live.replay(&lines).map_err(|(i, reason)| bad(i, reason))?;
@@ -627,6 +671,11 @@ impl LiveSession {
     }
 
     /// The broker's handle: the venue's position, equity and the session's resting orders.
+    /// The order route the session trades through, for the stop guard.
+    pub(crate) fn client(&self) -> Arc<Client> {
+        self.client.clone()
+    }
+
     pub fn handle(&self) -> &VenueHandle {
         &self.handle
     }
@@ -650,6 +699,7 @@ impl Parts {
         client: Arc<Client>,
         strategy: Box<dyn Strategy>,
         config_path: &Path,
+        gate: &Arc<SendGate>,
     ) -> Result<Parts, LiveError> {
         let config = &saved.config;
         let (inner, handle) = VenueBroker::new(
@@ -662,6 +712,7 @@ impl Parts {
             path: config_path.to_path_buf(),
             reason: e.to_string(),
         })?;
+        let inner = inner.gated(gate.clone());
         let log = Arc::new(Mutex::new(LogFile::closed()));
         let broker = LoggedBroker {
             inner,
@@ -838,7 +889,7 @@ fn push_warning(warnings: &mut Vec<String>, warning: String) {
     warnings.push(warning);
 }
 
-fn take_lock(dir: &Path) -> Result<File, LiveError> {
+pub(crate) fn take_lock(dir: &Path) -> Result<File, LiveError> {
     let path = dir.join(LOCK_FILE);
     let file = OpenOptions::new()
         .create(true)
@@ -855,7 +906,7 @@ fn take_lock(dir: &Path) -> Result<File, LiveError> {
 
 /// Writes `name` in `dir` through a synced temporary file renamed over it, so a crash cannot
 /// leave it empty or partial.
-fn write_synced(dir: &Path, name: &str, bytes: &[u8]) -> Result<(), LiveError> {
+pub(crate) fn write_synced(dir: &Path, name: &str, bytes: &[u8]) -> Result<(), LiveError> {
     let path = dir.join(name);
     let temp = dir.join(format!("{name}.tmp"));
     File::create(&temp)
@@ -864,7 +915,7 @@ fn write_synced(dir: &Path, name: &str, bytes: &[u8]) -> Result<(), LiveError> {
     fs::rename(&temp, &path).map_err(LiveError::io(&path))
 }
 
-fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, LiveError> {
+pub(crate) fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, LiveError> {
     let text = fs::read_to_string(path).map_err(LiveError::io(path))?;
     serde_json::from_str(&text).map_err(|e| LiveError::BadFile {
         path: path.to_path_buf(),
@@ -872,7 +923,7 @@ fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, LiveError
     })
 }
 
-fn check_id(id: &str) -> Result<(), LiveError> {
+pub(crate) fn check_id(id: &str) -> Result<(), LiveError> {
     let ok = (1..=64).contains(&id.len())
         && id
             .chars()

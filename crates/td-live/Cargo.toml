@@ -11,6 +11,7 @@ license.workspace = true
 # restart, so the strategy code a backtest runs can trade there.
 
 [dependencies]
+clap.workspace = true
 serde.workspace = true
 # Exact float round trips, so a replayed bar or broker record is the one that was saved.
 serde_json = { workspace = true, features = ["float_roundtrip"] }

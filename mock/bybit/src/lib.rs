@@ -324,6 +324,11 @@ impl MockVenue {
             .map_or(0.0, |p| p.size)
     }
 
+    /// Sets the USDT wallet balance, as a realised loss or a transfer would; equity follows.
+    pub fn set_wallet(&self, balance: f64) {
+        self.state.lock().unwrap().wallet = balance;
+    }
+
     /// The USDT wallet balance.
     pub fn wallet_balance(&self) -> f64 {
         self.state.lock().unwrap().wallet

@@ -8,6 +8,11 @@
 //! - `c`: the reduce-only market order sent in place of stop `n` when the venue will not take the
 //!   stop (its trigger is already through the market). Its executions are reported as fills of
 //!   order `n`.
+//! - `f`: the stop guard's own orders when a loss limit fires or the owner flattens the session
+//!   (`crate::guard`): a reduce-only market order that closes the venue's position. Here `n` is
+//!   the guard's own counter, saved in the session's stop-state file before each send, not an
+//!   engine order. The broker does not track these; one seen on a bar is a fault, which is
+//!   harmless because the session has halted before the guard sends one.
 //! - `x`: reserved for orders the session sends itself outside the engine, such as a later
 //!   "close the position" action. This crate sends none; an execution carrying one is a fault
 //!   until that action exists.
@@ -36,6 +41,8 @@ const _: () = assert!(PREFIX_MAX_LEN + 2 + MAX_DIGITS <= CLIENT_ID_MAX_LEN);
 pub(crate) enum Role {
     Order,
     Close,
+    /// A flatten order the stop guard sends; `n` is the guard's counter.
+    Flatten,
     /// Reserved; never sent by this crate.
     Session,
 }
@@ -45,6 +52,7 @@ impl Role {
         match self {
             Role::Order => 'o',
             Role::Close => 'c',
+            Role::Flatten => 'f',
             Role::Session => 'x',
         }
     }
@@ -86,6 +94,7 @@ pub(crate) fn parse(prefix: &str, id: &str) -> Option<(Role, OrderId)> {
     let role = match chars.next()? {
         'o' => Role::Order,
         'c' => Role::Close,
+        'f' => Role::Flatten,
         'x' => Role::Session,
         _ => return None,
     };
@@ -123,7 +132,7 @@ mod tests {
 
     #[test]
     fn ids_round_trip_and_other_ids_are_not_ours() {
-        for role in [Role::Order, Role::Close, Role::Session] {
+        for role in [Role::Order, Role::Close, Role::Flatten, Role::Session] {
             let id = client_id("s1", role, OrderId(42));
             assert_eq!(parse("s1", id.as_str()), Some((role, OrderId(42))));
         }

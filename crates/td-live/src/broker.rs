@@ -16,6 +16,7 @@ use td_orders::{
     Position, VenueOrder,
 };
 
+use crate::guard::SendGate;
 use crate::ids::{self, InvalidPrefix, Role};
 
 /// How far before the newest execution seen each read starts, for an execution the venue lists
@@ -200,6 +201,9 @@ struct Core {
     log: Vec<Call>,
     /// Records still to replay; `Some` while replaying.
     replay: Option<VecDeque<BrokerRecord>>,
+    /// The stop guard's gate, which every order passes before it is placed: the pre-trade
+    /// notional cap, and the guard's stop of all sending. A live session always sets one.
+    gate: Option<Arc<SendGate>>,
 }
 
 fn lock(core: &Mutex<Core>) -> MutexGuard<'_, Core> {
@@ -231,6 +235,7 @@ impl VenueBroker {
             fault: None,
             log: Vec::new(),
             replay: None,
+            gate: None,
         }));
         let handle = VenueHandle { core: core.clone() };
         Ok((
@@ -240,6 +245,12 @@ impl VenueBroker {
             },
             handle,
         ))
+    }
+
+    /// Puts every order this broker places behind `gate` (see [`SendGate`]).
+    pub(crate) fn gated(self, gate: Arc<SendGate>) -> Self {
+        lock(&self.core).gate = Some(gate);
+        self
     }
 
     fn with_core<R>(&mut self, f: impl FnOnce(&mut Core) -> R) -> R {
@@ -413,6 +424,17 @@ impl Core {
         self.id(role, t.order.id)
     }
 
+    /// Why the gate refuses to place `request` now, priced at `last`, if it does.
+    fn gated(&self, request: &OrderRequest, last: f64) -> Option<String> {
+        let gate = self.gate.as_ref()?;
+        gate.refusal(&self.client, &self.instrument, request, last)
+    }
+
+    /// Whether the stop guard has stopped all sending.
+    fn sending_stopped(&self) -> bool {
+        self.gate.as_ref().is_some_and(|g| g.stopped().is_some())
+    }
+
     fn raise(&mut self, kind: FaultKind, message: String) {
         if self.fault.is_none() {
             self.fault = Some(BrokerFault { kind, message });
@@ -510,6 +532,9 @@ impl Core {
     fn send(&mut self, id: OrderId) {
         let t = &self.book.orders[&id.0];
         let (request, last) = (t.order.request.clone(), t.order.decision_close);
+        if let Some(why) = self.gated(&request, last) {
+            return self.refuse(id, &format!("not sent: {why}"));
+        }
         let cid = self.id(Role::Order, id);
         match self.client.place(&self.instrument, &request, &cid, last) {
             Ok(_) => {
@@ -601,6 +626,10 @@ impl Core {
     /// further fill. A stop the venue will not take is replaced by a close at market; when that
     /// fails too, or a resize fails, the broker faults.
     fn protect(&mut self, entry: OrderId, qty: f64, last: f64) {
+        // The stop guard is flattening: it cancels and closes everything itself.
+        if self.sending_stopped() {
+            return;
+        }
         let e = &self.book.orders[&entry.0];
         let Some(stop) = e.order.attached_stop else {
             return;
@@ -666,6 +695,11 @@ impl Core {
     /// Sends a reduce-only market order for `qty` under order `id`'s `c` id, against the side its
     /// stop would close.
     fn close_at_market(&mut self, id: OrderId, qty: f64, last: f64) -> Result<(), CloseFailed> {
+        if self.sending_stopped() {
+            return Err(CloseFailed::Refused(
+                "the stop guard has stopped all sending".into(),
+            ));
+        }
         let stop = &self.book.orders[&id.0].order;
         let request = OrderRequest {
             instrument: stop.request.instrument.clone(),

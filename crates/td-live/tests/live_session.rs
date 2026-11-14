@@ -14,7 +14,7 @@ use td_core::{
 };
 use td_data::DataError;
 use td_data::live::{Rest, SharedStream};
-use td_engine::{Context, EngineError, ParamValue, Params, Strategy};
+use td_engine::{Context, DayRollover, EngineError, ParamValue, Params, StopRules, Strategy};
 use td_live::{
     LiveConfig, LiveError, LiveRun, LiveSession, LiveStatus, State, VenueHandle, live_dir,
 };
@@ -155,6 +155,13 @@ fn config(buy_on: i64, close_on: i64, stop: bool) -> LiveConfig {
         slippage_bps: 0.0,
         fees: None,
         max_leverage: 1.0,
+        // Wide enough never to fire or refuse here; tests/stops.rs tests the stops.
+        stops: StopRules {
+            daily_loss_share: 1.0,
+            max_loss_share: 1.0,
+            open_notional_cap: 1e12,
+            rollover: DayRollover::default(),
+        },
     }
 }
 
