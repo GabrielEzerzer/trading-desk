@@ -89,7 +89,8 @@ pub struct LiveConfig {
     pub strategy: String,
     pub params: Params,
     /// The instrument with the trading rules it had when the session was made, fixed for the
-    /// session's life so a resume replays against the same rules.
+    /// session's life so a resume replays against the same rules. A run halts before it sends
+    /// anything when the venue's rules no longer match these.
     pub instrument: Instrument,
     pub timeframe: Timeframe,
     /// Prices the strategy's checks at submission; fills come from the venue.
@@ -777,6 +778,10 @@ impl LiveSession {
 
     pub(crate) fn data_dir(&self) -> &Path {
         &self.data_dir
+    }
+
+    pub(crate) fn client(&self) -> &Client {
+        &self.client
     }
 
     pub fn id(&self) -> &str {

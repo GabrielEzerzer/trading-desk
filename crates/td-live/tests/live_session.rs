@@ -35,6 +35,7 @@ const CREATE: &str = "/v5/order/create";
 const CANCEL: &str = "/v5/order/cancel";
 const AMEND: &str = "/v5/order/amend";
 const WALLET: &str = "/v5/account/wallet-balance";
+const INSTRUMENTS: &str = "/v5/market/instruments-info";
 /// Warm-up bars the fake REST source has before the first live bar.
 const WARM_UP: i64 = 3;
 
@@ -890,6 +891,99 @@ fn nothing_is_sent_during_warm_up() {
         1,
         "the first live bar trades"
     );
+}
+
+/// Runs a session that buys on its first live bar and stops it after that bar, its position open.
+fn traded(rig: &Rig, id: &str) {
+    let feed = rig.feed();
+    feed.minute(rig.bar(1));
+    let run = rig.run(
+        rig.create(id, config(0, 99, false)).expect("creates"),
+        &feed,
+    );
+    wait_for_bar(&run, rig.bar(0));
+    let (live, ended) = run.stop();
+    ended.expect("stopped cleanly");
+    drop(live);
+    assert_eq!(rig.mock.position(SYMBOL), QTY);
+}
+
+#[test]
+fn a_resume_halts_before_sending_when_the_venue_changed_the_instruments_quantity_step() {
+    let rig = Rig::new();
+    traded(&rig, "rules");
+    // The saved rules no longer match the venue's: its quantity step is 0.001.
+    let path = rig.path("rules", "config.json");
+    let mut saved: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&path).expect("config")).expect("json");
+    saved["instrument"]["lot_size"] = 0.002.into();
+    fs::write(&path, serde_json::to_vec(&saved).expect("json")).expect("write");
+
+    let requests = rig.mock.requests().len();
+    let live = rig.open("rules").expect("reopens");
+    assert_eq!(rig.mock.requests().len(), requests, "open asks nothing");
+    let sends = rig.sends();
+    let feed = rig.feed();
+    feed.minute(rig.bar(2));
+    let run = rig.run(live, &feed);
+    wait_until(&run, "a halt", |s| matches!(s.state, State::Halted { .. }));
+    let (live, ended) = run.wait();
+    let Err(LiveError::Halted(reason)) = ended else {
+        panic!("not halted: {ended:?}");
+    };
+    assert!(
+        reason.contains("quantity step saved as 0.002, now 0.001 at the venue"),
+        "{reason}"
+    );
+    assert!(!reason.contains("tick size"), "{reason}");
+    assert_eq!(live.status().state, State::Halted { reason });
+    assert_eq!(rig.sends(), sends, "nothing sent, cancelled or resized");
+    assert_eq!(rig.mock.request_count(CREATE), 1);
+    assert!(!feed.opened.load(Ordering::SeqCst), "no bar was fed");
+    assert_eq!(live.status().last_bar, Some(rig.bar(0)));
+    assert_eq!(rig.mock.position(SYMBOL), QTY);
+}
+
+#[test]
+fn a_resume_whose_instrument_rules_cannot_be_read_halts_before_sending() {
+    let rig = Rig::new();
+    traded(&rig, "unread");
+    rig.mock.inject_always(INSTRUMENTS, Fault::ServerError);
+    let live = rig.open("unread").expect("reopens");
+    let sends = rig.sends();
+    let feed = rig.feed();
+    feed.minute(rig.bar(2));
+    let run = rig.run(live, &feed);
+    wait_until(&run, "a halt", |s| matches!(s.state, State::Halted { .. }));
+    let (live, ended) = run.wait();
+    let Err(LiveError::Halted(reason)) = ended else {
+        panic!("not halted: {ended:?}");
+    };
+    assert!(
+        reason.contains("rules for BTCUSDT could not be read"),
+        "{reason}"
+    );
+    assert_eq!(live.status().state, State::Halted { reason });
+    assert_eq!(rig.sends(), sends);
+    assert!(!feed.opened.load(Ordering::SeqCst), "no bar was fed");
+}
+
+#[test]
+fn a_resume_whose_instrument_rules_are_unchanged_reads_them_once_and_trades_on() {
+    let rig = Rig::new();
+    traded(&rig, "same");
+    let reads = rig.mock.request_count(INSTRUMENTS);
+    let live = rig.open("same").expect("reopens");
+    let feed = rig.feed();
+    feed.minute(rig.bar(2));
+    let run = rig.run(live, &feed);
+    wait_for_bar(&run, rig.bar(1));
+    let (live, ended) = run.stop();
+    ended.expect("stopped cleanly");
+    assert_eq!(rig.mock.request_count(INSTRUMENTS), reads + 1);
+    assert!(feed.opened.load(Ordering::SeqCst), "it went live");
+    assert_eq!(live.session().portfolio().position(), QTY);
+    assert_eq!(rig.mock.position(SYMBOL), QTY);
 }
 
 #[test]

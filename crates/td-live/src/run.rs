@@ -2,13 +2,15 @@
 //! traded yet, then each closed bar from the live feed, with the funding due in it, fed on the
 //! run's own thread.
 //!
-//! The run halts, sending and cancelling nothing more, when the broker faults, when the warm-up
-//! or a funding read fails after its bounded retries, when the log or the status cannot be
-//! written, when the feed ends, when the run panics, or when the owner asks it to. A fault
-//! writes the session's `faulted` marker, and a fault or a panic leaves a session that is never
-//! run again. A stop leaves the position and resting orders at the venue as they are. A resumed
-//! session skips warm-up and continues from the bar after its last one; the feed backfills the
-//! bars missed while it was down, and they are fed as live bars.
+//! The run halts, sending and cancelling nothing more, when the venue's trading rules for the
+//! instrument (tick size, quantity step, minimum quantity, minimum notional) differ from the ones
+//! saved at creation or cannot be read, which is checked before anything else goes out, when the
+//! broker faults, when the warm-up or a funding read fails after its bounded retries, when the
+//! log or the status cannot be written, when the feed ends, when the run panics, or when the
+//! owner asks it to. A fault writes the session's `faulted` marker, and a fault or a panic leaves a
+//! session that is never run again. A stop leaves the position and resting orders at the venue as
+//! they are. A resumed session skips warm-up and continues from the bar after its last one; the
+//! feed backfills the bars missed while it was down, and they are fed as live bars.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
@@ -42,6 +44,8 @@ const DEFAULT_FUNDING_INTERVAL: Millis = 8 * HOUR;
 const FUNDING_RETRIES: u32 = 3;
 const FUNDING_RETRY_DELAY: Duration = Duration::from_secs(5);
 const FEED_ENDED: &str = "the feed ended, so no more bars can come";
+/// The relative difference below which a saved trading rule and the venue's are the same.
+const RULE_TOLERANCE: f64 = 1e-9;
 
 /// What the owner asked for.
 enum Signal {
@@ -241,6 +245,9 @@ where
         // A session that faulted or panicked stays halted, in this process as after a restart.
         if let Some(refused) = s.refusal() {
             return Err(refused);
+        }
+        if let Err(reason) = check_rules(&s) {
+            return halt(&mut s, LiveError::Halted(reason));
         }
         // Ends a replay: a fault here halts before a single bar is fed.
         if let Err(e) = s.go_live() {
@@ -462,6 +469,41 @@ fn stop(s: &mut LiveSession) -> Result<(), LiveError> {
         s.handle().resting_orders().len()
     );
     s.set_state(State::Stopped { note })
+}
+
+/// Whether the venue's trading rules for the instrument are still the ones the session saved when
+/// it was created, which its orders are rounded to. The error names each rule that changed, with
+/// the saved value and the venue's, or says the rules could not be read.
+fn check_rules(s: &LiveSession) -> Result<(), String> {
+    let saved = &s.config().config.instrument;
+    let symbol = &saved.id.symbol;
+    let venue = s.client().instrument_info(symbol).map_err(|e| {
+        format!(
+            "the venue's trading rules for {symbol} could not be read, so the session did not go \
+             live and sent nothing: {e}"
+        )
+    })?;
+    let changed: Vec<String> = [
+        ("tick size", saved.tick_size, venue.tick_size),
+        ("quantity step", saved.lot_size, venue.qty_step),
+        ("minimum quantity", saved.min_qty, venue.min_order_qty),
+        ("minimum notional", saved.min_notional, venue.min_notional),
+    ]
+    .into_iter()
+    .filter(|&(_, saved, venue)| {
+        (saved - venue).abs() > RULE_TOLERANCE * saved.abs().max(venue.abs())
+    })
+    .map(|(rule, saved, venue)| format!("{rule} saved as {saved}, now {venue} at the venue"))
+    .collect();
+    if changed.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "the venue changed its trading rules for {symbol} since the session was created ({}), so \
+         orders rounded to the saved rules could be refused or mis-sized; the session did not go \
+         live and sent nothing",
+        changed.join("; ")
+    ))
 }
 
 /// The bars of `timeframe` to warm up on, opening in `[from, end)`: from the local store as far as
