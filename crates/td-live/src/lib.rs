@@ -32,6 +32,11 @@
 //!   own id then; if its outcome is unknown, the venue is asked about it on the first confirmed
 //!   fill (see "Unknown outcomes"). A stop the venue shows closed with nothing filled is treated
 //!   as one it refused. An entry that closes unfilled owes nothing for a stop that did not rest.
+//!   When that stop's outcome is unknown, the venue is asked about it by its id first, and the
+//!   close is ordinary only when the venue shows the stop closed with nothing filled. The broker
+//!   faults if the stop rests or filled there, if the venue cannot be asked, or if neither its
+//!   open orders nor two looks show the stop, since a list that lags can leave out a stop that
+//!   rests; the stop then stays unresolved.
 //!   For a confirmed fill, a stop the venue does not take now is replaced by a reduce-only market
 //!   order, since flat is the safe side (not while an order carried over a restart is
 //!   unresolved; see "Records"); if the close fails or is not sent, the broker faults. A stop that
@@ -93,11 +98,13 @@
 //!   is asked about too: one the venue holds is taken, and one it does not show stays
 //!   unresolved, so the entry's first confirmed fill asks about it again as under "Unknown
 //!   outcomes" (a second stop under the cover id if the venue still does not show it, and a
-//!   fault). The only orders going live can send are reduce-only stops, and resizes of them, for
-//!   fills the venue lists. While an order carried over the restart is unresolved (an entry or
-//!   stop whose outcome going live could not settle, until the venue settles it), no close at
-//!   market goes out at all: a stop the venue refuses then faults the broker and nothing is
-//!   closed.
+//!   fault), or the entry's close unfilled asks about it as under "Orders". Going live takes off
+//!   what a stop the session cancelled had not filled only once a lookup by id shows that stop
+//!   closed, as each bar's reconcile does. The only orders going live can send are reduce-only
+//!   stops, and resizes of them, for fills the venue lists. While an order carried over the
+//!   restart is unresolved (an entry or stop whose outcome going live could not settle, until
+//!   the venue settles it), no close at market goes out at all: a stop the venue refuses then
+//!   faults the broker and nothing is closed.
 //!
 //! The session keeps its own model of liquidation and funding on its portfolio. The broker cannot
 //! stop that model, so a bar on which the session's model would liquidate the position is a fault

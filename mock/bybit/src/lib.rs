@@ -279,6 +279,13 @@ impl MockVenue {
         self.state.lock().unwrap().listed_twice = Some(link_id.into());
     }
 
+    /// Leaves the orders with `link_id` out of the real-time orders and the order history for
+    /// `ms` from now, as the lag (`set_lag`) leaves out a new order, while they rest, fill and
+    /// trigger as before. Zero shows them again.
+    pub fn hide(&self, link_id: &str, ms: i64) {
+        self.state.lock().unwrap().hide(link_id, ms);
+    }
+
     /// Makes instruments info answer a query for `asked` with the listed instrument `listed`, as
     /// a venue that takes a symbol written another way would.
     pub fn list_as(&self, asked: &str, listed: &str) {
