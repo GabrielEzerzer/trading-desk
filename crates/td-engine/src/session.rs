@@ -80,6 +80,9 @@ pub struct Session {
     fills: Vec<Fill>,
     equity: Vec<EquityPoint>,
     bar_funding: Vec<BarFunding>,
+    /// Every funding event fed, with a warm-up bar or a live one, oldest first: what
+    /// [`Context::funding`] returns.
+    funding: Vec<(Millis, f64)>,
     trade_stops: Vec<TradeStops>,
     /// The reason the strategy stopped the run on the bar being fed ([`Context::fail`]).
     failure: Option<String>,
@@ -159,6 +162,7 @@ impl Session {
             fills: Vec::new(),
             equity: Vec::new(),
             bar_funding: Vec::new(),
+            funding: Vec::new(),
             trade_stops: Vec::new(),
             failure: None,
         })
@@ -318,6 +322,7 @@ impl Session {
             }
         }
         self.bar_funding.push(charged);
+        self.record_funding(funding);
         // A short closes with a buy, at the ask.
         let mark = if self.portfolio.position() < 0.0 {
             ask_bar.close
@@ -351,7 +356,8 @@ impl Session {
     /// history, and the strategy is called on it the same way, with `on_start` on the first bar fed
     /// whether that is a warm-up bar or a live one. But trading is disabled: every order the
     /// strategy submits is rejected (see [`Context::is_warming_up`]), nothing fills, no funding is
-    /// charged, no equity point or bar funding is recorded and the portfolio does not change. It is an error once
+    /// charged, no equity point or bar funding is recorded and the portfolio does not change. The
+    /// funding events join what [`Context::funding`] shows, as a live bar's do. It is an error once
     /// a bar has been fed with `on_bar`.
     pub fn warm_up(&mut self, bar: Candle, funding: &[(Millis, f64)]) -> Result<(), EngineError> {
         // Every live bar records an equity point.
@@ -359,9 +365,19 @@ impl Session {
             return Err(EngineError::WarmUpAfterLive);
         }
         self.check_bar(&bar, funding)?;
+        self.record_funding(funding);
         self.bars.push(bar);
         self.call_strategy(&bar, self.fills.len(), true);
         self.strategy_failure()
+    }
+
+    /// Adds the funding events fed with a bar to what [`Context::funding`] shows. Events from one
+    /// bar come after every earlier bar's (see `check_bar`), but may come in any order among
+    /// themselves.
+    fn record_funding(&mut self, funding: &[(Millis, f64)]) {
+        let from = self.funding.len();
+        self.funding.extend_from_slice(funding);
+        self.funding[from..].sort_by_key(|&(time, _)| time);
     }
 
     /// The error for a strategy that called [`Context::fail`] on the bar just fed. The bar itself
@@ -464,6 +480,7 @@ impl Session {
             slippage_bps: self.slippage_bps,
             max_leverage: self.max_leverage,
             portfolio: &self.portfolio,
+            funding: &self.funding,
             broker: &mut *self.broker,
             orders: &mut self.orders,
             warming_up: false,
@@ -629,6 +646,7 @@ impl Session {
             slippage_bps: self.slippage_bps,
             max_leverage: self.max_leverage,
             portfolio: &self.portfolio,
+            funding: &self.funding,
             broker: &mut *self.broker,
             orders: &mut self.orders,
             warming_up,

@@ -200,6 +200,10 @@ async fn drive(
             s.live_from().is_some(),
         )
     };
+    // A warm-up that reads the funding rates gives the clock its start from the same rates, and
+    // leaves the rates after its last bar for the first live bar.
+    let mut warmed = None;
+    let mut after_warm_up = Vec::new();
     let start = match next {
         Some(next) if live => next,
         // Never live: warm up, or finish a warm-up the log holds part of, then go live from now.
@@ -211,18 +215,36 @@ async fn drive(
             let from = next.map_or(earliest, |n| n.max(earliest));
             let store = Store::new(data_dir);
             let bars = warm_up_bars(shared, store, &rest, &id, timeframe, from, end).await?;
+            // The strategy sees every rate from where its bars begin, the end of the log or the
+            // first warm-up bar, each fed at its due time with the bar it falls in or the next,
+            // uncharged. Without a bar fed before the first live bar, that bar takes no funding
+            // from before its open.
+            let mut rates = Vec::new();
+            if let Some(seen_from) = next.or(bars.first().map(|b| b.open_time))
+                && id.kind.rules().funding
+            {
+                let lookback = seen_from.min(end - FUNDING_LOOKBACK);
+                rates = warm_up_funding(shared, &rest, &id, lookback, end).await?;
+                warmed = Some(FundingClock::new(&rates, end));
+                rates.retain(|&(time, _)| time >= seen_from);
+            }
+            let mut rates = rates.into_iter().peekable();
             let mut s = lock(shared);
             for bar in bars {
-                s.feed(bar, Vec::new(), true)?;
+                let bar_end = bar.open_time + timeframe.duration_ms();
+                let due = std::iter::from_fn(|| rates.next_if(|&(time, _)| time < bar_end));
+                let from = s.next_bar_time().unwrap_or(bar.open_time);
+                s.feed(bar, funding_at(due, from), true)?;
             }
+            after_warm_up.extend(rates);
             end
         }
     };
 
-    let mut funding = if id.kind.rules().funding {
-        Some(funding_clock(shared, &rest, &id, start).await)
-    } else {
-        None
+    let mut funding = match warmed {
+        Some(clock) => Some(clock),
+        None if id.kind.rules().funding => Some(funding_clock(shared, &rest, &id, start).await),
+        None => None,
     };
 
     lock(shared).set_status(Status::Reconnecting);
@@ -256,13 +278,17 @@ async fn drive(
                  the closed minutes among them are backfilled"
             )),
             FeedEvent::Bar(bar) => {
-                let charged = match &mut funding {
-                    Some(clock) => {
-                        let mut warn = |w| lock(shared).warn(w);
-                        clock.for_bar(&rest, &id, timeframe, &bar, &mut warn).await
-                    }
-                    None => Vec::new(),
-                };
+                // Rates after the last warm-up bar, missing from the feed's history, go with the
+                // first live bar, charged at its open on the flat position warm-up leaves.
+                let from = lock(shared).next_bar_time().unwrap_or(bar.open_time);
+                let mut charged = funding_at(after_warm_up.drain(..), from);
+                if let Some(clock) = &mut funding {
+                    let mut warn = |w| lock(shared).warn(w);
+                    let due = clock
+                        .for_bar(&rest, &id, timeframe, &bar, from, &mut warn)
+                        .await;
+                    charged.extend(due);
+                }
                 feed_live(&session, bar, charged).await?;
             }
         }
@@ -342,6 +368,48 @@ async fn warm_up_bars(
     Ok(bars)
 }
 
+/// The funding rates in `[from, to)` for a warm-up, sorted, over REST: one request, retried as
+/// [`warm_up_bars`] retries, so the strategy never sees a series with rates missing.
+async fn warm_up_funding(
+    shared: &Mutex<PaperSession>,
+    rest: &Arc<dyn Rest>,
+    id: &InstrumentId,
+    from: Millis,
+    to: Millis,
+) -> Result<Vec<(Millis, f64)>, PaperError> {
+    let (rest, id) = (Arc::clone(rest), id.clone());
+    let mut rates = retry_rest(
+        move || rest.funding(&id, from, to),
+        |error| {
+            lock(shared).warn(format!("warm-up funding failed, retrying: {error}"));
+            std::future::ready(Ok::<(), PaperError>(()))
+        },
+    )
+    .await?;
+    // As `FundingClock::take` keeps them.
+    rates.retain(|&(time, rate)| (from..to).contains(&time) && rate.is_finite());
+    rates.sort_by_key(|&(time, _)| time);
+    rates.dedup_by_key(|&mut (time, _)| time);
+    Ok(rates)
+}
+
+/// Funding for a bar from rates `(due, rate)` due before its end and not fed yet. `from` is the
+/// earliest time the engine takes with the bar: the end of the last bar fed, or the bar's own open
+/// when it is the first. Each rate is given at its due time, as a backtest of the same bars gives
+/// it, so a rate due in a gap before the bar keeps its time; only a rate due before `from`, which
+/// should have come with an earlier bar, is given at `from`. The engine charges both at the bar's
+/// open, as a backtest charges a rate due in a gap.
+fn funding_at(rates: impl IntoIterator<Item = (Millis, f64)>, from: Millis) -> Vec<Funding> {
+    rates
+        .into_iter()
+        .map(|(due, rate)| Funding {
+            time: due.max(from),
+            rate,
+            due,
+        })
+        .collect()
+}
+
 /// Sets up funding tracking for a perpetual going live at `start`: the venue's recent rates give
 /// the last funding time before the session went live and the interval between rates, and the
 /// rates already charged (on a resume) move it on.
@@ -418,8 +486,9 @@ impl FundingClock {
     }
 
     /// Takes the rates fetched after the last one charged, up to the bar's end, as funding for the
-    /// bar opening at `open`. A rate due before the bar is charged on it, at its open.
-    fn take(&mut self, rates: &[(Millis, f64)], open: Millis, end: Millis) -> Vec<Funding> {
+    /// bar whose earliest funding time is `from` (see [`funding_at`]). A rate due before the bar is
+    /// charged on it, at its open.
+    fn take(&mut self, rates: &[(Millis, f64)], from: Millis, end: Millis) -> Vec<Funding> {
         let mut rates: Vec<(Millis, f64)> = rates
             .iter()
             .copied()
@@ -427,27 +496,22 @@ impl FundingClock {
             .collect();
         rates.sort_by_key(|&(t, _)| t);
         rates.dedup_by_key(|&mut (t, _)| t);
-        rates
-            .into_iter()
-            .map(|(due, rate)| {
-                self.seen(due);
-                Funding {
-                    time: due.max(open),
-                    rate,
-                    due,
-                }
-            })
-            .collect()
+        for &(due, _) in &rates {
+            self.seen(due);
+        }
+        funding_at(rates, from)
     }
 
-    /// The funding to charge with `bar`. A rate expected inside the bar that the venue has not
-    /// published is asked for again a few times, then left for a later bar.
+    /// The funding to charge with `bar`, which takes funding from `from` on (see [`funding_at`]). A
+    /// rate expected inside the bar that the venue has not published is asked for again a few
+    /// times, then left for a later bar, with a warning on this bar and another when it comes.
     async fn for_bar(
         &mut self,
         rest: &Arc<dyn Rest>,
         id: &InstrumentId,
         timeframe: Timeframe,
         bar: &Candle,
+        from: Millis,
         warn: &mut (dyn FnMut(String) + Send),
     ) -> Vec<Funding> {
         let (open, end) = (bar.open_time, bar.open_time + timeframe.duration_ms());
@@ -462,10 +526,10 @@ impl FundingClock {
             if attempt > 0 {
                 tokio::time::sleep(self.retry_delay).await;
             }
-            let (rest, id, from) = (rest.clone(), id.clone(), self.last + 1);
-            match blocking(move || rest.funding(&id, from, end)).await {
+            let (rest, id, after) = (rest.clone(), id.clone(), self.last + 1);
+            match blocking(move || rest.funding(&id, after, end)).await {
                 Ok(rates) => {
-                    charged.extend(self.take(&rates, open, end));
+                    charged.extend(self.take(&rates, from, end));
                     error = None;
                 }
                 Err(e) => error = Some(e),
@@ -479,8 +543,18 @@ impl FundingClock {
             warn(format!(
                 "funding for the bar at {open} could not be read: {e}"
             ));
+        } else if due_here && self.next_due() < end {
+            // A warning, not a halt: the expected time is inferred from the last two rates, and a
+            // venue that changes its funding interval must not stop the session.
+            warn(format!(
+                "the venue had not published the funding due at {} when the bar at {open} closed, \
+                 so the strategy ran this bar without it; it will be charged and shown when the \
+                 venue publishes it",
+                self.next_due()
+            ));
         }
-        for late in charged.iter().filter(|f| f.due < open) {
+        // A rate due in a gap before the bar keeps its time and is not late.
+        for late in charged.iter().filter(|f| f.due < from) {
             warn(format!(
                 "funding due at {} was published late and charged on the bar at {open}",
                 late.due
@@ -588,15 +662,19 @@ mod tests {
         }
     }
 
+    fn perpetual() -> InstrumentId {
+        InstrumentId {
+            venue: td_core::Venue::Binance,
+            symbol: "BTCUSDT".into(),
+            kind: InstrumentKind::Perpetual,
+        }
+    }
+
     /// Feeds bars at `T`, `T + 1m`, ... to a fresh clock against funding published on the
     /// `publish_on`th request, and returns the funding charged with each bar, the requests made and
     /// the warnings.
     async fn charge(publish_on: u32, bars: i64) -> (Vec<Vec<Funding>>, u32, Vec<String>) {
-        let id = InstrumentId {
-            venue: td_core::Venue::Binance,
-            symbol: "BTCUSDT".into(),
-            kind: InstrumentKind::Perpetual,
-        };
+        let id = perpetual();
         let slow = Arc::new(SlowFunding {
             publish_on,
             calls: Mutex::new(0),
@@ -611,7 +689,7 @@ mod tests {
             let bar = bar(T + i * MIN);
             charged.push(
                 clock
-                    .for_bar(&rest, &id, Timeframe::M1, &bar, &mut warn)
+                    .for_bar(&rest, &id, Timeframe::M1, &bar, bar.open_time, &mut warn)
                     .await,
             );
         }
@@ -661,7 +739,21 @@ mod tests {
     async fn a_rate_still_unpublished_after_the_retries_is_charged_on_a_later_bar() {
         // Four requests in its own bar find nothing; the next bar's one request finds it.
         let (charged, calls, warnings) = charge(5, 3).await;
-        assert_eq!(warnings.len(), 1, "the late charge is noted");
+        assert_eq!(
+            warnings,
+            [
+                format!(
+                    "the venue had not published the funding due at {T} when the bar at {T} \
+                     closed, so the strategy ran this bar without it; it will be charged and shown \
+                     when the venue publishes it"
+                ),
+                format!(
+                    "funding due at {T} was published late and charged on the bar at {}",
+                    T + MIN
+                ),
+            ],
+            "warned once on the bar it was due in and once when it came"
+        );
         let late = Funding {
             time: T + MIN,
             rate: 0.0001,
@@ -669,5 +761,30 @@ mod tests {
         };
         assert_eq!(charged, [vec![], vec![late], vec![]]);
         assert_eq!(calls, 5);
+    }
+
+    /// The bar at `T` was dropped, so the rate due at `T` comes with the next bar fed. It is not
+    /// late: it keeps its own time, before that bar's open, as a backtest of the same bars feeds it.
+    #[tokio::test]
+    async fn a_rate_due_in_a_dropped_bar_comes_with_the_next_bar_at_its_own_time() {
+        let rest: Arc<dyn Rest> = Arc::new(SlowFunding {
+            publish_on: 1,
+            calls: Mutex::new(0),
+        });
+        let mut clock = FundingClock::new(&[(T - 16 * HOUR, 0.1), (T - 8 * HOUR, 0.1)], T);
+        let mut warnings = Vec::new();
+        let mut warn = |w: String| warnings.push(w);
+        // The last bar fed ended at `T`.
+        let next = bar(T + MIN);
+        let charged = clock
+            .for_bar(&rest, &perpetual(), Timeframe::M1, &next, T, &mut warn)
+            .await;
+        let in_gap = Funding {
+            time: T,
+            rate: 0.0001,
+            due: T,
+        };
+        assert_eq!(charged, [in_gap]);
+        assert!(warnings.is_empty(), "{warnings:?}");
     }
 }
