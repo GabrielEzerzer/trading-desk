@@ -1,4 +1,4 @@
-use td_core::{Candle, Instrument, Liquidity, OrderType, Rounding, Side, TimeInForce};
+use td_core::{Candle, Fill, Instrument, Liquidity, OrderType, Rounding, Side, TimeInForce};
 
 use crate::Order;
 
@@ -46,7 +46,9 @@ pub trait FillModel: Send {
 ///
 /// - Market: the bar's open, moved against the order by `slippage_bps`. Taker.
 /// - Limit buy: rests from the close it was decided on, and fills at the limit if the low reaches
-///   it. When a bar opens below it, the market passed the limit between the bars, where the
+///   it, in full, even when the low only touches the limit: there is no queue, so a fill that a
+///   real book would give only as far as the order's place in it allows is taken whole (see
+///   [`touch_only`], which the battery counts). When a bar opens below it, the market passed the limit between the bars, where the
 ///   resting order filled: it fills at the limit, not the better open, as of the open. Sells
 ///   mirror this. Maker.
 /// - Limit already marketable at the close it was decided on (a buy at or above that close, a
@@ -186,5 +188,165 @@ impl FillModel for CandleFillModel {
             }
             OrderType::StopLimit { .. } => FillCheck::NoFill,
         }
+    }
+}
+
+/// Whether a resting limit's fill was touch-only: its side's bar reached the limit without trading
+/// at least one tick through it, a buy whose low is above `price - tick` or a sell whose high is
+/// below `price + tick`. [`CandleFillModel`] fills these in full on the touch alone; a rule that
+/// asked for a trade-through would not fill them. `None` for a taker fill, which is not a resting
+/// limit's.
+///
+/// It reads the fill as the model makes it: only a resting limit fills as a maker, always at its
+/// own limit and as of the bar it filled on. So `fill.price` is the limit, and `bar` must be the
+/// bar on the fill's side that opened at `fill.time`: the ask on a market with quotes for a buy,
+/// the bid bar otherwise. Being worked out from the fill and its bar, not marked on the order,
+/// nothing a strategy sends can change it.
+pub(crate) fn touch_only(fill: &Fill, bar: &Candle, inst: &Instrument) -> Option<bool> {
+    if fill.liquidity != Liquidity::Maker {
+        return None;
+    }
+    // A hair under a tick, so a low exactly one tick below the limit reads as a trade-through
+    // whichever way the float subtraction rounds.
+    let through = inst.tick_size * (1.0 - 1e-6);
+    Some(match fill.side {
+        Side::Buy => bar.low > fill.price - through,
+        Side::Sell => bar.high < fill.price + through,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use td_core::{FeeSchedule, InstrumentId, InstrumentKind, OrderId, OrderRequest, Venue};
+
+    use super::*;
+    use crate::OrderStatus;
+
+    fn inst() -> Instrument {
+        Instrument {
+            id: InstrumentId {
+                venue: Venue::Binance,
+                symbol: "TESTUSDT".into(),
+                kind: InstrumentKind::Perpetual,
+            },
+            base: "TEST".into(),
+            quote: "USDT".into(),
+            tick_size: 0.01,
+            lot_size: 0.001,
+            min_qty: 0.001,
+            min_notional: 0.0,
+            fees: FeeSchedule {
+                maker: 0.0,
+                taker: 0.0,
+                per_unit: 0.0,
+            },
+        }
+    }
+
+    /// A limit at `price`, decided on a close of 100.
+    fn limit(side: Side, price: f64) -> Order {
+        Order {
+            id: OrderId(1),
+            request: OrderRequest {
+                instrument: inst().id,
+                side,
+                qty: 1.0,
+                order_type: OrderType::Limit { price },
+                tif: TimeInForce::Gtc,
+                reduce_only: false,
+                client_tag: None,
+            },
+            submitted_at: 0,
+            decision_close: 100.0,
+            attached_stop: None,
+            status: OrderStatus::Open,
+        }
+    }
+
+    fn bar(open: f64, high: f64, low: f64) -> Candle {
+        Candle {
+            open_time: 60_000,
+            open,
+            high,
+            low,
+            close: open,
+            volume: 1.0,
+            quote_volume: open,
+        }
+    }
+
+    /// The model's fill of `order` on `bar`, its first bar when `first`, made into the fill the
+    /// broker would record, and whether that fill was touch-only.
+    fn touch_only_on(order: &Order, first: bool, bar: &Candle) -> Option<bool> {
+        let model = CandleFillModel { slippage_bps: 0.0 };
+        let FillCheck::Fill {
+            price, liquidity, ..
+        } = model.check(order, first, false, bar, &inst())
+        else {
+            panic!("the limit should fill on {bar:?}");
+        };
+        let fill = Fill {
+            order_id: order.id,
+            instrument: inst().id,
+            side: order.request.side,
+            time: bar.open_time,
+            price,
+            qty: 1.0,
+            fee: 0.0,
+            liquidity,
+            close_out: false,
+        };
+        touch_only(&fill, bar, &inst())
+    }
+
+    #[test]
+    fn a_buy_limit_the_low_only_touches_is_touch_only() {
+        let order = limit(Side::Buy, 99.03);
+        assert_eq!(
+            touch_only_on(&order, false, &bar(100.0, 100.5, 99.03)),
+            Some(true)
+        );
+        // One tick below, which float subtraction may land either side of, and further.
+        assert_eq!(
+            touch_only_on(&order, false, &bar(100.0, 100.5, 99.02)),
+            Some(false)
+        );
+        assert_eq!(
+            touch_only_on(&order, false, &bar(100.0, 100.5, 98.5)),
+            Some(false)
+        );
+        // Opened through it: filled between the bars, and traded through.
+        assert_eq!(
+            touch_only_on(&order, false, &bar(99.0, 99.5, 98.9)),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn a_sell_limit_the_high_only_touches_is_touch_only() {
+        let order = limit(Side::Sell, 101.07);
+        assert_eq!(
+            touch_only_on(&order, false, &bar(100.0, 101.07, 99.5)),
+            Some(true)
+        );
+        assert_eq!(
+            touch_only_on(&order, false, &bar(100.0, 101.08, 99.5)),
+            Some(false)
+        );
+        assert_eq!(
+            touch_only_on(&order, false, &bar(100.0, 102.0, 99.5)),
+            Some(false)
+        );
+        assert_eq!(
+            touch_only_on(&order, false, &bar(101.2, 101.5, 101.1)),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn a_limit_that_takes_liquidity_is_not_a_resting_limit_fill() {
+        // Marketable at its decision close, so on its first bar it fills at the open as a taker.
+        let order = limit(Side::Buy, 101.0);
+        assert_eq!(touch_only_on(&order, true, &bar(100.0, 100.5, 99.5)), None);
     }
 }
