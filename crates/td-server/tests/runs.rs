@@ -470,6 +470,7 @@ fn config(kind: InstrumentKind, days: i64) -> BacktestConfig {
         max_leverage: 1.0,
         account_currency: td_core::AccountCurrency::Quote,
         references: Vec::new(),
+        series: Vec::new(),
     }
 }
 
@@ -1995,6 +1996,7 @@ async fn a_backtest_naming_a_reference_instrument_runs_on_its_stored_bars_with_t
         &data.asks,
         &data.funding,
         &data.references,
+        &[],
     )
     .unwrap();
     assert_eq!(**through_api, direct);
@@ -2052,4 +2054,59 @@ async fn a_backtest_naming_a_reference_instrument_runs_on_its_stored_bars_with_t
     let (status, answer) = cut.post("/runs/backtest", &body).await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{answer}");
     assert_eq!(answer["error"]["code"], "after_cutoff");
+}
+
+/// A saved run's data check reads a series no further than the run's end (#227): a malformed row
+/// known after it, added once the run is saved, leaves the data matching, while a changed value
+/// of a row the run saw, the one known exactly at its last bar's close, does not.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_run_naming_a_series_still_matches_when_a_malformed_row_follows_its_end() {
+    let t = TestServer::seeded(5).await;
+    let config = BacktestConfig {
+        series: vec!["made_up".into()],
+        ..config(InstrumentKind::Spot, 5)
+    };
+    // The last seeded hour is whole, so the last bar closes at `to`.
+    let seen = |last: f64| {
+        json!([
+            { "known_at": config.from, "value": 1.0 },
+            { "known_at": config.from + DAY, "value": 2.0 },
+            { "known_at": config.to, "value": last },
+        ])
+    };
+    let folder = t.store.root().join(td_engine::SERIES_DIR);
+    std::fs::create_dir_all(&folder).unwrap();
+    let write =
+        |rows: &Value| std::fs::write(folder.join("made_up.json"), rows.to_string()).unwrap();
+    write(&seen(3.0));
+    let body = serde_json::to_value(&config).unwrap();
+    let detail = saved_run(&t, "/runs/backtest", &body).await;
+    let run = format!("/runs/{}", detail.id);
+    let (status, reopened) = t.get(&run).await;
+    assert_eq!(status, StatusCode::OK, "{reopened}");
+    assert_eq!(
+        reopened["check"],
+        json!({ "data_matches": true, "engine_matches": true })
+    );
+
+    let malformed = json!({ "known_at": config.to + 1, "value": "not a number" });
+    let mut rows = seen(3.0);
+    rows.as_array_mut().unwrap().push(malformed.clone());
+    write(&rows);
+    let (_, reopened) = t.get(&run).await;
+    assert_eq!(
+        reopened["check"],
+        json!({ "data_matches": true, "engine_matches": true }),
+        "a row known after the run's end is not read"
+    );
+
+    let mut rows = seen(4.0);
+    rows.as_array_mut().unwrap().push(malformed);
+    write(&rows);
+    let (_, reopened) = t.get(&run).await;
+    assert_eq!(
+        reopened["check"],
+        json!({ "data_matches": false, "engine_matches": true }),
+        "a row known at the last bar's close is in the fingerprint"
+    );
 }

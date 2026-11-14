@@ -409,6 +409,7 @@ pub(crate) fn compare(
         // As the session's own account (`SavedConfig::money`).
         account_currency: AccountCurrency::Quote,
         references: config.references.clone(),
+        series: Vec::new(),
     };
     let result = catch_unwind(AssertUnwindSafe(|| {
         let strategy = build(&config.strategy, &config.params)?;
@@ -419,6 +420,7 @@ pub(crate) fn compare(
             &[],
             &replayed.due,
             &replayed.references,
+            &[],
         )
     }))
     .map_err(|p| format!("the backtest panicked: {}", panic_message(&*p)))?

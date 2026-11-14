@@ -13,6 +13,7 @@ use td_core::{
 use crate::metrics::{self, DAY_MS, DAYS_PER_YEAR, EquitySeries, MetricsReport};
 use crate::reference::{Aligned, ReferenceBars, align, row};
 use crate::risk::{self, EquityRange, Exposure, Intrabar};
+use crate::series::{Series, SeriesRow, known_by};
 use crate::session::{check_quote, funding_ranges, sorted_funding};
 use crate::{
     BarFunding, CLOSE_OUT_TAG, CandleFillModel, EngineError, EquityPoint, Order, Params, Portfolio,
@@ -115,6 +116,13 @@ pub struct BacktestConfig {
     /// when there are none, the default.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub references: Vec<InstrumentId>,
+    /// The series, by name, whose rows the strategy can read beside its bars, each row from the
+    /// first bar whose close is at or after the time it became known ([`crate::Context::series`]).
+    /// Their rows are given to the run with [`run_with_references`] and the rows the run could
+    /// read are part of the data fingerprint. Left out of the saved result when there are none,
+    /// the default.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub series: Vec<String>,
 }
 
 impl BacktestConfig {
@@ -122,6 +130,12 @@ impl BacktestConfig {
     /// a reference, and one named twice.
     pub fn check_references(&self) -> Result<(), EngineError> {
         crate::reference::check_ids(&self.instrument.id, &self.references)
+    }
+
+    /// Refuses a series name that is not a plain one ([`crate::check_series_name`]) and one named
+    /// twice.
+    pub fn check_series(&self) -> Result<(), EngineError> {
+        crate::series::check_names(&self.series)
     }
 }
 
@@ -152,6 +166,8 @@ impl<'de> Deserialize<'de> for BacktestConfig {
             account_currency: AccountCurrency,
             #[serde(default)]
             references: Vec<InstrumentId>,
+            #[serde(default)]
+            series: Vec<String>,
         }
         let g = Given::deserialize(deserializer)?;
         Ok(BacktestConfig {
@@ -171,6 +187,7 @@ impl<'de> Deserialize<'de> for BacktestConfig {
             close_at_end: g.close_at_end,
             account_currency: g.account_currency,
             references: g.references,
+            series: g.series,
         })
     }
 }
@@ -284,22 +301,26 @@ pub fn run(
     asks: &[Candle],
     funding: &[(Millis, f64)],
 ) -> Result<BacktestResult, EngineError> {
-    run_with_references(config, bars, asks, funding, &[])
+    run_with_references(config, bars, asks, funding, &[], &[])
 }
 
 /// [`run`] for a configuration that names reference instruments
-/// ([`BacktestConfig::references`]), with the bars of each at the run's timeframe. The strategy
-/// reads them through [`crate::Context::reference`], aligned to its own bars by open time, and the
-/// data fingerprint covers the reference bars it was shown. [`run`] is this with none given, so it
-/// refuses a configuration that names references.
+/// ([`BacktestConfig::references`]) or series ([`BacktestConfig::series`]), with the bars of each
+/// reference at the run's timeframe and the rows of each series. The strategy reads the references
+/// through [`crate::Context::reference`], aligned to its own bars by open time, and the series
+/// through [`crate::Context::series`], each row from the first bar whose close is at or after the
+/// time it became known. The data fingerprint covers the reference bars it was shown and the
+/// series rows known by its last bar's close. [`run`] is this with none given, so it refuses a
+/// configuration that names either.
 pub fn run_with_references(
     config: &BacktestConfig,
     bars: &[Candle],
     asks: &[Candle],
     funding: &[(Millis, f64)],
     references: &[ReferenceBars],
+    series: &[Series],
 ) -> Result<BacktestResult, EngineError> {
-    run_built(config, bars, asks, funding, references, || {
+    run_built(config, bars, asks, funding, references, series, || {
         build_strategy(&config.strategy, &config.params)
     })
 }
@@ -314,10 +335,18 @@ pub(crate) fn run_exposures(
     asks: &[Candle],
     funding: &[(Millis, f64)],
     references: &[ReferenceBars],
+    series: &[Series],
 ) -> Result<Vec<Exposure>, EngineError> {
-    let sim = simulate(config, bars, asks, funding, references, true, || {
-        build_strategy(&config.strategy, &config.params)
-    })?;
+    let sim = simulate(
+        config,
+        bars,
+        asks,
+        funding,
+        references,
+        series,
+        true,
+        || build_strategy(&config.strategy, &config.params),
+    )?;
     Ok(sim.intrabar.exposures)
 }
 
@@ -332,11 +361,11 @@ pub fn run_strategy(
     asks: &[Candle],
     funding: &[(Millis, f64)],
 ) -> Result<BacktestResult, EngineError> {
-    run_strategy_with_references(config, strategy, bars, asks, funding, &[])
+    run_strategy_with_references(config, strategy, bars, asks, funding, &[], &[])
 }
 
-/// [`run_strategy`] with the bars of the reference instruments `config` names, as
-/// [`run_with_references`] takes them.
+/// [`run_strategy`] with the bars of the reference instruments and the rows of the series `config`
+/// names, as [`run_with_references`] takes them.
 pub fn run_strategy_with_references(
     config: &BacktestConfig,
     strategy: Box<dyn Strategy>,
@@ -344,8 +373,11 @@ pub fn run_strategy_with_references(
     asks: &[Candle],
     funding: &[(Millis, f64)],
     references: &[ReferenceBars],
+    series: &[Series],
 ) -> Result<BacktestResult, EngineError> {
-    run_built(config, bars, asks, funding, references, || Ok(strategy))
+    run_built(config, bars, asks, funding, references, series, || {
+        Ok(strategy)
+    })
 }
 
 /// The metrics [`run`] would report, without the parts of its result a sweep row does not keep:
@@ -356,10 +388,18 @@ pub(crate) fn run_metrics(
     asks: &[Candle],
     funding: &[(Millis, f64)],
     references: &[ReferenceBars],
+    series: &[Series],
 ) -> Result<MetricsReport, EngineError> {
-    let sim = simulate(config, bars, asks, funding, references, false, || {
-        build_strategy(&config.strategy, &config.params)
-    })?;
+    let sim = simulate(
+        config,
+        bars,
+        asks,
+        funding,
+        references,
+        series,
+        false,
+        || build_strategy(&config.strategy, &config.params),
+    )?;
     Ok(sim.report)
 }
 
@@ -371,6 +411,7 @@ pub(crate) fn run_built(
     asks: &[Candle],
     funding: &[(Millis, f64)],
     references: &[ReferenceBars],
+    series: &[Series],
     build: impl FnOnce() -> Result<Box<dyn Strategy>, EngineError>,
 ) -> Result<BacktestResult, EngineError> {
     let Simulated {
@@ -382,22 +423,27 @@ pub(crate) fn run_built(
         ranges,
         seen,
         references,
+        named,
         session,
         fills,
         trades,
-        series,
+        series: equity_series,
         intrabar,
         report,
-    } = simulate(config, bars, asks, funding, references, false, build)?;
+    } = simulate(
+        config, bars, asks, funding, references, series, false, build,
+    )?;
     let benchmark = benchmark(
         config,
         &bars,
         &traded_asks,
         &funding,
         &ranges,
-        &series,
+        &equity_series,
         &report,
     );
+    let last_close = bars.last().map_or(0, |b| b.open_time) + config.timeframe.duration_ms();
+    let known = known_series(&named, last_close);
     let mut used_bars = warmup;
     used_bars.extend_from_slice(&bars);
     let used_asks: Vec<Candle> = warmup_asks
@@ -410,7 +456,7 @@ pub(crate) fn run_built(
         config: config.clone(),
         engine_version: env!("CARGO_PKG_VERSION").to_string(),
         engine_revision: ENGINE_REVISION,
-        data_fingerprint: fingerprint(&used_bars, &used_asks, &funding[seen], &references),
+        data_fingerprint: fingerprint(&used_bars, &used_asks, &funding[seen], &references, &known),
         equity: session.equity().to_vec(),
         orders: session.orders().to_vec(),
         fills,
@@ -422,7 +468,7 @@ pub(crate) fn run_built(
 }
 
 /// What a backtest's simulation leaves for [`run_built`] and [`run_metrics`] to finish from.
-struct Simulated {
+struct Simulated<'a> {
     /// The warm-up bars.
     warmup: Vec<Candle>,
     /// The traded bars.
@@ -438,6 +484,8 @@ struct Simulated {
     seen: Range<usize>,
     /// The reference instruments' bars, aligned to the warm-up and traded bars.
     references: Aligned,
+    /// The series the configuration names, in its order, as given.
+    named: Vec<&'a Series>,
     session: Session,
     fills: Vec<Fill>,
     trades: Vec<Trade>,
@@ -449,17 +497,20 @@ struct Simulated {
 /// Checks the data, runs the strategy on a [`Session`] and derives the trade list and metrics,
 /// keeping the open positions inside the bars ([`Intrabar::exposures`]) only with
 /// `keep_exposures`.
-fn simulate(
+#[allow(clippy::too_many_arguments)]
+fn simulate<'a>(
     config: &BacktestConfig,
     bars: &[Candle],
     asks: &[Candle],
     funding: &[(Millis, f64)],
     references: &[ReferenceBars],
+    series: &'a [Series],
     keep_exposures: bool,
     build: impl FnOnce() -> Result<Box<dyn Strategy>, EngineError>,
-) -> Result<Simulated, EngineError> {
+) -> Result<Simulated<'a>, EngineError> {
     let (warmup, traded) = select_bars(config, bars)?;
     let references = align_used(config, &warmup, &traded, references)?;
+    let named = named_series(config, &warmup, &traded, series)?;
     let warmup_asks = match_asks(config.instrument.id.kind, bars, asks, &warmup)?;
     let traded_asks = match_asks(config.instrument.id.kind, bars, asks, &traded)?;
     // The session checks each traded bar's ask as it is fed, but warm-up bars are fed without one.
@@ -479,6 +530,7 @@ fn simulate(
     };
     let mut session = Session::new(strategy, config.instrument.clone(), tf, session_config)?;
     session.name_references(references.iter().map(|(id, _)| id.clone()).collect())?;
+    session.name_series(named.iter().map(|s| (*s).clone()).collect())?;
     for (j, (bar, range)) in warmup.iter().zip(warmup_ranges).enumerate() {
         session.feed(*bar, None, &funding[range], &row(&references, j), true)?;
     }
@@ -538,6 +590,7 @@ fn simulate(
         ranges,
         seen,
         references,
+        named,
         session,
         fills,
         trades,
@@ -545,6 +598,27 @@ fn simulate(
         intrabar,
         report,
     })
+}
+
+/// The series `given` for `config`, in the order it names them, checked by [`crate::series::named`]
+/// against the close of the first bar the strategy sees, warm-up included.
+fn named_series<'a>(
+    config: &BacktestConfig,
+    warmup: &[Candle],
+    traded: &[Candle],
+    given: &'a [Series],
+) -> Result<Vec<&'a Series>, EngineError> {
+    let first = warmup.first().or(traded.first()).map_or(0, |b| b.open_time);
+    crate::series::named(config, first + config.timeframe.duration_ms(), given)
+}
+
+/// Each of `named` with only its rows known at or before `at`: the rows a run whose last bar
+/// closes at `at` could read.
+fn known_series<'a>(named: &[&'a Series], at: Millis) -> Vec<(&'a str, &'a [SeriesRow])> {
+    named
+        .iter()
+        .map(|s| (s.name.as_str(), &s.rows[..known_by(&s.rows, at)]))
+        .collect()
 }
 
 /// The bars given for `config`'s reference instruments, aligned to its warm-up and traded bars
@@ -707,20 +781,25 @@ pub fn config_fingerprint(
     asks: &[Candle],
     funding: &[(Millis, f64)],
 ) -> Result<String, EngineError> {
-    config_fingerprint_with_references(config, bars, asks, funding, &[])
+    config_fingerprint_with_references(config, bars, asks, funding, &[], &[])
 }
 
-/// [`config_fingerprint`] for a configuration that names reference instruments, with their bars
-/// as [`run_with_references`] takes them: the fingerprint that run would record.
+/// [`config_fingerprint`] for a configuration that names reference instruments or series, with
+/// their bars and rows as [`run_with_references`] takes them: the fingerprint that run would
+/// record.
 pub fn config_fingerprint_with_references(
     config: &BacktestConfig,
     bars: &[Candle],
     asks: &[Candle],
     funding: &[(Millis, f64)],
     references: &[ReferenceBars],
+    series: &[Series],
 ) -> Result<String, EngineError> {
     let (warmup, traded) = select_bars(config, bars)?;
     let references = align_used(config, &warmup, &traded, references)?;
+    let named = named_series(config, &warmup, &traded, series)?;
+    let last_close = traded.last().map_or(0, |b| b.open_time) + config.timeframe.duration_ms();
+    let known = known_series(&named, last_close);
     let mut used_asks = match_asks(config.instrument.id.kind, bars, asks, &warmup)?;
     used_asks.extend(match_asks(config.instrument.id.kind, bars, asks, &traded)?);
     let funding = sorted_funding(funding);
@@ -730,7 +809,13 @@ pub fn config_fingerprint_with_references(
     // No session runs here to check the traded bars' asks, so every ask is checked.
     check_quotes(&used, &used_asks)?;
     let used_asks: Vec<Candle> = used_asks.into_iter().flatten().collect();
-    Ok(fingerprint(&used, &used_asks, &funding[seen], &references))
+    Ok(fingerprint(
+        &used,
+        &used_asks,
+        &funding[seen],
+        &references,
+        &known,
+    ))
 }
 
 /// Runs a saved result's configuration again on `bars`, `asks` and `funding`, as [`run`] takes
@@ -979,18 +1064,23 @@ fn annualised_alpha_beta(times: &[Millis], returns: &(Vec<f64>, Vec<f64>)) -> Op
 /// count and each ask in the same form as a bar follow. Without asks nothing is added, so a
 /// fingerprint from before asks existed is unchanged.
 pub fn data_fingerprint(bars: &[Candle], asks: &[Candle], funding: &[(Millis, f64)]) -> String {
-    fingerprint(bars, asks, funding, &[])
+    fingerprint(bars, asks, funding, &[], &[])
 }
 
 /// [`data_fingerprint`], followed, when a run names reference instruments, by each one's id as
 /// `venue:symbol:kind` (its byte length as a little-endian u64, then its UTF-8 bytes), its slot
 /// count, and per slot a 0 byte for a missing bar or a 1 byte and the bar in the form above.
-/// Without references nothing is added, so a fingerprint is what it was before they existed.
+/// Then, when a run names series, the bytes `series`, their count, and per series its name in the
+/// form of an id, its row count and per row its `known_at`, the bits of its value, and a 0 byte
+/// for no period or a 1 byte and the period: the rows the run could read, those known by its last
+/// bar's close. Without references or series nothing is added, so a fingerprint is what it was
+/// before they existed.
 fn fingerprint(
     bars: &[Candle],
     asks: &[Candle],
     funding: &[(Millis, f64)],
     references: &[(InstrumentId, Vec<Option<Candle>>)],
+    series: &[(&str, &[SeriesRow])],
 ) -> String {
     let mut h = Sha256::new();
     let candle = |h: &mut Sha256, b: &Candle| {
@@ -1024,6 +1114,26 @@ fn fingerprint(
                 Some(b) => {
                     h.update([1u8]);
                     candle(&mut h, b);
+                }
+                None => h.update([0u8]),
+            }
+        }
+    }
+    if !series.is_empty() {
+        h.update(b"series");
+        h.update((series.len() as u64).to_le_bytes());
+    }
+    for (name, rows) in series {
+        h.update((name.len() as u64).to_le_bytes());
+        h.update(name.as_bytes());
+        h.update((rows.len() as u64).to_le_bytes());
+        for row in *rows {
+            h.update(row.known_at.to_le_bytes());
+            h.update(row.value.to_bits().to_le_bytes());
+            match row.period {
+                Some(p) => {
+                    h.update([1u8]);
+                    h.update(p.to_le_bytes());
                 }
                 None => h.update([0u8]),
             }
@@ -1094,11 +1204,12 @@ mod tests {
             close_at_end: true,
             account_currency: AccountCurrency::Quote,
             references: Vec::new(),
+            series: Vec::new(),
         };
         let full = run(&config, &bars, &[], &funding).unwrap();
         assert!(full.metrics.trades > 2, "{:?}", full.metrics);
         assert_eq!(
-            run_metrics(&config, &bars, &[], &funding, &[]).unwrap(),
+            run_metrics(&config, &bars, &[], &funding, &[], &[]).unwrap(),
             full.metrics
         );
 
@@ -1110,7 +1221,7 @@ mod tests {
             "{refused:?}"
         );
         assert_eq!(
-            run_metrics(&config, &bars, &[], &funding, &[])
+            run_metrics(&config, &bars, &[], &funding, &[], &[])
                 .unwrap_err()
                 .to_string(),
             refused.to_string()
@@ -1179,6 +1290,7 @@ mod tests {
             close_at_end: false,
             account_currency: AccountCurrency::Quote,
             references: Vec::new(),
+            series: Vec::new(),
         };
         let seen = FundingSeen::default();
         let strategy = Box::new(SeesFunding(seen.clone()));
@@ -1336,6 +1448,7 @@ mod tests {
                     close_at_end: false,
                     account_currency: AccountCurrency::Quote,
                     references: Vec::new(),
+                    series: Vec::new(),
                 },
                 axes: Vec::new(),
                 mode: SweepMode::Grid,

@@ -88,8 +88,8 @@ use crate::verdict::{
 use crate::{
     BacktestConfig, BacktestResult, Criterion, Direction, DrawdownMode, EngineError, EquityPoint,
     EvidenceInputs, Headline, KindInputs, MAX_RUNS, Objective, Order, Outcome, Params,
-    PermutationResult, PermutationSpec, PortfolioBenchmark, Progress, SweepResult, SweepSpec,
-    TestPlan, TesterError, Trade, TradeSide, Verdict, VerdictRule, WalkForwardResult,
+    PermutationResult, PermutationSpec, PortfolioBenchmark, Progress, Series, SweepResult,
+    SweepSpec, TestPlan, TesterError, Trade, TradeSide, Verdict, VerdictRule, WalkForwardResult,
     WalkForwardSpec, combine, evaluate, evaluate_evidence, permutation_test_with_references,
     run_with_references, sweep_with_references, walk_forward_with_references,
 };
@@ -378,20 +378,23 @@ pub fn run_battery(
     funding: &[(Millis, f64)],
     progress: Option<Progress>,
 ) -> Result<BatteryResult, TesterError> {
-    run_battery_with_references(spec, bars, asks, funding, &[], progress)
+    run_battery_with_references(spec, bars, asks, funding, &[], &[], progress)
 }
 
-/// [`run_battery`] with reference instruments: the plan's runs name each of `references`, in
-/// this order ([`crate::BacktestConfig::references`]), and every run, sweep, walk-forward and
-/// luck test is given their bars, as [`crate::run_with_references`] takes them. The luck test
-/// shuffles the traded bars and the reference bars with one permutation
-/// ([`crate::permutation_test_with_references`]); R4 widens the traded instrument's spread only.
+/// [`run_battery`] with reference instruments and series: the plan's runs name each of
+/// `references` and each of `series`, in these orders ([`crate::BacktestConfig::references`],
+/// [`crate::BacktestConfig::series`]), and every run, sweep, walk-forward and luck test is given
+/// their bars and rows, as [`crate::run_with_references`] takes them. The luck test shuffles the
+/// traded bars and the reference bars with one permutation and leaves each series in place in
+/// time ([`crate::permutation_test_with_references`]); R4 widens the traded instrument's spread
+/// only.
 pub fn run_battery_with_references(
     spec: &BatterySpec,
     bars: &[Candle],
     asks: &[Candle],
     funding: &[(Millis, f64)],
     references: &[ReferenceBars],
+    series: &[Series],
     progress: Option<Progress>,
 ) -> Result<BatteryResult, TesterError> {
     let BatterySpec {
@@ -411,12 +414,16 @@ pub fn run_battery_with_references(
     rule.validate()
         .map_err(|e| TesterError::InvalidSpec(e.to_string()))?;
     let names: Vec<_> = references.iter().map(|r| r.instrument.clone()).collect();
+    let series_names: Vec<_> = series.iter().map(|s| s.name.clone()).collect();
     let mut base = plan.backtest_config(strategy, instrument.clone());
     base.references.clone_from(&names);
+    base.series.clone_from(&series_names);
     let mut sweep_spec = plan.sweep_spec(strategy, instrument.clone());
     sweep_spec.base.references.clone_from(&names);
+    sweep_spec.base.series.clone_from(&series_names);
     let mut wf_spec = plan.walk_forward_spec(strategy, instrument.clone());
     wf_spec.sweep.base.references = names;
+    wf_spec.sweep.base.series = series_names;
     wf_spec.check()?;
     let ev = &plan.evidence;
     check_start_offsets(wf_spec.windows.test_bars, ev.start_offsets)
@@ -443,7 +450,7 @@ pub fn run_battery_with_references(
     // 1. Integrity: I1 to I3.
     let (open_buckets, dropped_buckets) = bucket_counts(&base, &traded);
     let split = (traded.len() >= 2).then(|| traded[traded.len() / 2].open_time);
-    let data = (bars, asks, funding, references);
+    let data = (bars, asks, funding, references, series);
     let base_checks = repeat_and_prefix(&base, data, split, &mut meter)?;
     let mut integrity_inputs = IntegrityInputs {
         dropped_share: (open_buckets > 0).then(|| dropped_buckets as f64 / open_buckets as f64),
@@ -494,6 +501,7 @@ pub fn run_battery_with_references(
         asks,
         funding,
         references,
+        series,
         Some(&meter.step()),
     )?;
     meter.base += per_sweep;
@@ -512,6 +520,7 @@ pub fn run_battery_with_references(
             asks,
             funding,
             references,
+            series,
             Some(&meter.step()),
         ) {
             Ok(wf) => (Some(wf), None),
@@ -590,7 +599,7 @@ pub fn run_battery_with_references(
                 .iter()
                 .map(|w| {
                     let config = &w.out_of_sample.config;
-                    runner::run_exposures(config, bars, asks, funding, references)
+                    runner::run_exposures(config, bars, asks, funding, references, series)
                 })
                 .collect::<Result<Vec<_>, _>>()?,
         ),
@@ -613,7 +622,7 @@ pub fn run_battery_with_references(
                         ..w.out_of_sample.config.clone()
                     };
                     // A set the strategy refuses is left out, as a sweep leaves its row unranked.
-                    match run_with_references(&config, bars, asks, funding, references) {
+                    match run_with_references(&config, bars, asks, funding, references, series) {
                         Ok(r) => window.push((steps, r)),
                         Err(EngineError::InvalidParam { .. }) => {}
                         Err(e) => return Err(e.into()),
@@ -916,7 +925,8 @@ pub fn run_battery_with_references(
                 slippage_bps: w.out_of_sample.config.slippage_bps * ev.cost_stress,
                 ..w.out_of_sample.config.clone()
             };
-            let r = run_with_references(&config, bars, &stressed_asks, funding, references)?;
+            let r =
+                run_with_references(&config, bars, &stressed_asks, funding, references, series)?;
             meter.tick()?;
             let end = r.equity.last().map(|p| p.equity);
             window_returns.push(end.map_or(1.0, |e| e / cash) - 1.0);
@@ -952,6 +962,7 @@ pub fn run_battery_with_references(
                     asks,
                     funding,
                     references,
+                    series,
                     Some(&meter.step()),
                 ) {
                     Ok(r) => offset.oos_return = as_judged(&r, sizing, None).metrics.total_return,
@@ -986,6 +997,7 @@ pub fn run_battery_with_references(
             asks,
             funding,
             references,
+            series,
             Some(&meter.step()),
         ) {
             Ok(p) => {
@@ -1334,25 +1346,26 @@ fn stressed_total_return(cash: f64, ends: &[Option<f64>], fixed_size: bool) -> f
     level.max(0.0) - 1.0
 }
 
-/// The data a battery's runs are given: bars, asks, funding and reference bars.
+/// The data a battery's runs are given: bars, asks, funding, reference bars and series.
 type BatteryData<'a> = (
     &'a [Candle],
     &'a [Candle],
     &'a [(Millis, f64)],
     &'a [ReferenceBars],
+    &'a [Series],
 );
 
 /// I2 and I3 on one backtest, in three counted runs: the backtest twice, then once on the bars
 /// before `split` alone. Returns I2's and I3's differences; I3's is `None` without a split.
 fn repeat_and_prefix(
     config: &BacktestConfig,
-    (bars, asks, funding, references): BatteryData,
+    (bars, asks, funding, references, series): BatteryData,
     split: Option<Millis>,
     meter: &mut Meter,
 ) -> Result<(usize, Option<usize>), TesterError> {
-    let first = run_with_references(config, bars, asks, funding, references)?;
+    let first = run_with_references(config, bars, asks, funding, references, series)?;
     meter.tick()?;
-    let again = run_with_references(config, bars, asks, funding, references)?;
+    let again = run_with_references(config, bars, asks, funding, references, series)?;
     meter.tick()?;
     let prefix = match split {
         Some(at) => {
@@ -1365,6 +1378,7 @@ fn repeat_and_prefix(
                 asks,
                 funding,
                 references,
+                series,
             )?;
             Some(prefix_differences(&first.orders, &half.orders, at))
         }
@@ -2041,6 +2055,7 @@ mod tests {
             close_at_end: false,
             account_currency: td_core::AccountCurrency::Quote,
             references: Vec::new(),
+            series: Vec::new(),
         }
     }
 
@@ -3684,7 +3699,7 @@ mod tests {
         for w in &wf.windows {
             assert!(fixed > 0.0);
             let r = &w.out_of_sample;
-            let held = crate::runner::run_exposures(&r.config, &bars, &[], &[], &[]).unwrap();
+            let held = crate::runner::run_exposures(&r.config, &bars, &[], &[], &[], &[]).unwrap();
             largest = held.iter().map(|x| x.notional).fold(largest, f64::max);
             leverage = held
                 .iter()
@@ -4022,7 +4037,7 @@ mod tests {
         for (o, f) in on.start_offsets.iter().zip(&off.start_offsets) {
             let mut spec = plan.walk_forward_spec("sma_cross", test_instrument());
             spec.sweep.base.to = traded[traded.len() - o.shift_bars].open_time;
-            let Ok(r) = walk_forward_with_references(&spec, &bars, &[], &[], &[], None) else {
+            let Ok(r) = walk_forward_with_references(&spec, &bars, &[], &[], &[], &[], None) else {
                 assert!(o.error.is_some() && f.error.is_some(), "{o:?}");
                 continue;
             };
@@ -4172,7 +4187,7 @@ mod tests {
     fn sma_walk_forward() -> crate::WalkForwardResult {
         let (plan, bars) = sma_plan(sma_axes());
         let spec = plan.walk_forward_spec("sma_cross", test_instrument());
-        let wf = walk_forward_with_references(&spec, &bars, &[], &[], &[], None).unwrap();
+        let wf = walk_forward_with_references(&spec, &bars, &[], &[], &[], &[], None).unwrap();
         assert_eq!(wf.spec.sweep.base.starting_cash, 10_000.0);
         wf
     }

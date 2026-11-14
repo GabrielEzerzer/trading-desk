@@ -1,6 +1,8 @@
 [workspace]
 resolver = "3"
 members = ["crates/*", "mock/*"]
+# Series fixtures, a data folder for the series reader's tests, not a crate.
+exclude = ["mock/series"]
 
 [workspace.package]
 version = "0.1.0"

@@ -82,6 +82,9 @@ pub struct VerdictRecord {
     /// The reference instruments the battery's runs named; empty, and left out, when none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub references: Vec<InstrumentId>,
+    /// The series the battery's runs named; empty, and left out, when none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub series: Vec<String>,
 }
 
 /// One row of `GET /verdicts`: the latest verdict of a strategy on an instrument, the newest
@@ -132,6 +135,10 @@ pub struct VerdictSummary {
     /// references and one without share a row, the newer winning as above.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub references: Vec<InstrumentId>,
+    /// The series the battery's runs named; left out when none. A paper or live session refuses to
+    /// start from a verdict with series.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub series: Vec<String>,
 }
 
 /// A plan run's `config.json`, enough to tell it from the other kinds' without reading the result.
@@ -165,6 +172,8 @@ struct ConfigHead {
     instrument: InstrumentHead,
     #[serde(default)]
     references: Vec<InstrumentId>,
+    #[serde(default)]
+    series: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -219,6 +228,7 @@ pub fn read_record(dir: &Path) -> Option<VerdictRecord> {
             .and_then(|bytes| serde_json::from_slice::<RecordHead>(&bytes).ok())
             .and_then(|r| r.code_hash),
         references: run.config.references,
+        series: run.config.series,
     })
 }
 
@@ -355,6 +365,7 @@ pub fn latest_verdicts(
             runs,
             code_versions: 0,
             references: record.references,
+            series: record.series,
         };
         // A complete run beats an incomplete one; between two of the same, the newer wins.
         match latest.get_mut(&key) {
@@ -501,11 +512,16 @@ impl LinkState {
 /// `references` are the reference instruments the session feeds its strategy, in any order.
 ///
 /// [`VerdictError::Invalid`] for a run that is not a saved verdict of this strategy on this
-/// instrument, or one judged with other reference instruments than the session feeds: it would be
-/// a different test from the one the verdict judged. The message names the instruments the session
-/// is missing, or feeds beyond the verdict's. That holds for the latest verdict too, so such a
-/// session does not start unless the caller names a matching verdict; `name_one` says how, as in
-/// "name a verdict judged with the same ones {name_one}".
+/// instrument, one judged with a series ([`crate::BacktestConfig::series`]), or one judged with
+/// other reference instruments than the session feeds: it would be a different test from the one
+/// the verdict judged. The message names the instruments the session is missing, or feeds beyond
+/// the verdict's. That holds for the latest verdict too, so such a session does not start unless
+/// the caller names a matching verdict; `name_one` says how, as in "name a verdict judged with the
+/// same ones {name_one}".
+///
+/// shortcut: no session feeds a series yet, so a verdict judged with one is always refused; feed
+/// the series' rows by their `known_at` in paper and live sessions when a strategy that reads one
+/// is traded.
 ///
 /// `verdict` is checked with [`RunId::parse`] before it is joined to `runs_dir`, since it names a
 /// path and may come from outside.
@@ -519,6 +535,14 @@ pub fn session_link(
 ) -> Result<SessionLink, VerdictError> {
     let bad = VerdictError::Invalid;
     let mismatch = |id: &RunId, judged: &[InstrumentId]| references_differ(id, judged, references);
+    let judged_with_series = |id: &RunId, series: &[String]| {
+        (!series.is_empty()).then(|| {
+            format!(
+                "run {id} was judged with the series {}, and a session cannot feed a series yet",
+                series.join(", ")
+            )
+        })
+    };
     let record = match verdict {
         Some(id) => {
             let checked = RunId::parse(id).map_err(|_| bad(format!("{id:?} is not a run id")))?;
@@ -529,6 +553,9 @@ pub fn session_link(
                     "run {id} is the verdict of {} on {}, not of {} on {instrument}",
                     record.strategy, record.instrument, entry.name
                 )));
+            }
+            if let Some(why) = judged_with_series(&checked, &record.series) {
+                return Err(bad(why));
             }
             if let Some(why) = mismatch(&checked, &record.references) {
                 return Err(bad(why));
@@ -553,16 +580,27 @@ pub fn session_link(
                     "{why}; it is the strategy's latest verdict on {instrument}, so {instead}"
                 ))
             };
+            let series_refused = |why: String| {
+                bad(format!(
+                    "{why}; it is the strategy's latest verdict on {instrument}, so name a verdict judged without series {name_one}, or run a test without them first"
+                ))
+            };
             match latest {
                 // Judged from the row, so a record that cannot be read again does not let the
                 // session start unlinked.
                 Some(row) => {
+                    if let Some(why) = judged_with_series(&row.run_id, &row.series) {
+                        return Err(series_refused(why));
+                    }
                     if let Some(why) = mismatch(&row.run_id, &row.references) {
                         return Err(latest_refused(why));
                     }
                     // And from the record read again, which may have been rewritten since.
                     match read_record(&runs_dir.join(row.run_id.as_str())) {
                         Some(record) => {
+                            if let Some(why) = judged_with_series(&row.run_id, &record.series) {
+                                return Err(series_refused(why));
+                            }
                             if let Some(why) = mismatch(&row.run_id, &record.references) {
                                 return Err(latest_refused(why));
                             }

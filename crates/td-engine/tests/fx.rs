@@ -920,6 +920,7 @@ fn fx_backtest(bars: usize) -> td_engine::BacktestConfig {
         close_at_end: false,
         account_currency: td_core::AccountCurrency::Quote,
         references: Vec::new(),
+        series: Vec::new(),
     }
 }
 

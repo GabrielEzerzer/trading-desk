@@ -20,7 +20,13 @@ use crate::{
 };
 
 pub(crate) fn entries() -> Vec<StrategyEntry> {
-    vec![unrepeatable(), one_hour(), tells_funding(), rests_limits()]
+    vec![
+        unrepeatable(),
+        one_hour(),
+        tells_funding(),
+        rests_limits(),
+        example_series(),
+    ]
 }
 
 /// How many `Unrepeatable` strategies have been built in this process.
@@ -260,6 +266,84 @@ impl Strategy for RestsLimits {
                 OrderType::Limit { price },
                 true,
             )
+        };
+        let _ = ctx.submit(request);
+    }
+}
+
+/// The series [`ExampleSeries`] reads. Its made-up rows are in `mock/series/example_series.json`.
+pub(crate) const EXAMPLE_SERIES: &str = "example_series";
+
+/// Reads the series [`EXAMPLE_SERIES`]: long with its cash while the series' latest known value is
+/// above `level`, flat otherwise. It fails the run when the series is not given, or when it is shown a
+/// row known after the close of the bar it is deciding on, so a test reads from a run that
+/// completes that it was fed the series and shown only what was known.
+pub struct ExampleSeries {
+    level: f64,
+}
+
+fn example_series() -> StrategyEntry {
+    let mut plan = plan();
+    plan.sweep.axes = vec![ParamAxis {
+        name: "level".into(),
+        space: ParamSpace::Range {
+            from: 40.0,
+            to: 60.0,
+            step: 10.0,
+        },
+    }];
+    StrategyEntry {
+        name: "example_series",
+        description: "Long while the series example_series is above a level.",
+        params: vec![ParamSpec {
+            name: "level",
+            kind: ParamKind::Float,
+            default: ParamValue::Float(50.0),
+            min: None,
+            max: None,
+            description: "The value above which it is long.",
+        }],
+        build: |p| {
+            Ok(Box::new(ExampleSeries {
+                level: p.float("level")?,
+            }))
+        },
+        plan,
+        rule: VerdictRule::Portfolio {
+            benchmark: PortfolioBenchmark::Cash,
+            limits: PortfolioLimits::default(),
+        },
+    }
+}
+
+impl Strategy for ExampleSeries {
+    fn on_bar(&mut self, ctx: &mut Context, bar: &Candle) {
+        let close = bar.open_time + ctx.timeframe().duration_ms();
+        let Some(rows) = ctx.series(EXAMPLE_SERIES) else {
+            ctx.fail(format!("no series {EXAMPLE_SERIES}"));
+            return;
+        };
+        let Some(latest) = rows.last().copied() else {
+            return;
+        };
+        if latest.known_at > close {
+            ctx.fail(format!(
+                "shown a row known at {} on the bar closing at {close}",
+                latest.known_at
+            ));
+            return;
+        }
+        if ctx.is_warming_up() {
+            return;
+        }
+        let position = ctx.position();
+        let request = if position == 0.0 && latest.value > self.level {
+            let qty = affordable_qty(ctx, ctx.cash(), bar.close);
+            order(ctx, Side::Buy, qty, OrderType::Market, false)
+        } else if position > 0.0 && latest.value <= self.level {
+            order(ctx, Side::Sell, position, OrderType::Market, true)
+        } else {
+            return;
         };
         let _ = ctx.submit(request);
     }

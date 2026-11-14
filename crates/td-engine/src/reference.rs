@@ -282,6 +282,7 @@ pub(crate) mod tests {
             close_at_end: false,
             account_currency: AccountCurrency::Quote,
             references,
+            series: Vec::new(),
         }
     }
 
@@ -341,7 +342,7 @@ pub(crate) mod tests {
             reference,
             seen: seen.clone(),
         };
-        let result = run_built(config, &own_bars(), &[], &[], given, || {
+        let result = run_built(config, &own_bars(), &[], &[], given, &[], || {
             Ok(Box::new(strategy))
         })?;
         let seen = seen.lock().unwrap().clone();
@@ -413,7 +414,7 @@ pub(crate) mod tests {
             }
         }
         let config = config(vec![id("OTHERUSDT")]);
-        let result = run_built(&config, &own_bars(), &[], &[], &given(), || {
+        let result = run_built(&config, &own_bars(), &[], &[], &given(), &[], || {
             Ok(Box::new(OrdersTheReference { sent: false }))
         })
         .unwrap();
@@ -468,8 +469,15 @@ pub(crate) mod tests {
         let config = config(vec![id("OTHERUSDT")]);
         let (result, _) = backtest(&config, &given(), id("OTHERUSDT")).unwrap();
         let fingerprint = |given: &[ReferenceBars]| -> String {
-            crate::runner::config_fingerprint_with_references(&config, &own_bars(), &[], &[], given)
-                .unwrap()
+            crate::runner::config_fingerprint_with_references(
+                &config,
+                &own_bars(),
+                &[],
+                &[],
+                given,
+                &[],
+            )
+            .unwrap()
         };
         assert_eq!(fingerprint(&given()), result.data_fingerprint);
         assert_ne!(
@@ -502,6 +510,7 @@ pub(crate) mod tests {
             &[],
             &[],
             given,
+            &[],
         ) {
             Err(EngineError::InvalidReferences(why)) => why,
             other => panic!("{other:?}"),
@@ -533,7 +542,7 @@ pub(crate) mod tests {
         let mut invalid = given();
         invalid[0].bars[1].high = 1.0;
         assert!(matches!(
-            run_with_references(&named, &own_bars(), &[], &[], &invalid),
+            run_with_references(&named, &own_bars(), &[], &[], &invalid, &[]),
             Err(EngineError::Core(_))
         ));
     }
@@ -759,7 +768,7 @@ pub(crate) mod tests {
         let refs = tester_reference();
         let spec = sweep_spec(0, 60 * HOUR);
 
-        let swept = crate::sweep_with_references(&spec, &bars, &[], &[], &refs, None).unwrap();
+        let swept = crate::sweep_with_references(&spec, &bars, &[], &[], &refs, &[], None).unwrap();
         let best = swept.best.expect("one qualifying run");
         let last = best.orders.last().unwrap();
         assert_eq!(
@@ -775,7 +784,7 @@ pub(crate) mod tests {
             sweep: spec.clone(),
             split: crate::Split::At(40 * HOUR),
         };
-        let split = crate::out_of_sample_with_references(&oos, &bars, &[], &[], &refs, None);
+        let split = crate::out_of_sample_with_references(&oos, &bars, &[], &[], &refs, &[], None);
         let out = split.unwrap().out_of_sample;
         // The out-of-sample run is warmed up on the in-sample bars, and sees their reference
         // bars from its first bar on.
@@ -797,7 +806,7 @@ pub(crate) mod tests {
             },
         };
         let result =
-            crate::walk_forward_with_references(&wf, &bars, &[], &[], &refs, None).unwrap();
+            crate::walk_forward_with_references(&wf, &bars, &[], &[], &refs, &[], None).unwrap();
         assert_eq!(result.windows.len(), 3);
         for w in &result.windows {
             let first = &w.out_of_sample.orders[0];
@@ -830,7 +839,8 @@ pub(crate) mod tests {
             seed: 11,
         };
         let result =
-            crate::permutation_test_with_references(&spec, &bars, &[], &[], &same, None).unwrap();
+            crate::permutation_test_with_references(&spec, &bars, &[], &[], &same, &[], None)
+                .unwrap();
         for (k, got) in result.permuted_best.iter().enumerate() {
             let seed = crate::rng::derive_seed(spec.seed, k as u64);
             let copy = crate::permute_bars(&bars, seed).unwrap();
@@ -838,7 +848,7 @@ pub(crate) mod tests {
                 instrument: id("OTHERUSDT"),
                 bars: copy.clone(),
             }];
-            let want = run_with_references(&spec.sweep.base, &copy, &[], &[], &copy_refs)
+            let want = run_with_references(&spec.sweep.base, &copy, &[], &[], &copy_refs, &[])
                 .unwrap()
                 .metrics
                 .total_return;
@@ -884,7 +894,8 @@ pub(crate) mod tests {
             seed: 5,
         };
         let battery =
-            crate::run_battery_with_references(&spec, &four_hours, &[], &[], &refs, None).unwrap();
+            crate::run_battery_with_references(&spec, &four_hours, &[], &[], &refs, &[], None)
+                .unwrap();
         assert!(
             battery.walk_forward.is_some(),
             "{:?}",
@@ -897,7 +908,8 @@ pub(crate) mod tests {
         let base = &battery.walk_forward.as_ref().unwrap().spec.sweep.base;
         assert_eq!(base.references, vec![id("OTHERUSDT")]);
         let record =
-            crate::PlanRun::with_references(&spec, battery, &four_hours, &[], &[], &refs).unwrap();
+            crate::PlanRun::with_references(&spec, battery, &four_hours, &[], &[], &refs, &[])
+                .unwrap();
         assert_eq!(record.config.references, vec![id("OTHERUSDT")]);
         assert_eq!(
             record.data_fingerprint,
@@ -906,7 +918,8 @@ pub(crate) mod tests {
                 &four_hours,
                 &[],
                 &[],
-                &refs
+                &refs,
+                &[]
             )
             .unwrap()
         );
