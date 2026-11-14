@@ -207,9 +207,11 @@ struct Tracked {
     /// outcome was unknown, or an entry's stop sent with an unknown outcome
     /// ([`At::Unsettled`]), from when going live starts until the venue settles it. An entry is
     /// settled once the venue shows it or two looks find nothing (it is then refused); a stop
-    /// only once the venue shows it, since not finding it does not show that it never rested.
-    /// While any order is carried, no close at market goes out (`Core::restart_unresolved`). A
-    /// record made before this field existed loads it as false.
+    /// once the venue shows it, or once its entry closes unfilled and the venue shows the stop
+    /// neither resting nor filled (it is then dropped). While its entry may still fill, not
+    /// finding the stop does not show that it never rested. While any order is carried, no
+    /// close at market goes out (`Core::restart_unresolved`). A record made before this field
+    /// existed loads it as false.
     #[serde(default)]
     carried: bool,
 }
@@ -233,7 +235,8 @@ enum At {
     /// An entry's attached stop sent under its `o` id whose outcome is unknown: it may rest. On
     /// the first fill the venue confirms, the venue is asked about it before anything else goes
     /// out for the fill (`Core::settle_stop`); going live after a restart asks at once, and keeps
-    /// it unsettled when the venue does not show it.
+    /// it unsettled when the venue does not show it. When the entry closes unfilled, the venue
+    /// is asked about it before the close is taken (`Core::unsettled_at_venue`).
     Unsettled,
     /// An entry's attached stop at the venue under its `s` id.
     Cover,
@@ -1172,6 +1175,10 @@ impl Core {
                 t.at = At::Cover;
                 t.sent = qty;
                 t.order.request.qty = qty;
+                // It now stands for the cover, which the venue took, so it is no longer carried
+                // over a restart. The `o` stop's outcome stays unknown, and the fault raised
+                // below, before anything else is sent, says so and stops every close at market.
+                t.carried = false;
                 format!(
                     "the fill of {qty} is covered by {cover}, and {cid} may also rest at the venue"
                 )
@@ -1841,10 +1848,16 @@ impl Core {
             };
             // Its attached stop goes with it. One already placed because the entry's fill could
             // not be confirmed must not rest without a position; one whose placement did not
-            // rest is owed nothing.
+            // rest is owed nothing; one whose placement's outcome is unknown is asked about first.
             if let Some(s) = attached {
                 match self.book.orders.get(&s.id.0) {
                     Some(t) if t.at == At::Unplaced => {
+                        self.book.orders.remove(&s.id.0);
+                    }
+                    Some(t) if t.at == At::Unsettled => {
+                        if let Some(problem) = self.unsettled_at_venue(s.id, &cid, &status, open) {
+                            return Ok(Some(problem));
+                        }
                         self.book.orders.remove(&s.id.0);
                     }
                     Some(t) => {
@@ -1873,6 +1886,57 @@ impl Core {
         Ok(self
             .position_check(position, self.book.tally)
             .or_else(|| self.uncovered(open, position, self.book.owed)))
+    }
+
+    /// Entry `cid` closed with nothing filled (`status`) while its attached stop `stop` was sent
+    /// under its `o` id with an unknown outcome. The venue is asked about the stop before the
+    /// close is taken as ordinary: the fault when `open`, the venue's open orders, lists it, its
+    /// lookup shows it open or filled, or the venue cannot be asked; `None` when the lookup shows
+    /// it closed with nothing filled or two looks find nothing.
+    ///
+    /// Finding nothing is enough here, unlike for a fill (`Core::settle_stop`): nothing goes out
+    /// on it, and a stop that rests after all is listed as an open order this session does not
+    /// hold, or fills under an id it no longer tracks, and either faults the broker.
+    fn unsettled_at_venue(
+        &self,
+        stop: OrderId,
+        cid: &ClientOrderId,
+        status: &str,
+        open: &[VenueOrder],
+    ) -> Option<(FaultKind, String)> {
+        let scid = self.id(Role::Order, stop);
+        let found = match open.iter().find(|o| o.client_id == scid.as_str()) {
+            Some(listed) => listed.clone(),
+            None => match self.find(stop) {
+                Ok(found) => found?,
+                Err(e) => {
+                    return Some((
+                        FaultKind::UnresolvedOrder,
+                        format!(
+                            "entry {cid} closed unfilled ({status}), and whether its stop {scid}, \
+                             sent with an unknown outcome, rests at the venue could not be read \
+                             ({}), so it may rest at the venue",
+                            venue_text(&e)
+                        ),
+                    ));
+                }
+            },
+        };
+        let left = if found.status.is_open() {
+            "rests"
+        } else if found.filled_qty > self.half_lot() {
+            "filled"
+        } else {
+            return None;
+        };
+        Some((
+            FaultKind::UnknownOpenOrder,
+            format!(
+                "entry {cid} closed unfilled ({status}) while its stop {scid}, sent with an unknown \
+                 outcome, {left} at the venue: {}",
+                describe(&found)
+            ),
+        ))
     }
 
     /// How venue order `o`, open under `t`'s id, differs from what the session holds, if it
@@ -2395,9 +2459,10 @@ impl Core {
         // and carried: not finding it does not show that it never rested. The entry's first
         // confirmed fill then asks again (`Core::settle_stop`), and while the stop is carried a
         // cover the venue refuses closes nothing.
-        // shortcut: a carried stop whose entry never fills is never asked about again, so it
-        // stays carried and no close at market goes out for the rest of the session. Ask about it
-        // on each bar's reads, as for an entry of unknown outcome, if that matters in practice.
+        // shortcut: a carried stop whose entry rests unfilled is not asked about again until the
+        // entry fills or closes, so it stays carried and no close at market goes out meanwhile.
+        // Ask about it on each bar's reads, as for an entry of unknown outcome, if that matters
+        // in practice.
         for (entry, id) in unsettled {
             if let Ok(Some(found)) = self.find(id) {
                 self.take_stop(entry, Role::Order, &found);
@@ -2411,8 +2476,8 @@ impl Core {
 
     /// The reconcile at the end of a replay: the venue's open orders must be the session's, its
     /// position the recorded fills plus this session's executions not yet reported, and the
-    /// quantity the session owes a stop for, less what a stop it cancelled had not filled,
-    /// covered by its stops resting at the venue.
+    /// quantity the session owes a stop for, less what a stop it cancelled had not filled once a
+    /// lookup by id shows that stop closed, covered by its stops resting at the venue.
     fn verify(&mut self) -> Result<(), RouteError> {
         let executions = self.client.executions_since(
             &self.instrument,
@@ -2442,14 +2507,22 @@ impl Core {
         let position = self.client.position(&self.instrument)?.size;
         // A stop the session cancelled before the restart is no longer owed for what it did not
         // fill, as on a bar's reconcile. The record cannot take that off when the cancel is
-        // confirmed: what the stop filled before the cancel took may only be read here.
+        // confirmed: what the stop filled before the cancel took may only be read here. Missing
+        // from the open orders is not enough, since a list that lags can leave out a stop that
+        // still rests: as on a bar's reconcile, only a lookup by id that shows it closed counts.
         for t in self.book.orders.values() {
-            let listed = open
-                .iter()
-                .any(|o| o.client_id == self.venue_id(t).as_str());
-            if matches!(t.at, At::Live | At::Cover) && !listed {
-                let done = t.reported + filled.get(&t.order.id.0).copied().unwrap_or(0.0);
-                owed = (owed - released(t, done)).max(0.0);
+            let cid = self.venue_id(t);
+            let done = t.reported + filled.get(&t.order.id.0).copied().unwrap_or(0.0);
+            if !matches!(t.at, At::Live | At::Cover)
+                || released(t, done) <= 0.0
+                || open.iter().any(|o| o.client_id == cid.as_str())
+            {
+                continue;
+            }
+            if let Some(found) = self.client.order_by_client_id(&self.instrument, &cid)?
+                && !found.status.is_open()
+            {
+                owed = (owed - released(t, done.max(found.filled_qty))).max(0.0);
             }
         }
         if let Some((kind, message)) = self

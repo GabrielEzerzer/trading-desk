@@ -2399,6 +2399,12 @@ fn going_live_keeps_a_stop_of_unknown_outcome_it_finds_and_leaves_one_it_does_no
         let (mut session, handle) = replayed(&rig, &records);
         handle.go_live().unwrap();
         session.on_bar(rig.candle(1, PRICE), &[]).unwrap();
+        // Settled either way: the stop is taken as it rests, or now stands for its cover.
+        let record = serde_json::to_value(handle.take_record()).unwrap();
+        assert_eq!(
+            record["book"]["orders"]["2"]["carried"], false,
+            "kept {kept}: {record}"
+        );
         if kept {
             assert_eq!(handle.fault(), None);
         } else {
@@ -2566,5 +2572,256 @@ fn after_a_restart_an_entrys_stop_the_venue_closed_unfilled_is_replaced_under_th
         assert_eq!(handle.fault(), None, "hidden {hidden}");
         assert_eq!(session.orders()[1].status, OrderStatus::Open);
         assert_eq!(session.orders()[1].request.qty, 0.004);
+    }
+}
+
+/// A live run of one bar whose entry with a stop rests unfilled and unconfirmed while its stop's
+/// create is lost with `lost`, so the stop's outcome is unknown, with `acts` after it; the venue
+/// then closes the entry unfilled. Returns the rig and the bar's record.
+fn entry_closed_unfilled_with_unsettled_stop(
+    lost: Fault,
+    acts: Vec<(usize, Act)>,
+) -> (Rig, Vec<String>) {
+    let mock = venue();
+    let lose = blind_and_lose_the_stop(&mock, lost);
+    mock.cap_next_fill(0.0);
+    let mut all = vec![
+        (0, lose),
+        (
+            0,
+            Act::SubmitWithStop(market(Side::Buy, 0.004, false), 60000.0),
+        ),
+    ];
+    all.extend(acts);
+    let mut rig = Rig::with(mock, all);
+    let records = run_recorded(&mut rig, 1);
+    rig.mock.clear_faults();
+    assert!(records[0].contains("\"Unsettled\""), "{}", records[0]);
+    assert_eq!(rig.mock.orders_with_link_id("t-o1")[0].status, "New");
+    rig.mock.cancel_after_partial_fill("t-o1", 0.0);
+    (rig, records)
+}
+
+/// An entry decided on bar 2 with a stop at 64000. Filled below that trigger (the test moves the
+/// price first), its stop is refused and replaced by a close at market: one that no order carried
+/// over a restart allows.
+fn later_entry_closed_at_market() -> (usize, Act) {
+    (
+        2,
+        Act::SubmitWithStop(market(Side::Buy, 0.004, false), 64000.0),
+    )
+}
+
+#[test]
+fn an_entry_that_closes_unfilled_while_its_stop_of_unknown_outcome_is_not_at_the_venue_carries_on()
+{
+    let (mut rig, _) = entry_closed_unfilled_with_unsettled_stop(
+        Fault::DropBeforeApply,
+        vec![later_entry_closed_at_market()],
+    );
+    let sends = rig.sends();
+    rig.bar();
+    assert_eq!(rig.handle.fault(), None);
+    assert!(matches!(rig.status(1), OrderStatus::Cancelled(_)));
+    assert!(matches!(rig.status(2), OrderStatus::Cancelled(_)));
+    assert!(rig.mock.orders_with_link_id("t-o2").is_empty());
+    assert_eq!(rig.sends(), sends, "nothing sent for it");
+    // It carries on: the later entry is sent and its refused stop closed at market.
+    rig.mock.set_price(SYMBOL, 63500.0);
+    rig.bar();
+    rig.bar();
+    assert_eq!(rig.handle.fault(), None);
+    assert_eq!(rig.mock.orders_with_link_id("t-c4")[0].status, "Filled");
+    assert_eq!(rig.status(3), OrderStatus::Filled);
+    assert_eq!(rig.status(4), OrderStatus::Filled);
+    assert_eq!(rig.session.portfolio().position(), 0.0);
+    assert_eq!(rig.mock.position(SYMBOL), 0.0);
+}
+
+#[test]
+fn after_a_restart_an_entry_that_closes_unfilled_while_its_stop_of_unknown_outcome_is_not_at_the_venue_carries_on()
+ {
+    let (rig, records) = entry_closed_unfilled_with_unsettled_stop(
+        Fault::DropBeforeApply,
+        vec![later_entry_closed_at_market()],
+    );
+    let (mut session, handle) = replayed(&rig, &records);
+    // Going live does not find the stop, so it stays unsettled and carried over the restart.
+    handle.go_live().unwrap();
+    let sends = rig.sends();
+    session.on_bar(rig.candle(1, PRICE), &[]).unwrap();
+    assert_eq!(handle.fault(), None);
+    assert!(matches!(
+        session.orders()[0].status,
+        OrderStatus::Cancelled(_)
+    ));
+    assert!(matches!(
+        session.orders()[1].status,
+        OrderStatus::Cancelled(_)
+    ));
+    assert_eq!(rig.sends(), sends, "nothing sent for it");
+    // Nothing is carried any more: the later entry's refused stop is closed at market.
+    rig.mock.set_price(SYMBOL, 63500.0);
+    session.on_bar(rig.candle(2, PRICE), &[]).unwrap();
+    session.on_bar(rig.candle(3, PRICE), &[]).unwrap();
+    assert_eq!(handle.fault(), None);
+    assert_eq!(rig.mock.orders_with_link_id("t-c4")[0].status, "Filled");
+    assert_eq!(session.orders()[3].status, OrderStatus::Filled);
+    assert_eq!(session.portfolio().position(), 0.0);
+    assert_eq!(rig.mock.position(SYMBOL), 0.0);
+}
+
+#[test]
+fn an_entry_that_closes_unfilled_while_its_stop_of_unknown_outcome_rests_or_cannot_be_read_faults()
+{
+    for rests in [true, false] {
+        let lost = if rests {
+            Fault::DropAfterApply
+        } else {
+            Fault::DropBeforeApply
+        };
+        let (mut rig, _) = entry_closed_unfilled_with_unsettled_stop(lost, vec![]);
+        if !rests {
+            // The stop is not in the real-time list, and the order history cannot be read.
+            rig.mock.inject_always(HISTORY, Fault::DropBeforeApply);
+        }
+        let sends = rig.sends();
+        rig.bar();
+        let fault = rig.handle.fault().expect("faulted");
+        if rests {
+            assert_eq!(fault.kind, FaultKind::UnknownOpenOrder, "{fault}");
+            assert!(
+                fault.message.contains("t-o1 closed unfilled")
+                    && fault.message.contains("t-o2")
+                    && fault.message.contains("rests at the venue"),
+                "{fault}"
+            );
+            assert_eq!(
+                rig.mock.orders_with_link_id("t-o2")[0].status,
+                "Untriggered"
+            );
+        } else {
+            assert_eq!(fault.kind, FaultKind::UnresolvedOrder, "{fault}");
+            assert!(
+                fault.message.contains("t-o1 closed unfilled")
+                    && fault.message.contains("t-o2")
+                    && fault.message.contains("may rest at the venue"),
+                "{fault}"
+            );
+            assert!(rig.mock.orders_with_link_id("t-o2").is_empty());
+        }
+        assert_eq!(rig.sends(), sends, "nothing sent, rests {rests}");
+    }
+}
+
+#[test]
+fn after_a_restart_a_cancelled_stop_a_lagging_list_leaves_out_but_its_lookup_shows_open_is_still_owed()
+ {
+    let mock = venue();
+    let faults = mock.clone();
+    // The venue acknowledges the session's cancel of the stop but never applies it, so the
+    // cancel's outcome is unknown and the stop still rests.
+    let ack = run(move || faults.inject(CANCEL, Fault::Answer(0)));
+    let mut rig = Rig::with(
+        mock,
+        vec![
+            (
+                0,
+                Act::SubmitWithStop(market(Side::Buy, 0.004, false), 60000.0),
+            ),
+            (1, ack),
+            (1, Act::Cancel(2)),
+        ],
+    );
+    let records = run_recorded(&mut rig, 2);
+    assert_eq!(rig.results()[2], "1: cancel false", "{:?}", rig.results());
+    assert_eq!(rig.handle.fault(), None);
+    assert_eq!(
+        rig.mock.orders_with_link_id("t-o2")[0].status,
+        "Untriggered"
+    );
+    let sends = rig.sends();
+    let (_session, handle) = replayed(&rig, &records);
+    // Going live's check reads the open orders without the stop, as a list that lags would; the
+    // stop's lookup by id then shows it open.
+    rig.mock.inject(REALTIME, Fault::Answer(0));
+    let fault = handle.go_live().expect_err("faulted");
+    // Not taken off, the stop's 0.004 is still owed, and the list shows no stop covering it.
+    assert_eq!(fault.kind, FaultKind::Uncovered, "{fault}");
+    assert!(
+        fault.message.contains("owes a stop for 0.004") && fault.message.contains("cover 0,"),
+        "{fault}"
+    );
+    assert_eq!(rig.sends(), sends, "nothing sent");
+}
+
+#[test]
+fn a_close_at_market_whose_id_the_venue_already_holds_is_read_and_not_sent_again() {
+    // Another session reusing the prefix holds the close's id; the venue lets it be read, or not.
+    for readable in [true, false] {
+        let mock = venue();
+        let other = mock.clone();
+        let squat = run(move || {
+            client_for(&other)
+                .place(
+                    &instrument(),
+                    &stop(Side::Sell, 0.003, 50000.0),
+                    &ClientOrderId::new("t-c2").unwrap(),
+                    PRICE,
+                )
+                .unwrap();
+            if !readable {
+                // The entry's fill is read; the order under the close's id cannot be.
+                other.inject(REALTIME, Fault::Hang(Duration::ZERO));
+                other.inject_always(REALTIME, Fault::DropBeforeApply);
+                other.inject_always(HISTORY, Fault::DropBeforeApply);
+            }
+        });
+        let mut rig = Rig::with(
+            mock,
+            vec![
+                (0, squat),
+                (
+                    0,
+                    Act::SubmitWithStop(market(Side::Buy, 0.004, false), 64000.0),
+                ),
+            ],
+        );
+        // The entry fills below its stop's trigger, so the stop is refused and closed at market.
+        rig.mock.set_price(SYMBOL, 63500.0);
+        rig.bar();
+        rig.mock.clear_faults();
+        // The stop is refused before it is sent: its trigger is above the entry's fill.
+        assert_eq!(
+            rig.mock.request_count(CREATE),
+            3,
+            "the other order, the entry and the close refused as a duplicate"
+        );
+        let held = rig.mock.orders_with_link_id("t-c2");
+        assert_eq!(held.len(), 1, "readable {readable}");
+        assert_eq!(held[0].status, "Untriggered");
+        assert_eq!(rig.mock.position(SYMBOL), 0.004, "nothing closed");
+        if readable {
+            // Taken as the close, for the venue's quantity, which the next bar holds it to.
+            assert_eq!(rig.handle.fault(), None);
+            let sends = rig.sends();
+            rig.bar();
+            let fault = rig.handle.fault().expect("faulted");
+            assert_eq!(fault.kind, FaultKind::ProtectionFailed, "{fault}");
+            assert!(
+                fault.message.contains("close at market for 0.003"),
+                "{fault}"
+            );
+            assert_eq!(rig.sends(), sends, "nothing sent");
+        } else {
+            let fault = rig.handle.fault().expect("faulted");
+            assert_eq!(fault.kind, FaultKind::ProtectionFailed, "{fault}");
+            assert!(
+                fault.message.contains("closing at market failed")
+                    && fault.message.contains("t-c2")
+                    && fault.message.contains("could not be read"),
+                "{fault}"
+            );
+        }
     }
 }
