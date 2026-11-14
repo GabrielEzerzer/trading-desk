@@ -53,13 +53,13 @@ use super::jobs::{JobCreated, JobCtx, JobError, JobRequest, JobResult, JobStatus
 use super::source::MarketSource;
 
 /// The folder under the data directory that holds saved runs.
-const RUNS_DIR: &str = "runs";
+use td_engine::RUNS_DIR;
 
 /// The file beside a saved run's `result.json` that holds its [`DataReport`].
 const DATA_REPORT_FILE: &str = "data.json";
 
 /// The file beside a saved run's `result.json` that holds its [`RunRecord`].
-pub(super) const RECORD_FILE: &str = "record.json";
+use td_engine::RECORD_FILE;
 
 /// The environment variable that sets the data cutoff.
 const DATA_CUTOFF_VAR: &str = "TD_DATA_CUTOFF";
@@ -161,14 +161,8 @@ impl RunRecord {
     }
 }
 
-/// Whether a saved code hash is the strategy's code in this engine: `None` when the run saved no
-/// hash (saved before hashes were recorded) or the strategy is no longer registered, so the answer
-/// is unknown.
-pub fn code_matches(strategy: &str, saved: Option<&str>) -> Option<bool> {
-    saved
-        .zip(td_engine::code_hash(strategy))
-        .map(|(saved, now)| saved == now)
-}
+/// Whether a saved code hash is the strategy's code in this engine (moved to `td_engine`).
+pub use td_engine::code_matches;
 
 /// Missing open time, or time without a funding rate, this long or longer in one stretch means the
 /// store lacks that part of a run's range, and the run is refused: a day. Closures recorded at
