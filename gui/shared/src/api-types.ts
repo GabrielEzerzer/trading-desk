@@ -234,7 +234,15 @@ account_currency?: AccountCurrency,
  * [`run_with_references`] and are part of the data fingerprint. Left out of the saved result
  * when there are none, the default.
  */
-references?: Array<InstrumentId>, };
+references?: Array<InstrumentId>, 
+/**
+ * The series, by name, whose rows the strategy can read beside its bars, each row from the
+ * first bar whose close is at or after the time it became known ([`crate::Context::series`]).
+ * Their rows are given to the run with [`run_with_references`] and the rows the run could
+ * read are part of the data fingerprint. Left out of the saved result when there are none,
+ * the default.
+ */
+series?: Array<string>, };
 
 export type BacktestResult = { config: BacktestConfig, 
 /**
@@ -2536,7 +2544,15 @@ instruments?: Array<InstrumentId>,
  * and the store must hold their bars over the plan's period; they are not downloaded. None
  * when left out.
  */
-references?: Array<InstrumentId>, };
+references?: Array<InstrumentId>, 
+/**
+ * Series every run of each battery names ([`td_engine::BacktestConfig::series`]): the
+ * strategy reads each one's rows, from `<data_dir>/series/<name>.json`, as they became known.
+ * Each must have a row known by the close of the plan's first bar. The luck test leaves them
+ * in place in time. A paper or live session cannot start from a verdict judged with them.
+ * None when left out.
+ */
+series?: Array<string>, };
 
 /**
  * What a plan job kept: one entry per instrument whose battery finished or reached the luck test
@@ -2632,7 +2648,12 @@ code_versions: number,
  * The reference instruments the battery's runs named; left out when none. A verdict with
  * references and one without share a row, the newer winning as above.
  */
-references?: Array<InstrumentId>, };
+references?: Array<InstrumentId>, 
+/**
+ * The series the battery's runs named; left out when none. A paper or live session refuses to
+ * start from a verdict with series.
+ */
+series?: Array<string>, };
 
 /**
  * A saved run in full.

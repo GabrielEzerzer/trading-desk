@@ -485,7 +485,7 @@ fn latest_verdicts(
 
 /// The link of a paper session that feeds its strategy `references` ([`td_engine::session_link`]):
 /// 400 `invalid_verdict` for a run that is not a saved verdict of this strategy on this instrument,
-/// or one judged with other reference instruments, named or latest.
+/// or one judged with a series or with other reference instruments, named or latest.
 pub(crate) fn session_link(
     runs_dir: &Path,
     entry: &StrategyEntry,
@@ -538,16 +538,17 @@ mod tests {
 
     /// A verdict of `entry` on `instrument` as it is now, saved as run `run_id` under `runs_dir`.
     fn save_verdict(runs_dir: &Path, run_id: &str, entry: &StrategyEntry, on: &InstrumentId) {
-        save_verdict_with(runs_dir, run_id, entry, on, Vec::new());
+        save_verdict_with(runs_dir, run_id, entry, on, Vec::new(), Vec::new());
     }
 
-    /// [`save_verdict`] for a battery whose runs named `references`.
+    /// [`save_verdict`] for a battery whose runs named `references` and `series`.
     fn save_verdict_with(
         runs_dir: &Path,
         run_id: &str,
         entry: &StrategyEntry,
         on: &InstrumentId,
         references: Vec<InstrumentId>,
+        series: Vec<String>,
     ) {
         let record = VerdictRecord {
             strategy: entry.name.into(),
@@ -560,7 +561,7 @@ mod tests {
             complete: true,
             code_hash: td_engine::code_hash(entry.name).map(String::from),
             references,
-            series: Vec::new(),
+            series,
         };
         let dir = runs_dir.join(run_id);
         fs::create_dir_all(&dir).unwrap();
@@ -618,7 +619,14 @@ mod tests {
         };
         let (older, newer) = ("1700000000000-0000000a", "1700000000001-0000000b");
         save_verdict(dir.path(), older, &entry, &on);
-        save_verdict_with(dir.path(), newer, &entry, &on, vec![reference.clone()]);
+        save_verdict_with(
+            dir.path(),
+            newer,
+            &entry,
+            &on,
+            vec![reference.clone()],
+            Vec::new(),
+        );
 
         let named = RunId::parse(newer).unwrap();
         let refused = session_link(dir.path(), &entry, &on, Some(&named), &[]).unwrap_err();
@@ -667,6 +675,61 @@ mod tests {
         assert_eq!(rows[0].references, vec![reference]);
         let row = serde_json::to_value(&rows[0]).unwrap();
         assert!(row.get("references").is_some());
+    }
+
+    /// A paper session feeds its strategy no series, so it is never linked to a verdict judged
+    /// with one, named or latest, whatever references it feeds; the verdict list says which
+    /// series the latest verdict was judged with.
+    #[test]
+    fn a_session_is_never_linked_to_a_verdict_judged_with_a_series() {
+        let dir = tempfile::tempdir().unwrap();
+        let entry = td_engine::find_strategy("sma_cross").unwrap();
+        let on = entry.plan.instruments[0].clone();
+        let (older, newer) = ("1700000000000-0000000a", "1700000000001-0000000b");
+        save_verdict(dir.path(), older, &entry, &on);
+        let series = vec!["made_up".to_string()];
+        save_verdict_with(dir.path(), newer, &entry, &on, Vec::new(), series.clone());
+
+        let why = format!(
+            "run {newer} was judged with the series made_up, and a session cannot feed a series yet"
+        );
+        let named = RunId::parse(newer).unwrap();
+        let refused = session_link(dir.path(), &entry, &on, Some(&named), &[]).unwrap_err();
+        assert_eq!(refused.body.code, "invalid_verdict");
+        assert!(
+            refused.body.message.contains(&why),
+            "{}",
+            refused.body.message
+        );
+        let latest = session_link(dir.path(), &entry, &on, None, &[]).unwrap_err();
+        assert_eq!(latest.body.code, "invalid_verdict");
+        assert!(
+            latest.body.message.contains(&format!(
+                "{why}; it is the strategy's latest verdict on {on}, so name a verdict judged \
+                 without series in `verdict_run_id`"
+            )),
+            "{}",
+            latest.body.message
+        );
+        // A verdict judged without one still links.
+        let plain = RunId::parse(older).unwrap();
+        let link = session_link(dir.path(), &entry, &on, Some(&plain), &[]).unwrap();
+        assert_eq!(link.verdict.unwrap().run_id, plain);
+
+        let rows = latest_verdicts(dir.path(), std::slice::from_ref(&entry), None).unwrap();
+        assert_eq!(rows[0].series, series);
+        let row = serde_json::to_value(&rows[0]).unwrap();
+        assert_eq!(row["series"], serde_json::json!(["made_up"]));
+        // A verdict judged without series lists none, as before series existed.
+        let older_dir = tempfile::tempdir().unwrap();
+        save_verdict(older_dir.path(), older, &entry, &on);
+        let rows = latest_verdicts(older_dir.path(), std::slice::from_ref(&entry), None).unwrap();
+        assert!(
+            serde_json::to_value(&rows[0])
+                .unwrap()
+                .get("series")
+                .is_none()
+        );
     }
 
     #[test]

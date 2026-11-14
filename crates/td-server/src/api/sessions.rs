@@ -662,8 +662,7 @@ impl Sessions {
             // A paper session cannot start from a verdict judged with a series.
             series: Vec::new(),
         };
-        let result =
-            td_engine::run_with_references(&backtest, &bars, &[], &due, &references, &[]);
+        let result = td_engine::run_with_references(&backtest, &bars, &[], &due, &references, &[]);
         let result = result.map_err(|e| {
             ApiError::internal(format!("the backtest beside the session failed: {e}"))
         })?;

@@ -1951,6 +1951,60 @@ mod tests {
         assert!(load_run_data(&store, &spot, None).is_ok());
     }
 
+    /// A run's series are read from `<data dir>/series` by the check and the load alike, and with
+    /// a cutoff in force no row known after it is read: the run loads although that row would be
+    /// refused, and without the cutoff it is. A bad name is the request's fault, a missing or
+    /// malformed file the data's.
+    #[test]
+    fn series_are_read_from_the_data_folder_and_rows_after_the_cutoff_are_not() {
+        let (dir, store, spot, _) = store_with_an_hour_missing();
+        let cutoff = DataCutoff::parse("2024-03-03").unwrap();
+        let named = BacktestConfig {
+            to: cutoff.end(),
+            series: vec!["made_up".into()],
+            ..spot
+        };
+        let folder = dir.path().join(td_engine::SERIES_DIR);
+        fs::create_dir_all(&folder).unwrap();
+        let rows = format!(
+            r#"[{{"known_at": {}, "value": 1}}, {{"known_at": {}, "value": 2}}, {{"known_at": {}, "value": "x"}}]"#,
+            named.from,
+            cutoff.end(),
+            cutoff.end() + 1
+        );
+        fs::write(folder.join("made_up.json"), rows).unwrap();
+
+        assert_eq!(check_run_data(&store, &named, Some(&cutoff)), Ok(()));
+        let data = load_run_data(&store, &named, Some(&cutoff)).unwrap();
+        assert_eq!(data.series.len(), 1);
+        assert_eq!(data.series[0].rows.len(), 2);
+        let late = checked(&store, &named).err().unwrap();
+        assert_eq!(
+            (late.status.as_u16(), late.body.code.as_str()),
+            (422, "data_missing")
+        );
+        assert!(late.body.message.contains("row 3"), "{}", late.body.message);
+
+        let missing = BacktestConfig {
+            series: vec!["absent".into()],
+            ..named.clone()
+        };
+        let e = checked(&store, &missing).err().unwrap();
+        assert_eq!(
+            (e.status.as_u16(), e.body.code.as_str()),
+            (422, "data_missing")
+        );
+        let outside = BacktestConfig {
+            series: vec!["../made_up".into()],
+            ..named
+        };
+        let e = checked(&store, &outside).err().unwrap();
+        assert_eq!(
+            (e.status.as_u16(), e.body.code.as_str()),
+            (400, "invalid_config")
+        );
+    }
+
     /// On an empty store a range past the cutoff is refused as past the cutoff, not answered as a
     /// shortfall, both by the check a request makes and by the job's first load, so neither the
     /// request nor the job reaches a download step.
