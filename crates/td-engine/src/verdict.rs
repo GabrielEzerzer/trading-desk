@@ -1175,17 +1175,20 @@ pub struct KindInputs {
     pub return_without_best_trade: Option<f64>,
     // prop_firm: fractions measured inside bars
     /// The worst loss within one day, on the firm's day when its rule states one, as a fraction
-    /// of that day's starting balance: what an attempt started that morning would have lost.
+    /// of that day's starting balance: what an attempt started that morning would have lost. For
+    /// a `prop_firm` rule with `sizes_from_starting_cash`, as a fraction of the starting cash.
     pub worst_daily_loss: Option<f64>,
     /// Max drawdown from the starting balance. For a `prop_firm` rule, the worst over attempts of
     /// its `breach_horizon_days` started on each day of the curve, each from its own starting
-    /// balance; for the other kinds, over the whole curve.
+    /// balance; for the other kinds, over the whole curve. For a `prop_firm` rule with
+    /// `sizes_from_starting_cash`, each fall is a fraction of the starting cash instead.
     pub intrabar_drawdown_static: Option<f64>,
     /// Max drawdown from the running peak, as a fraction of the starting balance, over the same
     /// span as `intrabar_drawdown_static`: for a `prop_firm` rule, each attempt's peak starts at
     /// its own starting balance, and the fall is a fraction of that balance. With the firm's
     /// `trailing_floor_lock`, the peak counts only up to where the floor reaches the lock, so the
-    /// fall is to the floor the firm applies.
+    /// fall is to the floor the firm applies. For a `prop_firm` rule with
+    /// `sizes_from_starting_cash`, each fall is a fraction of the starting cash instead.
     pub intrabar_drawdown_trailing: Option<f64>,
     /// The chance of reaching the firm's profit target before breaching a limit.
     pub pass_probability: Option<f64>,
@@ -1251,11 +1254,21 @@ pub fn evaluate(rule: &VerdictRule, x: &KindInputs) -> Vec<Criterion> {
                     },
                 ),
             };
+            // A strategy sized from the starting cash has each fall judged as a share of the
+            // starting cash, not of the day's or the attempt's own starting balance.
+            let (day_start, of_cash) = if limits.sizes_from_starting_cash {
+                (
+                    "the starting balance",
+                    ", as a share of the starting balance",
+                )
+            } else {
+                ("the day's starting balance", "")
+            };
             let daily_loss = match firm.day_rollover {
                 // A rule saved before the field existed names no day end.
-                None => "Worst daily loss as a share of the day's starting balance".to_string(),
+                None => format!("Worst daily loss as a share of {day_start}"),
                 Some(rollover) => format!(
-                    "Worst daily loss as a share of the day's starting balance, days ending at {}",
+                    "Worst daily loss as a share of {day_start}, days ending at {}",
                     day_end(rollover)
                 ),
             };
@@ -1271,7 +1284,8 @@ pub fn evaluate(rule: &VerdictRule, x: &KindInputs) -> Vec<Criterion> {
                 line(
                     "max_drawdown",
                     &format!(
-                        "Max drawdown {measured} in any {}-day attempt started on a day of the test",
+                        "Max drawdown {measured} in any {}-day attempt started on a day of the \
+                         test{of_cash}",
                         limits.breach_horizon_days
                     ),
                     drawdown,
@@ -2232,20 +2246,23 @@ mod tests {
     }
 
     /// The daily loss line names the day it measured when the rule states one, and the drawdown
-    /// line the attempt length it measured over, which is the breach horizon.
+    /// line the attempt length it measured over, which is the breach horizon. With
+    /// `sizes_from_starting_cash`, both say each fall is a share of the starting balance.
     #[test]
     fn prop_firm_lines_say_what_they_measured() {
-        let name = |rollover, horizon| {
+        let sized_name = |mode, lock, rollover, horizon, sized| {
             let VerdictRule::PropFirm {
                 mut firm,
                 mut limits,
                 attempt,
-            } = prop(DrawdownMode::Static)
+            } = prop(mode)
             else {
                 unreachable!()
             };
+            firm.trailing_floor_lock = lock;
             firm.day_rollover = rollover;
             limits.breach_horizon_days = horizon;
+            limits.sizes_from_starting_cash = sized;
             let rule = VerdictRule::PropFirm {
                 firm,
                 limits,
@@ -2254,6 +2271,8 @@ mod tests {
             let lines = evaluate(&rule, &good_prop());
             (lines[0].name.clone(), lines[1].name.clone())
         };
+        let name =
+            |rollover, horizon| sized_name(DrawdownMode::Static, None, rollover, horizon, false);
         let utc = |offset_minutes| Some(DayRollover::Utc { offset_minutes });
         assert_eq!(
             name(utc(0), 90).0,
@@ -2276,6 +2295,42 @@ mod tests {
             name(None, 30).1,
             "Max drawdown from the starting balance in any 30-day attempt started on a day of the \
              test"
+        );
+
+        // Sized from the starting cash, both lines say each fall is a share of it; without the
+        // field, every reading's text is as it was.
+        let trailing = |lock, sized| sized_name(DrawdownMode::Trailing, lock, None, 30, sized).1;
+        assert_eq!(
+            sized_name(DrawdownMode::Static, None, None, 30, true),
+            (
+                "Worst daily loss as a share of the starting balance".to_string(),
+                "Max drawdown from the starting balance in any 30-day attempt started on a day of \
+                 the test, as a share of the starting balance"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            sized_name(DrawdownMode::Static, None, utc(0), 30, true).0,
+            "Worst daily loss as a share of the starting balance, days ending at 00:00 UTC"
+        );
+        assert_eq!(
+            trailing(None, false),
+            "Max drawdown from the peak in any 30-day attempt started on a day of the test"
+        );
+        assert_eq!(
+            trailing(None, true),
+            "Max drawdown from the peak in any 30-day attempt started on a day of the test, as a \
+             share of the starting balance"
+        );
+        assert_eq!(
+            trailing(Some(0.0), false),
+            "Max drawdown from the peak, with the floor stopping at the starting balance, in any \
+             30-day attempt started on a day of the test"
+        );
+        assert_eq!(
+            trailing(Some(0.01), true),
+            "Max drawdown from the peak, with the floor stopping 1.00% above the starting balance, \
+             in any 30-day attempt started on a day of the test, as a share of the starting balance"
         );
     }
 

@@ -1708,13 +1708,15 @@ risk_of_ruin: number | null,
 return_without_best_trade: number | null, 
 /**
  * The worst loss within one day, on the firm's day when its rule states one, as a fraction
- * of that day's starting balance: what an attempt started that morning would have lost.
+ * of that day's starting balance: what an attempt started that morning would have lost. For
+ * a `prop_firm` rule with `sizes_from_starting_cash`, as a fraction of the starting cash.
  */
 worst_daily_loss: number | null, 
 /**
  * Max drawdown from the starting balance. For a `prop_firm` rule, the worst over attempts of
  * its `breach_horizon_days` started on each day of the curve, each from its own starting
- * balance; for the other kinds, over the whole curve.
+ * balance; for the other kinds, over the whole curve. For a `prop_firm` rule with
+ * `sizes_from_starting_cash`, each fall is a fraction of the starting cash instead.
  */
 intrabar_drawdown_static: number | null, 
 /**
@@ -1722,7 +1724,8 @@ intrabar_drawdown_static: number | null,
  * span as `intrabar_drawdown_static`: for a `prop_firm` rule, each attempt's peak starts at
  * its own starting balance, and the fall is a fraction of that balance. With the firm's
  * `trailing_floor_lock`, the peak counts only up to where the floor reaches the lock, so the
- * fall is to the floor the firm applies.
+ * fall is to the floor the firm applies. For a `prop_firm` rule with
+ * `sizes_from_starting_cash`, each fall is a fraction of the starting cash instead.
  */
 intrabar_drawdown_trailing: number | null, 
 /**
