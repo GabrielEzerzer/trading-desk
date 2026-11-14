@@ -1677,7 +1677,8 @@ risk_of_ruin: number | null,
  */
 return_without_best_trade: number | null, 
 /**
- * The worst loss within one day, on the firm's day when its rule states one.
+ * The worst loss within one day, on the firm's day when its rule states one, as a fraction
+ * of that day's starting balance: what an attempt started that morning would have lost.
  */
 worst_daily_loss: number | null, 
 /**
@@ -1844,9 +1845,11 @@ export type PropFirmOdds = {
  */
 pass: number, 
 /**
- * The fraction of paths that breach a limit within the horizon, trading on after reaching
- * the target as a funded account would. The `prop_firm` kind rule asks for at most 0.10
- * over 90 days.
+ * The fraction of paths that breach a limit within the horizon: in a phase of the
+ * evaluation, or after the last phase passes, trading on as the funded account from a fresh
+ * balance and a fresh peak, as a firm starts each phase and the funded account again at the
+ * account size. The funded account takes no payouts here. The `prop_firm` kind rule asks for
+ * at most 0.10 over 90 days.
  */
 breach: number, paths: number, 
 /**
@@ -1870,14 +1873,17 @@ export type PropFirmAttempt = {
  */
 full: AttemptFigures, 
 /**
- * From the daily returns with their mean scaled by `reduced_edge_factor` and their shape
- * unchanged. The `prop_firm` kind rule asks for its `value` to be above zero.
+ * From the daily returns with a positive mean scaled by `reduced_edge_factor` and their
+ * shape unchanged; with a negative mean, the same as `full`, since a reduction never adds
+ * edge. The `prop_firm` kind rule asks for its `value` to be above zero.
  */
 reduced: AttemptFigures, 
 /**
  * From the daily returns with their mean removed (a factor of 0) and their shape unchanged:
  * what the terms alone are worth, with no edge. A positive value here says the terms pay for
  * an attempt by themselves, so a positive `reduced` value does not show that the edge does.
+ * With a negative mean, removing it reads better than `full`: this is the terms without an
+ * edge, not a reduction of the one the test shows.
  * Reported only: no line of the verdict judges it. `None` in a result saved before it
  * existed.
  */
