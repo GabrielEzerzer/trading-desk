@@ -571,13 +571,13 @@ pub fn session_link(
 
 /// Why a session cannot be linked to verdict `id`, judged with `references`.
 ///
-/// shortcut: a paper session feeds no reference instruments, so it cannot run the test a verdict
-/// with references judged; feed their live bars beside the session's own when a strategy that
-/// reads them is paper traded.
+/// shortcut: neither a paper session nor a live one feeds reference instruments, so neither can
+/// run the test a verdict with references judged; feed their live bars beside the session's own
+/// when a strategy that reads them is traded in a session.
 fn cannot_feed(id: &RunId, references: &[InstrumentId]) -> String {
     let names: Vec<String> = references.iter().map(ToString::to_string).collect();
     format!(
-        "run {id} was judged with the reference instruments {}, and a paper session cannot feed reference instruments yet",
+        "run {id} was judged with the reference instruments {}, and a paper or live session cannot feed reference instruments yet",
         names.join(", ")
     )
 }

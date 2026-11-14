@@ -2405,3 +2405,108 @@ fn a_session_saved_without_a_link_loads_resumes_and_shows_status() {
     assert_eq!(code, 0, "{text}");
     assert!(text.contains("resumed session old"), "{text}");
 }
+
+/// A live session feeds its strategy no reference instruments, so it is never started from a
+/// verdict judged with them, named or latest; nor from a run that is not a saved verdict of the
+/// strategy on the instrument. Each refusal comes before the session's folder is made and before
+/// any request reaches the venue.
+#[test]
+fn start_refuses_a_verdict_it_cannot_run_before_writing_or_asking_the_venue_anything() {
+    let rig = Rig::new();
+    let feed = rig.feed();
+    let on = instrument().id;
+    let reference = InstrumentId {
+        symbol: "ETHUSDT".into(),
+        ..on.clone()
+    };
+    rig.save_verdict(OLDER, &on, Vec::new());
+    rig.save_verdict(NEWER, &on, vec![reference.clone()]);
+    let another = "1700000000002-0000000c";
+    rig.save_verdict(another, &reference, Vec::new());
+
+    let requests = rig.mock.requests().len();
+    let refused = |extra: &[&str], why: &[&str]| {
+        let (code, text) = rig.start_linked(&feed, "refused", extra);
+        assert_eq!(code, 1, "{extra:?}: {text}");
+        assert!(text.starts_with("error: "), "{text}");
+        for part in why {
+            assert!(text.contains(part), "{extra:?}: {part:?} not in {text}");
+        }
+        assert_eq!(rig.mock.requests().len(), requests, "{extra:?}: {text}");
+        assert!(!rig.data().join("live").exists(), "{extra:?}");
+    };
+    let feeds_none = format!(
+        "run {NEWER} was judged with the reference instruments {reference}, and a paper or live \
+         session cannot feed reference instruments yet"
+    );
+    // The latest verdict was judged with a reference.
+    refused(
+        &[],
+        &[
+            &feeds_none,
+            &format!("it is the strategy's latest verdict on {on}"),
+            "name a verdict judged without them with --verdict",
+        ],
+    );
+    // So is the verdict named.
+    refused(&["--verdict", NEWER], &[&feeds_none]);
+    // A verdict of another instrument, a run that is not a verdict, and an id that is not one.
+    refused(
+        &["--verdict", another],
+        &[&format!(
+            "run {another} is the verdict of {LINKED} on {reference}, not of {LINKED} on {on}"
+        )],
+    );
+    refused(
+        &["--verdict", "1700000000003-0000000d"],
+        &["run 1700000000003-0000000d is not a saved verdict"],
+    );
+    refused(
+        &["--verdict", "../../etc"],
+        &["\"../../etc\" is not a run id"],
+    );
+    refused(&["--verdict", r"..\runs"], &["is not a run id"]);
+
+    // A verdict judged without references still starts the session.
+    let (code, text) = rig.start_linked(&feed, "plain", &["--verdict", OLDER]);
+    assert_eq!(code, 0, "{text}");
+    assert_eq!(rig.config_json("plain")["link"]["verdict"]["run_id"], OLDER);
+}
+
+#[test]
+fn a_verdict_named_for_a_strategy_that_is_not_registered_is_refused_before_anything_is_sent() {
+    let rig = Rig::new();
+    let feed = rig.feed();
+    let requests = rig.mock.requests().len();
+    let (code, text) = rig.td_live(
+        &feed,
+        &[
+            "start",
+            "--id",
+            "double",
+            "--strategy",
+            "double",
+            "--params",
+            "{}",
+            "--symbol",
+            SYMBOL,
+            "--timeframe",
+            "1h",
+            "--daily-loss",
+            "1",
+            "--max-loss",
+            "1",
+            "--notional-cap",
+            "1",
+            "--verdict",
+            OLDER,
+        ],
+    );
+    assert_eq!(code, 1, "{text}");
+    assert!(
+        text.contains("double is not a registered strategy, so it has none"),
+        "{text}"
+    );
+    assert_eq!(rig.mock.requests().len(), requests);
+    assert!(!rig.data().join("live").exists());
+}
