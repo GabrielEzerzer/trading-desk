@@ -325,6 +325,23 @@ pub struct PropFirmLimits {
     /// Days a simulated attempt runs for the breach odds, and the length of each attempt the
     /// max-drawdown line reads on the test's curve.
     pub breach_horizon_days: u32,
+    /// Whether the strategy trades a fixed quantity or notional set from the starting cash, so
+    /// its falls in money stay the same size as the balance grows. When set, the max-drawdown and
+    /// worst-daily-loss lines judge each fall in money as a share of the starting cash, and the
+    /// simulated attempts add each day's profit and loss as a share of the starting cash instead
+    /// of compounding a return on the balance. Every figure the battery reads then comes from one
+    /// account that adds each walk-forward test window's own money changes at the size it was
+    /// tested at, whose own balance decides when it is gone, and the runs at higher costs, at
+    /// each start offset and of each plateau neighbour are put together the same way. The
+    /// exceptions read each window's own run (I1 to I3, the share of profitable windows, the day
+    /// and window counts and the breakdown's rising and falling returns) or the full-period sweep
+    /// (the luck test), and the other kinds' benchmark figures. The lowest-equity line also fails
+    /// when a window that account counts reached zero or below in its own run.
+    /// `false`, the default, reads every fall and every day as a share of the balance it starts
+    /// from, which is exact for a strategy whose size grows with its balance. `false` is left out
+    /// of JSON.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub sizes_from_starting_cash: bool,
 }
 
 fn default_pass_horizon_days() -> u32 {
@@ -339,6 +356,7 @@ impl Default for PropFirmLimits {
             pass_horizon_days: default_pass_horizon_days(),
             max_breach_probability: 0.1,
             breach_horizon_days: 90,
+            sizes_from_starting_cash: false,
         }
     }
 }
@@ -984,16 +1002,23 @@ pub struct IntegrityInputs {
 }
 
 /// The integrity checks read on the stitched walk-forward out-of-sample curve (I4 and I5),
-/// computed once it exists.
+/// computed once it exists. For a `prop_firm` rule with `sizes_from_starting_cash`, on the curve
+/// that adds each test window's own money changes at a fixed size instead.
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct OosIntegrityInputs {
     /// I4: the annualised Sharpe ratio of the curve's daily returns.
     pub sharpe: Option<f64>,
-    /// I5: the highest notional over equity inside any bar.
+    /// I5: the highest notional over equity inside any bar. For a `prop_firm` rule with
+    /// `sizes_from_starting_cash`, the highest of the counted windows' own.
     pub peak_leverage: Option<f64>,
     /// I5: the lowest equity inside any bar, over the starting cash. Zero is a bankrupt account:
-    /// a liquidation leaves the account at exactly zero.
+    /// a liquidation leaves the account at exactly zero. For a `prop_firm` rule with
+    /// `sizes_from_starting_cash`, the lowest low of the curve that adds each test window's own
+    /// money changes instead, or lower, the lowest low of a window that curve counts whose own run
+    /// reached zero or below: the backtest stops such a run at zero (a liquidated perpetual, a
+    /// spot account) or lets it go negative with the position open (FX), so its money change
+    /// shows only part of the loss.
     pub lowest_equity: Option<f64>,
     /// Whether the stitched out-of-sample curve exists. A curve can exist without the equity
     /// ranges inside its bars that I5 reads (a test run that kept none), and the lines then say
@@ -1129,7 +1154,9 @@ pub fn evaluate_oos_integrity(x: &OosIntegrityInputs, max_leverage: f64) -> Vec<
 // ---------------------------------------------------------------------------------------------
 
 /// The out-of-sample statistics the kind rules read, computed by the battery on the stitched
-/// walk-forward out-of-sample curve. Fractions are of equity unless said otherwise. A statistic
+/// walk-forward out-of-sample curve, or for a `prop_firm` rule with `sizes_from_starting_cash`,
+/// on the curve that adds each test window's own money changes at a fixed size; the benchmark's
+/// figures are the walk-forward's own either way. Fractions are of equity unless said otherwise. A statistic
 /// the battery could not compute is `None` and fails its criterion. Each kind reads only its own
 /// fields.
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -1163,17 +1190,20 @@ pub struct KindInputs {
     pub return_without_best_trade: Option<f64>,
     // prop_firm: fractions measured inside bars
     /// The worst loss within one day, on the firm's day when its rule states one, as a fraction
-    /// of that day's starting balance: what an attempt started that morning would have lost.
+    /// of that day's starting balance: what an attempt started that morning would have lost. For
+    /// a `prop_firm` rule with `sizes_from_starting_cash`, as a fraction of the starting cash.
     pub worst_daily_loss: Option<f64>,
     /// Max drawdown from the starting balance. For a `prop_firm` rule, the worst over attempts of
     /// its `breach_horizon_days` started on each day of the curve, each from its own starting
-    /// balance; for the other kinds, over the whole curve.
+    /// balance; for the other kinds, over the whole curve. For a `prop_firm` rule with
+    /// `sizes_from_starting_cash`, each fall is a fraction of the starting cash instead.
     pub intrabar_drawdown_static: Option<f64>,
     /// Max drawdown from the running peak, as a fraction of the starting balance, over the same
     /// span as `intrabar_drawdown_static`: for a `prop_firm` rule, each attempt's peak starts at
     /// its own starting balance, and the fall is a fraction of that balance. With the firm's
     /// `trailing_floor_lock`, the peak counts only up to where the floor reaches the lock, so the
-    /// fall is to the floor the firm applies.
+    /// fall is to the floor the firm applies. For a `prop_firm` rule with
+    /// `sizes_from_starting_cash`, each fall is a fraction of the starting cash instead.
     pub intrabar_drawdown_trailing: Option<f64>,
     /// The chance of reaching the firm's profit target before breaching a limit.
     pub pass_probability: Option<f64>,
@@ -1239,11 +1269,21 @@ pub fn evaluate(rule: &VerdictRule, x: &KindInputs) -> Vec<Criterion> {
                     },
                 ),
             };
+            // A strategy sized from the starting cash has each fall judged as a share of the
+            // starting cash, not of the day's or the attempt's own starting balance.
+            let (day_start, of_cash) = if limits.sizes_from_starting_cash {
+                (
+                    "the starting balance",
+                    ", as a share of the starting balance",
+                )
+            } else {
+                ("the day's starting balance", "")
+            };
             let daily_loss = match firm.day_rollover {
                 // A rule saved before the field existed names no day end.
-                None => "Worst daily loss as a share of the day's starting balance".to_string(),
+                None => format!("Worst daily loss as a share of {day_start}"),
                 Some(rollover) => format!(
-                    "Worst daily loss as a share of the day's starting balance, days ending at {}",
+                    "Worst daily loss as a share of {day_start}, days ending at {}",
                     day_end(rollover)
                 ),
             };
@@ -1259,7 +1299,8 @@ pub fn evaluate(rule: &VerdictRule, x: &KindInputs) -> Vec<Criterion> {
                 line(
                     "max_drawdown",
                     &format!(
-                        "Max drawdown {measured} in any {}-day attempt started on a day of the test",
+                        "Max drawdown {measured} in any {}-day attempt started on a day of the \
+                         test{of_cash}",
                         limits.breach_horizon_days
                     ),
                     drawdown,
@@ -1455,11 +1496,16 @@ pub fn evaluate(rule: &VerdictRule, x: &KindInputs) -> Vec<Criterion> {
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct EvidenceInputs {
-    /// R1: total return of the stitched out-of-sample curve.
+    /// R1: total return of the stitched out-of-sample curve. For a `prop_firm` rule with
+    /// `sizes_from_starting_cash`, of the curve that adds each test window's own money changes
+    /// instead, its last value over the starting cash less one.
     pub oos_return: Option<f64>,
     /// R1: the share of walk-forward windows with a positive return.
     pub profitable_windows: Option<f64>,
-    /// R2: closed out-of-sample trades.
+    /// R2: closed out-of-sample trades. For a `prop_firm` rule with `sizes_from_starting_cash`,
+    /// those of the test windows that `oos_return`'s added curve counts: every window up to and
+    /// including the one that took that curve to zero or below, where the stitched count stops
+    /// at the one that took the stitched curve there.
     pub oos_trades: usize,
     /// R2: days of bars covered by the stitched out-of-sample curve, as in
     /// [`MinSample`](crate::MinSample): 24 hours of the market's open bars, so the days it is
@@ -1470,14 +1516,21 @@ pub struct EvidenceInputs {
     /// R3: the luck test's p. `None` when it was cancelled or not run.
     pub luck_p: Option<f64>,
     /// R4: the out-of-sample return with fees, the per-unit commission, slippage and on a market
-    /// with quotes each bar's spread multiplied by the cost stress.
+    /// with quotes each bar's spread multiplied by the cost stress. For a `prop_firm` rule with
+    /// `sizes_from_starting_cash`, read like `oos_return`: the stressed windows' own money changes
+    /// added to the starting cash.
     pub stressed_return: Option<f64>,
     /// R5: the neighbours' median objective over R1's, both out of sample
-    /// ([`crate::PlateauReport`]).
+    /// ([`crate::PlateauReport`]). For a `prop_firm` rule with `sizes_from_starting_cash`, every
+    /// objective is read at a fixed size, as `oos_return` is.
     pub plateau_median_ratio: Option<f64>,
-    /// R5: the share of neighbours with a positive out-of-sample return.
+    /// R5: the share of neighbours with a positive out-of-sample return. For a `prop_firm` rule
+    /// with `sizes_from_starting_cash`, each neighbour's return is read like `oos_return`, on its
+    /// own windows' money changes added.
     pub plateau_positive_share: Option<f64>,
-    /// R6: how many start offsets gave a result of the same sign as the main run.
+    /// R6: how many start offsets gave a result of the same sign as the main run. For a
+    /// `prop_firm` rule with `sizes_from_starting_cash`, each offset's result is read like
+    /// `oos_return`, on its own windows' money changes added.
     pub start_offsets_same_sign: usize,
 }
 
@@ -2218,20 +2271,23 @@ mod tests {
     }
 
     /// The daily loss line names the day it measured when the rule states one, and the drawdown
-    /// line the attempt length it measured over, which is the breach horizon.
+    /// line the attempt length it measured over, which is the breach horizon. With
+    /// `sizes_from_starting_cash`, both say each fall is a share of the starting balance.
     #[test]
     fn prop_firm_lines_say_what_they_measured() {
-        let name = |rollover, horizon| {
+        let sized_name = |mode, lock, rollover, horizon, sized| {
             let VerdictRule::PropFirm {
                 mut firm,
                 mut limits,
                 attempt,
-            } = prop(DrawdownMode::Static)
+            } = prop(mode)
             else {
                 unreachable!()
             };
+            firm.trailing_floor_lock = lock;
             firm.day_rollover = rollover;
             limits.breach_horizon_days = horizon;
+            limits.sizes_from_starting_cash = sized;
             let rule = VerdictRule::PropFirm {
                 firm,
                 limits,
@@ -2240,6 +2296,8 @@ mod tests {
             let lines = evaluate(&rule, &good_prop());
             (lines[0].name.clone(), lines[1].name.clone())
         };
+        let name =
+            |rollover, horizon| sized_name(DrawdownMode::Static, None, rollover, horizon, false);
         let utc = |offset_minutes| Some(DayRollover::Utc { offset_minutes });
         assert_eq!(
             name(utc(0), 90).0,
@@ -2262,6 +2320,42 @@ mod tests {
             name(None, 30).1,
             "Max drawdown from the starting balance in any 30-day attempt started on a day of the \
              test"
+        );
+
+        // Sized from the starting cash, both lines say each fall is a share of it; without the
+        // field, every reading's text is as it was.
+        let trailing = |lock, sized| sized_name(DrawdownMode::Trailing, lock, None, 30, sized).1;
+        assert_eq!(
+            sized_name(DrawdownMode::Static, None, None, 30, true),
+            (
+                "Worst daily loss as a share of the starting balance".to_string(),
+                "Max drawdown from the starting balance in any 30-day attempt started on a day of \
+                 the test, as a share of the starting balance"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            sized_name(DrawdownMode::Static, None, utc(0), 30, true).0,
+            "Worst daily loss as a share of the starting balance, days ending at 00:00 UTC"
+        );
+        assert_eq!(
+            trailing(None, false),
+            "Max drawdown from the peak in any 30-day attempt started on a day of the test"
+        );
+        assert_eq!(
+            trailing(None, true),
+            "Max drawdown from the peak in any 30-day attempt started on a day of the test, as a \
+             share of the starting balance"
+        );
+        assert_eq!(
+            trailing(Some(0.0), false),
+            "Max drawdown from the peak, with the floor stopping at the starting balance, in any \
+             30-day attempt started on a day of the test"
+        );
+        assert_eq!(
+            trailing(Some(0.01), true),
+            "Max drawdown from the peak, with the floor stopping 1.00% above the starting balance, \
+             in any 30-day attempt started on a day of the test, as a share of the starting balance"
         );
     }
 
@@ -3153,6 +3247,40 @@ mod tests {
             ..terms
         };
         assert!(with_attempt(zero).validate().is_err());
+    }
+
+    #[test]
+    fn sizing_from_the_starting_cash_is_left_out_of_json_when_off_and_reads_as_off_when_absent() {
+        // Limits without it are written without its key, and limits saved without the key read
+        // as off.
+        let limits = PropFirmLimits::default();
+        let json = serde_json::to_value(limits).unwrap();
+        assert!(json.get("sizes_from_starting_cash").is_none(), "{json}");
+        let read: PropFirmLimits = serde_json::from_value(json).unwrap();
+        assert!(!read.sizes_from_starting_cash);
+        assert_eq!(read, limits);
+        // Set, it is written and read back, in a rule that validates.
+        let fixed = PropFirmLimits {
+            sizes_from_starting_cash: true,
+            ..limits
+        };
+        let json = serde_json::to_value(fixed).unwrap();
+        assert_eq!(json["sizes_from_starting_cash"], true);
+        assert_eq!(
+            serde_json::from_value::<PropFirmLimits>(json).unwrap(),
+            fixed
+        );
+        let VerdictRule::PropFirm { firm, .. } = prop(DrawdownMode::Static) else {
+            unreachable!()
+        };
+        let rule = VerdictRule::PropFirm {
+            firm,
+            limits: fixed,
+            attempt: Some(attempt_terms()),
+        };
+        assert_eq!(rule.validate(), Ok(()));
+        let json = serde_json::to_value(rule).unwrap();
+        assert_eq!(serde_json::from_value::<VerdictRule>(json).unwrap(), rule);
     }
 
     #[test]
