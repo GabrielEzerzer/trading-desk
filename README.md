@@ -12,7 +12,7 @@ Choosing a strategy in Strategy Lab and running it, through to the result. The w
 
 ## Status
 
-Backtesting and paper trading only. The app never sends a real order to any exchange, and nothing in it is financial advice. It is a personal project that changes often.
+Backtesting and paper trading only. The app and its sidecar never send an order; the `td-live` command sends orders only to a venue's demo-trading environment, never to a real-money endpoint, and that is fixed in code. Nothing in it is financial advice. It is a personal project that changes often.
 
 ## Building and running
 
@@ -74,6 +74,38 @@ A request returns at most 5,000 minutes, so a month of one pair takes six or sev
 To keep the latest months unseen while you work on a strategy, start the engine with `TD_DATA_CUTOFF` set to a UTC date written `YYYY-MM-DD`, for example `TD_DATA_CUTOFF=2026-06-30`. While it is set, every backtest, sweep, out-of-sample run, walk-forward run and test battery whose range ends after the end of that date is refused with an error that names the cutoff, before any bar is read. A range that ends at midnight UTC at the end of the cutoff date is allowed. Paper trading and the live chart are not affected.
 
 The cutoff is shown in one place on the server, `GET /health` (`data_cutoff`), and the app shows it while it is in force. Each run saved under a cutoff records it, and `GET /runs/{id}` returns it as `data_cutoff`. A value that is not a real date, an empty one included, stops the engine at start with an error. Runs saved before the cutoff was set still open in full, held-back months included. For the final check on the held-back months, start the engine without the variable.
+
+## Live sessions on a demo account
+
+The `td-live` command runs a strategy on a venue's demo-trading account: it trades the same strategy code on live closed bars and sends its orders to the venue's demo-trading environment. It is the only way to start a live session. It reads its keys from the environment, so it runs through `hush run`:
+
+```
+hush run -e dev -- cargo run -p td-live --bin td-live -- start --id demo-1 --strategy sma_cross --params '{"fast":10,"slow":30}' --symbol BTCUSDT --timeframe 1h --daily-loss 0.03 --max-loss 0.08 --notional-cap 5000
+```
+
+The symbol must be a linear perpetual settled in USDT. The session is saved under `live/<id>/` in the data folder, or in the folder `--data-dir` names. The command prints one line per event and runs until the session halts or you press Ctrl-C.
+
+**The limits.** All three are required and have no defaults.
+
+- `--daily-loss` is the most the account may lose in one trading day, as a share of the starting balance: 0.03 is 3%. The loss is measured from the equity at the start of the day. `--rollover` sets when the day ends: `utc` (the default, midnight UTC), `utc:<minutes>` for a time that many minutes after midnight UTC, or `new-york-17` for 17:00 in New York.
+- `--max-loss` is the most the account may lose over the whole session, from the starting balance, as a share of it.
+- `--notional-cap` is the largest open position allowed, as its value in USDT.
+
+The starting balance is the account's equity when the session is created. Losses are measured from the equity the venue reports, open profit and loss included, never from the strategy's own figures. The limits are written into the session folder when the session is created, and nothing changes them afterwards: `resume` takes no limits, and a session whose saved limits, starting balance or stop state have been edited or removed is refused. The session folder is the owner's: the engine refuses the edits it can detect, but a person or program that can rewrite both `config.json` and `stops.json` can change a saved session.
+
+The limits are checked against the venue before the first bar each time the session starts or resumes, after every bar, and every 15 seconds between bars. An order that is not reduce-only is refused before it is sent when it would take the open position's value above the cap, and the strategy sees an ordinary rejection with the reason. An order that only reduces the position is never refused by the cap. If the venue cannot be read for four checks in a row, the session halts without sending anything and the position stays as it is.
+
+**When a limit is reached**, the stop fires, and that is final. The engine saves the fired stop, halts the strategy and stops it sending, cancels every resting order of the session on the instrument, and closes the position with a reduce-only market order. It then reads the venue again and repeats this, a few seconds apart and for at most ten rounds, until the position is flat and no order of the session rests. If something is still open after that, the session is recorded as fired, not flat, with what is left, and the command exits with an error. A session whose stop fired never trades again.
+
+**The other commands.**
+
+- `resume --id <id>` runs a saved session again with the limits it was created with. If its stop fired and the flatten did not finish, it finishes the flatten instead, and the session stays halted.
+- `status --id <id>` prints the saved status and stop state. It does not contact the venue.
+- `flatten --id <id>` cancels the session's resting orders, closes its position with a reduce-only order and ends the session, which cannot be resumed afterwards. A session that faulted stays halted: `resume` refuses it, and `flatten` is how to close what it holds.
+
+**Ctrl-C** stops the strategy cleanly and leaves the position and its resting orders, the protective stop included, at the venue. The limits are not enforced while the command is not running; `flatten` closes the position.
+
+The command exits with 0 when it is stopped with Ctrl-C or a flatten ends flat, 1 for a halt, a fault or an error, 2 when a stop fired and the position was closed, and 3 when a flatten left something open at the venue.
 
 ## Writing a strategy
 
