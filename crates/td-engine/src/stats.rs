@@ -774,12 +774,15 @@ pub struct AttemptFigures {
 pub struct PropFirmAttempt {
     /// From the daily returns as they are.
     pub full: AttemptFigures,
-    /// From the daily returns with their mean scaled by `reduced_edge_factor` and their shape
-    /// unchanged. The `prop_firm` kind rule asks for its `value` to be above zero.
+    /// From the daily returns with a positive mean scaled by `reduced_edge_factor` and their
+    /// shape unchanged; with a negative mean, the same as `full`, since a reduction never adds
+    /// edge. The `prop_firm` kind rule asks for its `value` to be above zero.
     pub reduced: AttemptFigures,
     /// From the daily returns with their mean removed (a factor of 0) and their shape unchanged:
     /// what the terms alone are worth, with no edge. A positive value here says the terms pay for
     /// an attempt by themselves, so a positive `reduced` value does not show that the edge does.
+    /// With a negative mean, removing it reads better than `full`: this is the terms without an
+    /// edge, not a reduction of the one the test shows.
     /// Reported only: no line of the verdict judges it. `None` in a result saved before it
     /// existed.
     #[serde(default)]
@@ -956,11 +959,13 @@ impl Tally {
 /// `horizon_days`), then a funded account under `terms` after a pass, both checked against the
 /// loss limits on each day's low when `lows` is given and at each daily close when it is not.
 ///
-/// The second set of figures subtracts `(1 - reduced_edge_factor) * mean` from every daily
-/// return and from its low before the size multiplier, so the mean becomes
-/// `reduced_edge_factor * mean` and the days keep their shape, their dips and their flags. The
-/// third set subtracts the whole mean the same way, a factor of 0. All three use the same draws,
-/// so they differ by the edge alone.
+/// The second set of figures subtracts `(1 - reduced_edge_factor) * max(mean, 0)` from every
+/// daily return and from its low before the size multiplier, so a positive mean becomes
+/// `reduced_edge_factor * mean` and the days keep their shape, their dips and their flags. A
+/// negative mean is left as it is, so the second set is the first: reducing an edge that is not
+/// there must not make the strategy lose less. The third set subtracts the whole mean the same
+/// way, whatever its sign, a factor of 0: it is the terms with no edge, so for a negative mean it
+/// reads better than the first. All three use the same draws, so they differ by the edge alone.
 pub fn prop_firm_attempt(
     daily_returns: &[f64],
     lows: Option<&[f64]>,
@@ -977,7 +982,8 @@ pub fn prop_firm_attempt(
     }
     let n = daily_returns.len();
     let mean = daily_returns.iter().sum::<f64>() / n as f64;
-    let shift = (1.0 - terms.reduced_edge_factor) * mean;
+    // The reduction never adds edge: a negative mean is left as it is.
+    let shift = (1.0 - terms.reduced_edge_factor) * mean.max(0.0);
     let lows = lows.unwrap_or(daily_returns);
     let reduced: Vec<f64> = daily_returns.iter().map(|r| r - shift).collect();
     let reduced_lows: Vec<f64> = lows.iter().map(|l| l - shift).collect();
@@ -2685,6 +2691,36 @@ mod tests {
         // The edge is worth something: without it an attempt passes less and is worth less.
         assert!(zero.reduced.pass < zero.full.pass, "{zero:?}");
         assert!(zero.reduced.value < zero.full.value, "{zero:?}");
+    }
+
+    /// The reduction never adds edge. With a negative mean the reduced figures are the full ones;
+    /// subtracting half of a mean of -0.2% a day would have priced a strategy losing 0.1% a day.
+    /// With a positive mean they are the full figures of the series shifted down by
+    /// `(1 - factor) * mean`, as before.
+    #[test]
+    fn a_negative_mean_is_not_reduced_and_a_positive_one_is_reduced_as_before() {
+        let spec = attempt_spec();
+        let terms = AttemptTerms {
+            reduced_edge_factor: 0.5,
+            funded_horizon_days: 60,
+            ..terms()
+        };
+        let attempt = |x: &[f64]| prop_firm_attempt(x, None, &every_day(x), &spec, &terms).unwrap();
+
+        let losing: Vec<f64> = symmetric().iter().map(|r| r * 4.0 - 0.002).collect();
+        let mean = losing.iter().sum::<f64>() / losing.len() as f64;
+        assert!(mean < 0.0, "{mean}");
+        let a = attempt(&losing);
+        assert_eq!(a.reduced, a.full);
+        assert!(a.reduced.value <= a.full.value, "{a:?}");
+
+        let x = edged();
+        let mean = x.iter().sum::<f64>() / x.len() as f64;
+        assert!(mean > 0.0, "{mean}");
+        let shifted: Vec<f64> = x.iter().map(|r| r - 0.5 * mean).collect();
+        let a = attempt(&x);
+        assert_eq!(a.reduced, attempt(&shifted).full);
+        assert!(a.reduced.value < a.full.value, "{a:?}");
     }
 
     #[test]
