@@ -2548,6 +2548,48 @@ fn a_verdict_named_for_a_strategy_that_is_not_registered_is_refused_before_anyth
     assert!(!rig.data().join("live").exists());
 }
 
+/// A symbol the venue lists written another way is refused before a session is written or an
+/// order sent, so the link and the session name one instrument. `Client::instrument_info` refuses
+/// the answer first; td-live's own check stands behind it.
+#[test]
+fn start_refuses_a_symbol_the_venue_lists_written_another_way() {
+    let rig = Rig::new();
+    let feed = rig.feed();
+    rig.mock.list_as("btcusdt", SYMBOL);
+    let (code, text) = rig.td_live(
+        &feed,
+        &[
+            "start",
+            "--id",
+            "lower",
+            "--strategy",
+            LINKED,
+            "--params",
+            LINKED_PARAMS,
+            "--symbol",
+            "btcusdt",
+            "--timeframe",
+            "1h",
+            "--daily-loss",
+            "1",
+            "--max-loss",
+            "1",
+            "--notional-cap",
+            "1000000000000",
+        ],
+    );
+    assert_eq!(code, 1, "{text}");
+    assert!(!rig.data().join("live").exists(), "{text}");
+    let sent = rig.mock.requests();
+    assert!(
+        !sent
+            .iter()
+            .any(|r| [CREATE, CANCEL, AMEND].contains(&r.path.as_str())),
+        "{text}"
+    );
+    assert!(text.contains("another symbol"), "{text}");
+}
+
 /// Text from the data folder reaches the owner's terminal without control characters, so a file
 /// another person or program wrote cannot drive it: a run record's text in an error, and the link
 /// `status` shows from a session's config.
