@@ -3581,7 +3581,7 @@ mod tests {
             let limit = (stitched_fall.own + stitched_fall.cash) / 2.0 / share;
             assert_eq!(drawdown_warnings(&battery(drawdown, limit, false)).len(), 1);
             let on = battery(drawdown, limit, true);
-            assert_ne!(fall.cash, stitched_fall.own, "{drawdown:?}");
+            assert_ne!(fall.cash, stitched_fall.cash, "{drawdown:?}");
             assert_eq!(line(&on, "max_drawdown").value, Some(fall.cash));
             assert_eq!(
                 (

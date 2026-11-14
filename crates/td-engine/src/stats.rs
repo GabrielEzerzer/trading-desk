@@ -645,8 +645,8 @@ fn walk_path(
 }
 
 /// Walks days, each its return and its low (applied as [`PropFirmSpec::step`] says), on one
-/// balance from 1 with a peak that starts there, and returns the day (counted from 1) it first breached a limit, if it did before the days ran
-/// out: one account, never reset.
+/// balance from 1 with a peak that starts there, and returns the day (counted from 1) it first
+/// breached a limit, if it did before the days ran out: one account, never reset.
 fn first_breach(spec: &PropFirmSpec, days: impl Iterator<Item = (f64, f64)>) -> Option<usize> {
     let (mut equity, mut peak) = (1.0f64, 1.0f64);
     for (day, (r, low)) in (1..).zip(days) {
