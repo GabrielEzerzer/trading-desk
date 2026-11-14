@@ -582,10 +582,18 @@ fn reference_by_hand(
     (dir, paper)
 }
 
-/// Asserts the API's state of a session is the reference's, apart from its id and status.
+/// Asserts the API's state of a session is the reference's, apart from its id, status and link.
+/// The API links each strategy session it starts and the reference is built without one, so the
+/// link is only checked to be there exactly when the session runs a strategy.
 fn assert_same_state(api: &Value, reference: &PaperSession) {
     let mut expected = serde_json::to_value(SessionState::of(reference)).expect("serializes");
     let mut actual = api.clone();
+    let linked = actual
+        .as_object_mut()
+        .expect("an object")
+        .remove("link")
+        .is_some();
+    assert_eq!(linked, reference.config().strategy != MANUAL_STRATEGY);
     for state in [&mut expected, &mut actual] {
         let object = state.as_object_mut().expect("an object");
         object.remove("id");

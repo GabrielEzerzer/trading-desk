@@ -17,9 +17,15 @@ use super::data::{
 };
 use super::error::{ErrorBody, ErrorResponse};
 use super::jobs::{JobCreated, JobInfo, JobKind, JobRequest, JobResult, JobStatus};
-use super::plans::{PlanDone, PlanInstrumentDone, PlanRequest, VerdictSummary};
+use super::plans::{
+    LinkState, LinkedVerdict, PlanDone, PlanInstrumentDone, PlanRequest, SessionLink,
+    VerdictSummary,
+};
 use super::runs::{DataReport, RunCheck, RunDetail, RunDone, ToleratedBucket};
-use super::sessions::{PositionInfo, SessionState, SessionSummary, StartSessionRequest};
+use super::sessions::{
+    ComparedBars, PositionInfo, SessionComparisonResponse, SessionState, SessionSummary,
+    StartSessionRequest,
+};
 use super::ws::{ClientMessage, ServerMessage};
 use crate::{
     Funding, ManualOrder, ManualOrderType, OrderSource, PaperConfig, PaperFill, PaperOrder,
@@ -159,6 +165,12 @@ pub fn render() -> String {
         td_engine::StartOffset,
         td_engine::PermutationSpec,
         td_engine::PermutationResult,
+        td_engine::SessionComparison,
+        td_engine::SideSummary,
+        td_engine::FillPair,
+        td_engine::OrderPair,
+        td_engine::DifferenceKind,
+        td_engine::Difference,
         // the API
         Handshake,
         ErrorResponse,
@@ -210,6 +222,11 @@ pub fn render() -> String {
         ManualOrder,
         ManualOrderType,
         SessionState,
+        SessionLink,
+        LinkedVerdict,
+        LinkState,
+        SessionComparisonResponse,
+        ComparedBars,
         SessionEvent,
         ClientMessage,
         ServerMessage,

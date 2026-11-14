@@ -105,12 +105,22 @@
 //!   renaming a strategy starts both again from zero. Only the given strategy's with `strategy`.
 //! - Paper sessions (see [`sessions`]):
 //!   - `POST /sessions` `{strategy, params, instrument, timeframe, starting_cash, slippage_bps,
-//!     fees?}`: creates a session and starts it, 201 with its summary. `instrument` is an
-//!     instrument id; its trading rules come from `GET /instruments`. Strategy `none`, with no
-//!     parameters, makes a manual session: no strategy runs and only manual orders trade.
+//!     fees?, verdict_run_id?}`: creates a session and starts it, 201 with its summary.
+//!     `instrument` is an instrument id; its trading rules come from `GET /instruments`. Strategy
+//!     `none`, with no parameters, makes a manual session: no strategy runs and only manual
+//!     orders trade. A strategy session is linked to its code hash, plan and rule, and to the
+//!     verdict `verdict_run_id` names, or else the latest verdict for its strategy and instrument;
+//!     400 `invalid_verdict` if the named verdict is missing, is for another strategy or
+//!     instrument, or the session is manual.
 //!   - `GET /sessions`: every session, oldest first, with its status and equity.
 //!   - `GET /sessions/{id}`: a session's full state: status, position, cash, equity curve, open
-//!     orders, fills and trades so far.
+//!     orders, fills and trades so far, and its `link` when it has one, with `stale` set when its
+//!     code, plan or engine no longer matches the linked verdict.
+//!   - `GET /sessions/{id}/comparison`: a backtest of the session's strategy and parameters on
+//!     the session's own logged bars, compared with what the session recorded: fills paired one
+//!     to one, the fills and orders only one side has, fees, funding and result per side, the
+//!     ratio of the session's P&L to the backtest's, and each difference named. 409
+//!     `nothing_to_compare` for a manual session or one with no live bar yet.
 //!   - `POST /sessions/{id}/stop`: 200 once stopped, 409 `not_running` if it was not running.
 //!   - `POST /sessions/{id}/resume`: replays a stopped session and starts it again, backfilling
 //!     what it missed; 409 `already_running` if it is running. A session that ended on its own
@@ -378,6 +388,7 @@ pub(crate) fn router(state: Arc<AppState>) -> Router {
         .route("/sessions/{id}", get(sessions::get))
         .route("/sessions/{id}/stop", post(sessions::stop))
         .route("/sessions/{id}/resume", post(sessions::resume))
+        .route("/sessions/{id}/comparison", get(sessions::comparison))
         .route("/sessions/{id}/orders", post(sessions::place_order))
         .route(
             "/sessions/{id}/orders/{order_id}/cancel",
