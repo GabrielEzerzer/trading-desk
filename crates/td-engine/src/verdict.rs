@@ -351,14 +351,15 @@ pub struct PropFirmLimits {
     #[serde(default, skip_serializing_if = "is_false")]
     pub sizes_from_starting_cash: bool,
     /// The most open notional the firm allows, as a multiple of the account size, the starting
-    /// cash. When set, a line fails if the largest open notional of the account the battery reads
-    /// rises above it, at any point inside a bar the peak leverage is read at, times the
-    /// `attempt` terms' `funded_size` when the rule has them. With `sizes_from_starting_cash`,
-    /// that account trades a fixed size and the figure is its notional over the starting cash.
-    /// Without it, the account's position grows and shrinks with its balance from one test window
-    /// to the next, so the figure is that scaled notional over the starting cash: a firm measures
-    /// the limit against the account size, not the balance. `None`, the default, sets no limit
-    /// and is left out of JSON.
+    /// cash. When set, a line fails if the largest open notional at any point inside a bar the
+    /// peak leverage is read at, in any walk-forward test window the battery's account counts, is
+    /// above that multiple of the starting cash. Each window is its own backtest from the starting
+    /// cash, so the figure is the window's own notional over the starting cash, with or without
+    /// `sizes_from_starting_cash`; it is not scaled by the stitched curve's level, as each attempt
+    /// the other lines read starts again from its own balance. With `attempt` terms it is taken at
+    /// the larger of their `evaluation_size` and `funded_size`, so a phase traded at either size
+    /// that breaches the limit fails the line. `None`, the default, sets no limit and is left out
+    /// of JSON.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_open_notional_multiple: Option<f64>,
 }
@@ -1249,10 +1250,10 @@ pub struct KindInputs {
     /// when false, so a result saved before it existed reads as checked at closes, as it was.
     #[serde(default, skip_serializing_if = "is_false")]
     pub limits_inside_day: bool,
-    /// The largest open notional inside any bar over the starting cash, at the funded size when
-    /// the rule has `attempt` terms, read for a `prop_firm` rule with `max_open_notional_multiple`
-    /// and `None` otherwise (see that field for which account it describes). Left out when
-    /// `None`.
+    /// The largest open notional inside any bar of a counted test window over the starting cash,
+    /// at the larger of the evaluation and funded sizes when the rule has `attempt` terms, read
+    /// for a `prop_firm` rule with `max_open_notional_multiple` and `None` otherwise (see that
+    /// field). Left out when `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub peak_open_notional: Option<f64>,
 }
@@ -1369,14 +1370,15 @@ pub fn evaluate(rule: &VerdictRule, x: &KindInputs) -> Vec<Criterion> {
             ];
             if let Some(multiple) = limits.max_open_notional_multiple {
                 let at = if attempt.is_some() {
-                    ", at the funded account's size"
+                    ", at the larger of the evaluation and funded sizes"
                 } else {
                     ""
                 };
                 lines.push(line(
                     "open_notional",
                     &format!(
-                        "Largest open notional inside a bar as a multiple of the starting                          balance{at}"
+                        "Largest open notional inside a bar as a multiple of the starting \
+                         balance{at}"
                     ),
                     x.peak_open_notional,
                     AtMost,
@@ -3375,6 +3377,29 @@ mod tests {
                 (l.value, l.outcome, l.limit),
                 (notional, outcome, Some(2.5))
             );
+        }
+        // The label is one sentence with single spaces; with attempt terms it names the size the
+        // figure is taken at.
+        let plain = line(&capped, Some(2.5)).unwrap().name;
+        assert_eq!(
+            plain,
+            "Largest open notional inside a bar as a multiple of the starting balance"
+        );
+        let priced = VerdictRule::PropFirm {
+            firm,
+            limits: PropFirmLimits {
+                max_open_notional_multiple: Some(2.5),
+                ..limits
+            },
+            attempt: Some(attempt_terms()),
+        };
+        let sized = line(&priced, Some(2.5)).unwrap().name;
+        assert_eq!(
+            sized,
+            format!("{plain}, at the larger of the evaluation and funded sizes")
+        );
+        for name in [plain, sized] {
+            assert!(!name.contains("  "), "{name}");
         }
         // Without the limit there is no line, whatever the figure, and the other lines are as
         // before.

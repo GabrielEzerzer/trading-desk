@@ -1835,12 +1835,14 @@ fn placed_peak_leverage(exposures: &[Exposure], moved: f64) -> f64 {
         .fold(0.0, f64::max)
 }
 
-/// The largest open notional, in the account currency, of the account `windows`' test runs make
-/// stitched with `sizing`: each counted window's largest notional at the points its run's intrabar
-/// measures evaluate (`held`, one list per window, from [`crate::runner::run_exposures`]), times
-/// the window's factor ([`segment_factors`]). When compounding, a window's position is its own
-/// times the account's level over the starting cash; at a fixed size it is the window's own. 0
-/// when no counted window held a position.
+/// The largest open notional, in the account currency, of the test windows the account stitched
+/// with `sizing` counts ([`segment_factors`]): each counted window's own largest notional at the
+/// points its run's intrabar measures evaluate (`held`, one list per window, from
+/// [`crate::runner::run_exposures`]). Each window is its own backtest from the starting cash, so
+/// this is the notional of an account started at the starting cash, at a fixed size or
+/// compounding alike: when compounding it is not scaled by the stitched curve's level, as each
+/// attempt a `prop_firm` rule's other lines read starts again from its own balance. 0 when no
+/// counted window held a position.
 pub(crate) fn peak_open_notional(
     starting_cash: f64,
     windows: &[WindowResult],
@@ -1850,7 +1852,8 @@ pub(crate) fn peak_open_notional(
     segment_factors(starting_cash, &test_curves(windows), sizing)
         .into_iter()
         .zip(held)
-        .flat_map(|(f, h)| h.iter().map(move |x| x.notional * f))
+        .filter(|&(f, _)| f != 0.0)
+        .flat_map(|(_, h)| h.iter().map(|x| x.notional))
         .fold(0.0, f64::max)
 }
 
@@ -1970,7 +1973,7 @@ fn stitched_benchmark(
             equity: &h.equity,
             ranges: &h.intrabar.ranges,
             peak_leverage: h.intrabar.peak_leverage,
-            exposures: Some(&h.intrabar.exposures),
+            exposures: None,
             fills: &h.fills,
             trades: &h.trades,
             funding_paid: h.funding_paid,
@@ -2865,27 +2868,30 @@ mod tests {
         assert_eq!(peak(Sizing::Compounding), Some(1.5));
     }
 
-    /// The largest open notional of the account the windows make: at a fixed size each window's
-    /// own; compounding scales the second by the account's level, twice the starting cash.
+    /// The largest open notional of the windows the account counts, each window's own, whether
+    /// the account compounds or trades a fixed size. The first window doubles the starting cash,
+    /// so the stitched curve stands at 20,000 where the second starts; the second's own 8,000 is
+    /// read as 8,000, not as the 16,000 the curve's level would scale it to.
     #[test]
-    fn the_peak_open_notional_takes_each_window_at_the_size_the_account_holds() {
+    fn the_peak_open_notional_reads_each_counted_window_at_its_own_size() {
         let mut doubled = rising_window(0, 20);
         doubled.out_of_sample.equity.last_mut().unwrap().equity = 20_000.0;
         let at = |notional| Exposure {
             notional,
             equity: 10_000.0,
         };
-        let held = [vec![at(5_000.0), at(12_000.0)], vec![at(8_000.0)]];
+        let held = [vec![at(5_000.0), at(6_000.0)], vec![at(8_000.0)]];
         let windows = [doubled, rising_window(20, 40)];
         let peak =
             |windows: &[WindowResult], sizing| peak_open_notional(10_000.0, windows, &held, sizing);
-        assert_eq!(peak(&windows, Sizing::FixedSize), 12_000.0);
-        assert_eq!(peak(&windows, Sizing::Compounding), 16_000.0);
-        // Windows after the account is gone hold nothing.
+        for sizing in [Sizing::FixedSize, Sizing::Compounding] {
+            assert_eq!(peak(&windows, sizing), 8_000.0);
+        }
+        // A window after the account is gone is not counted, so its notional is not read.
         let mut gone = windows.clone();
         gone[0].out_of_sample.equity.last_mut().unwrap().equity = 0.0;
         for sizing in [Sizing::FixedSize, Sizing::Compounding] {
-            assert_eq!(peak(&gone, sizing), 12_000.0);
+            assert_eq!(peak(&gone, sizing), 6_000.0);
         }
     }
 

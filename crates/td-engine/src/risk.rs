@@ -39,7 +39,8 @@ pub struct Intrabar {
     /// where equity is at or below zero are skipped: the account is bankrupt there, which the
     /// drawdowns show.
     pub peak_leverage: Option<f64>,
-    /// Every one of those points where a position is open, in path order, bankrupt ones too.
+    /// Every one of those points where a position is open, in path order, bankrupt ones too, when
+    /// asked for ([`intrabar_with`]); empty otherwise.
     pub exposures: Vec<Exposure>,
 }
 
@@ -96,6 +97,31 @@ pub fn intrabar(
     funding: &[BarFunding],
     account: AccountCurrency,
 ) -> Intrabar {
+    intrabar_with(
+        starting_cash,
+        bars,
+        asks,
+        equity,
+        fills,
+        funding,
+        account,
+        false,
+    )
+}
+
+/// [`intrabar`], also keeping [`Intrabar::exposures`] when `keep_exposures` is set. Only
+/// [`crate::runner::run_exposures`] asks for them, so every other run keeps none.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn intrabar_with(
+    starting_cash: f64,
+    bars: &[Candle],
+    asks: &[Option<Candle>],
+    equity: &[EquityPoint],
+    fills: &[Fill],
+    funding: &[BarFunding],
+    account: AccountCurrency,
+    keep_exposures: bool,
+) -> Intrabar {
     let mut ranges = Vec::with_capacity(bars.len());
     let mut peak: Option<f64> = (!bars.is_empty()).then_some(0.0);
     let mut exposures = Vec::new();
@@ -126,10 +152,12 @@ pub fn intrabar(
                 return;
             }
             let notional = account.from_quote(q.abs() * price, price);
-            exposures.push(Exposure {
-                notional,
-                equity: e,
-            });
+            if keep_exposures {
+                exposures.push(Exposure {
+                    notional,
+                    equity: e,
+                });
+            }
             if e > 0.0
                 && let Some(lev) = finite(notional / e)
             {
@@ -582,13 +610,26 @@ mod tests {
         // least equity: 2 * 104 / 1007.8 on bar 0 (0.20639) against 2 * 99 / 997.3 at bar 1's
         // open (0.19854) and 2 * 106 / 1011.3 at its fill (0.20963).
         approx(x.peak_leverage.unwrap(), 2.0 * 106.0 / 1011.3);
+        // The open positions are kept only when asked for, and asking changes nothing else.
+        assert!(x.exposures.is_empty());
+        let kept = intrabar_with(
+            1000.0,
+            &bars,
+            &[],
+            &equity,
+            &fills,
+            &funding,
+            AccountCurrency::Quote,
+            true,
+        );
+        assert_eq!((&kept.ranges, kept.peak_leverage), (r, x.peak_leverage));
         // Every point with the position open is recorded, in path order, and none while flat:
         // bar 0's low, high and close after the entry, then bar 1's open, the exit's price with
         // the position before it, and the maker exit's adverse low.
-        let notionals: Vec<f64> = x.exposures.iter().map(|p| p.notional).collect();
+        let notionals: Vec<f64> = kept.exposures.iter().map(|p| p.notional).collect();
         let held = [97.0, 104.0, 102.0, 99.0, 106.0, 95.0].map(|price| 2.0 * price);
         assert_eq!(notionals, held);
-        let peak = x.exposures.iter().map(|p| p.notional / p.equity);
+        let peak = kept.exposures.iter().map(|p| p.notional / p.equity);
         approx(peak.fold(0.0, f64::max), x.peak_leverage.unwrap());
     }
 

@@ -49,7 +49,7 @@ pub fn default_slippage_bps(instrument: &Instrument) -> f64 {
 /// in the same change. `tests/revision.rs` records the checksums and the fixture each revision
 /// gave, and fails when either moves without a new row there; a row at a new revision needs this
 /// bump.
-pub const ENGINE_REVISION: u32 = 13;
+pub const ENGINE_REVISION: u32 = 14;
 
 /// Everything that defines a backtest apart from the data itself.
 ///
@@ -332,7 +332,7 @@ pub(crate) fn run_exposures(
     funding: &[(Millis, f64)],
     references: &[ReferenceBars],
 ) -> Result<Vec<Exposure>, EngineError> {
-    let sim = simulate(config, bars, asks, funding, references, || {
+    let sim = simulate(config, bars, asks, funding, references, true, || {
         build_strategy(&config.strategy, &config.params)
     })?;
     Ok(sim.intrabar.exposures)
@@ -361,7 +361,7 @@ pub(crate) fn run_metrics(
     funding: &[(Millis, f64)],
     references: &[ReferenceBars],
 ) -> Result<MetricsReport, EngineError> {
-    let sim = simulate(config, bars, asks, funding, references, || {
+    let sim = simulate(config, bars, asks, funding, references, false, || {
         build_strategy(&config.strategy, &config.params)
     })?;
     Ok(sim.report)
@@ -392,7 +392,7 @@ pub(crate) fn run_built(
         series,
         intrabar,
         report,
-    } = simulate(config, bars, asks, funding, references, build)?;
+    } = simulate(config, bars, asks, funding, references, false, build)?;
     let benchmark = benchmark(
         config,
         &bars,
@@ -450,13 +450,16 @@ struct Simulated {
     report: MetricsReport,
 }
 
-/// Checks the data, runs the strategy on a [`Session`] and derives the trade list and metrics.
+/// Checks the data, runs the strategy on a [`Session`] and derives the trade list and metrics,
+/// keeping the open positions inside the bars ([`Intrabar::exposures`]) only with
+/// `keep_exposures`.
 fn simulate(
     config: &BacktestConfig,
     bars: &[Candle],
     asks: &[Candle],
     funding: &[(Millis, f64)],
     references: &[ReferenceBars],
+    keep_exposures: bool,
     build: impl FnOnce() -> Result<Box<dyn Strategy>, EngineError>,
 ) -> Result<Simulated, EngineError> {
     let (warmup, traded) = select_bars(config, bars)?;
@@ -511,7 +514,7 @@ fn simulate(
     attach_stops(&mut trades, session.trade_stops(), account);
     mark_forced_closes(&mut trades, &fills);
     let series = EquitySeries::new(config.starting_cash, session.equity(), tf);
-    let intrabar = risk::intrabar(
+    let intrabar = risk::intrabar_with(
         config.starting_cash,
         &bars,
         &traded_asks,
@@ -519,6 +522,7 @@ fn simulate(
         &fills,
         session.bar_funding(),
         account,
+        keep_exposures,
     );
     let report = metrics::report_with(
         &series,

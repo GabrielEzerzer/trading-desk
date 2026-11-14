@@ -1331,14 +1331,15 @@ breach_horizon_days: number,
 sizes_from_starting_cash?: boolean, 
 /**
  * The most open notional the firm allows, as a multiple of the account size, the starting
- * cash. When set, a line fails if the largest open notional of the account the battery reads
- * rises above it, at any point inside a bar the peak leverage is read at, times the
- * `attempt` terms' `funded_size` when the rule has them. With `sizes_from_starting_cash`,
- * that account trades a fixed size and the figure is its notional over the starting cash.
- * Without it, the account's position grows and shrinks with its balance from one test window
- * to the next, so the figure is that scaled notional over the starting cash: a firm measures
- * the limit against the account size, not the balance. `None`, the default, sets no limit
- * and is left out of JSON.
+ * cash. When set, a line fails if the largest open notional at any point inside a bar the
+ * peak leverage is read at, in any walk-forward test window the battery's account counts, is
+ * above that multiple of the starting cash. Each window is its own backtest from the starting
+ * cash, so the figure is the window's own notional over the starting cash, with or without
+ * `sizes_from_starting_cash`; it is not scaled by the stitched curve's level, as each attempt
+ * the other lines read starts again from its own balance. With `attempt` terms it is taken at
+ * the larger of their `evaluation_size` and `funded_size`, so a phase traded at either size
+ * that breaches the limit fails the line. `None`, the default, sets no limit and is left out
+ * of JSON.
  */
 max_open_notional_multiple?: number | null, };
 
@@ -1788,10 +1789,10 @@ attempt_value: number | null,
  */
 limits_inside_day?: boolean, 
 /**
- * The largest open notional inside any bar over the starting cash, at the funded size when
- * the rule has `attempt` terms, read for a `prop_firm` rule with `max_open_notional_multiple`
- * and `None` otherwise (see that field for which account it describes). Left out when
- * `None`.
+ * The largest open notional inside any bar of a counted test window over the starting cash,
+ * at the larger of the evaluation and funded sizes when the rule has `attempt` terms, read
+ * for a `prop_firm` rule with `max_open_notional_multiple` and `None` otherwise (see that
+ * field). Left out when `None`.
  */
 peak_open_notional?: number | null, };
 
