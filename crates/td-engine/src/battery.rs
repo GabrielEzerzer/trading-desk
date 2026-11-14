@@ -63,9 +63,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde::{Deserialize, Serialize};
 use td_core::{
-    AccountCurrency, Candle, Carry, FeeSchedule, Fill, Instrument, InstrumentId, Millis, Timeframe,
+    AccountCurrency, Candle, Carry, FeeSchedule, Fill, Instrument, InstrumentId, Millis, Side,
+    Timeframe,
 };
 
+use crate::fill;
 use crate::metrics::{self, DAY_MS, EquitySeries};
 use crate::plan::check_start_offsets;
 use crate::portfolio::next_position;
@@ -264,6 +266,16 @@ pub struct Breakdown {
     pub best_trade_pnl: Option<f64>,
     /// The out-of-sample return without it.
     pub return_without_best_trade: Option<f64>,
+    /// The out-of-sample fills of resting limits, those that filled as a maker. `None` in a
+    /// result saved before it existed.
+    #[serde(default)]
+    pub limit_fills: Option<usize>,
+    /// How many of `limit_fills` were touch-only: the bar reached the limit without trading a
+    /// tick through it, and the backtest filled the order in full with no queue. A real book fills
+    /// such an order only as far as its place in the queue allows, so this many of the fills the
+    /// result rests on may not have happened. `None` in a result saved before it existed.
+    #[serde(default)]
+    pub touch_only_fills: Option<usize>,
 }
 
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -641,7 +653,7 @@ pub fn run_battery_with_references(
             &BootstrapSpec::trades(derive_seed(seed, SEED_TRADE_BOOTSTRAP)),
         )
         .ok();
-        let breakdown = breakdown(wf, bars, cash);
+        let breakdown = breakdown(wf, bars, asks, &instrument, cash);
 
         oos_integrity = OosIntegrityInputs {
             sharpe: m.sharpe,
@@ -1683,7 +1695,13 @@ fn trade_returns(trades: &[Trade], equity: &[EquityPoint], cash: f64) -> Vec<f64
 }
 
 /// R8 on the stitched walk-forward.
-fn breakdown(wf: &WalkForwardResult, bars: &[Candle], cash: f64) -> Breakdown {
+fn breakdown(
+    wf: &WalkForwardResult,
+    bars: &[Candle],
+    asks: &[Candle],
+    instrument: &Instrument,
+    cash: f64,
+) -> Breakdown {
     let mut long = SideResult::default();
     let mut short = SideResult::default();
     for t in wf.trades.iter().filter(|t| !t.open) {
@@ -1724,6 +1742,7 @@ fn breakdown(wf: &WalkForwardResult, bars: &[Candle], cash: f64) -> Breakdown {
         .map(|t| t.net_pnl)
         .reduce(f64::max);
     let end = wf.equity.last().map_or(cash, |p| p.equity);
+    let (limit_fills, touch_only_fills) = limit_fills(&wf.fills, bars, asks, instrument);
     Breakdown {
         long,
         short,
@@ -1732,7 +1751,37 @@ fn breakdown(wf: &WalkForwardResult, bars: &[Candle], cash: f64) -> Breakdown {
         falling,
         best_trade_pnl,
         return_without_best_trade: best_trade_pnl.map(|b| (end - b) / cash - 1.0),
+        limit_fills: Some(limit_fills),
+        touch_only_fills: Some(touch_only_fills),
     }
+}
+
+/// How many of `fills` were resting limits' and how many of those were touch-only
+/// ([`fill::touch_only`]), each read on its own side's bar at its time: the ask for a buy on a
+/// market with quotes (`asks` is empty without them), the bar otherwise.
+fn limit_fills(
+    fills: &[Fill],
+    bars: &[Candle],
+    asks: &[Candle],
+    instrument: &Instrument,
+) -> (usize, usize) {
+    let by_time = |candles: &[Candle]| -> HashMap<Millis, Candle> {
+        candles.iter().map(|c| (c.open_time, *c)).collect()
+    };
+    let (bids, asks) = (by_time(bars), by_time(asks));
+    let (mut limits, mut touches) = (0, 0);
+    for f in fills {
+        let own = match f.side {
+            Side::Buy => asks.get(&f.time).or_else(|| bids.get(&f.time)),
+            Side::Sell => bids.get(&f.time),
+        };
+        // Every fill is at a bar's open time, so its bar is always found.
+        if let Some(touch) = own.and_then(|bar| fill::touch_only(f, bar, instrument)) {
+            limits += 1;
+            touches += usize::from(touch);
+        }
+    }
+    (limits, touches)
 }
 
 #[cfg(test)]
@@ -1865,6 +1914,93 @@ mod tests {
         let mut fills = a.clone();
         fills.fills[0].price += 0.01;
         assert_eq!(repeat_differences(&a, &fills), 1);
+    }
+
+    /// The fills of resting limits the result rests on, and those of them the bar only touched,
+    /// on a market with quotes so each fill is read on its own side's bar. Every bid opens and
+    /// closes at 100 and its ask a spread higher, and the strategy rests a buy at 99 and a sell at
+    /// 101: the buy fills on the ask, touched where the ask's low is 99, traded through where it
+    /// is 98.75, and the sell on the bid, touched where its high is 101, through at 101.25.
+    #[test]
+    fn the_breakdown_counts_the_limit_fills_and_those_only_touched() {
+        let entry = crate::find_strategy("test_rests_limits").unwrap();
+        let mut plan = entry.plan;
+        let mut instrument = test_instrument();
+        instrument.id.kind = InstrumentKind::Fx;
+        instrument.id.venue = Venue::Oanda;
+        plan.instruments = vec![instrument.id.clone()];
+        let step = plan.timeframe.duration_ms();
+        let count = ((plan.period.to - plan.period.from) / step) as usize;
+        let candle = |i: usize, base: f64, high: f64, low: f64| Candle {
+            open_time: plan.period.from + i as Millis * step,
+            open: base,
+            high,
+            low,
+            close: base,
+            volume: 1.0,
+            quote_volume: base,
+        };
+        // The bars not wholly inside the market's weekend.
+        let open: Vec<usize> = (0..count)
+            .filter(|&i| {
+                let start = plan.period.from + i as Millis * step;
+                let closed = InstrumentKind::Fx.closed_spans(start, start + step);
+                !matches!(closed.as_slice(), [span] if *span == (start..start + step))
+            })
+            .collect();
+        let bids: Vec<Candle> = open
+            .iter()
+            .map(|&i| candle(i, 100.0, [101.0, 101.25][i % 2], 98.5))
+            .collect();
+        let asks: Vec<Candle> = open
+            .iter()
+            .map(|&i| candle(i, 100.5, 101.5, [99.0, 98.75, 99.0][i % 3]))
+            .collect();
+        let spec = BatterySpec {
+            strategy: entry.name,
+            plan: &plan,
+            rule: &entry.rule,
+            instrument: &instrument,
+            seed: 7,
+        };
+        let r = run_battery(&spec, &bids, &asks, &[], None).unwrap();
+
+        let wf = r.walk_forward.as_ref().unwrap();
+        let at =
+            |candles: &[Candle], t: Millis| *candles.iter().find(|c| c.open_time == t).unwrap();
+        let resting: Vec<&Fill> = wf
+            .fills
+            .iter()
+            .filter(|f| f.liquidity == td_core::Liquidity::Maker)
+            .collect();
+        let touched = resting
+            .iter()
+            .filter(|f| match f.side {
+                Side::Buy => at(&asks, f.time).low == f.price,
+                Side::Sell => at(&bids, f.time).high == f.price,
+            })
+            .count();
+        assert!(resting.iter().any(|f| f.side == Side::Buy));
+        assert!(resting.iter().any(|f| f.side == Side::Sell));
+        assert!(
+            0 < touched && touched < resting.len(),
+            "{touched} of {}",
+            resting.len()
+        );
+        let b = r.breakdown.unwrap();
+        assert_eq!(b.limit_fills, Some(resting.len()));
+        assert_eq!(b.touch_only_fills, Some(touched));
+    }
+
+    /// A breakdown saved before the limit fill counts existed loads, with both unknown.
+    #[test]
+    fn a_breakdown_saved_before_the_limit_fill_counts_loads_without_them() {
+        let saved = r#"{"long":{"trades":1,"net_pnl":2.0},"short":{"trades":0,"net_pnl":0.0},
+            "funding_paid":0.0,"rising":{"windows":1,"strategy_return":0.1},
+            "falling":{"windows":0,"strategy_return":0.0},"best_trade_pnl":2.0,
+            "return_without_best_trade":0.0}"#;
+        let b: Breakdown = serde_json::from_str(saved).unwrap();
+        assert_eq!((b.limit_fills, b.touch_only_fills), (None, None));
     }
 
     /// A strategy that never trades with its defaults passes I2 and I3 on the plan's backtest

@@ -1947,7 +1947,19 @@ best_trade_pnl: number | null,
 /**
  * The out-of-sample return without it.
  */
-return_without_best_trade: number | null, };
+return_without_best_trade: number | null, 
+/**
+ * The out-of-sample fills of resting limits, those that filled as a maker. `None` in a
+ * result saved before it existed.
+ */
+limit_fills: number | null, 
+/**
+ * How many of `limit_fills` were touch-only: the bar reached the limit without trading a
+ * tick through it, and the backtest filled the order in full with no queue. A real book fills
+ * such an order only as far as its place in the queue allows, so this many of the fills the
+ * result rests on may not have happened. `None` in a result saved before it existed.
+ */
+touch_only_fills: number | null, };
 
 export type SideResult = { 
 /**
