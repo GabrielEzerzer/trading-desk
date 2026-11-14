@@ -216,6 +216,13 @@ pub struct AttemptTerms {
     /// balance, or where the floor stands at that payout if that is higher.
     #[serde(default)]
     pub payout_locks_floor: bool,
+    /// Whether each payout returns the balance to the start: it counts the profit above the
+    /// start up to `payout_cap`, and any profit above the cap is lost rather than left in the
+    /// account. The loss limits stay as they were. It cannot be set with `payout_locks_floor`,
+    /// and a `prop_firm` rule refuses it with a trailing drawdown: either can put the floor
+    /// at or above the start a payout returns to. `false` is left out of JSON.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub payout_resets_balance: bool,
     /// Days the funded account is simulated for after a pass.
     pub funded_horizon_days: u32,
     /// The size traded in the evaluation, as a multiple of the size the strategy was tested at:
@@ -275,6 +282,14 @@ impl AttemptTerms {
         positive("attempt.evaluation_size", self.evaluation_size)?;
         positive("attempt.funded_size", self.funded_size)?;
         probability("attempt.reduced_edge_factor", self.reduced_edge_factor)?;
+        if self.payout_resets_balance && self.payout_locks_floor {
+            return Err(PlanError(
+                "attempt.payout_resets_balance cannot be set with attempt.payout_locks_floor: \
+                 the lock fixes the floor at or above the start, and a payout returns the \
+                 balance to the start"
+                    .to_string(),
+            ));
+        }
         Ok(())
     }
 }
@@ -473,6 +488,17 @@ impl VerdictRule {
                 }
                 if let Some(terms) = attempt {
                     terms.validate()?;
+                    // shortcut: whether a payout that returns the balance to the start also
+                    // returns a trailing floor's peak there is not settled, and keeping the peak
+                    // can leave the floor at or above the start; allow the pair once a plan's
+                    // firm says which it does.
+                    if terms.payout_resets_balance && firm.drawdown == DrawdownMode::Trailing {
+                        return Err(PlanError(
+                            "attempt.payout_resets_balance needs a static drawdown: a trailing \
+                             floor can rise to or above the start a payout returns the balance to"
+                                .to_string(),
+                        ));
+                    }
                     // The trading-day flags are built once, at the tested size: see the shortcut
                     // on `battery::traded_days`.
                     if firm.trading_day.is_some_and(|t| t.min_trade_size.is_some()) {
@@ -3083,6 +3109,7 @@ mod tests {
             payout_cap: None,
             max_payouts: None,
             payout_locks_floor: false,
+            payout_resets_balance: false,
             funded_horizon_days: 180,
             evaluation_size: 1.0,
             funded_size: 1.0,
@@ -3126,6 +3153,44 @@ mod tests {
             ..terms
         };
         assert!(with_attempt(zero).validate().is_err());
+    }
+
+    #[test]
+    fn a_payout_that_resets_the_balance_is_left_out_of_json_when_off_and_needs_a_static_floor() {
+        // Terms without it are written without its key; a saved terms object without the key
+        // reads as off.
+        let terms = attempt_terms();
+        let json = serde_json::to_value(terms).unwrap();
+        assert!(json.get("payout_resets_balance").is_none(), "{json}");
+        assert_eq!(serde_json::from_value::<AttemptTerms>(json).unwrap(), terms);
+        // Set, it is written and read back, and validates under a static floor.
+        let reset = AttemptTerms {
+            payout_resets_balance: true,
+            ..terms
+        };
+        let json = serde_json::to_value(reset).unwrap();
+        assert_eq!(json["payout_resets_balance"], true);
+        assert_eq!(serde_json::from_value::<AttemptTerms>(json).unwrap(), reset);
+        let VerdictRule::PropFirm { firm, limits, .. } = prop(DrawdownMode::Static) else {
+            unreachable!()
+        };
+        let static_rule = |attempt| VerdictRule::PropFirm {
+            firm,
+            limits,
+            attempt: Some(attempt),
+        };
+        assert_eq!(static_rule(reset).validate(), Ok(()));
+        // A trailing floor can stand at or above the start it returns to, so the rule refuses it.
+        let refused = with_attempt(reset).validate().unwrap_err();
+        assert!(refused.0.contains("needs a static drawdown"), "{refused:?}");
+        // A locked floor stands at or above the start, so the terms refuse the pair.
+        let locked = AttemptTerms {
+            payout_locks_floor: true,
+            ..reset
+        };
+        let refused = locked.validate().unwrap_err();
+        assert!(refused.0.contains("payout_locks_floor"), "{refused:?}");
+        assert!(static_rule(locked).validate().is_err());
     }
 
     #[test]

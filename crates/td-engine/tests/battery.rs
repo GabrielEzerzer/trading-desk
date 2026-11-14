@@ -1031,6 +1031,7 @@ fn attempt_terms_price_an_attempt_and_add_the_value_line() {
         payout_cap: None,
         max_payouts: None,
         payout_locks_floor: false,
+        payout_resets_balance: false,
         funded_horizon_days: 90,
         evaluation_size: 1.0,
         funded_size: 1.0,

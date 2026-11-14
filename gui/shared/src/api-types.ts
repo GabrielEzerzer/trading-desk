@@ -1212,6 +1212,14 @@ max_payouts: number | null,
  */
 payout_locks_floor: boolean, 
 /**
+ * Whether each payout returns the balance to the start: it counts the profit above the
+ * start up to `payout_cap`, and any profit above the cap is lost rather than left in the
+ * account. The loss limits stay as they were. It cannot be set with `payout_locks_floor`,
+ * and a `prop_firm` rule refuses it with a trailing drawdown: either can put the floor
+ * at or above the start a payout returns to. `false` is left out of JSON.
+ */
+payout_resets_balance?: boolean, 
+/**
  * Days the funded account is simulated for after a pass.
  */
 funded_horizon_days: number, 
