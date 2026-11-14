@@ -702,7 +702,7 @@ pub fn run_battery_with_references(
         oos_integrity = OosIntegrityInputs {
             sharpe: m.sharpe,
             peak_leverage: m.peak_leverage,
-            lowest_equity: lowest_equity(wf, cash),
+            lowest_equity: lowest_equity(wf, cash, sizing),
             curve: true,
         };
 
@@ -1416,8 +1416,22 @@ fn as_judged(wf: &WalkForwardResult, sizing: Sizing) -> Cow<'_, WalkForwardResul
 
 /// I5's lowest equity inside a bar over the starting cash: the lowest range low of `wf`, the
 /// walk-forward as judged.
-fn lowest_equity(wf: &WalkForwardResult, cash: f64) -> Option<f64> {
-    let lows = wf.equity_extremes.iter().map(|r| r.low);
+///
+/// With [`Sizing::FixedSize`], a test window the fixed-size account counts whose own run reached
+/// zero or below inside a bar adds its own low ([`tester::fixed_size_own_low_at_zero`]), which
+/// fails the line. That run is the strategy at its tested size on the starting cash, and the
+/// engine does not carry it on past zero as an account holding more would: a perpetual account is
+/// liquidated at its maintenance margin, ends at exactly zero, and fits no new margined order
+/// after it; a spot account cannot go below zero; an FX account, which the engine does not
+/// liquidate yet, goes on below zero with the position open, which no venue allows. The window's
+/// money change then counts the loss only down to that zero, so the curve that adds it can stay
+/// above zero for an account that, at that size, was wiped out in the window.
+fn lowest_equity(wf: &WalkForwardResult, cash: f64, sizing: Sizing) -> Option<f64> {
+    let own_zero = match sizing {
+        Sizing::Compounding => None,
+        Sizing::FixedSize => tester::fixed_size_own_low_at_zero(cash, &wf.windows),
+    };
+    let lows = wf.equity_extremes.iter().map(|r| r.low).chain(own_zero);
     lows.reduce(f64::min).map(|low| low / cash)
 }
 
@@ -4034,37 +4048,51 @@ mod tests {
         as_judged(&wf, sizing).into_owned()
     }
 
-    /// A rule sized from the starting cash reads I5's lowest equity on the fixed-size account.
-    /// Three windows on 10,000 end at 20,000, 0 and 15,000, the second dipping to its own zero
-    /// inside a bar. The compounding account holds twice the size there and is gone, at 0, which
-    /// fails the line; the fixed-size account is at 20,000 when that window loses 10,000, and
-    /// never goes below 10,000. Every figure is exact in binary.
-    #[test]
-    fn the_lowest_equity_line_reads_the_fixed_size_account_when_sized_from_the_starting_cash() {
+    /// Test windows on 10,000 from [`nth_window`], one per `(end, low)`: each holds the starting
+    /// cash through its first bar and moves to `end` in its second, dipping to `low` inside it.
+    fn ranged_windows(windows: &[(f64, f64)]) -> Vec<crate::WindowResult> {
         let template = flat_run();
         let range = |low: f64, high: f64| crate::EquityRange { low, high };
-        let windows = [
-            (
-                20_000.0,
-                [range(10_000.0, 10_000.0), range(10_000.0, 20_000.0)],
-            ),
-            (0.0, [range(10_000.0, 10_000.0), range(0.0, 10_000.0)]),
-            (
-                15_000.0,
-                [range(10_000.0, 10_000.0), range(10_000.0, 15_000.0)],
-            ),
-        ]
-        .into_iter()
-        .enumerate()
-        .map(|(k, (end, ranges))| {
+        let windows = windows.iter().enumerate().map(|(k, &(end, low))| {
             let mut w = nth_window(&template, k, end);
-            w.out_of_sample.equity_extremes = ranges.to_vec();
+            let high = end.max(10_000.0);
+            w.out_of_sample.equity_extremes = vec![range(10_000.0, 10_000.0), range(low, high)];
             w
-        })
-        .collect::<Vec<_>>();
+        });
+        windows.collect()
+    }
+
+    /// I5's lowest equity over a cash of 10,000 for `windows`, with the field on and off.
+    fn lowest_on_and_off(windows: Vec<crate::WindowResult>) -> (Option<f64>, Option<f64>) {
         let cash = 10_000.0;
+        let reading =
+            |sizing| lowest_equity(&judged_windows(windows.clone(), sizing), cash, sizing);
+        (reading(Sizing::FixedSize), reading(Sizing::Compounding))
+    }
+
+    /// The lowest-equity line's outcome for a reading.
+    fn lowest_equity_outcome(lowest_equity: Option<f64>) -> Outcome {
+        let inputs = OosIntegrityInputs {
+            lowest_equity,
+            curve: true,
+            ..OosIntegrityInputs::default()
+        };
+        let mut lines = evaluate_oos_integrity(&inputs, 1.0).into_iter();
+        lines.find(|l| l.id == "lowest_equity").unwrap().outcome
+    }
+
+    /// A rule sized from the starting cash fails I5 when a window the fixed-size account counts
+    /// went to its own zero. Three windows on 10,000 end at 20,000, 0 and 15,000, the second
+    /// dipping to its own zero inside a bar. The fixed-size account is at 20,000 when that window
+    /// loses 10,000 and never goes below 10,000, but the window's run stopped at its zero, so the
+    /// line reads that zero and fails; it passed before, on the fixed-size curve alone. The
+    /// compounding account holds twice the size there and is gone, at 0, as before. Without
+    /// ranges the line reads the windows' own equity. Every figure is exact in binary.
+    #[test]
+    fn the_lowest_equity_line_fails_when_a_counted_window_reached_its_own_zero() {
+        let windows = ranged_windows(&[(20_000.0, 10_000.0), (0.0, 0.0), (15_000.0, 10_000.0)]);
         let on = judged_windows(windows.clone(), Sizing::FixedSize);
-        let off = judged_windows(windows, Sizing::Compounding);
+        let off = judged_windows(windows.clone(), Sizing::Compounding);
         let lows = |r: &[crate::EquityRange]| r.iter().map(|x| x.low).collect::<Vec<f64>>();
         assert_eq!(
             lows(&off.equity_extremes),
@@ -4074,21 +4102,38 @@ mod tests {
             lows(&on.equity_extremes),
             [10_000.0, 10_000.0, 20_000.0, 10_000.0, 10_000.0, 10_000.0]
         );
-        let (on, off) = (lowest_equity(&on, cash), lowest_equity(&off, cash));
-        assert_eq!((on, off), (Some(1.0), Some(0.0)));
-        let outcome = |lowest_equity| {
-            let inputs = OosIntegrityInputs {
-                lowest_equity,
-                curve: true,
-                ..OosIntegrityInputs::default()
-            };
-            evaluate_oos_integrity(&inputs, 1.0)
-                .into_iter()
-                .find(|l| l.id == "lowest_equity")
-                .unwrap()
-                .outcome
-        };
-        assert_eq!((outcome(on), outcome(off)), (Outcome::Pass, Outcome::Fail));
+        let (on, off) = lowest_on_and_off(windows.clone());
+        assert_eq!((on, off), (Some(0.0), Some(0.0)));
+        assert_eq!(lowest_equity_outcome(on), Outcome::Fail);
+        let bare = windows.into_iter().map(|mut w| {
+            w.out_of_sample.equity_extremes.clear();
+            w
+        });
+        assert_eq!(lowest_on_and_off(bare.collect()), (Some(0.0), None));
+    }
+
+    /// Two windows on 10,000 that each end at 3,750, a loss of 62.5%, take the fixed-size account
+    /// to -2,500, which fails I5, though neither window reached its own zero. Compounded, the
+    /// second loses 62.5% of 3,750 and the account ends at 1,406.25, which passes.
+    #[test]
+    fn two_losses_of_most_of_the_cash_fail_the_lowest_equity_line_at_a_fixed_size() {
+        let windows = ranged_windows(&[(3_750.0, 3_750.0), (3_750.0, 3_750.0)]);
+        let (on, off) = lowest_on_and_off(windows);
+        assert_eq!((on, off), (Some(-0.25), Some(0.140625)));
+        assert_eq!(
+            (lowest_equity_outcome(on), lowest_equity_outcome(off)),
+            (Outcome::Fail, Outcome::Pass)
+        );
+    }
+
+    /// When no window reaches its own zero, I5 reads the fixed-size account's lowest low, not a
+    /// window's own: the second window on 10,000 dips to 2,000 inside a bar and ends at 12,000,
+    /// but the fixed-size account holds 20,000 then and dips only to 12,000, so its lowest is the
+    /// starting cash. Compounded, it holds twice the size and dips to 4,000.
+    #[test]
+    fn the_lowest_equity_line_reads_the_fixed_size_low_when_no_window_reaches_zero() {
+        let windows = ranged_windows(&[(20_000.0, 10_000.0), (12_000.0, 2_000.0)]);
+        assert_eq!(lowest_on_and_off(windows), (Some(1.0), Some(0.4)));
     }
 
     /// A rule sized from the starting cash counts R2's trades in the windows the fixed-size

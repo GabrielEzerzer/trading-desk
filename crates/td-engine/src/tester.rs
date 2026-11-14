@@ -1802,6 +1802,27 @@ pub(crate) fn tested_fills(starting_cash: f64, windows: &[WindowResult]) -> Vec<
         .collect()
 }
 
+/// The lowest equity that a test window the fixed-size account counts (see [`Sizing::FixedSize`])
+/// reached inside a bar in its own run, when that is at or below zero: the window's lowest range
+/// low, or its lowest equity when it has no range per bar. None when no counted window got there.
+pub(crate) fn fixed_size_own_low_at_zero(
+    starting_cash: f64,
+    windows: &[WindowResult],
+) -> Option<f64> {
+    let counted = segment_factors(starting_cash, &test_curves(windows), Sizing::FixedSize);
+    let own_low = |r: &BacktestResult| match r.equity_extremes.len() == r.equity.len() {
+        true => r.equity_extremes.iter().map(|x| x.low).reduce(f64::min),
+        false => r.equity.iter().map(|p| p.equity).reduce(f64::min),
+    };
+    windows
+        .iter()
+        .zip(counted)
+        .filter(|&(_, f)| f != 0.0)
+        .filter_map(|(w, _)| own_low(&w.out_of_sample))
+        .filter(|&low| low <= 0.0)
+        .reduce(f64::min)
+}
+
 /// Each window's test equity.
 fn test_curves(windows: &[WindowResult]) -> Vec<&[EquityPoint]> {
     windows
