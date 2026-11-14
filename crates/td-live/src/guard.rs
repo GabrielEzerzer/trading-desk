@@ -16,12 +16,13 @@
 //!   notional cannot be valued at all, the loss limits are still checked on the equity alone
 //!   (`StopState::check_losses`) and the check counts as a failed read.
 //! - **Pre-trade.** An order that is not reduce-only passes [`SendGate::refusal`] at the one point
-//!   where the broker places orders. It is judged by the position it would leave (the venue's
-//!   position plus the order, both with and without the orders the gate let through since the
-//!   bar began, which may or may not have filled) and refused, before sending, when either
-//!   position's notional is above the cap and above the notional before the order. So an order
-//!   that only reduces the position is never refused by the cap, and two orders in one bar are
-//!   counted together.
+//!   where the broker places orders. It is judged by the position it would leave: the venue's
+//!   position plus the order, once with the buys the gate let through since the bar began added
+//!   and once with the sells, since each of them may or may not have filled. It is refused,
+//!   before sending, when either position's notional is above the cap and above the notional
+//!   before the order. So an order that only reduces the position is never refused by the cap
+//!   while no earlier order of the bar is pending, and the orders of one bar are counted
+//!   together.
 //! - **A venue that cannot be read** is never a pass. After [`GuardTiming::unreadable`] failed
 //!   checks in a row the guard halts the run, and the broker refuses every order that is not
 //!   reduce-only; its protective stops still go out, so an entry already filled is still
@@ -207,9 +208,10 @@ pub(crate) struct SendGate {
     /// Set when the venue could not be read for the bound: orders that are not reduce-only are
     /// refused, and the broker's protective stops and closes still go out.
     halted: Mutex<Option<String>>,
-    /// The signed quantity of the orders that are not reduce-only let through since the current
-    /// bar began. Held while an order is judged, so two orders are judged one after the other.
-    passed: Mutex<f64>,
+    /// The summed quantity of the buys (zero or more) and of the sells (zero or less) that are not
+    /// reduce-only let through since the current bar began. Held while an order is judged, so two
+    /// orders are judged one after the other.
+    passed: Mutex<(f64, f64)>,
 }
 
 impl SendGate {
@@ -218,7 +220,7 @@ impl SendGate {
             rules,
             stopped: Mutex::new(None),
             halted: Mutex::new(None),
-            passed: Mutex::new(0.0),
+            passed: Mutex::new((0.0, 0.0)),
         }
     }
 
@@ -240,7 +242,7 @@ impl SendGate {
     /// A new bar has begun: the orders let through on the bars before are in the venue's
     /// position by now, or never filled.
     pub fn new_bar(&self) {
-        *lock(&self.passed) = 0.0;
+        *lock(&self.passed) = (0.0, 0.0);
     }
 
     /// Why an order may not go out now whatever its size, or `None`.
@@ -260,12 +262,13 @@ impl SendGate {
     /// stop has fired, and an order that is not reduce-only once the guard has halted.
     ///
     /// An order that is not reduce-only is judged by the position it would leave: the venue's
-    /// signed position plus the order's signed quantity, both with and without the orders this
-    /// gate let through since the bar began (they may or may not have filled), valued at the
-    /// position's mark price (or at `last`, the order's last known price, when the venue gives no
-    /// mark). It is refused when either notional is above the cap and above the notional before
-    /// it, or when the position cannot be read. So an order
-    /// that shrinks the position is never refused by the cap, whether or not it is reduce-only.
+    /// signed position plus the order's signed quantity, once with the buys this gate let through
+    /// since the bar began added and once with its sells added (each may or may not have filled),
+    /// valued at the position's mark price (or at `last`, the order's last known price, when the
+    /// venue gives no mark). It is refused when either notional is above the cap and above the
+    /// notional before it, or when the position cannot be read. So an order that shrinks the
+    /// position is never refused by the cap while no earlier order of the bar is pending, whether
+    /// or not it is reduce-only.
     pub fn refusal(
         &self,
         client: &Client,
@@ -296,10 +299,12 @@ impl SendGate {
             Side::Buy => request.qty.abs(),
             Side::Sell => -request.qty.abs(),
         };
-        // The orders let through earlier in the bar may or may not have filled into the venue's
-        // position yet, so the order must pass with them added and without them.
+        // Each order let through earlier in the bar is in the venue's position already or still
+        // pending, so the real starting position lies between the position with the bar's sells
+        // added and the position with its buys added. The positions an order passes from form one
+        // unbroken range, so passing at both ends covers every mix of fills.
         // shortcut: near the cap this can refuse an order that would fit, in either direction,
-        // until the next bar clears the count; it never lets through one that takes the position
+        // until the next bar clears the sums; it never lets through one that takes the position
         // past the cap. Upgrade to reading the orders' fills back if strategies place several
         // orders a bar near the cap.
         let price = valuation_price(&position, last);
@@ -307,9 +312,14 @@ impl SendGate {
             self.rules
                 .check_order(before.abs() * price, (before + signed).abs() * price)
         };
-        match check(position.size + *passed).and_then(|()| check(position.size)) {
+        let (buys, sells) = &mut *passed;
+        match check(position.size + *buys).and_then(|()| check(position.size + *sells)) {
+            Ok(()) if signed >= 0.0 => {
+                *buys += signed;
+                None
+            }
             Ok(()) => {
-                *passed += signed;
+                *sells += signed;
                 None
             }
             Err(e) => Some(e.to_string()),
@@ -1373,7 +1383,9 @@ mod tests {
         assert_eq!(buy(), None);
         let second = buy().expect("260 + 260 is above the cap of 400");
         assert!(second.contains("from 260 to 520"), "{second}");
-        // A refused order is not counted, and an exit from what was let through still passes.
+        // An exit from what was let through still passes. The first buy may fill before the sell,
+        // so another buy is refused until the next bar, judged from 260: the refused order is not
+        // counted.
         let sell = gate.refusal(
             &client,
             &instrument(),
@@ -1381,7 +1393,8 @@ mod tests {
             PRICE,
         );
         assert_eq!(sell, None);
-        assert_eq!(buy(), None);
+        let third = buy().expect("the first buy may fill before the sell");
+        assert!(third.contains("from 260 to 520"), "{third}");
         gate.new_bar();
         assert_eq!(buy(), None, "the next bar starts from the venue's position");
         assert_eq!(mock.position(SYMBOL), 0.0);
@@ -1404,6 +1417,21 @@ mod tests {
         mock.set_position(SYMBOL, QTY, PRICE);
         let sell = order(&gate, &client, Side::Sell, 3.0 * QTY).expect("a short of 520");
         assert!(sell.contains("from 260 to 520"), "{sell}");
+    }
+
+    #[test]
+    fn a_pending_buy_cannot_hide_behind_a_filled_sell_of_the_same_bar() {
+        let order = |gate: &SendGate, client: &Client, side, qty| {
+            gate.refusal(client, &instrument(), &market(side, qty, false), PRICE)
+        };
+        // Flat; a sell of 260 passes and fills, a buy of 520 passes and is still pending, then a
+        // buy of 260 would leave a long of 520 once both fill.
+        let (mock, client, gate) = gate_at(0.0);
+        assert_eq!(order(&gate, &client, Side::Sell, QTY), None);
+        mock.set_position(SYMBOL, -QTY, PRICE);
+        assert_eq!(order(&gate, &client, Side::Buy, 2.0 * QTY), None);
+        let buy = order(&gate, &client, Side::Buy, QTY).expect("a long of 520");
+        assert!(buy.contains("from 260 to 520"), "{buy}");
     }
 
     #[test]
