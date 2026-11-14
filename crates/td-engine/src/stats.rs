@@ -487,9 +487,9 @@ pub struct PropFirmSpec {
     /// still multiply the day's figure, and every limit, target and payout keeps its meaning in
     /// fractions of the starting balance. `false` compounds.
     pub sizes_from_starting_cash: bool,
-    /// The most days in a row without a day the traded flags mark before the firm ends the
-    /// account: in each evaluation phase and on the funded account, each counted from its own
-    /// start. The days are the series' days, as the calendar wait before the first payout counts
+    /// The number of days in a row without a day the traded flags mark that ends the account:
+    /// in each evaluation phase and on the funded account, each counted from its own start.
+    /// The days are the series' days, as the calendar wait before the first payout counts
     /// them, so a day without bars counts. An account ends at the close of the day this many days
     /// after its start or its last trading day, with no trading day between, and the walks report
     /// it as a breach. `None` sets no such limit.
@@ -3129,7 +3129,6 @@ mod tests {
     fn sized_from_cash(spec: PropFirmSpec) -> PropFirmSpec {
         PropFirmSpec {
             sizes_from_starting_cash: true,
-            max_days_without_trading: None,
             ..spec
         }
     }

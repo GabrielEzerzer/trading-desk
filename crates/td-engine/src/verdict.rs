@@ -121,12 +121,12 @@ pub struct FirmLimits {
     /// days ending at midnight UTC and at 17:00 New York, and walks days ending at midnight UTC.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub day_rollover: Option<DayRollover>,
-    /// The most days in a row without a trading day (as `min_trading_days` counts them) before
-    /// the firm ends the account, in each evaluation phase and on the funded account. The days are
-    /// the walks' calendar days, counted as `calendar_days_to_first_payout` counts them, and each
-    /// account counts from its own start: the account ends at the close of this many days after
-    /// its start or its last trading day, with no trading day between. The attempt walks treat
-    /// that end as a breach. `None` sets no such limit.
+    /// The number of days in a row without a trading day (as `min_trading_days` counts them) that
+    /// ends the account, in each evaluation phase and on the funded account. The days are the
+    /// walks' calendar days, counted as `calendar_days_to_first_payout` counts them, and each
+    /// account counts from its own start: the account ends at the close of the day this many
+    /// days after its start or its last trading day, with no trading day between. The attempt
+    /// walks treat that end as a breach. `None` sets no such limit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_days_without_trading: Option<u32>,
 }
