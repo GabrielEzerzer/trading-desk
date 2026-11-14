@@ -86,7 +86,8 @@ impl DemoKeys {
     /// they are looked for in the message reduced to its visible ASCII characters: a credential
     /// split by anything else (a space, a hidden or format character) is found whole. The
     /// signature is compared without regard to case. The cut to length comes last, so a
-    /// credential at the cut is found whole too.
+    /// credential at the cut is found whole too. Callers hand it the venue's whole text, never
+    /// text already cut.
     pub(crate) fn scrub(&self, message: &str, signature: &str) -> String {
         let visible: String = message.chars().filter(char::is_ascii_graphic).collect();
         let leaks = [self.key.as_str(), self.secret.as_str()]

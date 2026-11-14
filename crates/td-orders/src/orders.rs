@@ -172,6 +172,17 @@ impl Client {
     /// possibly live, as [`Error::OutcomeUnknown`] describes: it keeps the id across a restart,
     /// asks again later with [`Client::order_by_client_id`], counts a possible fill in its
     /// exposure, and never sends the same order again under another id.
+    ///
+    /// When `place` returns [`Error::RateLimited`], [`Error::TimestampRejected`] or
+    /// [`Error::Transport`], the venue did not take the order as far as its answers show: every
+    /// send was refused before processing, or none was made. The id is free again, and a retry
+    /// of the same order goes under the same id, never a new one. If an earlier send was applied
+    /// after all, the venue holds an order with that id, and a retry it refuses as a duplicate
+    /// comes back as [`Error::DuplicateClientId`] (or, when the refusal answers a resend within
+    /// the retry, is looked up like any unknown outcome). The caller then reads the order with
+    /// [`Client::order_by_client_id`] and takes what the venue shows. The venue documents the id
+    /// as "always unique" without saying whether that covers closed orders (the `ids` module); a
+    /// new id it would never refuse.
     pub fn place(
         &self,
         instrument: &Instrument,
@@ -219,9 +230,10 @@ impl Client {
                 // Every send carried the same order and id, so the record is this order's.
                 Err(Error::OrderRejected {
                     id: id.to_string(),
+                    // The read scrubbed the reason whole before cutting it.
                     reason: match o.reject_reason.as_str() {
                         "" | "EC_NoError" => "none given".into(),
-                        r => self.scrub(r),
+                        _ => o.reject_reason,
                     },
                 })
             }

@@ -80,8 +80,8 @@ pub enum OrderStatus {
     /// A conditional order cancelled before it triggered.
     Deactivated,
     /// A status this route does not know, kept as the venue spelled it, without hidden characters
-    /// ([`hidden`]) and cut to 200 characters; the client's reads withhold it when it carries a
-    /// credential.
+    /// ([`hidden`]) and cut to 200 characters; the client's reads look for a credential in the
+    /// whole status before it is cut, and withhold it when one is there.
     Other(String),
 }
 
@@ -177,7 +177,8 @@ pub struct VenueOrder {
     /// The trigger price of a conditional order; `None` for a plain order.
     pub trigger_price: Option<f64>,
     pub reduce_only: bool,
-    /// The venue's reject reason enum, `EC_NoError` when there is none.
+    /// The venue's reject reason enum, `EC_NoError` when there is none. The client's reads keep
+    /// it as they keep an unknown status: scrubbed whole, then cut to 200 characters.
     pub reject_reason: String,
     pub created: Millis,
     pub updated: Millis,
@@ -208,10 +209,20 @@ pub(crate) struct RawOrder {
 }
 
 impl RawOrder {
-    pub(crate) fn into_order(self, endpoint: &'static str) -> Result<VenueOrder, Error> {
+    /// The order. Its free text, an unknown status and the reject reason, goes whole through
+    /// `scrub` (the client's credential check, which then cuts it), so a credential at the cut is
+    /// found whole. A known status parses to its variant.
+    pub(crate) fn into_order(
+        self,
+        endpoint: &'static str,
+        scrub: impl Fn(&str) -> String,
+    ) -> Result<VenueOrder, Error> {
         Ok(VenueOrder {
             side: side(endpoint, &self.side)?,
-            status: OrderStatus::parse(&self.order_status),
+            status: match OrderStatus::parse(&self.order_status) {
+                OrderStatus::Other(_) => OrderStatus::Other(scrub(&self.order_status)),
+                known => known,
+            },
             qty: unsigned(endpoint, "qty", num(endpoint, "qty", &self.qty)?)?,
             filled_qty: unsigned_or_zero(endpoint, "cumExecQty", &self.cum_exec_qty)?,
             avg_price: positive_or_none(endpoint, "avgPrice", &self.avg_price)?,
@@ -222,7 +233,7 @@ impl RawOrder {
             order_id: self.order_id,
             client_id: self.order_link_id,
             symbol: self.symbol,
-            reject_reason: self.reject_reason,
+            reject_reason: scrub(&self.reject_reason),
         })
     }
 }
@@ -244,7 +255,8 @@ pub enum ExecKind {
     BlockTrade,
     MovePosition,
     /// A type this route does not know, kept as the venue spelled it, without hidden characters
-    /// ([`hidden`]) and cut to 200 characters.
+    /// ([`hidden`]) and cut to 200 characters; the client's reads look for a credential in the
+    /// whole type before it is cut, and withhold it when one is there.
     Other(String),
 }
 
@@ -305,7 +317,12 @@ pub(crate) struct RawExecution {
 }
 
 impl RawExecution {
-    pub(crate) fn into_execution(self, endpoint: &'static str) -> Result<Execution, Error> {
+    /// The execution. An unknown type goes whole through `scrub`, as in [`RawOrder::into_order`].
+    pub(crate) fn into_execution(
+        self,
+        endpoint: &'static str,
+        scrub: impl Fn(&str) -> String,
+    ) -> Result<Execution, Error> {
         Ok(Execution {
             side: match self.side.as_str() {
                 "" => None,
@@ -320,7 +337,10 @@ impl RawExecution {
                 Liquidity::Taker
             },
             time: millis(endpoint, "execTime", &self.exec_time)?,
-            kind: ExecKind::parse(&self.exec_type),
+            kind: match ExecKind::parse(&self.exec_type) {
+                ExecKind::Other(_) => ExecKind::Other(scrub(&self.exec_type)),
+                known => known,
+            },
             exec_id: self.exec_id,
             order_id: self.order_id,
             client_id: self.order_link_id,
@@ -673,7 +693,7 @@ mod tests {
             .into_iter()
             .next()
             .unwrap()
-            .into_order("t")
+            .into_order("t", venue_text)
             .unwrap();
         assert_eq!(order.status, OrderStatus::Untriggered);
         assert_eq!(order.trigger_price, Some(58000.0));
@@ -686,7 +706,7 @@ mod tests {
             .into_iter()
             .next()
             .unwrap()
-            .into_order("t")
+            .into_order("t", venue_text)
             .unwrap();
         assert_eq!(order.status, OrderStatus::Filled);
         assert_eq!(order.avg_price, Some(65000.1));
@@ -695,7 +715,7 @@ mod tests {
         let execs: Vec<Execution> = execs
             .list
             .into_iter()
-            .map(|e| e.into_execution("t").unwrap())
+            .map(|e| e.into_execution("t", venue_text).unwrap())
             .collect();
         assert_eq!(execs[0].kind, ExecKind::Trade);
         assert_eq!(execs[0].liquidity, Liquidity::Taker);
@@ -813,7 +833,7 @@ mod tests {
             v[field] = serde_json::json!(value);
             serde_json::from_value::<RawOrder>(v)
                 .unwrap()
-                .into_order("t")
+                .into_order("t", venue_text)
         };
         assert!(order("qty", "0.002").is_ok());
         for field in ["qty", "cumExecQty", "avgPrice", "triggerPrice"] {
@@ -824,7 +844,7 @@ mod tests {
             v[field] = serde_json::json!(value);
             serde_json::from_value::<RawExecution>(v)
                 .unwrap()
-                .into_execution("t")
+                .into_execution("t", venue_text)
         };
         for field in ["execQty", "execPrice"] {
             assert!(exec(field, "-1").is_err(), "{field}");

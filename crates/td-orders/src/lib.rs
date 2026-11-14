@@ -25,9 +25,11 @@
 //!   that leaves open whether the venue took it (a timeout, a dropped connection, a server error,
 //!   a load or frequency answer) is resolved by asking the venue, never by sending it again; only a
 //!   rate-limit (10006) or timestamp (10002) refusal, which the venue documents as a refusal before
-//!   processing, is sent again, and a refusal of that resend is looked up too. A lookup that finds
-//!   nothing is [`Error::OutcomeUnknown`], never "not placed": the caller keeps the order as
-//!   possibly live under its original id, across a restart, keeps asking the venue about it,
+//!   processing, is sent again, and a refusal of that resend is looked up too. An order `place`
+//!   returns as not taken frees its id, and the caller retries it under that id, never a new one
+//!   ([`Client::place`] lists those errors). A lookup that finds nothing is
+//!   [`Error::OutcomeUnknown`], never "not placed": the caller keeps the order as possibly live
+//!   under its original id, across a restart, keeps asking the venue about it,
 //!   counts its possible fill in its exposure, and never sends the same order again under another
 //!   id because a lookup came back empty; a timeout or a spent time budget does not withdraw the
 //!   request ([`Error::OutcomeUnknown`] has the full contract). A cancel or amend is confirmed by

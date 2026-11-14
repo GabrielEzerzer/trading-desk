@@ -690,6 +690,71 @@ fn an_unknown_order_status_never_carries_a_credential() {
     assert!(!shown.contains(TEST_KEY), "{shown}");
 }
 
+/// Whether `text` holds any 8-character slice of `credential`, so a credential cut short is
+/// caught too.
+fn carries_part_of(text: &str, credential: &str) -> bool {
+    credential
+        .as_bytes()
+        .windows(8)
+        .any(|w| text.contains(std::str::from_utf8(w).unwrap()))
+}
+
+/// The `Debug` of a read's answer, with the `Display` of its error.
+fn shown<T: std::fmt::Debug>(read: &Result<T, Error>) -> String {
+    match read {
+        Ok(v) => format!("{v:?}"),
+        Err(e) => format!("{e} {e:?}"),
+    }
+}
+
+#[test]
+fn an_unknown_status_with_a_credential_at_the_cut_is_withheld_by_every_order_read() {
+    for credential in [TEST_KEY, TEST_SECRET] {
+        let (mock, client) = setup();
+        let i = instrument();
+        long_with_stop(&mock, &client, "cut-1");
+        // 182 visible characters, then the credential across the 200-character cut.
+        mock.set_order_status("cut-1", format!("{}{credential}", "x".repeat(182)).leak());
+        let by_id = client.order_by_client_id(&i, &id("cut-1"));
+        let open = client.open_orders(&i);
+        let text = format!("{} {}", shown(&by_id), shown(&open));
+        assert!(!carries_part_of(&text, credential), "{text}");
+        let mut statuses = vec![by_id.unwrap().unwrap().status];
+        statuses.extend(open.unwrap().into_iter().map(|o| o.status));
+        assert_eq!(statuses.len(), 2, "{statuses:?}");
+        for status in statuses {
+            assert!(
+                !carries_part_of(&status.to_string(), credential),
+                "{status}"
+            );
+            assert!(
+                matches!(&status, OrderStatus::Other(t) if t.contains("withheld")),
+                "{status:?}"
+            );
+            assert!(status.is_open());
+        }
+    }
+}
+
+#[test]
+fn a_reject_reason_with_a_credential_is_withheld_when_the_order_is_read() {
+    let (mock, client) = setup();
+    let i = instrument();
+    let reason = format!("{}{TEST_KEY}", "x".repeat(182));
+    mock.inject(CREATE, Fault::RejectThenDrop(reason));
+    let placed = client.place(&i, &market(Side::Buy, 0.002, false), &id("rr-1"), PRICE);
+    let read = client.order_by_client_id(&i, &id("rr-1"));
+    let text = format!("{} {}", shown(&placed), shown(&read));
+    assert!(!carries_part_of(&text, TEST_KEY), "{text}");
+    assert!(
+        matches!(&placed, Err(Error::OrderRejected { reason, .. }) if reason.contains("withheld")),
+        "{placed:?}"
+    );
+    let order = read.unwrap().unwrap();
+    assert_eq!(order.status, OrderStatus::Rejected);
+    assert!(order.reject_reason.contains("withheld"), "{order:?}");
+}
+
 #[test]
 fn a_lookup_window_is_not_moved_by_a_clock_resync() {
     // The create is lost. While it is looked up the venue's clock falls 20 s behind, so a lookup

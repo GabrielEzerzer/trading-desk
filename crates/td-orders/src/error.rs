@@ -48,7 +48,14 @@ pub enum Error {
     #[error("invalid client order id: {reason}")]
     InvalidClientId { reason: &'static str },
 
-    #[error("client order id {id} was already sent by this client; use a new id")]
+    /// `place` was given an id this client has already sent and not freed. The id stays spent
+    /// whatever the earlier send's result was. When that result was [`Error::OutcomeUnknown`],
+    /// the order may be live: read it with [`crate::Client::order_by_client_id`], and never send
+    /// it again under a new id. A new id is only for a new order.
+    #[error(
+        "client order id {id} was already sent by this client; read that order with \
+         order_by_client_id, and use a new id only for a new order"
+    )]
     ClientIdAlreadyUsed { id: String },
 
     #[error("order refused before sending: {0}")]
@@ -100,12 +107,16 @@ pub enum Error {
         reason: String,
     },
 
+    /// From `place`, the venue did not take the order and the id is free again; a retry goes
+    /// under the same id ([`crate::Client::place`]).
     #[error("rate limited on {endpoint}{}", if *.ip_block { " (IP blocked; wait at least 10 minutes)" } else { "" })]
     RateLimited {
         endpoint: &'static str,
         ip_block: bool,
     },
 
+    /// From `place`, the venue did not take the order and the id is free again; a retry goes
+    /// under the same id ([`crate::Client::place`]).
     #[error("the venue rejected the request timestamp after a clock resync: {code} {message}")]
     TimestampRejected { code: i64, message: String },
 
@@ -118,6 +129,8 @@ pub enum Error {
     )]
     ResponseTooLarge { endpoint: &'static str },
 
+    /// From `place`, the venue did not take the order and the id is free again; a retry goes
+    /// under the same id ([`crate::Client::place`]).
     #[error("request to {endpoint} failed: {reason}")]
     Transport {
         endpoint: &'static str,
