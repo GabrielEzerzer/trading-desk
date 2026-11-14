@@ -9,12 +9,15 @@ use std::time::{Duration, Instant};
 
 use futures_util::SinkExt;
 use td_core::{
-    Candle, FeeSchedule, Instrument, InstrumentId, InstrumentKind, Millis, OrderRequest, OrderType,
-    Side, TimeInForce, Timeframe, Venue,
+    AccountCurrency, Candle, FeeSchedule, Instrument, InstrumentId, InstrumentKind, Millis,
+    OrderRequest, OrderType, Side, TimeInForce, Timeframe, Venue,
 };
 use td_data::live::{Greeting, KlineUpdate, Rest, SharedStream};
 use td_data::{DataError, DataSource, Http, InstrumentList, LiveStream, MinuteHistory};
-use td_engine::{Context, EngineError, ParamValue, Params, Strategy};
+use td_engine::{
+    BacktestConfig, Context, EngineError, ParamValue, Params, Session, SessionConfig, Strategy,
+    run_strategy,
+};
 use td_live::{
     LiveConfig, LiveError, LiveRun, LiveSession, LiveStatus, State, VenueHandle, live_dir,
 };
@@ -1409,6 +1412,130 @@ fn a_funding_rate_is_charged_once_across_a_restart() {
         .map(|l| l["funding"].as_array().map_or(0, Vec::len))
         .sum();
     assert_eq!(charged, 1);
+}
+
+/// What a strategy saw on each bar it was called on: the bar's open time, whether it was a warm-up
+/// bar, and [`Context::funding`].
+type Seen = Vec<(Millis, bool, Vec<(Millis, f64)>)>;
+
+/// Never trades; records what [`Context::funding`] gives it on each bar.
+struct SeesFunding(Arc<Mutex<Seen>>);
+
+impl Strategy for SeesFunding {
+    fn on_bar(&mut self, ctx: &mut Context, bar: &Candle) {
+        let seen = (bar.open_time, ctx.is_warming_up(), ctx.funding().to_vec());
+        self.0.lock().expect("lock").push(seen);
+    }
+}
+
+/// What a strategy saw in the live session `id`: each bar of its log fed to a session running
+/// [`SeesFunding`] as the live session fed it and as a reopen replays it, warm-up bars as warm-up
+/// and each rate at its `time`.
+fn seen_live(rig: &Rig, id: &str, cfg: &LiveConfig) -> Seen {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let money = SessionConfig {
+        starting_cash: 100_000.0,
+        slippage_bps: cfg.slippage_bps,
+        fees: cfg.fees,
+        max_leverage: cfg.max_leverage,
+        account_currency: AccountCurrency::Quote,
+    };
+    let strategy = Box::new(SeesFunding(seen.clone()));
+    let mut session =
+        Session::new(strategy, cfg.instrument.clone(), cfg.timeframe, money).expect("session");
+    for line in rig.log(id) {
+        // A `sending` line's bar is fed by the line after it.
+        if line["sending"] == true {
+            continue;
+        }
+        let bar: Candle = serde_json::from_value(line["bar"].clone()).expect("a bar");
+        let funding: Vec<(Millis, f64)> = line["funding"].as_array().map_or(Vec::new(), |rates| {
+            rates
+                .iter()
+                .map(|f| {
+                    (
+                        f["time"].as_i64().expect("time"),
+                        f["rate"].as_f64().expect("rate"),
+                    )
+                })
+                .collect()
+        });
+        let fed = if line["warm_up"] == true {
+            session.warm_up(bar, &funding)
+        } else {
+            session.on_bar(bar, &funding)
+        };
+        fed.expect("feeds");
+    }
+    seen.lock().expect("lock").clone()
+}
+
+/// What a strategy sees in a backtest of `bars` given the venue's `funding`, warmed up on the bars
+/// before `live_from` and trading from it.
+fn seen_in_backtest(
+    cfg: &LiveConfig,
+    bars: &[Candle],
+    live_from: Millis,
+    funding: &[(Millis, f64)],
+) -> Seen {
+    let config = BacktestConfig {
+        strategy: "sees_funding".into(),
+        params: Params::new(),
+        instrument: cfg.instrument.clone(),
+        timeframe: cfg.timeframe,
+        from: live_from,
+        to: bars.last().expect("bars").open_time + cfg.timeframe.duration_ms(),
+        starting_cash: 100_000.0,
+        slippage_bps: cfg.slippage_bps,
+        fee_override: cfg.fees,
+        max_leverage: cfg.max_leverage,
+        warmup_from: Some(bars[0].open_time),
+        close_at_end: false,
+        account_currency: AccountCurrency::Quote,
+    };
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let strategy = Box::new(SeesFunding(seen.clone()));
+    run_strategy(&config, strategy, bars, &[], funding).expect("runs");
+    seen.lock().expect("lock").clone()
+}
+
+/// A live session shows its strategy, on every bar, warm-up bars included, the funding a backtest
+/// of the same bars shows it, times and rates.
+#[test]
+fn a_live_session_shows_its_strategy_the_funding_a_backtest_of_its_bars_shows() {
+    let rig = Rig::new();
+    // Before the first warm-up bar, so never seen; at its open; inside a warm-up bar; at the
+    // first live bar's open; at the second's and the third's.
+    let funding = vec![
+        (rig.bar(-4), 0.0005),
+        (rig.bar(-3), 0.0001),
+        (rig.bar(-2) + 30 * MIN, -0.0002),
+        (rig.bar(0), 0.0003),
+        (rig.bar(1), 0.0004),
+        (rig.bar(2), -0.0001),
+    ];
+    *rig.rest.rates.lock().unwrap() = funding.clone();
+    let cfg = config(-1, -1, false);
+    let feed = rig.feed();
+    feed.minute(rig.bar(3));
+    let run = rig.run(rig.create("seen", cfg.clone()).expect("creates"), &feed);
+    wait_for_bar(&run, rig.bar(2));
+    let (live, ended) = run.stop();
+    ended.expect("stopped cleanly");
+    assert!(live.status().warnings.is_empty(), "{:?}", live.status());
+
+    let in_live = seen_live(&rig, "seen", &cfg);
+    let bars = live.session().bars();
+    let opens: Vec<Millis> = in_live.iter().map(|s| s.0).collect();
+    assert_eq!(opens, bars.iter().map(|b| b.open_time).collect::<Vec<_>>());
+    assert_eq!(in_live.len(), WARM_UP as usize + 3);
+    assert_eq!(in_live, seen_in_backtest(&cfg, bars, rig.bar(0), &funding));
+    // On the first live bar: every rate from the first warm-up bar's open on, at its own time.
+    let first_live = in_live.iter().find(|s| !s.1).expect("a live bar");
+    assert_eq!(
+        (first_live.0, &first_live.2[..]),
+        (rig.bar(0), &funding[1..4])
+    );
 }
 
 #[test]
