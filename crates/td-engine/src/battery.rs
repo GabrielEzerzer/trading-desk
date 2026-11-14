@@ -552,6 +552,7 @@ pub fn run_battery(
     // For a `prop_firm` rule, the worst attempt's fall as a share of the starting cash, on the
     // reading (static or trailing) its drawdown line judges, for `sizing_warning`.
     let mut fixed_size_drawdown = None;
+    let mut fixed_size_daily_loss = None;
     if let Some(p) = &plateau {
         evidence.plateau_median_ratio = p.median_ratio;
         evidence.plateau_positive_share = p.positive_share;
@@ -646,7 +647,8 @@ pub fn run_battery(
                 _ => None,
             },
             return_without_best_trade: breakdown.return_without_best_trade,
-            worst_daily_loss: worst_daily_loss(&series, &wf.equity_extremes, cash, None),
+            worst_daily_loss: worst_daily_loss(&series, &wf.equity_extremes, cash, None)
+                .map(|f| f.own),
             intrabar_drawdown_static: m.static_drawdown_intrabar,
             intrabar_drawdown_trailing: risk::trailing_drawdown(cash, &wf.equity_extremes)
                 .map(|d| d.amount / cash),
@@ -664,8 +666,10 @@ pub fn run_battery(
             // The firm's day, for its daily loss line, its drawdown line's attempts and the
             // attempt walks alike. Without one, the walks read UTC days, the days of `daily`.
             let rollover = firm.day_rollover.unwrap_or_default();
-            kind.worst_daily_loss =
+            let daily_loss =
                 worst_daily_loss(&series, &wf.equity_extremes, cash, firm.day_rollover);
+            kind.worst_daily_loss = daily_loss.map(|f| f.own);
+            fixed_size_daily_loss = daily_loss.map(|f| f.cash);
             // A trailing floor that stops at a lock stops counting the peak once it reaches the
             // lock plus the drawdown above the start, as the attempt walks apply it.
             let peak_cap = match firm.drawdown {
@@ -763,10 +767,16 @@ pub fn run_battery(
         plan.backtest.max_leverage,
     ));
     let kind_lines = evaluate(rule, &kind);
-    let sizing = fixed_size_drawdown.and_then(|fixed_size| {
-        let line = kind_lines.iter().find(|l| l.id == "max_drawdown")?;
-        sizing_warning(line, fixed_size)
-    });
+    let sizing: Vec<String> = [
+        ("worst_daily_loss", fixed_size_daily_loss),
+        ("max_drawdown", fixed_size_drawdown),
+    ]
+    .into_iter()
+    .filter_map(|(id, fixed_size)| {
+        let line = kind_lines.iter().find(|l| l.id == id)?;
+        sizing_warning(line, fixed_size?)
+    })
+    .collect();
 
     // 5 to 7 run only when their lines could still change the verdict.
     let decided =
@@ -1111,26 +1121,40 @@ fn carry_warning(carry: Carry, trades: &[Trade], timeframe: Timeframe) -> Option
     })
 }
 
-/// The warning for a `prop_firm` drawdown line, `line`, that passes on each attempt's fall as a
-/// share of the attempt's own starting balance, when `fixed_size`, the worst attempt's fall as a
-/// share of the starting cash, would fail it. The line then passes only because it assumes the
-/// position size grows with the balance, which the engine cannot check ([`attempt_drawdowns`]).
+/// The warning for a `prop_firm` line, `line`, that passes on a fall as a share of the balance it
+/// started from, when `fixed_size`, the same worst fall as a share of the starting cash, would
+/// fail it. The line then passes only because it assumes the position size grows with the
+/// balance, which the engine cannot check. For the drawdown line the fall is the worst attempt's
+/// ([`attempt_drawdowns`]); for the worst-daily-loss line, the worst day's ([`worst_daily_loss`]).
 fn sizing_warning(line: &Criterion, fixed_size: f64) -> Option<String> {
     let (value, limit) = (line.value?, line.limit?);
     let percent = |x: f64| format!("{:.2}%", x * 100.0);
-    (line.outcome == Outcome::Pass && !line.comparison.holds(Some(fixed_size), limit)).then(|| {
-        format!(
-            "The max drawdown line passed on the assumption that position size grows with the \
+    if line.outcome != Outcome::Pass || line.comparison.holds(Some(fixed_size), limit) {
+        return None;
+    }
+    if line.id == "worst_daily_loss" {
+        return Some(format!(
+            "The worst daily loss line passed on the assumption that position size grows with \
+             the balance: its worst day, as the line measures it, lost {} of that day's starting \
+             balance. In money, the worst day lost {} of the starting balance, over the line's \
+             limit of {}. If the strategy trades a fixed position size set from the starting \
+             balance, that is what an account at the starting balance would have lost in a day.",
+            percent(value),
+            percent(fixed_size),
+            percent(limit)
+        ));
+    }
+    Some(format!(
+        "The max drawdown line passed on the assumption that position size grows with the \
              balance: its worst attempt's drawdown, as the line measures it, was {} of that \
              attempt's starting balance. In money, the worst attempt's drawdown was {} of the \
              starting balance, over the line's limit of {}. If the strategy trades a fixed \
              position size set from the starting balance, that is what an account started fresh \
              would have lost.",
-            percent(value),
-            percent(fixed_size),
-            percent(limit)
-        )
-    })
+        percent(value),
+        percent(fixed_size),
+        percent(limit)
+    ))
 }
 
 /// R4's fees: every fee of `fees`, the per-unit commission too, times `multiplier`.
@@ -1393,15 +1417,27 @@ fn traded_days(
     traded
 }
 
-/// The prop-firm worst daily loss inside bars, as a fraction of the starting balance, on days
-/// ending at `rollover`, the firm's day; without one, the worse of the days ending at midnight UTC
-/// and at 17:00 New York. `None` without equity ranges.
+/// The prop-firm worst daily loss inside bars, on days ending at `rollover`, the firm's day;
+/// without one, the worse of the days ending at midnight UTC and at 17:00 New York. Each day's
+/// fall is read as a share of that day's starting balance ([`Fall::own`], what the line judges),
+/// as an attempt started that morning measures it and as the attempt walks compound each day on
+/// a fresh balance, and as a share of `cash`, the starting cash ([`Fall::cash`]). Each reading
+/// is its own worst, which need not be the same day. `None` without equity ranges.
+///
+/// The walk-forward curve compounds from window to window, so the two differ by the curve's level:
+/// a day that loses 4% of a balance standing at 0.6 of the starting cash loses 2.4% of the
+/// starting cash.
+///
+/// shortcut: judging each day's fall against its own starting balance assumes the position size
+/// grows with the balance, as for the drawdown line ([`attempt_drawdowns`]); the verdict warns when
+/// the starting-cash reading would fail a line that passes (`sizing_warning`). Judge the line on
+/// the starting-cash reading once a plan can say its strategy trades a fixed size.
 fn worst_daily_loss(
     series: &EquitySeries,
     ranges: &[crate::EquityRange],
     cash: f64,
     rollover: Option<DayRollover>,
-) -> Option<f64> {
+) -> Option<Fall> {
     if ranges.is_empty() {
         return None;
     }
@@ -1413,17 +1449,24 @@ fn worst_daily_loss(
         .copied()
         .map(|rollover| {
             let days = risk::daily_pnl(series, Some(ranges), rollover);
-            risk::worst_daily_loss_intraday(&days, cash)
+            Some(Fall {
+                own: risk::worst_daily_loss_intraday_own(&days)?,
+                cash: risk::worst_daily_loss_intraday(&days, cash)?,
+            })
         })
-        .collect::<Option<Vec<f64>>>()?
+        .collect::<Option<Vec<Fall>>>()?
         .into_iter()
-        .reduce(f64::max)
+        .reduce(|a, b| Fall {
+            own: a.own.max(b.own),
+            cash: a.cash.max(b.cash),
+        })
 }
 
-/// The worst fall of [`attempt_drawdowns`]' attempts on one reading, static or trailing.
+/// A worst fall read two ways: the worst of [`attempt_drawdowns`]' attempts on one reading,
+/// static or trailing, or the worst day of [`worst_daily_loss`].
 #[derive(Debug, Clone, Copy, PartialEq)]
-struct AttemptFall {
-    /// As a fraction of each attempt's own starting equity: what the drawdown line judges.
+struct Fall {
+    /// As a fraction of each attempt's, or each day's, own starting equity: what the line judges.
     own: f64,
     /// As a fraction of the starting cash: what a fresh account at the starting balance would
     /// lose trading the same fixed size.
@@ -1446,7 +1489,7 @@ struct AttemptFall {
 /// attempt holds a bar.
 ///
 /// Each reading also gives the worst of the same attempts' falls, in money, as a fraction of the
-/// curve's first value, the starting cash ([`AttemptFall::cash`]).
+/// curve's first value, the starting cash ([`Fall::cash`]).
 ///
 /// `peak_cap`, for a trailing floor that stops rising at a lock, is how far above an attempt's
 /// start the peak counts, as a fraction of that start: the firm's `trailing_floor_lock` plus its
@@ -1474,7 +1517,7 @@ fn attempt_drawdowns(
     rollover: DayRollover,
     horizon: usize,
     peak_cap: Option<f64>,
-) -> (Option<AttemptFall>, Option<AttemptFall>) {
+) -> (Option<Fall>, Option<Fall>) {
     let (times, values) = (&series.times, &series.values);
     if ranges.is_empty() || ranges.len() + 1 != values.len() || horizon == 0 {
         return (None, None);
@@ -1495,19 +1538,19 @@ fn attempt_drawdowns(
                 let low = bars.iter().map(|r| r.low).reduce(f64::min);
                 let fixed = risk::static_drawdown(start, low)
                     .zip(low)
-                    .map(|(own, low)| AttemptFall {
+                    .map(|(own, low)| Fall {
                         own,
                         cash: (start - low).max(0.0) / cash,
                     });
                 let trailing = match peak_cap {
-                    None => risk::trailing_drawdown(start, bars).map(|d| AttemptFall {
+                    None => risk::trailing_drawdown(start, bars).map(|d| Fall {
                         own: d.amount / start,
                         cash: d.amount / cash,
                     }),
                     Some(cap) => {
                         let own = capped_fall(start, bars, start * (1.0 + cap)) / start;
                         let fixed_size = capped_fall(start, bars, start + cash * cap) / cash;
-                        (own.is_finite() && fixed_size.is_finite()).then_some(AttemptFall {
+                        (own.is_finite() && fixed_size.is_finite()).then_some(Fall {
                             own,
                             cash: fixed_size,
                         })
@@ -1518,9 +1561,9 @@ fn attempt_drawdowns(
         })
         .unzip();
     // Each share's worst, which need not be the same attempt's.
-    let worst = |falls: Vec<Option<AttemptFall>>| {
-        let falls = falls.into_iter().collect::<Option<Vec<AttemptFall>>>()?;
-        Some(AttemptFall {
+    let worst = |falls: Vec<Option<Fall>>| {
+        let falls = falls.into_iter().collect::<Option<Vec<Fall>>>()?;
+        Some(Fall {
             own: falls.iter().map(|f| f.own).reduce(f64::max)?,
             cash: falls.iter().map(|f| f.cash).reduce(f64::max)?,
         })
@@ -2302,23 +2345,25 @@ mod tests {
         };
         let line = |(series, ranges): &(EquitySeries, Vec<crate::EquityRange>), rollover| {
             let kind = KindInputs {
-                worst_daily_loss: worst_daily_loss(series, ranges, 100.0, rollover),
+                worst_daily_loss: worst_daily_loss(series, ranges, 100.0, rollover).map(|f| f.own),
                 ..KindInputs::default()
             };
             let rule = firm_rule(DrawdownMode::Static, 90, rollover);
             kind_line(&rule, &kind, "worst_daily_loss")
         };
         let (utc, ny) = (Some(DayRollover::default()), Some(DayRollover::NewYork1700));
-        // From 22:00 to 02:00 UTC: 2% on each UTC day, 4% on the New York day that starts at
+        // From 22:00 to 02:00 UTC: 2 of 100 on the first UTC day and 2 of the 98 the second
+        // starts at, 4 of 100 on the New York day that starts at
         // 22:00.
         let late = falling(22);
         assert_eq!(line(&late, None), (Some(0.04), Outcome::Fail));
-        assert_eq!(line(&late, utc), (Some(0.02), Outcome::Pass));
+        assert_eq!(line(&late, utc), (Some(2.0 / 98.0), Outcome::Pass));
         assert_eq!(line(&late, ny), (Some(0.04), Outcome::Fail));
-        // From 20:00 to 24:00 UTC: 4% on the UTC day, 2% on each New York day around 22:00.
+        // From 20:00 to 24:00 UTC: 4 of 100 on the UTC day; on the New York days around 22:00,
+        // 2 of 100 and 2 of the 98 the second starts at.
         let early = falling(20);
         assert_eq!(line(&early, None), (Some(0.04), Outcome::Fail));
-        assert_eq!(line(&early, ny), (Some(0.02), Outcome::Pass));
+        assert_eq!(line(&early, ny), (Some(2.0 / 98.0), Outcome::Pass));
         assert_eq!(line(&early, utc), (Some(0.04), Outcome::Fail));
     }
 
@@ -2416,9 +2461,7 @@ mod tests {
     }
 
     /// The static and trailing falls as shares of each attempt's own start, which the line judges.
-    fn own(
-        (fixed, trailing): (Option<AttemptFall>, Option<AttemptFall>),
-    ) -> (Option<f64>, Option<f64>) {
+    fn own((fixed, trailing): (Option<Fall>, Option<Fall>)) -> (Option<f64>, Option<f64>) {
         (fixed.map(|f| f.own), trailing.map(|f| f.own))
     }
 
@@ -2927,7 +2970,7 @@ mod tests {
         let extremes = &wf.equity_extremes;
         assert_eq!(
             r.kind.worst_daily_loss,
-            worst_daily_loss(&series, extremes, cash, Some(ny))
+            worst_daily_loss(&series, extremes, cash, Some(ny)).map(|f| f.own)
         );
         assert_eq!(
             (
@@ -2998,12 +3041,132 @@ mod tests {
             let line = drawdown_line(&between);
             assert_eq!((line.value, line.outcome), (Some(fall.own), Outcome::Pass));
             let warning = sizing_warning(&line, fall.cash).unwrap();
-            assert_eq!(between.verdict.warnings, [warning], "{drawdown:?}");
+            assert_eq!(drawdown_warnings(&between), [warning], "{drawdown:?}");
 
             let above = battery(drawdown, fall.cash * 1.01 / share);
             assert_eq!(drawdown_line(&above).outcome, Outcome::Pass);
-            assert!(above.verdict.warnings.is_empty(), "{drawdown:?}");
+            assert!(drawdown_warnings(&above).is_empty(), "{drawdown:?}");
         }
+    }
+
+    /// The verdict's warnings that start with `text`.
+    fn warnings_starting(r: &BatteryResult, text: &str) -> Vec<String> {
+        let warnings = r.verdict.warnings.iter();
+        warnings.filter(|w| w.starts_with(text)).cloned().collect()
+    }
+
+    fn drawdown_warnings(r: &BatteryResult) -> Vec<String> {
+        warnings_starting(r, "The max drawdown line")
+    }
+
+    fn daily_loss_warnings(r: &BatteryResult) -> Vec<String> {
+        warnings_starting(r, "The worst daily loss line")
+    }
+
+    /// A rule like [`firm_rule`] whose firm allows a daily loss of `daily_loss`.
+    fn daily_loss_rule(daily_loss: f64, day_rollover: Option<DayRollover>) -> VerdictRule {
+        let VerdictRule::PropFirm { firm, limits, .. } =
+            firm_rule(DrawdownMode::Static, 10, day_rollover)
+        else {
+            unreachable!()
+        };
+        VerdictRule::PropFirm {
+            firm: crate::FirmLimits { daily_loss, ..firm },
+            limits,
+            attempt: None,
+        }
+    }
+
+    /// The worst-daily-loss line reads each day's fall as a share of that day's starting balance,
+    /// on a curve that compounds: a day that loses 4% of a balance standing at 0.6 of the starting
+    /// cash is 4%, and fails a line of 2.5% (a firm's 5% judged at half), though it is 2.4% of the
+    /// starting cash. After gains the other way: 2% of a balance at 1.5 times the starting cash
+    /// passes, though it is 3% of the starting cash, and the warning carries both figures.
+    #[test]
+    fn the_daily_loss_line_reads_each_day_on_its_own_starting_balance() {
+        let judge = |values: &[f64]| {
+            let (series, ranges) = curve(10 * DAY_MS, DAY_MS, values);
+            let fall = worst_daily_loss(&series, &ranges, 100.0, None).unwrap();
+            let kind = KindInputs {
+                worst_daily_loss: Some(fall.own),
+                ..KindInputs::default()
+            };
+            let line = crate::evaluate(&daily_loss_rule(0.05, None), &kind)
+                .into_iter()
+                .find(|l| l.id == "worst_daily_loss")
+                .unwrap();
+            let warning = sizing_warning(&line, fall.cash);
+            (fall, line, warning)
+        };
+        let near = |a: f64, b: f64| assert!((a - b).abs() < 1e-12, "{a} against {b}");
+
+        let (fall, line, warning) = judge(&[60.0, 57.6]);
+        near(fall.own, 0.04);
+        near(fall.cash, 0.024);
+        assert_eq!(line.limit, Some(0.025));
+        assert_eq!((line.value, line.outcome), (Some(fall.own), Outcome::Fail));
+        assert_eq!(warning, None);
+
+        let (fall, line, warning) = judge(&[150.0, 147.0]);
+        near(fall.own, 0.02);
+        near(fall.cash, 0.03);
+        assert_eq!(line.outcome, Outcome::Pass);
+        let warning = warning.unwrap();
+        assert!(
+            warning.contains("lost 2.00% of that day's starting balance"),
+            "{warning}"
+        );
+        assert!(
+            warning.contains("lost 3.00% of the starting balance"),
+            "{warning}"
+        );
+        assert!(warning.contains("limit of 2.50%"), "{warning}");
+    }
+
+    /// The battery puts the worst-daily-loss line's sizing warning on the verdict, from the reading
+    /// the line judges: with the line's limit between the worst day's fall as a share of its own
+    /// start and as a share of the starting cash, the line passes and the verdict warns; with the
+    /// limit above both, it does not.
+    #[test]
+    fn the_battery_warns_when_the_daily_loss_line_passes_only_on_its_sizing() {
+        let (plan, bars) = sma_plan(sma_axes());
+        let battery = |daily_loss| {
+            let rule = daily_loss_rule(daily_loss, None);
+            let spec = BatterySpec {
+                strategy: "sma_cross",
+                plan: &plan,
+                rule: &rule,
+                instrument: &test_instrument(),
+                seed: 7,
+            };
+            run_battery(&spec, &bars, &[], &[], None).unwrap()
+        };
+        let daily_line = |r: &BatteryResult| {
+            r.verdict
+                .criteria
+                .iter()
+                .find(|l| l.layer == crate::Layer::Kind && l.id == "worst_daily_loss")
+                .unwrap()
+                .clone()
+        };
+        let share = crate::PropFirmLimits::default().share_of_firm_limits;
+        let r = battery(0.06);
+        let wf = r.walk_forward.as_ref().unwrap();
+        let cash = plan.backtest.starting_cash;
+        let series = EquitySeries::new(cash, &wf.equity, plan.timeframe);
+        let fall = worst_daily_loss(&series, &wf.equity_extremes, cash, None).unwrap();
+        // The curve grows well above its start, so its days read smaller on their own start.
+        assert!(fall.own < fall.cash, "{fall:?}");
+
+        let between = battery((fall.own + fall.cash) / 2.0 / share);
+        let line = daily_line(&between);
+        assert_eq!((line.value, line.outcome), (Some(fall.own), Outcome::Pass));
+        let warning = sizing_warning(&line, fall.cash).unwrap();
+        assert_eq!(daily_loss_warnings(&between), [warning]);
+
+        let above = battery(fall.cash * 1.01 / share);
+        assert_eq!(daily_line(&above).outcome, Outcome::Pass);
+        assert!(daily_loss_warnings(&above).is_empty());
     }
 
     /// A decimal parameter swept over whole numbers: the chosen sets hold `equity_fraction` as the

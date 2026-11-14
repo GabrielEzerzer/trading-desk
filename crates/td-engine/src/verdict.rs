@@ -1135,8 +1135,9 @@ pub struct KindInputs {
     pub risk_of_ruin: Option<f64>,
     /// The total return with the single best trade removed.
     pub return_without_best_trade: Option<f64>,
-    // prop_firm: fractions of the starting balance, measured inside bars
-    /// The worst loss within one day, on the firm's day when its rule states one.
+    // prop_firm: fractions measured inside bars
+    /// The worst loss within one day, on the firm's day when its rule states one, as a fraction
+    /// of that day's starting balance: what an attempt started that morning would have lost.
     pub worst_daily_loss: Option<f64>,
     /// Max drawdown from the starting balance. For a `prop_firm` rule, the worst over attempts of
     /// its `breach_horizon_days` started on each day of the curve, each from its own starting
@@ -1213,9 +1214,12 @@ pub fn evaluate(rule: &VerdictRule, x: &KindInputs) -> Vec<Criterion> {
                 ),
             };
             let daily_loss = match firm.day_rollover {
-                // A rule saved before the field existed keeps its line as it was.
-                None => "Worst daily loss".to_string(),
-                Some(rollover) => format!("Worst daily loss, days ending at {}", day_end(rollover)),
+                // A rule saved before the field existed names no day end.
+                None => "Worst daily loss as a share of the day's starting balance".to_string(),
+                Some(rollover) => format!(
+                    "Worst daily loss as a share of the day's starting balance, days ending at {}",
+                    day_end(rollover)
+                ),
             };
             let mut lines = vec![
                 line(
@@ -2155,8 +2159,11 @@ mod tests {
              test"
         );
         assert_eq!(lines[3].name, "Chance of breaching a limit within 90 days");
-        // A rule that does not say where its firm's day ends keeps its daily loss line as it was.
-        assert_eq!(lines[0].name, "Worst daily loss");
+        // A rule that does not say where its firm's day ends names none.
+        assert_eq!(
+            lines[0].name,
+            "Worst daily loss as a share of the day's starting balance"
+        );
     }
 
     #[test]
@@ -2210,20 +2217,20 @@ mod tests {
         let utc = |offset_minutes| Some(DayRollover::Utc { offset_minutes });
         assert_eq!(
             name(utc(0), 90).0,
-            "Worst daily loss, days ending at 00:00 UTC"
+            "Worst daily loss as a share of the day's starting balance, days ending at 00:00 UTC"
         );
         assert_eq!(
             name(Some(DayRollover::NewYork1700), 90).0,
-            "Worst daily loss, days ending at 17:00 New York"
+            "Worst daily loss as a share of the day's starting balance, days ending at 17:00 New York"
         );
         // An offset is read modulo a day, as the rollover reads it.
         assert_eq!(
             name(utc(-60), 90).0,
-            "Worst daily loss, days ending at 23:00 UTC"
+            "Worst daily loss as a share of the day's starting balance, days ending at 23:00 UTC"
         );
         assert_eq!(
             name(utc(22 * 60 + 5), 90).0,
-            "Worst daily loss, days ending at 22:05 UTC"
+            "Worst daily loss as a share of the day's starting balance, days ending at 22:05 UTC"
         );
         assert_eq!(
             name(None, 30).1,

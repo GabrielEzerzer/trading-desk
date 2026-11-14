@@ -1677,7 +1677,8 @@ risk_of_ruin: number | null,
  */
 return_without_best_trade: number | null, 
 /**
- * The worst loss within one day, on the firm's day when its rule states one.
+ * The worst loss within one day, on the firm's day when its rule states one, as a fraction
+ * of that day's starting balance: what an attempt started that morning would have lost.
  */
 worst_daily_loss: number | null, 
 /**
@@ -1844,9 +1845,11 @@ export type PropFirmOdds = {
  */
 pass: number, 
 /**
- * The fraction of paths that breach a limit within the horizon, trading on after reaching
- * the target as a funded account would. The `prop_firm` kind rule asks for at most 0.10
- * over 90 days.
+ * The fraction of paths that breach a limit within the horizon: in a phase of the
+ * evaluation, or after the last phase passes, trading on as the funded account from a fresh
+ * balance and a fresh peak, as a firm starts each phase and the funded account again at the
+ * account size. The funded account takes no payouts here. The `prop_firm` kind rule asks for
+ * at most 0.10 over 90 days.
  */
 breach: number, paths: number, 
 /**
