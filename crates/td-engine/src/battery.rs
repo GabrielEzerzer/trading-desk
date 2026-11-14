@@ -1112,9 +1112,10 @@ fn sizing_warning(line: &Criterion, fixed_size: f64) -> Option<String> {
     (line.outcome == Outcome::Pass && !line.comparison.holds(Some(fixed_size), limit)).then(|| {
         format!(
             "The max drawdown line passed on the assumption that position size grows with the \
-             balance: its worst attempt fell by {} of that attempt's starting balance. At a fixed \
-             position size set from the starting balance, the worst attempt would have fallen by \
-             {} of the starting balance, over the line's limit of {}.",
+             balance: its worst attempt fell by {} of that attempt's starting balance. In money, the \
+             worst attempt's fall was {} of the starting balance, over the line's limit of {}. \
+             If the strategy trades a fixed position size set from the starting balance, that is \
+             what an account started fresh would have lost.",
             percent(value),
             percent(fixed_size),
             percent(limit)
@@ -2426,9 +2427,10 @@ mod tests {
                 Some(
                     "The max drawdown line passed on the assumption that position size grows \
                      with the balance: its worst attempt fell by 9.17% of that attempt's \
-                     starting balance. At a fixed position size set from the starting balance, \
-                     the worst attempt would have fallen by 11.00% of the starting balance, over \
-                     the line's limit of 10.00%."
+                     starting balance. In money, the worst attempt's fall was 11.00% of the starting \
+                     balance, over the line's limit of 10.00%. If the strategy trades a fixed \
+                     position size set from the starting balance, that is what an account \
+                     started fresh would have lost."
                 ),
                 "{drawdown:?}"
             );
@@ -2465,7 +2467,7 @@ mod tests {
         assert!(
             warning
                 .unwrap()
-                .contains("fallen by 11.00% of the starting balance")
+                .contains("fall was 11.00% of the starting balance")
         );
     }
 
