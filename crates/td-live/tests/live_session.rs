@@ -91,13 +91,14 @@ fn market(side: Side, qty: f64, reduce_only: bool) -> OrderRequest {
 /// it buys [`QTY`], with an attached stop at `stop` when that is above zero. On live bar
 /// `close_on` it cancels its open orders and sells its position. On live bar `panic_on` it
 /// panics, and on `fail_on` it fails the bar ([`Context::fail`]), each after anything else it does
-/// on that bar. `eager` instead submits a buy on every bar, warm-up bars included, while it is
-/// flat with no open orders.
+/// on that bar. On every live bar from `add_from` on it buys [`QTY`] more. `eager` instead submits
+/// a buy on every bar, warm-up bars included, while it is flat with no open orders.
 struct Double {
     buy_on: i64,
     close_on: i64,
     panic_on: i64,
     fail_on: i64,
+    add_from: i64,
     stop: f64,
     eager: bool,
     bar: i64,
@@ -124,6 +125,9 @@ impl Strategy for Double {
             } else {
                 ctx.submit(market(Side::Buy, QTY, false)).expect("buy");
             }
+        }
+        if self.add_from >= 0 && self.bar >= self.add_from {
+            ctx.submit(market(Side::Buy, QTY, false)).expect("add");
         }
         if self.bar == self.close_on {
             for id in ctx.open_orders().iter().map(|o| o.id).collect::<Vec<_>>() {
@@ -154,6 +158,7 @@ fn build(name: &str, params: &Params) -> Result<Box<dyn Strategy>, EngineError> 
         close_on: params.int("close_on")?,
         panic_on: params.int("panic_on")?,
         fail_on: params.int("fail_on")?,
+        add_from: params.int("add_from")?,
         stop: params.float("stop")?,
         eager: params.bool("eager")?,
         bar: 0,
@@ -167,6 +172,7 @@ fn config(buy_on: i64, close_on: i64, stop: bool) -> LiveConfig {
         .with("close_on", ParamValue::Int(close_on))
         .with("panic_on", ParamValue::Int(-1))
         .with("fail_on", ParamValue::Int(-1))
+        .with("add_from", ParamValue::Int(-1))
         .with("stop", ParamValue::Float(if stop { STOP } else { 0.0 }))
         .with("eager", ParamValue::Bool(false));
     LiveConfig {
@@ -786,6 +792,100 @@ fn a_fault_during_the_run_halts_it_and_the_session_stays_halted() {
     let refused = rig.open("fault").err().expect("refused");
     assert!(matches!(&refused, LiveError::StillFaulted(f) if f == fault));
     assert!(refused.to_string().contains("stays halted"), "{refused}");
+}
+
+/// The broker's rule for a venue it cannot read ("Unreadable venue" in the crate header), seen
+/// through a running session: no order that could add to the position goes out, the status warns
+/// and the session runs on, and the third bar in a row without a full read halts it for good.
+#[test]
+fn a_venue_that_cannot_be_read_gets_no_adding_order_and_halts_the_session_on_the_third_bar() {
+    let rig = Rig::new();
+    let mut cfg = config(0, 99, true);
+    cfg.params.set("add_from", ParamValue::Int(2));
+    let feed = rig.feed();
+    feed.minute(rig.bar(2));
+    let run = rig.run(rig.create("blind", cfg).expect("creates"), &feed);
+
+    // Bar 0 bought with a stop; by the end of bar 1 both are at the venue.
+    wait_for_bar(&run, rig.bar(1));
+    assert_eq!(rig.mock.position(SYMBOL), QTY);
+    let orders = rig.mock.orders();
+    assert_eq!(orders.len(), 2, "{orders:?}");
+    assert_eq!(orders.iter().filter(|o| o.reduce_only).count(), 1);
+
+    // From bar 2 on the strategy buys more on every bar, and the venue cannot be read.
+    for path in [
+        "/v5/execution/list",
+        "/v5/order/realtime",
+        "/v5/position/list",
+        WALLET,
+    ] {
+        rig.mock.inject_always(path, Fault::DropBeforeApply);
+    }
+    let creates = rig.mock.request_count(CREATE);
+
+    // One bar without a read: a warning, still running, nothing sent.
+    feed.minute(rig.bar(3));
+    wait_for_bar(&run, rig.bar(2));
+    let status = run.status();
+    assert_eq!(status.state, State::Running);
+    assert!(
+        status
+            .warnings
+            .iter()
+            .any(|w| w.contains("the venue could not be read")),
+        "{status:?}"
+    );
+    assert_eq!(rig.mock.request_count(CREATE), creates, "nothing sent");
+
+    // Two more: the third halts the run on the broker's fault.
+    feed.minute(rig.bar(5));
+    wait_until(&run, "the fault", |s| {
+        matches!(s.state, State::Faulted { .. })
+    });
+    let (live, ended) = run.wait();
+    let Err(error) = &ended else {
+        panic!("not faulted: {ended:?}");
+    };
+    let LiveError::Faulted(fault) = error else {
+        panic!("not faulted: {error}");
+    };
+    assert!(
+        fault.starts_with("venue unreadable: 3 bars in a row without a full read"),
+        "{fault}"
+    );
+    assert!(error.to_string().contains("broker fault"), "{error}");
+    assert!(error.to_string().contains(fault.as_str()), "{error}");
+    assert_eq!(live.status().last_bar, Some(rig.bar(4)));
+
+    // The venue received no order while it could not be read, so nothing added to the position.
+    assert_eq!(rig.mock.request_count(CREATE), creates, "nothing sent");
+    assert_eq!(rig.mock.orders().len(), 2);
+    assert_eq!(rig.mock.position(SYMBOL), QTY);
+    // The adds the strategy decided were cancelled with the broker's reason, never sent.
+    let refused = live
+        .session()
+        .orders()
+        .iter()
+        .filter(|o| !o.request.reduce_only && o.attached_stop.is_none())
+        .filter(|o| matches!(&o.status, td_engine::OrderStatus::Cancelled(r) if r.contains("could not be read")))
+        .count();
+    assert_eq!(refused, 2, "bars 2 and 3: {:?}", live.session().orders());
+
+    assert_eq!(
+        rig.saved_status("blind").state,
+        State::Faulted {
+            fault: fault.clone()
+        }
+    );
+    let marker = fs::read_to_string(rig.path("blind", "faulted")).expect("faulted marker");
+    assert!(marker.contains("without a full read"), "{marker}");
+    drop(live);
+    let refused = rig.open("blind").err().expect("refused");
+    assert!(
+        matches!(&refused, LiveError::StillFaulted(f) if f == fault),
+        "{refused}"
+    );
 }
 
 #[test]
@@ -1599,13 +1699,17 @@ fn a_resumed_part_finished_warm_up_shows_each_rate_once() {
         .collect();
     *rig.rest.rates.lock().unwrap() = funding.clone();
     let cfg = config(-1, -1, false);
+    // Held until the run stops: a feed dropped earlier closes its socket, and the disconnect is a
+    // warning.
+    let first_feed = rig.feed();
     let run = rig.run(
         rig.create("part", cfg.clone()).expect("creates"),
-        &rig.feed(),
+        &first_feed,
     );
     wait_until(&run, "running", |s| s.state == State::Running);
     let (live, ended) = run.stop();
     ended.expect("stopped cleanly");
+    drop(first_feed);
     drop(live);
     // The process ended after the first warm-up bar's line: the later warm-up lines are not synced.
     let path = rig.path("part", "events.jsonl");
@@ -1623,12 +1727,7 @@ fn a_resumed_part_finished_warm_up_shows_each_rate_once() {
     wait_for_bar(&run, rig.bar(1));
     let (live, ended) = run.stop();
     ended.expect("stopped cleanly");
-    // The status keeps the first run's warnings, such as its feed's disconnect when it stopped.
-    let warnings = &live.status().warnings;
-    assert!(
-        !warnings.iter().any(|w| w.contains("funding")),
-        "{warnings:?}"
-    );
+    assert!(live.status().warnings.is_empty(), "{:?}", live.status());
 
     let in_live = seen_live(&rig, "part", &cfg);
     let bars = live.session().bars();
