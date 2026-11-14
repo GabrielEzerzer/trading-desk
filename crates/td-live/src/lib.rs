@@ -49,14 +49,14 @@
 //!   order carried over a restart is unresolved) and the broker faults all the same. If the venue
 //!   cannot be asked, nothing goes out and the broker faults.
 //! - **Reconcile.** Every bar the venue's position must equal the fills reported, and the venue's
-//!   open orders must be the ones the session holds, each for the quantity sent and, for a stop,
-//!   at its trigger; the reads are repeated once to allow for an execution landing between them.
-//!   Then the quantity the session owes a stop for, capped at the venue's position, must be
-//!   covered by the session's reduce-only stops resting at the venue, or the broker faults
-//!   ([`FaultKind::Uncovered`]). That quantity grows by what each fill of an entry with an attached
-//!   stop opens, and shrinks by what any fill closes (a stop's own fill, a close at market, a
-//!   strategy's exit) and by what a stop the session cancelled had not filled. Going live after a
-//!   restart ends with the same check.
+//!   open orders must be the ones the session holds, each listed once, for the quantity sent and,
+//!   for a stop, at its trigger; the reads are repeated once to allow for an execution landing
+//!   between them. Then the quantity the session owes a stop for, capped at the venue's position,
+//!   must be covered by the session's reduce-only stops resting at the venue, or the broker
+//!   faults ([`FaultKind::Uncovered`]). That quantity grows by what each fill of an entry with an
+//!   attached stop opens, and shrinks by what any fill closes (a stop's own fill, a close at
+//!   market, a strategy's exit) and by what a stop the session cancelled had not filled. Going
+//!   live after a restart ends with the same check.
 //! - **Faults.** A disagreement, an execution the session did not make, or a protective stop that
 //!   cannot be placed or replaced is a [`BrokerFault`]. Once faulted the broker places, cancels and
 //!   amends nothing more, from any path: no flatten, no cancel, no resize. The one exception is a

@@ -273,6 +273,12 @@ impl MockVenue {
         self.state.lock().unwrap().cap_ioc = Some((link_id.to_string(), qty));
     }
 
+    /// Makes the real-time list of open orders show the open order with `link_id` twice, as a
+    /// venue listing an order wrongly would. A lookup by id still finds it once.
+    pub fn list_twice(&self, link_id: &str) {
+        self.state.lock().unwrap().listed_twice = Some(link_id.into());
+    }
+
     /// Fills the rest of the partially filled order with `link_id` at the current price.
     pub fn fill_rest(&self, link_id: &str) {
         self.state.lock().unwrap().fill_rest(link_id);

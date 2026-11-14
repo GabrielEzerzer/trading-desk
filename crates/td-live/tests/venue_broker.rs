@@ -2218,6 +2218,32 @@ fn after_a_restart_a_stop_cancelled_after_a_part_fill_takes_off_only_what_it_did
 }
 
 #[test]
+fn a_stop_the_venue_lists_twice_faults_and_does_not_cover_a_fill_twice() {
+    let mut rig = Rig::new(vec![
+        (
+            0,
+            Act::SubmitWithStop(market(Side::Buy, 0.004, false), 60000.0),
+        ),
+        (
+            0,
+            Act::SubmitWithStop(market(Side::Buy, 0.004, false), 60000.0),
+        ),
+    ]);
+    let records = run_recorded(&mut rig, 2);
+    assert_eq!(rig.handle.fault(), None);
+    // While the session is down the venue drops the second entry's stop, and its open orders list
+    // the first entry's stop twice, which would cover the whole position.
+    rig.mock.cancel_after_partial_fill("t-o4", 0.0);
+    rig.mock.list_twice("t-o2");
+    let sends = rig.sends();
+    let (_session, handle) = replayed(&rig, &records);
+    let fault = handle.go_live().expect_err("faulted");
+    assert_eq!(fault.kind, FaultKind::UnknownOpenOrder, "{fault}");
+    assert!(fault.message.contains("'t-o2' twice"), "{fault}");
+    assert_eq!(rig.sends(), sends, "nothing sent");
+}
+
+#[test]
 fn a_stop_missing_from_the_venues_open_orders_faults_though_its_lookup_shows_it_open() {
     let mut rig = stopped_entry(vec![]);
     rig.bar();

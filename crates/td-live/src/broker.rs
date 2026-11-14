@@ -64,8 +64,9 @@ pub enum FaultKind {
     UnmodelledExecution,
     /// The venue's position differs from the fills reported.
     PositionMismatch,
-    /// The venue lists an open order the session does not hold open, or holds one of the
-    /// session's open orders with another quantity or trigger.
+    /// The venue lists an open order the session does not hold open, lists one client id twice
+    /// among its open orders, or holds one of the session's open orders with another quantity or
+    /// trigger.
     UnknownOpenOrder,
     /// An order the session holds open is gone from the venue without a fill to explain it.
     MissingOrder,
@@ -1863,11 +1864,21 @@ impl Core {
         ))
     }
 
-    /// A venue open order the session does not hold open. An order of this session still counts
-    /// as held while it works on after a fill the session was given, and an entry's attached stop
-    /// while it waits for the bar that announces it.
+    /// A venue open order the session does not hold open, or a client id the venue lists twice,
+    /// which would count one stop twice as cover. An order of this session still counts as held
+    /// while it works on after a fill the session was given, and an entry's attached stop while
+    /// it waits for the bar that announces it.
     fn unknown_open(&self, open: &[VenueOrder]) -> Option<(FaultKind, String)> {
-        for o in open {
+        for (i, o) in open.iter().enumerate() {
+            if open[..i].iter().any(|p| p.client_id == o.client_id) {
+                return Some((
+                    FaultKind::UnknownOpenOrder,
+                    format!(
+                        "the venue lists open order '{}' twice",
+                        venue_text(&o.client_id)
+                    ),
+                ));
+            }
             let known = match ids::parse(&self.prefix, &o.client_id) {
                 Some((Role::Order, id)) => self.book.orders.get(&id.0).is_some_and(|t| {
                     matches!(
