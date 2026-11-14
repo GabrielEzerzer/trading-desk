@@ -27,7 +27,7 @@ use std::time::Duration;
 use td_core::{Candle, InstrumentId, Millis, Timeframe};
 use td_data::Store;
 use td_data::live::{FeedEvent, Rest, SharedStream, run_feed_on};
-use td_data::time::round_to_minute;
+use td_data::time::{format_minute, round_to_minute};
 
 use crate::VenueHandle;
 use crate::session::{Funding, LiveError, LiveSession, LiveStatus, State, panic_message};
@@ -49,6 +49,13 @@ const DEFAULT_FUNDING_INTERVAL: Millis = 8 * HOUR;
 /// Retries of a funding read that failed, or of a rate due in the bar and not yet published.
 const FUNDING_RETRIES: u32 = 3;
 const FUNDING_RETRY_DELAY: Duration = Duration::from_secs(5);
+/// The largest funding rate per interval, in absolute value, taken as a real read.
+///
+/// shortcut: a fixed bound set by hand far above the rates a working read gives, so a broken read
+/// such as 1e6 never reaches the modelled equity the strategy sizes from; it is not read from the
+/// venue's own cap for the instrument. Read that cap from the instrument's listing instead if a
+/// real rate ever comes near this bound.
+const MAX_FUNDING_RATE: f64 = 0.1;
 const FEED_ENDED: &str = "the feed ended, so no more bars can come";
 /// The relative difference below which a saved trading rule and the venue's are the same.
 const RULE_TOLERANCE: f64 = 1e-9;
@@ -633,7 +640,10 @@ fn read_funding(
                 rates.retain(|&(time, rate)| (from..to).contains(&time) && rate.is_finite());
                 rates.sort_by_key(|&(time, _)| time);
                 rates.dedup_by_key(|&mut (time, _)| time);
-                return Ok(rates);
+                match broken_rate(&rates) {
+                    None => return Ok(rates),
+                    Some(broken) => error = broken,
+                }
             }
             Err(e) => error = e.to_string(),
         }
@@ -641,6 +651,22 @@ fn read_funding(
     Err(format!(
         "funding rates could not be read after {FUNDING_RETRIES} retries: {error}"
     ))
+}
+
+/// Why a read holding `rates` is taken as broken: the first rate above [`MAX_FUNDING_RATE`] in
+/// absolute value, with its due time. `None` when every rate is within it. A rate that is not
+/// finite is left to the reads' own filter, which drops it.
+fn broken_rate(rates: &[(Millis, f64)]) -> Option<String> {
+    rates
+        .iter()
+        .find(|(_, rate)| rate.is_finite() && rate.abs() > MAX_FUNDING_RATE)
+        .map(|&(due, rate)| {
+            format!(
+                "the funding rate {rate} due at {} is above {MAX_FUNDING_RATE} per interval in \
+                 absolute value, so the read is taken as broken",
+                format_minute(due)
+            )
+        })
 }
 
 /// Funding for a bar from rates `(due, rate)` due before its end and not fed yet. `from` is the
@@ -756,8 +782,19 @@ impl FundingClock {
             }
             match rest.funding(id, self.last + 1, end) {
                 Ok(rates) => {
-                    charged.extend(self.take(&rates, from, end));
-                    error = None;
+                    // Only the rates `take` would charge: those after the last one charged.
+                    let window: Vec<_> = rates
+                        .iter()
+                        .copied()
+                        .filter(|&(t, _)| t > self.last && t < end)
+                        .collect();
+                    match broken_rate(&window) {
+                        None => {
+                            charged.extend(self.take(&rates, from, end));
+                            error = None;
+                        }
+                        Some(broken) => error = Some(broken),
+                    }
                 }
                 Err(e) => error = Some(e.to_string()),
             }
@@ -805,12 +842,13 @@ mod tests {
     const T: Millis = 1_704_067_200_000; // 2024-01-01 00:00 UTC
     const MIN: Millis = 60_000;
 
-    /// Publishes a rate every 8 hours; the first `fail` reads fail and the first `hide` reads
+    /// Publishes `rate` every 8 hours; the first `fail` reads fail and the first `hide` reads
     /// leave out the newest rate.
     struct Rates {
         fail: AtomicU32,
         hide: AtomicU32,
         reads: AtomicU32,
+        rate: f64,
     }
 
     impl Rates {
@@ -819,6 +857,7 @@ mod tests {
                 fail: AtomicU32::new(fail),
                 hide: AtomicU32::new(hide),
                 reads: AtomicU32::new(0),
+                rate: 0.0001,
             }
         }
     }
@@ -859,7 +898,7 @@ mod tests {
             Ok((-2..=2)
                 .map(|i| T + i * 8 * HOUR)
                 .filter(|t| (from..to).contains(t) && !(hide && *t == T))
-                .map(|t| (t, 0.0001))
+                .map(|t| (t, self.rate))
                 .collect())
         }
     }
@@ -944,6 +983,32 @@ mod tests {
         let error = charge(&rest, T).unwrap_err();
         assert!(error.contains("could not be read"), "{error}");
         assert_eq!(rest.reads.load(Ordering::SeqCst), FUNDING_RETRIES + 1);
+    }
+
+    /// A rate far past any a working read gives would wreck the modelled equity the strategy
+    /// sizes from, so it is refused as a broken read, retried and then halts, naming the rate and
+    /// its time; nothing is charged.
+    #[test]
+    fn a_rate_beyond_the_bound_is_a_broken_read_on_a_bar_and_in_a_history_read() {
+        let broken = "the funding rate -5 due at 2024-01-01 00:00 is above 0.1 per interval in \
+                      absolute value, so the read is taken as broken";
+        let rest = Rates {
+            rate: -5.0,
+            ..Rates::new(0, 0)
+        };
+        let error = charge(&rest, T).unwrap_err();
+        assert!(error.ends_with(broken), "{error}");
+        assert_eq!(rest.reads.load(Ordering::SeqCst), FUNDING_RETRIES + 1);
+
+        let error = read_funding(&rest, &id(), T - HOUR, T + HOUR).unwrap_err();
+        assert!(error.ends_with(broken), "{error}");
+
+        // The bound itself is a real read.
+        let rest = Rates {
+            rate: MAX_FUNDING_RATE,
+            ..Rates::new(0, 0)
+        };
+        assert_eq!(charge(&rest, T).unwrap()[0].rate, MAX_FUNDING_RATE);
     }
 
     #[test]

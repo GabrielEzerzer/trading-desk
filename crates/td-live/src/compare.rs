@@ -104,6 +104,16 @@ struct Playback {
     open: Vec<Order>,
 }
 
+/// The most of a recorded call a replay error shows. A call's text can be long (a bar's events),
+/// and the error's end says where the replay differs, so the call is cut rather than the error,
+/// which stays within the [`MAX_TEXT`] the command prints.
+const CALL_TEXT: usize = 400;
+
+/// A recorded call as a replay error shows it: cleaned and cut to [`CALL_TEXT`].
+fn shown(call: &dyn std::fmt::Debug) -> String {
+    clean(&format!("{call:?}"), CALL_TEXT)
+}
+
 fn lock(script: &Mutex<Script>) -> MutexGuard<'_, Script> {
     script.lock().unwrap_or_else(|p| p.into_inner())
 }
@@ -125,7 +135,8 @@ impl Broker for Playback {
             }
             Some(other) => {
                 script.diverged.get_or_insert(format!(
-                    "the record has {other:?} where the strategy submitted order {}, or submitted it differently",
+                    "the record has {} where the strategy submitted order {}, or submitted it differently",
+                    shown(&other),
                     order.id.0
                 ));
             }
@@ -150,7 +161,8 @@ impl Broker for Playback {
             }
             Some(other) => {
                 script.diverged.get_or_insert(format!(
-                    "the record has {other:?} where the strategy cancelled order {}",
+                    "the record has {} where the strategy cancelled order {}",
+                    shown(&other),
                     id.0
                 ));
                 false
@@ -175,7 +187,8 @@ impl Broker for Playback {
             Some(RecordedCall::Bar { open_time, events }) if open_time == bar.open_time => events,
             other => {
                 script.diverged.get_or_insert(format!(
-                    "the record has {other:?} where the session fed the bar opening at {}",
+                    "the record has {} where the session fed the bar opening at {}",
+                    shown(&other),
                     bar.open_time
                 ));
                 Vec::new()
@@ -294,15 +307,17 @@ fn replay(saved: &SavedConfig, lines: &[Line], build: BuildStrategy) -> Result<R
     let script = lock(&script);
     if let Some(left) = script.calls.front() {
         return Err(format!(
-            "the log does not replay with the strategy as it is now: the record has {left:?} that \
-             the replay never reached"
+            "the log does not replay with the strategy as it is now: the record has {} that \
+             the replay never reached",
+            shown(left)
         ));
     }
     if let Some(bar) = cut_short.filter(|_| !script.sent_past_record) {
         return Err(format!(
             "the log does not replay with the strategy as it is now: it ends on the sending line \
-             of the bar opening at {bar}, which the session writes before it sends or cancels, \
-             and the replay sent and cancelled nothing on that bar"
+             of the bar opening at {}, which the session writes before it sends or cancels, and \
+             the replay sent and cancelled nothing on that bar",
+            format_minute(bar)
         ));
     }
     let cut_short = cut_short.map(|bar| (bar, script.past_record));

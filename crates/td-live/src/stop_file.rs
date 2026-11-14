@@ -10,7 +10,8 @@
 //! and starting balance in `config.json`. A missing, unreadable or refused file, a link at its
 //! path, or a file with no fired stop whose flatten record shows a flatten ran refuses the open:
 //! the state is never rebuilt from nothing for a session that has run. Only `flatten` goes on
-//! past a damaged or missing file, with a fresh record that says so.
+//! past a damaged or missing file, with a fresh record that says so; when the rules or starting
+//! balance in `config.json` are refused too, it goes on with no stop state and writes no file.
 
 use std::path::Path;
 
@@ -107,15 +108,7 @@ impl StopRecord {
 
     /// Writes `stops.json` in `dir`: a synced temporary file renamed over the old one.
     pub fn save(&self, dir: &Path) -> Result<(), LiveError> {
-        let out = Out {
-            stops: &self.state,
-            flatten: &self.flatten,
-        };
-        let json = serde_json::to_vec_pretty(&out).map_err(|e| LiveError::StopFile {
-            path: dir.join(STOP_FILE),
-            reason: e.to_string(),
-        })?;
-        write_synced(dir, STOP_FILE, &json)
+        save_parts(dir, &self.state, &self.flatten)
     }
 
     /// Refuses a state with no fired stop whose flatten record shows a flatten ran: the guard
@@ -137,4 +130,21 @@ impl StopRecord {
     pub fn flatten_unfinished(&self) -> bool {
         self.state.fired().is_some() && self.flatten.result != Some(FlattenResult::Flat)
     }
+}
+
+/// Writes `stops.json` in `dir` from `state` and `flatten`, as [`StopRecord::save`] does.
+pub(crate) fn save_parts(
+    dir: &Path,
+    state: &StopState,
+    flatten: &Flatten,
+) -> Result<(), LiveError> {
+    let out = Out {
+        stops: state,
+        flatten,
+    };
+    let json = serde_json::to_vec_pretty(&out).map_err(|e| LiveError::StopFile {
+        path: dir.join(STOP_FILE),
+        reason: e.to_string(),
+    })?;
+    write_synced(dir, STOP_FILE, &json)
 }
