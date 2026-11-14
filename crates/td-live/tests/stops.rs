@@ -1730,6 +1730,33 @@ fn flatten_ends_a_faulted_session() {
     ));
 }
 
+/// A prefix too long to make an order id is refused before the venue is touched, as opening the
+/// session refuses it, rather than panicking when the first close is built.
+#[test]
+fn flatten_refuses_a_damaged_prefix_before_sending_anything() {
+    let rig = Rig::new();
+    let feed = rig.feed();
+    let (_, _) = rig.entered("prefix", wide(), &feed, bars_only()).stop();
+    let mut config = rig.json("prefix", "config.json");
+    config["prefix"] = "a".repeat(40).into();
+    rig.write_json("prefix", "config.json", &config);
+    let sends = rig.sends();
+    let (code, text) = td_live(&rig, &feed, &["flatten", "--id", "prefix"]);
+    assert_eq!(code, 1, "{text}");
+    assert!(
+        text.starts_with("error: ")
+            && text.contains("invalid session prefix: it is longer than 12 characters"),
+        "{text}"
+    );
+    assert_eq!(rig.sends(), sends, "nothing sent: {text}");
+    assert_eq!(rig.mock.position(SYMBOL), QTY);
+    assert_eq!(rig.resting(), 1);
+    assert!(!matches!(
+        rig.saved_status("prefix").state,
+        State::Ended { .. }
+    ));
+}
+
 /// The broker's own fault (here a position change the session did not make) halts the run; the
 /// guard keeps checking, and a fired limit or the owner's flatten still cancels and closes.
 #[test]

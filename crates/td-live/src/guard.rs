@@ -1166,8 +1166,9 @@ fn ended_reason(outcome: &Outcome) -> String {
 /// [`State::Ended`]. For a session that is not running: halted, faulted, stopped, or one whose
 /// stop fired and whose flatten did not finish. Nothing else is done at the venue.
 ///
-/// The session's lock is held throughout, so it cannot run meanwhile. The stop state's flatten
-/// counter keeps every close under a new id. A stop file that is missing, unreadable or refused
+/// A client-id prefix in `config.json` that cannot make order ids is refused before anything is
+/// sent. The session's lock is held throughout, so it cannot run meanwhile. The stop state's
+/// flatten counter keeps every close under a new id. A stop file that is missing, unreadable or refused
 /// does not block the flatten: it is replaced by a fresh record that says so, whose flatten ids
 /// count on from the venue's clock in milliseconds, far above any count the lost record could
 /// have reached. A link in its place is refused. A status file that cannot be read is replaced.
@@ -1185,6 +1186,12 @@ pub fn flatten_session(
         return Err(LiveError::NotFound(dir));
     }
     let saved: SavedConfig = read_json(&config_path)?;
+    // As opening a session checks it, so a damaged prefix is an error rather than a panic when
+    // the first order id is built.
+    ids::check_prefix(&saved.prefix).map_err(|e| LiveError::BadFile {
+        path: config_path.clone(),
+        reason: e.to_string(),
+    })?;
     let _lock = take_lock(&dir)?;
     let (mut record, saved_once) = match StopRecord::load(&dir, &saved) {
         Ok(record) => (record, true),
