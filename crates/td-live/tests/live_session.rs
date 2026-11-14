@@ -2416,7 +2416,10 @@ fn a_link_without_a_verdict_is_current_until_the_code_or_plan_it_started_with_ch
         status.contains("plan and rule does not match, code matches; no engine check"),
         "{status}"
     );
-    assert!(status.contains("\nlink: stale; the code or plan"), "{status}");
+    assert!(
+        status.contains("\nlink: stale; the code or plan"),
+        "{status}"
+    );
 }
 
 #[test]
@@ -2605,7 +2608,10 @@ fn text_from_the_data_folder_reaches_the_terminal_without_control_characters() {
     let (code, text) = rig.start_linked(&feed, "refused", &["--verdict", NEWER]);
     assert_eq!(code, 1, "{text}");
     assert!(!text.chars().any(char::is_control), "{text:?}");
-    assert!(text.contains(" on bybit:ETH [2JUSDT:perpetual, not of "), "{text}");
+    assert!(
+        text.contains(" on bybit:ETH [2JUSDT:perpetual, not of "),
+        "{text}"
+    );
 
     rig.save_verdict(OLDER, &instrument().id, Vec::new());
     let (code, text) = rig.start_linked(&feed, "marked", &[]);
@@ -2629,7 +2635,10 @@ fn text_from_the_data_folder_reaches_the_terminal_without_control_characters() {
         ),
         "{text}"
     );
-    assert!(text.contains("the strategy's code hash was  ]0;title \n"), "{text}");
+    assert!(
+        text.contains("the strategy's code hash was  ]0;title \n"),
+        "{text}"
+    );
 }
 
 /// `status` reads a session's config only from a plain folder and file, as `compare` and a resume
@@ -2928,7 +2937,11 @@ fn compare_counts_the_funding_the_session_was_charged_late() {
     drop(live);
     let log = rig.log("funded");
     let with_rate = |l: &&serde_json::Value| l["funding"].as_array().is_some_and(|f| !f.is_empty());
-    assert_eq!(log.iter().filter(with_rate).count(), 2, "a sending line and its bar's");
+    assert_eq!(
+        log.iter().filter(with_rate).count(),
+        2,
+        "a sending line and its bar's"
+    );
 
     let charged = |late: usize| {
         format!(
@@ -2969,7 +2982,8 @@ fn compare_prints_the_saved_config_without_control_characters() {
     let feed = rig.feed();
     feed.minute(rig.bar(1));
     let run = rig.run(
-        rig.create("marked", config(99, 99, false)).expect("creates"),
+        rig.create("marked", config(99, 99, false))
+            .expect("creates"),
         &feed,
     );
     wait_for_bar(&run, rig.bar(0));
