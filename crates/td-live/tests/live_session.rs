@@ -400,7 +400,7 @@ impl Rig {
     }
 
     fn create(&self, id: &str, config: LiveConfig) -> Result<LiveSession, LiveError> {
-        LiveSession::create(self.data(), id, config, self.client.clone(), build)
+        LiveSession::create(self.data(), id, config, None, self.client.clone(), build)
     }
 
     fn open(&self, id: &str) -> Result<LiveSession, LiveError> {
@@ -2142,4 +2142,864 @@ fn warnings_are_trimmed_when_a_status_is_loaded() {
     assert_eq!(warnings.len(), 100);
     assert_eq!(warnings[0], "warning 51");
     assert!(warnings.iter().all(|w| w.chars().count() <= 1001));
+}
+
+// ---- the link to what a session was started from, and `td-live status` ----
+
+/// The registered strategy the link tests start: it trades nothing on the rig's flat bars.
+const LINKED: &str = "sma_cross";
+const LINKED_PARAMS: &str = r#"{"fast":10,"slow":30}"#;
+
+impl Rig {
+    /// An `Env` for the command on this rig. Its stop is asked for before the command runs, so a
+    /// `start` or `resume` creates or opens the session and stops it cleanly.
+    fn env(&self, feed: &Feed) -> td_live::cli::Env {
+        let client = self.client.clone();
+        let (url, data) = (feed.url.clone(), self.data().to_path_buf());
+        let stop = StopHandle::new();
+        stop.stop();
+        td_live::cli::Env {
+            connect: Box::new(move || Ok(client.clone())),
+            rest: self.rest.clone(),
+            stream: Arc::new(move |id| Arc::new(SharedStream::open(id, url.clone()))),
+            build,
+            data_dir: Box::new(move || Ok(data.clone())),
+            timing: GuardTiming {
+                interval: Duration::from_millis(100),
+                pause: Duration::from_millis(50),
+                rounds: 6,
+                unreadable: 4,
+            },
+            stop,
+        }
+    }
+
+    /// Runs `td-live` with `args` on this rig and returns its exit code and output.
+    fn td_live(&self, feed: &Feed, args: &[&str]) -> (u8, String) {
+        use clap::Parser;
+        let cli = td_live::cli::Cli::try_parse_from(
+            std::iter::once("td-live").chain(args.iter().copied()),
+        )
+        .expect("parses");
+        let mut lines = Vec::new();
+        let code = td_live::cli::execute(cli, &self.env(feed), &mut |l| lines.push(l.to_string()));
+        (code, lines.join("\n"))
+    }
+
+    /// `td-live start` of [`LINKED`] as session `id`, with `extra` arguments.
+    fn start_linked(&self, feed: &Feed, id: &str, extra: &[&str]) -> (u8, String) {
+        let mut args = vec![
+            "start",
+            "--id",
+            id,
+            "--strategy",
+            LINKED,
+            "--params",
+            LINKED_PARAMS,
+            "--symbol",
+            SYMBOL,
+            "--timeframe",
+            "1h",
+            "--daily-loss",
+            "1",
+            "--max-loss",
+            "1",
+            "--notional-cap",
+            "1000000000000",
+        ];
+        args.extend_from_slice(extra);
+        self.td_live(feed, &args)
+    }
+
+    fn config_json(&self, id: &str) -> serde_json::Value {
+        serde_json::from_str(&fs::read_to_string(self.path(id, "config.json")).expect("config"))
+            .expect("config reads")
+    }
+
+    fn write_config_json(&self, id: &str, config: &serde_json::Value) {
+        fs::write(
+            self.path(id, "config.json"),
+            serde_json::to_vec_pretty(config).expect("json"),
+        )
+        .expect("write");
+    }
+
+    /// Saves a verdict of [`LINKED`] on `on`, as its plan and rule are now, as run `run_id` in the
+    /// runs folder, judged with `references`.
+    fn save_verdict(&self, run_id: &str, on: &InstrumentId, references: Vec<InstrumentId>) {
+        let entry = td_engine::find_strategy(LINKED).expect("registered");
+        let record = td_engine::VerdictRecord {
+            strategy: LINKED.into(),
+            instrument: on.clone(),
+            seed: 1,
+            engine_revision: td_engine::ENGINE_REVISION,
+            verdict: td_engine::Verdict::new(on.clone(), Vec::new()),
+            plan: serde_json::to_value(&entry.plan).unwrap(),
+            rule: serde_json::to_value(entry.rule).unwrap(),
+            complete: true,
+            code_hash: td_engine::code_hash(LINKED).map(String::from),
+            references,
+        };
+        let dir = self.data().join(td_engine::RUNS_DIR).join(run_id);
+        fs::create_dir_all(&dir).expect("run folder");
+        fs::write(
+            dir.join(td_engine::VERDICT_FILE),
+            serde_json::to_vec(&record).expect("json"),
+        )
+        .expect("verdict");
+    }
+}
+
+const OLDER: &str = "1700000000000-0000000a";
+const NEWER: &str = "1700000000001-0000000b";
+
+/// The status lines that start with `link`.
+fn link_status(rig: &Rig, feed: &Feed, id: &str) -> String {
+    let (code, text) = rig.td_live(feed, &["status", "--id", id]);
+    assert_eq!(code, 0, "{text}");
+    text.lines()
+        .filter(|l| l.starts_with("link"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn start_links_the_session_to_the_latest_verdict_or_the_one_named_and_status_checks_it() {
+    let rig = Rig::new();
+    let feed = rig.feed();
+    let on = instrument().id;
+    rig.save_verdict(OLDER, &on, Vec::new());
+    rig.save_verdict(NEWER, &on, Vec::new());
+
+    let (code, text) = rig.start_linked(&feed, "latest", &[]);
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("created session latest"), "{text}");
+    let link = &rig.config_json("latest")["link"];
+    assert_eq!(link["verdict"]["run_id"], NEWER);
+    assert_eq!(
+        link["code_hash"].as_str(),
+        td_engine::code_hash(LINKED),
+        "the hash of the strategy's file"
+    );
+    let entry = td_engine::find_strategy(LINKED).unwrap();
+    assert_eq!(link["plan"], serde_json::to_value(&entry.plan).unwrap());
+    assert_eq!(link["rule"], serde_json::to_value(entry.rule).unwrap());
+
+    // The session started with the code, plan and rule the verdict judged. The verdict's engine
+    // and code are this build's. The strategy's plan does not test this venue's perpetual, so the
+    // plan check fails and the link is stale, as the verdict list would show it.
+    let status = link_status(&rig, &feed, "latest");
+    assert!(
+        status.contains(&format!(
+            "link: started from verdict {NEWER} of {LINKED} on {on}"
+        )),
+        "{status}"
+    );
+    assert!(
+        status.contains(
+            "link checks of what the session started with against the verdict: plan and rule \
+             matches, code matches\n"
+        ),
+        "{status}"
+    );
+    assert!(
+        status.contains(
+            "link checks of the verdict against the strategy as this td-live build has it: \
+             engine revision matches, plan and rule does not match, code matches"
+        ),
+        "{status}"
+    );
+    assert!(
+        status.contains(
+            "link: stale; what the session started with, or the code, plan or engine of the \
+             strategy as this td-live build has it, may not be what that verdict judged; a \
+             running session keeps the code it was started with until it is restarted"
+        ),
+        "{status}"
+    );
+
+    // A session started with other code than the verdict judged shows it from its saved link,
+    // whatever this build's code is.
+    let mut config = rig.config_json("latest");
+    config["link"]["code_hash"] = "0000000000000000".into();
+    rig.write_config_json("latest", &config);
+    let status = link_status(&rig, &feed, "latest");
+    assert!(
+        status.contains(
+            "against the verdict: plan and rule matches, code does not match\nlink checks of the \
+             verdict against the strategy as this td-live build has it: engine revision matches, \
+             plan and rule does not match, code matches"
+        ),
+        "{status}"
+    );
+
+    // An older engine revision shows in its own check.
+    let mut config = rig.config_json("latest");
+    config["link"]["verdict"]["engine_revision"] = (td_engine::ENGINE_REVISION - 1).into();
+    rig.write_config_json("latest", &config);
+    let status = link_status(&rig, &feed, "latest");
+    assert!(
+        status.contains("engine revision does not match, plan and rule does not match"),
+        "{status}"
+    );
+
+    // A verdict named with --verdict is the one linked, in a data folder of its own.
+    let other = tempfile::tempdir().expect("temp dir");
+    let runs = other.path().join(td_engine::RUNS_DIR);
+    fs::create_dir_all(&runs).unwrap();
+    for run in [OLDER, NEWER] {
+        let from = rig.data().join(td_engine::RUNS_DIR).join(run);
+        fs::create_dir_all(runs.join(run)).unwrap();
+        fs::copy(
+            from.join(td_engine::VERDICT_FILE),
+            runs.join(run).join(td_engine::VERDICT_FILE),
+        )
+        .unwrap();
+    }
+    let data = other.path().to_str().unwrap();
+    let (code, text) = rig.start_linked(&feed, "named", &["--verdict", OLDER, "--data-dir", data]);
+    assert_eq!(code, 0, "{text}");
+    let config: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(live_dir(other.path(), "named").join("config.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(config["link"]["verdict"]["run_id"], OLDER);
+}
+
+#[test]
+fn a_link_without_a_verdict_is_current_until_the_code_or_plan_it_started_with_changes() {
+    let rig = Rig::new();
+    let feed = rig.feed();
+    let (code, text) = rig.start_linked(&feed, "unjudged", &[]);
+    assert_eq!(code, 0, "{text}");
+    let started = rig.config_json("unjudged");
+    assert!(started["link"]["verdict"].is_null(), "{started}");
+
+    let status = link_status(&rig, &feed, "unjudged");
+    let on = instrument().id;
+    assert_eq!(
+        status,
+        format!(
+            "link: started with no saved verdict of {LINKED} on {on}; the strategy's code hash was {}\n\
+             link checks of what the session started with against the strategy as this td-live \
+             build has it: plan and rule matches, code matches; no engine check is made, since the \
+             link saves no engine revision\n\
+             link: current",
+            td_engine::code_hash(LINKED).unwrap()
+        )
+    );
+
+    // As if the strategy's file had been edited since the session started.
+    let mut edited = started.clone();
+    edited["link"]["code_hash"] = "0000000000000000".into();
+    rig.write_config_json("unjudged", &edited);
+    let status = link_status(&rig, &feed, "unjudged");
+    assert!(
+        status.contains(
+            "plan and rule matches, code does not match; no engine check is made, since the link \
+             saves no engine revision\nlink: stale; the code or plan of the strategy as this \
+             td-live build has it may not be what the session started with; a running session \
+             keeps the code it was started with until it is restarted"
+        ),
+        "{status}"
+    );
+
+    // As if its plan had been changed since.
+    let mut replanned = started.clone();
+    let from = replanned["link"]["plan"]["period"]["from"]
+        .as_i64()
+        .unwrap();
+    replanned["link"]["plan"]["period"]["from"] = (from - 86_400_000).into();
+    rig.write_config_json("unjudged", &replanned);
+    let status = link_status(&rig, &feed, "unjudged");
+    assert!(
+        status.contains("plan and rule does not match, code matches; no engine check"),
+        "{status}"
+    );
+    assert!(
+        status.contains("\nlink: stale; the code or plan"),
+        "{status}"
+    );
+}
+
+#[test]
+fn a_session_saved_without_a_link_loads_resumes_and_shows_status() {
+    let rig = Rig::new();
+    let feed = rig.feed();
+    // The test double is not registered, so its session has no link, and its config.json is the
+    // one a session saved before links were recorded holds: the same fields, with no `link`.
+    drop(rig.create("old", config(-1, -1, false)).expect("creates"));
+    let config = rig.config_json("old");
+    assert!(config.get("link").is_none(), "{config}");
+    let saved: td_live::SavedConfig = serde_json::from_value(config).expect("reads");
+    assert_eq!(saved.link, None);
+
+    let status = link_status(&rig, &feed, "old");
+    assert_eq!(
+        status,
+        "link: none recorded; the session was created before links were recorded, or its \
+         strategy is not registered"
+    );
+    drop(rig.open("old").expect("opens"));
+    let (code, text) = rig.td_live(&feed, &["resume", "--id", "old"]);
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("resumed session old"), "{text}");
+}
+
+/// A live session feeds its strategy no reference instruments, so it is never started from a
+/// verdict judged with them, named or latest; nor from a run that is not a saved verdict of the
+/// strategy on the instrument. Each refusal comes before the session's folder is made and before
+/// any request reaches the venue.
+#[test]
+fn start_refuses_a_verdict_it_cannot_run_before_writing_or_asking_the_venue_anything() {
+    let rig = Rig::new();
+    let feed = rig.feed();
+    let on = instrument().id;
+    let reference = InstrumentId {
+        symbol: "ETHUSDT".into(),
+        ..on.clone()
+    };
+    rig.save_verdict(OLDER, &on, Vec::new());
+    rig.save_verdict(NEWER, &on, vec![reference.clone()]);
+    let another = "1700000000002-0000000c";
+    rig.save_verdict(another, &reference, Vec::new());
+
+    let requests = rig.mock.requests().len();
+    let refused = |extra: &[&str], why: &[&str]| {
+        let (code, text) = rig.start_linked(&feed, "refused", extra);
+        assert_eq!(code, 1, "{extra:?}: {text}");
+        assert!(text.starts_with("error: "), "{text}");
+        for part in why {
+            assert!(text.contains(part), "{extra:?}: {part:?} not in {text}");
+        }
+        assert_eq!(rig.mock.requests().len(), requests, "{extra:?}: {text}");
+        assert!(!rig.data().join("live").exists(), "{extra:?}");
+    };
+    let feeds_none = format!(
+        "run {NEWER} was judged with the reference instruments {reference}, and a paper or live \
+         session cannot feed reference instruments yet"
+    );
+    // The latest verdict was judged with a reference.
+    refused(
+        &[],
+        &[
+            &feeds_none,
+            &format!("it is the strategy's latest verdict on {on}"),
+            "name a verdict judged without them with --verdict",
+        ],
+    );
+    // So is the verdict named.
+    refused(&["--verdict", NEWER], &[&feeds_none]);
+    // A verdict of another instrument, a run that is not a verdict, and an id that is not one.
+    refused(
+        &["--verdict", another],
+        &[&format!(
+            "run {another} is the verdict of {LINKED} on {reference}, not of {LINKED} on {on}"
+        )],
+    );
+    refused(
+        &["--verdict", "1700000000003-0000000d"],
+        &["run 1700000000003-0000000d is not a saved verdict"],
+    );
+    refused(
+        &["--verdict", "../../etc"],
+        &["\"../../etc\" is not a run id"],
+    );
+    refused(&["--verdict", r"..\runs"], &["is not a run id"]);
+
+    // A verdict judged without references still starts the session.
+    let (code, text) = rig.start_linked(&feed, "plain", &["--verdict", OLDER]);
+    assert_eq!(code, 0, "{text}");
+    assert_eq!(rig.config_json("plain")["link"]["verdict"]["run_id"], OLDER);
+}
+
+#[test]
+fn a_verdict_named_for_a_strategy_that_is_not_registered_is_refused_before_anything_is_sent() {
+    let rig = Rig::new();
+    let feed = rig.feed();
+    let requests = rig.mock.requests().len();
+    let (code, text) = rig.td_live(
+        &feed,
+        &[
+            "start",
+            "--id",
+            "double",
+            "--strategy",
+            "double",
+            "--params",
+            "{}",
+            "--symbol",
+            SYMBOL,
+            "--timeframe",
+            "1h",
+            "--daily-loss",
+            "1",
+            "--max-loss",
+            "1",
+            "--notional-cap",
+            "1",
+            "--verdict",
+            OLDER,
+        ],
+    );
+    assert_eq!(code, 1, "{text}");
+    assert!(
+        text.contains("double is not a registered strategy, so it has none"),
+        "{text}"
+    );
+    assert_eq!(rig.mock.requests().len(), requests);
+    assert!(!rig.data().join("live").exists());
+}
+
+/// A symbol the venue lists written another way is refused before a session is written or an
+/// order sent, so the link and the session name one instrument. `Client::instrument_info` refuses
+/// the answer first; td-live's own check stands behind it.
+#[test]
+fn start_refuses_a_symbol_the_venue_lists_written_another_way() {
+    let rig = Rig::new();
+    let feed = rig.feed();
+    rig.mock.list_as("btcusdt", SYMBOL);
+    let (code, text) = rig.td_live(
+        &feed,
+        &[
+            "start",
+            "--id",
+            "lower",
+            "--strategy",
+            LINKED,
+            "--params",
+            LINKED_PARAMS,
+            "--symbol",
+            "btcusdt",
+            "--timeframe",
+            "1h",
+            "--daily-loss",
+            "1",
+            "--max-loss",
+            "1",
+            "--notional-cap",
+            "1000000000000",
+        ],
+    );
+    assert_eq!(code, 1, "{text}");
+    assert!(!rig.data().join("live").exists(), "{text}");
+    let sent = rig.mock.requests();
+    assert!(
+        !sent
+            .iter()
+            .any(|r| [CREATE, CANCEL, AMEND].contains(&r.path.as_str())),
+        "{text}"
+    );
+    assert!(text.contains("another symbol"), "{text}");
+}
+
+/// Text from the data folder reaches the owner's terminal without control characters, so a file
+/// another person or program wrote cannot drive it: a run record's text in an error, and the link
+/// `status` shows from a session's config.
+#[test]
+fn text_from_the_data_folder_reaches_the_terminal_without_control_characters() {
+    let rig = Rig::new();
+    let feed = rig.feed();
+    let marked = InstrumentId {
+        symbol: "ETH\u{1b}[2JUSDT".into(),
+        ..instrument().id
+    };
+    rig.save_verdict(NEWER, &marked, Vec::new());
+    let (code, text) = rig.start_linked(&feed, "refused", &["--verdict", NEWER]);
+    assert_eq!(code, 1, "{text}");
+    assert!(!text.chars().any(char::is_control), "{text:?}");
+    assert!(
+        text.contains(" on bybit:ETH [2JUSDT:perpetual, not of "),
+        "{text}"
+    );
+
+    rig.save_verdict(OLDER, &instrument().id, Vec::new());
+    let (code, text) = rig.start_linked(&feed, "marked", &[]);
+    assert_eq!(code, 0, "{text}");
+    let mut config = rig.config_json("marked");
+    config["strategy"] = "sma\u{1b}[2Jcross".into();
+    config["instrument"]["id"]["symbol"] = "BTC\u{7}USDT".into();
+    config["link"]["code_hash"] = "\u{1b}]0;title\u{7}".into();
+    config["link"]["verdict"]["run_id"] = "1700000000000-\u{1b}[31m".into();
+    rig.write_config_json("marked", &config);
+    let (code, text) = rig.td_live(&feed, &["status", "--id", "marked"]);
+    assert_eq!(code, 0, "{text}");
+    assert!(
+        !text.chars().any(|c| c.is_control() && c != '\n'),
+        "{text:?}"
+    );
+    assert!(
+        text.contains(
+            "link: started from verdict 1700000000000- [31m of sma [2Jcross on \
+             bybit:BTC USDT:perpetual: "
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains("the strategy's code hash was  ]0;title \n"),
+        "{text}"
+    );
+}
+
+/// `status` reads a session's config only from a plain folder and file, as `compare` and a resume
+/// do.
+#[test]
+fn status_refuses_a_link_in_place_of_the_session_folder_or_its_config() {
+    let rig = Rig::new();
+    let feed = rig.feed();
+    drop(rig.create("real", config(0, 99, false)).expect("creates"));
+    let refused = |id: &str| {
+        let (code, text) = rig.td_live(&feed, &["status", "--id", id]);
+        assert_eq!(code, 1, "{text}");
+        assert!(text.starts_with("error: "), "nothing before it: {text}");
+        assert!(text.contains("is a link or reparse point"), "{text}");
+    };
+    match link_dir(
+        &live_dir(rig.data(), "real"),
+        &live_dir(rig.data(), "linked"),
+    ) {
+        Ok(()) => refused("linked"),
+        Err(why) => println!("skipped the folder link: it could not be made: {why}"),
+    }
+
+    let saved = rig.path("real", "config.json");
+    let outside = rig.data().join("elsewhere");
+    fs::create_dir_all(&outside).expect("folder");
+    let target = outside.join("config.json");
+    fs::rename(&saved, &target).expect("move the config out");
+    match link_file(&target, &saved) {
+        Ok(()) => refused("real"),
+        Err(why) => println!("skipped the config link: it could not be made: {why}"),
+    }
+}
+
+// ---- `td-live compare` ----
+
+/// Runs session `id` on live bars 0 to 2: it buys on bar 0 and adds on every bar after. The venue
+/// fills bar 0's buy 10 above the bar and refuses every order after it.
+fn compared_session(rig: &Rig, feed: &Feed, id: &str) {
+    let mut cfg = config(0, -1, false);
+    cfg.params.set("add_from", ParamValue::Int(1));
+    rig.mock.set_price(SYMBOL, PRICE + 10.0);
+    feed.minute(rig.bar(1));
+    let run = rig.run(rig.create(id, cfg).expect("creates"), feed);
+    wait_for_bar(&run, rig.bar(0));
+    rig.mock.inject_always(CREATE, Fault::Answer(10001));
+    feed.minute(rig.bar(3));
+    wait_for_bar(&run, rig.bar(2));
+    let (live, ended) = run.stop();
+    ended.expect("stopped cleanly");
+    assert_eq!(live.session().fills().len(), 1);
+}
+
+/// Writes `lines` as session `id`'s log.
+fn write_log(rig: &Rig, id: &str, lines: &[serde_json::Value]) {
+    let text: String = lines.iter().map(|l| format!("{l}\n")).collect();
+    fs::write(rig.path(id, "events.jsonl"), text).expect("log");
+}
+
+/// A session against the mock beside a backtest over its own bars ([`compared_session`]), while
+/// the backtest also fills bar 1's add. `compare` reads the folder only: it runs with a connect
+/// that fails and sends nothing.
+#[test]
+fn compare_pairs_the_venue_fills_with_a_backtest_over_the_session_bars() {
+    let rig = Rig::new();
+    let feed = rig.feed();
+    compared_session(&rig, &feed, "cmp");
+
+    let mut env = rig.env(&feed);
+    env.connect = Box::new(|| Err("no keys in this test".into()));
+    let requests = rig.mock.requests().len();
+    let cli =
+        <td_live::cli::Cli as clap::Parser>::try_parse_from(["td-live", "compare", "--id", "cmp"])
+            .expect("parses");
+    let mut lines = Vec::new();
+    let code = td_live::cli::execute(cli, &env, &mut |l| lines.push(l.to_string()));
+    let text = lines.join("\n");
+    assert_eq!(code, 0, "{text}");
+    assert_eq!(
+        rig.mock.requests().len(),
+        requests,
+        "compare asked the venue nothing"
+    );
+
+    let at = |t: Millis| td_data::time::format_minute(t);
+    // By hand. The venue: 0.004 at 65010, fee 65010 x 0.004 x 0.00055 = 0.143022, read on bar 1.
+    // The backtest: 0.004 at bar 1's open of 65000, fee 260 x 0.00055 = 0.143; and bar 1's add at
+    // bar 2's open, fee 0.143. Bar 2's add has no bar after it to fill on.
+    assert!(
+        text.contains(&format!(
+            "compared session cmp with a backtest of double on {} 1h over the session's own bars: \
+             3 live bars from {} to {}, after {WARM_UP} warm-up bars",
+            instrument().id,
+            at(rig.bar(0)),
+            at(rig.bar(2)),
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains("what is compared: the fills the venue reported"),
+        "{text}"
+    );
+    assert!(text.contains("which the backtest cannot model"), "{text}");
+    assert!(
+        text.contains(&format!(
+            "matched fills: 1\n  buy 0.004, decided on the bar opening at {}: session 65010 at \
+             {}, backtest 65000 at {}; time difference 0 ms, price difference +10, quantity \
+             difference 0, fee difference +0.000022",
+            at(rig.bar(0)),
+            at(rig.bar(1)),
+            at(rig.bar(1)),
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains("session fills with no backtest partner: 0\n"),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "backtest fills with no session partner: 1\n  buy 0.004 at 65000 at {}, fee 0.143",
+            at(rig.bar(2))
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            "fees: session 0.143022, backtest 0.286; funding paid: session 0, backtest 0"
+        ),
+        "{text}"
+    );
+    // The session loses its fee and 10 x 0.004 = 0.04 to the bar's close of 65000: -0.183022. The
+    // backtest loses its two fees: -0.286. -0.183022 / -0.286 = 0.63993...
+    assert!(
+        text.ends_with(
+            "profit and loss: session -0.183022, backtest -0.286; the session's over the \
+             backtest's: 0.6399"
+        ),
+        "{text}"
+    );
+
+    // A strategy whose code or parameters now make other orders than the session made is not
+    // compared: here it no longer adds on bar 1, as the record says it did.
+    let mut config = rig.config_json("cmp");
+    config["params"]["add_from"] = 5.into();
+    rig.write_config_json("cmp", &config);
+    let (code, text) = rig.td_live(&feed, &["compare", "--id", "cmp"]);
+    assert_eq!(code, 1, "{text}");
+    assert!(
+        text.contains("does not replay with the strategy as it is now"),
+        "{text}"
+    );
+}
+
+/// A session id that is not one is refused before any path is made from it, and a session
+/// that has fed no live bar has nothing to compare.
+#[test]
+fn compare_refuses_a_bad_id_and_a_session_with_no_live_bar() {
+    let rig = Rig::new();
+    let feed = rig.feed();
+    let (code, text) = rig.td_live(&feed, &["compare", "--id", "../x"]);
+    assert_eq!(code, 1, "{text}");
+    assert!(text.contains("invalid session id \"../x\""), "{text}");
+    drop(rig.create("empty", config(-1, -1, false)).expect("creates"));
+    let (code, text) = rig.td_live(&feed, &["compare", "--id", "empty"]);
+    assert_eq!(code, 1, "{text}");
+    assert!(text.contains("has not fed a live bar yet"), "{text}");
+}
+
+/// A log that ends on a `sending` line, as a session that stopped while sending, or is still
+/// sending, leaves it: the orders the strategy makes on that bar past the record count as
+/// unfilled. A strategy that now makes no send or cancel there does not replay, since the
+/// session wrote that line because it was about to make one.
+#[test]
+fn compare_counts_the_orders_of_a_bar_the_log_ends_part_way_through_as_unfilled() {
+    let rig = Rig::new();
+    let feed = rig.feed();
+    compared_session(&rig, &feed, "cut");
+    drop_last_line(&rig.path("cut", "events.jsonl"));
+    let log = rig.log("cut");
+    let last = log.last().expect("a line");
+    assert_eq!(
+        (&last["sending"], &last["bar"]["open_time"]),
+        (&true.into(), &rig.bar(2).into())
+    );
+
+    let at = |t: Millis| td_data::time::format_minute(t);
+    let (code, text) = rig.td_live(&feed, &["compare", "--id", "cut"]);
+    assert_eq!(code, 0, "{text}");
+    assert!(
+        text.contains(&format!(
+            "3 live bars from {} to {}, after {WARM_UP} warm-up bars",
+            at(rig.bar(0)),
+            at(rig.bar(2))
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "the log ends part way through the bar opening at {} (the session stopped, or is \
+             still sending), and the 1 orders the strategy made on it after the record ended are \
+             counted as unfilled\nmatched fills: 1\n",
+            at(rig.bar(2))
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains("session fills with no backtest partner: 0\n"),
+        "{text}"
+    );
+    assert!(
+        text.contains("backtest fills with no session partner: 1\n"),
+        "{text}"
+    );
+
+    // The log cut after bar 0's sending line, with a strategy that no longer buys there.
+    let first_sending = log.iter().position(|l| l["sending"] == true).unwrap();
+    write_log(&rig, "cut", &log[..=first_sending]);
+    let mut config = rig.config_json("cut");
+    config["params"]["buy_on"] = 5.into();
+    rig.write_config_json("cut", &config);
+    let (code, text) = rig.td_live(&feed, &["compare", "--id", "cut"]);
+    assert_eq!(code, 1, "{text}");
+    assert!(
+        text.contains(&format!(
+            "it ends on the sending line of the bar opening at {}, which the session writes \
+             before it sends or cancels, and the replay sent and cancelled nothing on that bar",
+            rig.bar(0)
+        )),
+        "{text}"
+    );
+}
+
+/// `compare` reads a faulted session's folder as any other: the fault halted the session after
+/// its bars were logged, and its fills are compared.
+#[test]
+fn compare_works_on_a_faulted_session() {
+    let rig = Rig::new();
+    let feed = rig.feed();
+    feed.minute(rig.bar(2));
+    let run = rig.run(
+        rig.create("fault", config(0, 99, false)).expect("creates"),
+        &feed,
+    );
+    wait_for_bar(&run, rig.bar(1));
+    rig.mock.set_position(SYMBOL, 0.01, PRICE);
+    feed.minute(rig.bar(4));
+    let (live, ended) = run.wait();
+    assert!(matches!(ended, Err(LiveError::Faulted(_))), "{ended:?}");
+    drop(live);
+    assert!(matches!(
+        rig.saved_status("fault").state,
+        State::Faulted { .. }
+    ));
+
+    let at = |t: Millis| td_data::time::format_minute(t);
+    let (code, text) = rig.td_live(&feed, &["compare", "--id", "fault"]);
+    assert_eq!(code, 0, "{text}");
+    assert!(
+        text.contains(&format!(
+            "3 live bars from {} to {}",
+            at(rig.bar(0)),
+            at(rig.bar(2))
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "matched fills: 1\n  buy 0.004, decided on the bar opening at {}: session 65000 at \
+             {}, backtest 65000 at {}; time difference 0 ms, price difference 0",
+            at(rig.bar(0)),
+            at(rig.bar(1)),
+            at(rig.bar(1)),
+        )),
+        "{text}"
+    );
+}
+
+/// The report counts the funding rates the session was charged, and how many of them on a later
+/// bar than the one they were due in, which the backtest charges on that earlier bar. A rate fed
+/// with a bar's `sending` line and its own line is one rate.
+#[test]
+fn compare_counts_the_funding_the_session_was_charged_late() {
+    let rig = Rig::new();
+    eight_hourly(&rig);
+    let feed = rig.feed();
+    feed.minute(rig.bar(2));
+    let run = rig.run(
+        rig.create("funded", config(1, 99, false)).expect("creates"),
+        &feed,
+    );
+    wait_for_bar(&run, rig.bar(1));
+    let (live, ended) = run.stop();
+    ended.expect("stopped cleanly");
+    assert_eq!(live.funding().len(), 1);
+    drop(live);
+    let log = rig.log("funded");
+    let with_rate = |l: &&serde_json::Value| l["funding"].as_array().is_some_and(|f| !f.is_empty());
+    assert_eq!(
+        log.iter().filter(with_rate).count(),
+        2,
+        "a sending line and its bar's"
+    );
+
+    let charged = |late: usize| {
+        format!(
+            "funding rates the session was charged: 1, {late} of them on a later bar than the \
+             one they were due in. The backtest is given each rate at its due time, so each of \
+             those is applied on another bar there. That can change funding, equity and the \
+             result without any difference in how orders were filled; how much depends on the \
+             position and the price when each rate is applied."
+        )
+    };
+    let (code, text) = rig.td_live(&feed, &["compare", "--id", "funded"]);
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains(&charged(0)), "{text}");
+
+    // As if the venue had published the rate due at bar 0 only after bar 0 closed.
+    let late: Vec<serde_json::Value> = log
+        .into_iter()
+        .map(|mut l| {
+            if let Some(rates) = l.get_mut("funding").and_then(|f| f.as_array_mut()) {
+                for rate in rates {
+                    rate["due"] = rig.bar(0).into();
+                }
+            }
+            l
+        })
+        .collect();
+    write_log(&rig, "funded", &late);
+    let (code, text) = rig.td_live(&feed, &["compare", "--id", "funded"]);
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains(&charged(1)), "{text}");
+}
+
+/// The strategy name and symbol `compare` prints come from config.json, and reach the terminal
+/// without control characters.
+#[test]
+fn compare_prints_the_saved_config_without_control_characters() {
+    let rig = Rig::new();
+    let feed = rig.feed();
+    feed.minute(rig.bar(1));
+    let run = rig.run(
+        rig.create("marked", config(99, 99, false))
+            .expect("creates"),
+        &feed,
+    );
+    wait_for_bar(&run, rig.bar(0));
+    run.stop().1.expect("stopped cleanly");
+    // The double orders nothing here, so the replay never meets the symbol it orders on.
+    let mut config = rig.config_json("marked");
+    config["instrument"]["id"]["symbol"] = "BTC\u{1b}[2JUSDT".into();
+    rig.write_config_json("marked", &config);
+    let (code, text) = rig.td_live(&feed, &["compare", "--id", "marked"]);
+    assert_eq!(code, 0, "{text}");
+    assert!(
+        !text.chars().any(|c| c.is_control() && c != '\n'),
+        "{text:?}"
+    );
+    assert!(
+        text.contains(" with a backtest of double on bybit:BTC [2JUSDT:perpetual 1h "),
+        "{text}"
+    );
 }

@@ -383,7 +383,7 @@ impl Rig {
     }
 
     fn create(&self, id: &str, config: LiveConfig) -> Result<LiveSession, LiveError> {
-        LiveSession::create(self.data(), id, config, self.client.clone(), build)
+        LiveSession::create(self.data(), id, config, None, self.client.clone(), build)
     }
 
     fn open(&self, id: &str) -> Result<LiveSession, LiveError> {

@@ -41,8 +41,9 @@ use td_data::{
     Closures, DataError, Gap, LoadedCandles, MonthQuotes, Store, missing_minutes, resample,
 };
 use td_engine::{
-    BacktestConfig, ENGINE_REVISION, EngineError, ReferenceBars, RunId, RunSummary, SavedRun,
-    StoreError, TesterError, config_fingerprint_with_references,
+    BacktestConfig, ENGINE_REVISION, EngineError, RECORD_FILE, RUNS_DIR, ReferenceBars, RunId,
+    RunSummary, SavedRun, StoreError, TesterError, code_matches,
+    config_fingerprint_with_references,
 };
 use ts_rs::TS;
 
@@ -52,14 +53,8 @@ use super::error::ApiError;
 use super::jobs::{JobCreated, JobCtx, JobError, JobRequest, JobResult, JobStatus};
 use super::source::MarketSource;
 
-/// The folder under the data directory that holds saved runs.
-const RUNS_DIR: &str = "runs";
-
 /// The file beside a saved run's `result.json` that holds its [`DataReport`].
 const DATA_REPORT_FILE: &str = "data.json";
-
-/// The file beside a saved run's `result.json` that holds its [`RunRecord`].
-pub(super) const RECORD_FILE: &str = "record.json";
 
 /// The environment variable that sets the data cutoff.
 const DATA_CUTOFF_VAR: &str = "TD_DATA_CUTOFF";
@@ -159,15 +154,6 @@ impl RunRecord {
             data_cutoff: cutoff.map(|c| c.date.clone()),
         }
     }
-}
-
-/// Whether a saved code hash is the strategy's code in this engine: `None` when the run saved no
-/// hash (saved before hashes were recorded) or the strategy is no longer registered, so the answer
-/// is unknown.
-pub fn code_matches(strategy: &str, saved: Option<&str>) -> Option<bool> {
-    saved
-        .zip(td_engine::code_hash(strategy))
-        .map(|(saved, now)| saved == now)
 }
 
 /// Missing open time, or time without a funding rate, this long or longer in one stretch means the

@@ -3,8 +3,8 @@
 //!
 //! The folder holds these files:
 //! - `config.json`, written once at creation: the [`LiveConfig`] with its stop rules, the starting
-//!   balance read from the venue, the client-id prefix, the engine revision and the creation time
-//!   ([`SavedConfig`]).
+//!   balance read from the venue, the client-id prefix, the engine revision, the creation time and
+//!   what the session was started from ([`SavedConfig`]).
 //! - `stops.json`, the stop state and the stop guard's flatten record (`crate::stop_file`),
 //!   written at creation and by the guard whenever it changes. A session whose stop has fired is
 //!   never opened to trade again.
@@ -54,7 +54,7 @@ use serde::{Deserialize, Serialize};
 use td_core::{AccountCurrency, Candle, FeeSchedule, Instrument, Millis, OrderId, Timeframe};
 use td_engine::{
     Broker, BrokerEvent, ENGINE_REVISION, EngineError, Order, Params, Portfolio, Session,
-    SessionConfig, StopError, StopRules, StopState, Strategy,
+    SessionConfig, SessionLink, StopError, StopRules, StopState, Strategy,
 };
 use td_orders::Client;
 
@@ -63,7 +63,7 @@ use crate::stop_file::{STOP_FILE, StopRecord};
 use crate::{BrokerRecord, VenueBroker, VenueHandle};
 
 pub(crate) const CONFIG_FILE: &str = "config.json";
-const EVENTS_FILE: &str = "events.jsonl";
+pub(crate) const EVENTS_FILE: &str = "events.jsonl";
 pub(crate) const STATUS_FILE: &str = "status.json";
 const LOCK_FILE: &str = "lock";
 const FAULTED_FILE: &str = "faulted";
@@ -82,7 +82,7 @@ const FILES: [&str; 9] = [
 /// The most warnings the status keeps.
 const KEEP_WARNINGS: usize = 100;
 /// The longest warning, fault or panic text kept, in characters.
-const MAX_TEXT: usize = 1000;
+pub(crate) const MAX_TEXT: usize = 1000;
 /// The pause before a failed rename of a rewritten file is tried once more.
 const RENAME_RETRY: Duration = Duration::from_millis(200);
 const NOT_STARTED: &str = "created; not started";
@@ -132,6 +132,27 @@ pub struct SavedConfig {
     pub engine_revision: u32,
     /// The venue's time when the session was created.
     pub created_at: Millis,
+    /// What the session was started from: the strategy's code hash, test plan and verdict rule
+    /// then, and the saved verdict it was started from ([`td_engine::session_link`]). Fixed at
+    /// creation and only read for the status. `None` for a strategy that is not registered, and in
+    /// a session saved before links were recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link: Option<SessionLink>,
+}
+
+impl SavedConfig {
+    /// The money settings of the engine session.
+    pub(crate) fn money(&self) -> SessionConfig {
+        SessionConfig {
+            starting_cash: self.starting_balance,
+            slippage_bps: self.config.slippage_bps,
+            fees: self.config.fees,
+            max_leverage: self.config.max_leverage,
+            // shortcut: a quote-currency account, as paper sessions have; add the account
+            // currency to `LiveConfig` when a live session trades a market with quotes.
+            account_currency: AccountCurrency::Quote,
+        }
+    }
 }
 
 /// A funding rate fed with a bar.
@@ -146,18 +167,18 @@ pub struct Funding {
 
 /// One line of `events.jsonl`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-struct Line {
-    bar: Candle,
+pub(crate) struct Line {
+    pub(crate) bar: Candle,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    funding: Vec<Funding>,
+    pub(crate) funding: Vec<Funding>,
     /// Fed with `Session::warm_up`: no trading, no broker record.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    warm_up: bool,
+    pub(crate) warm_up: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    record: Option<BrokerRecord>,
+    pub(crate) record: Option<BrokerRecord>,
     /// Written before the bar's first send or cancel; the bar's own line follows it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    sending: bool,
+    pub(crate) sending: bool,
 }
 
 /// Where a session stands.
@@ -395,12 +416,13 @@ impl LiveSession {
     /// taken, the stop rules or the strategy or settings do not check, the venue cannot be read,
     /// or the account holds a position or open orders on the instrument. The starting balance is
     /// the account's equity read here, the stop state starts from it, and the client-id prefix is
-    /// made from the creation time. When writing the folder fails part way, what was written is
-    /// removed, so the id can be used again.
+    /// made from the creation time. `link` is saved as it is. When writing the folder fails part
+    /// way, what was written is removed, so the id can be used again.
     pub fn create(
         data_dir: &Path,
         id: &str,
         config: LiveConfig,
+        link: Option<SessionLink>,
         client: Arc<Client>,
         build: BuildStrategy,
     ) -> Result<LiveSession, LiveError> {
@@ -431,6 +453,7 @@ impl LiveSession {
             prefix: base36(created_at),
             engine_revision: ENGINE_REVISION,
             created_at,
+            link,
         };
         let config_path = dir.join(CONFIG_FILE);
         let log_path = dir.join(EVENTS_FILE);
@@ -566,20 +589,11 @@ impl LiveSession {
         let strategy = build(&saved.config.strategy, &saved.config.params)?;
         let gate = Arc::new(SendGate::new(saved.config.stops));
         let parts = Parts::build(&saved, client.clone(), strategy, &config_path, &gate)?;
-        let complete = bytes.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+        let (lines, complete) = read_lines(&bytes, &log_path)?;
         let bad = |index: usize, reason: String| LiveError::BadLog {
             path: log_path.clone(),
             reason: format!("line {}: {reason}", index + 1),
         };
-        let text = std::str::from_utf8(&bytes[..complete]).map_err(|e| LiveError::BadLog {
-            path: log_path.clone(),
-            reason: format!("it is not UTF-8: {e}"),
-        })?;
-        let lines = text
-            .lines()
-            .enumerate()
-            .map(|(i, l)| serde_json::from_str::<Line>(l).map_err(|e| bad(i, e.to_string())))
-            .collect::<Result<Vec<Line>, LiveError>>()?;
 
         let mut live = LiveSession {
             id: id.to_string(),
@@ -940,20 +954,11 @@ impl Parts {
             handle: handle.clone(),
             log: log.clone(),
         };
-        let money = SessionConfig {
-            starting_cash: saved.starting_balance,
-            slippage_bps: config.slippage_bps,
-            fees: config.fees,
-            max_leverage: config.max_leverage,
-            // shortcut: a quote-currency account, as paper sessions have; add the account
-            // currency to `LiveConfig` when a live session trades a market with quotes.
-            account_currency: AccountCurrency::Quote,
-        };
         let session = Session::with_broker(
             strategy,
             config.instrument.clone(),
             config.timeframe,
-            money,
+            saved.money(),
             Box::new(broker),
         )?;
         Ok(Parts {
@@ -1118,7 +1123,30 @@ impl Broker for LoggedBroker {
     }
 }
 
-fn pairs(funding: &[Funding]) -> Vec<(Millis, f64)> {
+/// The complete lines of the log `bytes`, read from `path`, and the length they take. A last line
+/// without its newline, torn by a crash mid-write, is left out; any other line that does not read
+/// is refused.
+pub(crate) fn read_lines(bytes: &[u8], path: &Path) -> Result<(Vec<Line>, usize), LiveError> {
+    let complete = bytes.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+    let text = std::str::from_utf8(&bytes[..complete]).map_err(|e| LiveError::BadLog {
+        path: path.to_path_buf(),
+        reason: format!("it is not UTF-8: {e}"),
+    })?;
+    let lines = text
+        .lines()
+        .enumerate()
+        .map(|(i, l)| {
+            serde_json::from_str::<Line>(l).map_err(|e| LiveError::BadLog {
+                path: path.to_path_buf(),
+                reason: format!("line {}: {e}", i + 1),
+            })
+        })
+        .collect::<Result<Vec<Line>, LiveError>>()?;
+    Ok((lines, complete))
+}
+
+/// The funding fed with a bar as the engine takes it: each rate at the time it was given.
+pub(crate) fn pairs(funding: &[Funding]) -> Vec<(Millis, f64)> {
     funding.iter().map(|f| (f.time, f.rate)).collect()
 }
 
@@ -1140,7 +1168,7 @@ fn trim_warnings(warnings: &mut Vec<String>) {
 }
 
 /// `text` with control characters replaced by spaces, cut to `max` characters.
-fn clean(text: &str, max: usize) -> String {
+pub(crate) fn clean(text: &str, max: usize) -> String {
     let mut out: String = text
         .chars()
         .take(max)
@@ -1470,9 +1498,15 @@ mod tests {
     fn an_order_made_after_the_log_breaks_is_not_sent_and_is_cancelled_in_the_engine() {
         let mock = mock();
         let data = tempfile::tempdir().unwrap();
-        let mut live =
-            LiveSession::create(data.path(), "broken", config(1), client_for(&mock), build)
-                .unwrap();
+        let mut live = LiveSession::create(
+            data.path(),
+            "broken",
+            config(1),
+            None,
+            client_for(&mock),
+            build,
+        )
+        .unwrap();
         let start = Timeframe::H1.floor(mock.now()) - HOUR;
         live.feed(flat(start), Vec::new(), false).expect("bar 0");
         let lines = fs::read_to_string(live.dir().join(EVENTS_FILE)).unwrap();
@@ -1499,8 +1533,15 @@ mod tests {
         let mock = mock();
         let data = tempfile::tempdir().unwrap();
         let client = client_for(&mock);
-        let mut live =
-            LiveSession::create(data.path(), "pending", config(0), client.clone(), build).unwrap();
+        let mut live = LiveSession::create(
+            data.path(),
+            "pending",
+            config(0),
+            None,
+            client.clone(),
+            build,
+        )
+        .unwrap();
         let start = Timeframe::H1.floor(mock.now()) - HOUR;
         live.feed(flat(start), Vec::new(), false).expect("bar 0");
         assert_eq!(mock.request_count(CREATE), 1);

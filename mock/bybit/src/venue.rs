@@ -13,7 +13,8 @@
 //!   then rests `PartiallyFilled` until [`crate::MockVenue::fill_rest`] fills the rest. A cap of
 //!   zero leaves it `New` and unfilled.
 //! - Instruments info lists every instrument as a `Trading` `LinearPerpetual` settled in its quote
-//!   coin, and the ticker's mark price is the last price.
+//!   coin, and the ticker's mark price is the last price. A test can have it answer a symbol
+//!   written another way with a listed one ([`crate::MockVenue::list_as`]).
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -143,6 +144,8 @@ pub(crate) struct State {
     pub cap_ioc: Option<(String, f64)>,
     /// The order link id the real-time list of open orders shows twice.
     pub listed_twice: Option<String>,
+    /// Symbols instruments info answers with another listed instrument: asked, then listed.
+    pub listed_as: HashMap<String, String>,
 }
 
 impl State {
@@ -171,6 +174,7 @@ impl State {
             cap_next_fill: None,
             cap_ioc: None,
             listed_twice: None,
+            listed_as: HashMap::new(),
         }
     }
 
@@ -1121,7 +1125,8 @@ impl State {
 
     fn instruments_info(&self, p: &HashMap<String, String>) -> VenueResult {
         linear(p.get("category").map(String::as_str))?;
-        let symbol = p.get("symbol").cloned().unwrap_or_default();
+        let asked = p.get("symbol").cloned().unwrap_or_default();
+        let symbol = self.listed_as.get(&asked).cloned().unwrap_or(asked);
         let inst = &self.market(&symbol)?.instrument;
         Ok(json!({
             "category": "linear",

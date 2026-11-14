@@ -279,6 +279,16 @@ impl MockVenue {
         self.state.lock().unwrap().listed_twice = Some(link_id.into());
     }
 
+    /// Makes instruments info answer a query for `asked` with the listed instrument `listed`, as
+    /// a venue that takes a symbol written another way would.
+    pub fn list_as(&self, asked: &str, listed: &str) {
+        self.state
+            .lock()
+            .unwrap()
+            .listed_as
+            .insert(asked.into(), listed.into());
+    }
+
     /// Fills the rest of the partially filled order with `link_id` at the current price.
     pub fn fill_rest(&self, link_id: &str) {
         self.state.lock().unwrap().fill_rest(link_id);

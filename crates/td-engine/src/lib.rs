@@ -35,6 +35,7 @@ mod results;
 pub mod risk;
 mod rng;
 mod runner;
+mod saved_verdicts;
 mod session;
 pub mod stats;
 mod stops;
@@ -80,6 +81,11 @@ pub use runner::{
     BacktestConfig, BacktestResult, Benchmark, ENGINE_REVISION, Rerun, config_fingerprint,
     config_fingerprint_with_references, data_fingerprint, default_slippage_bps, rerun, run,
     run_strategy, run_with_references,
+};
+pub use saved_verdicts::{
+    LinkState, LinkedVerdict, RECORD_FILE, RUNS_DIR, SessionLink, VERDICT_FILE, VerdictError,
+    VerdictRecord, VerdictSummary, code_matches, instrument_view, latest_verdicts, read_record,
+    session_link,
 };
 pub use session::{
     CLOSE_OUT_TAG, EquityPoint, LIQUIDATION_TAG, MAINTENANCE_MARGIN_RATE, Session, SessionConfig,
