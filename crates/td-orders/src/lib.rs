@@ -44,8 +44,10 @@
 //!   goes again a few times; a read answered 429 does too, while an order request answered 429 is
 //!   looked up; an IP block is returned at once. The clock offset is measured against the venue's
 //!   server time when the client is built and again on a timestamp rejection, and a server time
-//!   more than a day from the local clock is refused ([`Error::ServerTimeOutOfRange`]). Timeouts
-//!   are seconds, and each place, cancel and amend runs within one time budget ([`Timing`]).
+//!   more than a day from the local clock is refused ([`Error::ServerTimeOutOfRange`]; when the
+//!   measurement after a timestamp rejection fails, the request is returned as not sent, an
+//!   [`Error::Transport`] whose reason holds the cause). Timeouts are seconds, and each place,
+//!   cancel and amend runs within one time budget ([`Timing`]).
 //! - **Answers.** A response body is read up to 4 MiB after decompression and refused past it
 //!   ([`Error::ResponseTooLarge`]). Negative quantities, sizes and prices are refused.
 //!
