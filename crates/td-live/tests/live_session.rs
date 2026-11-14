@@ -16,7 +16,8 @@ use td_data::live::{Greeting, KlineUpdate, Rest, SharedStream};
 use td_data::{DataError, DataSource, Http, InstrumentList, LiveStream, MinuteHistory};
 use td_engine::{Context, DayRollover, EngineError, ParamValue, Params, StopRules, Strategy};
 use td_live::{
-    LiveConfig, LiveError, LiveRun, LiveSession, LiveStatus, State, VenueHandle, live_dir,
+    GuardTiming, LiveConfig, LiveError, LiveRun, LiveSession, LiveStatus, Outcome, State,
+    StopHandle, VenueHandle, live_dir, run_guarded,
 };
 use td_mock_bybit::{Fault, MockVenue, TEST_KEY, TEST_SECRET};
 use td_orders::{Client, ClientOrderId, DemoKeys, Endpoint, Timing};
@@ -392,7 +393,7 @@ impl Rig {
     }
 
     fn run(&self, live: LiveSession, feed: &Feed) -> LiveRun {
-        live.run(self.rest.clone(), feed.opener(), |_, _| None)
+        td_live::run_unguarded(live, self.rest.clone(), feed.opener(), |_, _| None)
     }
 
     fn feed(&self) -> Feed {
@@ -913,7 +914,8 @@ fn the_owner_reads_the_venue_after_each_bar_and_can_halt_the_run() {
     let reads = Arc::new(Mutex::new(Vec::new()));
     let (seen, last) = (reads.clone(), rig.bar(1));
     let live = rig.create("owner", config(0, 99, true)).expect("creates");
-    let run = live.run(
+    let run = td_live::run_unguarded(
+        live,
         rig.rest.clone(),
         feed.opener(),
         move |status: &LiveStatus, handle: &VenueHandle| {
@@ -1498,7 +1500,8 @@ fn a_feed_that_ends_halts_the_run() {
     let feed = rig.feed();
     let url = feed.url.clone();
     let live = rig.create("ended", config(0, 99, false)).expect("creates");
-    let run = live.run(
+    let run = td_live::run_unguarded(
+        live,
         rig.rest.clone(),
         move || Arc::new(SharedStream::open_on(&PANICKY, instrument().id, url)),
         |_, _| None,
@@ -1518,6 +1521,52 @@ fn a_feed_that_ends_halts_the_run() {
     assert_eq!(rig.saved_status("ended").state, live.status().state);
     drop(live);
     rig.open("ended").expect("a halt resumes");
+}
+
+#[test]
+fn a_feed_that_ends_halts_a_guarded_run_with_exit_code_one() {
+    let rig = Rig::new();
+    let feed = rig.feed();
+    let url = feed.url.clone();
+    let live = rig
+        .create("guarded", config(0, 99, false))
+        .expect("creates");
+    let rest = rig.rest.clone();
+    let guarded = std::thread::spawn(move || {
+        let mut lines = Vec::new();
+        let outcome = run_guarded(
+            live,
+            rest,
+            move || Arc::new(SharedStream::open_on(&PANICKY, instrument().id, url)),
+            GuardTiming::default(),
+            &StopHandle::new(),
+            &mut |line| lines.push(line.to_string()),
+        );
+        (outcome, lines)
+    });
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while rig.saved_status("guarded").state != State::Running {
+        assert!(Instant::now() < deadline, "the run did not start");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    feed.text("boom".into());
+    while !guarded.is_finished() {
+        assert!(Instant::now() < deadline, "the run did not halt");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let (outcome, lines) = guarded.join().expect("the guarded run");
+    let Outcome::Halted(reason) = &outcome else {
+        panic!(
+            "not halted: {outcome:?}
+{}",
+            lines.join(
+                "
+"
+            )
+        );
+    };
+    assert!(reason.contains("the feed ended"), "{reason}");
+    assert_eq!(outcome.exit_code(), 1);
 }
 
 #[test]

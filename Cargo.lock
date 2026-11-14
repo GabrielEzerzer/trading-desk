@@ -2383,6 +2383,7 @@ dependencies = [
  "td-core",
  "td-data",
  "td-engine",
+ "td-live",
  "td-mock-bybit",
  "td-orders",
  "tempfile",

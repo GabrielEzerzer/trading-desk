@@ -67,25 +67,24 @@ impl StopRules {
         Ok(())
     }
 
-    /// Whether an order may be sent, given the open position's notional now and the notional the
-    /// order would add, both in the account currency and at or above zero. An order that adds
-    /// none, such as a reduce-only order, is always allowed, even when the notional now is above
-    /// the cap or could not be read. Any other order is refused when it would take the open
-    /// notional above the cap, or when either notional is not a finite number at or above zero.
+    /// Whether an order may be sent, given the open position's notional now and its notional once
+    /// the order has filled, both in the account currency and at or above zero. The caller works
+    /// out the position after the order from the signed position and the order's signed quantity,
+    /// so an order that shrinks or flips the position is judged by where it leaves it.
+    ///
+    /// An order is refused only when the notional after it is above the cap and above the
+    /// notional now, so an order that brings an open notional above the cap down is never
+    /// refused. It is also refused when either notional is not a finite number at or above zero.
     ///
     /// Refusing an order does not fire the stop; only [`StopState::check`] does.
-    pub fn check_order(&self, open_notional: f64, added_notional: f64) -> Result<(), StopError> {
-        if added_notional == 0.0 {
-            return Ok(());
-        }
+    pub fn check_order(&self, open_notional: f64, notional_after: f64) -> Result<(), StopError> {
         self.validate()?;
         valid_notional(open_notional)?;
-        valid_notional(added_notional)?;
-        let after = open_notional + added_notional;
-        if after > self.open_notional_cap {
+        valid_notional(notional_after)?;
+        if notional_after > self.open_notional_cap && notional_after > open_notional {
             return Err(StopError::OrderOverCap {
                 open: open_notional,
-                after,
+                after: notional_after,
                 cap: self.open_notional_cap,
             });
         }
@@ -111,8 +110,10 @@ pub struct StopFired {
     pub time: Millis,
     /// The equity given to that check, open profit and loss included.
     pub equity: f64,
-    /// The open notional given to that check.
-    pub notional: f64,
+    /// The open notional given to that check; `None` when it could not be valued and only the
+    /// loss rules were checked ([`StopState::check_losses`]). The key is required when read back.
+    #[serde(deserialize_with = "Option::deserialize")]
+    pub notional: Option<f64>,
     /// The threshold crossed. For the two loss rules, the equity at or below which the rule fires:
     /// the starting balance, or the day's starting equity, less the limit. For the notional cap,
     /// the cap.
@@ -122,24 +123,27 @@ pub struct StopFired {
 impl fmt::Display for StopFired {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let when = utc(self.time);
-        let (equity, notional, threshold) = (self.equity, self.notional, self.threshold);
+        let (equity, threshold) = (self.equity, self.threshold);
+        let open = match self.notional {
+            Some(notional) => format!("Open notional was {notional:.2}."),
+            None => "Open notional could not be valued.".to_string(),
+        };
         match self.rule {
             StopRule::MaxLoss => write!(
                 f,
                 "The maximum loss stop fired at {when}: equity of {equity:.2} was at or below \
-                 {threshold:.2}, the starting balance less the maximum loss. Open notional was \
-                 {notional:.2}."
+                 {threshold:.2}, the starting balance less the maximum loss. {open}"
             ),
             StopRule::DailyLoss => write!(
                 f,
                 "The daily loss stop fired at {when}: equity of {equity:.2} was at or below \
-                 {threshold:.2}, the day's starting equity less the daily loss limit. Open \
-                 notional was {notional:.2}."
+                 {threshold:.2}, the day's starting equity less the daily loss limit. {open}"
             ),
             StopRule::OpenNotional => write!(
                 f,
-                "The open notional stop fired at {when}: open notional of {notional:.2} was above \
-                 the cap of {threshold:.2}. Equity was {equity:.2}."
+                "The open notional stop fired at {when}: open notional of {:.2} was above the \
+                 cap of {threshold:.2}. Equity was {equity:.2}.",
+                self.notional.unwrap_or(f64::NAN)
             ),
         }
     }
@@ -205,7 +209,8 @@ impl StopState {
     /// First it checks the saved state against itself, refusing one that [`StopState::start`] and
     /// [`StopState::check`] could not have left: the rules must pass [`StopRules::validate`], the
     /// starting balance must be a finite number above zero, the day's starting equity must be
-    /// finite, and the day must end at the first rollover after the last check. Both keep
+    /// finite and, while no stop has fired, above the maximum loss line (a check at or below it
+    /// fires), and the day must end at the first rollover after the last check. Both keep
     /// `day_ends` at that rollover: `start` sets both, a check that rolls the day over sets both,
     /// a check before the day's end moves `last_check` to a time with no rollover between it and
     /// `day_ends`, and a check that is refused or comes after a fired stop changes neither. Then
@@ -245,6 +250,15 @@ impl StopState {
             return Err(StopError::StartingBalanceDiffers {
                 saved: saved.starting_balance,
                 session: starting_balance,
+            });
+        }
+        // A day starts from the equity of a check, which would have fired the maximum loss at or
+        // below its line; the same arithmetic as `check`.
+        let max_loss = saved.rules.max_loss_share * saved.starting_balance;
+        if saved.fired.is_none() && saved.starting_balance - saved.day_start_equity >= max_loss {
+            return Err(StopError::DayStartAtMaxLoss {
+                value: saved.day_start_equity,
+                line: saved.starting_balance - max_loss,
             });
         }
         Ok(StopState {
@@ -308,6 +322,26 @@ impl StopState {
         equity: f64,
         notional: f64,
     ) -> Result<Option<StopFired>, StopError> {
+        self.check_at(time, equity, Some(notional))
+    }
+
+    /// [`StopState::check`] for a check whose open notional could not be valued: the day rolls
+    /// over and the two loss rules are checked as there, on the equity alone, and the cap is not.
+    /// A fired stop records the notional as `None`.
+    pub fn check_losses(
+        &mut self,
+        time: Millis,
+        equity: f64,
+    ) -> Result<Option<StopFired>, StopError> {
+        self.check_at(time, equity, None)
+    }
+
+    fn check_at(
+        &mut self,
+        time: Millis,
+        equity: f64,
+        notional: Option<f64>,
+    ) -> Result<Option<StopFired>, StopError> {
         if let Some(fired) = self.fired {
             return Ok(Some(fired));
         }
@@ -325,7 +359,9 @@ impl StopState {
         if !equity.is_finite() {
             return Err(StopError::EquityNotFinite { value: equity });
         }
-        valid_notional(notional)?;
+        if let Some(notional) = notional {
+            valid_notional(notional)?;
+        }
 
         self.last_check = time;
         if time >= self.day_ends {
@@ -356,7 +392,7 @@ impl StopState {
                 StopRule::DailyLoss,
                 self.day_start_equity - daily_loss,
             ))
-        } else if notional > r.open_notional_cap {
+        } else if notional.is_some_and(|n| n > r.open_notional_cap) {
             Some(fired(StopRule::OpenNotional, r.open_notional_cap))
         } else {
             None
@@ -399,6 +435,12 @@ pub enum StopError {
 
     #[error("the saved starting equity of the day is {value}, which is not a finite number")]
     DayStartEquityNotFinite { value: f64 },
+
+    #[error(
+        "the saved starting equity of the day is {value}, at or below the maximum loss line of \
+         {line}, but no stop fired"
+    )]
+    DayStartAtMaxLoss { value: f64, line: f64 },
 
     #[error(
         "the saved day ends at {saved}, but the first rollover after the last check at \
@@ -806,6 +848,35 @@ mod tests {
     }
 
     #[test]
+    fn an_unfired_state_whose_day_starts_at_the_maximum_loss_does_not_load() {
+        // The maximum loss line is 8,750: a check at or below it fires.
+        let s = state(rules());
+        let saved = |day_start_equity, fired| SavedStopState {
+            rules: s.rules,
+            starting_balance: s.starting_balance,
+            day_start_equity,
+            day_ends: s.day_ends,
+            last_check: s.last_check,
+            fired,
+        };
+        for value in [8_750.0, 100.0, -5.0] {
+            assert_eq!(
+                StopState::restore(saved(value, None), &rules(), START),
+                Err(StopError::DayStartAtMaxLoss {
+                    value,
+                    line: 8_750.0
+                })
+            );
+        }
+        assert!(StopState::restore(saved(8_750.01, None), &rules(), START).is_ok());
+        // A fired state may hold any baseline: the check that fired it can roll the day over.
+        let mut fired = state(rules());
+        let record = fired.check(6 * DAY, 8_000.0, 0.0).unwrap();
+        assert_eq!(fired.day_start_equity(), 8_000.0);
+        assert_eq!(reload(&fired).unwrap().fired().copied(), record);
+    }
+
+    #[test]
     fn a_saved_state_without_its_fired_key_does_not_load() {
         let mut s = state(rules());
         let unfired = serde_json::to_value(&s).unwrap();
@@ -994,27 +1065,54 @@ mod tests {
     #[test]
     fn an_order_over_the_cap_is_refused_without_firing_the_stop() {
         let r = rules();
-        assert_eq!(r.check_order(30_000.0, 19_999.0), Ok(()));
-        assert_eq!(r.check_order(30_000.0, 20_000.0), Ok(()));
+        assert_eq!(r.check_order(30_000.0, 49_999.0), Ok(()));
+        assert_eq!(r.check_order(30_000.0, 50_000.0), Ok(()));
         assert_eq!(
-            r.check_order(30_000.0, 20_001.0),
+            r.check_order(30_000.0, 50_001.0),
             Err(StopError::OrderOverCap {
                 open: 30_000.0,
                 after: 50_001.0,
                 cap: 50_000.0
             })
         );
-        // An order that adds nothing, such as a reduce-only order, is always allowed.
+        // An order that leaves the notional above the cap but lower than now, such as an exit
+        // from a position the price has carried over the cap, is allowed; one that raises it is not.
         assert_eq!(r.check_order(80_000.0, 0.0), Ok(()));
-        assert_eq!(r.check_order(f64::NAN, 0.0), Ok(()));
-        // Otherwise a notional that cannot be judged refuses the order.
-        assert!(r.check_order(f64::NAN, 1.0).is_err());
+        assert_eq!(r.check_order(80_000.0, 60_000.0), Ok(()));
+        assert_eq!(r.check_order(80_000.0, 80_000.0), Ok(()));
+        assert!(r.check_order(80_000.0, 80_001.0).is_err());
+        // A notional that cannot be judged refuses the order.
+        assert!(r.check_order(f64::NAN, 0.0).is_err());
         assert!(r.check_order(0.0, f64::INFINITY).is_err());
         assert!(r.check_order(0.0, -1.0).is_err());
         // The refusal leaves the stops alone.
         let mut s = state(r);
-        assert!(s.rules().check_order(40_000.0, 20_000.0).is_err());
+        assert!(s.rules().check_order(40_000.0, 60_000.0).is_err());
         assert_eq!(s.check(5 * DAY + 2 * HOUR, START, 40_000.0), Ok(None));
+    }
+
+    #[test]
+    fn a_check_without_the_notional_fires_the_losses_and_not_the_cap() {
+        let r = StopRules {
+            daily_loss_share: 1.0,
+            ..rules()
+        };
+        let t = 5 * DAY + 2 * HOUR;
+        assert_eq!(state(r).check_losses(t, 8_750.01), Ok(None));
+        let fired = state(r).check_losses(t, 8_750.0).unwrap().unwrap();
+        assert_eq!(fired.rule, StopRule::MaxLoss);
+        assert_eq!(fired.notional, None);
+        assert!(
+            fired
+                .to_string()
+                .ends_with("Open notional could not be valued.")
+        );
+        // The day rolls over as in a full check.
+        let mut s = state(r);
+        assert_eq!(s.check_losses(6 * DAY, 9_500.0), Ok(None));
+        assert_eq!(s.day_start_equity(), 9_500.0);
+        assert_eq!(s.day_ends(), 7 * DAY);
+        assert!(s.check_losses(6 * DAY, f64::NAN).is_err());
     }
 
     #[test]
@@ -1023,7 +1121,7 @@ mod tests {
             rule: StopRule::DailyLoss,
             time: 1_710_079_500_000, // 2024-03-10 14:05:00 UTC
             equity: 9_300.0,
-            notional: 1_234.5,
+            notional: Some(1_234.5),
             threshold: 9_375.0,
         };
         assert_eq!(
@@ -1034,7 +1132,7 @@ mod tests {
         );
         let cap = StopFired {
             rule: StopRule::OpenNotional,
-            notional: 60_000.0,
+            notional: Some(60_000.0),
             threshold: 50_000.0,
             ..fired
         };

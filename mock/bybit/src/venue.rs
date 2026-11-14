@@ -431,7 +431,8 @@ pub(crate) fn handle(state: &Arc<Mutex<State>>, req: Request) -> Reply {
         }
         Some(Fault::DropBeforeApply) => return Reply::Drop,
         Some(Fault::Answer(code)) => {
-            let body = envelope(*code, answer_message(*code), json!({}), now);
+            let msg = state.lock().unwrap().echo(answer_message(*code), &req);
+            let body = envelope(*code, &msg, json!({}), now);
             return respond(200, limit_headers(now), body.to_string());
         }
         // Checked now, as the venue checks a request when it arrives; applied later.

@@ -97,7 +97,10 @@ impl LiveSession {
     /// minute stream; it is called on the run's thread, inside the run's own async runtime, once
     /// warm-up is done. `after_bar` is called after each live bar is fed, logged and its status
     /// written, before the next bar: returning a reason halts the run with it.
-    pub fn run<S, A>(self, rest: Arc<dyn Rest>, stream: S, after_bar: A) -> LiveRun
+    ///
+    /// This run has no loss checks; only [`crate::run_guarded`] runs a session outside this
+    /// crate's tests.
+    pub(crate) fn run<S, A>(self, rest: Arc<dyn Rest>, stream: S, after_bar: A) -> LiveRun
     where
         S: FnOnce() -> Arc<SharedStream> + Send + 'static,
         A: FnMut(&LiveStatus, &VenueHandle) -> Option<String> + Send + 'static,
@@ -130,6 +133,24 @@ impl LiveSession {
             thread: Some(thread),
         }
     }
+}
+
+/// [`LiveSession::run`], the run without the stop guard's loss checks, for this crate's own
+/// integration tests. It is not part of the API: only the `test-run` feature, which the crate
+/// turns on for its tests alone, builds it.
+#[doc(hidden)]
+#[cfg(feature = "test-run")]
+pub fn run_unguarded<S, A>(
+    live: LiveSession,
+    rest: Arc<dyn Rest>,
+    stream: S,
+    after_bar: A,
+) -> LiveRun
+where
+    S: FnOnce() -> Arc<SharedStream> + Send + 'static,
+    A: FnMut(&LiveStatus, &VenueHandle) -> Option<String> + Send + 'static,
+{
+    live.run(rest, stream, after_bar)
 }
 
 impl LiveRun {

@@ -5,9 +5,7 @@
 //! resumes after a restart by replaying that log without touching the venue. Make one with
 //! [`LiveSession::create`] (it must start flat), reopen it with [`LiveSession::open`], and run it
 //! with [`run_guarded`], which runs it with its stop rules enforced (the `guard` module) until it
-//! ends. [`LiveSession::run`] runs it without the loss checks and returns a [`LiveRun`] to stop,
-//! halt or watch it; the notional cap still holds there. The library never reads the
-//! environment: the caller builds the order route's `Client`. The `td-live` command ([`cli`]) is
+//! ends. The library never reads the environment: the caller builds the order route's `Client`. The `td-live` command ([`cli`]) is
 //! the only thing in the app that starts a live session.
 //!
 //! The broker is a [`td_engine::Broker`] that sends a session's orders through the order route
@@ -59,6 +57,9 @@ pub use broker::{BrokerFault, BrokerRecord, FaultKind, VenueBroker, VenueHandle}
 pub use guard::{GuardTiming, Outcome, StopHandle, flatten_session, run_guarded, saved_files};
 pub use ids::{InvalidPrefix, PREFIX_MAX_LEN};
 pub use run::LiveRun;
+#[doc(hidden)]
+#[cfg(feature = "test-run")]
+pub use run::run_unguarded;
 pub use session::{
     BuildStrategy, Funding, LiveConfig, LiveError, LiveSession, LiveStatus, SavedConfig, State,
     VenueRead, live_dir,

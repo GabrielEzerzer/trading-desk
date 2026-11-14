@@ -351,8 +351,8 @@ impl VenueHandle {
         lock(&self.core).open_list()
     }
 
-    // The owner's "cancel this session's resting orders and close its position" action belongs
-    // here, sending under the reserved `x` ids (see `crate::ids`). It is not built yet.
+    // Cancelling the session's resting orders and closing the position is the stop guard's
+    // flatten (`crate::guard`), sent through the route under the `f` ids (see `crate::ids`).
 
     fn route(&self) -> (Arc<Client>, Instrument) {
         let core = lock(&self.core);

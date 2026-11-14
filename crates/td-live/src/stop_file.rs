@@ -7,15 +7,17 @@
 //! before every flatten order is sent.
 //!
 //! It is read back only through [`SavedStopState`] and [`StopState::restore`] against the rules
-//! and starting balance in `config.json`. A missing, unreadable or refused file refuses the open:
-//! the state is never rebuilt from nothing for a session that has run.
+//! and starting balance in `config.json`. A missing, unreadable or refused file, a link at its
+//! path, or a file with no fired stop whose flatten record shows a flatten ran refuses the open:
+//! the state is never rebuilt from nothing for a session that has run. Only `flatten` goes on
+//! past a damaged or missing file, with a fresh record that says so.
 
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use td_engine::{SavedStopState, StopState};
 
-use crate::session::{LiveError, SavedConfig, read_json, write_synced};
+use crate::session::{LiveError, SavedConfig, read_json, refuse_link, write_synced};
 
 pub(crate) const STOP_FILE: &str = "stops.json";
 
@@ -85,9 +87,11 @@ impl StopRecord {
     }
 
     /// Reads `stops.json` in `dir` and restores its stop state against the rules and starting
-    /// balance in the session's config. Any failure is [`LiveError::StopFile`].
+    /// balance in the session's config. A link there is [`LiveError::Link`]; any other failure
+    /// is [`LiveError::StopFile`].
     pub fn load(dir: &Path, saved: &SavedConfig) -> Result<StopRecord, LiveError> {
         let path = dir.join(STOP_FILE);
+        refuse_link(&path)?;
         let refused = |reason: String| LiveError::StopFile {
             path: path.clone(),
             reason,
@@ -112,6 +116,21 @@ impl StopRecord {
             reason: e.to_string(),
         })?;
         write_synced(dir, STOP_FILE, &json)
+    }
+
+    /// Refuses a state with no fired stop whose flatten record shows a flatten ran: the guard
+    /// flattens only after a stop fires and `flatten` ends the session, so such a file was
+    /// edited.
+    pub fn check_unfired(&self, dir: &Path) -> Result<(), LiveError> {
+        if self.state.fired().is_none()
+            && (self.flatten.result.is_some() || self.flatten.last_id > 0)
+        {
+            return Err(LiveError::StopFile {
+                path: dir.join(STOP_FILE),
+                reason: "no stop fired, but its flatten record shows a flatten ran".into(),
+            });
+        }
+        Ok(())
     }
 
     /// Whether a fired stop still has a flatten to finish.

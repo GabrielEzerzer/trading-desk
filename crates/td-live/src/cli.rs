@@ -18,7 +18,7 @@ use td_orders::{Client, SETTLE_COIN};
 use crate::guard::{
     GuardTiming, Outcome, StopHandle, flatten_session, flatten_unfinished, run_guarded, saved_files,
 };
-use crate::session::{BuildStrategy, LiveConfig, LiveError, LiveSession};
+use crate::session::{BuildStrategy, LiveConfig, LiveError, LiveSession, refuse_unended};
 
 /// Runs a strategy on a venue's demo-trading account with loss limits the engine enforces.
 #[derive(Debug, Parser)]
@@ -137,6 +137,7 @@ fn run(cli: Cli, env: &Env, out: &mut dyn FnMut(&str)) -> Result<u8, String> {
     match cli.command {
         Command::Start(args) => {
             let data = data_dir(args.data_dir.clone())?;
+            refuse_unended(&data).map_err(|e| e.to_string())?;
             let client = (env.connect)()?;
             let config = start_config(&args, &client)?;
             let live = LiveSession::create(&data, &args.id, config, client, env.build)

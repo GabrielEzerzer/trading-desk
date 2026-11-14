@@ -22,8 +22,14 @@ td-orders.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 
+# `test-run` builds `run_unguarded`, the run without the stop guard, for the crate's own
+# integration tests only; the self dev-dependency below turns it on for them.
+[features]
+test-run = []
+
 [dev-dependencies]
 futures-util.workspace = true
+td-live = { path = ".", features = ["test-run"] }
 tempfile.workspace = true
 td-mock-bybit.workspace = true
 tokio-tungstenite.workspace = true

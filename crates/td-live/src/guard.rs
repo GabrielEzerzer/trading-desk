@@ -11,25 +11,35 @@
 //! - **While running.** The check runs after every live bar (the run's `after_bar` hook) and on a
 //!   timer between bars ([`GuardTiming::interval`]) from the guard's own thread, which does not
 //!   wait for bars, so it keeps checking if the feed stalls or ends. Both go through one function,
-//!   which reads the venue's equity, position and mark price and calls `StopState::check`.
+//!   which reads the venue's equity, position and mark price and calls `StopState::check`. The
+//!   mark is the ticker's, or the position read's own when the ticker fails. When the open
+//!   notional cannot be valued at all, the loss limits are still checked on the equity alone
+//!   (`StopState::check_losses`) and the check counts as a failed read.
 //! - **Pre-trade.** An order that is not reduce-only passes [`SendGate::refusal`] at the one point
-//!   where the broker places orders: refused, before sending, when the open notional plus the
-//!   order's notional at its last known price would pass the cap. A reduce-only order is never
-//!   refused by the cap.
+//!   where the broker places orders. It is judged by the position it would leave (the venue's
+//!   position, plus the orders the gate let through since the bar began, plus the order) and
+//!   refused, before sending, when that position's notional is above the cap and above the
+//!   notional before the order. So an order that only reduces the position is never refused by
+//!   the cap, and two orders in one bar are counted together.
 //! - **A venue that cannot be read** is never a pass. After [`GuardTiming::unreadable`] failed
-//!   checks in a row the guard stops the broker sending and halts the run. It does not flatten on
-//!   data it cannot read, since it cannot know the position.
-//! - **When a stop fires**, in this order: the fired state is saved to `stops.json`; the broker
-//!   stops sending and the run is asked to halt; every open order on the instrument with the
-//!   session's prefix is cancelled and the venue's position is closed with a reduce-only market
-//!   order for the size the venue reports, through the route directly (not the broker, whose
-//!   "send nothing once faulted" rule stays as it is); then the venue is read again, and the
-//!   cancel and close repeat, a pause apart and for a bounded number of rounds, until the run has
-//!   finished, the position is flat and no order of the session rests. Each step is recorded in
-//!   `stops.json`. A close whose outcome is unknown is settled by reading the venue on the next
-//!   round, never by sending it again. Each close carries a new `f` id whose number is saved
-//!   before it is sent, so a crash and a retry never reuse an id, and a reduce-only order can
-//!   never take the position past flat. The session's status becomes [`State::Ended`].
+//!   checks in a row the guard halts the run, and the broker refuses every order that is not
+//!   reduce-only; its protective stops still go out, so an entry already filled is still
+//!   protected. The guard does not flatten on data it cannot read, since it cannot know the
+//!   position.
+//! - **When a stop fires**, in this order: the fired state is saved to `stops.json` (a save that
+//!   fails does not hold the flatten back; it is tried again at the start of each round, before
+//!   each close and when the flatten ends, and the outcome names a save that never went
+//!   through); the broker stops sending and the run is asked to halt; every open order on the
+//!   instrument with the session's prefix is cancelled and the venue's position is closed with a
+//!   reduce-only market order for the size the venue reports, through the route directly (not the
+//!   broker, whose "send nothing once faulted" rule stays as it is); then the venue is read again,
+//!   and the cancel and close repeat, a pause apart and for a bounded number of rounds, until the
+//!   run has finished, the position is flat and no order of the session rests. Each step is
+//!   recorded in `stops.json`. A close whose outcome is unknown is settled by reading the venue on
+//!   the next round, never by sending it again. Each close carries a new `f` id whose number is
+//!   saved before it is sent, so a crash and a retry do not reuse an id while the disk takes the
+//!   save, and a reduce-only order can never take the position past flat. The session's status
+//!   becomes [`State::Ended`].
 //! - **After the run ends** for another reason (a halt, a fault, a feed that ended), the guard
 //!   keeps checking while the process lives and the venue position is not known to be flat.
 //!
@@ -43,13 +53,13 @@ use std::time::{Duration, Instant};
 
 use td_core::{Instrument, Millis, OrderId, OrderRequest, OrderType, Side, TimeInForce};
 use td_data::live::{Rest, SharedStream};
-use td_engine::{StopFired, StopRules};
+use td_engine::{StopFired, StopRules, StopState};
 use td_orders::{CancelOutcome, Client, ClientOrderId, Error as RouteError, Position};
 
 use crate::ids::{self, Role};
 use crate::session::{
     LiveError, LiveSession, LiveStatus, STATUS_FILE, SavedConfig, State, check_id, live_dir,
-    read_json, take_lock, write_synced,
+    read_json, session_dir, take_lock, write_synced,
 };
 use crate::stop_file::{FlattenResult, StopRecord};
 
@@ -87,24 +97,39 @@ pub enum Outcome {
     /// The run halted or faulted, or could not start; the reason says why.
     Halted(String),
     /// A stop fired. `left` is `None` when the flatten ended flat, and otherwise says what is
-    /// still open at the venue ("fired, not flat").
+    /// still open at the venue ("fired, not flat"). `unsaved` is `Some` when the last save of
+    /// `stops.json` failed, and says what the file does not hold.
     Fired {
         fired: StopFired,
         left: Option<String>,
+        unsaved: Option<String>,
     },
-    /// The owner flattened a session whose stop had not fired. `left` as for `Fired`.
-    Flattened { left: Option<String> },
+    /// The owner flattened a session whose stop had not fired. `left` and `unsaved` as for
+    /// `Fired`.
+    Flattened {
+        left: Option<String>,
+        unsaved: Option<String>,
+    },
 }
 
 impl Outcome {
     /// The command's exit code: 0 for a stop by the owner or a flatten that ended flat, 1 for a
-    /// halt, 2 for a fired stop flattened, 3 for anything left open at the venue.
+    /// halt, 2 for a fired stop flattened, 3 for anything left open at the venue or a stop file
+    /// that could not be saved at the end of a flatten.
     pub fn exit_code(&self) -> u8 {
         match self {
-            Outcome::Stopped | Outcome::Flattened { left: None } => 0,
+            Outcome::Stopped
+            | Outcome::Flattened {
+                left: None,
+                unsaved: None,
+            } => 0,
             Outcome::Halted(_) => 1,
-            Outcome::Fired { left: None, .. } => 2,
-            Outcome::Fired { left: Some(_), .. } | Outcome::Flattened { left: Some(_) } => 3,
+            Outcome::Fired {
+                left: None,
+                unsaved: None,
+                ..
+            } => 2,
+            Outcome::Fired { .. } | Outcome::Flattened { .. } => 3,
         }
     }
 }
@@ -172,10 +197,18 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 /// The broker's gate: every order it places passes here first. It holds the session's rules for
-/// the pre-trade notional cap, and the guard's stop of all sending.
+/// the pre-trade notional cap and the guard's two levels of stopping: a halt on a venue it cannot
+/// read, after which only reduce-only orders go out, and a fired stop, after which nothing does.
 pub(crate) struct SendGate {
     rules: StopRules,
+    /// Set when a stop fires: the broker sends nothing more, its protective stops included.
     stopped: Mutex<Option<String>>,
+    /// Set when the venue could not be read for the bound: orders that are not reduce-only are
+    /// refused, and the broker's protective stops and closes still go out.
+    halted: Mutex<Option<String>>,
+    /// The signed quantity of the orders that are not reduce-only let through since the current
+    /// bar began. Held while an order is judged, so two orders are judged one after the other.
+    passed: Mutex<f64>,
 }
 
 impl SendGate {
@@ -183,6 +216,8 @@ impl SendGate {
         SendGate {
             rules,
             stopped: Mutex::new(None),
+            halted: Mutex::new(None),
+            passed: Mutex::new(0.0),
         }
     }
 
@@ -191,15 +226,44 @@ impl SendGate {
         lock(&self.stopped).get_or_insert_with(|| reason.to_string());
     }
 
+    /// Whether a fired stop has stopped all sending, and why.
     pub fn stopped(&self) -> Option<String> {
         lock(&self.stopped).clone()
     }
 
-    /// Why `request` may not be placed now, or `None` when it may. Every order is refused once
-    /// sending has stopped. An order that is not reduce-only is refused when the venue's open
-    /// notional (its position at the mark price) plus the order's quantity at `last`, its last
-    /// known price, would pass the cap, or when the position cannot be read. A reduce-only order
-    /// is never refused by the cap.
+    /// Refuses every order that is not reduce-only from now on; the first reason given is kept.
+    pub fn halt(&self, reason: &str) {
+        lock(&self.halted).get_or_insert_with(|| reason.to_string());
+    }
+
+    /// A new bar has begun: the orders let through on the bars before are in the venue's
+    /// position by now, or never filled.
+    pub fn new_bar(&self) {
+        *lock(&self.passed) = 0.0;
+    }
+
+    /// Why an order may not go out now whatever its size, or `None`.
+    fn blocked(&self, reduce_only: bool) -> Option<String> {
+        if let Some(reason) = self.stopped() {
+            return Some(format!("the stop guard stopped all sending: {reason}"));
+        }
+        if reduce_only {
+            return None;
+        }
+        lock(&self.halted)
+            .as_ref()
+            .map(|reason| format!("the stop guard refuses new exposure: {reason}"))
+    }
+
+    /// Why `request` may not be placed now, or `None` when it may. Every order is refused once a
+    /// stop has fired, and an order that is not reduce-only once the guard has halted.
+    ///
+    /// An order that is not reduce-only is judged by the position it would leave: the venue's
+    /// signed position, plus the orders this gate let through since the bar began, plus the
+    /// order's signed quantity, valued at the position's mark price (or at `last`, the order's
+    /// last known price, when the venue gives no mark). It is refused when that notional is above
+    /// the cap and above the notional before it, or when the position cannot be read. So an order
+    /// that shrinks the position is never refused by the cap, whether or not it is reduce-only.
     pub fn refusal(
         &self,
         client: &Client,
@@ -207,12 +271,13 @@ impl SendGate {
         request: &OrderRequest,
         last: f64,
     ) -> Option<String> {
-        if let Some(reason) = self.stopped() {
-            return Some(format!("the stop guard stopped all sending: {reason}"));
+        if let Some(reason) = self.blocked(request.reduce_only) {
+            return Some(reason);
         }
         if request.reduce_only {
             return None;
         }
+        let mut passed = lock(&self.passed);
         let position = match client.position(instrument) {
             Ok(position) => position,
             Err(e) => {
@@ -221,22 +286,41 @@ impl SendGate {
                 ));
             }
         };
-        let open = position_notional(&position, last);
-        self.rules
-            .check_order(open, request.qty.abs() * last)
-            .err()
-            .map(|e| e.to_string())
+        // The guard may have fired or halted while the position was read.
+        if let Some(reason) = self.blocked(false) {
+            return Some(reason);
+        }
+        let signed = match request.side {
+            Side::Buy => request.qty.abs(),
+            Side::Sell => -request.qty.abs(),
+        };
+        // shortcut: an order let through earlier in the bar is counted here and, once it fills,
+        // again in the venue's position, so near the cap a second order in the same bar can be
+        // refused though it would fit; the count clears when the next bar begins. Upgrade to
+        // reading the order's fill back if strategies place several orders a bar near the cap.
+        let before = position.size + *passed;
+        let price = valuation_price(&position, last);
+        match self
+            .rules
+            .check_order(before.abs() * price, (before + signed).abs() * price)
+        {
+            Ok(()) => {
+                *passed += signed;
+                None
+            }
+            Err(e) => Some(e.to_string()),
+        }
     }
 }
 
-/// The position's notional at its mark price, or at `fallback` when the venue gives no mark.
-fn position_notional(position: &Position, fallback: f64) -> f64 {
-    let price = if position.mark_price > 0.0 {
+/// The price a position is valued at for the cap: its mark price, or `fallback` when the venue
+/// gives no mark.
+fn valuation_price(position: &Position, fallback: f64) -> f64 {
+    if position.mark_price > 0.0 {
         position.mark_price
     } else {
         fallback
-    };
-    position.size.abs() * price
+    }
 }
 
 /// One check's answer.
@@ -249,7 +333,7 @@ enum Check {
         notional: f64,
     },
     Fired(StopFired),
-    /// The check could not be made; `failures` in a row so far.
+    /// The check could not be made in full; `failures` in a row so far.
     Unreadable {
         failures: u32,
         reason: String,
@@ -260,8 +344,9 @@ enum Check {
 struct VenueNow {
     time: Millis,
     equity: f64,
-    notional: f64,
-    flat: bool,
+    /// The open notional and whether the position is flat, or why the notional could not be
+    /// valued.
+    open: Result<(f64, bool), String>,
 }
 
 /// The guard's shared side: the check, used from the run's thread after each bar and from the
@@ -284,6 +369,8 @@ struct Inner {
     last_time: Millis,
     /// Whether the last check shown was clear, so a clear check is shown only on a change.
     shown_clear: bool,
+    /// Why the last save of `record` failed, while `stops.json` does not hold its last change.
+    unsaved: Option<String>,
 }
 
 impl Guard {
@@ -296,34 +383,65 @@ impl Guard {
         self.instrument.lot_size / 2.0
     }
 
-    /// Reads the venue for a check: the settle coin's equity with open P&L included, the position,
-    /// and, when there is one, the mark price.
+    /// Reads the venue for a check: the settle coin's equity with open P&L included, and the open
+    /// notional. Only an equity that cannot be read fails the read.
     fn read_venue(&self) -> Result<VenueNow, String> {
-        let equity = self.client.equity().map_err(|e| e.to_string())?.equity;
-        let position = self
+        let equity = self
             .client
-            .position(&self.instrument)
-            .map_err(|e| e.to_string())?;
-        let flat = position.size.abs() < self.half_lot();
-        let notional = if flat {
-            0.0
-        } else {
-            let mark = self
-                .client
-                .ticker(&self.instrument.id.symbol)
-                .map_err(|e| e.to_string())?
-                .mark_price;
-            if !(mark.is_finite() && mark > 0.0) {
-                return Err(format!("the venue gave a mark price of {mark}"));
-            }
-            position.size.abs() * mark
-        };
+            .equity()
+            .map_err(|e| format!("the equity could not be read: {e}"))?
+            .equity;
         Ok(VenueNow {
             time: self.client.server_now(),
             equity,
-            notional,
-            flat,
+            open: self.open_notional(),
         })
+    }
+
+    /// The open notional and whether the position is flat: the venue position's size at the
+    /// ticker's mark price, or at the position read's own mark price when the ticker fails or
+    /// gives no usable mark.
+    fn open_notional(&self) -> Result<(f64, bool), String> {
+        let position = self
+            .client
+            .position(&self.instrument)
+            .map_err(|e| format!("the position could not be read: {e}"))?;
+        if position.size.abs() < self.half_lot() {
+            return Ok((0.0, true));
+        }
+        let usable = |mark: f64| mark.is_finite() && mark > 0.0;
+        let mark = match self.client.ticker(&self.instrument.id.symbol) {
+            Ok(ticker) if usable(ticker.mark_price) => ticker.mark_price,
+            _ if usable(position.mark_price) => position.mark_price,
+            ticker => {
+                let ticker = match ticker {
+                    Ok(t) => format!("the ticker gave a mark price of {}", t.mark_price),
+                    Err(e) => format!("the ticker could not be read ({e})"),
+                };
+                return Err(format!(
+                    "{ticker} and the position read gave a mark price of {}",
+                    position.mark_price
+                ));
+            }
+        };
+        Ok((position.size.abs() * mark, false))
+    }
+
+    /// Saves the record, and on success forgets an earlier failed save.
+    fn save(&self, inner: &mut Inner) -> Result<(), String> {
+        match inner.record.save(&self.dir) {
+            Ok(()) => {
+                if inner.unsaved.take().is_some() {
+                    self.event("the stop state was saved after an earlier failed save".into());
+                }
+                Ok(())
+            }
+            Err(e) => {
+                let e = e.to_string();
+                inner.unsaved = Some(e.clone());
+                Err(e)
+            }
+        }
     }
 
     /// The one stop check: reads the venue and calls `StopState::check` with the time, the
@@ -333,15 +451,22 @@ impl Guard {
     /// open P&L included), never from a figure the strategy or the session's own bookkeeping
     /// computes. The only saved number the limits rest on is the starting balance, which
     /// `StopState::restore` checks against `config.json`. Open notional is the venue position's
-    /// size times the venue's mark price.
+    /// size times the venue's mark price. When the notional cannot be valued, the loss limits are
+    /// still checked on the equity alone (`StopState::check_losses`), and the check counts as a
+    /// failed read.
     ///
     /// The state is saved whenever it changes (a new day's baseline, a fired stop) before this
-    /// returns, and a fired stop is saved before anything is sent. A read that fails, a check the
-    /// state refuses, or a save that fails is not a pass: it counts toward the failures in a row.
+    /// returns. A fired stop is acted on whether or not its save succeeded; a new day's baseline
+    /// that could not be saved is kept in memory and reported once. A failed save is tried again
+    /// at the start of each later check. An equity read that fails or a check the state refuses
+    /// is not a pass: it counts toward the failures in a row.
     fn check(&self) -> Check {
         let mut inner = lock(&self.inner);
         if let Some(fired) = inner.record.state.fired() {
             return Check::Fired(*fired);
+        }
+        if inner.unsaved.is_some() {
+            let _ = self.save(&mut inner);
         }
         let now = match self.read_venue() {
             Ok(now) => now,
@@ -349,44 +474,70 @@ impl Guard {
         };
         let time = now.time.max(inner.last_time);
         let day_ends = inner.record.state.day_ends();
-        let fired = match inner.record.state.check(time, now.equity, now.notional) {
+        let checked = match &now.open {
+            Ok((notional, _)) => inner.record.state.check(time, now.equity, *notional),
+            Err(_) => inner.record.state.check_losses(time, now.equity),
+        };
+        let fired = match checked {
             Ok(fired) => fired,
             Err(e) => return self.failed(&mut inner, e.to_string()),
         };
-        if fired.is_some() || inner.record.state.day_ends() != day_ends {
-            if let Some(fired) = fired {
-                inner
-                    .record
-                    .flatten
-                    .step(format!("fired, saved before anything is sent: {fired}"));
-            }
-            if let Err(e) = inner.record.save(&self.dir) {
-                let reason = format!("the stop state could not be saved: {e}");
-                if let Some(fired) = fired {
-                    // A fired stop is acted on whether or not it reached the disk: the account
-                    // is better flat than exposed.
-                    self.event(format!("{reason}; the flatten goes ahead"));
-                    return Check::Fired(fired);
-                }
-                return self.failed(&mut inner, reason);
-            }
-        }
-        inner.failures = 0;
         inner.last_time = time;
         if let Some(fired) = fired {
+            inner
+                .record
+                .flatten
+                .step(format!("fired, saved before anything is sent: {fired}"));
+            if let Err(e) = self.save(&mut inner) {
+                // A fired stop is acted on whether or not it reached the disk: the account is
+                // better flat than exposed.
+                if let Some(step) = inner.record.flatten.steps.last_mut() {
+                    *step = format!(
+                        "fired: {fired} The save before the flatten failed and the flatten went \
+                         ahead: {e}"
+                    );
+                }
+                self.event(format!(
+                    "the fired stop could not be saved, and the flatten goes ahead: {e}"
+                ));
+            }
             return Check::Fired(fired);
         }
+        if inner.record.state.day_ends() != day_ends {
+            let reported = inner.unsaved.is_some();
+            if let Err(e) = self.save(&mut inner)
+                && !reported
+            {
+                self.event(format!(
+                    "the new day's starting equity could not be saved; the guard keeps it and \
+                     tries the save again at each check: {e}"
+                ));
+            }
+        }
+        let (notional, flat) = match now.open {
+            Ok(open) => open,
+            Err(reason) => {
+                return self.failed(
+                    &mut inner,
+                    format!(
+                        "the loss limits were checked, but the open notional could not be \
+                         valued: {reason}"
+                    ),
+                );
+            }
+        };
+        inner.failures = 0;
         if !inner.shown_clear {
             inner.shown_clear = true;
             self.event(format!(
-                "check: no stop fired (equity {:.2}, open notional {:.2})",
-                now.equity, now.notional
+                "check: no stop fired (equity {:.2}, open notional {notional:.2})",
+                now.equity
             ));
         }
         Check::Clear {
-            flat: now.flat,
+            flat,
             equity: now.equity,
-            notional: now.notional,
+            notional,
         }
     }
 
@@ -401,25 +552,57 @@ impl Guard {
         Check::Unreadable { failures, reason }
     }
 
-    /// The reason a check gives the run to halt, or `None` to go on. A fired stop or the last
-    /// allowed failure also stops the broker sending.
+    /// The reason a check gives the run to halt, or `None` to go on. A fired stop also stops the
+    /// broker sending anything; the last allowed failure stops it sending anything that is not
+    /// reduce-only, so an entry already filled still gets its protective stop.
     fn halt_reason(&self, check: &Check) -> Option<String> {
-        let reason = match check {
-            Check::Fired(fired) => format!("a stop fired: {fired}"),
+        match check {
+            Check::Fired(fired) => {
+                let reason = format!("a stop fired: {fired}");
+                self.gate.stop(&reason);
+                Some(reason)
+            }
             Check::Unreadable { failures, reason } if *failures >= self.timing.unreadable => {
                 // shortcut: the guard halts on a venue it cannot read but does not flatten, since
                 // it cannot know the position; the position and the limits are then unwatched
                 // until the venue answers again or the owner runs `flatten`. Upgrade to a
                 // flatten on reads that come back, or to a second route, if outages turn out long.
-                format!(
+                let reason = format!(
                     "the venue could not be read for {failures} checks in a row, so the session \
-                     halted without sending anything: {reason}"
-                )
+                     halted and sends no order that could add to the position: {reason}"
+                );
+                self.gate.halt(&reason);
+                Some(reason)
             }
-            _ => return None,
-        };
-        self.gate.stop(&reason);
-        Some(reason)
+            _ => None,
+        }
+    }
+}
+
+/// Whether `stops.json` holds the record a flatten works on.
+struct Disk<'a> {
+    dir: &'a Path,
+    /// Why the last save failed, while the disk does not hold the record's last change.
+    unsaved: Option<String>,
+    /// Whether a save of the record has gone through, so the disk holds the fired stop (or, for
+    /// the owner's flatten, the record it loaded).
+    saved_once: bool,
+}
+
+impl Disk<'_> {
+    fn save(&mut self, record: &StopRecord) -> Result<(), String> {
+        match record.save(self.dir) {
+            Ok(()) => {
+                self.unsaved = None;
+                self.saved_once = true;
+                Ok(())
+            }
+            Err(e) => {
+                let e = e.to_string();
+                self.unsaved = Some(e.clone());
+                Err(e)
+            }
+        }
     }
 }
 
@@ -428,14 +611,14 @@ struct Flattener<'a> {
     client: &'a Client,
     instrument: &'a Instrument,
     prefix: &'a str,
-    dir: &'a Path,
     timing: GuardTiming,
 }
 
 impl Flattener<'_> {
     /// Cancels the session's resting orders and closes the venue's position, round by round,
     /// until the run has finished, the position is flat and no order of the session rests, or the
-    /// rounds run out. Each step is recorded in `record` and shown with `out`.
+    /// rounds run out. Each step is recorded in `record` and shown with `out`. A save that failed
+    /// is tried again at the start of each round; a failed save never holds a round back.
     ///
     /// `done(wait)` says whether the run has finished; with `wait` it first waits for it to. It is
     /// asked before each round's reads, so an order the run had in flight when it was halted shows
@@ -445,6 +628,7 @@ impl Flattener<'_> {
     fn run(
         &self,
         record: &mut StopRecord,
+        disk: &mut Disk,
         done: &mut dyn FnMut(bool) -> bool,
         out: &mut dyn FnMut(String),
     ) -> FlattenResult {
@@ -457,6 +641,12 @@ impl Flattener<'_> {
         for round in 1..=self.timing.rounds {
             if round > 1 {
                 std::thread::sleep(self.timing.pause);
+            }
+            if disk.unsaved.is_some() && disk.save(record).is_ok() {
+                note(
+                    record,
+                    format!("round {round}: the stop file was saved after an earlier failed save"),
+                );
             }
             let finished = done(false);
             let open = match self.client.open_orders(self.instrument) {
@@ -473,8 +663,8 @@ impl Flattener<'_> {
                 .into_iter()
                 .filter(|o| ids::parse(self.prefix, &o.client_id).is_some())
                 .collect();
-            let position = match self.client.position(self.instrument) {
-                Ok(p) => p.size,
+            let read = match self.client.position(self.instrument) {
+                Ok(read) => read,
                 Err(e) => {
                     note(
                         record,
@@ -483,13 +673,15 @@ impl Flattener<'_> {
                     continue;
                 }
             };
+            let position = read.size;
             let flat = position.abs() < half;
             if flat && ours.is_empty() {
                 if finished {
                     note(
                         record,
                         format!(
-                            "round {round}: the venue position is flat and no order of the                              session rests"
+                            "round {round}: the venue position is flat and no order of the \
+                             session rests"
                         ),
                     );
                     return FlattenResult::Flat;
@@ -524,7 +716,7 @@ impl Flattener<'_> {
                 note(record, format!("round {round}: {line}"));
             }
             if !flat {
-                let line = self.close(record, position);
+                let line = self.close(record, disk, &read);
                 note(record, format!("round {round}: {line}"));
             }
         }
@@ -538,24 +730,35 @@ impl Flattener<'_> {
         FlattenResult::NotFlat { left }
     }
 
-    /// Sends one reduce-only market order for the venue's position `size`, under a new `f` id
-    /// whose number is saved first. Returns what happened.
-    fn close(&self, record: &mut StopRecord, size: f64) -> String {
+    /// Sends one reduce-only market order for the size of the venue's position `read`, under a new
+    /// `f` id whose number is saved first. When that save fails the order is sent all the same,
+    /// under the id it claimed. It is priced at the ticker's last price, or at the position read's
+    /// mark price when the ticker gives none. Returns what happened.
+    fn close(&self, record: &mut StopRecord, disk: &mut Disk, read: &Position) -> String {
+        let usable = |price: f64| price.is_finite() && price > 0.0;
         let last = match self.client.ticker(&self.instrument.id.symbol) {
-            Ok(t) if t.last_price.is_finite() && t.last_price > 0.0 => t.last_price,
+            Ok(t) if usable(t.last_price) => t.last_price,
+            _ if usable(read.mark_price) => read.mark_price,
             Ok(t) => {
                 return format!(
-                    "not closed: the venue gave a last price of {}",
-                    t.last_price
+                    "not closed: the venue gave a last price of {} and a mark price of {}",
+                    t.last_price, read.mark_price
                 );
             }
-            Err(e) => return format!("not closed: the last price could not be read: {e}"),
+            Err(e) => {
+                return format!(
+                    "not closed: the last price could not be read ({e}) and the position read \
+                     gave a mark price of {}",
+                    read.mark_price
+                );
+            }
         };
         record.flatten.last_id += 1;
-        if let Err(e) = record.save(self.dir) {
-            return format!("not closed: the flatten id could not be saved first: {e}");
-        }
+        let unsaved = disk.save(record).err().map_or_else(String::new, |e| {
+            format!(" (the flatten id could not be saved first, and the close went ahead: {e})")
+        });
         let cid = ids::client_id(self.prefix, Role::Flatten, OrderId(record.flatten.last_id));
+        let size = read.size;
         let qty = self.instrument.round_qty(size.abs());
         let request = OrderRequest {
             instrument: self.instrument.id.clone(),
@@ -566,7 +769,7 @@ impl Flattener<'_> {
             reduce_only: true,
             client_tag: None,
         };
-        match self.client.place(self.instrument, &request, &cid, last) {
+        let line = match self.client.place(self.instrument, &request, &cid, last) {
             Ok(_) => format!(
                 "sent {cid}, a reduce-only market {:?} of {qty}",
                 request.side
@@ -576,7 +779,8 @@ impl Flattener<'_> {
                  else is sent: {e}"
             ),
             Err(e) => format!("{cid} was not taken: {e}"),
-        }
+        };
+        format!("{line}{unsaved}")
     }
 }
 
@@ -608,6 +812,7 @@ where
             failures: 0,
             last_time: Millis::MIN,
             shown_clear: false,
+            unsaved: None,
         }),
         wake: stop.wake.clone(),
         events: Mutex::new(tx),
@@ -677,8 +882,11 @@ where
         }
     };
     let mut run = Some(live.run(rest, stream, after_bar));
-    // Why the run ended, once it has, and the session it gave back.
+    // Why the run ended, once it has, and the session it gave back. Set when `run` is taken.
     let mut ended: Option<(String, LiveSession)> = None;
+    let why_ended = |ended: Option<(String, LiveSession)>| {
+        ended.map_or_else(|| "the run ended".to_string(), |(reason, _)| reason)
+    };
     let mut halted = false;
     let mut next_check = Instant::now() + timing.interval;
     loop {
@@ -700,24 +908,19 @@ where
             ended = Some((reason, session));
         }
         if stopping {
-            return match (run.take(), ended.take()) {
-                (Some(run), _) => {
-                    let (_session, result) = run.stop();
-                    out(
-                        "stopped: the position and its resting orders stay at the venue, and the \
-                         loss limits are not enforced while td-live is not running; `td-live \
-                         flatten` closes the position",
-                    );
-                    match result {
-                        Ok(()) => Outcome::Stopped,
-                        Err(e) => Outcome::Halted(e.to_string()),
-                    }
-                }
-                (None, Some((reason, _))) => {
-                    out("stopped: the loss limits are not enforced while td-live is not running");
-                    Outcome::Halted(reason)
-                }
-                (None, None) => Outcome::Halted("stopped".into()),
+            let Some(run) = run.take() else {
+                out("stopped: the loss limits are not enforced while td-live is not running");
+                return Outcome::Halted(why_ended(ended.take()));
+            };
+            let (_session, result) = run.stop();
+            out(
+                "stopped: the position and its resting orders stay at the venue, and the loss \
+                 limits are not enforced while td-live is not running; `td-live flatten` closes \
+                 the position",
+            );
+            return match result {
+                Ok(()) => Outcome::Stopped,
+                Err(e) => Outcome::Halted(e.to_string()),
             };
         }
         if Instant::now() < next_check {
@@ -741,10 +944,7 @@ where
                 }
             }
             Check::Clear { flat: true, .. } if run.is_none() => {
-                let reason = ended
-                    .take()
-                    .map_or_else(|| "the run ended".into(), |(r, _)| r);
-                return Outcome::Halted(reason);
+                return Outcome::Halted(why_ended(ended.take()));
             }
             Check::Clear { .. } => {}
         }
@@ -767,7 +967,15 @@ fn fire(
         run.halt(reason.clone());
     }
     out(&format!("stop fired: {fired}"));
-    let mut record = lock(&guard.inner).record.clone();
+    let (mut record, unsaved) = {
+        let inner = lock(&guard.inner);
+        (inner.record.clone(), inner.unsaved.clone())
+    };
+    let mut disk = Disk {
+        dir: &guard.dir,
+        saved_once: unsaved.is_none(),
+        unsaved,
+    };
     let (mut run, mut session) = (run, session);
     let mut ran = Vec::new();
     let mut done = |wait: bool| {
@@ -784,26 +992,23 @@ fn fire(
         client: &guard.client,
         instrument: &guard.instrument,
         prefix,
-        dir: &guard.dir,
         timing: guard.timing,
     };
     for line in rx.try_iter() {
         out(&line);
     }
-    let result = flattener.run(&mut record, &mut done, &mut |l| out(&l));
+    let result = flattener.run(&mut record, &mut disk, &mut done, &mut |l| out(&l));
     drop(done);
     for line in rx.try_iter().chain(ran) {
         out(&line);
     }
-    let outcome = finish(&mut record, fired_outcome(fired), result, &guard.dir);
-    if let Err(e) = record.save(&guard.dir) {
-        out(&format!("the stop state could not be saved: {e}"));
-    }
+    let outcome = finish(&mut record, fired_outcome(fired), result, &mut disk);
     *lock(&guard.inner) = Inner {
         record,
         failures: 0,
         last_time: Millis::MIN,
         shown_clear: false,
+        unsaved: disk.unsaved,
     };
     if let Some(session) = &mut session
         && let Err(e) = session.set_state(State::Ended {
@@ -817,36 +1022,74 @@ fn fire(
 }
 
 fn fired_outcome(fired: StopFired) -> Outcome {
-    Outcome::Fired { fired, left: None }
+    Outcome::Fired {
+        fired,
+        left: None,
+        unsaved: None,
+    }
 }
 
-/// Records `result` and returns `outcome` with what was left open, if anything.
+/// Records `result`, saves the record a last time, and returns `outcome` with what was left open
+/// at the venue and what the stop file does not hold, if anything.
 fn finish(
     record: &mut StopRecord,
     outcome: Outcome,
     result: FlattenResult,
-    _dir: &Path,
+    disk: &mut Disk,
 ) -> Outcome {
     let left = match &result {
         FlattenResult::Flat => None,
         FlattenResult::NotFlat { left } => Some(left.clone()),
     };
     record.flatten.result = Some(result);
-    match outcome {
-        Outcome::Fired { fired, .. } => Outcome::Fired { fired, left },
-        _ => Outcome::Flattened { left },
+    let fired = match outcome {
+        Outcome::Fired { fired, .. } => Some(fired),
+        _ => None,
+    };
+    let unsaved = disk.save(record).err().map(|e| {
+        let missing = match (disk.saved_once, fired) {
+            (true, _) => "how the flatten ended",
+            (false, Some(_)) => "the fired stop",
+            (false, None) => "this flatten",
+        };
+        format!("stops.json could not be saved, so it does not record {missing}: {e}")
+    });
+    match fired {
+        Some(fired) => Outcome::Fired {
+            fired,
+            left,
+            unsaved,
+        },
+        None => Outcome::Flattened { left, unsaved },
     }
 }
 
 /// The status reason of an ended session.
 fn ended_reason(outcome: &Outcome) -> String {
-    let done = |left: &Option<String>| match left {
-        None => "the session's orders were cancelled and the venue position is flat".to_string(),
-        Some(left) => format!("fired, not flat: still open at the venue: {left}"),
+    let done = |not_flat: &str, left: &Option<String>, unsaved: &Option<String>| {
+        let done = match left {
+            None => {
+                "the session's orders were cancelled and the venue position is flat".to_string()
+            }
+            Some(left) => format!("{not_flat}: still open at the venue: {left}"),
+        };
+        match unsaved {
+            None => done,
+            Some(unsaved) => format!("{done}; {unsaved}"),
+        }
     };
     match outcome {
-        Outcome::Fired { fired, left } => format!("{fired} {}", done(left)),
-        Outcome::Flattened { left } => format!("flattened by the owner: {}", done(left)),
+        Outcome::Fired {
+            fired,
+            left,
+            unsaved,
+        } => format!("{fired} {}", done("fired, not flat", left, unsaved)),
+        Outcome::Flattened { left, unsaved } => {
+            format!(
+                "flattened by the owner: {}",
+                done("not flat", left, unsaved)
+            )
+        }
         Outcome::Stopped => "stopped".into(),
         Outcome::Halted(reason) => reason.clone(),
     }
@@ -857,8 +1100,11 @@ fn ended_reason(outcome: &Outcome) -> String {
 /// [`State::Ended`]. For a session that is not running: halted, faulted, stopped, or one whose
 /// stop fired and whose flatten did not finish. Nothing else is done at the venue.
 ///
-/// The session's lock is held throughout, so it cannot run meanwhile. The stop state must load
-/// as for an open: its flatten counter keeps every close under a new id.
+/// The session's lock is held throughout, so it cannot run meanwhile. The stop state's flatten
+/// counter keeps every close under a new id. A stop file that is missing, unreadable or refused
+/// does not block the flatten: it is replaced by a fresh record that says so, whose flatten ids
+/// count on from the venue's clock in milliseconds, far above any count the lost record could
+/// have reached. A link in its place is refused. A status file that cannot be read is replaced.
 pub fn flatten_session(
     data_dir: &Path,
     id: &str,
@@ -867,30 +1113,60 @@ pub fn flatten_session(
     out: &mut dyn FnMut(&str),
 ) -> Result<Outcome, LiveError> {
     check_id(id)?;
-    let dir = live_dir(data_dir, id);
+    let dir = session_dir(data_dir, id)?;
     let config_path = dir.join(crate::session::CONFIG_FILE);
     if !config_path.exists() {
         return Err(LiveError::NotFound(dir));
     }
     let saved: SavedConfig = read_json(&config_path)?;
     let _lock = take_lock(&dir)?;
-    let mut record = StopRecord::load(&dir, &saved)?;
+    let (mut record, saved_once) = match StopRecord::load(&dir, &saved) {
+        Ok(record) => (record, true),
+        Err(LiveError::StopFile { reason, .. }) => {
+            let now = client.server_now();
+            let mut record = StopRecord::new(StopState::start(
+                saved.config.stops,
+                saved.starting_balance,
+                now,
+            )?);
+            record.flatten.last_id = u64::try_from(now).unwrap_or(0);
+            let line = format!(
+                "the stop file could not be read ({reason}), so this flatten keeps a fresh \
+                 record; its flatten ids count on from the venue's clock"
+            );
+            out(&format!("flatten: {line}"));
+            record.flatten.step(line);
+            (record, false)
+        }
+        Err(e) => return Err(e),
+    };
     let outcome = match record.state.fired() {
         Some(fired) => fired_outcome(*fired),
-        None => Outcome::Flattened { left: None },
+        None => Outcome::Flattened {
+            left: None,
+            unsaved: None,
+        },
+    };
+    let mut disk = Disk {
+        dir: &dir,
+        unsaved: None,
+        saved_once,
     };
     let flattener = Flattener {
         client,
         instrument: &saved.config.instrument,
         prefix: &saved.prefix,
-        dir: &dir,
         timing,
     };
-    let result = flattener.run(&mut record, &mut |_| true, &mut |l| out(&l));
-    let outcome = finish(&mut record, outcome, result, &dir);
-    record.save(&dir)?;
+    let result = flattener.run(&mut record, &mut disk, &mut |_| true, &mut |l| out(&l));
+    let outcome = finish(&mut record, outcome, result, &mut disk);
     let status_path = dir.join(STATUS_FILE);
-    let mut status: LiveStatus = read_json(&status_path)?;
+    let mut status: LiveStatus = read_json(&status_path).unwrap_or_else(|e| {
+        out(&format!(
+            "the status could not be read, so a fresh one is written: {e}"
+        ));
+        LiveStatus::not_started(None)
+    });
     status.state = State::Ended {
         reason: ended_reason(&outcome),
     };
@@ -930,7 +1206,19 @@ pub fn saved_files(
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use td_core::{FeeSchedule, InstrumentId, InstrumentKind, Venue};
+    use td_engine::DayRollover;
+    use td_mock_bybit::{MockVenue, TEST_KEY, TEST_SECRET};
+    use td_orders::{DemoKeys, Endpoint, Timing};
+
     use super::*;
+
+    const SYMBOL: &str = "BTCUSDT";
+    const PRICE: f64 = 65000.0;
+    /// 260 of notional at [`PRICE`].
+    const QTY: f64 = 0.004;
 
     #[test]
     fn exit_codes_tell_a_stop_a_halt_a_fire_and_what_is_left_apart() {
@@ -938,23 +1226,25 @@ mod tests {
             rule: td_engine::StopRule::MaxLoss,
             time: 0,
             equity: 1.0,
-            notional: 0.0,
+            notional: Some(0.0),
             threshold: 2.0,
         };
+        let some = || Some("x".to_string());
         assert_eq!(Outcome::Stopped.exit_code(), 0);
-        assert_eq!(Outcome::Flattened { left: None }.exit_code(), 0);
+        let flattened = |left, unsaved| Outcome::Flattened { left, unsaved };
+        assert_eq!(flattened(None, None).exit_code(), 0);
         assert_eq!(Outcome::Halted("x".into()).exit_code(), 1);
-        assert_eq!(Outcome::Fired { fired, left: None }.exit_code(), 2);
-        let left = Some("a position".to_string());
-        assert_eq!(
-            Outcome::Fired {
-                fired,
-                left: left.clone()
-            }
-            .exit_code(),
-            3
-        );
-        assert_eq!(Outcome::Flattened { left }.exit_code(), 3);
+        let fire = |left, unsaved| Outcome::Fired {
+            fired,
+            left,
+            unsaved,
+        };
+        assert_eq!(fire(None, None).exit_code(), 2);
+        // Something left at the venue, or a stop file that does not hold the end, even when flat.
+        assert_eq!(fire(some(), None).exit_code(), 3);
+        assert_eq!(fire(None, some()).exit_code(), 3);
+        assert_eq!(flattened(some(), None).exit_code(), 3);
+        assert_eq!(flattened(None, some()).exit_code(), 3);
     }
 
     #[test]
@@ -966,8 +1256,152 @@ mod tests {
             unrealised_pnl: 0.0,
             mark_price: 12.0,
         };
-        assert_eq!(position_notional(&p, 11.0), 24.0);
+        assert_eq!(valuation_price(&p, 11.0), 12.0);
         p.mark_price = 0.0;
-        assert_eq!(position_notional(&p, 11.0), 22.0);
+        assert_eq!(valuation_price(&p, 11.0), 11.0);
+    }
+
+    fn instrument() -> Instrument {
+        Instrument {
+            id: InstrumentId {
+                venue: Venue::Bybit,
+                symbol: SYMBOL.into(),
+                kind: InstrumentKind::Perpetual,
+            },
+            base: "BTC".into(),
+            quote: "USDT".into(),
+            tick_size: 0.1,
+            lot_size: 0.001,
+            min_qty: 0.002,
+            min_notional: 100.0,
+            fees: FeeSchedule {
+                maker: 0.0002,
+                taker: 0.00055,
+                per_unit: 0.0,
+            },
+        }
+    }
+
+    /// The mock with the instrument at [`PRICE`] and a position of `size`, a client for it, and a
+    /// gate with a cap of 400.
+    fn gate_at(size: f64) -> (MockVenue, Client, SendGate) {
+        let mock = MockVenue::start();
+        mock.add_instrument(&instrument(), PRICE);
+        if size != 0.0 {
+            mock.set_position(SYMBOL, size, PRICE);
+        }
+        let timing = Timing {
+            connect_timeout: Duration::from_secs(1),
+            request_timeout: Duration::from_millis(1500),
+            recv_window: Duration::from_millis(1000),
+            settle: Duration::from_millis(50),
+        };
+        let keys = DemoKeys::for_loopback(TEST_KEY, TEST_SECRET).unwrap();
+        let client = Client::with_timing(Endpoint::Loopback(mock.port()), keys, timing).unwrap();
+        let gate = SendGate::new(StopRules {
+            daily_loss_share: 0.05,
+            max_loss_share: 0.1,
+            open_notional_cap: 400.0,
+            rollover: DayRollover::default(),
+        });
+        (mock, client, gate)
+    }
+
+    fn market(side: Side, qty: f64, reduce_only: bool) -> OrderRequest {
+        OrderRequest {
+            instrument: instrument().id,
+            side,
+            qty,
+            order_type: OrderType::Market,
+            tif: TimeInForce::Gtc,
+            reduce_only,
+            client_tag: None,
+        }
+    }
+
+    #[test]
+    fn the_cap_judges_an_order_by_the_position_it_leaves() {
+        // A long of 260, above half the cap of 400, so an order counted as added notional would
+        // pass the cap whatever its side.
+        let refused = |side, qty| {
+            let (_mock, client, gate) = gate_at(QTY);
+            gate.refusal(&client, &instrument(), &market(side, qty, false), PRICE)
+        };
+        assert_eq!(
+            refused(Side::Sell, QTY),
+            None,
+            "an exit that is not reduce-only"
+        );
+        assert_eq!(refused(Side::Sell, 0.002), None, "a partial exit");
+        assert_eq!(
+            refused(Side::Sell, 2.0 * QTY),
+            None,
+            "a flip to a short of 260"
+        );
+        let over = refused(Side::Sell, 3.0 * QTY).expect("a flip to a short of 520");
+        assert!(over.contains("above the cap of 400"), "{over}");
+        assert!(refused(Side::Buy, QTY).is_some(), "an add to 520");
+        // A short is judged the same way.
+        let (_mock, client, gate) = gate_at(-QTY);
+        let buy = |qty| {
+            gate.refusal(
+                &client,
+                &instrument(),
+                &market(Side::Buy, qty, false),
+                PRICE,
+            )
+        };
+        assert_eq!(buy(QTY), None);
+    }
+
+    #[test]
+    fn two_orders_let_through_in_one_bar_are_counted_together() {
+        let (mock, client, gate) = gate_at(0.0);
+        let buy = || {
+            gate.refusal(
+                &client,
+                &instrument(),
+                &market(Side::Buy, QTY, false),
+                PRICE,
+            )
+        };
+        // Nothing reaches the venue here, so its position stays flat throughout.
+        assert_eq!(buy(), None);
+        let second = buy().expect("260 + 260 is above the cap of 400");
+        assert!(second.contains("from 260 to 520"), "{second}");
+        // A refused order is not counted, and an exit from what was let through still passes.
+        let sell = gate.refusal(
+            &client,
+            &instrument(),
+            &market(Side::Sell, QTY, false),
+            PRICE,
+        );
+        assert_eq!(sell, None);
+        assert_eq!(buy(), None);
+        gate.new_bar();
+        assert_eq!(buy(), None, "the next bar starts from the venue's position");
+        assert_eq!(mock.position(SYMBOL), 0.0);
+    }
+
+    #[test]
+    fn a_halt_refuses_new_exposure_and_a_fired_stop_refuses_everything() {
+        let (_mock, client, gate) = gate_at(QTY);
+        let refused = |request: OrderRequest| gate.refusal(&client, &instrument(), &request, PRICE);
+        gate.halt("the venue could not be read");
+        let entry = refused(market(Side::Buy, 0.002, false)).expect("an entry");
+        assert!(entry.contains("refuses new exposure"), "{entry}");
+        assert!(refused(market(Side::Sell, QTY, false)).is_some());
+        assert_eq!(refused(market(Side::Sell, QTY, true)), None, "reduce-only");
+        assert_eq!(
+            gate.stopped(),
+            None,
+            "the broker's protective stops still go out"
+        );
+        gate.stop("a stop fired");
+        let close = refused(market(Side::Sell, QTY, true)).expect("reduce-only too");
+        assert!(
+            close.contains("stopped all sending: a stop fired"),
+            "{close}"
+        );
     }
 }
