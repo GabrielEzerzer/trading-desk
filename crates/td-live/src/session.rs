@@ -18,6 +18,12 @@
 //! before a torn last line is cut, the log must replay to the state it records, and a replay that
 //! panics is refused like any other bad log; none of it sends anything.
 //!
+//! shortcut: the settings in `config.json` (starting balance, leverage limit, slippage and fees,
+//! the strategy's parameters) are trusted when a session is resumed and are not compared with the
+//! venue, so an edit that does not change the orders already recorded passes the replay and
+//! changes how later orders are sized. Upgrade when a folder may be edited between runs: compare
+//! the session's modelled equity with the venue's when going live, and halt past a set difference.
+//!
 //! **Write-ahead.** A live bar on which the session sends or cancels an order writes two lines.
 //! Before the first send or cancel, a `sending` line holds the bar and the broker's record so far
 //! (the bar's own reads and fills); after the bar, the bar's line holds the rest. A process that
@@ -252,7 +258,10 @@ pub enum LiveError {
          {current}; it cannot be resumed: start a new session"
     )]
     EngineChanged { created: u32, current: u32 },
-    #[error("the session halted on a broker fault; nothing was sent or cancelled after it: {0}")]
+    #[error(
+        "the session halted on a broker fault; nothing was sent or cancelled after it, except a \
+         reduce-only stop for a fill confirmed in the same step: {0}"
+    )]
     Faulted(String),
     #[error("the session halted on a broker fault and stays halted, so it cannot be resumed: {0}")]
     StillFaulted(String),

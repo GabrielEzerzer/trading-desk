@@ -143,7 +143,8 @@ impl Context<'_> {
     ///
     /// A reference instrument is only read: an order for it is rejected, since orders, fills,
     /// costs and the account stay on [`Context::instrument`]. Backtests, sweeps, out-of-sample and
-    /// walk-forward runs and the battery supply it; a paper session names none (see the README).
+    /// walk-forward runs and the battery supply it; a paper or live session names none (see the
+    /// README).
     pub fn reference(&self, instrument: &InstrumentId) -> Option<&[Option<Candle>]> {
         self.references
             .iter()
