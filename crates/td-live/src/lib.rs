@@ -109,6 +109,7 @@
 
 mod broker;
 pub mod cli;
+mod compare;
 mod guard;
 mod ids;
 mod run;

@@ -50,6 +50,8 @@ pub enum Command {
     Status(SessionArgs),
     /// Cancels a session's resting orders and closes its position, reduce-only, and ends it.
     Flatten(SessionArgs),
+    /// Compares a session's fills with a backtest over its own saved bars; touches no venue.
+    Compare(SessionArgs),
 }
 
 #[derive(Debug, Args)]
@@ -217,6 +219,11 @@ fn run(cli: Cli, env: &Env, out: &mut dyn FnMut(&str)) -> Result<u8, String> {
             let data = data_dir(args.data_dir)?;
             let client = (env.connect)()?;
             flatten(&data, &args.id, &client, env, out)
+        }
+        Command::Compare(args) => {
+            let data = data_dir(args.data_dir)?;
+            crate::compare::compare(&data, &args.id, env.build, out)?;
+            Ok(0)
         }
     }
 }

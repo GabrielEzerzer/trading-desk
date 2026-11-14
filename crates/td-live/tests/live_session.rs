@@ -2510,3 +2510,127 @@ fn a_verdict_named_for_a_strategy_that_is_not_registered_is_refused_before_anyth
     assert_eq!(rig.mock.requests().len(), requests);
     assert!(!rig.data().join("live").exists());
 }
+
+// ---- `td-live compare` ----
+
+/// A session against the mock beside a backtest over its own bars. The venue fills bar 0's buy
+/// 10 above the bar and refuses every order after it, while the backtest also fills bar 1's add.
+/// `compare` reads the folder only: it runs with a connect that fails and sends nothing.
+#[test]
+fn compare_pairs_the_venue_fills_with_a_backtest_over_the_session_bars() {
+    let rig = Rig::new();
+    let mut cfg = config(0, -1, false);
+    cfg.params.set("add_from", ParamValue::Int(1));
+    rig.mock.set_price(SYMBOL, PRICE + 10.0);
+    let feed = rig.feed();
+    feed.minute(rig.bar(1));
+    let run = rig.run(rig.create("cmp", cfg).expect("creates"), &feed);
+    wait_for_bar(&run, rig.bar(0));
+    rig.mock.inject_always(CREATE, Fault::Answer(10001));
+    feed.minute(rig.bar(3));
+    wait_for_bar(&run, rig.bar(2));
+    let (live, ended) = run.stop();
+    ended.expect("stopped cleanly");
+    assert_eq!(live.session().fills().len(), 1);
+    drop(live);
+
+    let mut env = rig.env(&feed);
+    env.connect = Box::new(|| Err("no keys in this test".into()));
+    let requests = rig.mock.requests().len();
+    let cli =
+        <td_live::cli::Cli as clap::Parser>::try_parse_from(["td-live", "compare", "--id", "cmp"])
+            .expect("parses");
+    let mut lines = Vec::new();
+    let code = td_live::cli::execute(cli, &env, &mut |l| lines.push(l.to_string()));
+    let text = lines.join("\n");
+    assert_eq!(code, 0, "{text}");
+    assert_eq!(
+        rig.mock.requests().len(),
+        requests,
+        "compare asked the venue nothing"
+    );
+
+    let at = |t: Millis| td_data::time::format_minute(t);
+    // By hand. The venue: 0.004 at 65010, fee 65010 x 0.004 x 0.00055 = 0.143022, read on bar 1.
+    // The backtest: 0.004 at bar 1's open of 65000, fee 260 x 0.00055 = 0.143; and bar 1's add at
+    // bar 2's open, fee 0.143. Bar 2's add has no bar after it to fill on.
+    assert!(
+        text.contains(&format!(
+            "compared session cmp with a backtest of double on {} 1h over the session's own bars: \
+             3 live bars from {} to {}, after {WARM_UP} warm-up bars",
+            instrument().id,
+            at(rig.bar(0)),
+            at(rig.bar(2)),
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains("what is compared: the fills the venue reported"),
+        "{text}"
+    );
+    assert!(text.contains("which the backtest cannot model"), "{text}");
+    assert!(
+        text.contains(&format!(
+            "matched fills: 1\n  buy 0.004, decided on the bar opening at {}: session 65010 at \
+             {}, backtest 65000 at {}; time difference 0 ms, price difference +10, quantity \
+             difference 0, fee difference +0.000022",
+            at(rig.bar(0)),
+            at(rig.bar(1)),
+            at(rig.bar(1)),
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains("session fills with no backtest partner: 0\n"),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "backtest fills with no session partner: 1\n  buy 0.004 at 65000 at {}, fee 0.143",
+            at(rig.bar(2))
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            "fees: session 0.143022, backtest 0.286; funding paid: session 0, backtest 0"
+        ),
+        "{text}"
+    );
+    // The session loses its fee and 10 x 0.004 = 0.04 to the bar's close of 65000: -0.183022. The
+    // backtest loses its two fees: -0.286. -0.183022 / -0.286 = 0.63993...
+    assert!(
+        text.ends_with(
+            "profit and loss: session -0.183022, backtest -0.286; the session's over the \
+             backtest's: 0.6399"
+        ),
+        "{text}"
+    );
+
+    // A strategy whose code or parameters now make other orders than the session made is not
+    // compared: here it no longer adds on bar 1, as the record says it did.
+    let mut config = rig.config_json("cmp");
+    config["params"]["add_from"] = 5.into();
+    rig.write_config_json("cmp", &config);
+    let (code, text) = rig.td_live(&feed, &["compare", "--id", "cmp"]);
+    assert_eq!(code, 1, "{text}");
+    assert!(
+        text.contains("does not replay with the strategy as it is now"),
+        "{text}"
+    );
+}
+
+/// A session id that is not one is refused before any path is made from it, and a session
+/// that has fed no live bar has nothing to compare.
+#[test]
+fn compare_refuses_a_bad_id_and_a_session_with_no_live_bar() {
+    let rig = Rig::new();
+    let feed = rig.feed();
+    let (code, text) = rig.td_live(&feed, &["compare", "--id", "../x"]);
+    assert_eq!(code, 1, "{text}");
+    assert!(text.contains("invalid session id \"../x\""), "{text}");
+    drop(rig.create("empty", config(-1, -1, false)).expect("creates"));
+    let (code, text) = rig.td_live(&feed, &["compare", "--id", "empty"]);
+    assert_eq!(code, 1, "{text}");
+    assert!(text.contains("has not fed a live bar yet"), "{text}");
+}

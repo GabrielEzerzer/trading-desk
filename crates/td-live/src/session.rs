@@ -63,7 +63,7 @@ use crate::stop_file::{STOP_FILE, StopRecord};
 use crate::{BrokerRecord, VenueBroker, VenueHandle};
 
 pub(crate) const CONFIG_FILE: &str = "config.json";
-const EVENTS_FILE: &str = "events.jsonl";
+pub(crate) const EVENTS_FILE: &str = "events.jsonl";
 pub(crate) const STATUS_FILE: &str = "status.json";
 const LOCK_FILE: &str = "lock";
 const FAULTED_FILE: &str = "faulted";
@@ -140,6 +140,21 @@ pub struct SavedConfig {
     pub link: Option<SessionLink>,
 }
 
+impl SavedConfig {
+    /// The money settings of the engine session.
+    pub(crate) fn money(&self) -> SessionConfig {
+        SessionConfig {
+            starting_cash: self.starting_balance,
+            slippage_bps: self.config.slippage_bps,
+            fees: self.config.fees,
+            max_leverage: self.config.max_leverage,
+            // shortcut: a quote-currency account, as paper sessions have; add the account
+            // currency to `LiveConfig` when a live session trades a market with quotes.
+            account_currency: AccountCurrency::Quote,
+        }
+    }
+}
+
 /// A funding rate fed with a bar.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Funding {
@@ -152,18 +167,18 @@ pub struct Funding {
 
 /// One line of `events.jsonl`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-struct Line {
-    bar: Candle,
+pub(crate) struct Line {
+    pub(crate) bar: Candle,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    funding: Vec<Funding>,
+    pub(crate) funding: Vec<Funding>,
     /// Fed with `Session::warm_up`: no trading, no broker record.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    warm_up: bool,
+    pub(crate) warm_up: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    record: Option<BrokerRecord>,
+    pub(crate) record: Option<BrokerRecord>,
     /// Written before the bar's first send or cancel; the bar's own line follows it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    sending: bool,
+    pub(crate) sending: bool,
 }
 
 /// Where a session stands.
@@ -574,20 +589,11 @@ impl LiveSession {
         let strategy = build(&saved.config.strategy, &saved.config.params)?;
         let gate = Arc::new(SendGate::new(saved.config.stops));
         let parts = Parts::build(&saved, client.clone(), strategy, &config_path, &gate)?;
-        let complete = bytes.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+        let (lines, complete) = read_lines(&bytes, &log_path)?;
         let bad = |index: usize, reason: String| LiveError::BadLog {
             path: log_path.clone(),
             reason: format!("line {}: {reason}", index + 1),
         };
-        let text = std::str::from_utf8(&bytes[..complete]).map_err(|e| LiveError::BadLog {
-            path: log_path.clone(),
-            reason: format!("it is not UTF-8: {e}"),
-        })?;
-        let lines = text
-            .lines()
-            .enumerate()
-            .map(|(i, l)| serde_json::from_str::<Line>(l).map_err(|e| bad(i, e.to_string())))
-            .collect::<Result<Vec<Line>, LiveError>>()?;
 
         let mut live = LiveSession {
             id: id.to_string(),
@@ -948,20 +954,11 @@ impl Parts {
             handle: handle.clone(),
             log: log.clone(),
         };
-        let money = SessionConfig {
-            starting_cash: saved.starting_balance,
-            slippage_bps: config.slippage_bps,
-            fees: config.fees,
-            max_leverage: config.max_leverage,
-            // shortcut: a quote-currency account, as paper sessions have; add the account
-            // currency to `LiveConfig` when a live session trades a market with quotes.
-            account_currency: AccountCurrency::Quote,
-        };
         let session = Session::with_broker(
             strategy,
             config.instrument.clone(),
             config.timeframe,
-            money,
+            saved.money(),
             Box::new(broker),
         )?;
         Ok(Parts {
@@ -1126,7 +1123,30 @@ impl Broker for LoggedBroker {
     }
 }
 
-fn pairs(funding: &[Funding]) -> Vec<(Millis, f64)> {
+/// The complete lines of the log `bytes`, read from `path`, and the length they take. A last line
+/// without its newline, torn by a crash mid-write, is left out; any other line that does not read
+/// is refused.
+pub(crate) fn read_lines(bytes: &[u8], path: &Path) -> Result<(Vec<Line>, usize), LiveError> {
+    let complete = bytes.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+    let text = std::str::from_utf8(&bytes[..complete]).map_err(|e| LiveError::BadLog {
+        path: path.to_path_buf(),
+        reason: format!("it is not UTF-8: {e}"),
+    })?;
+    let lines = text
+        .lines()
+        .enumerate()
+        .map(|(i, l)| {
+            serde_json::from_str::<Line>(l).map_err(|e| LiveError::BadLog {
+                path: path.to_path_buf(),
+                reason: format!("line {}: {e}", i + 1),
+            })
+        })
+        .collect::<Result<Vec<Line>, LiveError>>()?;
+    Ok((lines, complete))
+}
+
+/// The funding fed with a bar as the engine takes it: each rate at the time it was given.
+pub(crate) fn pairs(funding: &[Funding]) -> Vec<(Millis, f64)> {
     funding.iter().map(|f| (f.time, f.rate)).collect()
 }
 
