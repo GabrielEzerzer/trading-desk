@@ -2082,3 +2082,150 @@ fn a_record_holding_an_order_of_unknown_outcome_as_not_open_is_refused() {
     assert!(handle.go_live().is_err());
     assert_eq!(rig.mock.request_count(CREATE), creates);
 }
+
+/// A live run whose entry of 0.004 carries a stop at 60000, read on bar 1, with `acts` after it.
+fn stopped_entry(acts: Vec<(usize, Act)>) -> Rig {
+    let mut all = vec![(
+        0,
+        Act::SubmitWithStop(market(Side::Buy, 0.004, false), 60000.0),
+    )];
+    all.extend(acts);
+    Rig::new(all)
+}
+
+#[test]
+fn an_entry_without_a_stop_beside_one_with_a_stop_owes_no_stop() {
+    let mut rig = stopped_entry(vec![(0, Act::Submit(market(Side::Buy, 0.004, false)))]);
+    rig.bar();
+    rig.bar();
+    rig.bar();
+    assert_eq!(rig.mock.position(SYMBOL), 0.008);
+    assert_eq!(rig.mock.orders_with_link_id("t-o2")[0].qty, 0.004);
+    assert_eq!(rig.handle.fault(), None);
+}
+
+#[test]
+fn a_stop_that_triggered_fully_owes_no_stop_for_a_later_entry_without_one() {
+    let mut rig = stopped_entry(vec![(2, Act::Submit(market(Side::Buy, 0.004, false)))]);
+    rig.bar();
+    rig.bar();
+    rig.mock.set_price(SYMBOL, 59900.0);
+    assert_eq!(rig.mock.position(SYMBOL), 0.0, "the stop filled");
+    rig.bar();
+    rig.bar();
+    assert_eq!(rig.status(2), OrderStatus::Filled);
+    assert_eq!(rig.mock.position(SYMBOL), 0.004);
+    assert_eq!(rig.handle.fault(), None);
+}
+
+#[test]
+fn a_market_exit_while_the_stop_rests_owes_no_stop_for_a_later_entry_without_one() {
+    let mut rig = stopped_entry(vec![
+        (1, Act::Submit(market(Side::Sell, 0.004, true))),
+        (2, Act::Submit(market(Side::Buy, 0.004, false))),
+    ]);
+    rig.bar();
+    rig.bar();
+    assert_eq!(rig.mock.position(SYMBOL), 0.0, "the exit filled");
+    // The stop triggers with nothing left to reduce.
+    rig.mock.set_price(SYMBOL, 59900.0);
+    assert_eq!(
+        rig.mock.orders_with_link_id("t-o2")[0].status,
+        "Deactivated"
+    );
+    rig.bar();
+    rig.bar();
+    assert_eq!(rig.mock.position(SYMBOL), 0.004);
+    assert!(matches!(rig.status(2), OrderStatus::Cancelled(_)));
+    assert_eq!(rig.handle.fault(), None);
+}
+
+#[test]
+fn a_stop_the_session_cancelled_owes_nothing_while_the_position_is_held() {
+    let mut rig = stopped_entry(vec![(1, Act::Cancel(2))]);
+    rig.bar();
+    rig.bar();
+    assert_eq!(rig.results()[1], "1: cancel true");
+    rig.bar();
+    rig.bar();
+    assert_eq!(rig.mock.position(SYMBOL), 0.004);
+    assert!(matches!(rig.status(2), OrderStatus::Cancelled(_)));
+    assert_eq!(rig.handle.fault(), None);
+}
+
+#[test]
+fn a_stop_missing_from_the_venues_open_orders_faults_though_its_lookup_shows_it_open() {
+    let mut rig = stopped_entry(vec![]);
+    rig.bar();
+    rig.bar();
+    assert_eq!(rig.handle.fault(), None);
+    // On both reads of the bar the open orders come back empty and the stop's own lookup finds
+    // it open, so only the check of the position against the stops resting at the venue sees it.
+    for _ in 0..2 {
+        rig.mock.inject(REALTIME, Fault::Answer(0));
+        rig.mock.inject(REALTIME, Fault::Hang(Duration::ZERO));
+    }
+    let sends = rig.sends();
+    rig.bar();
+    let fault = rig.handle.fault().expect("faulted");
+    assert_eq!(fault.kind, FaultKind::Uncovered, "{fault}");
+    assert!(
+        fault.message.contains("owes a stop for 0.004") && fault.message.contains("not covered"),
+        "{fault}"
+    );
+    assert_eq!(rig.sends(), sends);
+}
+
+#[test]
+fn after_a_restart_a_stop_the_venue_dropped_meanwhile_faults_at_go_live() {
+    let mut rig = stopped_entry(vec![]);
+    let records = run_recorded(&mut rig, 2);
+    assert_eq!(rig.handle.fault(), None);
+    // While the session is down the venue drops the stop with nothing filled.
+    rig.mock.cancel_after_partial_fill("t-o2", 0.0);
+    let sends = rig.sends();
+    let (_session, handle) = replayed(&rig, &records);
+    let fault = handle.go_live().expect_err("faulted");
+    assert_eq!(fault.kind, FaultKind::Uncovered, "{fault}");
+    assert!(
+        fault.message.contains("cover 0") && fault.message.contains("0.004 is not covered"),
+        "{fault}"
+    );
+    assert_eq!(rig.sends(), sends, "nothing sent");
+}
+
+#[test]
+fn after_a_restart_a_stop_that_triggered_meanwhile_owes_nothing_for_an_entry_without_one() {
+    let mut rig = stopped_entry(vec![(0, Act::Submit(market(Side::Buy, 0.004, false)))]);
+    let records = run_recorded(&mut rig, 2);
+    assert_eq!(rig.handle.fault(), None);
+    // While the session is down the stop fills; the entry without a stop stays.
+    rig.mock.set_price(SYMBOL, 59900.0);
+    assert_eq!(rig.mock.position(SYMBOL), 0.004);
+    let (mut session, handle) = replayed(&rig, &records);
+    handle.go_live().unwrap();
+    session.on_bar(rig.candle(2, PRICE), &[]).unwrap();
+    assert_eq!(handle.fault(), None);
+    assert_eq!(session.orders()[1].status, OrderStatus::Filled);
+    assert_eq!(session.portfolio().position(), 0.004);
+}
+
+#[test]
+fn a_record_without_the_quantity_owed_a_stop_or_owing_more_than_its_position_is_refused() {
+    let mut rig = stopped_entry(vec![]);
+    let records = run_recorded(&mut rig, 2);
+    let mut value: serde_json::Value = serde_json::from_str(&records[1]).unwrap();
+    assert_eq!(value["book"]["owed"], serde_json::json!(0.004));
+    let mut old = value.clone();
+    old["book"].as_object_mut().unwrap().remove("owed").unwrap();
+    let error = serde_json::from_str::<BrokerRecord>(&old.to_string()).expect_err("refused");
+    assert!(error.to_string().contains("owed"), "{error}");
+    value["book"]["owed"] = serde_json::json!(0.006);
+    let sends = rig.sends();
+    let (_session, handle) = replayed(&rig, &[records[0].clone(), value.to_string()]);
+    let fault = handle.fault().expect("refused");
+    assert_eq!(fault.kind, FaultKind::ReplayDiverged);
+    assert!(fault.message.contains("owes a stop"), "{fault}");
+    assert!(handle.go_live().is_err());
+    assert_eq!(rig.sends(), sends);
+}

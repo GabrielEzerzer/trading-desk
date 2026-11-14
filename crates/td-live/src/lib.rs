@@ -46,6 +46,12 @@
 //! - **Reconcile.** Every bar the venue's position must equal the fills reported, and the venue's
 //!   open orders must be the ones the session holds, each for the quantity sent and, for a stop,
 //!   at its trigger; the reads are repeated once to allow for an execution landing between them.
+//!   Then the quantity the session owes a stop for, capped at the venue's position, must be
+//!   covered by the session's reduce-only stops resting at the venue, or the broker faults
+//!   ([`FaultKind::Uncovered`]). That quantity grows by what each fill of an entry with an attached
+//!   stop opens, and shrinks by what any fill closes (a stop's own fill, a close at market, a
+//!   strategy's exit) and by what a stop the session cancelled had not filled. Going live after a
+//!   restart ends with the same check.
 //! - **Faults.** A disagreement, an execution the session did not make, or a protective stop that
 //!   cannot be placed or replaced is a [`BrokerFault`]. Once faulted the broker places, cancels and
 //!   amends nothing more, from any path: no flatten, no cancel, no resize. The one exception is a
@@ -56,16 +62,18 @@
 //! - **Records.** A [`BrokerRecord`] names the session prefix, instrument and timeframe it was
 //!   made under; a broker with any of the three different, or one that has already acted live,
 //!   faults when handed it. A record holding a value no live run makes (a number that is not
-//!   finite, a negative quantity, an execution cursor before its floor) is a fault too. The
-//!   replayed session's calls must match the record call for call, and its orders must match the
-//!   record's in full: the replay keeps the session's own orders and takes from the record only
-//!   where each stands at the venue. Going live after a replay sends nothing from the record: an
-//!   order the venue holds is adopted, and one whose outcome was unknown and that the venue does
-//!   not hold is cancelled with a reason; a cancel the replayed session asks for an order the
-//!   venue still holds answers false. The only orders going live can send are reduce-only stops,
-//!   and resizes of them, for fills the venue lists. An order whose outcome going live could not
-//!   settle stays under that rule until the venue settles it: the reads that later find it send
-//!   only a reduce-only stop for a fill the venue lists, never a close at market.
+//!   finite, a negative quantity, an execution cursor before its floor, more owed a stop than the
+//!   position) is a fault too, and a record made before records carried the quantity owed a stop
+//!   does not load. The replayed session's calls must match the record call for call, and its
+//!   orders must match the record's in full: the replay keeps the session's own orders and takes
+//!   from the record only where each stands at the venue. Going live after a replay sends nothing
+//!   from the record: an order the venue holds is adopted, and one whose outcome was unknown and
+//!   that the venue does not hold is cancelled with a reason; a cancel the replayed session asks
+//!   for an order the venue still holds answers false. The only orders going live can send are
+//!   reduce-only stops, and resizes of them, for fills the venue lists. An order whose outcome
+//!   going live could not settle stays under that rule until the venue settles it: the reads that
+//!   later find it send only a reduce-only stop for a fill the venue lists, never a close at
+//!   market.
 //!
 //! The session keeps its own model of liquidation and funding on its portfolio. The broker cannot
 //! stop that model, so a bar on which the session's model would liquidate the position is a fault

@@ -80,6 +80,9 @@ pub enum FaultKind {
     /// A replayed session made calls that differ from the record, went past it, or was handed a
     /// record made for another session or holding values no live run makes.
     ReplayDiverged,
+    /// Part of the position this session owes a stop for has none of the session's reduce-only
+    /// stops resting at the venue to cover it.
+    Uncovered,
 }
 
 impl fmt::Display for FaultKind {
@@ -98,6 +101,7 @@ impl fmt::Display for FaultKind {
             FaultKind::VenueUnreadable => "venue unreadable",
             FaultKind::IdCollision => "id collision",
             FaultKind::ReplayDiverged => "replay diverged",
+            FaultKind::Uncovered => "uncovered position",
         })
     }
 }
@@ -165,6 +169,12 @@ struct Book {
     pending: Vec<BrokerEvent>,
     /// The signed sum of the fills reported.
     tally: f64,
+    /// The quantity this session owes a stop for: each fill of an entry that asked for a stop
+    /// adds what it opens, any fill takes off what it closes (a stop's own fill, a close at
+    /// market, a strategy's exit), and a stop the session cancelled takes off what it had not
+    /// filled. Never more than the tally's size. A record made before this field existed is
+    /// refused when loaded: no released version wrote one.
+    owed: f64,
     /// Server time when the broker was built: earlier executions are not this session's to judge.
     floor: Millis,
     /// The time of the newest execution processed.
@@ -508,6 +518,23 @@ fn stop_order(entry: &Order, qty: f64) -> Option<Order> {
         attached_stop: None,
         status: OrderStatus::Open,
     })
+}
+
+/// The quantity owed a stop after a fill of signed quantity `fill` on signed position
+/// `position`: what the fill closes is no longer owed, and a fill of an entry that asked for a
+/// stop (`stopped`) owes one for what it opens.
+fn owe(owed: f64, position: f64, fill: f64, stopped: bool) -> f64 {
+    let closes = if position * fill < 0.0 {
+        fill.abs().min(position.abs())
+    } else {
+        0.0
+    };
+    let owed = (owed - closes).max(0.0);
+    if stopped {
+        owed + fill.abs() - closes
+    } else {
+        owed
+    }
 }
 
 /// The venue refused a stop because the market is already through its trigger.
@@ -1458,6 +1485,8 @@ impl Core {
         let since = self.book.cursor.saturating_sub(LOOKBACK_MS);
         let executions = self.client.executions_since(&self.instrument, since)?;
         let mut groups: Vec<(OrderId, Vec<Execution>)> = Vec::new();
+        // The position as of each execution, in the venue's order, for the quantity owed a stop.
+        let mut position = self.book.tally;
         for e in executions {
             if self.book.seen.contains_key(&e.exec_id) {
                 continue;
@@ -1533,6 +1562,15 @@ impl Core {
                 );
                 break;
             };
+            let order = &self.book.orders[&id.0].order;
+            let fill = order.request.side.sign() * e.qty;
+            self.book.owed = owe(
+                self.book.owed,
+                position,
+                fill,
+                order.attached_stop.is_some(),
+            );
+            position += fill;
             match groups.iter_mut().find(|(g, _)| *g == id) {
                 Some((_, list)) => list.push(e),
                 None => groups.push((id, vec![e])),
@@ -1648,7 +1686,8 @@ impl Core {
     }
 
     /// Settles the orders the venue no longer lists and compares the venue with what the session
-    /// holds. Returns the first disagreement.
+    /// holds, then checks the quantity it owes a stop for is covered by its stops resting at the
+    /// venue. Returns the first disagreement.
     fn reconcile(
         &mut self,
         open: &[VenueOrder],
@@ -1679,7 +1718,7 @@ impl Core {
                 self.tracked(id).at = At::Done;
                 continue;
             }
-            let (reported, sent, cancel_asked, stop, side, attached, held) = (
+            let (reported, sent, cancel_asked, stop, side, attached, held, announced) = (
                 t.reported,
                 t.sent,
                 t.cancel_asked,
@@ -1687,6 +1726,7 @@ impl Core {
                 t.order.request.side,
                 t.order.attached_stop,
                 t.open,
+                t.announced,
             );
             let Some(found) = self.client.order_by_client_id(&self.instrument, &cid)? else {
                 return Ok(Some((
@@ -1722,6 +1762,11 @@ impl Core {
                         self.book.tally
                     ),
                 )));
+            }
+            // An entry's attached stop the session cancelled is no longer owed for what it did not
+            // fill. Only an announced attached stop is held open, so only one can be cancelled.
+            if stop && cancel_asked && announced > 0.0 {
+                self.book.owed = (self.book.owed - (sent - reported)).max(0.0);
             }
             if reported > 0.0 {
                 // Part filled, the rest closed: the session already holds it filled.
@@ -1767,7 +1812,9 @@ impl Core {
                 events.push(BrokerEvent::Cancelled { id, reason });
             }
         }
-        Ok(self.position_check(position, self.book.tally))
+        Ok(self
+            .position_check(position, self.book.tally)
+            .or_else(|| self.uncovered(open, position, self.book.owed)))
     }
 
     /// How venue order `o`, open under `t`'s id, differs from what the session holds, if it
@@ -1851,6 +1898,48 @@ impl Core {
                 .any(|e| e.order.attached_stop.is_some_and(|s| s.id == id))
     }
 
+    /// The fault when `owed`, the quantity this session owes a stop for, capped at the venue's
+    /// `position`, is not covered by what is left of this session's reduce-only stops in `open`,
+    /// the venue's open orders, on the side that closes it.
+    fn uncovered(
+        &self,
+        open: &[VenueOrder],
+        position: f64,
+        owed: f64,
+    ) -> Option<(FaultKind, String)> {
+        let owed = owed.min(position.abs());
+        if owed <= self.half_lot() {
+            return None;
+        }
+        let closing = if position > 0.0 {
+            Side::Sell
+        } else {
+            Side::Buy
+        };
+        let covered: f64 = open
+            .iter()
+            .filter(|o| {
+                matches!(
+                    ids::parse(&self.prefix, &o.client_id),
+                    Some((Role::Order | Role::Cover, _))
+                ) && o.reduce_only
+                    && o.trigger_price.is_some()
+                    && o.side == closing
+            })
+            .map(|o| (o.qty - o.filled_qty).max(0.0))
+            .fold(0.0, |sum, left| sum + left);
+        (owed - covered > self.half_lot()).then(|| {
+            (
+                FaultKind::Uncovered,
+                format!(
+                    "this session owes a stop for {owed} of the position of {position}, but its \
+                     stops resting at the venue cover {covered}, so {} is not covered",
+                    owed - covered
+                ),
+            )
+        })
+    }
+
     fn position_check(&self, position: f64, expected: f64) -> Option<(FaultKind, String)> {
         ((position - expected).abs() > self.half_lot()).then(|| {
             (
@@ -1885,6 +1974,16 @@ impl Core {
         let book = &record.book;
         if !book.tally.is_finite() {
             return Err("the record's position tally is not a finite number".into());
+        }
+        if !(book.owed.is_finite()
+            && book.owed >= 0.0
+            && book.owed <= book.tally.abs() + self.half_lot())
+        {
+            return Err(
+                "the record owes a stop for a quantity that is negative, not finite or more than \
+                 its position"
+                    .into(),
+            );
         }
         if book.cursor < book.floor {
             return Err("the record's execution cursor is before its floor".into());
@@ -2214,14 +2313,15 @@ impl Core {
         }
     }
 
-    /// The reconcile at the end of a replay: the venue's open orders must be the session's, and
-    /// its position the recorded fills plus this session's executions not yet reported.
+    /// The reconcile at the end of a replay: the venue's open orders must be the session's, its
+    /// position the recorded fills plus this session's executions not yet reported, and the
+    /// quantity the session owes a stop for covered by its stops resting at the venue.
     fn verify(&mut self) -> Result<(), RouteError> {
         let executions = self.client.executions_since(
             &self.instrument,
             self.book.cursor.saturating_sub(LOOKBACK_MS),
         )?;
-        let mut expected = self.book.tally;
+        let (mut expected, mut owed) = (self.book.tally, self.book.owed);
         for e in executions {
             if self.book.seen.contains_key(&e.exec_id) || e.kind != ExecKind::Trade {
                 continue;
@@ -2230,7 +2330,12 @@ impl Core {
                 ids::parse(&self.prefix, &e.client_id)
                 && let Some(t) = self.book.orders.get(&id.0)
             {
-                expected += t.order.request.side.sign() * e.qty;
+                let fill = t.order.request.side.sign() * e.qty;
+                // What these fills closed is no longer owed. An entry's fill read here owes its
+                // stop from the first bar that reads it, once the stop has had its chance to go
+                // out.
+                owed = owe(owed, expected, fill, false);
+                expected += fill;
             }
         }
         let open = self.client.open_orders(&self.instrument)?;
@@ -2238,6 +2343,7 @@ impl Core {
         if let Some((kind, message)) = self
             .unknown_open(&open)
             .or_else(|| self.position_check(position, expected))
+            .or_else(|| self.uncovered(&open, position, owed))
         {
             self.raise(kind, message);
         }
