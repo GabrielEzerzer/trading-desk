@@ -2155,6 +2155,95 @@ fn a_stop_the_session_cancelled_owes_nothing_while_the_position_is_held() {
 }
 
 #[test]
+fn after_a_restart_a_stop_the_session_cancelled_owes_nothing_and_nothing_is_sent() {
+    let mut rig = stopped_entry(vec![(1, Act::Cancel(2))]);
+    let records = run_recorded(&mut rig, 2);
+    assert_eq!(rig.results()[1], "1: cancel true");
+    assert_eq!(rig.handle.fault(), None);
+    let sends = rig.sends();
+    let (mut session, handle) = replayed(&rig, &records);
+    handle.go_live().unwrap();
+    assert_eq!(rig.sends(), sends, "going live sends nothing");
+    session.on_bar(rig.candle(2, PRICE), &[]).unwrap();
+    assert_eq!(handle.fault(), None);
+    assert!(matches!(
+        session.orders()[1].status,
+        OrderStatus::Cancelled(_)
+    ));
+    assert_eq!(session.portfolio().position(), 0.004);
+    assert_eq!(rig.sends(), sends);
+}
+
+#[test]
+fn after_a_restart_a_stop_cancelled_after_a_part_fill_takes_off_only_what_it_did_not_fill() {
+    let mock = venue();
+    let faults = mock.clone();
+    // On bar 1 the first stop fills 0.001 and the venue closes the rest; the session's cancel,
+    // sent after, is acknowledged and finds it cancelled, so the run stops with that fill unread.
+    let part_fill = run(move || {
+        faults.cancel_after_partial_fill("t-o2", 0.001);
+        faults.inject(CANCEL, Fault::Answer(0));
+    });
+    let mut rig = Rig::with(
+        mock,
+        vec![
+            (
+                0,
+                Act::SubmitWithStop(market(Side::Buy, 0.004, false), 60000.0),
+            ),
+            (
+                0,
+                Act::SubmitWithStop(market(Side::Buy, 0.004, false), 60000.0),
+            ),
+            (1, part_fill),
+            (1, Act::Cancel(2)),
+        ],
+    );
+    let records = run_recorded(&mut rig, 2);
+    assert_eq!(rig.results()[3], "1: cancel true", "{:?}", rig.results());
+    assert_eq!(rig.handle.fault(), None);
+    // While the session is down the venue drops the second entry's stop with nothing filled.
+    rig.mock.cancel_after_partial_fill("t-o4", 0.0);
+    let sends = rig.sends();
+    let (_session, handle) = replayed(&rig, &records);
+    let fault = handle.go_live().expect_err("faulted");
+    // The cancelled stop takes off the 0.003 it did not fill, and no more, so the second entry's
+    // 0.004 is still owed.
+    assert_eq!(fault.kind, FaultKind::Uncovered, "{fault}");
+    assert!(
+        fault.message.contains("owes a stop for 0.004 of"),
+        "{fault}"
+    );
+    assert_eq!(rig.sends(), sends, "nothing sent");
+}
+
+#[test]
+fn a_stop_the_venue_lists_twice_faults_and_does_not_cover_a_fill_twice() {
+    let mut rig = Rig::new(vec![
+        (
+            0,
+            Act::SubmitWithStop(market(Side::Buy, 0.004, false), 60000.0),
+        ),
+        (
+            0,
+            Act::SubmitWithStop(market(Side::Buy, 0.004, false), 60000.0),
+        ),
+    ]);
+    let records = run_recorded(&mut rig, 2);
+    assert_eq!(rig.handle.fault(), None);
+    // While the session is down the venue drops the second entry's stop, and its open orders list
+    // the first entry's stop twice, which would cover the whole position.
+    rig.mock.cancel_after_partial_fill("t-o4", 0.0);
+    rig.mock.list_twice("t-o2");
+    let sends = rig.sends();
+    let (_session, handle) = replayed(&rig, &records);
+    let fault = handle.go_live().expect_err("faulted");
+    assert_eq!(fault.kind, FaultKind::UnknownOpenOrder, "{fault}");
+    assert!(fault.message.contains("'t-o2' twice"), "{fault}");
+    assert_eq!(rig.sends(), sends, "nothing sent");
+}
+
+#[test]
 fn a_stop_missing_from_the_venues_open_orders_faults_though_its_lookup_shows_it_open() {
     let mut rig = stopped_entry(vec![]);
     rig.bar();
@@ -2276,9 +2365,32 @@ fn after_a_restart_a_stop_of_unknown_outcome_whose_cover_is_refused_closes_nothi
 }
 
 #[test]
-fn going_live_asks_about_a_stop_of_unknown_outcome_so_the_first_fill_finds_it_settled() {
-    // Applied before the restart, it is kept; never applied, the fill's stop goes out under the
-    // cover id with no fault, as for a stop the venue refused.
+fn after_a_restart_a_stop_not_found_at_going_live_whose_cover_is_refused_closes_nothing() {
+    let (rig, records) = unsettled_stop_before_restart(Fault::DropBeforeApply);
+    let (mut session, handle) = replayed(&rig, &records);
+    // Going live finds no stop, so it stays unresolved.
+    handle.go_live().unwrap();
+    // The first live bar reads the entry's fill; the venue still does not show the stop and
+    // refuses its cover.
+    rig.mock.inject(CREATE, Fault::Answer(10001));
+    session.on_bar(rig.candle(1, PRICE), &[]).unwrap();
+    let fault = handle.fault().expect("faulted");
+    assert_eq!(fault.kind, FaultKind::ProtectionFailed, "{fault}");
+    assert!(
+        fault.message.contains("t-s2")
+            && fault.message.contains("no close at market")
+            && fault.message.contains("the fill is not covered"),
+        "{fault}"
+    );
+    assert!(rig.mock.orders_with_link_id("t-c2").is_empty(), "no close");
+    assert_eq!(rig.mock.position(SYMBOL), 0.004);
+}
+
+#[test]
+fn going_live_keeps_a_stop_of_unknown_outcome_it_finds_and_leaves_one_it_does_not_to_the_fill() {
+    // Applied before the restart, it is kept and nothing faults. Never applied, going live does
+    // not take its absence for a refusal: the first fill asks again, covers the fill under the
+    // cover id and faults, as a live session does.
     for (lost, kept) in [
         (Fault::DropAfterApply, true),
         (Fault::DropBeforeApply, false),
@@ -2287,7 +2399,18 @@ fn going_live_asks_about_a_stop_of_unknown_outcome_so_the_first_fill_finds_it_se
         let (mut session, handle) = replayed(&rig, &records);
         handle.go_live().unwrap();
         session.on_bar(rig.candle(1, PRICE), &[]).unwrap();
-        assert_eq!(handle.fault(), None, "kept {kept}");
+        if kept {
+            assert_eq!(handle.fault(), None);
+        } else {
+            let fault = handle.fault().expect("faulted");
+            assert_eq!(fault.kind, FaultKind::ProtectionFailed, "{fault}");
+            assert!(
+                fault.message.contains("covered by t-s2")
+                    && fault.message.contains("t-o2 may also rest"),
+                "{fault}"
+            );
+        }
+        assert!(rig.mock.orders_with_link_id("t-c2").is_empty(), "no close");
         let (resting, other) = if kept {
             ("t-o2", "t-s2")
         } else {

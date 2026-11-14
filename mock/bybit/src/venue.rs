@@ -141,6 +141,8 @@ pub(crate) struct State {
     /// The order link id whose market order fills only the quantity given and closes the rest,
     /// as the venue does to an immediate-or-cancel order it cannot fill in full.
     pub cap_ioc: Option<(String, f64)>,
+    /// The order link id the real-time list of open orders shows twice.
+    pub listed_twice: Option<String>,
 }
 
 impl State {
@@ -168,6 +170,7 @@ impl State {
             next: 1,
             cap_next_fill: None,
             cap_ioc: None,
+            listed_twice: None,
         }
     }
 
@@ -932,6 +935,14 @@ impl State {
             })
             .collect();
         list.sort_by_key(|o| std::cmp::Reverse(o.created));
+        if id.is_empty() && link.is_empty() {
+            let twice = self.listed_twice.as_deref();
+            let doubled = list
+                .iter()
+                .copied()
+                .find(|o| Some(o.link_id.as_str()) == twice);
+            list.extend(doubled);
+        }
         let items: Vec<Value> = list.iter().map(|o| self.order_json(o, false)).collect();
         page(items, p, 20, 50)
     }
