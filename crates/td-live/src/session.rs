@@ -9,8 +9,9 @@
 //!   written at creation and by the guard whenever it changes. A session whose stop has fired is
 //!   never opened to trade again.
 //! - `events.jsonl`, one [`Line`] per bar fed: the bar, the funding charged with it, whether it was
-//!   a warm-up bar, and for a live bar the broker's record ([`VenueHandle::take_record`]). A live
-//!   bar's line is synced to disk before the next bar is fed.
+//!   a warm-up bar, the reference instruments' bars it was fed with (a session with references),
+//!   and for a live bar the broker's record ([`VenueHandle::take_record`]). A live bar's line is
+//!   synced to disk before the next bar is fed.
 //! - `status.json`, rewritten after each live bar and on every change of state ([`LiveStatus`]).
 //! - `lock`, held locked by the process running the session, so two cannot run it at once.
 //! - `faulted`, written once when the broker faults: the fault and the venue's time. A session
@@ -51,7 +52,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use td_core::{AccountCurrency, Candle, FeeSchedule, Instrument, Millis, OrderId, Timeframe};
+use td_core::{
+    AccountCurrency, Candle, FeeSchedule, Instrument, InstrumentId, Millis, OrderId, Timeframe,
+};
 use td_engine::{
     Broker, BrokerEvent, ENGINE_REVISION, EngineError, Order, Params, Portfolio, Session,
     SessionConfig, SessionLink, StopError, StopRules, StopState, Strategy,
@@ -117,6 +120,12 @@ pub struct LiveConfig {
     /// Nothing changes them afterwards: they are written once in `config.json`, and the stop
     /// state is restored only against them.
     pub stops: StopRules,
+    /// Instruments on the same venue whose closed bars the strategy reads beside its own
+    /// ([`td_engine::Context::reference`]), in this order, as a backtest's `references` names
+    /// them. Fixed for the session's life. Left out of `config.json` when there are none, which a
+    /// config saved before sessions took references also reads as.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub references: Vec<InstrumentId>,
 }
 
 /// What `config.json` holds.
@@ -174,6 +183,11 @@ pub(crate) struct Line {
     /// Fed with `Session::warm_up`: no trading, no broker record.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(crate) warm_up: bool,
+    /// The slot of each of the session's reference instruments fed with the bar, in the order the
+    /// config names them: that instrument's bar opening at the bar's open time, or `null` where
+    /// the strategy was shown none. Left out for a session without references.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) references: Vec<Option<Candle>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) record: Option<BrokerRecord>,
     /// Written before the bar's first send or cancel; the bar's own line follows it.
@@ -401,8 +415,9 @@ pub struct LiveSession {
     next_bar: Option<Millis>,
     /// The funding charged on live bars.
     funding: Vec<Funding>,
-    /// A `sending` line the log ends with: its bar's line is written after `go_live`.
-    pending: Option<(Candle, Vec<Funding>)>,
+    /// A `sending` line the log ends with, without its record: its bar's line is written after
+    /// `go_live`.
+    pending: Option<Line>,
     /// The stop state as created or restored; the stop guard takes it over before the run.
     pub(crate) stops: StopRecord,
     /// The broker's send gate: the pre-trade cap, and the stop that ends all sending.
@@ -413,7 +428,8 @@ pub struct LiveSession {
 
 impl LiveSession {
     /// Makes a new session in `<data_dir>/live/<id>/`. Nothing is written or sent when the id is
-    /// taken, the stop rules or the strategy or settings do not check, the venue cannot be read,
+    /// taken, the stop rules or the strategy or settings do not check, a reference instrument is
+    /// refused ([`td_engine::check_reference_ids`]), the venue cannot be read,
     /// or the account holds a position or open orders on the instrument. The starting balance is
     /// the account's equity read here, the stop state starts from it, and the client-id prefix is
     /// made from the creation time. `link` is saved as it is. When writing the folder fails part
@@ -658,7 +674,7 @@ impl LiveSession {
             let funding = pairs(&line.funding);
             if line.warm_up {
                 self.session
-                    .warm_up(line.bar, &funding)
+                    .feed(line.bar, None, &funding, &line.references, true)
                     .map_err(|e| (i, e.to_string()))?;
                 self.next_bar =
                     Some(line.bar.open_time + self.saved.config.timeframe.duration_ms());
@@ -682,10 +698,19 @@ impl LiveSession {
                     Some(_) => {
                         return Err((i + 1, "a sending line is not followed by its bar".into()));
                     }
-                    None => self.pending = Some((line.bar, line.funding.clone())),
+                    None => {
+                        self.pending = Some(Line {
+                            record: None,
+                            sending: false,
+                            ..line.clone()
+                        });
+                    }
                 }
             }
-            match self.session.on_bar(line.bar, &funding) {
+            match self
+                .session
+                .feed(line.bar, None, &funding, &line.references, false)
+            {
                 // The bar was fed in full, as when it was logged.
                 Ok(()) | Err(EngineError::StrategyFailed(_)) => {}
                 Err(e) => return Err((i, e.to_string())),
@@ -702,8 +727,9 @@ impl LiveSession {
         Ok(())
     }
 
-    /// Feeds one bar with its funding. A warm-up bar goes through `Session::warm_up` and its line
-    /// is not synced. A live bar's line, with the broker's record, is synced before this returns.
+    /// Feeds one bar with its funding and its reference instruments' slots (`Session::feed`). A
+    /// warm-up bar is fed as `Session::warm_up` feeds it and its line is not synced. A live bar's
+    /// line, with the broker's record, is synced before this returns.
     /// After `EngineError::StrategyFailed` the bar was fed in full and is logged, and the error is
     /// returned so the run halts. On a log error the run must halt too: an order the strategy
     /// made after the log broke was not sent, and is cancelled in the engine with the reason.
@@ -711,25 +737,38 @@ impl LiveSession {
         &mut self,
         bar: Candle,
         funding: Vec<Funding>,
+        references: Vec<Option<Candle>>,
         warm_up: bool,
     ) -> Result<(), LiveError> {
         lock_log(&self.log).check()?;
         let engine_funding = pairs(&funding);
         if warm_up {
-            self.session.warm_up(bar, &engine_funding)?;
+            self.session
+                .feed(bar, None, &engine_funding, &references, true)?;
             self.next_bar = Some(bar.open_time + self.saved.config.timeframe.duration_ms());
             let line = Line {
                 bar,
                 funding,
                 warm_up: true,
+                references,
                 record: None,
                 sending: false,
             };
             return lock_log(&self.log).append(&line, false);
         }
         self.gate.new_bar();
-        lock_log(&self.log).armed = Some((bar, funding.clone()));
-        let fed = self.session.on_bar(bar, &engine_funding);
+        let mut line = Line {
+            bar,
+            funding,
+            warm_up: false,
+            references,
+            record: None,
+            sending: false,
+        };
+        lock_log(&self.log).armed = Some(line.clone());
+        let fed = self
+            .session
+            .feed(bar, None, &engine_funding, &line.references, false);
         let kept_back = {
             let mut log = lock_log(&self.log);
             log.armed = None;
@@ -748,16 +787,10 @@ impl LiveSession {
         }
         // A sending line that could not be written was cut; this line alone would not replay.
         log.check()?;
-        let line = Line {
-            bar,
-            funding: funding.clone(),
-            warm_up: false,
-            record: Some(self.handle.take_record()),
-            sending: false,
-        };
+        line.record = Some(self.handle.take_record());
         log.append(&line, true)?;
         drop(log);
-        self.mark_live(&bar, &funding);
+        self.mark_live(&bar, &line.funding);
         Ok(fed?)
     }
 
@@ -775,14 +808,8 @@ impl LiveSession {
     pub(crate) fn go_live(&mut self) -> Result<(), LiveError> {
         let result = self.handle.go_live();
         let mut logged = Ok(());
-        if let Some((bar, funding)) = self.pending.take() {
-            let line = Line {
-                bar,
-                funding,
-                warm_up: false,
-                record: Some(self.handle.take_record()),
-                sending: false,
-            };
+        if let Some(mut line) = self.pending.take() {
+            line.record = Some(self.handle.take_record());
             logged = lock_log(&self.log).append(&line, true);
             self.status.open_orders = self.session.open_orders().to_vec();
         }
@@ -954,13 +981,14 @@ impl Parts {
             handle: handle.clone(),
             log: log.clone(),
         };
-        let session = Session::with_broker(
+        let mut session = Session::with_broker(
             strategy,
             config.instrument.clone(),
             config.timeframe,
             saved.money(),
             Box::new(broker),
         )?;
+        session.name_references(config.references.clone())?;
         Ok(Parts {
             session,
             handle,
@@ -975,8 +1003,9 @@ struct LogFile {
     path: PathBuf,
     len: u64,
     broken: Option<String>,
-    /// The live bar being fed, until its first send or cancel writes the `sending` line.
-    armed: Option<(Candle, Vec<Funding>)>,
+    /// The line of the live bar being fed, without its record, until its first send or cancel
+    /// writes it as the `sending` line.
+    armed: Option<Line>,
     /// Orders the broker kept back because the log broke; [`LiveSession::feed`] cancels them.
     refused: Vec<OrderId>,
 }
@@ -1074,16 +1103,11 @@ impl LoggedBroker {
         if log.broken.is_some() {
             return false;
         }
-        let Some((bar, funding)) = log.armed.take() else {
+        let Some(mut line) = log.armed.take() else {
             return true;
         };
-        let line = Line {
-            bar,
-            funding,
-            warm_up: false,
-            record: Some(self.handle.take_record()),
-            sending: true,
-        };
+        line.record = Some(self.handle.take_record());
+        line.sending = true;
         log.append(&line, true).is_ok()
     }
 }
@@ -1467,6 +1491,7 @@ mod tests {
                 open_notional_cap: 1e12,
                 rollover: td_engine::DayRollover::default(),
             },
+            references: Vec::new(),
         }
     }
 
@@ -1508,12 +1533,13 @@ mod tests {
         )
         .unwrap();
         let start = Timeframe::H1.floor(mock.now()) - HOUR;
-        live.feed(flat(start), Vec::new(), false).expect("bar 0");
+        live.feed(flat(start), Vec::new(), Vec::new(), false)
+            .expect("bar 0");
         let lines = fs::read_to_string(live.dir().join(EVENTS_FILE)).unwrap();
 
         break_log(&live);
         let error = live
-            .feed(flat(start + HOUR), Vec::new(), false)
+            .feed(flat(start + HOUR), Vec::new(), Vec::new(), false)
             .unwrap_err();
         assert!(matches!(error, LiveError::LogFailed(_)), "{error}");
         assert_eq!(mock.request_count(CREATE), 0, "nothing reached the venue");
@@ -1543,7 +1569,8 @@ mod tests {
         )
         .unwrap();
         let start = Timeframe::H1.floor(mock.now()) - HOUR;
-        live.feed(flat(start), Vec::new(), false).expect("bar 0");
+        live.feed(flat(start), Vec::new(), Vec::new(), false)
+            .expect("bar 0");
         assert_eq!(mock.request_count(CREATE), 1);
         let path = live.dir().join(EVENTS_FILE);
         drop(live);
