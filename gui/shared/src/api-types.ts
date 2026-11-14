@@ -1308,9 +1308,10 @@ breach_horizon_days: number,
  * worst-daily-loss lines judge each fall in money as a share of the starting cash, and the
  * simulated attempts add each day's profit and loss as a share of the starting cash instead
  * of compounding a return on the balance, both read on each walk-forward test window's own
- * money changes. `false`, the default, reads every fall and every day as a share of the
- * balance it starts from, which is exact for a strategy whose size grows with its balance.
- * `false` is left out of JSON.
+ * money changes. The evidence layer's out-of-sample return reads the same added curve, its
+ * last value over the starting cash less one. `false`, the default, reads every fall and
+ * every day as a share of the balance it starts from, which is exact for a strategy whose
+ * size grows with its balance. `false` is left out of JSON.
  */
 sizes_from_starting_cash?: boolean, };
 
@@ -1607,7 +1608,9 @@ prefix_differences: number | null, };
  */
 export type EvidenceInputs = { 
 /**
- * R1: total return of the stitched out-of-sample curve.
+ * R1: total return of the stitched out-of-sample curve. For a `prop_firm` rule with
+ * `sizes_from_starting_cash`, of the curve that adds each test window's own money changes
+ * instead, its last value over the starting cash less one.
  */
 oos_return: number | null, 
 /**

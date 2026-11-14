@@ -720,10 +720,34 @@ pub fn run_battery_with_references(
             // changes, added from window to window, and its lines on the starting-cash reading;
             // otherwise on the stitched curve, and its lines on each fall's own start.
             let per_cash = limits.sizes_from_starting_cash.then_some(cash);
+            // shortcut: with `sizes_from_starting_cash` the evidence layer's out-of-sample return
+            // reads this curve, but these figures still read the compounding curve. Each judged
+            // one's pass can differ for a fixed-size strategy whose window returns are large
+            // against their sum. The return at higher costs compounds its windows: windows of
+            // +9.9% and -9.6% read -0.65% where this curve reads +0.3%, and for a profitable
+            // strategy it can read above the return it stresses (windows of +10% each read +20%
+            // here, and +9.8% each at higher costs compound to +20.56%). The start offsets'
+            // returns are their own walk-forwards' compounded ones, so their sign can differ from
+            // this curve's and fail the same-sign count. Each plateau direction's stitched return
+            // and objective compound, and so does R1's objective they are judged against. The
+            // lowest equity line reads the stitched lows, above zero after two windows of -60%
+            // where this curve is below it, a test that already fails the return. The Sharpe
+            // warning reads the stitched days, whose returns differ from this curve's by each
+            // window's own level, so only a figure near its limit can move. Shown but not judged
+            // by this kind: the daily bootstrap, likewise, and the trade bootstrap and breakdown,
+            // whose stitched trades carry the curve's level. The profitable windows, the trade,
+            // day and window counts, the luck test and the peak leverage read each window's own
+            // run, the same on either curve. Read the judged figures on this curve if a rule sized
+            // from the starting cash needs them to agree.
             let fixed_curve = per_cash.map(|_| {
                 let (equity, ranges) = tester::stitch_fixed_size(cash, &wf.windows);
                 (EquitySeries::new(cash, &equity, plan.timeframe), ranges)
             });
+            // The return the evidence layer judges is this account's too: the curve's last value
+            // over the starting cash, less one.
+            if let Some((fixed, _)) = &fixed_curve {
+                evidence.oos_return = metrics::total_return(&fixed.values);
+            }
             let (series, ranges) = match &fixed_curve {
                 Some((series, ranges)) => (series, &ranges[..]),
                 None => (&series, &wf.equity_extremes[..]),
@@ -3571,6 +3595,22 @@ mod tests {
             assert!(drawdown_warnings(&on).is_empty(), "{drawdown:?}");
             assert!(daily_loss_warnings(&on).is_empty(), "{drawdown:?}");
 
+            // The out-of-sample return the evidence layer judges is the windows' own money,
+            // added, over the starting cash; without the field, the stitched curve's, as before.
+            let fixed_return = metrics::total_return(&series.values);
+            assert_ne!(fixed_return, wf.metrics.total_return, "{drawdown:?}");
+            assert_eq!(on.evidence.oos_return, fixed_return, "{drawdown:?}");
+            let oos_line = |r: &BatteryResult| {
+                let lines = r.verdict.criteria.iter();
+                lines
+                    .filter(|l| l.layer == crate::Layer::Evidence && l.id == "oos_return")
+                    .map(|l| l.value)
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(oos_line(&on), [fixed_return]);
+            assert_eq!(off.evidence.oos_return, wf.metrics.total_return);
+            assert_eq!(oos_line(&off), [wf.metrics.total_return]);
+
             // The odds walk each day's money change, and its low, over the starting cash, added.
             let days = risk::daily_pnl(&series, None, utc);
             let daily: Vec<f64> = days.iter().map(|d| d.pnl() / cash).collect();
@@ -3629,6 +3669,64 @@ mod tests {
             assert!(attempt.full.payouts_per_funded.is_some(), "{attempt:?}");
             assert_eq!(on.prop_firm_attempt, Some(attempt), "{drawdown:?}");
         }
+    }
+
+    /// A rule sized from the starting cash judges the return of the account that trades the
+    /// tested size: two windows that each start at 10,000 and end at 11,000 and at 9,050 leave it
+    /// at 10,050, up 0.5%, where the compounding curve ends at 11,000 x 0.905 = 9,955, down
+    /// 0.45%, and fails the out-of-sample return line.
+    #[test]
+    fn the_fixed_size_accounts_return_can_pass_where_the_compounding_curve_fails() {
+        let config = test_config();
+        let bars: Vec<Candle> = (0..20)
+            .map(|i| Candle {
+                open_time: i * HOUR,
+                open: 100.0,
+                high: 100.1,
+                low: 99.9,
+                close: 100.0,
+                volume: 1.0,
+                quote_volume: 100.0,
+            })
+            .collect();
+        let template = run(&config, &bars, &[], &[]).unwrap();
+        let windows = [
+            window(&template, 11_000.0, Vec::new()),
+            window(&template, 9_050.0, Vec::new()),
+        ];
+        let cash = config.starting_cash;
+        // The battery's reading with the field: the windows added, last value over the cash.
+        let (equity, _) = tester::stitch_fixed_size(cash, &windows);
+        assert_eq!(equity.last().unwrap().equity, 10_050.0);
+        let fixed =
+            metrics::total_return(&EquitySeries::new(cash, &equity, config.timeframe).values)
+                .unwrap();
+        assert_eq!(fixed, 10_050.0 / 10_000.0 - 1.0);
+        assert!(fixed > 0.0);
+        // The compounding curve the stitched metrics read.
+        let segments: Vec<&[EquityPoint]> = windows
+            .iter()
+            .map(|w| &w.out_of_sample.equity[..])
+            .collect();
+        let stitched = tester::stitch(cash, &segments);
+        let compounded =
+            metrics::total_return(&EquitySeries::new(cash, &stitched, config.timeframe).values)
+                .unwrap();
+        assert!((compounded - (-0.0045)).abs() < 1e-12, "{compounded}");
+        // The return line passes on the first and fails on the second.
+        let outcome = |oos_return| {
+            let inputs = EvidenceInputs {
+                oos_return: Some(oos_return),
+                ..EvidenceInputs::default()
+            };
+            evaluate_evidence(&crate::EvidenceSettings::default(), &inputs)
+                .into_iter()
+                .find(|l| l.id == "oos_return")
+                .unwrap()
+                .outcome
+        };
+        assert_eq!(outcome(fixed), Outcome::Pass);
+        assert_eq!(outcome(compounded), Outcome::Fail);
     }
 
     /// The verdict's warnings that start with `text`.
