@@ -11,7 +11,7 @@ use crate::{
     BacktestSettings, Context, Direction, DrawdownMode, EngineError, EvidenceSettings, FirmLimits,
     Metric, Objective, ParamAxis, ParamKind, ParamSpace, ParamSpec, ParamValue, Params, Period,
     PropFirmLimits, Strategy, StrategyEntry, SweepPlan, TestPlan, VerdictRule, WalkForwardPlan,
-    date,
+    WindowMode, date,
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -249,6 +249,7 @@ fn plan() -> TestPlan {
         walk_forward: WalkForwardPlan {
             train_days: 360,
             test_days: 90,
+            mode: WindowMode::Rolling,
         },
         out_of_sample: None,
         evidence: EvidenceSettings::default(),

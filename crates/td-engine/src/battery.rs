@@ -8,8 +8,9 @@
 //!    first half of the period alone and compares the orders decided there with the full run's.
 //!    If any of them fails, the verdict is `invalid` and nothing else runs.
 //! 2. **The sweep** over the full period, reported only.
-//! 3. **R1**, the rolling walk-forward, stitched: the out-of-sample curve every later line is
-//!    judged on. Then I2 and I3 again on each parameter set the walk-forward chose, the plan's
+//! 3. **R1**, the walk-forward, stitched, on the plan's rolling or anchored windows: the
+//!    out-of-sample curve every later line is judged on. Then I2 and I3 again on each parameter
+//!    set the walk-forward chose, the plan's
 //!    backtest with those parameters over the same period, since the verdict rests on them: a
 //!    plan whose fixed parameters place no orders passes I3 on its own backtest vacuously. Each
 //!    line keeps the worst result over every set checked, and a failure there makes the verdict
@@ -506,7 +507,7 @@ pub fn run_battery_with_references(
     )?;
     meter.base += per_sweep;
 
-    // 3. R1: the rolling walk-forward, stitched.
+    // 3. R1: the walk-forward, stitched.
     let (wf, wf_error) = if windows == 0 {
         let error = match wf_spec.windows.windows(traded.len()) {
             Err(e) => e.to_string(),
@@ -2533,6 +2534,7 @@ mod tests {
         plan.walk_forward = crate::WalkForwardPlan {
             train_days: 60,
             test_days: 45,
+            mode: crate::WindowMode::Rolling,
         };
         plan.out_of_sample = None;
         plan.sweep.axes = axes;

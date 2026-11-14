@@ -19,6 +19,7 @@ use td_core::{
 };
 
 use crate::metrics::DAY_MS;
+use crate::tester::refuse_short_first_train;
 use crate::{
     BacktestConfig, MAX_RUNS, Objective, OosSpec, ParamAxis, Params, Split, SweepMode, SweepSpec,
     WalkForwardSpec, WindowMode, WindowSpec, default_slippage_bps,
@@ -148,16 +149,24 @@ pub struct SweepPlan {
     pub min_trades: usize,
 }
 
-/// Rolling walk-forward windows, in days of bars: a day is 24 hours of bars of the plan's
-/// timeframe, so on an FX pair, closed at weekends, a window spans more calendar days. Each test
-/// segment starts where the previous one ended, so the stitched out-of-sample curve has no holes.
-/// Both lengths must be whole bars of the timeframe.
+/// Walk-forward windows, in days of bars: a day is 24 hours of bars of the plan's timeframe, so on
+/// an FX pair, closed at weekends, a window spans more calendar days. Each test segment starts
+/// where the previous one ended, so the stitched out-of-sample curve has no holes. Both lengths
+/// must be whole bars of the timeframe.
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WalkForwardPlan {
+    /// With rolling windows, the length of every train window. With anchored windows, the length
+    /// of the first one: every train window starts at the period's first bar and grows by one test
+    /// window per window, and the first also takes the bars left over before the first test
+    /// window, fewer than a test window.
     pub train_days: u32,
     pub test_days: u32,
+    /// Rolling (the default) or anchored train windows ([`WindowMode`]). Left out of JSON when it
+    /// is rolling, so a plan saved before it existed reads as rolling.
+    #[serde(default, skip_serializing_if = "WindowMode::is_rolling")]
+    pub mode: WindowMode,
 }
 
 /// The common evidence layer (#35, R2 to R6). Every field is a number: there is no way to switch a
@@ -326,7 +335,7 @@ impl WalkForwardPlan {
             train_bars: bars(self.train_days),
             test_bars: test,
             step_bars: test,
-            mode: WindowMode::Rolling,
+            mode: self.mode,
         }
     }
 }
@@ -517,6 +526,18 @@ impl TestPlan {
                     min.windows, min.days
                 ));
             }
+            // The tester checks an anchored first train window at its longest: `train_days` and
+            // the bars left over before the first test window. A start-offset run ends earlier, so
+            // it has fewer bars left over, down to none. `train_days` alone is the shortest the
+            // first train window gets in any run of the battery, so it has to be long enough.
+            if ws.mode == WindowMode::Anchored {
+                let shortest = ws.train_bars;
+                let window = format!(
+                    "on {id} the first train window, {shortest} {tf} bars at its shortest,"
+                );
+                refuse_short_first_train(&wf, shortest, &window)
+                    .map_err(|e| PlanError(e.to_string()))?;
+            }
         }
         Ok(())
     }
@@ -671,6 +692,90 @@ mod tests {
             plan.oos_spec("sma_cross", inst).unwrap().split,
             Split::Fraction(0.7)
         );
+    }
+
+    /// A plan that does not set the window mode is rolling and is written as plans were before
+    /// they had one, with no `mode` key, so its saved JSON, and every comparison of plans made on
+    /// it, is unchanged. A plan with anchored windows carries the key, compares unequal to the
+    /// rolling plan, and lays its train windows from the first bar.
+    #[test]
+    fn a_plan_without_a_window_mode_is_rolling_and_written_as_before() {
+        let plan = example_plan();
+        assert_eq!(plan.walk_forward.mode, WindowMode::Rolling);
+        let json = serde_json::to_value(&plan).unwrap();
+        assert_eq!(
+            json["walk_forward"],
+            serde_json::json!({ "train_days": 180, "test_days": 60 })
+        );
+        assert_eq!(
+            serde_json::from_value::<TestPlan>(json.clone()).unwrap(),
+            plan
+        );
+        let mut named = json.clone();
+        named["walk_forward"]["mode"] = serde_json::json!("rolling");
+        assert_eq!(serde_json::from_value::<TestPlan>(named).unwrap(), plan);
+
+        let mut anchored = plan.clone();
+        anchored.walk_forward.mode = WindowMode::Anchored;
+        assert_eq!(anchored.validate("sma_cross"), Ok(()));
+        let anchored_json = serde_json::to_value(&anchored).unwrap();
+        assert_eq!(
+            anchored_json["walk_forward"],
+            serde_json::json!({ "train_days": 180, "test_days": 60, "mode": "anchored" })
+        );
+        assert_ne!(anchored_json, json);
+        assert_eq!(
+            serde_json::from_value::<TestPlan>(anchored_json).unwrap(),
+            anchored
+        );
+        let mut unknown = json;
+        unknown["walk_forward"]["mode"] = serde_json::json!("expanding");
+        assert!(serde_json::from_value::<TestPlan>(unknown).is_err());
+
+        // The same test windows; the anchored train windows start at the first bar and grow.
+        let bars = 731 * 24;
+        let on = anchored.walk_forward.window_spec(Timeframe::H1);
+        let off = plan.walk_forward.window_spec(Timeframe::H1);
+        assert_eq!(
+            on,
+            WindowSpec {
+                mode: WindowMode::Anchored,
+                ..off
+            }
+        );
+        let (on, off) = (on.windows(bars).unwrap(), off.windows(bars).unwrap());
+        assert_eq!(on.len(), off.len());
+        for (a, r) in on.iter().zip(&off) {
+            assert_eq!(a.test, r.test);
+            assert_eq!(a.train, 0..r.train.end);
+            assert_eq!(r.train.len(), 180 * 24);
+        }
+    }
+
+    /// The tester checks an anchored first train window at its longest, up to a test window less
+    /// one bar past `train_days`, since it cannot know the bars left over before the first test
+    /// window. A start-offset run of the battery ends earlier and has fewer bars left over, so a
+    /// plan checks the first train window at its shortest, `train_days` alone: 20 days is too
+    /// short for a Sharpe objective with nothing left over and with 10 days left over, which a
+    /// start-offset run would cut into; 30 days is not.
+    #[test]
+    fn an_anchored_first_train_window_is_checked_at_its_shortest() {
+        let mut plan = example_plan();
+        plan.walk_forward.train_days = 20;
+        plan.period.to = plan.period.from + (20 + 4 * 60) * DAY_MS;
+        let err = plan.validate("sma_cross").unwrap_err();
+        assert!(err.0.contains("a train window of 480"), "{err}");
+        plan.walk_forward.mode = WindowMode::Anchored;
+        let first = format!("on {} the first train window, 480 ", plan.instruments[0]);
+        for left_over in [0, 10] {
+            plan.period.to = plan.period.from + (20 + 4 * 60 + left_over) * DAY_MS;
+            let err = plan.validate("sma_cross").unwrap_err();
+            assert!(err.0.contains(&first), "{left_over}: {err}");
+            assert!(err.0.contains("at its shortest"), "{left_over}: {err}");
+            assert!(err.0.contains("Sharpe"), "{left_over}: {err}");
+        }
+        plan.walk_forward.train_days = 30;
+        assert_eq!(plan.validate("sma_cross"), Ok(()));
     }
 
     /// An instrument the plan sets no slippage for takes the backtest config's default; one it

@@ -19,7 +19,7 @@ use td_engine::{
     EvidenceSettings, FirmLimits, HighRiskLimits, Layer, MAX_RUNS, Metric, Objective, Outcome,
     ParamAxis, ParamSpace, ParamValue, Params, Period, PortfolioBenchmark, PortfolioLimits,
     PropFirmLimits, SlippageOverride, SweepPlan, TestPlan, TesterError, VerdictRule, VerdictState,
-    WalkForwardPlan, metrics, risk, run_battery,
+    WalkForwardPlan, WindowMode, metrics, risk, run_battery,
 };
 
 const HOUR: Millis = 3_600_000;
@@ -157,6 +157,7 @@ fn plan(days: i64) -> TestPlan {
         walk_forward: WalkForwardPlan {
             train_days: 60,
             test_days: 45,
+            mode: WindowMode::Rolling,
         },
         out_of_sample: None,
         evidence,
@@ -390,6 +391,59 @@ fn a_planted_edge_reaches_trade_with_every_input_from_the_runs() {
     }
     assert_eq!(r.integrity.dropped_buckets, 0);
     assert_eq!(r.integrity.open_buckets, bar_count(DAYS));
+}
+
+/// A plan that asks for anchored windows walks forward on them, in a walk-forward built from the
+/// plan and in the battery: every train window starts at the period's first bar and grows by a
+/// test window, and the test windows are the rolling plan's.
+#[test]
+fn a_plan_with_anchored_windows_trains_every_window_from_the_first_bar() {
+    let bars = edge_bars(DAYS);
+    let rolling = plan(DAYS);
+    let mut anchored = plan(DAYS);
+    anchored.walk_forward.mode = WindowMode::Anchored;
+    let walk_forward = |plan: &TestPlan| {
+        let spec = plan.walk_forward_spec("sma_cross", common::perp());
+        td_engine::walk_forward(&spec, &bars, &[], &[], None).unwrap()
+    };
+    let (on, off) = (walk_forward(&anchored), walk_forward(&rolling));
+    assert_eq!(on.spec.windows.mode, WindowMode::Anchored);
+    assert_eq!(off.spec.windows.mode, WindowMode::Rolling);
+    // 250 days hold four 45-day test windows after 60 train days, with 10 days left over before
+    // the first test window: the rolling train windows leave them out, the anchored ones start
+    // on them.
+    assert_eq!((on.windows.len(), off.windows.len()), (4, 4));
+    for (k, (a, r)) in on.windows.iter().zip(&off.windows).enumerate() {
+        let test_from = T0 + (70 + 45 * k as i64) * DAY;
+        assert_eq!((a.test_from, a.test_to), (test_from, test_from + 45 * DAY));
+        assert_eq!((r.test_from, r.test_to), (a.test_from, a.test_to));
+        assert_eq!((a.train_from, a.train_to), (T0, test_from), "window {k}");
+        assert_eq!(
+            (r.train_from, r.train_to),
+            (test_from - 60 * DAY, test_from)
+        );
+    }
+
+    let r = battery(&anchored, &cash_rule(), &bars, 7, None).unwrap();
+    let judged = r.walk_forward.as_ref().unwrap();
+    assert_eq!(judged.spec, on.spec);
+    let trains = |wf: &td_engine::WalkForwardResult| -> Vec<(Millis, Millis)> {
+        wf.windows
+            .iter()
+            .map(|w| (w.train_from, w.train_to))
+            .collect()
+    };
+    assert_eq!(trains(judged), trains(&on));
+    assert_eq!(r.evidence.windows, 4);
+    assert_eq!(r.evidence.oos_days, 180.0);
+    // The steps that walk forward again ran too.
+    assert!(r.cost_stress.is_some());
+    assert_eq!(r.start_offsets.len(), 8);
+    assert!(
+        r.start_offsets
+            .iter()
+            .all(|o| o.windows > 0 && o.error.is_none())
+    );
 }
 
 #[test]
@@ -683,6 +737,7 @@ fn daily_plan(test_days: u32) -> (TestPlan, Vec<Candle>) {
     plan.walk_forward = WalkForwardPlan {
         train_days: 120,
         test_days,
+        mode: WindowMode::Rolling,
     };
     (plan, bars_every(DAY, &edge_closes(days as usize)))
 }
