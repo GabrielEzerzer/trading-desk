@@ -2,8 +2,12 @@
 //! survives a restart.
 //!
 //! The folder holds these files:
-//! - `config.json`, written once at creation: the [`LiveConfig`], the starting balance read from
-//!   the venue, the client-id prefix, the engine revision and the creation time ([`SavedConfig`]).
+//! - `config.json`, written once at creation: the [`LiveConfig`] with its stop rules, the starting
+//!   balance read from the venue, the client-id prefix, the engine revision and the creation time
+//!   ([`SavedConfig`]).
+//! - `stops.json`, the stop state and the stop guard's flatten record (`crate::stop_file`),
+//!   written at creation and by the guard whenever it changes. A session whose stop has fired is
+//!   never opened to trade again.
 //! - `events.jsonl`, one [`Line`] per bar fed: the bar, the funding charged with it, whether it was
 //!   a warm-up bar, and for a live bar the broker's record ([`VenueHandle::take_record`]). A live
 //!   bar's line is synced to disk before the next bar is fed.
@@ -50,26 +54,30 @@ use serde::{Deserialize, Serialize};
 use td_core::{AccountCurrency, Candle, FeeSchedule, Instrument, Millis, OrderId, Timeframe};
 use td_engine::{
     Broker, BrokerEvent, ENGINE_REVISION, EngineError, Order, Params, Portfolio, Session,
-    SessionConfig, Strategy,
+    SessionConfig, StopError, StopRules, StopState, Strategy,
 };
 use td_orders::Client;
 
+use crate::guard::SendGate;
+use crate::stop_file::{STOP_FILE, StopRecord};
 use crate::{BrokerRecord, VenueBroker, VenueHandle};
 
-const CONFIG_FILE: &str = "config.json";
+pub(crate) const CONFIG_FILE: &str = "config.json";
 const EVENTS_FILE: &str = "events.jsonl";
-const STATUS_FILE: &str = "status.json";
+pub(crate) const STATUS_FILE: &str = "status.json";
 const LOCK_FILE: &str = "lock";
 const FAULTED_FILE: &str = "faulted";
 /// Every file a session folder holds, the temporary ones [`write_synced`] makes included.
-const FILES: [&str; 7] = [
+const FILES: [&str; 9] = [
     CONFIG_FILE,
     EVENTS_FILE,
     STATUS_FILE,
     LOCK_FILE,
     FAULTED_FILE,
+    STOP_FILE,
     "config.json.tmp",
     "status.json.tmp",
+    "stops.json.tmp",
 ];
 /// The most warnings the status keeps.
 const KEEP_WARNINGS: usize = 100;
@@ -105,6 +113,10 @@ pub struct LiveConfig {
     pub fees: Option<FeeSchedule>,
     /// The largest position allowed, as its notional over equity: 1.0 means 1x.
     pub max_leverage: f64,
+    /// The loss limits and the open-notional cap, required and fixed when the session is created.
+    /// Nothing changes them afterwards: they are written once in `config.json`, and the stop
+    /// state is restored only against them.
+    pub stops: StopRules,
 }
 
 /// What `config.json` holds.
@@ -172,6 +184,11 @@ pub enum State {
     Stopped {
         note: String,
     },
+    /// Halted for good: a stop fired, or the owner flattened the session. `reason` says which and
+    /// what was done at the venue. A resume is refused.
+    Ended {
+        reason: String,
+    },
 }
 
 /// The venue's position and equity as last read.
@@ -204,7 +221,7 @@ pub struct LiveStatus {
 }
 
 impl LiveStatus {
-    fn not_started(venue: Option<VenueRead>) -> LiveStatus {
+    pub(crate) fn not_started(venue: Option<VenueRead>) -> LiveStatus {
         LiveStatus {
             state: State::Stopped {
                 note: NOT_STARTED.into(),
@@ -272,6 +289,19 @@ pub enum LiveError {
     StillPanicked(String),
     #[error("the session halted: {0}")]
     Halted(String),
+    #[error("the stop rules are refused: {0}")]
+    InvalidStops(#[from] StopError),
+    #[error("{}: the stop state cannot be used, so the session is not opened: {reason}", path.display())]
+    StopFile { path: PathBuf, reason: String },
+    #[error("a stop fired, so the session never trades again: {0}")]
+    StopFired(String),
+    #[error("the session has ended and cannot be resumed: {0}")]
+    Ended(String),
+    #[error(
+        "session {0} on this data folder has not ended; a session must be the only thing trading \
+         on its account, so end it first with `td-live flatten --id {0}`"
+    )]
+    NotEnded(String),
     #[error("{}: {reason}; nothing was sent", path.display())]
     BadLog { path: PathBuf, reason: String },
     #[error("{}: {reason}", path.display())]
@@ -299,6 +329,35 @@ impl LiveError {
     }
 }
 
+/// Refuses when a session folder under `data_dir` has a status that is not `Ended`: a session must
+/// be the only thing trading on its account, and its flatten closes the account's whole position
+/// on the instrument. Reads only each folder's status file; a folder with a config and no status
+/// that reads counts as not ended, since it can still be opened.
+///
+/// shortcut: two `start` commands racing on one data folder can both pass; upgrade to a lock on
+/// the `live` folder if sessions are ever started by something other than one person.
+pub(crate) fn refuse_unended(data_dir: &Path) -> Result<(), LiveError> {
+    let root = data_dir.join("live");
+    let entries = match fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(LiveError::io(&root)(e)),
+    };
+    for entry in entries {
+        let entry = entry.map_err(LiveError::io(&root))?;
+        let dir = entry.path();
+        if !dir.join(CONFIG_FILE).exists() {
+            continue;
+        }
+        let id = entry.file_name().to_string_lossy().into_owned();
+        match read_json::<LiveStatus>(&dir.join(STATUS_FILE)) {
+            Ok(status) if matches!(status.state, State::Ended { .. }) => {}
+            _ => return Err(LiveError::NotEnded(id)),
+        }
+    }
+    Ok(())
+}
+
 /// The folder of the live session `id`.
 pub fn live_dir(data_dir: &Path, id: &str) -> PathBuf {
     data_dir.join("live").join(id)
@@ -323,16 +382,21 @@ pub struct LiveSession {
     funding: Vec<Funding>,
     /// A `sending` line the log ends with: its bar's line is written after `go_live`.
     pending: Option<(Candle, Vec<Funding>)>,
+    /// The stop state as created or restored; the stop guard takes it over before the run.
+    pub(crate) stops: StopRecord,
+    /// The broker's send gate: the pre-trade cap, and the stop that ends all sending.
+    pub(crate) gate: Arc<SendGate>,
     /// Held locked while the session is open.
     _lock: File,
 }
 
 impl LiveSession {
     /// Makes a new session in `<data_dir>/live/<id>/`. Nothing is written or sent when the id is
-    /// taken, the strategy or settings do not check, the venue cannot be read, or the account
-    /// holds a position or open orders on the instrument. The starting balance is the account's
-    /// equity read here, and the client-id prefix is made from the creation time. When writing
-    /// the folder fails part way, what was written is removed, so the id can be used again.
+    /// taken, the stop rules or the strategy or settings do not check, the venue cannot be read,
+    /// or the account holds a position or open orders on the instrument. The starting balance is
+    /// the account's equity read here, the stop state starts from it, and the client-id prefix is
+    /// made from the creation time. When writing the folder fails part way, what was written is
+    /// removed, so the id can be used again.
     pub fn create(
         data_dir: &Path,
         id: &str,
@@ -341,6 +405,7 @@ impl LiveSession {
         build: BuildStrategy,
     ) -> Result<LiveSession, LiveError> {
         check_id(id)?;
+        config.stops.validate()?;
         let root = data_dir.join("live");
         refuse_link(&root)?;
         let dir = root.join(id);
@@ -359,6 +424,7 @@ impl LiveSession {
             });
         }
         let created_at = client.server_now();
+        let stops = StopRecord::new(StopState::start(config.stops, equity.equity, created_at)?);
         let saved = SavedConfig {
             config,
             starting_balance: equity.equity,
@@ -368,7 +434,8 @@ impl LiveSession {
         };
         let config_path = dir.join(CONFIG_FILE);
         let log_path = dir.join(EVENTS_FILE);
-        let parts = Parts::build(&saved, client.clone(), strategy, &config_path)?;
+        let gate = Arc::new(SendGate::new(saved.config.stops));
+        let parts = Parts::build(&saved, client.clone(), strategy, &config_path, &gate)?;
         let venue = VenueRead {
             at: created_at,
             position: position.size,
@@ -386,6 +453,7 @@ impl LiveSession {
                 reason: e.to_string(),
             })?;
             write_synced(&dir, CONFIG_FILE, &json)?;
+            stops.save(&dir)?;
             let file = OpenOptions::new()
                 .append(true)
                 .create_new(true)
@@ -406,6 +474,8 @@ impl LiveSession {
                 next_bar: None,
                 funding: Vec::new(),
                 pending: None,
+                stops,
+                gate,
                 _lock: lock,
             };
             live.save_status()?;
@@ -415,9 +485,10 @@ impl LiveSession {
 
     /// Opens a saved session to resume it: checks the folder, takes the lock, checks the engine
     /// revision and the client-id prefix, and replays the log through a fresh session and broker
-    /// without touching the venue. A session that halted on a broker fault (its `faulted` marker,
-    /// or its status) or on a panic is refused. A status saved as running or warming up, left by
-    /// a process that ended without stopping, reads as stopped. A folder with its config and no
+    /// without touching the venue. A session whose stop state is missing, unreadable or refused,
+    /// whose stop has fired, that halted on a broker fault (its `faulted` marker, or its status)
+    /// or on a panic, or that has ended, is refused. A status saved as running or warming up, left
+    /// by a process that ended without stopping, reads as stopped. A folder with its config and no
     /// status, left by a crash inside [`LiveSession::create`], opens as not started when its log
     /// is empty or missing.
     ///
@@ -455,6 +526,10 @@ impl LiveSession {
                 reason: "the client-id prefix is not the one made from the creation time".into(),
             });
         }
+        let stops = StopRecord::load(&dir, &saved)?;
+        if let Some(fired) = stops.state.fired() {
+            return Err(LiveError::StopFired(fired.to_string()));
+        }
 
         let log_path = dir.join(EVENTS_FILE);
         let status_path = dir.join(STATUS_FILE);
@@ -476,6 +551,7 @@ impl LiveSession {
         if let Some(refused) = refusal(&dir, &status.state) {
             return Err(refused);
         }
+        stops.check_unfired(&dir)?;
         if matches!(status.state, State::Running | State::WarmingUp) {
             status.state = State::Stopped {
                 note: ENDED_UNSTOPPED.into(),
@@ -488,7 +564,8 @@ impl LiveSession {
         status.open_orders.clear();
 
         let strategy = build(&saved.config.strategy, &saved.config.params)?;
-        let parts = Parts::build(&saved, client.clone(), strategy, &config_path)?;
+        let gate = Arc::new(SendGate::new(saved.config.stops));
+        let parts = Parts::build(&saved, client.clone(), strategy, &config_path, &gate)?;
         let complete = bytes.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
         let bad = |index: usize, reason: String| LiveError::BadLog {
             path: log_path.clone(),
@@ -518,6 +595,8 @@ impl LiveSession {
             next_bar: None,
             funding: Vec::new(),
             pending: None,
+            stops,
+            gate,
             _lock: lock,
         };
         // The replay runs strategy and engine code on the file's contents.
@@ -634,6 +713,7 @@ impl LiveSession {
             };
             return lock_log(&self.log).append(&line, false);
         }
+        self.gate.new_bar();
         lock_log(&self.log).armed = Some((bar, funding.clone()));
         let fed = self.session.on_bar(bar, &engine_funding);
         let kept_back = {
@@ -789,7 +869,8 @@ impl LiveSession {
         &self.data_dir
     }
 
-    pub(crate) fn client(&self) -> &Client {
+    /// The order route the session trades through, for the rules check and the stop guard.
+    pub(crate) fn client(&self) -> &Arc<Client> {
         &self.client
     }
 
@@ -839,6 +920,7 @@ impl Parts {
         client: Arc<Client>,
         strategy: Box<dyn Strategy>,
         config_path: &Path,
+        gate: &Arc<SendGate>,
     ) -> Result<Parts, LiveError> {
         let config = &saved.config;
         let (inner, handle) = VenueBroker::new(
@@ -851,6 +933,7 @@ impl Parts {
             path: config_path.to_path_buf(),
             reason: e.to_string(),
         })?;
+        let inner = inner.gated(gate.clone());
         let log = Arc::new(Mutex::new(LogFile::closed()));
         let broker = LoggedBroker {
             inner,
@@ -1079,8 +1162,8 @@ pub(crate) fn panic_message(panic: &(dyn Any + Send)) -> String {
     clean(&text, MAX_TEXT)
 }
 
-/// The refusal for a session whose folder holds the `faulted` marker or whose state is faulted
-/// or panicked.
+/// The refusal for a session whose folder holds the `faulted` marker or whose state is faulted,
+/// panicked or ended.
 fn refusal(dir: &Path, state: &State) -> Option<LiveError> {
     if let Some(fault) = fault_marker(dir) {
         return Some(LiveError::StillFaulted(fault));
@@ -1088,6 +1171,7 @@ fn refusal(dir: &Path, state: &State) -> Option<LiveError> {
     match state {
         State::Faulted { fault } => Some(LiveError::StillFaulted(clean(fault, MAX_TEXT))),
         State::Panicked { panic } => Some(LiveError::StillPanicked(clean(panic, MAX_TEXT))),
+        State::Ended { reason } => Some(LiveError::Ended(clean(reason, MAX_TEXT))),
         _ => None,
     }
 }
@@ -1119,7 +1203,7 @@ fn fault_marker(dir: &Path) -> Option<String> {
 
 /// The folder of session `id`, once neither `live`, the folder nor any file a session folder
 /// holds is a link.
-fn session_dir(data_dir: &Path, id: &str) -> Result<PathBuf, LiveError> {
+pub(crate) fn session_dir(data_dir: &Path, id: &str) -> Result<PathBuf, LiveError> {
     let root = data_dir.join("live");
     refuse_link(&root)?;
     let dir = root.join(id);
@@ -1131,7 +1215,7 @@ fn session_dir(data_dir: &Path, id: &str) -> Result<PathBuf, LiveError> {
 }
 
 /// Refuses a link at `path`; nothing there passes.
-fn refuse_link(path: &Path) -> Result<(), LiveError> {
+pub(crate) fn refuse_link(path: &Path) -> Result<(), LiveError> {
     match fs::symlink_metadata(path) {
         Ok(meta) if is_link(&meta) => Err(LiveError::Link(path.to_path_buf())),
         Ok(_) => Ok(()),
@@ -1169,7 +1253,7 @@ fn make_folder<T>(dir: &Path, fill: impl FnOnce() -> Result<T, LiveError>) -> Re
     })
 }
 
-fn take_lock(dir: &Path) -> Result<File, LiveError> {
+pub(crate) fn take_lock(dir: &Path) -> Result<File, LiveError> {
     let path = dir.join(LOCK_FILE);
     let file = OpenOptions::new()
         .create(true)
@@ -1188,7 +1272,7 @@ fn take_lock(dir: &Path) -> Result<File, LiveError> {
 /// leave it empty or partial. A temporary file left by a crash is removed first (a link there is
 /// removed, never followed), and the new one is made fresh. A failed rename is tried once more
 /// after [`RENAME_RETRY`]: on Windows a reader holding the file makes it fail.
-fn write_synced(dir: &Path, name: &str, bytes: &[u8]) -> Result<(), LiveError> {
+pub(crate) fn write_synced(dir: &Path, name: &str, bytes: &[u8]) -> Result<(), LiveError> {
     let path = dir.join(name);
     let temp = dir.join(format!("{name}.tmp"));
     match fs::remove_file(&temp) {
@@ -1210,7 +1294,7 @@ fn write_synced(dir: &Path, name: &str, bytes: &[u8]) -> Result<(), LiveError> {
         .map_err(LiveError::io(&path))
 }
 
-fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, LiveError> {
+pub(crate) fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, LiveError> {
     let text = fs::read_to_string(path).map_err(LiveError::io(path))?;
     serde_json::from_str(&text).map_err(|e| LiveError::BadFile {
         path: path.to_path_buf(),
@@ -1221,7 +1305,7 @@ fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, LiveError
 /// An id is 1 to 64 lowercase ASCII letters, digits, `-` or `_`, and not a name Windows keeps for
 /// a device. Lowercase is required, not made: Windows folder names ignore case, so `Demo` and
 /// `demo` would be one folder.
-fn check_id(id: &str) -> Result<(), LiveError> {
+pub(crate) fn check_id(id: &str) -> Result<(), LiveError> {
     let device = matches!(id, "con" | "prn" | "aux" | "nul")
         || (id.len() == 4
             && (id.starts_with("com") || id.starts_with("lpt"))
@@ -1348,6 +1432,13 @@ mod tests {
             slippage_bps: 0.0,
             fees: None,
             max_leverage: 1.0,
+            // Wide enough never to fire or refuse here; tests/stops.rs tests the stops.
+            stops: td_engine::StopRules {
+                daily_loss_share: 1.0,
+                max_loss_share: 1.0,
+                open_notional_cap: 1e12,
+                rollover: td_engine::DayRollover::default(),
+            },
         }
     }
 
@@ -1547,5 +1638,49 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    #[test]
+    fn a_session_folder_that_has_not_ended_refuses_a_start() {
+        let data = tempfile::tempdir().unwrap();
+        assert!(refuse_unended(data.path()).is_ok(), "no live folder yet");
+        let live = data.path().join("live");
+        let session = |id: &str, state: Option<State>| {
+            let dir = live.join(id);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join(CONFIG_FILE), "{}").unwrap();
+            if let Some(state) = state {
+                let mut status = LiveStatus::not_started(None);
+                status.state = state;
+                fs::write(dir.join(STATUS_FILE), serde_json::to_vec(&status).unwrap()).unwrap();
+            }
+        };
+        let refused = |data: &Path| match refuse_unended(data) {
+            Err(LiveError::NotEnded(id)) => Some(id),
+            other => {
+                assert!(other.is_ok(), "{other:?}");
+                None
+            }
+        };
+        session(
+            "done",
+            Some(State::Ended {
+                reason: "flat".into(),
+            }),
+        );
+        // A folder with no config is not a session.
+        fs::create_dir_all(live.join("stray")).unwrap();
+        assert_eq!(refused(data.path()), None);
+        session(
+            "stopped",
+            Some(State::Stopped {
+                note: String::new(),
+            }),
+        );
+        assert_eq!(refused(data.path()).as_deref(), Some("stopped"));
+        fs::remove_dir_all(live.join("stopped")).unwrap();
+        // A config with no status, left by a crash inside create, can still be opened.
+        session("crashed", None);
+        assert_eq!(refused(data.path()).as_deref(), Some("crashed"));
     }
 }

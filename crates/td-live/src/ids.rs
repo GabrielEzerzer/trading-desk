@@ -15,6 +15,16 @@
 //!   not show it, just before the broker faults; or for the first confirmed fill when stop `n`
 //!   did not rest: the venue refused it, shows it closed with nothing filled, or did not show it
 //!   to going live after a restart.
+//! - `f`: the stop guard's own orders when a loss limit fires or the owner flattens the session
+//!   (`crate::guard`): a reduce-only market order that closes the venue's position. Here `n` is
+//!   the guard's own counter, saved in the session's stop-state file before each send, not an
+//!   engine order. The broker does not track these, so one a bar reads is a fault. The guard
+//!   sends one only after its gate has stopped passing anything and it has asked the run to halt,
+//!   so only a bar the run was already reading can see one, and that fault sends nothing more.
+//!   That bar can still send an order that passed its gate check before the gate stopped (an
+//!   order that is not reduce-only has then passed the cap); the flatten cannot report flat until
+//!   the run has ended and reads the venue again after that, so it cancels or closes what such an
+//!   order left.
 //! - `x`: reserved for orders the session sends itself outside the engine, such as a later
 //!   "close the position" action. This crate sends none; an execution carrying one is a fault
 //!   until that action exists.
@@ -46,6 +56,8 @@ pub(crate) enum Role {
     /// A second stop for an entry's fill: the part stop `n` does not cover, or all of it when stop
     /// `n` did not rest or its outcome is unknown.
     Cover,
+    /// A flatten order the stop guard sends; `n` is the guard's counter.
+    Flatten,
     /// Reserved; never sent by this crate.
     Session,
 }
@@ -56,6 +68,7 @@ impl Role {
             Role::Order => 'o',
             Role::Close => 'c',
             Role::Cover => 's',
+            Role::Flatten => 'f',
             Role::Session => 'x',
         }
     }
@@ -98,6 +111,7 @@ pub(crate) fn parse(prefix: &str, id: &str) -> Option<(Role, OrderId)> {
         'o' => Role::Order,
         'c' => Role::Close,
         's' => Role::Cover,
+        'f' => Role::Flatten,
         'x' => Role::Session,
         _ => return None,
     };
@@ -135,7 +149,13 @@ mod tests {
 
     #[test]
     fn ids_round_trip_and_other_ids_are_not_ours() {
-        for role in [Role::Order, Role::Close, Role::Cover, Role::Session] {
+        for role in [
+            Role::Order,
+            Role::Close,
+            Role::Cover,
+            Role::Flatten,
+            Role::Session,
+        ] {
             let id = client_id("s1", role, OrderId(42));
             assert_eq!(parse("s1", id.as_str()), Some((role, OrderId(42))));
         }

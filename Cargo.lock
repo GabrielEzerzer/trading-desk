@@ -2376,12 +2376,14 @@ dependencies = [
 name = "td-live"
 version = "0.1.0"
 dependencies = [
+ "clap",
  "futures-util",
  "serde",
  "serde_json",
  "td-core",
  "td-data",
  "td-engine",
+ "td-live",
  "td-mock-bybit",
  "td-orders",
  "tempfile",

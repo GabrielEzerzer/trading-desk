@@ -37,6 +37,7 @@ mod rng;
 mod runner;
 mod session;
 pub mod stats;
+mod stops;
 mod strategies;
 mod strategy;
 mod tester;
@@ -84,6 +85,7 @@ pub use session::{
     CLOSE_OUT_TAG, EquityPoint, LIQUIDATION_TAG, MAINTENANCE_MARGIN_RATE, Session, SessionConfig,
     run_backtest,
 };
+pub use stops::{SavedStopState, StopError, StopFired, StopRule, StopRules, StopState};
 pub use strategies::gotobi_calendar;
 pub use strategy::{Context, Strategy};
 pub use tester::{
