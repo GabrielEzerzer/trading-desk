@@ -546,11 +546,11 @@ pub fn session_link(
                 .find(|row| row.instrument == *instrument);
             let latest_refused = |why: String| {
                 let instead = match references {
-                    None => format!(
-                        "name a verdict judged without them {name_one}, or run a test without them first"
-                    ),
-                    Some(_) => format!(
+                    Some(fed) if !fed.is_empty() => format!(
                         "name a verdict judged with the reference instruments the session feeds {name_one}, or run a test with them first"
+                    ),
+                    _ => format!(
+                        "name a verdict judged without them {name_one}, or run a test without them first"
                     ),
                 };
                 bad(format!(

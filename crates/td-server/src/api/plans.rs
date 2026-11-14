@@ -615,7 +615,11 @@ mod tests {
         let latest = session_link(dir.path(), &entry, &on, None, &[]).unwrap_err();
         assert_eq!(latest.body.code, "invalid_verdict");
         assert!(
-            latest.body.message.contains("latest verdict"),
+            latest.body.message.contains(&format!(
+                "the session does not feed {reference}; it is the strategy's latest verdict on \
+                 {on}, so name a verdict judged without them in `verdict_run_id`, or run a test \
+                 without them first"
+            )),
             "{}",
             latest.body.message
         );
