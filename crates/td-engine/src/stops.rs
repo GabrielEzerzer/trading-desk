@@ -6,7 +6,8 @@
 //! account's equity, open profit and loss included, and the open position's notional, and passes
 //! them to [`StopState::check`]; when a stop fires the caller flattens the position, cancels
 //! resting orders and halts the session. A fired state stays fired: nothing in this module un-fires
-//! it, and a restart restores it from its serialised form with [`StopState::restore`].
+//! it, and a restart reads its serialised form as a [`SavedStopState`] and restores it with
+//! [`StopState::restore`], the only way from a saved state to a running one.
 //! [`StopRules::check_order`] is the pre-trade side of the notional cap.
 //!
 //! This module only decides. It does no I/O and keeps no clock: every time is given by the caller.
@@ -144,19 +145,13 @@ impl fmt::Display for StopFired {
     }
 }
 
-/// The state the stops keep for one session. It serialises, so a restart can restore it.
-///
-/// Loading a saved state checks it against itself, and a state that fails loads as an error with
-/// the reason. The rules must pass [`StopRules::validate`], the starting balance must be a finite
-/// number above zero, the day's starting equity must be finite, the day must end at the first
-/// rollover after the last check, and the `fired` key must be present, as `null` when no stop has
-/// fired. [`StopState::restore`] then checks the state against the session's own record of its
-/// rules and starting balance; what the two together catch, and what they do not, is said there.
+/// The state the stops keep for one session. It serialises, so a restart can restore it: the
+/// saved form reads back as a [`SavedStopState`], which only [`StopState::restore`] turns into a
+/// running state.
 ///
 /// The rules are kept in the state, so a session cannot check against other rules than the ones
 /// it started with.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(try_from = "SavedStopState")]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct StopState {
     rules: StopRules,
     starting_balance: f64,
@@ -166,10 +161,14 @@ pub struct StopState {
     fired: Option<StopFired>,
 }
 
-/// A [`StopState`] as it is read back, before it is checked. It has the same fields.
-#[derive(Deserialize)]
+/// A saved [`StopState`] as it is read back, before it is checked. It has the same fields, all
+/// private, and nothing turns it into a running state but [`StopState::restore`].
+///
+/// Reading it back requires every key, `fired` included, as `null` when no stop has fired, and
+/// refuses unknown keys.
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct SavedStopState {
+pub struct SavedStopState {
     rules: StopRules,
     starting_balance: f64,
     day_start_equity: f64,
@@ -179,41 +178,6 @@ struct SavedStopState {
     // `None`.
     #[serde(deserialize_with = "Option::deserialize")]
     fired: Option<StopFired>,
-}
-
-impl TryFrom<SavedStopState> for StopState {
-    type Error = StopError;
-
-    /// Refuses a saved state that [`StopState::start`] and [`StopState::check`] could not have
-    /// left. Both keep `day_ends` at the first rollover after `last_check`: `start` sets both, a
-    /// check that rolls the day over sets both, a check before the day's end moves `last_check`
-    /// to a time with no rollover between it and `day_ends`, and a check that is refused or comes
-    /// after a fired stop changes neither.
-    fn try_from(saved: SavedStopState) -> Result<Self, StopError> {
-        saved.rules.validate()?;
-        valid_balance(saved.starting_balance)?;
-        if !saved.day_start_equity.is_finite() {
-            return Err(StopError::DayStartEquityNotFinite {
-                value: saved.day_start_equity,
-            });
-        }
-        let day_ends = day_end_after(saved.rules.rollover, saved.last_check)?;
-        if saved.day_ends != day_ends {
-            return Err(StopError::DayEndsMismatch {
-                saved: saved.day_ends,
-                last_check: saved.last_check,
-                want: day_ends,
-            });
-        }
-        Ok(StopState {
-            rules: saved.rules,
-            starting_balance: saved.starting_balance,
-            day_start_equity: saved.day_start_equity,
-            day_ends: saved.day_ends,
-            last_check: saved.last_check,
-            fired: saved.fired,
-        })
-    }
 }
 
 impl StopState {
@@ -234,22 +198,46 @@ impl StopState {
         })
     }
 
-    /// Restores a loaded state against the session's own record of the rules and starting balance
+    /// Restores a saved state against the session's own record of the rules and starting balance
     /// it started with, which the caller keeps in the session's config, written once at start.
-    /// Refuses a state whose rules or starting balance are not exactly those.
+    /// This is the only way from a saved state to a running one.
     ///
-    /// With the checks made when the state was loaded, this catches a saved state that disagrees
-    /// with the session's config or with itself: weaker rules, a different starting balance, a
-    /// deleted fired stop, or a day end that does not follow from the last check. It cannot catch
-    /// an edit that keeps the state consistent with both, such as a fired stop set to `null`, a
-    /// different starting equity for the day, or an earlier last check with the day end moved to
-    /// match; the caller's own record of a halt covers the fired stop. It does not defend against
-    /// someone who rewrites every file of a stopped session consistently.
+    /// First it checks the saved state against itself, refusing one that [`StopState::start`] and
+    /// [`StopState::check`] could not have left: the rules must pass [`StopRules::validate`], the
+    /// starting balance must be a finite number above zero, the day's starting equity must be
+    /// finite, and the day must end at the first rollover after the last check. Both keep
+    /// `day_ends` at that rollover: `start` sets both, a check that rolls the day over sets both,
+    /// a check before the day's end moves `last_check` to a time with no rollover between it and
+    /// `day_ends`, and a check that is refused or comes after a fired stop changes neither. Then
+    /// it refuses a state whose rules or starting balance are not exactly the session's.
+    ///
+    /// With the required `fired` key, this catches a saved state that disagrees with the session's
+    /// config or with itself: weaker rules, a different starting balance, a deleted fired stop, or
+    /// a day end that does not follow from the last check. It cannot catch an edit that keeps the
+    /// state consistent with both, such as a fired stop set to `null`, a different starting equity
+    /// for the day, or an earlier last check with the day end moved to match; the caller's own
+    /// record of a halt covers the fired stop. It does not defend against someone who rewrites
+    /// every file of a stopped session consistently.
     pub fn restore(
-        saved: StopState,
+        saved: SavedStopState,
         rules: &StopRules,
         starting_balance: f64,
     ) -> Result<StopState, StopError> {
+        saved.rules.validate()?;
+        valid_balance(saved.starting_balance)?;
+        if !saved.day_start_equity.is_finite() {
+            return Err(StopError::DayStartEquityNotFinite {
+                value: saved.day_start_equity,
+            });
+        }
+        let day_ends = day_end_after(saved.rules.rollover, saved.last_check)?;
+        if saved.day_ends != day_ends {
+            return Err(StopError::DayEndsMismatch {
+                saved: saved.day_ends,
+                last_check: saved.last_check,
+                want: day_ends,
+            });
+        }
         if saved.rules != *rules {
             return Err(StopError::RulesDiffer);
         }
@@ -259,7 +247,14 @@ impl StopState {
                 session: starting_balance,
             });
         }
-        Ok(saved)
+        Ok(StopState {
+            rules: saved.rules,
+            starting_balance: saved.starting_balance,
+            day_start_equity: saved.day_start_equity,
+            day_ends: saved.day_ends,
+            last_check: saved.last_check,
+            fired: saved.fired,
+        })
     }
 
     pub fn rules(&self) -> &StopRules {
@@ -316,7 +311,7 @@ impl StopState {
         if let Some(fired) = self.fired {
             return Ok(Some(fired));
         }
-        // The rules and the starting balance were checked when the state was started or loaded,
+        // The rules and the starting balance were checked when the state was started or restored,
         // and nothing changes them.
         if time < self.last_check {
             return Err(StopError::TimeWentBack {
@@ -487,6 +482,13 @@ mod tests {
         StopState::start(rules, START, 5 * DAY + HOUR).unwrap()
     }
 
+    /// `s` saved as JSON, read back as a [`SavedStopState`] and restored against its own rules
+    /// and starting balance.
+    fn reload(s: &StopState) -> Result<StopState, StopError> {
+        let saved = serde_json::from_str(&serde_json::to_string(s).unwrap()).unwrap();
+        StopState::restore(saved, s.rules(), s.starting_balance())
+    }
+
     /// The rule that fires on a fresh state checked once at `equity` and `notional`.
     fn once(rules: StopRules, equity: f64, notional: f64) -> Option<StopRule> {
         state(rules)
@@ -620,8 +622,8 @@ mod tests {
         let mut s = state(rules());
         assert_eq!(s.check(5 * DAY + 20 * HOUR, 9_700.0, 10_000.0), Ok(None));
         assert_eq!(s.check(6 * DAY + HOUR, 9_600.0, 10_000.0), Ok(None));
-        let json = serde_json::to_string(&s).unwrap();
-        let mut restored: StopState = serde_json::from_str(&json).unwrap();
+        let saved = s.clone();
+        let mut restored = reload(&s).unwrap();
         assert_eq!(restored, s);
         for (t, e, n) in [
             (6 * DAY + 2 * HOUR, 9_100.0, 10_000.0),
@@ -633,10 +635,9 @@ mod tests {
         // The 625 the day started from 9,600 hit at 8,975.
         assert_eq!(s.fired().unwrap().rule, StopRule::DailyLoss);
         // A fired state comes back fired.
-        let again: StopState = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
-        assert_eq!(again.fired(), s.fired());
+        assert_eq!(reload(&s).unwrap().fired(), s.fired());
         // An earlier check than the restored state's last one is refused.
-        let mut restored: StopState = serde_json::from_str(&json).unwrap();
+        let mut restored = reload(&saved).unwrap();
         assert!(matches!(
             restored.check(6 * DAY, 9_600.0, 0.0),
             Err(StopError::TimeWentBack { .. })
@@ -732,11 +733,11 @@ mod tests {
         );
     }
 
-    /// The refusal a saved state given as JSON loads with. Deserialising a `StopState` from it is
-    /// refused too.
+    /// The refusal a saved state given as JSON is restored with, against the session's rules and
+    /// starting balance. The checks against itself come first, so the refusal names the edit.
     fn load_refusal(v: serde_json::Value) -> StopError {
-        assert!(serde_json::from_value::<StopState>(v.clone()).is_err());
-        StopState::try_from(serde_json::from_value::<SavedStopState>(v).unwrap()).unwrap_err()
+        let saved = serde_json::from_value::<SavedStopState>(v).unwrap();
+        StopState::restore(saved, &rules(), START).unwrap_err()
     }
 
     #[test]
@@ -798,7 +799,7 @@ mod tests {
                 fired: None,
             };
             assert!(matches!(
-                StopState::try_from(saved),
+                StopState::restore(saved, &rules(), START),
                 Err(StopError::DayStartEquityNotFinite { .. })
             ));
         }
@@ -810,15 +811,13 @@ mod tests {
         let unfired = serde_json::to_value(&s).unwrap();
         // A state that has not fired saves the key as null, and loads.
         assert_eq!(unfired["fired"], serde_json::Value::Null);
-        assert_eq!(
-            serde_json::from_value::<StopState>(unfired.clone()).unwrap(),
-            s
-        );
+        let saved = serde_json::from_value::<SavedStopState>(unfired.clone()).unwrap();
+        assert_eq!(StopState::restore(saved, &rules(), START).unwrap(), s);
         s.check(5 * DAY + 2 * HOUR, 9_300.0, 0.0).unwrap().unwrap();
         let fired = serde_json::to_value(&s).unwrap();
         for mut v in [unfired, fired] {
             v.as_object_mut().unwrap().remove("fired");
-            let err = serde_json::from_value::<StopState>(v).unwrap_err();
+            let err = serde_json::from_value::<SavedStopState>(v).unwrap_err();
             assert!(err.to_string().contains("missing field `fired`"), "{err}");
         }
     }
@@ -831,7 +830,7 @@ mod tests {
         v["rules"]["daily_loss_share"] = serde_json::json!(1.0);
         v["rules"]["max_loss_share"] = serde_json::json!(1.0);
         v["rules"]["open_notional_cap"] = serde_json::json!(1e300);
-        let weaker: StopState = serde_json::from_value(v).unwrap();
+        let weaker: SavedStopState = serde_json::from_value(v).unwrap();
         assert_eq!(
             StopState::restore(weaker, &rules(), START),
             Err(StopError::RulesDiffer)
@@ -840,7 +839,7 @@ mod tests {
         let mut v = saved.clone();
         v["rules"]["rollover"]["offset_minutes"] = serde_json::json!(1);
         v["day_ends"] = serde_json::json!(6 * DAY + 60_000);
-        let moved: StopState = serde_json::from_value(v).unwrap();
+        let moved: SavedStopState = serde_json::from_value(v).unwrap();
         assert_eq!(
             StopState::restore(moved, &rules(), START),
             Err(StopError::RulesDiffer)
@@ -850,7 +849,7 @@ mod tests {
         let mut v = saved;
         v["starting_balance"] = serde_json::json!(1e-300);
         v["day_start_equity"] = serde_json::json!(-1e308);
-        let lowered: StopState = serde_json::from_value(v).unwrap();
+        let lowered: SavedStopState = serde_json::from_value(v).unwrap();
         assert_eq!(
             StopState::restore(lowered, &rules(), START),
             Err(StopError::StartingBalanceDiffers {
@@ -865,7 +864,8 @@ mod tests {
         let mut s = state(rules());
         assert_eq!(s.check(5 * DAY + 20 * HOUR, 9_700.0, 10_000.0), Ok(None));
         assert_eq!(s.check(6 * DAY + HOUR, 9_600.0, 10_000.0), Ok(None));
-        let loaded: StopState = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        let loaded: SavedStopState =
+            serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
         let mut restored = StopState::restore(loaded, &rules(), START).unwrap();
         assert_eq!(restored, s);
         for (t, e, n) in [
@@ -876,6 +876,45 @@ mod tests {
             assert_eq!(restored.check(t, e, n), s.check(t, e, n));
         }
         assert_eq!(restored.fired().unwrap().rule, StopRule::DailyLoss);
+    }
+
+    #[test]
+    fn a_saved_state_reads_back_and_restores_only_against_the_session_s_record() {
+        let mut s = state(rules());
+        assert_eq!(s.check(5 * DAY + 2 * HOUR, 9_700.0, 10_000.0), Ok(None));
+        let unfired_state = s.clone();
+        let unfired = serde_json::to_string(&s).unwrap();
+        s.check(5 * DAY + 3 * HOUR, 9_300.0, 10_000.0)
+            .unwrap()
+            .unwrap();
+        let fired = serde_json::to_string(&s).unwrap();
+        let read = |json: &str| serde_json::from_str::<SavedStopState>(json).unwrap();
+        // With the session's rules and starting balance, both come back exactly.
+        let back = StopState::restore(read(&unfired), &rules(), START).unwrap();
+        assert_eq!(back, unfired_state);
+        assert_eq!(back.fired(), None);
+        assert_eq!(serde_json::to_string(&back).unwrap(), unfired);
+        let back = StopState::restore(read(&fired), &rules(), START).unwrap();
+        assert_eq!(back, s);
+        assert_eq!(serde_json::to_string(&back).unwrap(), fired);
+        // Against other rules or another starting balance, neither restores.
+        let other = StopRules {
+            open_notional_cap: 60_000.0,
+            ..rules()
+        };
+        for json in [&unfired, &fired] {
+            assert_eq!(
+                StopState::restore(read(json), &other, START),
+                Err(StopError::RulesDiffer)
+            );
+            assert_eq!(
+                StopState::restore(read(json), &rules(), START + 1.0),
+                Err(StopError::StartingBalanceDiffers {
+                    saved: START,
+                    session: START + 1.0
+                })
+            );
+        }
     }
 
     #[test]
@@ -914,8 +953,7 @@ mod tests {
             assert!(s.day_ends() > first);
             assert_eq!(s.check(last, START, 0.0), Ok(None));
             assert!(s.day_ends() > last);
-            let json = serde_json::to_string(&s).unwrap();
-            assert_eq!(serde_json::from_str::<StopState>(&json).unwrap(), s);
+            assert_eq!(reload(&s).unwrap(), s);
             let before = s.clone();
             assert_eq!(
                 s.check(last + 1, START, 0.0),
@@ -1051,10 +1089,7 @@ mod tests {
             };
             let mut s = StopState::start(StopRules { rollover, ..rules() }, START, start).unwrap();
             let mut t = start;
-            let loads_back = |s: &StopState| {
-                let json = serde_json::to_string(s).unwrap();
-                serde_json::from_str::<StopState>(&json).ok() == Some(s.clone())
-            };
+            let loads_back = |s: &StopState| reload(s).ok() == Some(s.clone());
             prop_assert!(loads_back(&s));
             for (dt, equity, notional) in checks {
                 // `None` checks exactly at the day's end.
