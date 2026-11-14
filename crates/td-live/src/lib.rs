@@ -5,8 +5,8 @@
 //! resumes after a restart by replaying that log without touching the venue. Make one with
 //! [`LiveSession::create`] (it must start flat), reopen it with [`LiveSession::open`], and run it
 //! with [`run_guarded`], which runs it with its stop rules enforced (the `guard` module) until it
-//! ends. The library never reads the environment: the caller builds the order route's `Client`. The `td-live` command ([`cli`]) is
-//! the only thing in the app that starts a live session.
+//! ends. The library never reads the environment: the caller builds the order route's `Client`.
+//! The `td-live` command ([`cli`]) is the only thing in the app that starts a live session.
 //!
 //! The broker is a [`td_engine::Broker`] that sends a session's orders through the order route
 //! (`td-orders`) to a venue's demo-trading environment and reports what the venue did, so the
@@ -73,7 +73,10 @@
 //!   reduce-only stop protecting a fill the venue confirmed in the same call or bar that raised
 //!   the fault; never a close at market and never a resize. The fault is kept in the record and
 //!   restored when the record is replayed, and nothing in this crate clears it. The owner decides
-//!   what happens next.
+//!   what happens next. The stop guard's flatten does not go through the broker: a fired limit
+//!   and the owner's `td-live flatten` cancel and close through the order route after a fault,
+//!   while an order carried over a restart is unresolved, and after a bar the venue could not be
+//!   read on (the `guard` module).
 //! - **Records.** A [`BrokerRecord`] names the session prefix, instrument and timeframe it was
 //!   made under; a broker with any of the three different, or one that has already acted live,
 //!   faults when handed it. A record holding a value no live run makes (a number that is not
