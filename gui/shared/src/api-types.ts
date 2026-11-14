@@ -1095,8 +1095,9 @@ profit_target: number,
  */
 second_target?: number | null, 
 /**
- * The fewest trading days each phase must hold before its target can pass it: days on
- * which the strategy filled an order, counted within the phase. 0 sets no minimum.
+ * The fewest trading days each phase must hold before its target can pass it: days that
+ * pass `trading_day`'s test (without one, days on which the strategy filled an order),
+ * counted within the phase. 0 sets no minimum.
  */
 min_trading_days?: number, 
 /**
@@ -1104,6 +1105,21 @@ min_trading_days?: number,
  * this share of the phase's total profit. `None` sets no such rule.
  */
 best_day_share?: number | null, 
+/**
+ * The day cap: the most one day counts toward an evaluation phase's target, as a share of
+ * that phase's target. A winning day counts its profit up to `day_target_share *
+ * profit_target` (or `second_target` in the second phase); a losing day counts its whole
+ * loss; the phase passes once the counted profit reaches the target. Profit above the cap
+ * stays in the account, and the loss limits act on the account. Independent of
+ * `best_day_share`: with both set, both must hold. The funded account has no such rule.
+ * `None` counts every day in full.
+ */
+day_target_share?: number | null, 
+/**
+ * The firm's own test for a trading day, which counts for `min_trading_days` and for the
+ * funded account's `days_to_first_payout`. `None` counts any day with a fill.
+ */
+trading_day?: TradingDayTest | null, 
 /**
  * For a trailing drawdown, the level the floor stops rising at, as a fraction of the starting
  * balance above the start: 0 stops it at the starting balance. `None` lets it trail for ever.
@@ -1139,8 +1155,8 @@ refund_fee_with_first_payout: boolean,
 profit_split: number, 
 /**
  * The trading days the funded account must hold before its first payout: the first payout
- * may be asked for at the close of the day on which the account has filled an order on this
- * many days.
+ * may be asked for at the close of the day on which the account has held this many trading
+ * days, as the firm's `trading_day` test counts them (without one, days with a fill).
  */
 days_to_first_payout: number, 
 /**
@@ -1184,6 +1200,36 @@ funded_size: number,
  * and 1: 0.5 asks what an attempt is worth if the edge is half what the test shows.
  */
 reduced_edge_factor: number, };
+
+/**
+ * A firm's test for a trading day. A day counts when one of its fills passes the test; each fill
+ * is judged on its own, so several small closes on one day do not add up to a large one. With
+ * every field off, any fill passes, as without a test.
+ *
+ * A fill closes a trade when it reduces a position: the closed quantity is the part of the
+ * position it takes off, so a partial close counts by its own size, and a fill that flips the
+ * position closes all of the old one (and opens a new one, which is not a close). Positions and
+ * their average entry prices are tracked per instrument across the fills.
+ */
+export type TradingDayTest = { 
+/**
+ * Only a closing fill can count, on the day the close happens: a day that only opens or
+ * adds to a position is not a trading day. Setting either smallest value below implies it.
+ */
+needs_close?: boolean, 
+/**
+ * The smallest value of the closed part of the trade, as a share of the starting balance:
+ * the closed quantity times the position's average entry price, in the account currency at
+ * that price, at the size the strategy was tested at. Since it is judged at that size, a
+ * rule that sets it is refused with an `attempt` whose `evaluation_size` or `funded_size`
+ * is not 1, until the flags are built per size. `None` sets no smallest size.
+ */
+min_trade_size?: number | null, 
+/**
+ * The smallest profit or loss of the closed part, as a share of its own value, before fees:
+ * `|exit price - average entry price| / average entry price`. `None` sets no smallest move.
+ */
+min_trade_move?: number | null, };
 
 export type DrawdownMode = "static" | "trailing";
 

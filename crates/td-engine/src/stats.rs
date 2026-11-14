@@ -431,6 +431,11 @@ pub struct PropFirmSpec {
     /// A phase passes only once its largest single day's profit is at most this share of the
     /// phase's total profit. `None` sets no such rule.
     pub best_day_share: Option<f64>,
+    /// The most one day counts toward a phase's target, as a share of that target: a winning
+    /// day counts `min(profit, day_target_share * target)`, a losing day its whole loss, and the
+    /// phase passes only once the counted profit reaches its target. The loss limits still act
+    /// on the balance. Evaluation only. `None` counts every day in full.
+    pub day_target_share: Option<f64>,
     /// For a trailing drawdown, the level the floor stops rising at, as a fraction of the start
     /// above the start: the floor is at most `start * (1 + trailing_lock)`. `None` lets it trail.
     pub trailing_lock: Option<f64>,
@@ -488,6 +493,11 @@ impl PropFirmSpec {
                 "the best-day share must be above 0 and at most 1",
             ));
         }
+        if !self.day_target_share.is_none_or(|s| s > 0.0 && s <= 1.0) {
+            return Err(StatsError::InvalidSpec(
+                "the share of the target one day may count must be above 0 and at most 1",
+            ));
+        }
         if !self.trailing_lock.is_none_or(|l| l >= 0.0 && l.is_finite()) {
             return Err(StatsError::InvalidSpec(
                 "the trailing floor's lock must be a finite number of at least 0",
@@ -540,6 +550,11 @@ fn walk_path(spec: &PropFirmSpec, returns: impl Iterator<Item = f64>) -> Option<
 /// that `traded` (one flag per return) marks. Returns the day (counted from 1 along `returns`) the
 /// last phase passed, or `None` after a breach or once `returns` run out.
 ///
+/// With `spec.day_target_share`, the target is met by the counted profit: the balance less the
+/// profit no day was allowed to count (each winning day's profit above the cap). A day that
+/// crosses the target counts up to the cap like any other, so it passes the phase only if what it
+/// counts is enough. Without a capped day the counted profit is the balance's profit exactly.
+///
 /// The limits are checked before the target each day. No day can do both from daily closes: a
 /// breach needs a losing day, and a losing day before the target is reached ends below it.
 ///
@@ -555,6 +570,8 @@ fn walk_evaluation(
     let mut later = spec.second_target;
     let mut target = spec.target;
     let (mut equity, mut peak, mut best, mut trading_days) = (1.0f64, 1.0f64, 0.0f64, 0usize);
+    // The profit above the day cap, which stays in the balance but does not count.
+    let mut uncounted = 0.0f64;
     for ((day, &r), &t) in (1..).zip(returns).zip(traded) {
         let prev = equity;
         equity *= 1.0 + size * r;
@@ -565,14 +582,20 @@ fn walk_evaluation(
             return None;
         }
         best = best.max(equity - prev);
+        if let Some(share) = spec.day_target_share {
+            let cap = share * target;
+            if equity - prev > cap {
+                uncounted += equity - prev - cap;
+            }
+        }
         let consistent = spec
             .best_day_share
             .is_none_or(|share| best <= share * (equity - 1.0));
-        if equity >= 1.0 + target && trading_days >= spec.min_days && consistent {
+        if equity - uncounted >= 1.0 + target && trading_days >= spec.min_days && consistent {
             match later.take() {
                 Some(next) => {
                     target = next;
-                    (equity, peak, best, trading_days) = (1.0, 1.0, 0.0, 0);
+                    (equity, peak, best, trading_days, uncounted) = (1.0, 1.0, 0.0, 0, 0.0);
                 }
                 None => return Some(day),
             }
@@ -1181,6 +1204,7 @@ mod tests {
             second_target: None,
             min_days: 0,
             best_day_share: None,
+            day_target_share: None,
             trailing_lock: None,
             daily_loss_limit: 0.05,
             max_drawdown: 0.10,
@@ -1323,6 +1347,14 @@ mod tests {
                 ..challenge(5)
             },
             PropFirmSpec {
+                day_target_share: Some(0.0),
+                ..challenge(5)
+            },
+            PropFirmSpec {
+                day_target_share: Some(1.5),
+                ..challenge(5)
+            },
+            PropFirmSpec {
                 trailing_lock: Some(-0.1),
                 ..challenge(5)
             },
@@ -1451,6 +1483,109 @@ mod tests {
         assert_eq!(passes(&unlimited(10), &path), Some(1));
         assert_eq!(passes(&half, &path), Some(5));
         assert_eq!(passes(&half, &path[..4]), None);
+    }
+
+    #[test]
+    fn the_day_cap_changes_nothing_while_no_day_makes_more_than_it() {
+        // symmetric() plus 0.002 a day: no day moves more than 0.0082, and a phase ends by the day
+        // its balance first reaches its target, so no day makes more than 0.0082 * 1.11 = 0.0091.
+        // A 0.2 share caps a day at 0.02 of the 10% target and 0.01 of the second phase's 5%, so
+        // nothing is capped and the odds come out exactly as with no cap.
+        let returns: Vec<f64> = symmetric().iter().map(|r| r + 0.002).collect();
+        let flags = every_day(&returns);
+        for spec in [
+            challenge(90),
+            PropFirmSpec {
+                second_target: Some(0.05),
+                ..challenge(90)
+            },
+        ] {
+            let off = prop_firm_odds(&returns, &flags, &spec).unwrap();
+            let capped = PropFirmSpec {
+                day_target_share: Some(0.2),
+                ..spec
+            };
+            assert_eq!(prop_firm_odds(&returns, &flags, &capped).unwrap(), off);
+            assert!(off.pass > 0.0, "{off:?}");
+            // A cap that binds holds passes back.
+            let tight = PropFirmSpec {
+                day_target_share: Some(0.02),
+                ..spec
+            };
+            assert!(prop_firm_odds(&returns, &flags, &tight).unwrap().pass < off.pass);
+        }
+    }
+
+    #[test]
+    fn a_day_cap_of_the_whole_target_passes_in_one_day_and_of_half_needs_a_second_winning_day() {
+        // A 12.5% target; day 1 makes 25%. All exact in binary.
+        let target = PropFirmSpec {
+            target: 0.125,
+            ..unlimited(10)
+        };
+        let cap = |share| PropFirmSpec {
+            day_target_share: Some(share),
+            ..target
+        };
+        let path = [0.25, 0.0, 0.0, 0.25];
+        assert_eq!(passes(&target, &path), Some(1));
+        // A share of 1: day 1 counts 0.125, the whole target.
+        assert_eq!(passes(&cap(1.0), &path), Some(1));
+        // A share of 0.5: day 1 counts 0.0625, the flat days nothing, and day 4 the other 0.0625.
+        assert_eq!(passes(&cap(0.5), &path), Some(4));
+        assert_eq!(passes(&cap(0.5), &path[..3]), None);
+        // A losing day counts in full. Day 2 loses 1/16 of 1.25, 0.078125, so after day 2 the
+        // counted profit is 0.0625 - 0.078125 = -0.015625; each later +25% day counts 0.0625:
+        // 0.046875, 0.109375 and 0.171875, so the pass comes on day 5, not on day 3 as it would if
+        // the loss did not count.
+        let loss = [0.25, -0.0625, 0.25, 0.25, 0.25];
+        assert_eq!(passes(&cap(0.5), &loss), Some(5));
+        assert_eq!(passes(&cap(0.5), &loss[..4]), None);
+    }
+
+    #[test]
+    fn the_day_cap_counts_less_than_the_balance_and_stands_apart_from_the_best_day_rule() {
+        // +6%, +2%, +2% against a 10% target: the balance reaches 1.102824 on day 3. With a cap of
+        // 0.4 of the target, day 1 counts 0.04 and the two others their 0.0212 and 0.021624, 0.0828
+        // in all: not yet passed, whatever the best day's share.
+        let cap = PropFirmSpec {
+            day_target_share: Some(0.4),
+            ..unlimited(10)
+        };
+        let path = [0.06, 0.02, 0.02, 0.02];
+        assert_eq!(passes(&unlimited(10), &path[..3]), Some(3));
+        assert_eq!(passes(&cap, &path[..3]), None);
+        // Another +2% counts 0.0221: 0.1049 passes. The best-day rule at 0.4 still holds the pass
+        // back (0.4 of the 0.1249 profit is under day 1's 0.06), so with both set, neither passes.
+        assert_eq!(passes(&cap, &path), Some(4));
+        let best = PropFirmSpec {
+            best_day_share: Some(0.4),
+            ..unlimited(10)
+        };
+        assert_eq!(passes(&best, &path), None);
+        let both = PropFirmSpec {
+            best_day_share: Some(0.4),
+            ..cap
+        };
+        assert_eq!(passes(&both, &path), None);
+    }
+
+    #[test]
+    fn each_phase_counts_from_zero_against_its_own_target() {
+        // 12.5% then 6.25%, each day capped at half its phase's target. All exact in binary:
+        //   days 1-2  +25% each   count 0.0625 each: phase 1 passes on day 2
+        //   day 3     +6.25%      1.0625, counts 0.03125 of phase 2's 0.0625
+        //   day 4     +6.25%      1.12890625, counts another 0.03125: phase 2 passes
+        // With phase 1's cap, day 3 would pass phase 2; with phase 1's uncounted profit carried
+        // over, phase 2 would never pass.
+        let two = PropFirmSpec {
+            target: 0.125,
+            second_target: Some(0.0625),
+            day_target_share: Some(0.5),
+            ..unlimited(10)
+        };
+        assert_eq!(passes(&two, &[0.25, 0.25, 0.0625, 0.0625]), Some(4));
+        assert_eq!(passes(&two, &[0.25, 0.25, 0.0625]), None);
     }
 
     #[test]

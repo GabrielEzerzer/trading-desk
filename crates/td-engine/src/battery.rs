@@ -62,10 +62,13 @@ use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde::{Deserialize, Serialize};
-use td_core::{Candle, Carry, FeeSchedule, Fill, Instrument, Millis, Timeframe};
+use td_core::{
+    AccountCurrency, Candle, Carry, FeeSchedule, Fill, Instrument, InstrumentId, Millis, Timeframe,
+};
 
 use crate::metrics::{self, DAY_MS, EquitySeries};
 use crate::plan::check_start_offsets;
+use crate::portfolio::next_position;
 use crate::risk::{self, DayRollover};
 use crate::rng::derive_seed;
 use crate::runner::select_bars;
@@ -76,7 +79,7 @@ use crate::stats::{
 use crate::strategies::direction;
 use crate::tester::stitched_headline;
 use crate::verdict::{
-    IntegrityInputs, OosIntegrityInputs, evaluate_integrity, evaluate_oos_integrity,
+    IntegrityInputs, OosIntegrityInputs, TradingDayTest, evaluate_integrity, evaluate_oos_integrity,
 };
 use crate::{
     BacktestConfig, BacktestResult, Criterion, Direction, DrawdownMode, EngineError, EquityPoint,
@@ -654,14 +657,24 @@ pub fn run_battery(
             attempt,
         } = rule
         {
-            // A firm counts trading days, not calendar days: the days of `daily` with a fill.
+            // A firm counts trading days, not calendar days: the days of `daily` with a fill that
+            // passes the firm's test, or with any fill without one.
             let step = plan.timeframe.duration_ms();
-            let traded = traded_days(&series, &wf.fills, step, daily.len());
+            let traded = traded_days(
+                &series,
+                &wf.fills,
+                step,
+                daily.len(),
+                firm.trading_day.as_ref(),
+                cash,
+                base.account_currency,
+            );
             let spec = PropFirmSpec {
                 target: firm.profit_target,
                 second_target: firm.second_target,
                 min_days: firm.min_trading_days as usize,
                 best_day_share: firm.best_day_share,
+                day_target_share: firm.day_target_share,
                 trailing_lock: firm.trailing_floor_lock,
                 daily_loss_limit: firm.daily_loss,
                 max_drawdown: firm.max_drawdown,
@@ -1223,15 +1236,51 @@ fn daily_returns(series: &EquitySeries) -> Vec<f64> {
 /// falls on, by [`metrics::daily_equity`]'s boundaries (UTC days, a close at exactly 00:00 ending
 /// the day before): the day whose return it moved.
 ///
-/// shortcut: a day with any fill counts as a trading day, so a firm's own definition (a closed
-/// trade, a smallest trade size) is not modelled; upgrade when a plan's firm needs it.
-fn traded_days(series: &EquitySeries, fills: &[Fill], step: Millis, days: usize) -> Vec<bool> {
+/// With a firm's `test`, only a fill that passes it marks its day ([`TradingDayTest`]). The
+/// fills are replayed per instrument with [`next_position`], the portfolio's rule, to know what
+/// each one closes and at what average entry; `cash`, the starting balance, and `account`, the
+/// account currency, turn a closed trade's value into a share of the balance.
+///
+/// shortcut: one set of flags, at the size the strategy was tested at, serves the evaluation and
+/// the funded account, so `VerdictRule::validate` refuses a `min_trade_size` with an attempt whose
+/// `evaluation_size` or `funded_size` is not 1; build flags per size to lift that refusal, once a
+/// plan needs a smallest trade size and another size together.
+///
+/// shortcut: a walk-forward test window closes its open position at its end, and that fill can
+/// pass the test, so up to one day per window is a trading day the strategy would not have had
+/// if it had held on; skip those fills once a fill says it is a window's close-out.
+fn traded_days(
+    series: &EquitySeries,
+    fills: &[Fill],
+    step: Millis,
+    days: usize,
+    test: Option<&TradingDayTest>,
+    cash: f64,
+    account: AccountCurrency,
+) -> Vec<bool> {
     let mut traded = vec![false; days];
     let Some(first) = series.times.first() else {
         return traded;
     };
     let first_day = first.div_euclid(DAY_MS);
+    // Each instrument's signed position and average entry price.
+    let mut positions: HashMap<&InstrumentId, (f64, f64)> = HashMap::new();
     for f in fills {
+        let counts = test.is_none_or(|test| {
+            let (pos, avg) = positions.entry(&f.instrument).or_insert((0.0, 0.0));
+            let dq = f.side.sign() * f.qty;
+            // A fill against the position closes up to all of it; any rest opens a new one.
+            let close = (*pos != 0.0 && dq.signum() != pos.signum()).then(|| {
+                let closed = f.qty.min(pos.abs());
+                let value = account.from_quote(closed * *avg, *avg) / cash;
+                (value, (f.price - *avg).abs() / *avg)
+            });
+            (*pos, *avg) = next_position(*pos, *avg, dq, f.price);
+            test.passes(close)
+        });
+        if !counts {
+            continue;
+        }
         let day = (f.time + step - 1).div_euclid(DAY_MS) - first_day;
         if let Some(t) = usize::try_from(day).ok().and_then(|d| traded.get_mut(d)) {
             *t = true;
@@ -1880,6 +1929,139 @@ mod tests {
         assert_ne!(r.drawdown_bootstrap, drawn(SEED_DAILY_BOOTSTRAP));
     }
 
+    /// A fill of `qty` at `price` at 10:00 UTC on day `day` of [`flagged_days`]' series.
+    fn day_fill(day: i64, side: Side, qty: f64, price: f64) -> Fill {
+        Fill {
+            order_id: td_core::OrderId(0),
+            instrument: test_instrument().id,
+            side,
+            time: day * DAY_MS + 10 * 3_600_000,
+            price,
+            qty,
+            fee: 0.0,
+            liquidity: td_core::Liquidity::Taker,
+        }
+    }
+
+    /// The days, counted from 1, that `traded_days` marks for `fills` on hourly bars, over five
+    /// days that start at day 1's midnight, on a quote account of 10,000.
+    fn flagged_days(fills: &[Fill], test: Option<TradingDayTest>) -> Vec<usize> {
+        let series = EquitySeries {
+            times: vec![DAY_MS],
+            values: vec![10_000.0],
+        };
+        let traded = traded_days(
+            &series,
+            fills,
+            3_600_000,
+            5,
+            test.as_ref(),
+            10_000.0,
+            td_core::AccountCurrency::Quote,
+        );
+        (1..=5).filter(|&d| traded[d - 1]).collect()
+    }
+
+    fn day_test(
+        needs_close: bool,
+        size: Option<f64>,
+        moved: Option<f64>,
+    ) -> Option<TradingDayTest> {
+        Some(TradingDayTest {
+            needs_close,
+            min_trade_size: size,
+            min_trade_move: moved,
+        })
+    }
+
+    const NO_DAYS: [usize; 0] = [];
+
+    #[test]
+    fn a_firms_trading_day_test_counts_only_the_closing_fill_of_a_large_enough_trade() {
+        // Buy 1 at 1,000 on day 1 and sell it at 1,010 on day 3: a trade worth 1,000, 10% of the
+        // balance, that moved 1%.
+        let fills = [
+            day_fill(1, Side::Buy, 1.0, 1_000.0),
+            day_fill(3, Side::Sell, 1.0, 1_010.0),
+        ];
+        assert_eq!(flagged_days(&fills, None), [1, 3]);
+        // A test with nothing set counts any fill, as no test does.
+        assert_eq!(flagged_days(&fills, day_test(false, None, None)), [1, 3]);
+        assert_eq!(flagged_days(&fills, day_test(true, None, None)), [3]);
+        // A smallest size alone also needs the close; 10% meets 0.1 and misses 0.2.
+        assert_eq!(flagged_days(&fills, day_test(false, Some(0.1), None)), [3]);
+        assert_eq!(
+            flagged_days(&fills, day_test(false, Some(0.2), None)),
+            NO_DAYS
+        );
+    }
+
+    #[test]
+    fn a_close_that_moves_less_than_the_smallest_move_is_not_a_trading_day() {
+        let at = |price| {
+            [
+                day_fill(1, Side::Buy, 1.0, 1_000.0),
+                day_fill(3, Side::Sell, 1.0, price),
+            ]
+        };
+        let test = day_test(false, None, Some(0.02));
+        // A 1% gain misses a 2% smallest move; a 3% loss meets it, as a loss counts by its size.
+        assert_eq!(flagged_days(&at(1_010.0), test), NO_DAYS);
+        assert_eq!(flagged_days(&at(970.0), test), [3]);
+        assert_eq!(
+            flagged_days(&at(1_010.0), day_test(false, None, Some(0.005))),
+            [3]
+        );
+    }
+
+    #[test]
+    fn a_partial_close_counts_by_the_part_closed_and_each_close_on_its_own() {
+        // Buy 2 at 1,000, then close 0.5 on day 2 (worth 5% of the balance) and 1.5 on day 3
+        // (15%). Against a 10% smallest size only day 3 counts; the whole position, 20%, would
+        // have passed on day 2.
+        let fills = [
+            day_fill(1, Side::Buy, 2.0, 1_000.0),
+            day_fill(2, Side::Sell, 0.5, 1_010.0),
+            day_fill(3, Side::Sell, 1.5, 1_010.0),
+        ];
+        assert_eq!(flagged_days(&fills, day_test(false, Some(0.1), None)), [3]);
+        assert_eq!(
+            flagged_days(&fills, day_test(false, Some(0.04), None)),
+            [2, 3]
+        );
+        // Two closes of 5% on one day are two small closes, not one of 10%.
+        let split = [
+            day_fill(1, Side::Buy, 1.0, 1_000.0),
+            day_fill(2, Side::Sell, 0.5, 1_010.0),
+            day_fill(2, Side::Sell, 0.5, 1_010.0),
+        ];
+        assert_eq!(
+            flagged_days(&split, day_test(false, Some(0.08), None)),
+            NO_DAYS
+        );
+    }
+
+    #[test]
+    fn a_fill_that_flips_the_position_closes_the_old_one_and_opens_a_new_one() {
+        // Long 1 at 1,000; on day 2 sell 3 at 1,010, which closes the long (worth 10%, moved 1%)
+        // and opens a short of 2 at 1,010; on day 3 buy 2 at 990, which closes the short (worth
+        // 20.2%, moved 20/1,010 = 1.98%).
+        let fills = [
+            day_fill(1, Side::Buy, 1.0, 1_000.0),
+            day_fill(2, Side::Sell, 3.0, 1_010.0),
+            day_fill(3, Side::Buy, 2.0, 990.0),
+        ];
+        assert_eq!(flagged_days(&fills, day_test(true, None, None)), [2, 3]);
+        // The flip closes 1, not 3: under a 15% smallest size only day 3 counts.
+        assert_eq!(flagged_days(&fills, day_test(false, Some(0.15), None)), [3]);
+        // The short was entered at the flip's price: its 1.98% meets 1.95%, which day 2's 1%
+        // misses. Measured from the long's 1,000 it would have moved 1%.
+        assert_eq!(
+            flagged_days(&fills, day_test(false, None, Some(0.0195))),
+            [3]
+        );
+    }
+
     /// A prop firm's minimum counts only the days on which the walk-forward filled an order: the
     /// battery flags the days of its fills, on the daily returns' own days, and runs the odds on
     /// those flags rather than counting every day.
@@ -1895,6 +2077,8 @@ mod tests {
             second_target: None,
             min_trading_days: 20,
             best_day_share: None,
+            day_target_share: None,
+            trading_day: None,
             trailing_floor_lock: None,
         };
         let rule = VerdictRule::PropFirm {
@@ -1916,7 +2100,15 @@ mod tests {
         let series = EquitySeries::new(cash, &wf.equity, plan.timeframe);
         let daily = daily_returns(&series);
         let step = plan.timeframe.duration_ms();
-        let traded = traded_days(&series, &wf.fills, step, daily.len());
+        let traded = traded_days(
+            &series,
+            &wf.fills,
+            step,
+            daily.len(),
+            None,
+            cash,
+            td_core::AccountCurrency::Quote,
+        );
         // A four-hour bar lies inside one UTC day, so a fill's day is the day its bar opened.
         let first = series.times[0].div_euclid(DAY_MS);
         let filled: BTreeSet<usize> = wf
@@ -1940,6 +2132,7 @@ mod tests {
                 second_target: None,
                 min_days: firm.min_trading_days as usize,
                 best_day_share: None,
+                day_target_share: None,
                 trailing_lock: None,
                 daily_loss_limit: firm.daily_loss,
                 max_drawdown: firm.max_drawdown,

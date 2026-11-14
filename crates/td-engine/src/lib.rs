@@ -90,7 +90,7 @@ pub use trades::{
 pub use verdict::{
     AttemptTerms, Comparison, Criterion, DrawdownMode, EvidenceInputs, FirmLimits, HighRiskLimits,
     IntegrityInputs, KindInputs, Layer, LoosenedLimit, MAX_DROPPED_SHARE, OosIntegrityInputs,
-    Outcome, PortfolioBenchmark, PortfolioLimits, PropFirmLimits, RuleKind, TOO_GOOD_SHARPE, Unit,
-    Verdict, VerdictRule, VerdictState, combine, evaluate, evaluate_evidence, evaluate_integrity,
-    evaluate_oos_integrity,
+    Outcome, PortfolioBenchmark, PortfolioLimits, PropFirmLimits, RuleKind, TOO_GOOD_SHARPE,
+    TradingDayTest, Unit, Verdict, VerdictRule, VerdictState, combine, evaluate, evaluate_evidence,
+    evaluate_integrity, evaluate_oos_integrity,
 };
