@@ -82,7 +82,7 @@ const FILES: [&str; 9] = [
 /// The most warnings the status keeps.
 const KEEP_WARNINGS: usize = 100;
 /// The longest warning, fault or panic text kept, in characters.
-const MAX_TEXT: usize = 1000;
+pub(crate) const MAX_TEXT: usize = 1000;
 /// The pause before a failed rename of a rewritten file is tried once more.
 const RENAME_RETRY: Duration = Duration::from_millis(200);
 const NOT_STARTED: &str = "created; not started";
@@ -1168,7 +1168,7 @@ fn trim_warnings(warnings: &mut Vec<String>) {
 }
 
 /// `text` with control characters replaced by spaces, cut to `max` characters.
-fn clean(text: &str, max: usize) -> String {
+pub(crate) fn clean(text: &str, max: usize) -> String {
     let mut out: String = text
         .chars()
         .take(max)

@@ -229,7 +229,7 @@ pub fn read_record(dir: &Path) -> Option<VerdictRecord> {
 /// instrument's, so adding, removing or reordering another instrument, changing another
 /// instrument's slippage or changing the split leaves this instrument's verdict current. A field that is missing or not
 /// shaped as expected is left as it is, so the plan compares unequal to the registered one.
-fn instrument_view(mut plan: Value, instrument: &Value) -> Value {
+pub fn instrument_view(mut plan: Value, instrument: &Value) -> Value {
     if let Some(fields) = plan.as_object_mut() {
         fields.remove("out_of_sample");
         if let Some(instruments) = fields.get_mut("instruments") {
@@ -453,8 +453,9 @@ pub struct LinkState {
 }
 
 impl LinkState {
-    /// `link`'s checks for a session of `strategy` on `instrument`, against `strategies`, the
-    /// server's registered strategies that `GET /verdicts` also reads.
+    /// `link`'s checks for a session of `strategy` on `instrument`, against `strategies`: the
+    /// strategies registered in the process that makes the checks, the server for a paper session
+    /// and the `td-live` build that runs `status` for a live one.
     pub fn of(
         link: &SessionLink,
         strategy: &str,

@@ -2285,9 +2285,9 @@ fn start_links_the_session_to_the_latest_verdict_or_the_one_named_and_status_che
     assert_eq!(link["plan"], serde_json::to_value(&entry.plan).unwrap());
     assert_eq!(link["rule"], serde_json::to_value(entry.rule).unwrap());
 
-    // The verdict's engine and code are this engine's and the strategy's. The strategy's plan does
-    // not test this venue's perpetual, so the plan check fails and the link is stale, as the
-    // verdict list would show it.
+    // The session started with the code, plan and rule the verdict judged. The verdict's engine
+    // and code are this build's. The strategy's plan does not test this venue's perpetual, so the
+    // plan check fails and the link is stale, as the verdict list would show it.
     let status = link_status(&rig, &feed, "latest");
     assert!(
         status.contains(&format!(
@@ -2297,12 +2297,41 @@ fn start_links_the_session_to_the_latest_verdict_or_the_one_named_and_status_che
     );
     assert!(
         status.contains(
-            "link checks against the verdict: engine revision matches, plan and rule does not \
-             match, code matches"
+            "link checks of what the session started with against the verdict: plan and rule \
+             matches, code matches\n"
         ),
         "{status}"
     );
-    assert!(status.contains("link: stale"), "{status}");
+    assert!(
+        status.contains(
+            "link checks of the verdict against the strategy as this td-live build has it: \
+             engine revision matches, plan and rule does not match, code matches"
+        ),
+        "{status}"
+    );
+    assert!(
+        status.contains(
+            "link: stale; what the session started with, or the code, plan or engine of the \
+             strategy as this td-live build has it, may not be what that verdict judged; a \
+             running session keeps the code it was started with until it is restarted"
+        ),
+        "{status}"
+    );
+
+    // A session started with other code than the verdict judged shows it from its saved link,
+    // whatever this build's code is.
+    let mut config = rig.config_json("latest");
+    config["link"]["code_hash"] = "0000000000000000".into();
+    rig.write_config_json("latest", &config);
+    let status = link_status(&rig, &feed, "latest");
+    assert!(
+        status.contains(
+            "against the verdict: plan and rule matches, code does not match\nlink checks of the \
+             verdict against the strategy as this td-live build has it: engine revision matches, \
+             plan and rule does not match, code matches"
+        ),
+        "{status}"
+    );
 
     // An older engine revision shows in its own check.
     let mut config = rig.config_json("latest");
@@ -2352,7 +2381,9 @@ fn a_link_without_a_verdict_is_current_until_the_code_or_plan_it_started_with_ch
         status,
         format!(
             "link: started with no saved verdict of {LINKED} on {on}; the strategy's code hash was {}\n\
-             link checks against what the session started with: plan and rule matches, code matches\n\
+             link checks of what the session started with against the strategy as this td-live \
+             build has it: plan and rule matches, code matches; no engine check is made, since the \
+             link saves no engine revision\n\
              link: current",
             td_engine::code_hash(LINKED).unwrap()
         )
@@ -2364,7 +2395,12 @@ fn a_link_without_a_verdict_is_current_until_the_code_or_plan_it_started_with_ch
     rig.write_config_json("unjudged", &edited);
     let status = link_status(&rig, &feed, "unjudged");
     assert!(
-        status.contains("plan and rule matches, code does not match\nlink: stale; the code or plan may have changed since the session started"),
+        status.contains(
+            "plan and rule matches, code does not match; no engine check is made, since the link \
+             saves no engine revision\nlink: stale; the code or plan of the strategy as this \
+             td-live build has it may not be what the session started with; a running session \
+             keeps the code it was started with until it is restarted"
+        ),
         "{status}"
     );
 
@@ -2377,9 +2413,10 @@ fn a_link_without_a_verdict_is_current_until_the_code_or_plan_it_started_with_ch
     rig.write_config_json("unjudged", &replanned);
     let status = link_status(&rig, &feed, "unjudged");
     assert!(
-        status.contains("plan and rule does not match, code matches\nlink: stale"),
+        status.contains("plan and rule does not match, code matches; no engine check"),
         "{status}"
     );
+    assert!(status.contains("\nlink: stale; the code or plan"), "{status}");
 }
 
 #[test]
@@ -2509,6 +2546,80 @@ fn a_verdict_named_for_a_strategy_that_is_not_registered_is_refused_before_anyth
     );
     assert_eq!(rig.mock.requests().len(), requests);
     assert!(!rig.data().join("live").exists());
+}
+
+/// Text from the data folder reaches the owner's terminal without control characters, so a file
+/// another person or program wrote cannot drive it: a run record's text in an error, and the link
+/// `status` shows from a session's config.
+#[test]
+fn text_from_the_data_folder_reaches_the_terminal_without_control_characters() {
+    let rig = Rig::new();
+    let feed = rig.feed();
+    let marked = InstrumentId {
+        symbol: "ETH\u{1b}[2JUSDT".into(),
+        ..instrument().id
+    };
+    rig.save_verdict(NEWER, &marked, Vec::new());
+    let (code, text) = rig.start_linked(&feed, "refused", &["--verdict", NEWER]);
+    assert_eq!(code, 1, "{text}");
+    assert!(!text.chars().any(char::is_control), "{text:?}");
+    assert!(text.contains(" on bybit:ETH [2JUSDT:perpetual, not of "), "{text}");
+
+    rig.save_verdict(OLDER, &instrument().id, Vec::new());
+    let (code, text) = rig.start_linked(&feed, "marked", &[]);
+    assert_eq!(code, 0, "{text}");
+    let mut config = rig.config_json("marked");
+    config["strategy"] = "sma\u{1b}[2Jcross".into();
+    config["instrument"]["id"]["symbol"] = "BTC\u{7}USDT".into();
+    config["link"]["code_hash"] = "\u{1b}]0;title\u{7}".into();
+    config["link"]["verdict"]["run_id"] = "1700000000000-\u{1b}[31m".into();
+    rig.write_config_json("marked", &config);
+    let (code, text) = rig.td_live(&feed, &["status", "--id", "marked"]);
+    assert_eq!(code, 0, "{text}");
+    assert!(
+        !text.chars().any(|c| c.is_control() && c != '\n'),
+        "{text:?}"
+    );
+    assert!(
+        text.contains(
+            "link: started from verdict 1700000000000- [31m of sma [2Jcross on \
+             bybit:BTC USDT:perpetual: "
+        ),
+        "{text}"
+    );
+    assert!(text.contains("the strategy's code hash was  ]0;title \n"), "{text}");
+}
+
+/// `status` reads a session's config only from a plain folder and file, as `compare` and a resume
+/// do.
+#[test]
+fn status_refuses_a_link_in_place_of_the_session_folder_or_its_config() {
+    let rig = Rig::new();
+    let feed = rig.feed();
+    drop(rig.create("real", config(0, 99, false)).expect("creates"));
+    let refused = |id: &str| {
+        let (code, text) = rig.td_live(&feed, &["status", "--id", id]);
+        assert_eq!(code, 1, "{text}");
+        assert!(text.starts_with("error: "), "nothing before it: {text}");
+        assert!(text.contains("is a link or reparse point"), "{text}");
+    };
+    match link_dir(
+        &live_dir(rig.data(), "real"),
+        &live_dir(rig.data(), "linked"),
+    ) {
+        Ok(()) => refused("linked"),
+        Err(why) => println!("skipped the folder link: it could not be made: {why}"),
+    }
+
+    let saved = rig.path("real", "config.json");
+    let outside = rig.data().join("elsewhere");
+    fs::create_dir_all(&outside).expect("folder");
+    let target = outside.join("config.json");
+    fs::rename(&saved, &target).expect("move the config out");
+    match link_file(&target, &saved) {
+        Ok(()) => refused("real"),
+        Err(why) => println!("skipped the config link: it could not be made: {why}"),
+    }
 }
 
 // ---- `td-live compare` ----

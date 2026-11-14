@@ -84,7 +84,8 @@ pub use runner::{
 };
 pub use saved_verdicts::{
     LinkState, LinkedVerdict, RECORD_FILE, RUNS_DIR, SessionLink, VERDICT_FILE, VerdictError,
-    VerdictRecord, VerdictSummary, code_matches, latest_verdicts, read_record, session_link,
+    VerdictRecord, VerdictSummary, code_matches, instrument_view, latest_verdicts, read_record,
+    session_link,
 };
 pub use session::{
     CLOSE_OUT_TAG, EquityPoint, LIQUIDATION_TAG, MAINTENANCE_MARGIN_RATE, Session, SessionConfig,
