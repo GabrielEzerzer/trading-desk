@@ -912,6 +912,40 @@ fn resume(rig: &Rig, id: &str, feed: &Feed) -> (u8, String) {
     td_live(rig, feed, &["resume", "--id", id])
 }
 
+/// Runs `cli` on this rig until the guard's first check has passed, stops it as Ctrl-C would, and
+/// returns its exit code and output.
+fn until_checked(rig: &Rig, feed: &Feed, cli: Cli) -> (u8, String) {
+    let env = rig.env(feed, quick());
+    let stop = env.stop.clone();
+    let lines = Arc::new(Mutex::new(Vec::<String>::new()));
+    let out = lines.clone();
+    let thread = std::thread::spawn(move || {
+        execute(cli, &env, &mut |l| out.lock().unwrap().push(l.to_string()))
+    });
+    let text = || lines.lock().unwrap().join("\n");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !text().contains("check: no stop fired") {
+        assert!(
+            Instant::now() < deadline && !thread.is_finished(),
+            "{}",
+            text()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    stop.stop();
+    let code = thread.join().expect("the command's thread");
+    (code, text())
+}
+
+/// The line after the first line of `text` that starts with `first`.
+fn line_after(text: &str, first: &str) -> String {
+    text.lines()
+        .skip_while(|l| !l.starts_with(first))
+        .nth(1)
+        .unwrap_or_default()
+        .to_string()
+}
+
 /// The command line that starts session `id` in `data` with the script strategy and `params`.
 fn start_cli(id: &str, data: &Path, params: &str) -> Cli {
     Cli::try_parse_from([
@@ -1225,6 +1259,40 @@ fn the_command_starts_a_session_and_no_key_reaches_a_file_or_the_output() {
     assert!(text.contains("created session cmd"), "{text}");
     assert_ended_flat(&rig, "cmd", StopRule::MaxLoss);
     assert_no_credential(&rig, "cmd", &format!("{refused}\n{text}"));
+}
+
+/// `start` and `resume` print the limits they run with next to the session's first line, so an
+/// edit that changes both saved files together, which `resume` accepts, is seen.
+#[test]
+fn start_and_resume_print_the_limits_they_run_with() {
+    let rig = Rig::new();
+    let (code, started) =
+        until_checked(&rig, &rig.feed(), start_cli("shown", rig.data(), NO_TRADES));
+    assert_eq!(code, 0, "{started}");
+    assert_eq!(
+        line_after(&started, "created session shown"),
+        "limits: daily loss 0.05 and maximum loss 0.1 of the starting balance of 100000 USDT, \
+         notional cap 1000 USDT, day rollover utc",
+        "{started}"
+    );
+    // A looser maximum loss and a higher cap, written into both files alike.
+    let mut config = rig.json("shown", "config.json");
+    config["stops"]["max_loss_share"] = 0.2.into();
+    config["stops"]["open_notional_cap"] = 2500.0.into();
+    rig.write_json("shown", "config.json", &config);
+    let mut stops = rig.json("shown", "stops.json");
+    stops["stops"]["rules"]["max_loss_share"] = 0.2.into();
+    stops["stops"]["rules"]["open_notional_cap"] = 2500.0.into();
+    rig.write_json("shown", "stops.json", &stops);
+    let resume = Cli::try_parse_from(["td-live", "resume", "--id", "shown"]).unwrap();
+    let (code, resumed) = until_checked(&rig, &rig.feed(), resume);
+    assert_eq!(code, 0, "{resumed}");
+    assert_eq!(
+        line_after(&resumed, "resumed session shown"),
+        "limits: daily loss 0.05 and maximum loss 0.2 of the starting balance of 100000 USDT, \
+         notional cap 2500 USDT, day rollover utc",
+        "{resumed}"
+    );
 }
 
 #[test]
