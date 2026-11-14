@@ -1496,6 +1496,7 @@ fn seen_in_backtest(
         max_leverage: cfg.max_leverage,
         warmup_from: Some(bars[0].open_time),
         close_at_end: false,
+        references: Vec::new(),
         account_currency: AccountCurrency::Quote,
     };
     let seen = Arc::new(Mutex::new(Vec::new()));
