@@ -1929,3 +1929,127 @@ async fn coverage_expects_the_open_minutes_so_a_complete_fx_month_is_whole() {
         "crypto expects every minute"
     );
 }
+
+/// The reference instrument the reference-run tests name: another symbol on the same venue.
+fn reference_id(symbol: &str, venue: Venue) -> InstrumentId {
+    InstrumentId {
+        venue,
+        symbol: symbol.into(),
+        kind: InstrumentKind::Spot,
+    }
+}
+
+/// A backtest naming a reference instrument reads that instrument's bars from the store over the
+/// run's range and timeframe, keeps its missing hours missing, runs as td-engine runs on the same
+/// bars, and records the reference in its configuration and its data fingerprint; a sweep runs
+/// with it too. A reference on another venue is a 400, one the store lacks is a 422 that starts no
+/// job, and the data cutoff refuses a range past it whatever the references.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_backtest_naming_a_reference_instrument_runs_on_its_stored_bars_with_their_gaps() {
+    let t = TestServer::seeded(5).await;
+    let other = reference_id("ETHUSDT", Venue::Binance);
+    // Three whole hours missing on day three, shorter than the longest gap a run accepts.
+    let hole = t0() + 2 * DAY + 5 * HOUR..t0() + 2 * DAY + 8 * HOUR;
+    let stored: Vec<Candle> = minutes(5, hole.clone())
+        .into_iter()
+        .map(|c| Candle {
+            open: c.open * 0.05,
+            high: c.high * 0.05,
+            low: c.low * 0.05,
+            close: c.close * 0.05,
+            quote_volume: c.quote_volume * 0.05,
+            ..c
+        })
+        .collect();
+    t.store.write_candles(&other, &stored).unwrap();
+
+    let config = BacktestConfig {
+        references: vec![other.clone()],
+        ..config(InstrumentKind::Spot, 5)
+    };
+    let body = serde_json::to_value(&config).unwrap();
+    assert_eq!(body["references"], json!([other]));
+    let detail = saved_run(&t, "/runs/backtest", &body).await;
+    let SavedRun::Backtest(through_api) = &detail.run else {
+        panic!("a saved backtest");
+    };
+    assert_eq!(through_api.config.references, vec![other.clone()]);
+
+    let data = load_run_data(&t.store, &config, None).unwrap();
+    assert_eq!(data.references.len(), 1);
+    let reference = &data.references[0];
+    assert_eq!(reference.instrument, other);
+    assert_eq!(
+        reference.bars.len(),
+        5 * 24 - 3,
+        "the missing hours stay missing"
+    );
+    assert!(
+        reference.bars.iter().all(
+            |b| (config.from..config.to).contains(&b.open_time) && !hole.contains(&b.open_time)
+        )
+    );
+    let direct = td_engine::run_with_references(
+        &config,
+        &data.bars,
+        &data.asks,
+        &data.funding,
+        &data.references,
+    )
+    .unwrap();
+    assert_eq!(**through_api, direct);
+
+    // The fingerprint covers the reference's bars: changing one makes the data no longer match.
+    let (_, reopened) = t.get(&format!("/runs/{}", detail.id)).await;
+    assert_eq!(
+        reopened["check"],
+        json!({ "data_matches": true, "engine_matches": true })
+    );
+    let mut changed = stored[100];
+    changed.close *= 1.01;
+    changed.high = changed.high.max(changed.close);
+    t.store.write_candles(&other, &[changed]).unwrap();
+    let (_, reopened) = t.get(&format!("/runs/{}", detail.id)).await;
+    assert_eq!(
+        reopened["check"],
+        json!({ "data_matches": false, "engine_matches": true })
+    );
+
+    // A sweep names it on its base and is saved with it.
+    let mut sweep = sweep_spec(5, (3, 4), (10, 11));
+    sweep["base"]["references"] = json!([other]);
+    let detail = saved_run(&t, "/runs/sweep", &sweep).await;
+    let SavedRun::Sweep(swept) = &detail.run else {
+        panic!("a saved sweep");
+    };
+    assert_eq!(swept.spec.base.references, vec![other.clone()]);
+
+    // Refusals, before any job starts.
+    let mut wrong_venue = body.clone();
+    wrong_venue["references"] = json!([reference_id("ETHUSDT", Venue::Bybit)]);
+    let (status, answer) = t.post("/runs/backtest", &wrong_venue).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{answer}");
+    assert_eq!(answer["error"]["code"], "invalid_config");
+    let mut absent = body.clone();
+    absent["references"] = json!([reference_id("SOLUSDT", Venue::Binance)]);
+    let (status, answer) = t.post("/runs/backtest", &absent).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{answer}");
+    assert_eq!(answer["error"]["code"], "data_missing");
+    let message = answer["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("binance:SOLUSDT:spot") && message.contains("download it first"),
+        "{message}"
+    );
+    let (_, jobs) = t.get("/jobs").await;
+    assert_eq!(
+        jobs.as_array().map(Vec::len),
+        Some(2),
+        "only the backtest and the sweep ran: {jobs}"
+    );
+
+    let cut = TestServer::seeded_with(5, Some("2024-03-03")).await;
+    cut.store.write_candles(&other, &stored).unwrap();
+    let (status, answer) = cut.post("/runs/backtest", &body).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{answer}");
+    assert_eq!(answer["error"]["code"], "after_cutoff");
+}

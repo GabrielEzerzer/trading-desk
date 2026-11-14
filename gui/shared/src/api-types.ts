@@ -226,7 +226,15 @@ close_at_end?: boolean,
  * quote currency, the default, or its base currency, as a dollar account trading USD/JPY
  * (FX only; see [`Session::new`]). Left out of the saved result when it is the default.
  */
-account_currency?: AccountCurrency, };
+account_currency?: AccountCurrency, 
+/**
+ * Instruments on the same venue whose closed bars at `timeframe` the strategy can read beside
+ * its own, aligned to them ([`crate::Context::reference`]). They are read-only: orders,
+ * fills, costs and the account stay on `instrument`. Their bars are given to the run with
+ * [`run_with_references`] and are part of the data fingerprint. Left out of the saved result
+ * when there are none, the default.
+ */
+references?: Array<InstrumentId>, };
 
 export type BacktestResult = { config: BacktestConfig, 
 /**
@@ -2406,7 +2414,15 @@ strategy: string,
  * Some of the plan's instruments, run in the plan's order; every one of them when left out.
  * Each must be one of the plan's.
  */
-instruments?: Array<InstrumentId>, };
+instruments?: Array<InstrumentId>, 
+/**
+ * Reference instruments every run of each battery names
+ * ([`td_engine::BacktestConfig::references`]): the strategy reads their bars beside its own
+ * but trades only the plan's instrument. Each must be on the venue of every instrument run,
+ * and the store must hold their bars over the plan's period; they are not downloaded. None
+ * when left out.
+ */
+references?: Array<InstrumentId>, };
 
 /**
  * What a plan job kept: one entry per instrument whose battery finished or reached the luck test
@@ -2497,7 +2513,12 @@ runs: number,
  * this instrument, this one included; batteries saved before code hashes were recorded count
  * together as one version. Keyed by strategy name like `runs`.
  */
-code_versions: number, };
+code_versions: number, 
+/**
+ * The reference instruments the battery's runs named; left out when none. A verdict with
+ * references and one without share a row, the newer winning as above.
+ */
+references?: Array<InstrumentId>, };
 
 /**
  * A saved run in full.
