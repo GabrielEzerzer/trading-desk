@@ -2947,9 +2947,9 @@ fn compare_counts_the_funding_the_session_was_charged_late() {
         format!(
             "funding rates the session was charged: 1, {late} of them on a later bar than the \
              one they were due in. The backtest is given each rate at its due time, so each of \
-             those moves funding, and the equity after it, to another bar in the backtest, and \
-             shows as a funding and result difference that is not a difference in how orders \
-             were filled."
+             those is applied on another bar there. That can change funding, equity and the \
+             result without any difference in how orders were filled; how much depends on the \
+             position and the price when each rate is applied."
         )
     };
     let (code, text) = rig.td_live(&feed, &["compare", "--id", "funded"]);

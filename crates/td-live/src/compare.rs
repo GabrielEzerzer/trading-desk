@@ -545,9 +545,10 @@ fn report(r: &Report, out: &mut dyn FnMut(&str)) {
     ));
     out(&format!(
         "funding rates the session was charged: {}, {} of them on a later bar than the one they \
-         were due in. The backtest is given each rate at its due time, so each of those moves \
-         funding, and the equity after it, to another bar in the backtest, and shows as a \
-         funding and result difference that is not a difference in how orders were filled.",
+         were due in. The backtest is given each rate at its due time, so each of those is \
+         applied on another bar there. That can change funding, equity and the result without \
+         any difference in how orders were filled; how much depends on the position and the \
+         price when each rate is applied.",
         r.charged, r.late_funding
     ));
     let ratio = c.pnl_ratio.map_or_else(
