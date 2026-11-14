@@ -1134,7 +1134,9 @@ pub struct KindInputs {
     pub intrabar_drawdown_static: Option<f64>,
     /// Max drawdown from the running peak, as a fraction of the starting balance, over the same
     /// span as `intrabar_drawdown_static`: for a `prop_firm` rule, each attempt's peak starts at
-    /// its own starting balance, and the fall is a fraction of that balance.
+    /// its own starting balance, and the fall is a fraction of that balance. With the firm's
+    /// `trailing_floor_lock`, the peak counts only up to where the floor reaches the lock, so the
+    /// fall is to the floor the firm applies.
     pub intrabar_drawdown_trailing: Option<f64>,
     /// The chance of reaching the firm's profit target before breaching a limit.
     pub pass_probability: Option<f64>,
@@ -1178,9 +1180,27 @@ pub fn evaluate(rule: &VerdictRule, x: &KindInputs) -> Vec<Criterion> {
             attempt,
         } => {
             let share = limits.share_of_firm_limits;
-            let (drawdown, measured) = match firm.drawdown {
-                DrawdownMode::Static => (x.intrabar_drawdown_static, "from the starting balance"),
-                DrawdownMode::Trailing => (x.intrabar_drawdown_trailing, "from the peak"),
+            let (drawdown, measured) = match (firm.drawdown, firm.trailing_floor_lock) {
+                (DrawdownMode::Static, _) => (
+                    x.intrabar_drawdown_static,
+                    "from the starting balance".into(),
+                ),
+                (DrawdownMode::Trailing, None) => {
+                    (x.intrabar_drawdown_trailing, "from the peak".to_string())
+                }
+                // The battery measures the fall to the floor the firm applies, lock included.
+                (DrawdownMode::Trailing, Some(lock)) => (
+                    x.intrabar_drawdown_trailing,
+                    if lock == 0.0 {
+                        "from the peak, with the floor stopping at the starting balance,".into()
+                    } else {
+                        format!(
+                            "from the peak, with the floor stopping {:.2}% above the starting \
+                             balance,",
+                            lock * 100.0
+                        )
+                    },
+                ),
             };
             let daily_loss = match firm.day_rollover {
                 // A rule saved before the field existed keeps its line as it was.

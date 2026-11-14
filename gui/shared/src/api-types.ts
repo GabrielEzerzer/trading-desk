@@ -1682,7 +1682,9 @@ intrabar_drawdown_static: number | null,
 /**
  * Max drawdown from the running peak, as a fraction of the starting balance, over the same
  * span as `intrabar_drawdown_static`: for a `prop_firm` rule, each attempt's peak starts at
- * its own starting balance, and the fall is a fraction of that balance.
+ * its own starting balance, and the fall is a fraction of that balance. With the firm's
+ * `trailing_floor_lock`, the peak counts only up to where the floor reaches the lock, so the
+ * fall is to the floor the firm applies.
  */
 intrabar_drawdown_trailing: number | null, 
 /**
