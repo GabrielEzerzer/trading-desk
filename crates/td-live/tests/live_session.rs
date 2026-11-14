@@ -65,6 +65,7 @@ fn client_for(mock: &MockVenue) -> Arc<Client> {
         request_timeout: Duration::from_millis(1500),
         recv_window: Duration::from_millis(1000),
         settle: Duration::from_millis(50),
+        operation_budget: Duration::from_secs(5),
     };
     let keys = DemoKeys::for_loopback(TEST_KEY, TEST_SECRET).unwrap();
     Arc::new(Client::with_timing(Endpoint::Loopback(mock.port()), keys, timing).unwrap())
@@ -654,11 +655,10 @@ fn an_order_sent_before_its_line_was_written_is_not_sent_twice_on_resume() {
     );
 }
 
-/// Pins a gap in the broker: an entry adopted at go_live does not adopt the stop the dead process
-/// placed for it, so the reconcile finds an order it does not know and the session halts on a
-/// fault, sending and cancelling nothing.
+/// The dead process placed the entry's stop as well: the resume adopts the entry and that stop
+/// from the venue, sends, cancels and resizes nothing, and trades on with the stop resting.
 #[test]
-fn an_entry_with_a_stop_sent_before_its_line_was_written_halts_on_resume() {
+fn an_entry_with_a_stop_sent_before_its_line_was_written_is_adopted_with_its_stop_on_resume() {
     let rig = Rig::new();
     let feed = rig.feed();
     feed.minute(rig.bar(1));
@@ -670,19 +670,33 @@ fn an_entry_with_a_stop_sent_before_its_line_was_written_halts_on_resume() {
     let (live, ended) = run.stop();
     ended.expect("stopped cleanly");
     drop(live);
+    assert_eq!(rig.mock.request_count(CREATE), 2, "the entry and its stop");
     drop_last_line(&rig.path("stopped", "events.jsonl"));
+    assert_eq!(rig.log("stopped").last().expect("a line")["sending"], true);
 
     let sends = rig.sends();
     let live = rig.open("stopped").expect("reopens");
     let feed = rig.feed();
-    let (live, ended) = rig.run(live, &feed).wait();
-    assert!(
-        matches!(&ended, Err(LiveError::Faulted(f)) if f.starts_with("unknown open order")),
-        "{ended:?}"
-    );
-    assert_eq!(rig.sends(), sends);
-    assert!(matches!(live.status().state, State::Faulted { .. }));
-    assert!(!feed.opened.load(Ordering::SeqCst), "no bar was fed");
+    feed.minute(rig.bar(2));
+    let run = rig.run(live, &feed);
+    wait_for_bar(&run, rig.bar(1));
+    let (live, ended) = run.stop();
+    ended.expect("stopped cleanly");
+
+    assert_eq!(rig.sends(), sends, "nothing sent, cancelled or resized");
+    assert_eq!(rig.mock.position(SYMBOL), QTY);
+    assert_eq!(live.session().portfolio().position(), QTY);
+    let resting = live.handle().resting_orders();
+    assert_eq!(resting.len(), 1, "{resting:?}");
+    assert_eq!(resting[0].request.qty, QTY);
+    assert!(resting[0].request.reduce_only);
+    let open: Vec<_> = rig
+        .mock
+        .orders()
+        .into_iter()
+        .filter(|o| o.status == "Untriggered")
+        .collect();
+    assert_eq!(open.len(), 1, "{open:?}");
 }
 
 #[test]

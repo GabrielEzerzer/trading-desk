@@ -22,11 +22,12 @@
 //! Before the first send or cancel, a `sending` line holds the bar and the broker's record so far
 //! (the bar's own reads and fills); after the bar, the bar's line holds the rest. A process that
 //! dies between the two leaves the `sending` line last. The resume replays it, the session makes
-//! the same orders again past the end of the record, and [`VenueHandle::go_live`] adopts each one
-//! the venue already holds instead of sending it twice. The broker's own sends inside its bar
-//! (the stop it places for a filled entry, a resize, a close at market) are not covered: a crash
-//! right after one of them leaves an order the record does not know, which the resume's reconcile
-//! reports as a fault, so the session halts rather than doubling an order.
+//! the same orders again past the end of the record, and [`VenueHandle::go_live`] asks the venue
+//! for each: one the venue holds is adopted, with the stop the dead process placed for an entry,
+//! and one it does not hold is cancelled with a reason, never sent. The broker's other sends
+//! inside its bar (a resize, a second stop, a close at market) are not covered: a crash right
+//! after one of them leaves the venue holding what the record does not know, which the resume's
+//! reconcile reports as a fault, so the session halts rather than doubling an order.
 //!
 //! Nothing secret is written: route errors are stored by their `Display` text, which holds no key,
 //! secret or signature.
@@ -1287,6 +1288,7 @@ mod tests {
             request_timeout: Duration::from_millis(1500),
             recv_window: Duration::from_millis(1000),
             settle: Duration::from_millis(50),
+            operation_budget: Duration::from_secs(5),
         };
         let keys = DemoKeys::for_loopback(TEST_KEY, TEST_SECRET).unwrap();
         Arc::new(Client::with_timing(Endpoint::Loopback(mock.port()), keys, timing).unwrap())

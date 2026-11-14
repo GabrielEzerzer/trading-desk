@@ -1452,6 +1452,7 @@ impl Core {
                 qty,
                 fee,
                 liquidity,
+                close_out: false,
             }));
             if let Some(stop) = has_stop {
                 self.protect(id, filled, price, Basis::Filled);
