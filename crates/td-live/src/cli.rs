@@ -326,6 +326,7 @@ fn start_link(
         &entry,
         instrument,
         args.verdict.as_deref(),
+        None,
         "with --verdict",
     )
     .map(Some)

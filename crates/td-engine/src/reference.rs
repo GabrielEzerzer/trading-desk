@@ -8,10 +8,15 @@
 //! when the strategy's own bar does, never later; the session holds no later slot, so a strategy
 //! cannot see a reference bar that closes after its own bar. A missing bar stays `None`: nothing is
 //! filled forward. A reference bar at a time the run has no bar of its own is not shown.
+//!
+//! A session fed live gives its strategy the same view: [`LiveReferences`] holds each reference's
+//! bars as its feed delivers them, and a traded bar is fed only once every reference's slot for it
+//! is known, for at most [`REFERENCE_WAIT`].
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::time::Duration;
 
-use td_core::{Candle, InstrumentId};
+use td_core::{Candle, InstrumentId, Millis};
 
 use crate::{BacktestConfig, EngineError};
 
@@ -21,6 +26,116 @@ use crate::{BacktestConfig, EngineError};
 pub struct ReferenceBars {
     pub instrument: InstrumentId,
     pub bars: Vec<Candle>,
+}
+
+/// Refuses reference instruments on another venue than `traded`, `traded` itself as a reference,
+/// and one named twice.
+pub fn check_ids(traded: &InstrumentId, ids: &[InstrumentId]) -> Result<(), EngineError> {
+    for (i, id) in ids.iter().enumerate() {
+        let refuse = |why: String| Err(EngineError::InvalidReferences(why));
+        if id.venue != traded.venue {
+            return refuse(format!(
+                "{id} is on another venue than {traded}; a reference instrument must be on the same venue"
+            ));
+        }
+        if id == traded {
+            return refuse(format!(
+                "{id} is the traded instrument, so it cannot also be a reference"
+            ));
+        }
+        if ids[..i].contains(id) {
+            return refuse(format!("{id} is named twice"));
+        }
+    }
+    Ok(())
+}
+
+/// How long a session fed live holds a traded bar for the reference bars that go with it, from
+/// the moment the traded bar arrives. A reference bar that has not come by then makes the session
+/// stop with an error naming the reference and the bar, every time: it never feeds the strategy a
+/// bar without a reference bar that a backtest over the same bars could show it. A resume backfills
+/// both feeds from the last bar fed.
+///
+/// Both feeds read the same venue, and a reference bar closes when the traded bar does, so the wait
+/// covers a reference stream that reconnects and backfills its minutes, which takes seconds to a
+/// minute or two; five minutes leaves room for a few failed backfill requests.
+pub const REFERENCE_WAIT: Duration = Duration::from_secs(300);
+
+/// The reference bars of a session fed live, held until the traded bar that opens at the same time
+/// is fed (see [`crate::Session::feed`]).
+///
+/// Each reference's feed delivers its bars in time order and reports the buckets it has no bar for
+/// ([`LiveReferences::reached`]). Once a reference has delivered or reported the bucket opening at
+/// a traded bar's open time, or a later one, its slot for that bar is known: the bar that opens
+/// then, or `None`, as a backtest over the same bars aligns it. Until then it is behind.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LiveReferences {
+    lanes: Vec<Lane>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct Lane {
+    id: InstrumentId,
+    /// Bars delivered and not yet fed, by open time.
+    bars: BTreeMap<Millis, Candle>,
+    /// The open time of the latest bucket the feed has delivered or reported.
+    reached: Option<Millis>,
+}
+
+impl LiveReferences {
+    /// Nothing delivered yet for any of `ids`, in the order the session named them.
+    pub fn new(ids: &[InstrumentId]) -> Self {
+        let lanes = ids
+            .iter()
+            .map(|id| Lane {
+                id: id.clone(),
+                bars: BTreeMap::new(),
+                reached: None,
+            })
+            .collect();
+        LiveReferences { lanes }
+    }
+
+    /// A bar of reference `index` (its place in the session's list).
+    pub fn bar(&mut self, index: usize, bar: Candle) {
+        let lane = &mut self.lanes[index];
+        lane.bars.insert(bar.open_time, bar);
+        lane.reached = lane.reached.max(Some(bar.open_time));
+    }
+
+    /// Reference `index` has delivered every bar it has up to the bucket opening at `open_time`,
+    /// such as a bucket its feed dropped, or the end of the history it was warmed up with.
+    pub fn reached(&mut self, index: usize, open_time: Millis) {
+        let lane = &mut self.lanes[index];
+        lane.reached = lane.reached.max(Some(open_time));
+    }
+
+    /// The slot of each reference for the traded bar opening at `open_time`, in order, or the
+    /// references still behind it.
+    pub fn slots(&self, open_time: Millis) -> Result<Vec<Option<Candle>>, Vec<&InstrumentId>> {
+        let behind: Vec<&InstrumentId> = self
+            .lanes
+            .iter()
+            .filter(|l| l.reached.is_none_or(|r| r < open_time))
+            .map(|l| &l.id)
+            .collect();
+        if !behind.is_empty() {
+            return Err(behind);
+        }
+        Ok(self
+            .lanes
+            .iter()
+            .map(|l| l.bars.get(&open_time).copied())
+            .collect())
+    }
+
+    /// Lets go of the bars opening at or before `open_time`, once the traded bar opening then has
+    /// been fed: no later traded bar can show them.
+    pub fn fed(&mut self, open_time: Millis) {
+        for lane in &mut self.lanes {
+            lane.bars = lane.bars.split_off(&(open_time + 1));
+        }
+    }
 }
 
 /// Each reference instrument's bars aligned to a run's own bars: one slot per own bar, holding the
@@ -439,7 +554,7 @@ pub(crate) mod tests {
         });
         let mut session =
             Session::new(strategy, instrument(), Timeframe::H1, session_config).unwrap();
-        session.name_references(vec![id("OTHERUSDT")]);
+        session.name_references(vec![id("OTHERUSDT")]).unwrap();
         let refused = session.feed(bar(0, 100.0), None, &[], &[Some(bar(1, 50.0))], true);
         assert!(matches!(refused, Err(EngineError::InvalidReferences(_))));
         // One slot per reference, no more and no fewer.
@@ -453,6 +568,130 @@ pub(crate) mod tests {
             .unwrap();
         let seen = seen.lock().unwrap();
         assert_eq!(seen[1].2, Some(vec![Some(bar(0, 50.0)), None]));
+    }
+
+    #[test]
+    fn a_live_slot_is_known_once_every_reference_has_reached_its_bar() {
+        let (a, b) = (id("AUSDT"), id("BUSDT"));
+        let mut live = LiveReferences::new(&[a.clone(), b.clone()]);
+        assert_eq!(live.slots(0), Err(vec![&a, &b]));
+        live.bar(0, bar(0, 50.0));
+        // A reference ahead of the traded bars waits for them; one behind holds the bar back.
+        live.bar(0, bar(1, 51.0));
+        assert_eq!(live.slots(0), Err(vec![&b]));
+        // A bucket the feed reports without a bar is known to be missing.
+        live.reached(1, 0);
+        assert_eq!(live.slots(0), Ok(vec![Some(bar(0, 50.0)), None]));
+        assert_eq!(live.slots(HOUR), Err(vec![&b]));
+        live.bar(1, bar(2, 70.0));
+        // A later bar shows the feed has passed the bucket at 1h, which had none.
+        assert_eq!(live.slots(HOUR), Ok(vec![Some(bar(1, 51.0)), None]));
+        live.fed(HOUR);
+        assert_eq!(live.slots(HOUR), Ok(vec![None, None]), "let go once fed");
+        assert_eq!(live.slots(2 * HOUR), Err(vec![&a]));
+    }
+
+    /// A session fed live, whose reference bars come before, with or after the traded bar they go
+    /// with or not at all, shows its strategy exactly the reference bars the backtest shows it.
+    #[test]
+    fn a_session_fed_live_sees_the_reference_bars_a_backtest_sees() {
+        let config = config(vec![id("OTHERUSDT")]);
+        let (_, want) = backtest(&config, &given(), id("OTHERUSDT")).unwrap();
+        let seen = Seen::default();
+        let strategy = Box::new(SeesReference {
+            reference: id("OTHERUSDT"),
+            seen: seen.clone(),
+        });
+        let session_config = SessionConfig {
+            starting_cash: config.starting_cash,
+            slippage_bps: config.slippage_bps,
+            fees: None,
+            max_leverage: config.max_leverage,
+            account_currency: AccountCurrency::Quote,
+        };
+        let mut session =
+            Session::new(strategy, instrument(), Timeframe::H1, session_config).unwrap();
+        session.name_references(config.references.clone()).unwrap();
+        let mut live = LiveReferences::new(&config.references);
+        let refs = reference_bars();
+        // Warm-up: the reference's history over the same span, then the traded history.
+        for r in refs.iter().filter(|r| r.open_time < 3 * HOUR) {
+            live.bar(0, *r);
+        }
+        live.reached(0, 2 * HOUR);
+        let own = own_bars();
+        let feed = |session: &mut Session, live: &mut LiveReferences, b: &Candle| {
+            let slots = live.slots(b.open_time).expect("every slot known");
+            session
+                .feed(*b, None, &[], &slots, b.open_time < 3 * HOUR)
+                .unwrap();
+            live.fed(b.open_time);
+        };
+        for b in own.iter().filter(|b| b.open_time < 3 * HOUR) {
+            feed(&mut session, &mut live, b);
+        }
+        // Live: the reference is a bar behind until 6h, then two bars ahead; its feed reports the
+        // bucket at 4h, where it has no bar, before the bar at 5h.
+        let mut pending: Vec<Candle> = Vec::new();
+        let mut next_ref = refs.iter().filter(|r| r.open_time >= 3 * HOUR).peekable();
+        for b in own.iter().filter(|b| b.open_time >= 3 * HOUR) {
+            pending.push(*b);
+            let lead = if b.open_time >= 6 * HOUR { 2 } else { -1 };
+            while let Some(r) = next_ref.next_if(|r| r.open_time <= b.open_time + lead * HOUR) {
+                if r.open_time == 5 * HOUR {
+                    live.reached(0, 4 * HOUR);
+                }
+                live.bar(0, *r);
+            }
+            while let Some(first) = pending.first().copied() {
+                if live.slots(first.open_time).is_err() {
+                    break;
+                }
+                feed(&mut session, &mut live, &first);
+                pending.remove(0);
+            }
+        }
+        for r in next_ref {
+            live.bar(0, *r);
+        }
+        for b in pending {
+            feed(&mut session, &mut live, &b);
+        }
+        assert_eq!(*seen.lock().unwrap(), want);
+    }
+
+    #[test]
+    fn a_session_names_its_references_once_before_its_first_bar() {
+        let session_config = SessionConfig {
+            starting_cash: 1_000.0,
+            slippage_bps: 0.0,
+            fees: None,
+            max_leverage: 1.0,
+            account_currency: AccountCurrency::Quote,
+        };
+        let new = || {
+            let strategy = Box::new(OrdersNothing);
+            Session::new(strategy, instrument(), Timeframe::H1, session_config).unwrap()
+        };
+        let other_venue = InstrumentId {
+            venue: Venue::Bybit,
+            ..id("OTHERUSDT")
+        };
+        assert!(new().name_references(vec![other_venue]).is_err());
+        assert!(new().name_references(vec![id("TESTUSDT")]).is_err());
+        let mut twice = new();
+        twice.name_references(vec![id("OTHERUSDT")]).unwrap();
+        assert!(twice.name_references(vec![id("AUSDT")]).is_err());
+        let mut late = new();
+        late.on_bar(bar(0, 100.0), &[]).unwrap();
+        assert!(late.name_references(vec![id("OTHERUSDT")]).is_err());
+        assert!(late.references().is_empty());
+    }
+
+    struct OrdersNothing;
+
+    impl Strategy for OrdersNothing {
+        fn on_bar(&mut self, _ctx: &mut Context, _bar: &Candle) {}
     }
 
     // The testers and the battery, which build the registered test double `Follows` by name.

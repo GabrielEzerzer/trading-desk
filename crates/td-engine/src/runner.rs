@@ -121,24 +121,7 @@ impl BacktestConfig {
     /// Refuses reference instruments on another venue than `instrument`'s, `instrument` itself as
     /// a reference, and one named twice.
     pub fn check_references(&self) -> Result<(), EngineError> {
-        let traded = &self.instrument.id;
-        for (i, id) in self.references.iter().enumerate() {
-            let refuse = |why: String| Err(EngineError::InvalidReferences(why));
-            if id.venue != traded.venue {
-                return refuse(format!(
-                    "{id} is on another venue than {traded}; a reference instrument must be on the same venue"
-                ));
-            }
-            if id == traded {
-                return refuse(format!(
-                    "{id} is the traded instrument, so it cannot also be a reference"
-                ));
-            }
-            if self.references[..i].contains(id) {
-                return refuse(format!("{id} is named twice"));
-            }
-        }
-        Ok(())
+        crate::reference::check_ids(&self.instrument.id, &self.references)
     }
 }
 
@@ -332,7 +315,20 @@ pub fn run_strategy(
     asks: &[Candle],
     funding: &[(Millis, f64)],
 ) -> Result<BacktestResult, EngineError> {
-    run_built(config, bars, asks, funding, &[], || Ok(strategy))
+    run_strategy_with_references(config, strategy, bars, asks, funding, &[])
+}
+
+/// [`run_strategy`] with the bars of the reference instruments `config` names, as
+/// [`run_with_references`] takes them.
+pub fn run_strategy_with_references(
+    config: &BacktestConfig,
+    strategy: Box<dyn Strategy>,
+    bars: &[Candle],
+    asks: &[Candle],
+    funding: &[(Millis, f64)],
+    references: &[ReferenceBars],
+) -> Result<BacktestResult, EngineError> {
+    run_built(config, bars, asks, funding, references, || Ok(strategy))
 }
 
 /// The metrics [`run`] would report, without the parts of its result a sweep row does not keep:
@@ -462,7 +458,7 @@ fn simulate(
         account_currency: config.account_currency,
     };
     let mut session = Session::new(strategy, config.instrument.clone(), tf, session_config)?;
-    session.name_references(references.iter().map(|(id, _)| id.clone()).collect());
+    session.name_references(references.iter().map(|(id, _)| id.clone()).collect())?;
     for (j, (bar, range)) in warmup.iter().zip(warmup_ranges).enumerate() {
         session.feed(*bar, None, &funding[range], &row(&references, j), true)?;
     }

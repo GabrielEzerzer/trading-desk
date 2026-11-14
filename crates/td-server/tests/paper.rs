@@ -63,6 +63,7 @@ fn config(kind: InstrumentKind, timeframe: Timeframe) -> PaperConfig {
         slippage_bps: 5.0,
         fees: None,
         max_leverage: 1.0,
+        references: Vec::new(),
     }
 }
 
