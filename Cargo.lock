@@ -2376,13 +2376,18 @@ dependencies = [
 name = "td-live"
 version = "0.1.0"
 dependencies = [
+ "futures-util",
  "serde",
  "serde_json",
  "td-core",
+ "td-data",
  "td-engine",
  "td-mock-bybit",
  "td-orders",
+ "tempfile",
  "thiserror",
+ "tokio",
+ "tokio-tungstenite 0.30.0",
 ]
 
 [[package]]
