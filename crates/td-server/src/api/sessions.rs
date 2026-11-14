@@ -24,9 +24,12 @@ use axum::extract::rejection::{JsonRejection, PathRejection};
 use axum::extract::{Path as UrlPath, State};
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
-use td_core::{Candle, FeeSchedule, InstrumentId, Millis, OrderId, Timeframe};
+use td_core::{AccountCurrency, Candle, FeeSchedule, InstrumentId, Millis, OrderId, Timeframe};
 use td_data::time::now_ms;
-use td_engine::{EquityPoint, Params};
+use td_engine::{
+    BacktestConfig, EquityPoint, Params, Recorded, RunId, SessionComparison, StrategyEntry,
+    compare_with_backtest,
+};
 use tokio::sync::{broadcast, oneshot, watch};
 use tokio::task::JoinHandle;
 use ts_rs::TS;
@@ -35,9 +38,10 @@ use super::AppState;
 use super::data;
 use super::error::ApiError;
 use super::live::Streams;
+use super::plans::{LinkState, SessionLink, session_link};
 use crate::{
-    Funding, ManualError, ManualOrder, PaperConfig, PaperError, PaperFill, PaperOrder,
-    PaperSession, PaperTrade, SessionEvent, Status,
+    Funding, MANUAL_STRATEGY, ManualError, ManualOrder, OrderSource, PaperConfig, PaperError,
+    PaperFill, PaperOrder, PaperSession, PaperTrade, SessionEvent, Status,
 };
 
 /// Events buffered per `session:` subscriber before it is sent the full state again.
@@ -59,6 +63,12 @@ pub struct StartSessionRequest {
     #[serde(default)]
     #[ts(optional)]
     pub fees: Option<FeeSchedule>,
+    /// The saved verdict (a plan run's id) the session is started from: a verdict of the same
+    /// strategy on the same instrument. Left out, the strategy's latest verdict on the instrument
+    /// as `GET /verdicts` gives it, if it has one. Refused on a manual session.
+    #[serde(default)]
+    #[ts(optional)]
+    pub verdict_run_id: Option<RunId>,
 }
 
 /// A session as `GET /sessions` lists it.
@@ -113,11 +123,18 @@ pub struct SessionState {
     pub dropped: Vec<Millis>,
     /// The latest problems that did not stop the session.
     pub warnings: Vec<String>,
+    /// The strategy's code, plan and rule when the session started and the verdict it was started
+    /// from, with whether the strategy as it is now still matches that verdict or, without one,
+    /// what the session started with (`stale`). Left out for a manual session and for one started
+    /// before links were recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub link: Option<LinkState>,
 }
 
 impl SessionState {
-    /// The state of a paper session, as the API shows it.
-    pub fn of(paper: &PaperSession) -> SessionState {
+    /// The state of a paper session, as the API shows it, its link checked against `strategies`.
+    pub fn of(paper: &PaperSession, strategies: &[StrategyEntry]) -> SessionState {
         let portfolio = paper.portfolio();
         SessionState {
             id: paper.id().to_string(),
@@ -143,8 +160,61 @@ impl SessionState {
             last_bar: paper.last_bar().copied(),
             dropped: paper.dropped().to_vec(),
             warnings: paper.warnings().to_vec(),
+            link: paper.link().map(|link| {
+                let config = paper.config();
+                LinkState::of(link, &config.strategy, &config.instrument.id, strategies)
+            }),
         }
     }
+}
+
+/// `GET /sessions/{id}/comparison`: a session beside a backtest of the same strategy, parameters,
+/// instrument, timeframe and money settings over the same bars.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+pub struct SessionComparisonResponse {
+    /// The backtest that was run: from the session's first live bar (`from`) to the end of its
+    /// last bar (`to`), warmed up from its first warm-up bar (`warmup_from`).
+    pub backtest: BacktestConfig,
+    pub bars: ComparedBars,
+    /// Manual orders placed on the session. The backtest has none, so they, their fills and what
+    /// they changed show as differences.
+    pub manual_orders: usize,
+    pub comparison: SessionComparison,
+}
+
+/// The bars the backtest ran on: the session's own, as its log holds them, warm-up bars included.
+/// Nothing is downloaded and nothing is read from the store, so both sides saw exactly the same
+/// prices.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+pub struct ComparedBars {
+    pub warm_up_bars: usize,
+    pub live_bars: usize,
+    /// Buckets the session's live feed left out; the backtest lacks them too.
+    pub dropped: Vec<Millis>,
+    /// The funding rates the session was charged. The backtest is given each at the venue's
+    /// funding time (`due`), as a backtest from stored data would be, so a rate the session was
+    /// charged on a later bar, because it was not yet published when its own bar closed, lands
+    /// on another bar there; one due before the first live bar is not charged there at all. The
+    /// rates fed with warm-up bars, which the strategy saw but was not charged, are not counted
+    /// here; the backtest is given them too, so a strategy that reads funding sees them there.
+    pub funding_events: usize,
+    /// How many of those rates the session charged on a later bar than the one they were due in.
+    /// Each moves funding, and the equity after it, to another bar in the backtest, so it shows as
+    /// a funding and a result difference and, for a strategy that sizes its orders on equity, as
+    /// order and fill quantity differences: none of these is then a difference in how orders were
+    /// filled.
+    pub late_funding: usize,
+}
+
+/// The funding a backtest beside `paper` is given, each rate at its due time: the rates fed with
+/// warm-up bars, which the session's strategy saw uncharged, then the rates charged.
+fn backtest_funding(paper: &PaperSession) -> Vec<(Millis, f64)> {
+    paper
+        .warm_up_funding()
+        .iter()
+        .chain(paper.funding())
+        .map(|f| (f.due, f.rate))
+        .collect()
 }
 
 fn summary(paper: &PaperSession) -> SessionSummary {
@@ -194,6 +264,9 @@ struct Entry {
 pub(crate) struct Sessions {
     data_dir: PathBuf,
     streams: Arc<Streams>,
+    /// The server's strategies, the list `GET /verdicts` reads, that each session's link is checked
+    /// against.
+    strategies: Arc<Vec<StrategyEntry>>,
     entries: Mutex<BTreeMap<String, Entry>>,
     /// Starts, stops and resumes go one at a time, so two cannot race on one session.
     ops: tokio::sync::Mutex<Ops>,
@@ -224,7 +297,11 @@ impl Sessions {
     ///
     /// shortcut: a session whose files do not read is left out with a line on stderr, and every
     /// log is replayed at start; list broken sessions and replay lazily if either starts to matter.
-    pub(crate) fn load(data_dir: &Path, streams: Arc<Streams>) -> Sessions {
+    pub(crate) fn load(
+        data_dir: &Path,
+        streams: Arc<Streams>,
+        strategies: Arc<Vec<StrategyEntry>>,
+    ) -> Sessions {
         let mut entries = BTreeMap::new();
         let folder = data_dir.join("paper");
         let names: Vec<String> = std::fs::read_dir(&folder)
@@ -253,6 +330,7 @@ impl Sessions {
         Sessions {
             data_dir: data_dir.to_path_buf(),
             streams,
+            strategies,
             entries: Mutex::new(entries),
             ops: tokio::sync::Mutex::new(Ops::default()),
             generations: AtomicU64::new(0),
@@ -273,7 +351,7 @@ impl Sessions {
     pub(crate) fn state(&self, id: &str) -> Option<SessionState> {
         self.entries()
             .get(id)
-            .map(|e| SessionState::of(&lock(&e.session)))
+            .map(|e| SessionState::of(&lock(&e.session), &self.strategies))
     }
 
     fn summary_of(&self, id: &str) -> Result<SessionSummary, ApiError> {
@@ -292,7 +370,10 @@ impl Sessions {
         let entries = self.entries();
         let entry = entries.get(id)?;
         let paper = lock(&entry.session);
-        Some((entry.events.subscribe(), SessionState::of(&paper)))
+        Some((
+            entry.events.subscribe(),
+            SessionState::of(&paper, &self.strategies),
+        ))
     }
 
     /// The sender of a session's current channel, to put events on it in tests.
@@ -301,18 +382,21 @@ impl Sessions {
         self.entries().get(id).map(|e| e.events.clone())
     }
 
-    /// Creates a session with a new id and starts it.
+    /// Creates a session with a new id and starts it, saving `link` with its config.
     pub(crate) async fn start(
         self: &Arc<Self>,
         config: PaperConfig,
+        link: Option<SessionLink>,
     ) -> Result<SessionSummary, ApiError> {
         let ops = self.ops.lock().await;
         refuse_if_closed(&ops)?;
         let id = new_id()?;
         let (dir, new) = (self.data_dir.clone(), id.clone());
-        let paper = tokio::task::spawn_blocking(move || PaperSession::create(&dir, &new, config))
-            .await
-            .map_err(|e| ApiError::internal(format!("creating the session stopped: {e}")))??;
+        let paper = tokio::task::spawn_blocking(move || {
+            PaperSession::create_linked(&dir, &new, config, link)
+        })
+        .await
+        .map_err(|e| ApiError::internal(format!("creating the session stopped: {e}")))??;
         let events = broadcast::channel(EVENT_BUFFER).0;
         {
             // Launched under the lock, so a session that ends at once finds its entry.
@@ -479,6 +563,117 @@ impl Sessions {
             .await
     }
 
+    /// Compares a session with a backtest of the same strategy over the bars it has been fed so
+    /// far (see [`SessionComparisonResponse`]). Blocks: it runs the backtest. The session's lock is
+    /// held only while its records are copied. 409 `nothing_to_compare` for a manual session, which
+    /// has no strategy to backtest, and for one with no live bar yet.
+    pub(crate) fn comparison(&self, id: &str) -> Result<SessionComparisonResponse, ApiError> {
+        let nothing = |why: &str| {
+            ApiError::new(
+                StatusCode::CONFLICT,
+                "nothing_to_compare",
+                format!("paper session {id:?} {why}"),
+            )
+        };
+        let session = self
+            .entries()
+            .get(id)
+            .map(|e| e.session.clone())
+            .ok_or_else(|| session_not_found(id))?;
+        let (
+            config,
+            bars,
+            live_from,
+            funding,
+            due,
+            orders,
+            fills,
+            equity,
+            funding_paid,
+            manual,
+            dropped,
+        ) = {
+            let paper = lock(&session);
+            let config = paper.config().clone();
+            if config.strategy == MANUAL_STRATEGY {
+                return Err(nothing(
+                    "is a manual session: there is no strategy to backtest",
+                ));
+            }
+            let Some(live_from) = paper.live_from() else {
+                return Err(nothing("has not fed a live bar yet"));
+            };
+            let s = paper.session();
+            let manual = s
+                .orders()
+                .iter()
+                .filter(|o| paper.source(o.id) == OrderSource::Manual)
+                .count();
+            (
+                config,
+                s.bars().to_vec(),
+                live_from,
+                paper.funding().to_vec(),
+                backtest_funding(&paper),
+                s.orders().to_vec(),
+                s.fills().to_vec(),
+                s.equity().to_vec(),
+                s.portfolio().funding_paid(),
+                manual,
+                paper.dropped().to_vec(),
+            )
+        };
+        let (first, last) = match (bars.first(), bars.last()) {
+            (Some(first), Some(last)) => (first.open_time, last.open_time),
+            _ => return Err(nothing("has not fed a live bar yet")),
+        };
+        let backtest = BacktestConfig {
+            strategy: config.strategy.clone(),
+            params: config.params.clone(),
+            instrument: config.instrument.clone(),
+            timeframe: config.timeframe,
+            from: live_from,
+            to: last + config.timeframe.duration_ms(),
+            starting_cash: config.starting_cash,
+            slippage_bps: config.slippage_bps,
+            fee_override: config.fees,
+            max_leverage: config.max_leverage,
+            warmup_from: (first < live_from).then_some(first),
+            close_at_end: false,
+            // Paper sessions are on a quote-currency account (see `paper::build_session`).
+            account_currency: AccountCurrency::Quote,
+        };
+        let result = td_engine::run(&backtest, &bars, &[], &due).map_err(|e| {
+            ApiError::internal(format!("the backtest beside the session failed: {e}"))
+        })?;
+        let recorded = Recorded {
+            orders: &orders,
+            fills: &fills,
+            equity: &equity,
+            starting_cash: config.starting_cash,
+            funding_paid,
+        };
+        let comparison = compare_with_backtest(recorded, Recorded::of_backtest(&result));
+        let warm_up_bars = bars.iter().filter(|b| b.open_time < live_from).count();
+        let bar_of = |t| config.timeframe.floor(t);
+        let late_funding = funding
+            .iter()
+            .filter(|f| bar_of(f.due) < bar_of(f.time))
+            .count();
+        Ok(SessionComparisonResponse {
+            backtest,
+            bars: ComparedBars {
+                warm_up_bars,
+                live_bars: bars.len() - warm_up_bars,
+                dropped,
+                funding_events: funding.len(),
+                late_funding,
+            },
+            manual_orders: manual,
+            comparison,
+        })
+    }
+
     /// Stops every running session, for shutdown; none starts after this.
     pub(crate) async fn stop_all(&self) {
         let mut ops = self.ops.lock().await;
@@ -637,8 +832,50 @@ pub(super) async fn start(
         // leverage yet; add the cap to the request when the apps get a leverage setting.
         max_leverage: 1.0,
     };
-    let created = state.sessions.start(config).await?;
+    let link = if config.strategy == MANUAL_STRATEGY {
+        if request.verdict_run_id.is_some() {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "invalid_verdict",
+                "a manual session runs no strategy, so it is not started from a verdict",
+            ));
+        }
+        None
+    } else {
+        // An unknown strategy has no link; creating the session refuses it.
+        match state
+            .strategies
+            .iter()
+            .find(|e| e.name == config.strategy)
+            .cloned()
+        {
+            None => None,
+            Some(entry) => {
+                let (runs_dir, instrument) = (state.runs_dir(), config.instrument.id.clone());
+                let verdict = request.verdict_run_id;
+                let link = tokio::task::spawn_blocking(move || {
+                    session_link(&runs_dir, &entry, &instrument, verdict.as_ref())
+                })
+                .await
+                .map_err(|e| ApiError::internal(format!("reading the verdict stopped: {e}")))??;
+                Some(link)
+            }
+        }
+    };
+    let created = state.sessions.start(config, link).await?;
     Ok((StatusCode::CREATED, Json(created)))
+}
+
+/// `GET /sessions/{id}/comparison`.
+pub(super) async fn comparison(
+    State(state): State<Arc<AppState>>,
+    UrlPath(id): UrlPath<String>,
+) -> Result<Json<SessionComparisonResponse>, ApiError> {
+    let sessions = state.sessions.clone();
+    let compared = tokio::task::spawn_blocking(move || sessions.comparison(&id))
+        .await
+        .map_err(|e| ApiError::internal(format!("the comparison stopped: {e}")))??;
+    Ok(Json(compared))
 }
 
 /// `GET /sessions`, oldest first.
@@ -780,7 +1017,11 @@ pub(crate) mod tests {
         };
         PaperSession::create(dir.path(), "s", config).expect("creates");
         let streams = Arc::new(Streams::new(Arc::new(Nowhere)));
-        let sessions = Arc::new(Sessions::load(dir.path(), streams));
+        let sessions = Arc::new(Sessions::load(
+            dir.path(),
+            streams,
+            Arc::new(td_engine::strategies()),
+        ));
         (dir, sessions)
     }
 
@@ -865,6 +1106,196 @@ pub(crate) mod tests {
             .expect("cancelled, synced on a blocking thread");
         assert_eq!(placed.source, crate::OrderSource::Manual);
         sessions.stop_all().await;
+    }
+
+    /// A bar of a wave that crosses its moving averages every few bars.
+    fn wave(i: i64) -> Candle {
+        let price = |i: i64| 100.0 + 10.0 * (i as f64 * std::f64::consts::TAU / 16.0).sin();
+        let (open, close) = (price(i - 1), price(i));
+        Candle {
+            open_time: i * 60_000,
+            open,
+            high: open.max(close) + 0.5,
+            low: open.min(close) - 0.5,
+            close,
+            volume: 1.0,
+            quote_volume: close,
+        }
+    }
+
+    /// Writes a perpetual sma_cross session `id` fed 5 warm-up bars and 60 live ones, with a
+    /// funding rate every 8 bars, `late` bars after its due time, and one rate on time with the
+    /// warm-up bar at 2 minutes, which the strategy sees and is not charged.
+    fn fed_session(dir: &Path, id: &str, late: i64) {
+        let config = PaperConfig {
+            params: Params::new()
+                .with("fast", ParamValue::Int(2))
+                .with("slow", ParamValue::Int(5))
+                .with("allow_short", ParamValue::Bool(true)),
+            ..crate::paper::tests::config()
+        };
+        let mut paper = PaperSession::create(dir, id, config).expect("creates");
+        for i in 0..65 {
+            let funding = if i >= 5 && i % 8 == 0 {
+                vec![Funding {
+                    time: i * 60_000,
+                    rate: 0.001,
+                    due: (i - late) * 60_000,
+                }]
+            } else if i == 2 {
+                vec![Funding {
+                    time: i * 60_000,
+                    rate: 0.002,
+                    due: i * 60_000,
+                }]
+            } else {
+                Vec::new()
+            };
+            paper.feed(wave(i), funding, i < 5).expect("feeds");
+        }
+    }
+
+    fn loaded(dir: &Path) -> Arc<Sessions> {
+        Arc::new(Sessions::load(
+            dir,
+            Arc::new(Streams::new(Arc::new(Nowhere))),
+            Arc::new(td_engine::strategies()),
+        ))
+    }
+
+    #[test]
+    fn a_paper_session_matches_a_backtest_on_its_own_bars() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        fed_session(dir.path(), "on-time", 0);
+        let compared = loaded(dir.path()).comparison("on-time").expect("compares");
+        let c = &compared.comparison;
+        assert_eq!(c.differences, [], "{:#?}", c.differences);
+        assert!(c.fills.len() >= 4, "the strategy trades: {}", c.fills.len());
+        assert!(c.session.funding != 0.0, "funding was charged");
+        assert_eq!(c.pnl_ratio, Some(1.0));
+        let bars = &compared.bars;
+        assert_eq!((bars.warm_up_bars, bars.live_bars), (5, 60));
+        assert_eq!((bars.funding_events, bars.late_funding), (8, 0));
+        let backtest = &compared.backtest;
+        assert_eq!(backtest.warmup_from, Some(0));
+        assert_eq!((backtest.from, backtest.to), (5 * 60_000, 65 * 60_000));
+        assert_eq!(compared.manual_orders, 0);
+    }
+
+    /// The backtest beside a session is given the rates fed with its warm-up bars as well as those
+    /// charged, so a strategy that reads funding sees there every rate it saw in the session, and
+    /// funding, charged on neither side during warm-up, shows no difference.
+    #[test]
+    fn the_backtest_beside_a_session_sees_the_funding_its_strategy_saw() {
+        /// Keeps what [`Context::funding`] gives it on the last bar it is called on.
+        struct LastSeen(Arc<Mutex<Vec<(Millis, f64)>>>);
+        impl td_engine::Strategy for LastSeen {
+            fn on_bar(&mut self, ctx: &mut td_engine::Context, _bar: &Candle) {
+                *lock(&self.0) = ctx.funding().to_vec();
+            }
+        }
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        fed_session(dir.path(), "seen", 0);
+        let compared = loaded(dir.path()).comparison("seen").expect("compares");
+        assert_eq!(
+            compared.comparison.differences,
+            [],
+            "{:#?}",
+            compared.comparison.differences
+        );
+        let paper = PaperSession::open(dir.path(), "seen").expect("opens");
+        assert_eq!(paper.warm_up_funding().len(), 1);
+        // What the session's strategy saw on its last bar: every rate fed, at the time it was fed.
+        let fed: Vec<(Millis, f64)> = paper
+            .warm_up_funding()
+            .iter()
+            .chain(paper.funding())
+            .map(|f| (f.time, f.rate))
+            .collect();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        td_engine::run_strategy(
+            &compared.backtest,
+            Box::new(LastSeen(seen.clone())),
+            paper.session().bars(),
+            &[],
+            &backtest_funding(&paper),
+        )
+        .expect("runs");
+        assert_eq!(*lock(&seen), fed);
+    }
+
+    #[test]
+    fn funding_charged_late_in_the_session_is_a_named_difference() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        // Each rate reaches the session one bar after it was due, as when the venue had not yet
+        // published it when its bar closed; the backtest charges it on the bar it was due in.
+        fed_session(dir.path(), "late", 1);
+        let compared = loaded(dir.path()).comparison("late").expect("compares");
+        let c = &compared.comparison;
+        let kinds: Vec<_> = c.differences.iter().map(|d| d.kind).collect();
+        assert!(
+            kinds.contains(&td_engine::DifferenceKind::Funding),
+            "{kinds:?}"
+        );
+        assert!(
+            kinds.contains(&td_engine::DifferenceKind::Result),
+            "{kinds:?}"
+        );
+        assert!(c.session_only_fills.is_empty() && c.backtest_only_fills.is_empty());
+        let bars = &compared.bars;
+        assert_eq!((bars.funding_events, bars.late_funding), (8, 8));
+    }
+
+    #[test]
+    fn a_manual_order_shows_in_the_comparison_and_a_manual_session_has_none() {
+        let (dir, _) = one_session();
+        {
+            let mut paper = PaperSession::open(dir.path(), "s").expect("opens");
+            paper.feed(wave(0), Vec::new(), false).expect("feeds");
+            let order = ManualOrder {
+                side: td_core::Side::Buy,
+                qty: 1.0,
+                order_type: crate::ManualOrderType::Market,
+                limit_price: None,
+                reduce_only: None,
+            };
+            paper.place(&order, 60_000).expect("placed");
+            paper.feed(wave(1), Vec::new(), false).expect("feeds");
+        }
+        let manual = PaperConfig {
+            strategy: MANUAL_STRATEGY.into(),
+            params: Params::new(),
+            ..crate::paper::tests::config()
+        };
+        PaperSession::create(dir.path(), "by-hand", manual).expect("creates");
+        PaperSession::create(dir.path(), "fresh", crate::paper::tests::config()).expect("creates");
+        let sessions = loaded(dir.path());
+
+        let compared = sessions.comparison("s").expect("compares");
+        assert_eq!(compared.manual_orders, 1);
+        let kinds: Vec<_> = compared
+            .comparison
+            .differences
+            .iter()
+            .map(|d| d.kind)
+            .collect();
+        assert!(
+            kinds.contains(&td_engine::DifferenceKind::SessionOnlyOrder)
+                && kinds.contains(&td_engine::DifferenceKind::SessionOnlyFill),
+            "{kinds:?}"
+        );
+        for id in ["by-hand", "fresh"] {
+            let refused = sessions.comparison(id).expect_err("nothing to compare");
+            assert_eq!(refused.body.code, "nothing_to_compare", "{id}");
+        }
+    }
+
+    #[test]
+    fn a_session_without_a_link_serialises_as_before() {
+        let (_dir, sessions) = one_session();
+        let state = serde_json::to_value(sessions.state("s").expect("loaded")).expect("json");
+        assert!(state.get("link").is_none(), "{state}");
     }
 
     #[test]

@@ -120,7 +120,14 @@ export type Fill = { order_id: OrderId, instrument: InstrumentId, side: Side, ti
  * The fee paid, in the account currency: the quote asset, or the base currency on a
  * base-currency account. Negative for a rebate.
  */
-fee: number, liquidity: Liquidity, };
+fee: number, liquidity: Liquidity, 
+/**
+ * True for a fill of the end-of-run close-out, the order a backtest submits to close what is
+ * open when it is told to end flat (each walk-forward test window does): the strategy did
+ * not choose it. False for every other fill, and then left out of JSON, so a fill saved
+ * before the field existed reads as false and every other fill is written as it was.
+ */
+close_out?: boolean, };
 
 /**
  * The currency an account holds and reports money in, against the instrument it trades.
@@ -231,8 +238,8 @@ engine_version: string,
  */
 engine_revision: number, 
 /**
- * SHA-256 of the bars (warm-up bars first), asks and funding the run used; see
- * [`data_fingerprint`].
+ * SHA-256 of the bars (warm-up bars first), asks and funding the run used, the funding being
+ * every event the strategy could see; see [`data_fingerprint`].
  */
 data_fingerprint: string, 
 /**
@@ -1124,7 +1131,14 @@ trading_day?: TradingDayTest | null,
  * For a trailing drawdown, the level the floor stops rising at, as a fraction of the starting
  * balance above the start: 0 stops it at the starting balance. `None` lets it trail for ever.
  */
-trailing_floor_lock?: number | null, };
+trailing_floor_lock?: number | null, 
+/**
+ * Where the firm's day ends, for its daily loss limit and its trading days. When set, the
+ * worst-daily-loss line measures these days only, and the attempt walks read each day's
+ * return, its low and its trading-day flag on them. `None` measures the line on the worse of
+ * days ending at midnight UTC and at 17:00 New York, and walks days ending at midnight UTC.
+ */
+day_rollover?: DayRollover | null, };
 
 /**
  * The terms of one attempt at a prop-firm challenge: its fees, the funded account it leads to
@@ -1159,6 +1173,13 @@ profit_split: number,
  * days, as the firm's `trading_day` test counts them (without one, days with a fill).
  */
 days_to_first_payout: number, 
+/**
+ * A wait in calendar days before the first payout, counted from the funded account's first
+ * trading day (as `days_to_first_payout` counts them): the first payout may be asked for at
+ * the close of the day this many days after that one, traded or not. With both set, both
+ * must be met. `None` sets no such wait, and is left out of JSON.
+ */
+calendar_days_to_first_payout?: number | null, 
 /**
  * The days from one payout to the earliest next one, traded or not.
  */
@@ -1231,6 +1252,11 @@ min_trade_size?: number | null,
  */
 min_trade_move?: number | null, };
 
+/**
+ * When one trading day ends and the next begins, for the daily P&L and daily loss limits.
+ */
+export type DayRollover = { "kind": "utc", offset_minutes: number, } | { "kind": "new_york1700" };
+
 export type DrawdownMode = "static" | "trailing";
 
 export type PropFirmLimits = { 
@@ -1254,7 +1280,12 @@ pass_horizon_days: number,
 /**
  * The chance of breaching a limit within `breach_horizon_days` must be at most this.
  */
-max_breach_probability: number, breach_horizon_days: number, };
+max_breach_probability: number, 
+/**
+ * Days a simulated attempt runs for the breach odds, and the length of each attempt the
+ * max-drawdown line reads on the test's curve.
+ */
+breach_horizon_days: number, };
 
 export type PortfolioBenchmark = "buy_and_hold" | "cash";
 
@@ -1373,8 +1404,9 @@ export type Verdict = { instrument: InstrumentId, state: VerdictState,
  */
 criteria: Array<Criterion>, 
 /**
- * Costs the runs behind the verdict leave out, each named, so a verdict that rests on one is
- * visible. They do not change the state. Empty in a verdict saved before warnings existed.
+ * Costs the runs behind the verdict leave out, and assumptions a line passed on that the
+ * engine cannot check, each named, so a verdict that rests on one is visible. They do not
+ * change the state. Empty in a verdict saved before warnings existed.
  */
 warnings: Array<string>, };
 
@@ -1645,15 +1677,21 @@ risk_of_ruin: number | null,
  */
 return_without_best_trade: number | null, 
 /**
- * The worst loss within one day.
+ * The worst loss within one day, on the firm's day when its rule states one.
  */
 worst_daily_loss: number | null, 
 /**
- * Max drawdown from the starting balance.
+ * Max drawdown from the starting balance. For a `prop_firm` rule, the worst over attempts of
+ * its `breach_horizon_days` started on each day of the curve, each from its own starting
+ * balance; for the other kinds, over the whole curve.
  */
 intrabar_drawdown_static: number | null, 
 /**
- * Max drawdown from the running peak.
+ * Max drawdown from the running peak, as a fraction of the starting balance, over the same
+ * span as `intrabar_drawdown_static`: for a `prop_firm` rule, each attempt's peak starts at
+ * its own starting balance, and the fall is a fraction of that balance. With the firm's
+ * `trailing_floor_lock`, the peak counts only up to where the floor reaches the lock, so the
+ * fall is to the floor the firm applies.
  */
 intrabar_drawdown_trailing: number | null, 
 /**
@@ -1810,10 +1848,21 @@ pass: number,
  * the target as a funded account would. The `prop_firm` kind rule asks for at most 0.10
  * over 90 days.
  */
-breach: number, paths: number, };
+breach: number, paths: number, 
+/**
+ * The days the paths were drawn from, one per daily return. `None` in a result saved before
+ * it existed.
+ */
+days: number | null, 
+/**
+ * How many of `days` count as trading days: the days the traded flags mark, so a reader can
+ * see how sparse the days are that the firm's minimum and the wait before the first payout
+ * count. `None` in a result saved before it existed.
+ */
+trading_days: number | null, };
 
 /**
- * The value of a prop-firm attempt at the edge the test shows and at a reduced one.
+ * The value of a prop-firm attempt at the edge the test shows, at a reduced one and at none.
  */
 export type PropFirmAttempt = { 
 /**
@@ -1824,7 +1873,15 @@ full: AttemptFigures,
  * From the daily returns with their mean scaled by `reduced_edge_factor` and their shape
  * unchanged. The `prop_firm` kind rule asks for its `value` to be above zero.
  */
-reduced: AttemptFigures, reduced_edge_factor: number, paths: number, };
+reduced: AttemptFigures, 
+/**
+ * From the daily returns with their mean removed (a factor of 0) and their shape unchanged:
+ * what the terms alone are worth, with no edge. A positive value here says the terms pay for
+ * an attempt by themselves, so a positive `reduced` value does not show that the edge does.
+ * Reported only: no line of the verdict judges it. `None` in a result saved before it
+ * existed.
+ */
+zero_edge: AttemptFigures | null, reduced_edge_factor: number, paths: number, };
 
 /**
  * What one attempt is worth, from one series of daily returns.
@@ -1981,6 +2038,86 @@ at_least_as_good: number,
  * threshold, the test cannot pass however good the real best is: too few copies qualified.
  */
 p_value: number, };
+
+/**
+ * A session beside its backtest.
+ */
+export type SessionComparison = { session: SideSummary, backtest: SideSummary, 
+/**
+ * The session's P&L over the backtest's; `null` when the backtest's P&L is zero. Negative
+ * when one made money and the other lost it.
+ */
+pnl_ratio: number | null, 
+/**
+ * Fills paired one to one through their orders, in the order of the orders' key.
+ */
+fills: Array<FillPair>, 
+/**
+ * Fills of the session with no partner in the backtest.
+ */
+session_only_fills: Array<Fill>, 
+/**
+ * Fills of the backtest with no partner in the session.
+ */
+backtest_only_fills: Array<Fill>, 
+/**
+ * Orders paired one to one, in the order of their key.
+ */
+orders: Array<OrderPair>, session_only_orders: Array<Order>, backtest_only_orders: Array<Order>, 
+/**
+ * Every difference found, each named; empty when the two sides agree.
+ */
+differences: Array<Difference>, };
+
+/**
+ * One side's costs and result.
+ */
+export type SideSummary = { 
+/**
+ * Orders submitted, rejected ones included.
+ */
+orders: number, fills: number, 
+/**
+ * Sum of fill fees; negative if rebates outweighed fees.
+ */
+fees: number, 
+/**
+ * Net funding paid; negative when the position received funding.
+ */
+funding: number, starting_equity: number, 
+/**
+ * Equity at the last live bar's close, or the starting equity before the first.
+ */
+final_equity: number, 
+/**
+ * `final_equity - starting_equity`.
+ */
+pnl: number, };
+
+/**
+ * A session fill and the backtest fill paired with it, with the session's value less the
+ * backtest's for each field.
+ */
+export type FillPair = { 
+/**
+ * The open time of the bar the fills' orders were decided on.
+ */
+decided_at: number, session: Fill, backtest: Fill, time_diff_ms: number, price_diff: number, qty_diff: number, fee_diff: number, };
+
+/**
+ * A session order and the backtest order paired with it.
+ */
+export type OrderPair = { session: Order, backtest: Order, };
+
+/**
+ * What a [`Difference`] is about.
+ */
+export type DifferenceKind = "fill_time" | "fill_price" | "fill_qty" | "fill_fee" | "session_only_fill" | "backtest_only_fill" | "order_request" | "order_status" | "session_only_order" | "backtest_only_order" | "fees" | "funding" | "result";
+
+/**
+ * One difference between the session and the backtest, in a plain sentence.
+ */
+export type Difference = { kind: DifferenceKind, message: string, };
 
 /**
  * The line the binary prints to stdout once it listens, for the app that started it.
@@ -2490,7 +2627,8 @@ max_leverage: number, };
  */
 export type Funding = { 
 /**
- * The time the engine was given, inside the bar's window.
+ * The time the engine was given: `due`, unless the rate came after the bar it is due in; then
+ * the end of the last bar fed before this one, or this bar's open if it is the first.
  */
 time: number, rate: number, 
 /**
@@ -2517,7 +2655,13 @@ strategy: string, params: Params, instrument: InstrumentId, timeframe: Timeframe
 /**
  * Replaces the instrument's fee schedule when set.
  */
-fees?: FeeSchedule, };
+fees?: FeeSchedule, 
+/**
+ * The saved verdict (a plan run's id) the session is started from: a verdict of the same
+ * strategy on the same instrument. Left out, the strategy's latest verdict on the instrument
+ * as `GET /verdicts` gives it, if it has one. Refused on a manual session.
+ */
+verdict_run_id?: RunId, };
 
 /**
  * A session as `GET /sessions` lists it.
@@ -2576,7 +2720,14 @@ export type PaperFill = { source: OrderSource, order_id: OrderId, instrument: In
  * The fee paid, in the account currency: the quote asset, or the base currency on a
  * base-currency account. Negative for a rebate.
  */
-fee: number, liquidity: Liquidity, };
+fee: number, liquidity: Liquidity, 
+/**
+ * True for a fill of the end-of-run close-out, the order a backtest submits to close what is
+ * open when it is told to end flat (each walk-forward test window does): the strategy did
+ * not choose it. False for every other fill, and then left out of JSON, so a fill saved
+ * before the field existed reads as false and every other fill is written as it was.
+ */
+close_out?: boolean, };
 
 /**
  * Whose fills make up a trade. A liquidation's fill does not count: it only closes a trade that
@@ -2753,7 +2904,174 @@ dropped: Array<number>,
 /**
  * The latest problems that did not stop the session.
  */
-warnings: Array<string>, };
+warnings: Array<string>, 
+/**
+ * The strategy's code, plan and rule when the session started and the verdict it was started
+ * from, with whether the strategy as it is now still matches that verdict or, without one,
+ * what the session started with (`stale`). Left out for a manual session and for one started
+ * before links were recorded.
+ */
+link?: LinkState, };
+
+/**
+ * What a session was started from: the strategy's code, plan and rule when it started, and the
+ * verdict of the strategy on the session's instrument it was started from. Fixed when the session
+ * starts and saved with its config; [`LinkState`] shows it with its checks.
+ */
+export type SessionLink = { 
+/**
+ * The hash of the strategy's source file when the session started
+ * ([`td_engine::code_hash`]); `null` for a strategy without one.
+ */
+code_hash: string | null, 
+/**
+ * The strategy's test plan ([`td_engine::TestPlan`]) when the session started, as JSON, so a
+ * session saved before a field of it changed still reads.
+ */
+plan: unknown, 
+/**
+ * The strategy's verdict rule ([`td_engine::VerdictRule`]) when the session started, as JSON
+ * like `plan`.
+ */
+rule: unknown, 
+/**
+ * The verdict the session was started from: the one named when it was started, or else the
+ * strategy's latest verdict on the instrument as `GET /verdicts` gives it. `null` when the
+ * strategy had none there.
+ */
+verdict: LinkedVerdict | null, };
+
+/**
+ * The verdict a session was started from, with what its checks compare.
+ */
+export type LinkedVerdict = { 
+/**
+ * The saved plan run, at `GET /runs/{run_id}`.
+ */
+run_id: RunId, state: VerdictState, 
+/**
+ * False when a cancel stopped the battery's luck test.
+ */
+complete: boolean, 
+/**
+ * The engine revision that produced the verdict.
+ */
+engine_revision: number, 
+/**
+ * The hash of the strategy's source file the battery ran with; `null` for a battery saved
+ * before code hashes were recorded.
+ */
+code_hash: string | null, 
+/**
+ * The plan the battery ran under, as its verdict record holds it.
+ */
+plan: unknown, 
+/**
+ * The rule the battery ran under, as its verdict record holds it.
+ */
+rule: unknown, };
+
+/**
+ * A session's [`SessionLink`] with its checks against the strategy as it is now, made when the
+ * session's state is read. With a verdict, each check compares the verdict with this engine and
+ * the strategy now, and is the one `GET /verdicts` makes for that verdict. Without one, the plan
+ * and code checks compare what the session started with (the link's `plan`, `rule` and
+ * `code_hash`) with the strategy now, and there is no engine check. A check that cannot be made is
+ * `null`, and counts as not matching for `stale`.
+ */
+export type LinkState = { 
+/**
+ * With a verdict, whether this engine has the verdict's engine revision; `null` without one.
+ */
+engine_matches: boolean | null, 
+/**
+ * With a verdict, whether the strategy's plan and rule are still the ones the verdict was
+ * judged under, as far as they concern the session's instrument, and the plan still tests
+ * it; false when the strategy is no longer registered. Without one, whether they are still
+ * the ones the session started with, as far as they concern the session's instrument; `null`
+ * when the strategy is no longer registered.
+ */
+plan_matches: boolean | null, 
+/**
+ * With a verdict, whether the strategy's source file is still the one the verdict was judged
+ * with; without one, whether it is still the one the session started with. `null` when that
+ * is unknown: no hash was saved, or the strategy is no longer registered. The session replays
+ * and trades with the current file, so this compares the code it runs now. The hash covers
+ * the strategy's own file only, not shared helpers it calls.
+ */
+code_matches: boolean | null, 
+/**
+ * True unless each check made is true: all three with a verdict, `plan_matches` and
+ * `code_matches` without one. With a verdict: the code, plan or engine the session runs on
+ * may no longer be the one that verdict judged. Without one: the code or plan may have
+ * changed since the session started.
+ */
+stale: boolean, 
+/**
+ * The hash of the strategy's source file when the session started
+ * ([`td_engine::code_hash`]); `null` for a strategy without one.
+ */
+code_hash: string | null, 
+/**
+ * The strategy's test plan ([`td_engine::TestPlan`]) when the session started, as JSON, so a
+ * session saved before a field of it changed still reads.
+ */
+plan: unknown, 
+/**
+ * The strategy's verdict rule ([`td_engine::VerdictRule`]) when the session started, as JSON
+ * like `plan`.
+ */
+rule: unknown, 
+/**
+ * The verdict the session was started from: the one named when it was started, or else the
+ * strategy's latest verdict on the instrument as `GET /verdicts` gives it. `null` when the
+ * strategy had none there.
+ */
+verdict: LinkedVerdict | null, };
+
+/**
+ * `GET /sessions/{id}/comparison`: a session beside a backtest of the same strategy, parameters,
+ * instrument, timeframe and money settings over the same bars.
+ */
+export type SessionComparisonResponse = { 
+/**
+ * The backtest that was run: from the session's first live bar (`from`) to the end of its
+ * last bar (`to`), warmed up from its first warm-up bar (`warmup_from`).
+ */
+backtest: BacktestConfig, bars: ComparedBars, 
+/**
+ * Manual orders placed on the session. The backtest has none, so they, their fills and what
+ * they changed show as differences.
+ */
+manual_orders: number, comparison: SessionComparison, };
+
+/**
+ * The bars the backtest ran on: the session's own, as its log holds them, warm-up bars included.
+ * Nothing is downloaded and nothing is read from the store, so both sides saw exactly the same
+ * prices.
+ */
+export type ComparedBars = { warm_up_bars: number, live_bars: number, 
+/**
+ * Buckets the session's live feed left out; the backtest lacks them too.
+ */
+dropped: Array<number>, 
+/**
+ * The funding rates the session was charged. The backtest is given each at the venue's
+ * funding time (`due`), as a backtest from stored data would be, so a rate the session was
+ * charged on a later bar, because it was not yet published when its own bar closed, lands
+ * on another bar there; one due before the first live bar is not charged there at all. The
+ * rates fed with warm-up bars, which the strategy saw but was not charged, are not counted
+ * here; the backtest is given them too, so a strategy that reads funding sees them there.
+ */
+funding_events: number, 
+/**
+ * How many of those rates the session charged on a later bar than the one they were due in.
+ * Each moves funding, and the equity after it, to another bar in the backtest, so it shows as
+ * a funding and a result difference and, for a strategy that sizes its orders on equity, as
+ * order and fill quantity differences: none of these is then a difference in how orders were
+ * filled.
+ */
+late_funding: number, };
 
 /**
  * What a session reports as it runs, once [`PaperSession::set_events`] gives it a channel. Sent

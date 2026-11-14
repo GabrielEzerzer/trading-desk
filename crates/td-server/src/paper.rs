@@ -2,8 +2,9 @@
 //! from, and the append-only log of every bar fed and every manual order and cancel, which is what
 //! a resume replays.
 //!
-//! Files live in `<data_dir>/paper/<session_id>/`: `config.json`, the config and the
-//! [`ENGINE_REVISION`] the session was made with, written once and synced to disk before it takes
+//! Files live in `<data_dir>/paper/<session_id>/`: `config.json`, the config, the
+//! [`ENGINE_REVISION`] the session was made with and, for a strategy session, the [`SessionLink`]
+//! of the code, plan and verdict it was started from, written once and synced to disk before it takes
 //! its name, and `events.jsonl`, one JSON object per line: a [`FedBar`] (`{"bar": ...}`), a manual
 //! order (`{"manual_order": {"id", "request", "accepted_at"}}`: the request before rounding, the id
 //! it got and when it was accepted) or a manual cancel (`{"manual_cancel": {"id"}}`). Logs written
@@ -52,6 +53,7 @@ use td_engine::{
 use tokio::sync::broadcast;
 use ts_rs::TS;
 
+use crate::api::plans::SessionLink;
 use crate::{ManualError, PaperError};
 
 const CONFIG_FILE: &str = "config.json";
@@ -100,6 +102,10 @@ struct SavedConfig {
     /// reads as revision 1.
     #[serde(default = "first_engine_revision")]
     engine_revision: u32,
+    /// What the session was started from. A config saved before links were recorded, and a manual
+    /// session's, has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    link: Option<SessionLink>,
 }
 
 fn first_engine_revision() -> u32 {
@@ -109,7 +115,8 @@ fn first_engine_revision() -> u32 {
 /// A funding rate fed with a bar.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, TS)]
 pub struct Funding {
-    /// The time the engine was given, inside the bar's window.
+    /// The time the engine was given: `due`, unless the rate came after the bar it is due in; then
+    /// the end of the last bar fed before this one, or this bar's open if it is the first.
     pub time: Millis,
     pub rate: f64,
     /// The venue's funding time. Earlier than `time` when the rate was not yet published when its
@@ -350,6 +357,7 @@ pub struct PaperSession {
     config: PaperConfig,
     /// The [`ENGINE_REVISION`] the session was made with.
     engine_revision: u32,
+    link: Option<SessionLink>,
     session: Session,
     log: File,
     log_path: PathBuf,
@@ -357,6 +365,8 @@ pub struct PaperSession {
     log_len: u64,
     status: Status,
     funding: Vec<Funding>,
+    /// The funding fed with warm-up bars, in order: shown to the strategy, never charged.
+    warm_up_funding: Vec<Funding>,
     /// Open time of the first bar fed live, after warm-up.
     live_from: Option<Millis>,
     dropped: Vec<Millis>,
@@ -379,6 +389,17 @@ impl PaperSession {
     /// [`ENGINE_REVISION`]. The strategy and money settings are checked before anything is
     /// written.
     pub fn create(data_dir: &Path, id: &str, config: PaperConfig) -> Result<Self, PaperError> {
+        Self::create_linked(data_dir, id, config, None)
+    }
+
+    /// [`PaperSession::create`] with the [`SessionLink`] of what the session was started from,
+    /// saved with its config.
+    pub fn create_linked(
+        data_dir: &Path,
+        id: &str,
+        config: PaperConfig,
+        link: Option<SessionLink>,
+    ) -> Result<Self, PaperError> {
         check_id(id)?;
         let session = build_session(&config)?;
         let dir = paper_dir(data_dir, id);
@@ -390,6 +411,7 @@ impl PaperSession {
         let saved = SavedConfig {
             config,
             engine_revision: ENGINE_REVISION,
+            link,
         };
         let json = serde_json::to_vec_pretty(&saved).map_err(|e| PaperError::BadFile {
             path: config_path.clone(),
@@ -413,12 +435,14 @@ impl PaperSession {
             data_dir: data_dir.to_path_buf(),
             config: saved.config,
             engine_revision: saved.engine_revision,
+            link: saved.link,
             session,
             log,
             log_path,
             log_len: 0,
             status: Status::Stopped,
             funding: Vec::new(),
+            warm_up_funding: Vec::new(),
             live_from: None,
             dropped: Vec::new(),
             warnings: Vec::new(),
@@ -481,11 +505,13 @@ impl PaperSession {
             session: build_session(&saved.config)?,
             config: saved.config,
             engine_revision: saved.engine_revision,
+            link: saved.link,
             log,
             log_path: log_path.clone(),
             log_len: complete as u64,
             status: Status::Stopped,
             funding: Vec::new(),
+            warm_up_funding: Vec::new(),
             live_from: None,
             dropped: Vec::new(),
             warnings,
@@ -765,6 +791,7 @@ impl PaperSession {
         let funding: Vec<(Millis, f64)> = fed.funding.iter().map(|f| (f.time, f.rate)).collect();
         if fed.warm_up {
             self.session.warm_up(fed.bar, &funding)?;
+            self.warm_up_funding.extend(&fed.funding);
         } else {
             self.session.on_bar(fed.bar, &funding)?;
             self.live_from.get_or_insert(fed.bar.open_time);
@@ -789,6 +816,12 @@ impl PaperSession {
     /// The [`ENGINE_REVISION`] the session was made with.
     pub fn engine_revision(&self) -> u32 {
         self.engine_revision
+    }
+
+    /// What the session was started from; `None` for a manual session and for one saved before
+    /// links were recorded.
+    pub fn link(&self) -> Option<&SessionLink> {
+        self.link.as_ref()
     }
 
     /// Refuses to run a session made by another [`ENGINE_REVISION`]: its log replays by this
@@ -919,6 +952,11 @@ impl PaperSession {
     /// Every funding rate charged, in order. Funding fed with a warm-up bar is not charged.
     pub fn funding(&self) -> &[Funding] {
         &self.funding
+    }
+
+    /// The funding fed with warm-up bars, in order. The strategy saw it; none of it was charged.
+    pub fn warm_up_funding(&self) -> &[Funding] {
+        &self.warm_up_funding
     }
 
     /// Open time of the first bar fed after warm-up.
@@ -1265,6 +1303,37 @@ pub(crate) mod tests {
             Err(PaperError::LogFailed(_))
         ));
         assert_eq!(rx.try_recv(), Err(broadcast::error::TryRecvError::Empty));
+    }
+
+    #[test]
+    fn a_config_saved_before_links_opens_without_one_and_a_link_is_kept() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        // A config as an engine before links wrote it.
+        let old = paper_dir(dir.path(), "old");
+        fs::create_dir_all(&old).expect("dir");
+        let mut json = serde_json::to_value(config()).expect("json");
+        json["engine_revision"] = ENGINE_REVISION.into();
+        fs::write(old.join(CONFIG_FILE), json.to_string()).expect("config");
+        fs::write(old.join(EVENTS_FILE), "").expect("log");
+        let opened = PaperSession::open(dir.path(), "old").expect("opens");
+        assert_eq!(opened.link(), None);
+        assert_eq!(opened.config(), &config());
+
+        // A session made without a link writes none, so its config reads as before.
+        PaperSession::create(dir.path(), "plain", config()).expect("creates");
+        let saved = fs::read_to_string(paper_dir(dir.path(), "plain").join(CONFIG_FILE));
+        assert!(!saved.expect("reads").contains("link"));
+
+        let link = SessionLink {
+            code_hash: Some("0123456789abcdef".into()),
+            plan: serde_json::json!({"timeframe": "1h"}),
+            rule: serde_json::json!({"kind": "standard"}),
+            verdict: None,
+        };
+        PaperSession::create_linked(dir.path(), "linked", config(), Some(link.clone()))
+            .expect("creates");
+        let reopened = PaperSession::open(dir.path(), "linked").expect("opens");
+        assert_eq!(reopened.link(), Some(&link));
     }
 
     #[test]

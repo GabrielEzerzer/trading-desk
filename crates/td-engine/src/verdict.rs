@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use td_core::InstrumentId;
 
 use crate::plan::{EvidenceSettings, MIN_PROFITABLE_WINDOWS, PlanError};
+use crate::risk::DayRollover;
 
 // ---------------------------------------------------------------------------------------------
 // Rules
@@ -114,6 +115,12 @@ pub struct FirmLimits {
     /// balance above the start: 0 stops it at the starting balance. `None` lets it trail for ever.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trailing_floor_lock: Option<f64>,
+    /// Where the firm's day ends, for its daily loss limit and its trading days. When set, the
+    /// worst-daily-loss line measures these days only, and the attempt walks read each day's
+    /// return, its low and its trading-day flag on them. `None` measures the line on the worse of
+    /// days ending at midnight UTC and at 17:00 New York, and walks days ending at midnight UTC.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub day_rollover: Option<DayRollover>,
 }
 
 /// A firm's test for a trading day. A day counts when one of its fills passes the test; each fill
@@ -186,6 +193,12 @@ pub struct AttemptTerms {
     /// may be asked for at the close of the day on which the account has held this many trading
     /// days, as the firm's `trading_day` test counts them (without one, days with a fill).
     pub days_to_first_payout: u32,
+    /// A wait in calendar days before the first payout, counted from the funded account's first
+    /// trading day (as `days_to_first_payout` counts them): the first payout may be asked for at
+    /// the close of the day this many days after that one, traded or not. With both set, both
+    /// must be met. `None` sets no such wait, and is left out of JSON.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calendar_days_to_first_payout: Option<u32>,
     /// The days from one payout to the earliest next one, traded or not.
     pub payout_interval_days: u32,
     /// The smallest payout the firm makes, after the split.
@@ -247,6 +260,10 @@ impl AttemptTerms {
         }
         for (name, days) in [
             ("days_to_first_payout", Some(self.days_to_first_payout)),
+            (
+                "calendar_days_to_first_payout",
+                self.calendar_days_to_first_payout,
+            ),
             ("payout_interval_days", Some(self.payout_interval_days)),
             ("funded_horizon_days", Some(self.funded_horizon_days)),
             ("max_payouts", self.max_payouts),
@@ -290,6 +307,8 @@ pub struct PropFirmLimits {
     pub pass_horizon_days: u32,
     /// The chance of breaching a limit within `breach_horizon_days` must be at most this.
     pub max_breach_probability: f64,
+    /// Days a simulated attempt runs for the breach odds, and the length of each attempt the
+    /// max-drawdown line reads on the test's curve.
     pub breach_horizon_days: u32,
 }
 
@@ -444,6 +463,14 @@ impl VerdictRule {
                     }
                     non_negative("firm.trailing_floor_lock", lock)?;
                 }
+                if let Some(DayRollover::Utc { offset_minutes }) = firm.day_rollover
+                    && offset_minutes.unsigned_abs() >= MINUTES_PER_DAY.unsigned_abs()
+                {
+                    return Err(PlanError(format!(
+                        "firm.day_rollover.offset_minutes must be less than a day either side of \
+                         midnight UTC, got {offset_minutes}"
+                    )));
+                }
                 if let Some(terms) = attempt {
                     terms.validate()?;
                     // The trading-day flags are built once, at the tested size: see the shortcut
@@ -577,7 +604,8 @@ impl VerdictRule {
                         d.max_breach_probability,
                         Higher,
                     ),
-                    // Fewer days to breach in lower the breach odds.
+                    // Fewer days to breach in lower the breach odds, and shorten the attempts the
+                    // drawdown line reads, which can only lower its figure.
                     (
                         "breach_horizon_days",
                         f64::from(l.breach_horizon_days),
@@ -1108,11 +1136,17 @@ pub struct KindInputs {
     /// The total return with the single best trade removed.
     pub return_without_best_trade: Option<f64>,
     // prop_firm: fractions of the starting balance, measured inside bars
-    /// The worst loss within one day.
+    /// The worst loss within one day, on the firm's day when its rule states one.
     pub worst_daily_loss: Option<f64>,
-    /// Max drawdown from the starting balance.
+    /// Max drawdown from the starting balance. For a `prop_firm` rule, the worst over attempts of
+    /// its `breach_horizon_days` started on each day of the curve, each from its own starting
+    /// balance; for the other kinds, over the whole curve.
     pub intrabar_drawdown_static: Option<f64>,
-    /// Max drawdown from the running peak.
+    /// Max drawdown from the running peak, as a fraction of the starting balance, over the same
+    /// span as `intrabar_drawdown_static`: for a `prop_firm` rule, each attempt's peak starts at
+    /// its own starting balance, and the fall is a fraction of that balance. With the firm's
+    /// `trailing_floor_lock`, the peak counts only up to where the floor reaches the lock, so the
+    /// fall is to the floor the firm applies.
     pub intrabar_drawdown_trailing: Option<f64>,
     /// The chance of reaching the firm's profit target before breaching a limit.
     pub pass_probability: Option<f64>,
@@ -1130,6 +1164,19 @@ pub struct KindInputs {
     pub limits_inside_day: bool,
 }
 
+const MINUTES_PER_DAY: i32 = 24 * 60;
+
+/// The time a firm's day ends, as a line names it.
+fn day_end(rollover: DayRollover) -> String {
+    match rollover {
+        DayRollover::Utc { offset_minutes } => {
+            let m = offset_minutes.rem_euclid(MINUTES_PER_DAY);
+            format!("{:02}:{:02} UTC", m / 60, m % 60)
+        }
+        DayRollover::NewYork1700 => "17:00 New York".to_string(),
+    }
+}
+
 /// Judges `inputs` against `rule`: one line per criterion of the rule's kind.
 pub fn evaluate(rule: &VerdictRule, x: &KindInputs) -> Vec<Criterion> {
     use Comparison::{Above, AtLeast, AtMost};
@@ -1143,14 +1190,37 @@ pub fn evaluate(rule: &VerdictRule, x: &KindInputs) -> Vec<Criterion> {
             attempt,
         } => {
             let share = limits.share_of_firm_limits;
-            let (drawdown, measured) = match firm.drawdown {
-                DrawdownMode::Static => (x.intrabar_drawdown_static, "from the starting balance"),
-                DrawdownMode::Trailing => (x.intrabar_drawdown_trailing, "from the peak"),
+            let (drawdown, measured) = match (firm.drawdown, firm.trailing_floor_lock) {
+                (DrawdownMode::Static, _) => (
+                    x.intrabar_drawdown_static,
+                    "from the starting balance".into(),
+                ),
+                (DrawdownMode::Trailing, None) => {
+                    (x.intrabar_drawdown_trailing, "from the peak".to_string())
+                }
+                // The battery measures the fall to the floor the firm applies, lock included.
+                (DrawdownMode::Trailing, Some(lock)) => (
+                    x.intrabar_drawdown_trailing,
+                    if lock == 0.0 {
+                        "from the peak, with the floor stopping at the starting balance,".into()
+                    } else {
+                        format!(
+                            "from the peak, with the floor stopping {:.2}% above the starting \
+                             balance,",
+                            lock * 100.0
+                        )
+                    },
+                ),
+            };
+            let daily_loss = match firm.day_rollover {
+                // A rule saved before the field existed keeps its line as it was.
+                None => "Worst daily loss".to_string(),
+                Some(rollover) => format!("Worst daily loss, days ending at {}", day_end(rollover)),
             };
             let mut lines = vec![
                 line(
                     "worst_daily_loss",
-                    "Worst daily loss",
+                    &daily_loss,
                     x.worst_daily_loss,
                     AtMost,
                     share * firm.daily_loss,
@@ -1158,7 +1228,10 @@ pub fn evaluate(rule: &VerdictRule, x: &KindInputs) -> Vec<Criterion> {
                 ),
                 line(
                     "max_drawdown",
-                    &format!("Max drawdown {measured}"),
+                    &format!(
+                        "Max drawdown {measured} in any {}-day attempt started on a day of the test",
+                        limits.breach_horizon_days
+                    ),
                     drawdown,
                     AtMost,
                     share * firm.max_drawdown,
@@ -1559,8 +1632,9 @@ pub struct Verdict {
     pub state: VerdictState,
     /// Every line of every layer that was judged, integrity first.
     pub criteria: Vec<Criterion>,
-    /// Costs the runs behind the verdict leave out, each named, so a verdict that rests on one is
-    /// visible. They do not change the state. Empty in a verdict saved before warnings existed.
+    /// Costs the runs behind the verdict leave out, and assumptions a line passed on that the
+    /// engine cannot check, each named, so a verdict that rests on one is visible. They do not
+    /// change the state. Empty in a verdict saved before warnings existed.
     #[serde(default)]
     pub warnings: Vec<String>,
 }
@@ -1659,6 +1733,7 @@ mod tests {
             day_target_share: None,
             trading_day: None,
             trailing_floor_lock: None,
+            day_rollover: None,
         };
         let prop = |limits| VerdictRule::PropFirm {
             firm,
@@ -1991,6 +2066,7 @@ mod tests {
                 day_target_share: None,
                 trading_day: None,
                 trailing_floor_lock: None,
+                day_rollover: None,
             },
             limits: PropFirmLimits::default(),
             attempt: None,
@@ -2073,8 +2149,14 @@ mod tests {
         // Half the firm's limits.
         assert_eq!((lines[0].limit, lines[1].limit), (Some(0.025), Some(0.05)));
         assert_eq!(lines[1].value, Some(0.03));
-        assert_eq!(lines[1].name, "Max drawdown from the starting balance");
+        assert_eq!(
+            lines[1].name,
+            "Max drawdown from the starting balance in any 90-day attempt started on a day of the \
+             test"
+        );
         assert_eq!(lines[3].name, "Chance of breaching a limit within 90 days");
+        // A rule that does not say where its firm's day ends keeps its daily loss line as it was.
+        assert_eq!(lines[0].name, "Worst daily loss");
     }
 
     #[test]
@@ -2102,6 +2184,54 @@ mod tests {
         }
     }
 
+    /// The daily loss line names the day it measured when the rule states one, and the drawdown
+    /// line the attempt length it measured over, which is the breach horizon.
+    #[test]
+    fn prop_firm_lines_say_what_they_measured() {
+        let name = |rollover, horizon| {
+            let VerdictRule::PropFirm {
+                mut firm,
+                mut limits,
+                attempt,
+            } = prop(DrawdownMode::Static)
+            else {
+                unreachable!()
+            };
+            firm.day_rollover = rollover;
+            limits.breach_horizon_days = horizon;
+            let rule = VerdictRule::PropFirm {
+                firm,
+                limits,
+                attempt,
+            };
+            let lines = evaluate(&rule, &good_prop());
+            (lines[0].name.clone(), lines[1].name.clone())
+        };
+        let utc = |offset_minutes| Some(DayRollover::Utc { offset_minutes });
+        assert_eq!(
+            name(utc(0), 90).0,
+            "Worst daily loss, days ending at 00:00 UTC"
+        );
+        assert_eq!(
+            name(Some(DayRollover::NewYork1700), 90).0,
+            "Worst daily loss, days ending at 17:00 New York"
+        );
+        // An offset is read modulo a day, as the rollover reads it.
+        assert_eq!(
+            name(utc(-60), 90).0,
+            "Worst daily loss, days ending at 23:00 UTC"
+        );
+        assert_eq!(
+            name(utc(22 * 60 + 5), 90).0,
+            "Worst daily loss, days ending at 22:05 UTC"
+        );
+        assert_eq!(
+            name(None, 30).1,
+            "Max drawdown from the starting balance in any 30-day attempt started on a day of the \
+             test"
+        );
+    }
+
     #[test]
     fn prop_firm_limits_are_inclusive() {
         let edge = KindInputs {
@@ -2122,7 +2252,10 @@ mod tests {
         let lines = evaluate(&prop(DrawdownMode::Trailing), &good_prop());
         assert_eq!(not_passing(&lines), [("max_drawdown", Outcome::Fail)]);
         assert_eq!(lines[1].value, Some(0.20));
-        assert_eq!(lines[1].name, "Max drawdown from the peak");
+        assert_eq!(
+            lines[1].name,
+            "Max drawdown from the peak in any 90-day attempt started on a day of the test"
+        );
         let x = KindInputs {
             intrabar_drawdown_trailing: Some(0.04),
             intrabar_drawdown_static: Some(0.9),
@@ -2245,6 +2378,7 @@ mod tests {
             day_target_share: None,
             trading_day: None,
             trailing_floor_lock: None,
+            day_rollover: None,
         };
         let bad = [
             VerdictRule::PropFirm {
@@ -2936,6 +3070,7 @@ mod tests {
             refund_fee_with_first_payout: false,
             profit_split: 0.8,
             days_to_first_payout: 14,
+            calendar_days_to_first_payout: None,
             payout_interval_days: 14,
             min_payout: 100.0,
             payout_cap: None,
@@ -2957,6 +3092,33 @@ mod tests {
             limits,
             attempt: Some(terms),
         }
+    }
+
+    #[test]
+    fn a_calendar_wait_before_the_first_payout_is_left_out_of_json_when_off() {
+        // Terms without the wait are written without its key, and read back the same.
+        let terms = attempt_terms();
+        let json = serde_json::to_value(terms).unwrap();
+        assert!(
+            json.get("calendar_days_to_first_payout").is_none(),
+            "{json}"
+        );
+        assert_eq!(serde_json::from_value::<AttemptTerms>(json).unwrap(), terms);
+        // Set, it is written and read back, and validates.
+        let wait = AttemptTerms {
+            calendar_days_to_first_payout: Some(10),
+            ..terms
+        };
+        let json = serde_json::to_value(wait).unwrap();
+        assert_eq!(json["calendar_days_to_first_payout"], 10);
+        assert_eq!(serde_json::from_value::<AttemptTerms>(json).unwrap(), wait);
+        assert_eq!(with_attempt(wait).validate(), Ok(()));
+        // A wait of 0 days is refused like the other day counts.
+        let zero = AttemptTerms {
+            calendar_days_to_first_payout: Some(0),
+            ..terms
+        };
+        assert!(with_attempt(zero).validate().is_err());
     }
 
     #[test]
@@ -3011,8 +3173,38 @@ mod tests {
             unreachable!()
         };
         assert_eq!((firm.day_target_share, firm.trading_day), (None, None));
+        assert_eq!(firm.day_rollover, None);
         let original: serde_json::Value = serde_json::from_str(saved).unwrap();
         assert_eq!(serde_json::to_value(rule).unwrap(), original);
+        // The firm's day reads and writes back in the rollover's own form.
+        for (json, rollover) in [
+            (r#"{"kind":"new_york1700"}"#, DayRollover::NewYork1700),
+            (
+                r#"{"kind":"utc","offset_minutes":0}"#,
+                DayRollover::Utc { offset_minutes: 0 },
+            ),
+        ] {
+            let text = format!(
+                r#"{{"daily_loss":0.05,"max_drawdown":0.1,"drawdown":"static",
+                "profit_target":0.08,"day_rollover":{json}}}"#
+            );
+            let firm: FirmLimits = serde_json::from_str(&text).unwrap();
+            assert_eq!(firm.day_rollover, Some(rollover));
+            let original: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(serde_json::to_value(firm).unwrap(), original);
+        }
+        // A key the rollover's kind does not have does not read, on either kind, so a misspelt
+        // key is refused rather than lost.
+        for json in [
+            r#"{"kind":"new_york1700","offset_minutes":60}"#,
+            r#"{"kind":"utc","offset_minutes":0,"offset_mins":60}"#,
+        ] {
+            let text = format!(
+                r#"{{"daily_loss":0.05,"max_drawdown":0.1,"drawdown":"static",
+                "profit_target":0.08,"day_rollover":{json}}}"#
+            );
+            assert!(serde_json::from_str::<FirmLimits>(&text).is_err(), "{json}");
+        }
         // Set, they read and write back; a test's fields that are off are left out of it too.
         let set = r#"{"daily_loss":0.05,"max_drawdown":0.1,"drawdown":"static",
             "profit_target":0.08,"day_target_share":0.4,
@@ -3048,7 +3240,29 @@ mod tests {
     #[test]
     fn each_new_field_out_of_range_is_refused_by_name() {
         type Tweak = fn(&mut FirmLimits, &mut AttemptTerms);
-        let cases: [(&str, Tweak); 27] = [
+        let cases: [(&str, Tweak); 31] = [
+            ("firm.day_rollover.offset_minutes", |f, _| {
+                f.day_rollover = Some(DayRollover::Utc {
+                    offset_minutes: 24 * 60,
+                })
+            }),
+            ("firm.day_rollover.offset_minutes", |f, _| {
+                f.day_rollover = Some(DayRollover::Utc {
+                    offset_minutes: -24 * 60,
+                })
+            }),
+            // The extremes a rule read from JSON can carry, where taking the absolute value of
+            // i32::MIN would overflow.
+            ("firm.day_rollover.offset_minutes", |f, _| {
+                f.day_rollover = Some(DayRollover::Utc {
+                    offset_minutes: i32::MIN,
+                })
+            }),
+            ("firm.day_rollover.offset_minutes", |f, _| {
+                f.day_rollover = Some(DayRollover::Utc {
+                    offset_minutes: i32::MAX,
+                })
+            }),
             ("firm.second_target", |f, _| f.second_target = Some(0.0)),
             ("firm.second_target", |f, _| {
                 f.second_target = Some(f64::NAN)

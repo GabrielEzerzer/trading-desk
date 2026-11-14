@@ -232,6 +232,7 @@ pub fn trailing_drawdown(start: f64, ranges: &[EquityRange]) -> Option<TrailingD
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(deny_unknown_fields)]
 pub enum DayRollover {
     /// At the same time every day: `offset_minutes` after 00:00 UTC, taken modulo a day, so 0
     /// is midnight UTC (the day the metrics use) and both 1380 and -60 are 23:00 UTC.
@@ -239,7 +240,18 @@ pub enum DayRollover {
     /// 17:00 in New York, where most prop firms reset their daily limits: 21:00 UTC while US
     /// daylight saving time is in force, from the second Sunday of March to the first Sunday of
     /// November (the rules since 2007), and 22:00 UTC otherwise.
+    // serde ignores any other key on a variant without fields, even with `deny_unknown_fields`,
+    // so this variant refuses them itself.
+    #[serde(deserialize_with = "no_other_keys")]
     NewYork1700,
+}
+
+/// Reads the keys after the tag of a rollover that has no fields, and refuses any it finds.
+fn no_other_keys<'de, D: serde::Deserializer<'de>>(keys: D) -> Result<(), D::Error> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct NoKeys {}
+    NoKeys::deserialize(keys).map(|_| ())
 }
 
 impl Default for DayRollover {
@@ -435,6 +447,7 @@ mod tests {
             qty,
             fee,
             liquidity,
+            close_out: false,
         }
     }
 
@@ -568,6 +581,7 @@ mod tests {
             fills[0].clone(),
             Fill {
                 liquidity: Liquidity::Maker,
+                close_out: false,
                 ..fills[1].clone()
             },
         ];

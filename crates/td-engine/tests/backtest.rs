@@ -646,6 +646,28 @@ fn the_close_out_at_the_end_counts_as_a_forced_close() {
 }
 
 #[test]
+fn the_close_out_fill_says_so_and_every_other_fill_is_written_as_before() {
+    assert!(run_synthetic().fills.iter().all(|f| !f.close_out));
+
+    let mut c = config();
+    c.close_at_end = true;
+    let r = run(&c, &synthetic_bars(), &[], &synthetic_funding()).unwrap();
+    let (last, rest) = r.fills.split_last().unwrap();
+    assert!(last.close_out);
+    assert_eq!(last.time, T0 + 489 * HOUR);
+    assert!(rest.iter().all(|f| !f.close_out));
+
+    // A close-out writes its marker; any other fill has no such key, and a fill saved without
+    // it reads as no close-out.
+    let json = serde_json::to_value(last).unwrap();
+    assert_eq!(json["close_out"], Value::Bool(true));
+    let other = serde_json::to_value(&rest[0]).unwrap();
+    assert!(other.get("close_out").is_none(), "{other}");
+    let back: td_core::Fill = serde_json::from_value(other).unwrap();
+    assert_eq!(back, rest[0]);
+}
+
+#[test]
 fn equity_extremes_bracket_each_close_and_feed_the_intrabar_metrics() {
     let r = run_synthetic();
     assert_eq!(r.equity_extremes.len(), r.equity.len());
