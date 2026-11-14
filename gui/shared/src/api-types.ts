@@ -1357,8 +1357,8 @@ value: number | null, comparison: Comparison,
  */
 limit: number | null, unit: Unit, outcome: Outcome, 
 /**
- * Why the line warns or is inconclusive, in words the GUI shows. `None` when the value and
- * the limit say it all.
+ * Why the line warns or is inconclusive, or what its value leaves out, in words the GUI
+ * shows. `None` when the value and the limit say it all.
  */
 note: string | null, };
 
@@ -1668,7 +1668,14 @@ breach_probability: number | null,
  * The value of one attempt in the account currency with the edge reduced by the rule's
  * `reduced_edge_factor`, for a rule with attempt terms.
  */
-attempt_value: number | null, };
+attempt_value: number | null, 
+/**
+ * Whether the pass odds, the breach odds and the attempt's value checked the loss limits on
+ * each day's lowest equity, inside the day. False when they were checked at daily closes
+ * only, because the curve had no equity inside its bars, and for the other kinds. Left out
+ * when false, so a result saved before it existed reads as checked at closes, as it was.
+ */
+limits_inside_day?: boolean, };
 
 /**
  * The integrity checks read on the stitched walk-forward out-of-sample curve (I4 and I5),

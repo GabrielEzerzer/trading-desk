@@ -800,8 +800,8 @@ pub struct Criterion {
     pub limit: Option<f64>,
     pub unit: Unit,
     pub outcome: Outcome,
-    /// Why the line warns or is inconclusive, in words the GUI shows. `None` when the value and
-    /// the limit say it all.
+    /// Why the line warns or is inconclusive, or what its value leaves out, in words the GUI
+    /// shows. `None` when the value and the limit say it all.
     pub note: Option<String>,
 }
 
@@ -1122,6 +1122,12 @@ pub struct KindInputs {
     /// `reduced_edge_factor`, for a rule with attempt terms.
     #[serde(default)]
     pub attempt_value: Option<f64>,
+    /// Whether the pass odds, the breach odds and the attempt's value checked the loss limits on
+    /// each day's lowest equity, inside the day. False when they were checked at daily closes
+    /// only, because the curve had no equity inside its bars, and for the other kinds. Left out
+    /// when false, so a result saved before it existed reads as checked at closes, as it was.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub limits_inside_day: bool,
 }
 
 /// Judges `inputs` against `rule`: one line per criterion of the rule's kind.
@@ -1193,6 +1199,19 @@ pub fn evaluate(rule: &VerdictRule, x: &KindInputs) -> Vec<Criterion> {
                     0.0,
                     Unit::Quote,
                 ));
+            }
+            if !x.limits_inside_day {
+                let simulated = ["pass_probability", "breach_probability", "attempt_value"];
+                for l in &mut lines {
+                    if simulated.contains(&l.id.as_str()) && l.value.is_some() {
+                        l.note = Some(
+                            "The loss limits were checked at daily closes only: the run has no \
+                             equity inside its bars, so a dip that recovers by the close does \
+                             not breach here."
+                                .to_string(),
+                        );
+                    }
+                }
             }
             lines
         }
@@ -1985,8 +2004,57 @@ mod tests {
             intrabar_drawdown_trailing: Some(0.20),
             pass_probability: Some(0.7),
             breach_probability: Some(0.05),
+            limits_inside_day: true,
             ..KindInputs::default()
         }
+    }
+
+    /// Odds simulated with the limits at daily closes say so on their lines, and only there; odds
+    /// that read each day's low need no note.
+    #[test]
+    fn prop_firm_odds_checked_at_closes_say_so() {
+        let rule = with_attempt(attempt_terms());
+        let inside = KindInputs {
+            attempt_value: Some(10.0),
+            ..good_prop()
+        };
+        let noted = |x: &KindInputs| -> Vec<String> {
+            evaluate(&rule, x)
+                .into_iter()
+                .filter(|l| {
+                    l.note
+                        .as_deref()
+                        .is_some_and(|n| n.contains("daily closes"))
+                })
+                .map(|l| l.id)
+                .collect()
+        };
+        assert!(noted(&inside).is_empty());
+        let closes = KindInputs {
+            limits_inside_day: false,
+            ..inside
+        };
+        assert_eq!(
+            noted(&closes),
+            ["pass_probability", "breach_probability", "attempt_value"]
+        );
+        // The note changes no outcome.
+        assert_eq!(
+            not_passing(&evaluate(&rule, &closes)),
+            not_passing(&evaluate(&rule, &inside))
+        );
+        // A line the battery could not compute gets no note: it fails for want of a value.
+        let missing = KindInputs {
+            breach_probability: None,
+            ..closes
+        };
+        assert_eq!(noted(&missing), ["pass_probability", "attempt_value"]);
+        // Left out of JSON when false, so a result saved before it existed reads as at closes.
+        let json = serde_json::to_value(&closes).unwrap();
+        assert!(json.get("limits_inside_day").is_none());
+        assert_eq!(serde_json::from_value::<KindInputs>(json).unwrap(), closes);
+        let json = serde_json::to_value(&inside).unwrap();
+        assert_eq!(json["limits_inside_day"], true);
     }
 
     #[test]

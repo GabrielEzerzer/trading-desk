@@ -24,12 +24,20 @@ use td_engine::ENGINE_REVISION;
 /// shortcut: a test cannot see edits to its own history, so a row edited in place (the last row's
 /// checksums overwritten instead of a new row appended) is not caught. Upgrade with a CI step that
 /// fails when `git diff origin/main -- crates/td-engine/tests/revision.rs` removes lines.
-const MEASURED: &[(u32, &str, &str, &str)] = &[(
-    7,
-    "c1ad6b64d1a62ad0",
-    "9bd8ed6281880a1c",
-    "10e139c40d46747d",
-)];
+const MEASURED: &[(u32, &str, &str, &str)] = &[
+    (
+        7,
+        "c1ad6b64d1a62ad0",
+        "9bd8ed6281880a1c",
+        "10e139c40d46747d",
+    ),
+    (
+        8,
+        "c1ad6b64d1a62ad0",
+        "9bd8ed6281880a1c",
+        "6e3ea1ae4cd6b228",
+    ),
+];
 
 fn repo_file(path: &str) -> String {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
