@@ -41,7 +41,7 @@ pub struct AttachedStop {
 
 impl AttachedStop {
     /// The stop's request for an entry that filled `qty`.
-    pub(crate) fn request(&self, entry: &OrderRequest, qty: f64) -> OrderRequest {
+    pub fn request(&self, entry: &OrderRequest, qty: f64) -> OrderRequest {
         OrderRequest {
             instrument: entry.instrument.clone(),
             side: match entry.side {
@@ -75,7 +75,7 @@ pub enum OrderStatus {
 }
 
 /// What happened to open orders on a bar.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum BrokerEvent {
     Filled(Fill),
     Cancelled {

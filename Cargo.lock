@@ -2373,6 +2373,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "td-live"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "td-core",
+ "td-engine",
+ "td-mock-bybit",
+ "td-orders",
+ "thiserror",
+]
+
+[[package]]
 name = "td-mock-bybit"
 version = "0.1.0"
 dependencies = [
