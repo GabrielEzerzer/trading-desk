@@ -507,6 +507,7 @@ fn respond(status: u16, mut headers: Vec<(String, String)>, body: String) -> Rep
 /// 2026-11-14).
 fn answer_message(code: i64) -> &'static str {
     match code {
+        0 => "OK",
         40004 => {
             "the order is modified during the process of replacing , please check the order status \
              again"
