@@ -71,7 +71,9 @@ pub use plan::{
     date,
 };
 pub use portfolio::Portfolio;
-pub use reference::ReferenceBars;
+pub use reference::{
+    LiveReferences, REFERENCE_WAIT, ReferenceBars, check_ids as check_reference_ids,
+};
 pub use registry::{StrategyEntry, build_strategy, code_hash, find_strategy, strategies};
 pub use results::{
     PlanRun, RunId, RunKind, RunSummary, SavedRun, StoreError, list, load, save, save_with_files,
@@ -80,7 +82,7 @@ pub use risk::{DayRollover, EquityRange};
 pub use runner::{
     BacktestConfig, BacktestResult, Benchmark, ENGINE_REVISION, Rerun, config_fingerprint,
     config_fingerprint_with_references, data_fingerprint, default_slippage_bps, rerun, run,
-    run_strategy, run_with_references,
+    run_strategy, run_strategy_with_references, run_with_references,
 };
 pub use saved_verdicts::{
     LinkState, LinkedVerdict, RECORD_FILE, RUNS_DIR, SessionLink, VERDICT_FILE, VerdictError,

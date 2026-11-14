@@ -465,20 +465,22 @@ fn latest_verdicts(
     td_engine::latest_verdicts(runs_dir, strategies, strategy).map_err(verdict_error)
 }
 
-/// The link of a paper session ([`td_engine::session_link`]): 400 `invalid_verdict` for a run that
-/// is not a saved verdict of this strategy on this instrument, or one judged with reference
-/// instruments, which a session cannot feed its strategy, named or latest.
+/// The link of a paper session that feeds its strategy `references` ([`td_engine::session_link`]):
+/// 400 `invalid_verdict` for a run that is not a saved verdict of this strategy on this instrument,
+/// or one judged with other reference instruments, named or latest.
 pub(crate) fn session_link(
     runs_dir: &Path,
     entry: &StrategyEntry,
     instrument: &InstrumentId,
     verdict: Option<&RunId>,
+    references: &[InstrumentId],
 ) -> Result<SessionLink, ApiError> {
     td_engine::session_link(
         runs_dir,
         entry,
         instrument,
         verdict.map(RunId::as_str),
+        Some(references),
         "in `verdict_run_id`",
     )
     .map_err(verdict_error)
@@ -555,7 +557,7 @@ mod tests {
         save_verdict(dir.path(), older, &entry, &on);
         save_verdict(dir.path(), newer, &entry, &on);
 
-        let latest = session_link(dir.path(), &entry, &on, None).unwrap();
+        let latest = session_link(dir.path(), &entry, &on, None, &[]).unwrap();
         assert_eq!(
             latest.code_hash.as_deref(),
             td_engine::code_hash("sma_cross")
@@ -564,29 +566,30 @@ mod tests {
         assert_eq!(latest.verdict.as_ref().unwrap().run_id.as_str(), newer);
 
         let named = RunId::parse(older).unwrap();
-        let link = session_link(dir.path(), &entry, &on, Some(&named)).unwrap();
+        let link = session_link(dir.path(), &entry, &on, Some(&named), &[]).unwrap();
         assert_eq!(link.verdict.unwrap().run_id, named);
 
         // Another instrument has no verdict to link to.
         let other = id("NOPEUSDT", InstrumentKind::Spot);
-        let none = session_link(dir.path(), &entry, &other, None).unwrap();
+        let none = session_link(dir.path(), &entry, &other, None, &[]).unwrap();
         assert_eq!(none.verdict, None);
         // A verdict of another instrument, a run that is not a verdict and an id that is not one
         // are refused.
         let refused = |run: &str| {
             let run: RunId = serde_json::from_value(Value::String(run.into())).unwrap();
-            session_link(dir.path(), &entry, &other, Some(&run)).unwrap_err()
+            session_link(dir.path(), &entry, &other, Some(&run), &[]).unwrap_err()
         };
         for run in [newer, "1700000000002-0000000c", "../../etc"] {
             assert_eq!(refused(run).body.code, "invalid_verdict", "{run}");
         }
     }
 
-    /// A paper session feeds no reference instruments, so it is never linked to a verdict judged
-    /// with them: one named is refused, and so is a session left to the latest verdict when that
-    /// is such a one, since it would run without the bars its strategy was judged on.
+    /// A session is linked to a verdict judged with reference instruments only when it feeds
+    /// exactly those: one named is refused without them, with the missing instruments in the
+    /// message, and so is a session left to the latest verdict when that is such a one, since it
+    /// would run without the bars its strategy was judged on.
     #[test]
-    fn a_session_is_never_linked_to_a_verdict_judged_with_reference_instruments() {
+    fn a_session_is_linked_to_a_verdict_judged_with_references_only_when_it_feeds_them() {
         let dir = tempfile::tempdir().unwrap();
         let entry = td_engine::find_strategy("sma_cross").unwrap();
         let on = entry.plan.instruments[0].clone();
@@ -599,27 +602,42 @@ mod tests {
         save_verdict_with(dir.path(), newer, &entry, &on, vec![reference.clone()]);
 
         let named = RunId::parse(newer).unwrap();
-        let refused = session_link(dir.path(), &entry, &on, Some(&named)).unwrap_err();
+        let refused = session_link(dir.path(), &entry, &on, Some(&named), &[]).unwrap_err();
         assert_eq!(refused.body.code, "invalid_verdict");
         assert!(
             refused
                 .body
                 .message
-                .contains("cannot feed reference instruments"),
+                .contains(&format!("the session does not feed {reference}")),
             "{}",
             refused.body.message
         );
-        let latest = session_link(dir.path(), &entry, &on, None).unwrap_err();
+        let latest = session_link(dir.path(), &entry, &on, None, &[]).unwrap_err();
         assert_eq!(latest.body.code, "invalid_verdict");
         assert!(
             latest.body.message.contains("latest verdict"),
             "{}",
             latest.body.message
         );
-        // A verdict judged without them still links.
+        // Fed the same references, both link.
+        let fed = std::slice::from_ref(&reference);
+        let link = session_link(dir.path(), &entry, &on, Some(&named), fed).unwrap();
+        assert_eq!(link.verdict.unwrap().run_id, named);
+        let link = session_link(dir.path(), &entry, &on, None, fed).unwrap();
+        assert_eq!(link.verdict.unwrap().run_id, named);
+        // A verdict judged without them links a session without them, and refuses one with them.
         let plain = RunId::parse(older).unwrap();
-        let link = session_link(dir.path(), &entry, &on, Some(&plain)).unwrap();
+        let link = session_link(dir.path(), &entry, &on, Some(&plain), &[]).unwrap();
         assert_eq!(link.verdict.unwrap().run_id, plain);
+        let extra = session_link(dir.path(), &entry, &on, Some(&plain), fed).unwrap_err();
+        assert!(
+            extra
+                .body
+                .message
+                .contains(&format!("also feeds {reference}")),
+            "{}",
+            extra.body.message
+        );
 
         // The verdict list says which references the latest verdict was judged with.
         let rows = latest_verdicts(dir.path(), std::slice::from_ref(&entry), None).unwrap();

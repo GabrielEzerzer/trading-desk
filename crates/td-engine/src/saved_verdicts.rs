@@ -498,12 +498,15 @@ impl LinkState {
 
 /// The link of a session of `entry` on `instrument` started now, from the verdict saved as run
 /// `verdict`, or from the strategy's latest verdict on the instrument when it is `None`.
+/// `references` are the reference instruments the session feeds its strategy, in any order, or
+/// `None` for a session that cannot feed any (a live session, today).
+///
 /// [`VerdictError::Invalid`] for a run that is not a saved verdict of this strategy on this
-/// instrument, or one judged with reference instruments, which a session cannot feed its strategy:
-/// it would be a different test from the one the verdict judged. That holds for the latest verdict
-/// too, so a session of a strategy last judged with references does not start unless the caller
-/// names a verdict judged without them; `name_one` says how, as in "name a verdict judged without
-/// them {name_one}".
+/// instrument, or one judged with other reference instruments than the session feeds: it would be
+/// a different test from the one the verdict judged. The message names the instruments the session
+/// is missing, or feeds beyond the verdict's. That holds for the latest verdict too, so such a
+/// session does not start unless the caller names a matching verdict; `name_one` says how, as in
+/// "name a verdict judged with the same ones {name_one}".
 ///
 /// `verdict` is checked with [`RunId::parse`] before it is joined to `runs_dir`, since it names a
 /// path and may come from outside.
@@ -512,9 +515,15 @@ pub fn session_link(
     entry: &StrategyEntry,
     instrument: &InstrumentId,
     verdict: Option<&str>,
+    references: Option<&[InstrumentId]>,
     name_one: &str,
 ) -> Result<SessionLink, VerdictError> {
     let bad = VerdictError::Invalid;
+    let mismatch = |id: &RunId, judged: &[InstrumentId]| match references {
+        None if judged.is_empty() => None,
+        None => Some(cannot_feed(id, judged)),
+        Some(fed) => references_differ(id, judged, fed),
+    };
     let record = match verdict {
         Some(id) => {
             let checked = RunId::parse(id).map_err(|_| bad(format!("{id:?} is not a run id")))?;
@@ -526,8 +535,8 @@ pub fn session_link(
                     record.strategy, record.instrument, entry.name
                 )));
             }
-            if !record.references.is_empty() {
-                return Err(bad(cannot_feed(&checked, &record.references)));
+            if let Some(why) = mismatch(&checked, &record.references) {
+                return Err(bad(why));
             }
             Some((checked, record))
         }
@@ -535,25 +544,37 @@ pub fn session_link(
             let latest = latest_verdicts(runs_dir, std::slice::from_ref(entry), Some(entry.name))?
                 .into_iter()
                 .find(|row| row.instrument == *instrument);
-            let latest_refused = |id: &RunId, references: &[InstrumentId]| {
+            let latest_refused = |why: String| {
+                let instead = match references {
+                    None => format!(
+                        "name a verdict judged without them {name_one}, or run a test without them first"
+                    ),
+                    Some(_) => format!(
+                        "name a verdict judged with the reference instruments the session feeds {name_one}, or run a test with them first"
+                    ),
+                };
                 bad(format!(
-                    "{}; it is the strategy's latest verdict on {instrument}, so name a verdict judged without them {name_one}, or run a test without them first",
-                    cannot_feed(id, references)
+                    "{why}; it is the strategy's latest verdict on {instrument}, so {instead}"
                 ))
             };
             match latest {
                 // Judged from the row, so a record that cannot be read again does not let the
                 // session start unlinked.
-                Some(row) if !row.references.is_empty() => {
-                    return Err(latest_refused(&row.run_id, &row.references));
-                }
-                // And from the record read again, which may have been rewritten since.
-                Some(row) => match read_record(&runs_dir.join(row.run_id.as_str())) {
-                    Some(record) if !record.references.is_empty() => {
-                        return Err(latest_refused(&row.run_id, &record.references));
+                Some(row) => {
+                    if let Some(why) = mismatch(&row.run_id, &row.references) {
+                        return Err(latest_refused(why));
                     }
-                    record => record.map(|record| (row.run_id, record)),
-                },
+                    // And from the record read again, which may have been rewritten since.
+                    match read_record(&runs_dir.join(row.run_id.as_str())) {
+                        Some(record) => {
+                            if let Some(why) = mismatch(&row.run_id, &record.references) {
+                                return Err(latest_refused(why));
+                            }
+                            Some((row.run_id, record))
+                        }
+                        None => None,
+                    }
+                }
                 None => None,
             }
         }
@@ -578,17 +599,63 @@ pub fn session_link(
     })
 }
 
-/// Why a session cannot be linked to verdict `id`, judged with `references`.
+/// Why a session that cannot feed reference instruments cannot be linked to verdict `id`, judged
+/// with `references`.
 ///
-/// shortcut: neither a paper session nor a live one feeds reference instruments, so neither can
-/// run the test a verdict with references judged; feed their live bars beside the session's own
-/// when a strategy that reads them is traded in a session.
+/// shortcut: a live session feeds no reference instruments yet, so it cannot run the test a
+/// verdict with references judged; take up [`crate::LiveReferences`] in the live session when a
+/// strategy that reads them is traded live.
 fn cannot_feed(id: &RunId, references: &[InstrumentId]) -> String {
-    let names: Vec<String> = references.iter().map(ToString::to_string).collect();
     format!(
-        "run {id} was judged with the reference instruments {}, and a paper or live session cannot feed reference instruments yet",
-        names.join(", ")
+        "run {id} was judged with the reference instruments {}, and a live session cannot feed reference instruments yet",
+        names(references)
     )
+}
+
+/// Why a session that feeds the reference instruments `fed` cannot be linked to verdict `id`,
+/// judged with `judged`, or `None` when both name the same ones.
+fn references_differ(id: &RunId, judged: &[InstrumentId], fed: &[InstrumentId]) -> Option<String> {
+    let missing: Vec<InstrumentId> = judged
+        .iter()
+        .filter(|j| !fed.contains(j))
+        .cloned()
+        .collect();
+    let extra: Vec<InstrumentId> = fed
+        .iter()
+        .filter(|f| !judged.contains(f))
+        .cloned()
+        .collect();
+    let judged_with = if judged.is_empty() {
+        format!("run {id} was judged with no reference instruments")
+    } else {
+        format!(
+            "run {id} was judged with the reference instruments {}",
+            names(judged)
+        )
+    };
+    match (missing.is_empty(), extra.is_empty()) {
+        (true, true) => None,
+        (false, true) => Some(format!(
+            "{judged_with}, and the session does not feed {}",
+            names(&missing)
+        )),
+        (true, false) => Some(format!(
+            "{judged_with}, and the session also feeds {}",
+            names(&extra)
+        )),
+        (false, false) => Some(format!(
+            "{judged_with}, and the session does not feed {} and also feeds {}",
+            names(&missing),
+            names(&extra)
+        )),
+    }
+}
+
+fn names(ids: &[InstrumentId]) -> String {
+    ids.iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Whether a saved code hash is the strategy's code in this engine: `None` when the run saved no

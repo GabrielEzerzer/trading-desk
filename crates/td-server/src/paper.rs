@@ -31,6 +31,11 @@
 //! session, which shares its account with them; the strategy sees their fills in `on_fill` like
 //! its own. Orders, fills and trades carry their [`OrderSource`].
 //!
+//! A session can name reference instruments ([`PaperConfig::references`]): each bar's line then
+//! holds the slot of each reference fed with it, its bar opening at the same time or `null`, so a
+//! replay gives the strategy the same reference bars. A config and log saved before references
+//! existed hold none and read as before.
+//!
 //! A session made by another engine revision still opens, so it can be listed and looked at, but
 //! its log is replayed by this engine's rules, so its numbers may differ from the ones it showed.
 //! It carries a warning saying so and cannot be resumed.
@@ -87,6 +92,12 @@ pub struct PaperConfig {
     /// gets. A kind without margin, such as spot, ignores it.
     #[serde(default = "default_max_leverage")]
     pub max_leverage: f64,
+    /// Instruments on the same venue whose closed bars the strategy reads beside its own
+    /// ([`td_engine::Context::reference`]), as a backtest's `references` names them. Fixed for the
+    /// session's life. Left out when there are none, the default, which a config saved without it
+    /// also gets.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub references: Vec<InstrumentId>,
 }
 
 fn default_max_leverage() -> f64 {
@@ -133,6 +144,11 @@ pub struct FedBar {
     /// Fed during warm-up with [`Session::warm_up`]: trading is disabled and no funding is charged.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub warm_up: bool,
+    /// The slot of each of the session's reference instruments fed with the bar, in the order the
+    /// config names them: that instrument's bar opening at the bar's open time, or `null` where it
+    /// has none. Left out for a session without references.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub references: Vec<Option<Candle>>,
 }
 
 /// A manual order or cancel, as a line of `events.jsonl`.
@@ -587,11 +603,25 @@ impl PaperSession {
         funding: Vec<Funding>,
         warm_up: bool,
     ) -> Result<(), PaperError> {
+        self.feed_with_references(bar, funding, Vec::new(), warm_up)
+    }
+
+    /// [`PaperSession::feed`] with the slot of each of the session's reference instruments for the
+    /// bar, in the config's order (see [`td_engine::Session::feed`]); a session without references
+    /// takes none.
+    pub fn feed_with_references(
+        &mut self,
+        bar: Candle,
+        funding: Vec<Funding>,
+        references: Vec<Option<Candle>>,
+        warm_up: bool,
+    ) -> Result<(), PaperError> {
         self.check_log()?;
         let fed = FedBar {
             bar,
             funding,
             warm_up,
+            references,
         };
         let before = self.events.as_ref().map(|_| self.mark());
         self.apply(&fed)?;
@@ -789,16 +819,23 @@ impl PaperSession {
 
     fn apply(&mut self, fed: &FedBar) -> Result<(), PaperError> {
         let funding: Vec<(Millis, f64)> = fed.funding.iter().map(|f| (f.time, f.rate)).collect();
+        self.session
+            .feed(fed.bar, None, &funding, &fed.references, fed.warm_up)?;
         if fed.warm_up {
-            self.session.warm_up(fed.bar, &funding)?;
             self.warm_up_funding.extend(&fed.funding);
         } else {
-            self.session.on_bar(fed.bar, &funding)?;
             self.live_from.get_or_insert(fed.bar.open_time);
             // The engine charges no funding on a warm-up bar.
             self.funding.extend(&fed.funding);
         }
         Ok(())
+    }
+
+    /// Swaps in `strategy` before any bar is fed, for a test that records what a strategy reads.
+    #[cfg(test)]
+    pub(crate) fn swap_strategy(&mut self, strategy: Box<dyn Strategy>) {
+        assert!(self.session.bars().is_empty(), "swapped before any bar");
+        self.session = session_with(&self.config, strategy).expect("session");
     }
 
     pub fn id(&self) -> &str {
@@ -1036,6 +1073,11 @@ fn build_session(config: &PaperConfig) -> Result<Session, PaperError> {
     } else {
         build_strategy(&config.strategy, &config.params)?
     };
+    session_with(config, strategy)
+}
+
+/// A session of `config` stepping `strategy`, with the config's reference instruments named.
+fn session_with(config: &PaperConfig, strategy: Box<dyn Strategy>) -> Result<Session, PaperError> {
     let money = SessionConfig {
         starting_cash: config.starting_cash,
         slippage_bps: config.slippage_bps,
@@ -1045,12 +1087,9 @@ fn build_session(config: &PaperConfig) -> Result<Session, PaperError> {
         // `PaperConfig` when paper trading takes a market with quotes.
         account_currency: td_core::AccountCurrency::Quote,
     };
-    Ok(Session::new(
-        strategy,
-        config.instrument.clone(),
-        config.timeframe,
-        money,
-    )?)
+    let mut session = Session::new(strategy, config.instrument.clone(), config.timeframe, money)?;
+    session.name_references(config.references.clone())?;
+    Ok(session)
 }
 
 fn check_id(id: &str) -> Result<(), PaperError> {
@@ -1132,7 +1171,56 @@ pub(crate) mod tests {
             slippage_bps: 0.0,
             fees: None,
             max_leverage: 1.0,
+            references: Vec::new(),
         }
+    }
+
+    /// A session saved with reference instruments resumes with them: its log replays each bar with
+    /// the reference bars it was fed. One saved before sessions took references, whose config and
+    /// log lines have no `references`, opens and replays as before.
+    #[test]
+    fn a_session_resumes_with_its_references_and_an_old_one_still_opens() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let other = InstrumentId {
+            symbol: "OTHERUSDT".into(),
+            ..config().instrument.id
+        };
+        let with = PaperConfig {
+            references: vec![other.clone()],
+            ..config()
+        };
+        let mut paper = PaperSession::create(dir.path(), "refs", with).expect("creates");
+        let mut gap = bar(0);
+        gap.close = 101.0;
+        paper
+            .feed_with_references(bar(0), Vec::new(), vec![Some(gap)], true)
+            .expect("warm-up bar");
+        paper
+            .feed_with_references(bar(1), Vec::new(), vec![None], false)
+            .expect("live bar");
+        // One slot per reference, no more and no fewer.
+        assert!(paper.feed(bar(2), Vec::new(), false).is_err());
+        let fed = vec![(other.clone(), vec![Some(gap), None])];
+        assert_eq!(paper.session().references(), fed.as_slice());
+        drop(paper);
+
+        let resumed = PaperSession::open(dir.path(), "refs").expect("opens");
+        assert_eq!(resumed.config().references, vec![other]);
+        assert_eq!(resumed.session().references(), fed.as_slice());
+        assert_eq!(resumed.session().bars().len(), 2);
+
+        let mut old = PaperSession::create(dir.path(), "old", config()).expect("creates");
+        old.feed(bar(0), Vec::new(), true).expect("warm-up bar");
+        old.feed(bar(1), Vec::new(), false).expect("live bar");
+        drop(old);
+        for file in [CONFIG_FILE, EVENTS_FILE] {
+            let text = fs::read_to_string(paper_dir(dir.path(), "old").join(file)).expect("reads");
+            assert!(!text.contains("references"), "{file} is as it was: {text}");
+        }
+        let old = PaperSession::open(dir.path(), "old").expect("opens");
+        assert!(old.config().references.is_empty());
+        assert!(old.session().references().is_empty());
+        assert_eq!(old.session().bars().len(), 2);
     }
 
     #[test]

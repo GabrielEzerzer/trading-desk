@@ -247,19 +247,33 @@ impl Session {
     }
 
     /// Names the reference instruments whose bars come with every bar fed from now on, warm-up
-    /// bars included, in this order (see [`Context::reference`]). Called once, before the first
-    /// bar; without it the session has none.
-    pub(crate) fn name_references(&mut self, ids: Vec<InstrumentId>) {
-        debug_assert!(self.bars.is_empty() && self.references.is_empty());
+    /// bars included, in this order (see [`Context::reference`] and [`Session::feed`]). Called
+    /// once, before the first bar; without it the session has none. Refuses an instrument on
+    /// another venue, the traded instrument, one named twice, and a call after a bar was fed or
+    /// references were named.
+    pub fn name_references(&mut self, ids: Vec<InstrumentId>) -> Result<(), EngineError> {
+        if !self.bars.is_empty() || !self.references.is_empty() {
+            return Err(EngineError::InvalidReferences(
+                "reference instruments are named once, before the first bar".into(),
+            ));
+        }
+        crate::reference::check_ids(&self.instrument.id, &ids)?;
         self.references = ids.into_iter().map(|id| (id, Vec::new())).collect();
+        Ok(())
+    }
+
+    /// Each reference instrument [`Session::name_references`] named, with its slot for every bar
+    /// fed so far, warm-up bars included: what the strategy reads with [`Context::reference`].
+    pub fn references(&self) -> &[(InstrumentId, Vec<Option<Candle>>)] {
+        &self.references
     }
 
     /// Feeds a bar as [`Session::warm_up`] does when `warming_up`, and as
     /// [`Session::on_bar_with_ask`] does otherwise, with `references`: one slot per reference
     /// instrument [`Session::name_references`] named, in its order, holding that instrument's bar
     /// opening at the bar's open time or `None`. They are checked with the bar, before anything
-    /// changes.
-    pub(crate) fn feed(
+    /// changes. A session fed live gathers them with [`crate::LiveReferences`].
+    pub fn feed(
         &mut self,
         bar: Candle,
         ask: Option<Candle>,

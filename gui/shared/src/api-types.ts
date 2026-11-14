@@ -2722,7 +2722,14 @@ fees: FeeSchedule | null,
  * equity, as in a backtest: 1.0 means 1x, the default, which a config saved without it also
  * gets. A kind without margin, such as spot, ignores it.
  */
-max_leverage: number, };
+max_leverage: number, 
+/**
+ * Instruments on the same venue whose closed bars the strategy reads beside its own
+ * ([`td_engine::Context::reference`]), as a backtest's `references` names them. Fixed for the
+ * session's life. Left out when there are none, the default, which a config saved without it
+ * also gets.
+ */
+references?: Array<InstrumentId>, };
 
 /**
  * A funding rate fed with a bar.
@@ -2761,10 +2768,17 @@ fees?: FeeSchedule,
 /**
  * The saved verdict (a plan run's id) the session is started from: a verdict of the same
  * strategy on the same instrument. Left out, the strategy's latest verdict on the instrument
- * as `GET /verdicts` gives it, if it has one. Refused on a manual session, and for a verdict
- * judged with reference instruments, named or latest, since a session cannot feed them.
+ * as `GET /verdicts` gives it, if it has one. Refused on a manual session, and for a verdict,
+ * named or latest, judged with other reference instruments than `references`; the message
+ * says which are missing or extra.
  */
-verdict_run_id?: RunId, };
+verdict_run_id?: RunId, 
+/**
+ * Instruments on the same venue, listed by it, whose closed bars the strategy reads beside its
+ * own ([`td_engine::Context::reference`]), as a backtest's `references` names them: warmed up
+ * and fed live with every bar. Left out or empty, none. Refused on a manual session.
+ */
+references?: Array<InstrumentId>, };
 
 /**
  * A session as `GET /sessions` lists it.
@@ -3134,7 +3148,7 @@ verdict: LinkedVerdict | null, };
 
 /**
  * `GET /sessions/{id}/comparison`: a session beside a backtest of the same strategy, parameters,
- * instrument, timeframe and money settings over the same bars.
+ * instrument, timeframe, money settings and reference instruments over the same bars.
  */
 export type SessionComparisonResponse = { 
 /**
@@ -3149,9 +3163,9 @@ backtest: BacktestConfig, bars: ComparedBars,
 manual_orders: number, comparison: SessionComparison, };
 
 /**
- * The bars the backtest ran on: the session's own, as its log holds them, warm-up bars included.
- * Nothing is downloaded and nothing is read from the store, so both sides saw exactly the same
- * prices.
+ * The bars the backtest ran on: the session's own, as its log holds them, warm-up bars included,
+ * and the reference bars it fed with them. Nothing is downloaded and nothing is read from the
+ * store, so both sides saw exactly the same prices.
  */
 export type ComparedBars = { warm_up_bars: number, live_bars: number, 
 /**

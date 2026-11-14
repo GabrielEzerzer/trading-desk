@@ -17,7 +17,17 @@
 //! resume. One restarted long after its log ends skips the bars in between, which the
 //! engine allows. It holds no position or orders then, so nothing is lost, but one stopped right
 //! after warm-up goes live at the restart rather than backfilling the bars it missed.
+//!
+//! Reference instruments ([`crate::PaperConfig::references`]) are warmed up over the same span as
+//! the traded instrument, from the store and then REST, and each has a live feed of its own on the
+//! same timeframe from the same bar. A traded bar is held until every reference has delivered its
+//! bar opening at the same time, or reported a bucket at or after it (so it has none there), and
+//! is then fed with them, as a backtest over the same bars aligns them. A traded bar held longer
+//! than [`td_engine::REFERENCE_WAIT`], or a reference feed that stops, stops the session with an
+//! error naming the reference and the bar; a resume backfills both feeds. A reference feed's
+//! disconnects, failed backfills and dropped buckets show as warnings.
 
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -25,8 +35,10 @@ use td_core::{Candle, InstrumentId, Millis, Timeframe};
 use td_data::live::{FeedEvent, Rest, SharedStream, retry_rest, run_feed_on, stream_url};
 use td_data::time::round_to_minute;
 use td_data::{DataError, Store};
+use td_engine::{LiveReferences, REFERENCE_WAIT};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 
 use crate::paper::{Funding, Status};
 use crate::{PaperError, PaperSession};
@@ -91,18 +103,38 @@ pub fn start(session: PaperSession, rest: Arc<dyn Rest>) -> PaperHandle {
 }
 
 /// [`start`] on another WebSocket URL serving the venue's message format, such as a test server.
-/// The session opens its own connection once it has warmed up.
+/// The session opens its own connection once it has warmed up, and one for each reference
+/// instrument, all to `url`.
 pub fn start_with_stream(session: PaperSession, rest: Arc<dyn Rest>, url: String) -> PaperHandle {
-    let id = session.config().instrument.id.clone();
-    start_on(session, rest, move || Arc::new(SharedStream::open(id, url)))
+    start_on(session, rest, move |id| {
+        Arc::new(SharedStream::open(id.clone(), url.clone()))
+    })
 }
 
-/// [`start`] on a stream other feeds may share. `stream` is called once the session has warmed up
-/// and is ready for live bars, and must give a stream of the session's instrument.
+/// [`start`] on streams other feeds may share. `stream` is called once the session has warmed up
+/// and is ready for live bars, once for the session's instrument and once for each of its
+/// reference instruments, and must give a stream of the instrument it is given.
 pub fn start_on(
     session: PaperSession,
     rest: Arc<dyn Rest>,
-    stream: impl FnOnce() -> Arc<SharedStream> + Send + 'static,
+    stream: impl Fn(&InstrumentId) -> Arc<SharedStream> + Send + 'static,
+) -> PaperHandle {
+    let timeframe = session.config().timeframe;
+    let feed_rest = Arc::clone(&rest);
+    let open: OpenFeed = Box::new(move |id, start, tx| {
+        let feed = run_feed_on(stream(id), timeframe, Some(start), feed_rest.clone(), tx);
+        tokio::spawn(feed)
+    });
+    start_feeds(session, rest, open, REFERENCE_WAIT)
+}
+
+/// [`start_on`] with the feeds `open` gives, holding a traded bar for its reference bars for at
+/// most `wait`.
+pub(crate) fn start_feeds(
+    session: PaperSession,
+    rest: Arc<dyn Rest>,
+    open: OpenFeed,
+    wait: Duration,
 ) -> PaperHandle {
     let session = Arc::new(Mutex::new(session));
     let (stop, mut stopped) = watch::channel(false);
@@ -110,7 +142,7 @@ pub fn start_on(
     let shared = Arc::clone(&session);
     let task = tokio::spawn(async move {
         // The loop runs in its own task so that a panic in it is caught here and shows as an error.
-        let mut driver = tokio::spawn(drive(Arc::clone(&shared), rest, Box::new(stream)));
+        let mut driver = tokio::spawn(drive(Arc::clone(&shared), rest, open, wait));
         let status = tokio::select! {
             joined = &mut driver => match joined {
                 Ok(Ok(())) => Status::Stopped,
@@ -179,16 +211,21 @@ async fn blocking<T: Send + 'static>(
         .map_err(PaperError::from)
 }
 
-/// Gives the stream to feed from, once the session is ready for live bars.
-type OpenStream = Box<dyn FnOnce() -> Arc<SharedStream> + Send>;
+/// Starts a live feed of an instrument's bars at the session's timeframe from the bar opening at
+/// the given time, sending its events on the channel until the receiver is dropped, and gives its
+/// task. Called once the session is ready for live bars, for the session's instrument and each
+/// reference instrument.
+pub(crate) type OpenFeed =
+    Box<dyn Fn(&InstrumentId, Millis, mpsc::Sender<FeedEvent>) -> JoinHandle<()> + Send>;
 
 async fn drive(
     session: Arc<Mutex<PaperSession>>,
     rest: Arc<dyn Rest>,
-    stream: OpenStream,
+    open: OpenFeed,
+    wait: Duration,
 ) -> Result<(), PaperError> {
     let shared = &*session;
-    let (id, timeframe, data_dir, next, live) = {
+    let (id, timeframe, data_dir, next, live, references) = {
         let s = lock(shared);
         s.check_resumable()?;
         let config = s.config();
@@ -198,8 +235,10 @@ async fn drive(
             s.data_dir().to_path_buf(),
             s.next_bar_time(),
             s.live_from().is_some(),
+            config.references.clone(),
         )
     };
+    let mut held_references = LiveReferences::new(&references);
     // A warm-up that reads the funding rates gives the clock its start from the same rates, and
     // leaves the rates after its last bar for the first live bar.
     let mut warmed = None;
@@ -213,8 +252,18 @@ async fn drive(
             // From the end of the log, but never more than a full warm-up back.
             let earliest = end - WARM_UP_BARS * timeframe.duration_ms();
             let from = next.map_or(earliest, |n| n.max(earliest));
-            let store = Store::new(data_dir);
+            let store = Store::new(data_dir.clone());
             let bars = warm_up_bars(shared, store, &rest, &id, timeframe, from, end).await?;
+            // Each reference's history over the same span; a bucket it has no bar for is missing.
+            for (i, reference) in references.iter().enumerate() {
+                let store = Store::new(data_dir.clone());
+                let history =
+                    warm_up_bars(shared, store, &rest, reference, timeframe, from, end).await?;
+                for bar in history {
+                    held_references.bar(i, bar);
+                }
+                held_references.reached(i, end - timeframe.duration_ms());
+            }
             // The strategy sees every rate from where its bars begin, the end of the log or the
             // first warm-up bar, each fed at its due time with the bar it falls in or the next,
             // uncharged. Without a bar fed before the first live bar, that bar takes no funding
@@ -234,7 +283,11 @@ async fn drive(
                 let bar_end = bar.open_time + timeframe.duration_ms();
                 let due = std::iter::from_fn(|| rates.next_if(|&(time, _)| time < bar_end));
                 let from = s.next_bar_time().unwrap_or(bar.open_time);
-                s.feed(bar, funding_at(due, from), true)?;
+                let slots = held_references
+                    .slots(bar.open_time)
+                    .expect("each reference is warmed up to the end of the span");
+                s.feed_with_references(bar, funding_at(due, from), slots, true)?;
+                held_references.fed(bar.open_time);
             }
             after_warm_up.extend(rates);
             end
@@ -248,52 +301,142 @@ async fn drive(
     };
 
     lock(shared).set_status(Status::Reconnecting);
-    let (tx, mut rx) = mpsc::channel(256);
-    let feed = run_feed_on(stream(), timeframe, Some(start), rest.clone(), tx);
-    let _feed = AbortOnDrop(tokio::spawn(feed));
-    while let Some(event) = rx.recv().await {
-        match event {
-            FeedEvent::Connected => lock(shared).set_status(Status::Live),
-            FeedEvent::Disconnected { reason } => {
-                let mut s = lock(shared);
-                s.set_status(Status::Reconnecting);
-                s.warn(format!("disconnected: {reason}"));
-            }
-            FeedEvent::ConnectFailed { .. } => lock(shared).set_status(Status::Reconnecting),
-            FeedEvent::BackfillFailed { error } => {
-                let mut s = lock(shared);
-                s.set_status(Status::Reconnecting);
-                s.warn(format!("backfill failed, retrying: {error}"));
-            }
-            FeedEvent::BadMessage { error } => lock(shared).warn(error),
-            FeedEvent::Dropped(open_time) => lock(shared).push_dropped(open_time),
-            FeedEvent::Tolerated {
-                open_time,
-                missing_minutes,
-            } => lock(shared).warn(format!(
-                "the bar at {open_time} was built with {missing_minutes} of its minutes missing"
-            )),
-            FeedEvent::FramesDropped { count } => lock(shared).warn(format!(
-                "{count} stream frames were dropped while the feed was behind; \
-                 the closed minutes among them are backfilled"
-            )),
-            FeedEvent::Bar(bar) => {
-                // Rates after the last warm-up bar, missing from the feed's history, go with the
-                // first live bar, charged at its open on the flat position warm-up leaves.
-                let from = lock(shared).next_bar_time().unwrap_or(bar.open_time);
-                let mut charged = funding_at(after_warm_up.drain(..), from);
-                if let Some(clock) = &mut funding {
-                    let mut warn = |w| lock(shared).warn(w);
-                    let due = clock
-                        .for_bar(&rest, &id, timeframe, &bar, from, &mut warn)
-                        .await;
-                    charged.extend(due);
+    // Every feed's events on one channel, each with its feed: `None` for the traded instrument's,
+    // `Some(i)` for reference `i`'s. A feed that ends sends `None` as its event.
+    let (tx, mut rx) = mpsc::channel::<(Option<usize>, Option<FeedEvent>)>(256);
+    let mut feeds = Vec::with_capacity(2 * (1 + references.len()));
+    let lanes = std::iter::once((None, &id))
+        .chain(references.iter().enumerate().map(|(i, r)| (Some(i), r)));
+    for (lane, feed_id) in lanes {
+        let (feed_tx, mut feed_rx) = mpsc::channel(256);
+        feeds.push(AbortOnDrop(open(feed_id, start, feed_tx)));
+        let tx = tx.clone();
+        feeds.push(AbortOnDrop(tokio::spawn(async move {
+            while let Some(event) = feed_rx.recv().await {
+                if tx.send((lane, Some(event))).await.is_err() {
+                    return;
                 }
-                feed_live(&session, bar, charged).await?;
+            }
+            let _ = tx.send((lane, None)).await;
+        })));
+    }
+    drop(tx);
+    // Traded bars waiting for their reference bars, oldest first, each with when it arrived.
+    let mut held: VecDeque<(Candle, Instant)> = VecDeque::new();
+    loop {
+        let next = match held.front() {
+            Some(&(bar, arrived)) => tokio::select! {
+                next = rx.recv() => next,
+                () = tokio::time::sleep_until(arrived + wait) => {
+                    let behind = held_references.slots(bar.open_time).err().unwrap_or_default();
+                    let names: Vec<String> = behind.iter().map(ToString::to_string).collect();
+                    return Err(PaperError::ReferenceBehind(format!(
+                        "no bar of the reference instrument {} opening at {} came within {} s of \
+                         the traded bar",
+                        names.join(", "),
+                        bar.open_time,
+                        wait.as_secs()
+                    )));
+                }
+            },
+            None => rx.recv().await,
+        };
+        match next {
+            None | Some((None, None)) => return Err(PaperError::FeedEnded),
+            Some((Some(i), None)) => {
+                return Err(PaperError::ReferenceBehind(format!(
+                    "the live feed of the reference instrument {} stopped",
+                    references[i]
+                )));
+            }
+            Some((None, Some(event))) => match event {
+                FeedEvent::Connected => lock(shared).set_status(Status::Live),
+                FeedEvent::Disconnected { reason } => {
+                    let mut s = lock(shared);
+                    s.set_status(Status::Reconnecting);
+                    s.warn(format!("disconnected: {reason}"));
+                }
+                FeedEvent::ConnectFailed { .. } => lock(shared).set_status(Status::Reconnecting),
+                FeedEvent::BackfillFailed { error } => {
+                    let mut s = lock(shared);
+                    s.set_status(Status::Reconnecting);
+                    s.warn(format!("backfill failed, retrying: {error}"));
+                }
+                FeedEvent::BadMessage { error } => lock(shared).warn(error),
+                FeedEvent::Dropped(open_time) => lock(shared).push_dropped(open_time),
+                FeedEvent::Tolerated {
+                    open_time,
+                    missing_minutes,
+                } => lock(shared).warn(format!(
+                    "the bar at {open_time} was built with {missing_minutes} of its minutes missing"
+                )),
+                FeedEvent::FramesDropped { count } => lock(shared).warn(format!(
+                    "{count} stream frames were dropped while the feed was behind; \
+                     the closed minutes among them are backfilled"
+                )),
+                FeedEvent::Bar(bar) => held.push_back((bar, Instant::now())),
+            },
+            Some((Some(i), Some(event))) => {
+                let reference = &references[i];
+                match event {
+                    FeedEvent::Bar(bar) => held_references.bar(i, bar),
+                    FeedEvent::Dropped(open_time) => {
+                        held_references.reached(i, open_time);
+                        lock(shared).warn(format!(
+                            "the feed of the reference instrument {reference} left out the bucket \
+                             at {open_time}, too many of its minutes missing: the strategy sees no \
+                             bar of {reference} there"
+                        ));
+                    }
+                    FeedEvent::Tolerated {
+                        open_time,
+                        missing_minutes,
+                    } => lock(shared).warn(format!(
+                        "the bar of the reference instrument {reference} at {open_time} was built \
+                         with {missing_minutes} of its minutes missing"
+                    )),
+                    FeedEvent::Disconnected { reason } => lock(shared).warn(format!(
+                        "the feed of the reference instrument {reference} disconnected: {reason}"
+                    )),
+                    FeedEvent::BackfillFailed { error } => lock(shared).warn(format!(
+                        "the backfill of the reference instrument {reference} failed, retrying: \
+                         {error}"
+                    )),
+                    FeedEvent::BadMessage { error } => lock(shared).warn(format!(
+                        "the feed of the reference instrument {reference}: {error}"
+                    )),
+                    FeedEvent::FramesDropped { count } => lock(shared).warn(format!(
+                        "{count} stream frames of the reference instrument {reference} were \
+                         dropped while its feed was behind; the closed minutes among them are \
+                         backfilled"
+                    )),
+                    // A reference that cannot connect holds back the next traded bar until the
+                    // wait runs out.
+                    FeedEvent::Connected | FeedEvent::ConnectFailed { .. } => {}
+                }
             }
         }
+        // Feed each held bar whose reference bars are all known, oldest first.
+        while let Some(&(bar, _)) = held.front() {
+            let Ok(slots) = held_references.slots(bar.open_time) else {
+                break;
+            };
+            held.pop_front();
+            // Rates after the last warm-up bar, missing from the feed's history, go with the
+            // first live bar, charged at its open on the flat position warm-up leaves.
+            let from = lock(shared).next_bar_time().unwrap_or(bar.open_time);
+            let mut charged = funding_at(after_warm_up.drain(..), from);
+            if let Some(clock) = &mut funding {
+                let mut warn = |w| lock(shared).warn(w);
+                let due = clock
+                    .for_bar(&rest, &id, timeframe, &bar, from, &mut warn)
+                    .await;
+                charged.extend(due);
+            }
+            feed_live(&session, bar, charged, slots).await?;
+            held_references.fed(bar.open_time);
+        }
     }
-    Err(PaperError::FeedEnded)
 }
 
 /// Feeds one live bar with its funding on a blocking thread. Its line is synced to disk before the
@@ -304,6 +447,7 @@ async fn feed_live(
     session: &Arc<Mutex<PaperSession>>,
     bar: Candle,
     charged: Vec<Funding>,
+    references: Vec<Option<Candle>>,
 ) -> Result<(), PaperError> {
     let session = Arc::clone(session);
     let fed = tokio::task::spawn_blocking(move || {
@@ -316,7 +460,7 @@ async fn feed_live(
         }
         // Bars flow again, after a failed backfill too.
         s.set_status(Status::Live);
-        s.feed(bar, charged, false)
+        s.feed_with_references(bar, charged, references, false)
     })
     .await;
     match fed {
@@ -566,6 +710,8 @@ impl FundingClock {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use td_core::InstrumentKind;
 
     use super::*;
@@ -708,7 +854,7 @@ mod tests {
         // As the run loop leaves it before its feed starts; a stopped session is fed nothing.
         lock(&session).set_status(Status::Reconnecting);
         crate::paper::FAIL_SYNC.set(true);
-        let fed = feed_live(&session, bar(T), Vec::new()).await;
+        let fed = feed_live(&session, bar(T), Vec::new(), Vec::new()).await;
         crate::paper::FAIL_SYNC.set(false);
         fed.expect("synced on a blocking thread");
         assert_eq!(lock(&session).last_bar().map(|b| b.open_time), Some(T));
@@ -716,7 +862,7 @@ mod tests {
 
         // A bar that waited for the lock while a stop set the final status is not fed.
         lock(&session).set_status(Status::Stopped);
-        feed_live(&session, bar(T + MIN), Vec::new())
+        feed_live(&session, bar(T + MIN), Vec::new(), Vec::new())
             .await
             .expect("skipped");
         assert_eq!(lock(&session).last_bar().map(|b| b.open_time), Some(T));
@@ -786,5 +932,398 @@ mod tests {
         };
         assert_eq!(charged, [in_gap]);
         assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    const OTHER: &str = "OTHERUSDT";
+
+    fn spot(symbol: &str) -> InstrumentId {
+        InstrumentId {
+            venue: td_core::Venue::Binance,
+            symbol: symbol.into(),
+            kind: InstrumentKind::Spot,
+        }
+    }
+
+    fn priced(open_time: Millis, close: f64) -> Candle {
+        Candle {
+            open_time,
+            open: close,
+            high: close,
+            low: close,
+            close,
+            volume: 1.0,
+            quote_volume: close,
+        }
+    }
+
+    /// Each instrument's bars over REST, by symbol, at a fixed time; no funding.
+    struct History {
+        bars: HashMap<String, Vec<Candle>>,
+        now: Millis,
+    }
+
+    impl Rest for History {
+        fn klines(
+            &self,
+            id: &InstrumentId,
+            _: Timeframe,
+            from: Millis,
+            to: Millis,
+        ) -> Result<Vec<Candle>, DataError> {
+            let bars = self.bars.get(&id.symbol).into_iter().flatten();
+            Ok(bars
+                .filter(|b| (from..to).contains(&b.open_time))
+                .copied()
+                .collect())
+        }
+
+        fn funding(
+            &self,
+            _: &InstrumentId,
+            _: Millis,
+            _: Millis,
+        ) -> Result<Vec<(Millis, f64)>, DataError> {
+            Ok(Vec::new())
+        }
+
+        fn now(&self) -> Millis {
+            self.now
+        }
+    }
+
+    /// One step of a scripted live feed.
+    enum Step {
+        Send(FeedEvent),
+        /// Sends the event after a pause.
+        Late(Duration, FeedEvent),
+        /// Waits until notified.
+        Wait(Arc<tokio::sync::Notify>),
+        /// Ends the feed. A script that runs out without it keeps its feed open.
+        End,
+    }
+
+    /// Live feeds that play each instrument's script, by symbol.
+    fn scripted(scripts: Vec<(&str, Vec<Step>)>) -> OpenFeed {
+        let scripts: Mutex<HashMap<String, Vec<Step>>> = Mutex::new(
+            scripts
+                .into_iter()
+                .map(|(symbol, steps)| (symbol.to_string(), steps))
+                .collect(),
+        );
+        Box::new(move |id, _, tx| {
+            let steps = scripts
+                .lock()
+                .expect("lock")
+                .remove(&id.symbol)
+                .unwrap_or_default();
+            tokio::spawn(async move {
+                for step in steps {
+                    let event = match step {
+                        Step::Send(event) => event,
+                        Step::Late(pause, event) => {
+                            tokio::time::sleep(pause).await;
+                            event
+                        }
+                        Step::Wait(notify) => {
+                            notify.notified().await;
+                            continue;
+                        }
+                        Step::End => return,
+                    };
+                    if tx.send(event).await.is_err() {
+                        return;
+                    }
+                }
+                std::future::pending::<()>().await;
+            })
+        })
+    }
+
+    /// What the strategy read of the reference on each bar, by the bar's open time.
+    type Seen = Arc<Mutex<Vec<(Millis, Option<Vec<Option<Candle>>>)>>>;
+
+    /// Records the reference series it reads on every bar.
+    struct Records(Seen);
+
+    impl td_engine::Strategy for Records {
+        fn on_bar(&mut self, ctx: &mut td_engine::Context, bar: &Candle) {
+            let series = ctx.reference(&spot(OTHER)).map(<[_]>::to_vec);
+            self.0.lock().expect("lock").push((bar.open_time, series));
+        }
+    }
+
+    /// A spot session on `TESTUSDT` reading `OTHERUSDT`, whose strategy records into `seen`, warmed
+    /// up from `history` and fed live by `feeds`.
+    fn start_reading(
+        dir: &std::path::Path,
+        seen: &Seen,
+        history: History,
+        feeds: OpenFeed,
+        wait: Duration,
+    ) -> PaperHandle {
+        let mut config = crate::paper::tests::config();
+        config.instrument.id = spot("TESTUSDT");
+        config.references = vec![spot(OTHER)];
+        let mut paper = PaperSession::create(dir, "reads", config).expect("creates");
+        paper.swap_strategy(Box::new(Records(Arc::clone(seen))));
+        start_feeds(paper, Arc::new(history), feeds, wait)
+    }
+
+    fn history(own: &[Candle], reference: &[Candle], now: Millis) -> History {
+        let bars = [("TESTUSDT", own), (OTHER, reference)]
+            .into_iter()
+            .map(|(symbol, bars)| (symbol.to_string(), bars.to_vec()))
+            .collect();
+        History { bars, now }
+    }
+
+    async fn until(handle: &PaperHandle, what: &str, done: impl Fn(&PaperSession) -> bool) {
+        for _ in 0..1000 {
+            if done(&lock(handle.session())) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let status = lock(handle.session()).status().clone();
+        panic!("timed out waiting for {what}: {status:?}");
+    }
+
+    fn last_bar(s: &PaperSession) -> Option<Millis> {
+        s.last_bar().map(|b| b.open_time)
+    }
+
+    /// Warm-up from history, then live bars of its own and of the reference arriving in any order:
+    /// a reference bar late, a bucket the reference feed dropped and one missing from its history.
+    /// The session shows its strategy, at each step, exactly the reference bars a backtest over
+    /// the same bars shows it.
+    #[tokio::test]
+    async fn a_session_and_a_backtest_show_the_strategy_the_same_reference_bars() {
+        let own: Vec<Candle> = (0..14)
+            .map(|i| priced(T + i * MIN, 100.0 + i as f64))
+            .collect();
+        // No bar at T + 3m in the reference's history, and its live feed drops T + 11m.
+        let reference: Vec<Candle> = (0..14)
+            .filter(|i| ![3, 11].contains(i))
+            .map(|i| priced(T + i * MIN, 50.0 + i as f64))
+            .collect();
+        let at = |i: i64| {
+            *reference
+                .iter()
+                .find(|b| b.open_time == T + i * MIN)
+                .unwrap()
+        };
+        let feeds = scripted(vec![
+            (
+                "TESTUSDT",
+                std::iter::once(Step::Send(FeedEvent::Connected))
+                    .chain((10..14).map(|i| Step::Send(FeedEvent::Bar(own[i]))))
+                    .collect(),
+            ),
+            (
+                OTHER,
+                vec![
+                    Step::Send(FeedEvent::Connected),
+                    Step::Late(Duration::from_millis(50), FeedEvent::Bar(at(10))),
+                    Step::Send(FeedEvent::Dropped(T + 11 * MIN)),
+                    Step::Send(FeedEvent::Bar(at(12))),
+                    Step::Send(FeedEvent::Bar(at(13))),
+                ],
+            ),
+        ]);
+        let dir = tempfile::tempdir().expect("temp dir");
+        let seen = Seen::default();
+        let now = T + 10 * MIN + 30_000;
+        let warm_up = history(&own[..10], &reference, now);
+        let handle = start_reading(dir.path(), &seen, warm_up, feeds, Duration::from_secs(60));
+        until(&handle, "the last live bar", |s| {
+            last_bar(s) == Some(T + 13 * MIN)
+        })
+        .await;
+        let session = handle.stop().await;
+        let warnings = lock(&session).warnings().to_vec();
+        assert!(
+            warnings.iter().any(|w| w.contains(OTHER)
+                && w.contains(&(T + 11 * MIN).to_string())
+                && w.contains("sees no bar")),
+            "{warnings:?}"
+        );
+
+        let config = lock(&session).config().clone();
+        let backtest = td_engine::BacktestConfig {
+            strategy: config.strategy.clone(),
+            params: config.params.clone(),
+            instrument: config.instrument.clone(),
+            timeframe: config.timeframe,
+            from: T + 10 * MIN,
+            to: T + 14 * MIN,
+            starting_cash: config.starting_cash,
+            slippage_bps: config.slippage_bps,
+            fee_override: config.fees,
+            max_leverage: config.max_leverage,
+            warmup_from: Some(T),
+            close_at_end: false,
+            account_currency: td_core::AccountCurrency::Quote,
+            references: config.references.clone(),
+        };
+        let tested = Seen::default();
+        let references = [td_engine::ReferenceBars {
+            instrument: spot(OTHER),
+            bars: reference.clone(),
+        }];
+        td_engine::run_strategy_with_references(
+            &backtest,
+            Box::new(Records(Arc::clone(&tested))),
+            &own,
+            &[],
+            &[],
+            &references,
+        )
+        .expect("backtest");
+        let (seen, tested) = (
+            seen.lock().expect("lock").clone(),
+            tested.lock().expect("lock").clone(),
+        );
+        assert_eq!(seen.len(), 14);
+        assert_eq!(seen, tested);
+        let last = seen[13].1.clone().expect("a series");
+        assert_eq!((last[3], last[11], last[13]), (None, None, Some(at(13))));
+    }
+
+    /// A traded bar waits for its reference bar: one that comes within the wait goes with it, and
+    /// once a wait runs out the session stops with an error naming the reference and the bar.
+    #[tokio::test]
+    async fn a_session_stops_when_a_reference_bar_does_not_come_within_the_wait() {
+        let own: Vec<Candle> = (0..12).map(|i| priced(T + i * MIN, 100.0)).collect();
+        let reference: Vec<Candle> = (0..11).map(|i| priced(T + i * MIN, 50.0)).collect();
+        let feeds = scripted(vec![
+            (
+                "TESTUSDT",
+                vec![
+                    Step::Send(FeedEvent::Connected),
+                    Step::Send(FeedEvent::Bar(own[10])),
+                    Step::Send(FeedEvent::Bar(own[11])),
+                ],
+            ),
+            (
+                OTHER,
+                vec![
+                    Step::Send(FeedEvent::Connected),
+                    Step::Late(Duration::from_millis(100), FeedEvent::Bar(reference[10])),
+                ],
+            ),
+        ]);
+        let dir = tempfile::tempdir().expect("temp dir");
+        let seen = Seen::default();
+        let warm_up = history(&own[..10], &reference[..10], T + 10 * MIN + 30_000);
+        let handle = start_reading(dir.path(), &seen, warm_up, feeds, Duration::from_secs(1));
+        tokio::time::timeout(Duration::from_secs(20), handle.finished())
+            .await
+            .expect("the session stops on its own");
+        let session = handle.stop().await;
+        let s = lock(&session);
+        let Status::Error(message) = s.status() else {
+            panic!("stopped with {:?}", s.status());
+        };
+        assert_eq!(
+            message,
+            &format!(
+                "no bar of the reference instrument {} opening at {} came within 1 s of the \
+                 traded bar; the session stops rather than feed the strategy a bar without the \
+                 reference bar a backtest would show it: resume it to backfill both feeds from its \
+                 last bar",
+                spot(OTHER),
+                T + 11 * MIN
+            )
+        );
+        assert_eq!(
+            last_bar(&s),
+            Some(T + 10 * MIN),
+            "the late reference bar went with its bar"
+        );
+        let (time, series) = seen.lock().expect("lock").last().cloned().expect("a bar");
+        assert_eq!(time, T + 10 * MIN);
+        assert_eq!(series.expect("a series").last(), Some(&Some(reference[10])));
+    }
+
+    /// A reference feed that disconnects or drops a bucket warns and goes on, the strategy seeing
+    /// no reference bar for the dropped bucket; one that stops stops the session.
+    #[tokio::test]
+    async fn a_reference_feed_that_drops_a_bucket_warns_and_one_that_stops_stops_the_session() {
+        let own: Vec<Candle> = (0..13).map(|i| priced(T + i * MIN, 100.0)).collect();
+        let reference: Vec<Candle> = (0..12).map(|i| priced(T + i * MIN, 50.0)).collect();
+        let stop_reference = Arc::new(tokio::sync::Notify::new());
+        let feeds = scripted(vec![
+            (
+                "TESTUSDT",
+                vec![
+                    Step::Send(FeedEvent::Connected),
+                    Step::Send(FeedEvent::Bar(own[10])),
+                    Step::Send(FeedEvent::Bar(own[11])),
+                    Step::Send(FeedEvent::Bar(own[12])),
+                ],
+            ),
+            (
+                OTHER,
+                vec![
+                    Step::Send(FeedEvent::Connected),
+                    Step::Send(FeedEvent::Disconnected {
+                        reason: "reset".into(),
+                    }),
+                    Step::Send(FeedEvent::Dropped(T + 10 * MIN)),
+                    Step::Send(FeedEvent::Bar(reference[11])),
+                    Step::Wait(Arc::clone(&stop_reference)),
+                    Step::End,
+                ],
+            ),
+        ]);
+        let dir = tempfile::tempdir().expect("temp dir");
+        let seen = Seen::default();
+        let warm_up = history(&own[..10], &reference[..10], T + 10 * MIN + 30_000);
+        let handle = start_reading(dir.path(), &seen, warm_up, feeds, Duration::from_secs(60));
+        until(&handle, "the bar after the dropped one", |s| {
+            last_bar(s) == Some(T + 11 * MIN)
+        })
+        .await;
+        {
+            let s = lock(handle.session());
+            assert_eq!(*s.status(), Status::Live);
+            let warnings = s.warnings();
+            assert!(
+                warnings
+                    .iter()
+                    .any(|w| w.contains(OTHER) && w.contains("disconnected: reset")),
+                "{warnings:?}"
+            );
+            assert!(
+                warnings
+                    .iter()
+                    .any(|w| w.contains(OTHER) && w.contains(&(T + 10 * MIN).to_string())),
+                "{warnings:?}"
+            );
+        }
+        let last = seen.lock().expect("lock").last().cloned().expect("a bar");
+        let series = last.1.expect("a series");
+        assert_eq!(
+            &series[9..],
+            [Some(reference[9]), None, Some(reference[11])]
+        );
+
+        stop_reference.notify_one();
+        tokio::time::timeout(Duration::from_secs(20), handle.finished())
+            .await
+            .expect("the session stops on its own");
+        let session = handle.stop().await;
+        let s = lock(&session);
+        let Status::Error(message) = s.status() else {
+            panic!("stopped with {:?}", s.status());
+        };
+        assert!(
+            message.starts_with(&format!(
+                "the live feed of the reference instrument {} stopped",
+                spot(OTHER)
+            )),
+            "{message}"
+        );
+        assert_eq!(last_bar(&s), Some(T + 11 * MIN), "the held bar was not fed");
     }
 }
