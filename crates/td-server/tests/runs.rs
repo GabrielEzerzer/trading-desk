@@ -470,6 +470,7 @@ fn config(kind: InstrumentKind, days: i64) -> BacktestConfig {
         max_leverage: 1.0,
         account_currency: td_core::AccountCurrency::Quote,
         references: Vec::new(),
+        series: Vec::new(),
     }
 }
 
@@ -1995,6 +1996,7 @@ async fn a_backtest_naming_a_reference_instrument_runs_on_its_stored_bars_with_t
         &data.asks,
         &data.funding,
         &data.references,
+        &[],
     )
     .unwrap();
     assert_eq!(**through_api, direct);

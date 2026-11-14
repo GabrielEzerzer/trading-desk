@@ -95,6 +95,14 @@ pub struct PlanRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub references: Option<Vec<InstrumentId>>,
+    /// Series every run of each battery names ([`td_engine::BacktestConfig::series`]): the
+    /// strategy reads each one's rows, from `<data_dir>/series/<name>.json`, as they became known.
+    /// Each must have a row known by the close of the plan's first bar. The luck test leaves them
+    /// in place in time. A paper or live session cannot start from a verdict judged with them.
+    /// None when left out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub series: Option<Vec<String>>,
 }
 
 /// What a plan job kept: one entry per instrument whose battery finished or reached the luck test
@@ -213,6 +221,7 @@ pub(super) async fn start(
     })?;
     let ids = chosen_instruments(&entry, request.instruments.as_deref())?;
     let references = request.references.clone().unwrap_or_default();
+    let series = request.series.clone().unwrap_or_default();
 
     // The trading rules of each instrument, from the venue's list as `GET /instruments` gives it
     // (cached per server run).
@@ -239,11 +248,12 @@ pub(super) async fn start(
     // nothing is downloaded.
     let (store, checked) = (state.store.clone(), entry.clone());
     let (to_check, cutoff) = (instruments.clone(), state.data_cutoff.clone());
-    let named = references.clone();
+    let (named, named_series) = (references.clone(), series.clone());
     tokio::task::spawn_blocking(move || {
         to_check.into_iter().try_for_each(|i| {
             let mut config = checked.plan.backtest_config(checked.name, i);
             config.references = named.clone();
+            config.series = named_series.clone();
             check_run_data(&store, &config, cutoff.as_ref())
         })
     })
@@ -255,6 +265,7 @@ pub(super) async fn start(
         strategy: request.strategy,
         instruments: Some(ids),
         references: request.references,
+        series: request.series,
     });
     let cutoff = state.data_cutoff.clone();
     let job = state.jobs.submit(job_request, move |ctx| {
@@ -262,6 +273,7 @@ pub(super) async fn start(
             &entry,
             &instruments,
             &references,
+            &series,
             &store,
             cutoff.as_ref(),
             &runs_dir,
@@ -272,10 +284,12 @@ pub(super) async fn start(
 }
 
 /// The job: loads every instrument's data, then runs and saves one battery after another.
+#[allow(clippy::too_many_arguments)]
 fn execute(
     entry: &StrategyEntry,
     instruments: &[Instrument],
     references: &[InstrumentId],
+    series: &[String],
     store: &Store,
     cutoff: Option<&DataCutoff>,
     runs_dir: &Path,
@@ -288,6 +302,7 @@ fn execute(
     for instrument in instruments {
         let mut config = entry.plan.backtest_config(entry.name, instrument.clone());
         config.references = references.to_vec();
+        config.series = series.to_vec();
         let data = load_run_data(store, &config, cutoff).map_err(changed_since_accepted)?;
         let spec = battery_spec(entry, instrument);
         totals.push(td_engine::battery_runs(&spec, &data.bars).map_err(tester_error)?);
@@ -332,6 +347,7 @@ fn execute(
                 &data.asks,
                 &data.funding,
                 &data.references,
+                &data.series,
                 Some(&progress),
             )
         });
@@ -414,6 +430,7 @@ fn save_plan_run(
             .iter()
             .map(|r| r.instrument.clone())
             .collect(),
+        series: data.series.iter().map(|s| s.name.clone()).collect(),
     };
     let run = PlanRun::with_references(
         &battery_spec(entry, instrument),
@@ -422,6 +439,7 @@ fn save_plan_run(
         &data.asks,
         &data.funding,
         &data.references,
+        &data.series,
     )
     .map_err(|e| ApiError::internal(e.to_string()))?;
     let record_json = serde_json::to_vec_pretty(&record)
@@ -542,6 +560,7 @@ mod tests {
             complete: true,
             code_hash: td_engine::code_hash(entry.name).map(String::from),
             references,
+            series: Vec::new(),
         };
         let dir = runs_dir.join(run_id);
         fs::create_dir_all(&dir).unwrap();

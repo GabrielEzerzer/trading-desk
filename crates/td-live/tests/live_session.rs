@@ -1661,6 +1661,7 @@ fn seen_in_backtest(
         warmup_from: Some(bars[0].open_time),
         close_at_end: false,
         references: Vec::new(),
+        series: Vec::new(),
         account_currency: AccountCurrency::Quote,
     };
     let seen = Arc::new(Mutex::new(Vec::new()));
@@ -2278,6 +2279,17 @@ impl Rig {
     /// Saves a verdict of [`LINKED`] on `on`, as its plan and rule are now, as run `run_id` in the
     /// runs folder, judged with `references`.
     fn save_verdict(&self, run_id: &str, on: &InstrumentId, references: Vec<InstrumentId>) {
+        self.save_verdict_with(run_id, on, references, Vec::new());
+    }
+
+    /// [`Rig::save_verdict`] judged with `series` too.
+    fn save_verdict_with(
+        &self,
+        run_id: &str,
+        on: &InstrumentId,
+        references: Vec<InstrumentId>,
+        series: Vec<String>,
+    ) {
         let entry = td_engine::find_strategy(LINKED).expect("registered");
         let record = td_engine::VerdictRecord {
             strategy: LINKED.into(),
@@ -2290,6 +2302,7 @@ impl Rig {
             complete: true,
             code_hash: td_engine::code_hash(LINKED).map(String::from),
             references,
+            series,
         };
         let dir = self.data().join(td_engine::RUNS_DIR).join(run_id);
         fs::create_dir_all(&dir).expect("run folder");
@@ -2585,6 +2598,38 @@ fn start_refuses_a_verdict_it_cannot_run_before_writing_or_asking_the_venue_anyt
     let (code, text) = rig.start_linked(&feed, "plain", &["--verdict", OLDER]);
     assert_eq!(code, 0, "{text}");
     assert_eq!(rig.config_json("plain")["link"]["verdict"]["run_id"], OLDER);
+}
+
+/// A live session feeds its strategy no series, so it is never started from a verdict judged with
+/// one, named or latest, and the refusal comes before anything is written or sent.
+#[test]
+fn start_refuses_a_verdict_judged_with_a_series() {
+    let rig = Rig::new();
+    let feed = rig.feed();
+    let on = instrument().id;
+    rig.save_verdict(OLDER, &on, Vec::new());
+    rig.save_verdict_with(NEWER, &on, Vec::new(), vec!["example_series".into()]);
+
+    let requests = rig.mock.requests().len();
+    let feeds_none = format!(
+        "run {NEWER} was judged with the series example_series, and a session cannot feed a \
+         series yet"
+    );
+    for (extra, also) in [
+        (&[][..], "name a verdict judged without series with --verdict"),
+        (&["--verdict", NEWER][..], ""),
+    ] {
+        let (code, text) = rig.start_linked(&feed, "refused", extra);
+        assert_eq!(code, 1, "{extra:?}: {text}");
+        assert!(text.contains(&feeds_none), "{extra:?}: {text}");
+        assert!(text.contains(also), "{extra:?}: {text}");
+        assert_eq!(rig.mock.requests().len(), requests, "{extra:?}: {text}");
+        assert!(!rig.data().join("live").exists(), "{extra:?}");
+    }
+
+    // A verdict judged without one still starts the session.
+    let (code, text) = rig.start_linked(&feed, "plain", &["--verdict", OLDER]);
+    assert_eq!(code, 0, "{text}");
 }
 
 #[test]

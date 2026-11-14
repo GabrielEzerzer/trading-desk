@@ -36,6 +36,7 @@ pub mod risk;
 mod rng;
 mod runner;
 mod saved_verdicts;
+mod series;
 mod session;
 pub mod stats;
 mod stops;
@@ -89,6 +90,7 @@ pub use saved_verdicts::{
     VerdictRecord, VerdictSummary, code_matches, instrument_view, latest_verdicts, read_record,
     session_link,
 };
+pub use series::{SERIES_DIR, Series, SeriesRow, check_name as check_series_name, read_series};
 pub use session::{
     CLOSE_OUT_TAG, EquityPoint, LIQUIDATION_TAG, MAINTENANCE_MARGIN_RATE, Session, SessionConfig,
     run_backtest,

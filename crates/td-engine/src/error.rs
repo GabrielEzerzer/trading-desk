@@ -60,6 +60,16 @@ pub enum EngineError {
     #[error("reference instruments: {0}")]
     InvalidReferences(String),
 
+    /// The series a run names ([`crate::BacktestConfig::series`]) or the rows given for them: a
+    /// name that is not a plain one, one named twice, or rows for a series the run does not name.
+    #[error("series: {0}")]
+    InvalidSeries(String),
+
+    /// A series' data: its file missing, a link or malformed, rows out of order or not finite, or
+    /// no row known by the close of the run's first bar.
+    #[error("{0}")]
+    SeriesData(String),
+
     #[error("unknown strategy {0:?}")]
     UnknownStrategy(String),
 

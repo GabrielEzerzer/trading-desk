@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::ops::Range;
 
 use serde::{Deserialize, Serialize};
@@ -10,7 +11,7 @@ use crate::broker::ENTRY_CANCELLED;
 use crate::runner::match_asks;
 use crate::{
     BarFunding, Broker, BrokerEvent, CandleFillModel, Context, EngineError, Order, OrderStatus,
-    Portfolio, SimBroker, Strategy, TradeStops,
+    Portfolio, Series, SeriesRow, SimBroker, Strategy, TradeStops,
 };
 
 /// Why [`Session::close_out`] cancels the open orders.
@@ -86,6 +87,12 @@ pub struct Session {
     /// Each reference instrument's bars, one slot per bar fed, warm-up bars included: what
     /// [`Context::reference`] returns. Empty unless [`Session::name_references`] named some.
     references: Vec<(InstrumentId, Vec<Option<Candle>>)>,
+    /// Each series' rows known by the close of the last bar fed: what [`Context::series`] returns.
+    /// Empty unless [`Session::name_series`] named some.
+    series: Vec<(String, Vec<SeriesRow>)>,
+    /// Each series' rows not yet known by the close of the last bar fed, oldest first, in the order
+    /// of `series`. They are kept out of anything a [`Context`] holds.
+    pending_series: Vec<VecDeque<SeriesRow>>,
     trade_stops: Vec<TradeStops>,
     /// The reason the strategy stopped the run on the bar being fed ([`Context::fail`]).
     failure: Option<String>,
@@ -169,6 +176,8 @@ impl Session {
             bar_funding: Vec::new(),
             funding: Vec::new(),
             references: Vec::new(),
+            series: Vec::new(),
+            pending_series: Vec::new(),
             trade_stops: Vec::new(),
             failure: None,
         }
@@ -268,6 +277,23 @@ impl Session {
         &self.references
     }
 
+    /// Gives the session the rows of the series a run names, in its order, each to be shown to the
+    /// strategy ([`Context::series`]) from the first bar fed whose close is at or after the row's
+    /// `known_at`. Called once, before the first bar, with rows already checked (see
+    /// [`crate::BacktestConfig::series`]); refuses a call after a bar was fed or series were named.
+    pub(crate) fn name_series(&mut self, series: Vec<Series>) -> Result<(), EngineError> {
+        if !self.bars.is_empty() || !self.series.is_empty() {
+            return Err(EngineError::InvalidSeries(
+                "series are named once, before the first bar".into(),
+            ));
+        }
+        for s in series {
+            self.series.push((s.name, Vec::new()));
+            self.pending_series.push(s.rows.into());
+        }
+        Ok(())
+    }
+
     /// Feeds a bar as [`Session::warm_up`] does when `warming_up`, and as
     /// [`Session::on_bar_with_ask`] does otherwise, with `references`: one slot per reference
     /// instrument [`Session::name_references`] named, in its order, holding that instrument's bar
@@ -290,6 +316,7 @@ impl Session {
             self.check_references(&bar, references)?;
             self.record_funding(funding);
             self.record_references(references);
+            self.reveal_series(&bar);
             self.bars.push(bar);
             self.call_strategy(&bar, self.fills.len(), true);
             return self.strategy_failure();
@@ -382,6 +409,7 @@ impl Session {
         self.bar_funding.push(charged);
         self.record_funding(funding);
         self.record_references(references);
+        self.reveal_series(&bar);
         // A short closes with a buy, at the ask.
         let mark = if self.portfolio.position() < 0.0 {
             ask_bar.close
@@ -455,6 +483,16 @@ impl Session {
     fn record_references(&mut self, references: &[Option<Candle>]) {
         for ((_, slots), reference) in self.references.iter_mut().zip(references) {
             slots.push(*reference);
+        }
+    }
+
+    /// Moves each series' rows known by `bar`'s close into what [`Context::series`] shows.
+    fn reveal_series(&mut self, bar: &Candle) {
+        let close = bar.open_time + self.timeframe.duration_ms();
+        for ((_, known), pending) in self.series.iter_mut().zip(&mut self.pending_series) {
+            while pending.front().is_some_and(|r| r.known_at <= close) {
+                known.extend(pending.pop_front());
+            }
         }
     }
 
@@ -569,6 +607,7 @@ impl Session {
             portfolio: &self.portfolio,
             funding: &self.funding,
             references: &self.references,
+            series: &self.series,
             broker: &mut *self.broker,
             orders: &mut self.orders,
             warming_up: false,
@@ -736,6 +775,7 @@ impl Session {
             portfolio: &self.portfolio,
             funding: &self.funding,
             references: &self.references,
+            series: &self.series,
             broker: &mut *self.broker,
             orders: &mut self.orders,
             warming_up,

@@ -389,6 +389,7 @@ pub(crate) fn compare(
         // As the session's own account (`SavedConfig::money`).
         account_currency: AccountCurrency::Quote,
         references: Vec::new(),
+        series: Vec::new(),
     };
     let result = catch_unwind(AssertUnwindSafe(|| {
         let strategy = build(&config.strategy, &config.params)?;

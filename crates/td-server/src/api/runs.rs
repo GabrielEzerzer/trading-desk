@@ -42,7 +42,7 @@ use td_data::{
 };
 use td_engine::{
     BacktestConfig, ENGINE_REVISION, EngineError, RECORD_FILE, RUNS_DIR, ReferenceBars, RunId,
-    RunSummary, SavedRun, StoreError, TesterError, code_matches,
+    RunSummary, SavedRun, Series, StoreError, TesterError, code_matches,
     config_fingerprint_with_references,
 };
 use ts_rs::TS;
@@ -286,6 +286,9 @@ pub struct RunData {
     /// The bars of each reference instrument the configuration names, over the same range and at
     /// the same timeframe ([`read_references`]); empty when it names none.
     pub references: Vec<ReferenceBars>,
+    /// The rows of each series the configuration names, from the data folder, up to the end of
+    /// the data cutoff date when there is one ([`read_series`]); empty when it names none.
+    pub series: Vec<Series>,
     pub report: DataReport,
 }
 
@@ -509,6 +512,25 @@ fn read_references(store: &Store, config: &BacktestConfig) -> Result<Vec<Referen
     Ok(references)
 }
 
+/// The rows of each series `config` names ([`BacktestConfig::series`]), from
+/// `<data_dir>/series/<name>.json` ([`td_engine::read_series`]). With a data cutoff, reading stops
+/// at the first row known after the end of its date, so no later row is read into a run. Refuses
+/// with 400 `invalid_config` a name that is not a plain one or is named twice, and with 422
+/// `data_missing` a series file that is missing, a link or malformed.
+fn read_series(
+    store: &Store,
+    config: &BacktestConfig,
+    cutoff: Option<&DataCutoff>,
+) -> Result<Vec<Series>, ApiError> {
+    config.check_series().map_err(engine_error)?;
+    let until = cutoff.map(DataCutoff::end);
+    config
+        .series
+        .iter()
+        .map(|name| td_engine::read_series(store.root(), name, until).map_err(engine_error))
+        .collect()
+}
+
 /// Checks that the store holds a configuration's range well enough to run it, by the rules of
 /// [`load_run_data`], without keeping the data: the months' 1-minute candles, and a quoted
 /// market's asks, are read together ([`read_months`]) and gone through a month at a time, and only
@@ -529,8 +551,8 @@ pub fn check_run_data(
 /// What [`check_run_data`] finds the store lacks of a configuration's range; `None` when it can
 /// run. A 400 for a bad range, a 422 `after_cutoff` for a range that ends after `cutoff`, checked
 /// before the store is read, and a 422 for a month without its asks. The reference instruments
-/// the configuration names are checked too, and one the store lacks is a refusal, not a
-/// shortfall, since a run does not download them ([`read_references`]).
+/// and series the configuration names are checked too, and one the store lacks is a refusal, not
+/// a shortfall, since a run does not download them ([`read_references`], [`read_series`]).
 pub(super) fn run_shortfall(
     store: &Store,
     config: &BacktestConfig,
@@ -582,6 +604,7 @@ pub(super) fn run_shortfall(
     let closures = store.closures(id, from, to)?;
     let gaps = closures.remove(gaps);
     read_references(store, config)?;
+    read_series(store, config, cutoff)?;
     Ok(shortfall(config, &gaps, &closures, any_bar, &funding))
 }
 
@@ -795,6 +818,7 @@ fn load_or_shortfall(
         return Ok(Err(s));
     }
     let references = read_references(store, config)?;
+    let series = read_series(store, config, cutoff)?;
     // Every bucket in the range with no bar: td-data's `dropped` lists only the incomplete ones,
     // not those with no minute at all. Bars are sorted and inside the range, which starts and
     // ends on bar boundaries. A bucket wholly in closed hours or recorded closures has no bar to
@@ -835,6 +859,7 @@ fn load_or_shortfall(
         asks,
         funding,
         references,
+        series,
         report,
     }))
 }
@@ -935,6 +960,7 @@ fn execute(
         asks,
         funding,
         references,
+        series,
         report,
     } = data;
     ctx.checkpoint()?;
@@ -946,9 +972,15 @@ fn execute(
         }
         JobRequest::Backtest(config) => {
             ctx.progress(0.0, "running the backtest");
-            let result =
-                td_engine::run_with_references(config, &bars, &asks, &funding, &references)
-                    .map_err(engine_error)?;
+            let result = td_engine::run_with_references(
+                config,
+                &bars,
+                &asks,
+                &funding,
+                &references,
+                &series,
+            )
+            .map_err(engine_error)?;
             SavedRun::Backtest(Box::new(result))
         }
         JobRequest::Sweep(spec) => {
@@ -959,6 +991,7 @@ fn execute(
                     &asks,
                     &funding,
                     &references,
+                    &series,
                     Some(&progress),
                 )
             })?;
@@ -972,6 +1005,7 @@ fn execute(
                     &asks,
                     &funding,
                     &references,
+                    &series,
                     Some(&progress),
                 )
             })?;
@@ -985,6 +1019,7 @@ fn execute(
                     &asks,
                     &funding,
                     &references,
+                    &series,
                     Some(&progress),
                 )
             })?;
@@ -1112,12 +1147,16 @@ pub fn check_run(store: &Store, run: &SavedRun) -> RunCheck {
         .ok()
         .and_then(|d| {
             let references = read_references(store, base).ok()?;
+            // Rows known after the run's last bar are not in its fingerprint, so the cutoff it
+            // was made under does not matter here.
+            let series = read_series(store, base, None).ok()?;
             config_fingerprint_with_references(
                 base,
                 &d.loaded.candles,
                 &d.asks,
                 &d.funding,
                 &references,
+                &series,
             )
             .ok()
         })
@@ -1214,9 +1253,11 @@ pub(super) async fn job_result(
 }
 
 /// Engine errors from what the client asked for are 400 `invalid_config`; quote errors, which mean
-/// the stored bids and asks cannot be run, are 422 `data_missing`; the rest are internal.
+/// the stored bids and asks cannot be run, and series data errors are 422 `data_missing`; the rest
+/// are internal.
 fn engine_error(e: EngineError) -> ApiError {
     match e {
+        EngineError::SeriesData(message) => data_missing(message),
         EngineError::MissingAsk { .. }
         | EngineError::UnmatchedAsk { .. }
         | EngineError::DuplicateAsk { .. }
@@ -1228,6 +1269,7 @@ fn engine_error(e: EngineError) -> ApiError {
         )),
         EngineError::InvalidConfig(_)
         | EngineError::InvalidReferences(_)
+        | EngineError::InvalidSeries(_)
         | EngineError::UnknownStrategy(_)
         | EngineError::InvalidParam { .. }
         | EngineError::NoBarsInRange { .. }
@@ -1313,6 +1355,7 @@ mod tests {
             max_leverage: 1.0,
             account_currency: td_core::AccountCurrency::Quote,
             references: Vec::new(),
+            series: Vec::new(),
         }
     }
 

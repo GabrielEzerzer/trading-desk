@@ -748,6 +748,7 @@ fn run_case(case_path: &Path, dir: &Path, series: &str, out: &Path) -> Res<()> {
         close_at_end: false,
         account_currency: AccountCurrency::Quote,
         references: Vec::new(),
+        series: Vec::new(),
     };
     let result = match harness_strategy(&case.strategy, &case.params)? {
         Some(strategy) => run_strategy(&config, strategy, &bars, &[], &funding)?,

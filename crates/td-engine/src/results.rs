@@ -157,12 +157,12 @@ impl PlanRun {
         asks: &[td_core::Candle],
         funding: &[(Millis, f64)],
     ) -> Result<PlanRun, EngineError> {
-        PlanRun::with_references(spec, battery, bars, asks, funding, &[])
+        PlanRun::with_references(spec, battery, bars, asks, funding, &[], &[])
     }
 
-    /// [`PlanRun::new`] for a battery run with reference instruments
+    /// [`PlanRun::new`] for a battery run with reference instruments or series
     /// ([`crate::run_battery_with_references`]): its configuration names them and its data
-    /// fingerprint covers their bars.
+    /// fingerprint covers their bars and rows.
     pub fn with_references(
         spec: &crate::BatterySpec,
         battery: BatteryResult,
@@ -170,15 +170,17 @@ impl PlanRun {
         asks: &[td_core::Candle],
         funding: &[(Millis, f64)],
         references: &[crate::ReferenceBars],
+        series: &[crate::Series],
     ) -> Result<PlanRun, EngineError> {
         let mut config = spec
             .plan
             .backtest_config(spec.strategy, spec.instrument.clone());
         config.references = references.iter().map(|r| r.instrument.clone()).collect();
+        config.series = series.iter().map(|s| s.name.clone()).collect();
         Ok(PlanRun {
             strategy: spec.strategy.to_string(),
             data_fingerprint: crate::config_fingerprint_with_references(
-                &config, bars, asks, funding, references,
+                &config, bars, asks, funding, references, series,
             )?,
             config,
             plan: spec.plan.clone(),
@@ -201,6 +203,9 @@ struct PlanConfig<'a> {
     /// The reference instruments the battery's runs named; left out when none.
     #[serde(skip_serializing_if = "<[_]>::is_empty")]
     references: &'a [InstrumentId],
+    /// The series the battery's runs named; left out when none.
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    series: &'a [String],
 }
 
 impl SavedRun {
@@ -327,6 +332,7 @@ pub fn save_with_files(
                 rule: &r.rule,
                 seed: r.battery.seed,
                 references: &r.config.references,
+                series: &r.config.series,
             },
             runs_dir,
         )?,
