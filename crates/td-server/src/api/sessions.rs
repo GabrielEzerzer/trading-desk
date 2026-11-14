@@ -27,8 +27,8 @@ use serde::{Deserialize, Serialize};
 use td_core::{AccountCurrency, Candle, FeeSchedule, InstrumentId, Millis, OrderId, Timeframe};
 use td_data::time::now_ms;
 use td_engine::{
-    BacktestConfig, EquityPoint, Params, Recorded, RunId, SessionComparison, StrategyEntry,
-    compare_with_backtest,
+    BacktestConfig, EquityPoint, Params, Recorded, ReferenceBars, RunId, SessionComparison,
+    StrategyEntry, compare_with_backtest,
 };
 use tokio::sync::{broadcast, oneshot, watch};
 use tokio::task::JoinHandle;
@@ -65,11 +65,18 @@ pub struct StartSessionRequest {
     pub fees: Option<FeeSchedule>,
     /// The saved verdict (a plan run's id) the session is started from: a verdict of the same
     /// strategy on the same instrument. Left out, the strategy's latest verdict on the instrument
-    /// as `GET /verdicts` gives it, if it has one. Refused on a manual session, and for a verdict
-    /// judged with reference instruments, named or latest, since a session cannot feed them.
+    /// as `GET /verdicts` gives it, if it has one. Refused on a manual session, and for a verdict,
+    /// named or latest, judged with other reference instruments than `references`; the message
+    /// says which are missing or extra.
     #[serde(default)]
     #[ts(optional)]
     pub verdict_run_id: Option<RunId>,
+    /// Instruments on the same venue, listed by it, whose closed bars the strategy reads beside its
+    /// own ([`td_engine::Context::reference`]), as a backtest's `references` names them: warmed up
+    /// and fed live with every bar. Left out or empty, none. Refused on a manual session.
+    #[serde(default)]
+    #[ts(optional)]
+    pub references: Option<Vec<InstrumentId>>,
 }
 
 /// A session as `GET /sessions` lists it.
@@ -170,7 +177,7 @@ impl SessionState {
 }
 
 /// `GET /sessions/{id}/comparison`: a session beside a backtest of the same strategy, parameters,
-/// instrument, timeframe and money settings over the same bars.
+/// instrument, timeframe, money settings and reference instruments over the same bars.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 pub struct SessionComparisonResponse {
     /// The backtest that was run: from the session's first live bar (`from`) to the end of its
@@ -183,9 +190,9 @@ pub struct SessionComparisonResponse {
     pub comparison: SessionComparison,
 }
 
-/// The bars the backtest ran on: the session's own, as its log holds them, warm-up bars included.
-/// Nothing is downloaded and nothing is read from the store, so both sides saw exactly the same
-/// prices.
+/// The bars the backtest ran on: the session's own, as its log holds them, warm-up bars included,
+/// and the reference bars it fed with them. Nothing is downloaded and nothing is read from the
+/// store, so both sides saw exactly the same prices.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 pub struct ComparedBars {
     pub warm_up_bars: usize,
@@ -593,6 +600,7 @@ impl Sessions {
             funding_paid,
             manual,
             dropped,
+            references,
         ) = {
             let paper = lock(&session);
             let config = paper.config().clone();
@@ -622,6 +630,13 @@ impl Sessions {
                 s.portfolio().funding_paid(),
                 manual,
                 paper.dropped().to_vec(),
+                s.references()
+                    .iter()
+                    .map(|(instrument, slots)| ReferenceBars {
+                        instrument: instrument.clone(),
+                        bars: slots.iter().flatten().copied().collect(),
+                    })
+                    .collect::<Vec<_>>(),
             )
         };
         let (first, last) = match (bars.first(), bars.last()) {
@@ -643,9 +658,10 @@ impl Sessions {
             close_at_end: false,
             // Paper sessions are on a quote-currency account (see `paper::build_session`).
             account_currency: AccountCurrency::Quote,
-            references: Vec::new(),
+            references: config.references.clone(),
         };
-        let result = td_engine::run(&backtest, &bars, &[], &due).map_err(|e| {
+        let result = td_engine::run_with_references(&backtest, &bars, &[], &due, &references);
+        let result = result.map_err(|e| {
             ApiError::internal(format!("the backtest beside the session failed: {e}"))
         })?;
         let recorded = Recorded {
@@ -704,10 +720,9 @@ impl Sessions {
         events: broadcast::Sender<SessionEvent>,
     ) -> (Arc<Mutex<PaperSession>>, Run) {
         paper.set_events(events);
-        let instrument = paper.config().instrument.id.clone();
         let streams = self.streams.clone();
         let rest = streams.live().rest();
-        let handle = crate::start_on(paper, rest, move || streams.stream(&instrument));
+        let handle = crate::start_on(paper, rest, move |id| streams.stream(id));
         let session = handle.session().clone();
         let ended = handle.ended();
         let generation = self.generations.fetch_add(1, Ordering::SeqCst);
@@ -774,6 +789,7 @@ impl From<PaperError> for ApiError {
             PaperError::Io { .. }
             | PaperError::BadFile { .. }
             | PaperError::FeedEnded
+            | PaperError::ReferenceBehind(_)
             | PaperError::Task(_)
             | PaperError::LogFailed(_) => ApiError::internal(message),
         }
@@ -822,6 +838,18 @@ pub(super) async fn start(
         .ok_or_else(|| {
             ApiError::bad_request(format!("{id} is not an instrument the venue lists"))
         })?;
+    let references = request.references.unwrap_or_default();
+    // Same venue, not the traded instrument, not twice; then each listed by the venue.
+    td_engine::check_reference_ids(id, &references)
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    for reference in &references {
+        let listed = data::instrument_list(&state, reference.venue, reference.kind).await?;
+        if !listed.instruments.iter().any(|i| i.id == *reference) {
+            return Err(ApiError::bad_request(format!(
+                "{reference} is not an instrument the venue lists"
+            )));
+        }
+    }
     let config = PaperConfig {
         strategy: request.strategy,
         params: request.params,
@@ -833,6 +861,7 @@ pub(super) async fn start(
         // shortcut: a session started over the API trades at 1x, since the request has no
         // leverage yet; add the cap to the request when the apps get a leverage setting.
         max_leverage: 1.0,
+        references,
     };
     let link = if config.strategy == MANUAL_STRATEGY {
         if request.verdict_run_id.is_some() {
@@ -840,6 +869,11 @@ pub(super) async fn start(
                 StatusCode::BAD_REQUEST,
                 "invalid_verdict",
                 "a manual session runs no strategy, so it is not started from a verdict",
+            ));
+        }
+        if !config.references.is_empty() {
+            return Err(ApiError::bad_request(
+                "a manual session runs no strategy, so it reads no reference instruments",
             ));
         }
         None
@@ -854,9 +888,15 @@ pub(super) async fn start(
             None => None,
             Some(entry) => {
                 let (runs_dir, instrument) = (state.runs_dir(), config.instrument.id.clone());
-                let verdict = request.verdict_run_id;
+                let (verdict, references) = (request.verdict_run_id, config.references.clone());
                 let link = tokio::task::spawn_blocking(move || {
-                    session_link(&runs_dir, &entry, &instrument, verdict.as_ref())
+                    session_link(
+                        &runs_dir,
+                        &entry,
+                        &instrument,
+                        verdict.as_ref(),
+                        &references,
+                    )
                 })
                 .await
                 .map_err(|e| ApiError::internal(format!("reading the verdict stopped: {e}")))??;
@@ -1016,6 +1056,7 @@ pub(crate) mod tests {
             slippage_bps: 0.0,
             fees: None,
             max_leverage: 1.0,
+            references: Vec::new(),
         };
         PaperSession::create(dir.path(), "s", config).expect("creates");
         let streams = Arc::new(Streams::new(Arc::new(Nowhere)));
@@ -1225,6 +1266,42 @@ pub(crate) mod tests {
         )
         .expect("runs");
         assert_eq!(*lock(&seen), fed);
+    }
+
+    /// The backtest beside a session that fed reference instruments names them and runs on the
+    /// reference bars the session fed, gaps included; given none, or not naming them, it would
+    /// refuse to run.
+    #[test]
+    fn the_backtest_beside_a_session_runs_on_the_reference_bars_it_fed() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let base = crate::paper::tests::config();
+        let other = InstrumentId {
+            symbol: "OTHERUSDT".into(),
+            ..base.instrument.id.clone()
+        };
+        let config = PaperConfig {
+            params: Params::new()
+                .with("fast", ParamValue::Int(2))
+                .with("slow", ParamValue::Int(5)),
+            references: vec![other.clone()],
+            ..base
+        };
+        let mut paper = PaperSession::create(dir.path(), "refs", config).expect("creates");
+        for i in 0..30 {
+            let slot = (i % 7 != 3).then(|| Candle {
+                volume: 2.0,
+                ..wave(i)
+            });
+            paper
+                .feed_with_references(wave(i), Vec::new(), vec![slot], i < 5)
+                .expect("feeds");
+        }
+        drop(paper);
+        let compared = loaded(dir.path()).comparison("refs").expect("compares");
+        assert_eq!(compared.backtest.references, vec![other]);
+        let c = &compared.comparison;
+        assert_eq!(c.differences, [], "{:#?}", c.differences);
+        assert_eq!(c.pnl_ratio, Some(1.0));
     }
 
     #[test]

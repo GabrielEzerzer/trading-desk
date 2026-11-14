@@ -38,6 +38,14 @@ pub enum PaperError {
     #[error("the live feed stopped")]
     FeedEnded,
 
+    /// A reference instrument's bar did not come within [`td_engine::REFERENCE_WAIT`] of the
+    /// traded bar it goes with, or its feed stopped.
+    #[error(
+        "{0}; the session stops rather than feed the strategy a bar without the reference bar a \
+         backtest would show it: resume it to backfill both feeds from its last bar"
+    )]
+    ReferenceBehind(String),
+
     #[error("a background task failed: {0}")]
     Task(String),
 

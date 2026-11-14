@@ -2550,8 +2550,8 @@ fn start_refuses_a_verdict_it_cannot_run_before_writing_or_asking_the_venue_anyt
         assert!(!rig.data().join("live").exists(), "{extra:?}");
     };
     let feeds_none = format!(
-        "run {NEWER} was judged with the reference instruments {reference}, and a paper or live \
-         session cannot feed reference instruments yet"
+        "run {NEWER} was judged with the reference instruments {reference}, and a live session \
+         cannot feed reference instruments yet"
     );
     // The latest verdict was judged with a reference.
     refused(

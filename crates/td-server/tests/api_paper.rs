@@ -527,6 +527,7 @@ fn config() -> PaperConfig {
         slippage_bps: 5.0,
         fees: None,
         max_leverage: 1.0,
+        references: Vec::new(),
     }
 }
 
@@ -1066,6 +1067,33 @@ async fn unknown_sessions_are_404_and_bad_starts_are_400() {
         let (status, answer) = api.post("/sessions", &case).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{case}: {answer}");
         assert_eq!(answer["error"]["code"], "invalid_verdict", "{answer}");
+    }
+    // Reference instruments the venue does not list, the traded instrument itself, one on another
+    // venue, one named twice, and any on a manual session are refused.
+    let traded = json!(instrument_id());
+    let mut elsewhere = traded.clone();
+    elsewhere["venue"] = json!("bybit");
+    let mut unlisted = traded.clone();
+    unlisted["symbol"] = json!("OTHERUSDT");
+    let references = [
+        json!([unlisted]),
+        json!([traded]),
+        json!([elsewhere]),
+        json!([unlisted, unlisted]),
+    ];
+    let mut cases: Vec<String> = references
+        .iter()
+        .map(|r| bad(&|b| b["references"] = r.clone()))
+        .collect();
+    cases.push(bad(&|b| {
+        b["strategy"] = json!(MANUAL_STRATEGY);
+        b["params"] = json!({});
+        b["references"] = json!([unlisted]);
+    }));
+    for case in cases {
+        let (status, answer) = api.post("/sessions", &case).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{case}: {answer}");
+        assert!(answer["error"]["message"].is_string(), "{answer}");
     }
     body["timeframe"] = json!("2m");
     let (status, _) = api.post("/sessions", &body.to_string()).await;
