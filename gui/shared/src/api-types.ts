@@ -1853,7 +1853,7 @@ days: number | null,
 trading_days: number | null, };
 
 /**
- * The value of a prop-firm attempt at the edge the test shows and at a reduced one.
+ * The value of a prop-firm attempt at the edge the test shows, at a reduced one and at none.
  */
 export type PropFirmAttempt = { 
 /**
@@ -1864,7 +1864,15 @@ full: AttemptFigures,
  * From the daily returns with their mean scaled by `reduced_edge_factor` and their shape
  * unchanged. The `prop_firm` kind rule asks for its `value` to be above zero.
  */
-reduced: AttemptFigures, reduced_edge_factor: number, paths: number, };
+reduced: AttemptFigures, 
+/**
+ * From the daily returns with their mean removed (a factor of 0) and their shape unchanged:
+ * what the terms alone are worth, with no edge. A positive value here says the terms pay for
+ * an attempt by themselves, so a positive `reduced` value does not show that the edge does.
+ * Reported only: no line of the verdict judges it. `None` in a result saved before it
+ * existed.
+ */
+zero_edge: AttemptFigures | null, reduced_edge_factor: number, paths: number, };
 
 /**
  * What one attempt is worth, from one series of daily returns.

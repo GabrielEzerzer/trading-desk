@@ -714,7 +714,7 @@ pub struct AttemptFigures {
     pub value: f64,
 }
 
-/// The value of a prop-firm attempt at the edge the test shows and at a reduced one.
+/// The value of a prop-firm attempt at the edge the test shows, at a reduced one and at none.
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct PropFirmAttempt {
@@ -723,6 +723,13 @@ pub struct PropFirmAttempt {
     /// From the daily returns with their mean scaled by `reduced_edge_factor` and their shape
     /// unchanged. The `prop_firm` kind rule asks for its `value` to be above zero.
     pub reduced: AttemptFigures,
+    /// From the daily returns with their mean removed (a factor of 0) and their shape unchanged:
+    /// what the terms alone are worth, with no edge. A positive value here says the terms pay for
+    /// an attempt by themselves, so a positive `reduced` value does not show that the edge does.
+    /// Reported only: no line of the verdict judges it. `None` in a result saved before it
+    /// existed.
+    #[serde(default)]
+    pub zero_edge: Option<AttemptFigures>,
     pub reduced_edge_factor: f64,
     pub paths: usize,
 }
@@ -887,8 +894,9 @@ impl Tally {
 ///
 /// The second set of figures subtracts `(1 - reduced_edge_factor) * mean` from every daily
 /// return and from its low before the size multiplier, so the mean becomes
-/// `reduced_edge_factor * mean` and the days keep their shape, their dips and their flags. Both
-/// sets use the same draws, so they differ by the edge alone.
+/// `reduced_edge_factor * mean` and the days keep their shape, their dips and their flags. The
+/// third set subtracts the whole mean the same way, a factor of 0. All three use the same draws,
+/// so they differ by the edge alone.
 pub fn prop_firm_attempt(
     daily_returns: &[f64],
     lows: Option<&[f64]>,
@@ -909,9 +917,11 @@ pub fn prop_firm_attempt(
     let lows = lows.unwrap_or(daily_returns);
     let reduced: Vec<f64> = daily_returns.iter().map(|r| r - shift).collect();
     let reduced_lows: Vec<f64> = lows.iter().map(|l| l - shift).collect();
+    let centred: Vec<f64> = daily_returns.iter().map(|r| r - mean).collect();
+    let centred_lows: Vec<f64> = lows.iter().map(|l| l - mean).collect();
     let days = spec.horizon_days + terms.funded_horizon_days as usize;
     let mut draw = Resampler::new(n, spec.mean_block, spec.seed);
-    let (mut full, mut low) = (Tally::default(), Tally::default());
+    let (mut full, mut low, mut none) = (Tally::default(), Tally::default(), Tally::default());
     let mut path = Vec::with_capacity(days);
     let mut flags = Vec::with_capacity(days);
     let mut returns = Vec::with_capacity(days);
@@ -928,6 +938,7 @@ pub fn prop_firm_attempt(
         for (series, series_lows, tally) in [
             (daily_returns, lows, &mut full),
             (&reduced[..], &reduced_lows[..], &mut low),
+            (&centred[..], &centred_lows[..], &mut none),
         ] {
             returns.clear();
             returns.extend(path.iter().map(|&i| series[i]));
@@ -942,6 +953,7 @@ pub fn prop_firm_attempt(
     Ok(PropFirmAttempt {
         full: full.figures(),
         reduced: low.figures(),
+        zero_edge: Some(none.figures()),
         reduced_edge_factor: terms.reduced_edge_factor,
         paths: spec.paths,
     })
@@ -2437,6 +2449,55 @@ mod tests {
         // The edge is worth something: without it an attempt passes less and is worth less.
         assert!(zero.reduced.pass < zero.full.pass, "{zero:?}");
         assert!(zero.reduced.value < zero.full.value, "{zero:?}");
+    }
+
+    #[test]
+    fn the_zero_edge_figures_remove_the_whole_mean_and_match_the_full_edge_without_drift() {
+        let spec = attempt_spec();
+        let terms = AttemptTerms {
+            funded_horizon_days: 60,
+            ..terms()
+        };
+        // A driftless series: symmetric() * 4 has a sample mean of exactly 0, so removing it
+        // changes nothing, and the zero-edge figures are the full-edge ones on the same draws.
+        let flat: Vec<f64> = symmetric().iter().map(|r| r * 4.0).collect();
+        let a = prop_firm_attempt(&flat, None, &every_day(&flat), &spec, &terms).unwrap();
+        assert_eq!(a.zero_edge, Some(a.full));
+        // A series whose drift is small next to its spread (a mean of 1e-5 against a spread of
+        // about 0.014): the zero-edge value equals the full-edge value within the noise of the
+        // paths, four standard errors of the mean of one attempt's value.
+        let near: Vec<f64> = flat.iter().map(|r| r + 1e-5).collect();
+        let b = prop_firm_attempt(&near, None, &every_day(&near), &spec, &terms).unwrap();
+        let zero = b.zero_edge.unwrap();
+        // One attempt's value lies between losing the fee and paying out every gain of 60
+        // funded days of at most 3% each (no day here gains more than 2.5%).
+        let spread =
+            terms.evaluation_fee + terms.profit_split * terms.account_size * 1.03f64.powi(60);
+        let se = spread / (spec.paths as f64).sqrt();
+        assert!(
+            (zero.value - b.full.value).abs() < 4.0 * se,
+            "{zero:?} {:?}",
+            b.full
+        );
+        // With an edge, removing all of it gives the figures of a factor of 0, and is worth less
+        // than the reduced edge, which is worth less than the full one.
+        let x = edged();
+        let half = prop_firm_attempt(&x, None, &every_day(&x), &spec, &terms).unwrap();
+        let none = AttemptTerms {
+            reduced_edge_factor: 0.0,
+            ..terms
+        };
+        let at_zero = prop_firm_attempt(&x, None, &every_day(&x), &spec, &none).unwrap();
+        assert_eq!(half.zero_edge, Some(at_zero.reduced));
+        let zero = half.zero_edge.unwrap();
+        assert!(zero.value < half.reduced.value, "{half:?}");
+        assert!(half.reduced.value < half.full.value, "{half:?}");
+        // A result saved before the field existed loads without it.
+        let mut saved = serde_json::to_value(half).unwrap();
+        saved.as_object_mut().unwrap().remove("zero_edge");
+        let back: PropFirmAttempt = serde_json::from_value(saved).unwrap();
+        assert_eq!(back.zero_edge, None);
+        assert_eq!((back.full, back.reduced), (half.full, half.reduced));
     }
 
     #[test]
