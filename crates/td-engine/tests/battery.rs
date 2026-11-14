@@ -192,6 +192,7 @@ fn prop_firm_rule() -> VerdictRule {
             day_target_share: None,
             trading_day: None,
             trailing_floor_lock: None,
+            day_rollover: None,
         },
         limits: PropFirmLimits::default(),
         attempt: None,
@@ -420,13 +421,19 @@ fn the_other_kinds_get_their_inputs_from_the_same_runs() {
 
     let prop = battery(&plan, &prop_firm_rule(), &bars, 7, None).unwrap();
     let cash = plan.backtest.starting_cash;
-    let trailing =
-        risk::trailing_drawdown(cash, &prop.walk_forward.as_ref().unwrap().equity_extremes)
-            .unwrap()
-            .amount
-            / cash;
-    assert!(trailing > 0.0);
-    assert_eq!(prop.kind.intrabar_drawdown_trailing, Some(trailing));
+    let extremes = &prop.walk_forward.as_ref().unwrap().equity_extremes;
+    // The first 90 of the 180 days are one of the attempts the drawdown line reads, so the worst
+    // attempt falls at least as far as the bars of its first 80 days do.
+    let first_attempt = extremes.len() * 80 / 180;
+    let first = risk::trailing_drawdown(cash, &extremes[..first_attempt])
+        .unwrap()
+        .amount
+        / cash;
+    let trailing = prop.kind.intrabar_drawdown_trailing.unwrap();
+    assert!(
+        first > 0.0 && trailing >= first,
+        "{trailing} against {first}"
+    );
     // The firm in this rule trails, so its drawdown line reads the trailing value.
     assert_eq!(line(&prop, "max_drawdown").value, Some(trailing));
     let odds = prop.prop_firm_odds.unwrap();
