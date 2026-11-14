@@ -12,7 +12,12 @@
 //! venue's prices and fees, and the equity is the session's own model of the account from them.
 //! The backtest runs on exactly the bars the log holds, warm-up bars included, with the funding
 //! the session was fed given at each rate's due time; nothing is downloaded. The two are paired
-//! with [`td_engine::compare_with_backtest`].
+//! with [`td_engine::compare_with_backtest`]. A rate the session was charged on a later bar than
+//! the one it was due in lands on another bar in the backtest, as in a paper session's comparison
+//! (td-server's `ComparedBars`), and the report counts those rates.
+//!
+//! Text read from the folder is printed through `clean`, so a control character in a file cannot
+//! reach the owner's terminal.
 
 use std::collections::VecDeque;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -20,7 +25,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use serde::Deserialize;
-use td_core::{AccountCurrency, Candle, Fill, Millis, OrderId, Side};
+use td_core::{AccountCurrency, Candle, Fill, Millis, OrderId, Side, Timeframe};
 use td_data::time::format_minute;
 use td_engine::{
     BacktestConfig, Broker, BrokerEvent, EngineError, Order, Portfolio, Recorded, Session,
@@ -29,8 +34,8 @@ use td_engine::{
 
 use crate::BrokerRecord;
 use crate::session::{
-    BuildStrategy, CONFIG_FILE, EVENTS_FILE, Line, LiveError, SavedConfig, check_id, pairs,
-    panic_message, read_json, read_lines, refuse_link, session_dir,
+    BuildStrategy, CONFIG_FILE, EVENTS_FILE, Funding, Line, LiveError, MAX_TEXT, SavedConfig,
+    check_id, clean, pairs, panic_message, read_json, read_lines, refuse_link, session_dir,
 };
 
 /// A call in a broker record, as [`BrokerRecord`] writes it (the broker's own `Call`, whose fields
@@ -74,13 +79,18 @@ struct Script {
     open_ended: bool,
     /// Orders the strategy made on that bar after the record ended.
     past_record: usize,
+    /// Whether the strategy sent or cancelled anything on that bar after the record ended. The
+    /// log's `sending` line is written before a bar's first send or cancel, so the session did.
+    sent_past_record: bool,
 }
 
 impl Script {
     /// Notes that the strategy made a call the record does not hold: a divergence, unless the log
     /// ends part way through this bar.
     fn ran_out(&mut self, call: String) {
-        if !self.open_ended {
+        if self.open_ended {
+            self.sent_past_record = true;
+        } else {
             self.diverged
                 .get_or_insert(format!("the record ends where the strategy {call}"));
         }
@@ -199,6 +209,8 @@ struct Replayed {
     live_from: Option<Millis>,
     /// Every funding rate fed, warm-up bars' included, at its due time, for the backtest.
     due: Vec<(Millis, f64)>,
+    /// The funding rates fed with live bars: the ones the session was charged.
+    charged: Vec<Funding>,
     /// The bar the log ends part way through, with the orders made after its record ended.
     cut_short: Option<(Millis, usize)>,
 }
@@ -222,6 +234,7 @@ fn replay(saved: &SavedConfig, lines: &[Line], build: BuildStrategy) -> Result<R
     )
     .map_err(|e| e.to_string())?;
     let (mut bars, mut live_from, mut due, mut cut_short) = (Vec::new(), None, Vec::new(), None);
+    let mut charged = Vec::new();
     let bad = |i: usize, why: String| format!("line {} of the log: {why}", i + 1);
     let queue = |record: &Option<BrokerRecord>, i: usize| -> Result<(), String> {
         let record = record
@@ -244,6 +257,8 @@ fn replay(saved: &SavedConfig, lines: &[Line], build: BuildStrategy) -> Result<R
             continue;
         }
         live_from.get_or_insert(line.bar.open_time);
+        // A bar's `sending` line and its own line carry the same rates; this is the first of them.
+        charged.extend_from_slice(&line.funding);
         queue(&line.record, i)?;
         let mut next = i + 1;
         if line.sending {
@@ -283,6 +298,13 @@ fn replay(saved: &SavedConfig, lines: &[Line], build: BuildStrategy) -> Result<R
              the replay never reached"
         ));
     }
+    if let Some(bar) = cut_short.filter(|_| !script.sent_past_record) {
+        return Err(format!(
+            "the log does not replay with the strategy as it is now: it ends on the sending line \
+             of the bar opening at {bar}, which the session writes before it sends or cancels, \
+             and the replay sent and cancelled nothing on that bar"
+        ));
+    }
     let cut_short = cut_short.map(|bar| (bar, script.past_record));
     drop(script);
     Ok(Replayed {
@@ -290,6 +312,7 @@ fn replay(saved: &SavedConfig, lines: &[Line], build: BuildStrategy) -> Result<R
         bars,
         live_from,
         due,
+        charged,
         cut_short,
     })
 }
@@ -326,13 +349,22 @@ pub(crate) fn compare(
             "session {id} has not fed a live bar yet, so there is nothing to compare"
         ));
     };
+    let to = last
+        .open_time
+        .checked_add(config.timeframe.duration_ms())
+        .ok_or_else(|| {
+            format!(
+                "the log's last bar opens at {}, which has no end",
+                last.open_time
+            )
+        })?;
     let backtest = BacktestConfig {
         strategy: config.strategy.clone(),
         params: config.params.clone(),
         instrument: config.instrument.clone(),
         timeframe: config.timeframe,
         from: live_from,
-        to: last.open_time + config.timeframe.duration_ms(),
+        to,
         starting_cash: saved.starting_balance,
         slippage_bps: config.slippage_bps,
         fee_override: config.fees,
@@ -366,6 +398,8 @@ pub(crate) fn compare(
             last: last.open_time,
             live_bars,
             warm_up_bars,
+            charged: replayed.charged.len(),
+            late_funding: late_funding(&replayed.charged, config.timeframe),
             cut_short: replayed.cut_short,
             comparison: &comparison,
         },
@@ -381,8 +415,21 @@ struct Report<'a> {
     last: Millis,
     live_bars: usize,
     warm_up_bars: usize,
+    /// The funding rates the session was charged, and how many of them on a later bar than the
+    /// one they were due in.
+    charged: usize,
+    late_funding: usize,
     cut_short: Option<(Millis, usize)>,
     comparison: &'a SessionComparison,
+}
+
+/// How many of the `charged` rates were charged on a later bar than the one they were due in,
+/// counted as a paper session's comparison counts them (td-server's `ComparedBars`).
+fn late_funding(charged: &[Funding], timeframe: Timeframe) -> usize {
+    charged
+        .iter()
+        .filter(|f| timeframe.floor(f.due) < timeframe.floor(f.time))
+        .count()
 }
 
 /// `x` to at most 8 decimals, without trailing zeros: the venue's amounts have no more, and the
@@ -432,8 +479,8 @@ fn report(r: &Report, out: &mut dyn FnMut(&str)) {
         "compared session {} with a backtest of {} on {} {} over the session's own bars: {} live \
          bars from {} to {}, after {} warm-up bars",
         r.id,
-        config.strategy,
-        config.instrument.id,
+        clean(&config.strategy, MAX_TEXT),
+        clean(&config.instrument.id.to_string(), MAX_TEXT),
         config.timeframe,
         r.live_bars,
         format_minute(r.live_from),
@@ -451,9 +498,9 @@ fn report(r: &Report, out: &mut dyn FnMut(&str)) {
     ));
     if let Some((bar, made)) = r.cut_short {
         out(&format!(
-            "the log ends part way through the bar opening at {}: the process stopped while \
-             sending, and the {made} orders the strategy made on it after the record ended are \
-             counted as unfilled",
+            "the log ends part way through the bar opening at {} (the session stopped, or is \
+             still sending), and the {made} orders the strategy made on it after the record \
+             ended are counted as unfilled",
             format_minute(bar)
         ));
     }
@@ -495,6 +542,13 @@ fn report(r: &Report, out: &mut dyn FnMut(&str)) {
         amount(c.backtest.fees),
         amount(c.session.funding),
         amount(c.backtest.funding),
+    ));
+    out(&format!(
+        "funding rates the session was charged: {}, {} of them on a later bar than the one they \
+         were due in. The backtest is given each rate at its due time, so each of those moves \
+         funding, and the equity after it, to another bar in the backtest, and shows as a \
+         funding and result difference that is not a difference in how orders were filled.",
+        r.charged, r.late_funding
     ));
     let ratio = c.pnl_ratio.map_or_else(
         || "none, since the backtest's is zero".to_string(),

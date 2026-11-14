@@ -2624,18 +2624,14 @@ fn status_refuses_a_link_in_place_of_the_session_folder_or_its_config() {
 
 // ---- `td-live compare` ----
 
-/// A session against the mock beside a backtest over its own bars. The venue fills bar 0's buy
-/// 10 above the bar and refuses every order after it, while the backtest also fills bar 1's add.
-/// `compare` reads the folder only: it runs with a connect that fails and sends nothing.
-#[test]
-fn compare_pairs_the_venue_fills_with_a_backtest_over_the_session_bars() {
-    let rig = Rig::new();
+/// Runs session `id` on live bars 0 to 2: it buys on bar 0 and adds on every bar after. The venue
+/// fills bar 0's buy 10 above the bar and refuses every order after it.
+fn compared_session(rig: &Rig, feed: &Feed, id: &str) {
     let mut cfg = config(0, -1, false);
     cfg.params.set("add_from", ParamValue::Int(1));
     rig.mock.set_price(SYMBOL, PRICE + 10.0);
-    let feed = rig.feed();
     feed.minute(rig.bar(1));
-    let run = rig.run(rig.create("cmp", cfg).expect("creates"), &feed);
+    let run = rig.run(rig.create(id, cfg).expect("creates"), feed);
     wait_for_bar(&run, rig.bar(0));
     rig.mock.inject_always(CREATE, Fault::Answer(10001));
     feed.minute(rig.bar(3));
@@ -2643,7 +2639,22 @@ fn compare_pairs_the_venue_fills_with_a_backtest_over_the_session_bars() {
     let (live, ended) = run.stop();
     ended.expect("stopped cleanly");
     assert_eq!(live.session().fills().len(), 1);
-    drop(live);
+}
+
+/// Writes `lines` as session `id`'s log.
+fn write_log(rig: &Rig, id: &str, lines: &[serde_json::Value]) {
+    let text: String = lines.iter().map(|l| format!("{l}\n")).collect();
+    fs::write(rig.path(id, "events.jsonl"), text).expect("log");
+}
+
+/// A session against the mock beside a backtest over its own bars ([`compared_session`]), while
+/// the backtest also fills bar 1's add. `compare` reads the folder only: it runs with a connect
+/// that fails and sends nothing.
+#[test]
+fn compare_pairs_the_venue_fills_with_a_backtest_over_the_session_bars() {
+    let rig = Rig::new();
+    let feed = rig.feed();
+    compared_session(&rig, &feed, "cmp");
 
     let mut env = rig.env(&feed);
     env.connect = Box::new(|| Err("no keys in this test".into()));
@@ -2744,4 +2755,195 @@ fn compare_refuses_a_bad_id_and_a_session_with_no_live_bar() {
     let (code, text) = rig.td_live(&feed, &["compare", "--id", "empty"]);
     assert_eq!(code, 1, "{text}");
     assert!(text.contains("has not fed a live bar yet"), "{text}");
+}
+
+/// A log that ends on a `sending` line, as a session that stopped while sending, or is still
+/// sending, leaves it: the orders the strategy makes on that bar past the record count as
+/// unfilled. A strategy that now makes no send or cancel there does not replay, since the
+/// session wrote that line because it was about to make one.
+#[test]
+fn compare_counts_the_orders_of_a_bar_the_log_ends_part_way_through_as_unfilled() {
+    let rig = Rig::new();
+    let feed = rig.feed();
+    compared_session(&rig, &feed, "cut");
+    drop_last_line(&rig.path("cut", "events.jsonl"));
+    let log = rig.log("cut");
+    let last = log.last().expect("a line");
+    assert_eq!(
+        (&last["sending"], &last["bar"]["open_time"]),
+        (&true.into(), &rig.bar(2).into())
+    );
+
+    let at = |t: Millis| td_data::time::format_minute(t);
+    let (code, text) = rig.td_live(&feed, &["compare", "--id", "cut"]);
+    assert_eq!(code, 0, "{text}");
+    assert!(
+        text.contains(&format!(
+            "3 live bars from {} to {}, after {WARM_UP} warm-up bars",
+            at(rig.bar(0)),
+            at(rig.bar(2))
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "the log ends part way through the bar opening at {} (the session stopped, or is \
+             still sending), and the 1 orders the strategy made on it after the record ended are \
+             counted as unfilled\nmatched fills: 1\n",
+            at(rig.bar(2))
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains("session fills with no backtest partner: 0\n"),
+        "{text}"
+    );
+    assert!(
+        text.contains("backtest fills with no session partner: 1\n"),
+        "{text}"
+    );
+
+    // The log cut after bar 0's sending line, with a strategy that no longer buys there.
+    let first_sending = log.iter().position(|l| l["sending"] == true).unwrap();
+    write_log(&rig, "cut", &log[..=first_sending]);
+    let mut config = rig.config_json("cut");
+    config["params"]["buy_on"] = 5.into();
+    rig.write_config_json("cut", &config);
+    let (code, text) = rig.td_live(&feed, &["compare", "--id", "cut"]);
+    assert_eq!(code, 1, "{text}");
+    assert!(
+        text.contains(&format!(
+            "it ends on the sending line of the bar opening at {}, which the session writes \
+             before it sends or cancels, and the replay sent and cancelled nothing on that bar",
+            rig.bar(0)
+        )),
+        "{text}"
+    );
+}
+
+/// `compare` reads a faulted session's folder as any other: the fault halted the session after
+/// its bars were logged, and its fills are compared.
+#[test]
+fn compare_works_on_a_faulted_session() {
+    let rig = Rig::new();
+    let feed = rig.feed();
+    feed.minute(rig.bar(2));
+    let run = rig.run(
+        rig.create("fault", config(0, 99, false)).expect("creates"),
+        &feed,
+    );
+    wait_for_bar(&run, rig.bar(1));
+    rig.mock.set_position(SYMBOL, 0.01, PRICE);
+    feed.minute(rig.bar(4));
+    let (live, ended) = run.wait();
+    assert!(matches!(ended, Err(LiveError::Faulted(_))), "{ended:?}");
+    drop(live);
+    assert!(matches!(
+        rig.saved_status("fault").state,
+        State::Faulted { .. }
+    ));
+
+    let at = |t: Millis| td_data::time::format_minute(t);
+    let (code, text) = rig.td_live(&feed, &["compare", "--id", "fault"]);
+    assert_eq!(code, 0, "{text}");
+    assert!(
+        text.contains(&format!(
+            "3 live bars from {} to {}",
+            at(rig.bar(0)),
+            at(rig.bar(2))
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "matched fills: 1\n  buy 0.004, decided on the bar opening at {}: session 65000 at \
+             {}, backtest 65000 at {}; time difference 0 ms, price difference 0",
+            at(rig.bar(0)),
+            at(rig.bar(1)),
+            at(rig.bar(1)),
+        )),
+        "{text}"
+    );
+}
+
+/// The report counts the funding rates the session was charged, and how many of them on a later
+/// bar than the one they were due in, which the backtest charges on that earlier bar. A rate fed
+/// with a bar's `sending` line and its own line is one rate.
+#[test]
+fn compare_counts_the_funding_the_session_was_charged_late() {
+    let rig = Rig::new();
+    eight_hourly(&rig);
+    let feed = rig.feed();
+    feed.minute(rig.bar(2));
+    let run = rig.run(
+        rig.create("funded", config(1, 99, false)).expect("creates"),
+        &feed,
+    );
+    wait_for_bar(&run, rig.bar(1));
+    let (live, ended) = run.stop();
+    ended.expect("stopped cleanly");
+    assert_eq!(live.funding().len(), 1);
+    drop(live);
+    let log = rig.log("funded");
+    let with_rate = |l: &&serde_json::Value| l["funding"].as_array().is_some_and(|f| !f.is_empty());
+    assert_eq!(log.iter().filter(with_rate).count(), 2, "a sending line and its bar's");
+
+    let charged = |late: usize| {
+        format!(
+            "funding rates the session was charged: 1, {late} of them on a later bar than the \
+             one they were due in. The backtest is given each rate at its due time, so each of \
+             those moves funding, and the equity after it, to another bar in the backtest, and \
+             shows as a funding and result difference that is not a difference in how orders \
+             were filled."
+        )
+    };
+    let (code, text) = rig.td_live(&feed, &["compare", "--id", "funded"]);
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains(&charged(0)), "{text}");
+
+    // As if the venue had published the rate due at bar 0 only after bar 0 closed.
+    let late: Vec<serde_json::Value> = log
+        .into_iter()
+        .map(|mut l| {
+            if let Some(rates) = l.get_mut("funding").and_then(|f| f.as_array_mut()) {
+                for rate in rates {
+                    rate["due"] = rig.bar(0).into();
+                }
+            }
+            l
+        })
+        .collect();
+    write_log(&rig, "funded", &late);
+    let (code, text) = rig.td_live(&feed, &["compare", "--id", "funded"]);
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains(&charged(1)), "{text}");
+}
+
+/// The strategy name and symbol `compare` prints come from config.json, and reach the terminal
+/// without control characters.
+#[test]
+fn compare_prints_the_saved_config_without_control_characters() {
+    let rig = Rig::new();
+    let feed = rig.feed();
+    feed.minute(rig.bar(1));
+    let run = rig.run(
+        rig.create("marked", config(99, 99, false)).expect("creates"),
+        &feed,
+    );
+    wait_for_bar(&run, rig.bar(0));
+    run.stop().1.expect("stopped cleanly");
+    // The double orders nothing here, so the replay never meets the symbol it orders on.
+    let mut config = rig.config_json("marked");
+    config["instrument"]["id"]["symbol"] = "BTC\u{1b}[2JUSDT".into();
+    rig.write_config_json("marked", &config);
+    let (code, text) = rig.td_live(&feed, &["compare", "--id", "marked"]);
+    assert_eq!(code, 0, "{text}");
+    assert!(
+        !text.chars().any(|c| c.is_control() && c != '\n'),
+        "{text:?}"
+    );
+    assert!(
+        text.contains(" with a backtest of double on bybit:BTC [2JUSDT:perpetual 1h "),
+        "{text}"
+    );
 }
