@@ -189,6 +189,8 @@ fn prop_firm_rule() -> VerdictRule {
             second_target: None,
             min_trading_days: 0,
             best_day_share: None,
+            day_target_share: None,
+            trading_day: None,
             trailing_floor_lock: None,
         },
         limits: PropFirmLimits::default(),

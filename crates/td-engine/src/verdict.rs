@@ -40,6 +40,11 @@ pub enum RuleKind {
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "a rule is made once per strategy and copied rarely; boxing the firm's rules would \
+              cost the type its Copy"
+)]
 pub enum VerdictRule {
     /// Traded on a prop firm's account, judged against the firm's loss limits.
     PropFirm {
@@ -83,18 +88,76 @@ pub struct FirmLimits {
     /// one-phase challenge.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub second_target: Option<f64>,
-    /// The fewest trading days each phase must hold before its target can pass it: days on
-    /// which the strategy filled an order, counted within the phase. 0 sets no minimum.
+    /// The fewest trading days each phase must hold before its target can pass it: days that
+    /// pass `trading_day`'s test (without one, days on which the strategy filled an order),
+    /// counted within the phase. 0 sets no minimum.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub min_trading_days: u32,
     /// The best-day rule: a phase passes only once its largest single day's profit is at most
     /// this share of the phase's total profit. `None` sets no such rule.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub best_day_share: Option<f64>,
+    /// The day cap: the most one day counts toward an evaluation phase's target, as a share of
+    /// that phase's target. A winning day counts its profit up to `day_target_share *
+    /// profit_target` (or `second_target` in the second phase); a losing day counts its whole
+    /// loss; the phase passes once the counted profit reaches the target. Profit above the cap
+    /// stays in the account, and the loss limits act on the account. Independent of
+    /// `best_day_share`: with both set, both must hold. The funded account has no such rule.
+    /// `None` counts every day in full.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub day_target_share: Option<f64>,
+    /// The firm's own test for a trading day, which counts for `min_trading_days` and for the
+    /// funded account's `days_to_first_payout`. `None` counts any day with a fill.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trading_day: Option<TradingDayTest>,
     /// For a trailing drawdown, the level the floor stops rising at, as a fraction of the starting
     /// balance above the start: 0 stops it at the starting balance. `None` lets it trail for ever.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trailing_floor_lock: Option<f64>,
+}
+
+/// A firm's test for a trading day. A day counts when one of its fills passes the test; each fill
+/// is judged on its own, so several small closes on one day do not add up to a large one. With
+/// every field off, any fill passes, as without a test.
+///
+/// A fill closes a trade when it reduces a position: the closed quantity is the part of the
+/// position it takes off, so a partial close counts by its own size, and a fill that flips the
+/// position closes all of the old one (and opens a new one, which is not a close). Positions and
+/// their average entry prices are tracked per instrument across the fills.
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TradingDayTest {
+    /// Only a closing fill can count, on the day the close happens: a day that only opens or
+    /// adds to a position is not a trading day. Setting either smallest value below implies it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub needs_close: bool,
+    /// The smallest value of the closed part of the trade, as a share of the starting balance:
+    /// the closed quantity times the position's average entry price, in the account currency at
+    /// that price, at the size the strategy was tested at. `None` sets no smallest size.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_trade_size: Option<f64>,
+    /// The smallest profit or loss of the closed part, as a share of its own value, before fees:
+    /// `|exit price - average entry price| / average entry price`. `None` sets no smallest move.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_trade_move: Option<f64>,
+}
+
+impl TradingDayTest {
+    /// Whether a fill passes. `close` is `None` for a fill that closes nothing, and for a closing
+    /// fill holds the closed part's value, as a share of the starting balance, and its move, as a
+    /// share of that value.
+    pub(crate) fn passes(&self, close: Option<(f64, f64)>) -> bool {
+        let needs_close =
+            self.needs_close || self.min_trade_size.is_some() || self.min_trade_move.is_some();
+        match close {
+            None => !needs_close,
+            Some((closed_value, moved)) => {
+                self.min_trade_size.is_none_or(|m| closed_value >= m)
+                    && self.min_trade_move.is_none_or(|m| moved >= m)
+            }
+        }
+    }
 }
 
 /// The terms of one attempt at a prop-firm challenge: its fees, the funded account it leads to
@@ -118,8 +181,8 @@ pub struct AttemptTerms {
     /// The trader's share of each payout's profit, above 0 and at most 1.
     pub profit_split: f64,
     /// The trading days the funded account must hold before its first payout: the first payout
-    /// may be asked for at the close of the day on which the account has filled an order on this
-    /// many days.
+    /// may be asked for at the close of the day on which the account has held this many trading
+    /// days, as the firm's `trading_day` test counts them (without one, days with a fill).
     pub days_to_first_payout: u32,
     /// The days from one payout to the earliest next one, traded or not.
     pub payout_interval_days: u32,
@@ -155,6 +218,10 @@ pub struct AttemptTerms {
 
 fn is_zero(n: &u32) -> bool {
     *n == 0
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 fn one() -> f64 {
@@ -353,6 +420,17 @@ impl VerdictRule {
                 }
                 if let Some(best) = firm.best_day_share {
                     share("firm.best_day_share", best)?;
+                }
+                if let Some(cap) = firm.day_target_share {
+                    share("firm.day_target_share", cap)?;
+                }
+                if let Some(test) = firm.trading_day {
+                    if let Some(size) = test.min_trade_size {
+                        positive("firm.trading_day.min_trade_size", size)?;
+                    }
+                    if let Some(moved) = test.min_trade_move {
+                        positive("firm.trading_day.min_trade_move", moved)?;
+                    }
                 }
                 if let Some(lock) = firm.trailing_floor_lock {
                     if firm.drawdown != DrawdownMode::Trailing {
@@ -1541,6 +1619,8 @@ mod tests {
             second_target: None,
             min_trading_days: 0,
             best_day_share: None,
+            day_target_share: None,
+            trading_day: None,
             trailing_floor_lock: None,
         };
         let prop = |limits| VerdictRule::PropFirm {
@@ -1871,6 +1951,8 @@ mod tests {
                 second_target: None,
                 min_trading_days: 0,
                 best_day_share: None,
+                day_target_share: None,
+                trading_day: None,
                 trailing_floor_lock: None,
             },
             limits: PropFirmLimits::default(),
@@ -2074,6 +2156,8 @@ mod tests {
             second_target: None,
             min_trading_days: 0,
             best_day_share: None,
+            day_target_share: None,
+            trading_day: None,
             trailing_floor_lock: None,
         };
         let bad = [
@@ -2828,6 +2912,44 @@ mod tests {
     }
 
     #[test]
+    fn the_day_cap_and_the_trading_day_test_are_left_out_of_json_when_off() {
+        // A rule with every earlier optional field set is written back exactly as it was saved,
+        // with neither new field.
+        let saved = r#"{"kind":"prop_firm","firm":{"daily_loss":0.05,"max_drawdown":0.1,
+            "drawdown":"trailing","profit_target":0.08,"second_target":0.05,"min_trading_days":4,
+            "best_day_share":0.5,"trailing_floor_lock":0.0},"limits":{"share_of_firm_limits":0.5,
+            "min_pass_probability":0.6,"pass_horizon_days":90,"max_breach_probability":0.1,
+            "breach_horizon_days":90}}"#;
+        let rule: VerdictRule = serde_json::from_str(saved).unwrap();
+        let VerdictRule::PropFirm { firm, .. } = rule else {
+            unreachable!()
+        };
+        assert_eq!((firm.day_target_share, firm.trading_day), (None, None));
+        let original: serde_json::Value = serde_json::from_str(saved).unwrap();
+        assert_eq!(serde_json::to_value(rule).unwrap(), original);
+        // Set, they read and write back; a test's fields that are off are left out of it too.
+        let set = r#"{"daily_loss":0.05,"max_drawdown":0.1,"drawdown":"static",
+            "profit_target":0.08,"day_target_share":0.4,
+            "trading_day":{"needs_close":true,"min_trade_move":0.001}}"#;
+        let firm: FirmLimits = serde_json::from_str(set).unwrap();
+        assert_eq!(firm.day_target_share, Some(0.4));
+        assert_eq!(
+            firm.trading_day,
+            Some(TradingDayTest {
+                needs_close: true,
+                min_trade_size: None,
+                min_trade_move: Some(0.001),
+            })
+        );
+        let original: serde_json::Value = serde_json::from_str(set).unwrap();
+        assert_eq!(serde_json::to_value(firm).unwrap(), original);
+        // A misspelt field of the test does not read.
+        let typo = r#"{"daily_loss":0.05,"max_drawdown":0.1,"drawdown":"static",
+            "profit_target":0.08,"trading_day":{"need_close":true}}"#;
+        assert!(serde_json::from_str::<FirmLimits>(typo).is_err());
+    }
+
+    #[test]
     fn attempt_terms_read_with_their_defaults() {
         let saved = r#"{"account_size":100000,"evaluation_fee":500,"profit_split":0.8,
             "days_to_first_payout":14,"payout_interval_days":14,"min_payout":100,
@@ -2840,13 +2962,36 @@ mod tests {
     #[test]
     fn each_new_field_out_of_range_is_refused_by_name() {
         type Tweak = fn(&mut FirmLimits, &mut AttemptTerms);
-        let cases: [(&str, Tweak); 22] = [
+        let cases: [(&str, Tweak); 27] = [
             ("firm.second_target", |f, _| f.second_target = Some(0.0)),
             ("firm.second_target", |f, _| {
                 f.second_target = Some(f64::NAN)
             }),
             ("firm.best_day_share", |f, _| f.best_day_share = Some(0.0)),
             ("firm.best_day_share", |f, _| f.best_day_share = Some(1.5)),
+            ("firm.day_target_share", |f, _| {
+                f.day_target_share = Some(0.0)
+            }),
+            ("firm.day_target_share", |f, _| {
+                f.day_target_share = Some(f64::NAN)
+            }),
+            ("firm.day_target_share", |f, _| {
+                f.day_target_share = Some(1.5)
+            }),
+            ("firm.trading_day.min_trade_size", |f, _| {
+                f.trading_day = Some(TradingDayTest {
+                    needs_close: false,
+                    min_trade_size: Some(0.0),
+                    min_trade_move: None,
+                })
+            }),
+            ("firm.trading_day.min_trade_move", |f, _| {
+                f.trading_day = Some(TradingDayTest {
+                    needs_close: true,
+                    min_trade_size: None,
+                    min_trade_move: Some(f64::INFINITY),
+                })
+            }),
             ("firm.trailing_floor_lock", |f, _| {
                 f.trailing_floor_lock = Some(-0.01)
             }),
@@ -2917,6 +3062,7 @@ mod tests {
             };
             firm.trailing_floor_lock = Some(0.0);
             firm.best_day_share = Some(1.0);
+            firm.day_target_share = Some(1.0);
             let rule = VerdictRule::PropFirm {
                 firm,
                 limits,

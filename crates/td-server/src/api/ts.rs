@@ -123,6 +123,7 @@ pub fn render() -> String {
         td_engine::VerdictRule,
         td_engine::FirmLimits,
         td_engine::AttemptTerms,
+        td_engine::TradingDayTest,
         td_engine::DrawdownMode,
         td_engine::PropFirmLimits,
         td_engine::PortfolioBenchmark,
