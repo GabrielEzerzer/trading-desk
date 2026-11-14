@@ -111,7 +111,8 @@
 //!     orders trade. A strategy session is linked to its code hash, plan and rule, and to the
 //!     verdict `verdict_run_id` names, or else the latest verdict for its strategy and instrument;
 //!     400 `invalid_verdict` if the named verdict is missing, is for another strategy or
-//!     instrument, or the session is manual.
+//!     instrument, or the session is manual, or if the verdict, named or latest, was judged
+//!     with reference instruments, which a session cannot feed.
 //!   - `GET /sessions`: every session, oldest first, with its status and equity.
 //!   - `GET /sessions/{id}`: a session's full state: status, position, cash, equity curve, open
 //!     orders, fills and trades so far, and its `link` when it has one, with `stale` set when its

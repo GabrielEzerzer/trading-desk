@@ -1865,8 +1865,8 @@ pass: number,
  * evaluation, or after the last phase passes, trading on as the funded account from a fresh
  * balance and a fresh peak, as a firm starts each phase and the funded account again at the
  * account size. With attempt terms the funded account takes its payouts by them, which
- * leave the balance and move no floor; without them it takes none. The `prop_firm` kind rule
- * asks for at most 0.10 over 90 days.
+ * leave the balance and move no floor, unless the terms lock the floor at the first payout;
+ * without them it takes none. The `prop_firm` kind rule asks for at most 0.10 over 90 days.
  */
 breach: number, paths: number, 
 /**
@@ -2695,7 +2695,8 @@ fees?: FeeSchedule,
 /**
  * The saved verdict (a plan run's id) the session is started from: a verdict of the same
  * strategy on the same instrument. Left out, the strategy's latest verdict on the instrument
- * as `GET /verdicts` gives it, if it has one. Refused on a manual session.
+ * as `GET /verdicts` gives it, if it has one. Refused on a manual session, and for a verdict
+ * judged with reference instruments, named or latest, since a session cannot feed them.
  */
 verdict_run_id?: RunId, };
 
