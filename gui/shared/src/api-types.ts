@@ -1212,6 +1212,14 @@ max_payouts: number | null,
  */
 payout_locks_floor: boolean, 
 /**
+ * Whether each payout returns the balance to the start: it counts the profit above the
+ * start up to `payout_cap`, and any profit above the cap is lost rather than left in the
+ * account. The loss limits stay as they were. It cannot be set with `payout_locks_floor`,
+ * and a `prop_firm` rule refuses it with a trailing drawdown: either can put the floor
+ * at or above the start a payout returns to. `false` is left out of JSON.
+ */
+payout_resets_balance?: boolean, 
+/**
  * Days the funded account is simulated for after a pass.
  */
 funded_horizon_days: number, 
@@ -1947,7 +1955,19 @@ best_trade_pnl: number | null,
 /**
  * The out-of-sample return without it.
  */
-return_without_best_trade: number | null, };
+return_without_best_trade: number | null, 
+/**
+ * The out-of-sample fills of resting limits, those that filled as a maker. `None` in a
+ * result saved before it existed.
+ */
+limit_fills: number | null, 
+/**
+ * How many of `limit_fills` were touch-only: the bar reached the limit without trading a
+ * tick through it, and the backtest filled the order in full with no queue. A real book fills
+ * such an order only as far as its place in the queue allows, so this many of the fills the
+ * result rests on may not have happened. `None` in a result saved before it existed.
+ */
+touch_only_fills: number | null, };
 
 export type SideResult = { 
 /**

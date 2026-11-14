@@ -20,7 +20,7 @@ use crate::{
 };
 
 pub(crate) fn entries() -> Vec<StrategyEntry> {
-    vec![unrepeatable(), one_hour(), tells_funding()]
+    vec![unrepeatable(), one_hour(), tells_funding(), rests_limits()]
 }
 
 /// How many `Unrepeatable` strategies have been built in this process.
@@ -218,6 +218,49 @@ impl Strategy for TellsFunding {
         let times: Vec<String> = ctx.funding().iter().map(|(t, _)| t.to_string()).collect();
         let mut request = order(ctx, Side::Buy, 0.0, OrderType::Market, false);
         request.client_tag = Some(times.join(" "));
+        let _ = ctx.submit(request);
+    }
+}
+
+/// Rests one limit at a time: while flat, a buy of one unit one price unit under the close it
+/// decides on; while long, a reduce-only sell one unit over it. Each stays until it fills, so a
+/// test can read how the fills of resting limits are reported.
+pub struct RestsLimits;
+
+fn rests_limits() -> StrategyEntry {
+    let mut plan = plan();
+    plan.sweep.axes = Vec::new();
+    StrategyEntry {
+        name: "test_rests_limits",
+        description: "Rests a buy limit under the close while flat and a sell limit over it while long.",
+        params: Vec::new(),
+        build: |_| Ok(Box::new(RestsLimits)),
+        plan,
+        rule: VerdictRule::Portfolio {
+            benchmark: PortfolioBenchmark::Cash,
+            limits: PortfolioLimits::default(),
+        },
+    }
+}
+
+impl Strategy for RestsLimits {
+    fn on_bar(&mut self, ctx: &mut Context, bar: &Candle) {
+        if ctx.is_warming_up() || !ctx.open_orders().is_empty() {
+            return;
+        }
+        let request = if ctx.position() == 0.0 {
+            let price = bar.close - 1.0;
+            order(ctx, Side::Buy, 1.0, OrderType::Limit { price }, false)
+        } else {
+            let price = bar.close + 1.0;
+            order(
+                ctx,
+                Side::Sell,
+                ctx.position(),
+                OrderType::Limit { price },
+                true,
+            )
+        };
         let _ = ctx.submit(request);
     }
 }
