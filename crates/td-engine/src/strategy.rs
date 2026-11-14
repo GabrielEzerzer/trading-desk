@@ -117,7 +117,7 @@ impl Context<'_> {
     /// included. The one difference: a rate the venue has not yet published when the bar it is due
     /// in closes reaches a paper session's strategy late, on a later bar, timed at that bar's open
     /// or, when bars are missing before it, at the end of the last bar fed, and the session warns
-    /// about it.
+    /// on the bar it was due in and again when it arrives.
     ///
     /// The series runs from the first bar fed, warm-up or live, which takes no funding from before
     /// its open (see [`crate::Session::on_bar`]), to the last settlement strictly before the

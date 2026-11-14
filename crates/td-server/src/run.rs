@@ -504,7 +504,7 @@ impl FundingClock {
 
     /// The funding to charge with `bar`, which takes funding from `from` on (see [`funding_at`]). A
     /// rate expected inside the bar that the venue has not published is asked for again a few
-    /// times, then left for a later bar, with a warning when it comes.
+    /// times, then left for a later bar, with a warning on this bar and another when it comes.
     async fn for_bar(
         &mut self,
         rest: &Arc<dyn Rest>,
@@ -542,6 +542,15 @@ impl FundingClock {
         if let Some(e) = error {
             warn(format!(
                 "funding for the bar at {open} could not be read: {e}"
+            ));
+        } else if due_here && self.next_due() < end {
+            // A warning, not a halt: the expected time is inferred from the last two rates, and a
+            // venue that changes its funding interval must not stop the session.
+            warn(format!(
+                "the venue had not published the funding due at {} when the bar at {open} closed, \
+                 so the strategy ran this bar without it; it will be charged and shown when the \
+                 venue publishes it",
+                self.next_due()
             ));
         }
         // A rate due in a gap before the bar keeps its time and is not late.
@@ -730,7 +739,21 @@ mod tests {
     async fn a_rate_still_unpublished_after_the_retries_is_charged_on_a_later_bar() {
         // Four requests in its own bar find nothing; the next bar's one request finds it.
         let (charged, calls, warnings) = charge(5, 3).await;
-        assert_eq!(warnings.len(), 1, "the late charge is noted");
+        assert_eq!(
+            warnings,
+            [
+                format!(
+                    "the venue had not published the funding due at {T} when the bar at {T} \
+                     closed, so the strategy ran this bar without it; it will be charged and shown \
+                     when the venue publishes it"
+                ),
+                format!(
+                    "funding due at {T} was published late and charged on the bar at {}",
+                    T + MIN
+                ),
+            ],
+            "warned once on the bar it was due in and once when it came"
+        );
         let late = Funding {
             time: T + MIN,
             rate: 0.0001,
