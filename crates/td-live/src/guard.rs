@@ -67,7 +67,7 @@ use crate::session::{
     LiveError, LiveSession, LiveStatus, STATUS_FILE, SavedConfig, State, check_id, live_dir,
     read_json, session_dir, take_lock, write_synced,
 };
-use crate::stop_file::{FlattenResult, StopRecord};
+use crate::stop_file::{Flatten, FlattenResult, StopRecord, save_parts};
 
 /// The guard's pace and bounds. [`GuardTiming::default`] is what the command uses; tests shorten
 /// it.
@@ -606,9 +606,15 @@ impl Guard {
     }
 }
 
+/// Why the owner's flatten of a session with no usable stop state writes no `stops.json`.
+const NO_STOP_STATE: &str = "the stop state could not be read, so stops.json is left as it is";
+
 /// Whether `stops.json` holds the record a flatten works on.
 struct Disk<'a> {
     dir: &'a Path,
+    /// The stop state the file is written with. `None` for the owner's flatten of a session whose
+    /// stop file and saved rules are both refused: then the file is never written.
+    state: Option<&'a StopState>,
     /// Why the last save failed, while the disk does not hold the record's last change.
     unsaved: Option<String>,
     /// Whether a save of the record has gone through, so the disk holds the fired stop (or, for
@@ -617,15 +623,18 @@ struct Disk<'a> {
 }
 
 impl Disk<'_> {
-    fn save(&mut self, record: &StopRecord) -> Result<(), String> {
-        match record.save(self.dir) {
+    fn save(&mut self, flatten: &Flatten) -> Result<(), String> {
+        let saved = match self.state {
+            Some(state) => save_parts(self.dir, state, flatten).map_err(|e| e.to_string()),
+            None => Err(NO_STOP_STATE.into()),
+        };
+        match saved {
             Ok(()) => {
                 self.unsaved = None;
                 self.saved_once = true;
                 Ok(())
             }
             Err(e) => {
-                let e = e.to_string();
                 self.unsaved = Some(e.clone());
                 Err(e)
             }
@@ -644,7 +653,7 @@ struct Flattener<'a> {
 impl Flattener<'_> {
     /// Cancels the session's resting orders and closes the venue's position, round by round,
     /// until the run has finished, the position is flat and no order of the session rests, or the
-    /// rounds run out. Each step is recorded in `record` and shown with `out`. A save that failed
+    /// rounds run out. Each step is recorded in `flatten` and shown with `out`. A save that failed
     /// is tried again at the start of each round; a failed save never holds a round back.
     ///
     /// `done(wait)` says whether the run has finished; with `wait` it first waits for it to. It is
@@ -656,24 +665,24 @@ impl Flattener<'_> {
     /// closed.
     fn run(
         &self,
-        record: &mut StopRecord,
+        flatten: &mut Flatten,
         disk: &mut Disk,
         done: &mut dyn FnMut(bool) -> bool,
         out: &mut dyn FnMut(String),
     ) -> FlattenResult {
         let half = self.instrument.lot_size / 2.0;
         let mut left = String::from("the venue could not be read");
-        let mut note = |record: &mut StopRecord, line: String| {
+        let mut note = |flatten: &mut Flatten, line: String| {
             out(format!("flatten: {line}"));
-            record.flatten.step(line);
+            flatten.step(line);
         };
         for round in 1..=self.timing.rounds {
             if round > 1 {
                 std::thread::sleep(self.timing.pause);
             }
-            if disk.unsaved.is_some() && disk.save(record).is_ok() {
+            if disk.unsaved.is_some() && disk.save(flatten).is_ok() {
                 note(
-                    record,
+                    flatten,
                     format!("round {round}: the stop file was saved after an earlier failed save"),
                 );
             }
@@ -682,7 +691,7 @@ impl Flattener<'_> {
                 Ok(open) => open,
                 Err(e) => {
                     note(
-                        record,
+                        flatten,
                         format!("round {round}: the open orders could not be read: {e}"),
                     );
                     continue;
@@ -696,7 +705,7 @@ impl Flattener<'_> {
                 Ok(read) => read,
                 Err(e) => {
                     note(
-                        record,
+                        flatten,
                         format!("round {round}: the position could not be read: {e}"),
                     );
                     continue;
@@ -707,7 +716,7 @@ impl Flattener<'_> {
             if flat && ours.is_empty() {
                 if finished {
                     note(
-                        record,
+                        flatten,
                         format!(
                             "round {round}: the venue position is flat and no order of the \
                              session rests"
@@ -716,7 +725,7 @@ impl Flattener<'_> {
                     return FlattenResult::Flat;
                 }
                 note(
-                    record,
+                    flatten,
                     format!("round {round}: the venue is clean; waiting for the run to end"),
                 );
                 done(true);
@@ -742,15 +751,15 @@ impl Flattener<'_> {
                     },
                     Err(e) => format!("{} cannot be cancelled by id: {e}", order.client_id),
                 };
-                note(record, format!("round {round}: {line}"));
+                note(flatten, format!("round {round}: {line}"));
             }
             if !flat {
-                let line = self.close(record, disk, &read);
-                note(record, format!("round {round}: {line}"));
+                let line = self.close(flatten, disk, &read);
+                note(flatten, format!("round {round}: {line}"));
             }
         }
         note(
-            record,
+            flatten,
             format!(
                 "fired, not flat after {} rounds: {left}",
                 self.timing.rounds
@@ -763,7 +772,7 @@ impl Flattener<'_> {
     /// `f` id whose number is saved first. When that save fails the order is sent all the same,
     /// under the id it claimed. It is priced at the ticker's last price, or at the position read's
     /// mark price when the ticker gives none. Returns what happened.
-    fn close(&self, record: &mut StopRecord, disk: &mut Disk, read: &Position) -> String {
+    fn close(&self, flatten: &mut Flatten, disk: &mut Disk, read: &Position) -> String {
         let usable = |price: f64| price.is_finite() && price > 0.0;
         let last = match self.client.ticker(&self.instrument.id.symbol) {
             Ok(t) if usable(t.last_price) => t.last_price,
@@ -782,11 +791,11 @@ impl Flattener<'_> {
                 );
             }
         };
-        record.flatten.last_id += 1;
-        let unsaved = disk.save(record).err().map_or_else(String::new, |e| {
+        flatten.last_id += 1;
+        let unsaved = disk.save(flatten).err().map_or_else(String::new, |e| {
             format!(" (the flatten id could not be saved first, and the close went ahead: {e})")
         });
-        let cid = ids::client_id(self.prefix, Role::Flatten, OrderId(record.flatten.last_id));
+        let cid = ids::client_id(self.prefix, Role::Flatten, OrderId(flatten.last_id));
         let size = read.size;
         let qty = self.instrument.round_qty(size.abs());
         let request = OrderRequest {
@@ -1039,6 +1048,7 @@ fn fire(
     };
     let mut disk = Disk {
         dir: &guard.dir,
+        state: Some(&record.state),
         saved_once: unsaved.is_none(),
         unsaved,
     };
@@ -1063,18 +1073,19 @@ fn fire(
     for line in rx.try_iter() {
         out(&line);
     }
-    let result = flattener.run(&mut record, &mut disk, &mut done, &mut |l| out(&l));
+    let result = flattener.run(&mut record.flatten, &mut disk, &mut done, &mut |l| out(&l));
     drop(done);
     for line in rx.try_iter().chain(ran) {
         out(&line);
     }
-    let outcome = finish(&mut record, fired_outcome(fired), result, &mut disk);
+    let outcome = finish(&mut record.flatten, fired_outcome(fired), result, &mut disk);
+    let unsaved = disk.unsaved;
     *lock(&guard.inner) = Inner {
         record,
         failures: 0,
         last_time: Millis::MIN,
         shown_clear: false,
-        unsaved: disk.unsaved,
+        unsaved,
     };
     if let Some(session) = &mut session
         && let Err(e) = session.set_state(State::Ended {
@@ -1098,7 +1109,7 @@ fn fired_outcome(fired: StopFired) -> Outcome {
 /// Records `result`, saves the record a last time, and returns `outcome` with what was left open
 /// at the venue and what the stop file does not hold, if anything.
 fn finish(
-    record: &mut StopRecord,
+    flatten: &mut Flatten,
     outcome: Outcome,
     result: FlattenResult,
     disk: &mut Disk,
@@ -1107,12 +1118,12 @@ fn finish(
         FlattenResult::Flat => None,
         FlattenResult::NotFlat { left } => Some(left.clone()),
     };
-    record.flatten.result = Some(result);
+    flatten.result = Some(result);
     let fired = match outcome {
         Outcome::Fired { fired, .. } => Some(fired),
         _ => None,
     };
-    let unsaved = disk.save(record).err().map(|e| {
+    let unsaved = disk.save(flatten).err().map(|e| {
         let missing = match (disk.saved_once, fired) {
             (true, _) => "how the flatten ended",
             (false, Some(_)) => "the fired stop",
@@ -1171,7 +1182,10 @@ fn ended_reason(outcome: &Outcome) -> String {
 /// flatten counter keeps every close under a new id. A stop file that is missing, unreadable or refused
 /// does not block the flatten: it is replaced by a fresh record that says so, whose flatten ids
 /// count on from the venue's clock in milliseconds, far above any count the lost record could
-/// have reached. A link in its place is refused. A status file that cannot be read is replaced.
+/// have reached. When the stop rules or starting balance in `config.json` are refused as well, so
+/// no stop state can be made, the flatten still runs from the instrument and the prefix alone, says
+/// so, and leaves `stops.json` as it is; the outcome then names the file as unsaved. A link in its
+/// place is refused. A status file that cannot be read is replaced.
 pub fn flatten_session(
     data_dir: &Path,
     id: &str,
@@ -1193,27 +1207,44 @@ pub fn flatten_session(
         reason: e.to_string(),
     })?;
     let _lock = take_lock(&dir)?;
-    let (mut record, saved_once) = match StopRecord::load(&dir, &saved) {
-        Ok(record) => (record, true),
+    let (state, mut flatten, saved_once) = match StopRecord::load(&dir, &saved) {
+        Ok(record) => (Some(record.state), record.flatten, true),
         Err(LiveError::StopFile { reason, .. }) => {
             let now = client.server_now();
-            let mut record = StopRecord::new(StopState::start(
-                saved.config.stops,
-                saved.starting_balance,
-                now,
-            )?);
-            record.flatten.last_id = u64::try_from(now).unwrap_or(0);
-            let line = format!(
-                "the stop file could not be read ({reason}), so this flatten keeps a fresh \
-                 record; its flatten ids count on from the venue's clock"
-            );
+            let mut flatten = Flatten {
+                last_id: u64::try_from(now).unwrap_or(0),
+                ..Flatten::default()
+            };
+            let ids_note = "its flatten ids count on from the venue's clock";
+            let start = StopState::start(saved.config.stops, saved.starting_balance, now);
+            let (state, line) = match start {
+                Ok(state) => (
+                    Some(state),
+                    format!(
+                        "the stop file could not be read ({reason}), so this flatten keeps a \
+                         fresh record; {ids_note}"
+                    ),
+                ),
+                // The owner's manual close still runs: it only cancels the session's orders and
+                // sends reduce-only closes, which need the instrument and the prefix alone.
+                Err(e) => (
+                    None,
+                    format!(
+                        "the stop state could not be read: the stop file was refused ({reason}) \
+                         and the stop rules or starting balance in config.json are refused too \
+                         ({e}); this flatten only cancels the session's orders and closes its \
+                         position with reduce-only orders, and leaves stops.json as it is; \
+                         {ids_note}"
+                    ),
+                ),
+            };
             out(&format!("flatten: {line}"));
-            record.flatten.step(line);
-            (record, false)
+            flatten.step(line);
+            (state, flatten, false)
         }
         Err(e) => return Err(e),
     };
-    let outcome = match record.state.fired() {
+    let outcome = match state.as_ref().and_then(StopState::fired) {
         Some(fired) => fired_outcome(*fired),
         None => Outcome::Flattened {
             left: None,
@@ -1222,6 +1253,7 @@ pub fn flatten_session(
     };
     let mut disk = Disk {
         dir: &dir,
+        state: state.as_ref(),
         unsaved: None,
         saved_once,
     };
@@ -1231,8 +1263,8 @@ pub fn flatten_session(
         prefix: &saved.prefix,
         timing,
     };
-    let result = flattener.run(&mut record, &mut disk, &mut |_| true, &mut |l| out(&l));
-    let outcome = finish(&mut record, outcome, result, &mut disk);
+    let result = flattener.run(&mut flatten, &mut disk, &mut |_| true, &mut |l| out(&l));
+    let outcome = finish(&mut flatten, outcome, result, &mut disk);
     let status_path = dir.join(STATUS_FILE);
     let mut status: LiveStatus = read_json(&status_path).unwrap_or_else(|e| {
         out(&format!(

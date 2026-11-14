@@ -1677,6 +1677,62 @@ fn flatten_ends_a_session_whose_stop_file_is_damaged_or_missing() {
     }
 }
 
+/// With the stop file refused and the rules in `config.json` refused too, no stop state can be
+/// made; the owner's flatten still cancels and closes with reduce-only orders, says why, leaves
+/// the stop file as it is and ends the session.
+#[test]
+fn flatten_ends_a_session_whose_stop_file_and_saved_rules_are_both_refused() {
+    let rig = Rig::new();
+    let feed = rig.feed();
+    let (outcome, _) = rig.entered("broken", wide(), &feed, bars_only()).stop();
+    assert_eq!(outcome, Outcome::Stopped);
+    fs::write(rig.path("broken", "stops.json"), "{").unwrap();
+    let mut config = rig.json("broken", "config.json");
+    config["stops"]["daily_loss_share"] = (-1.0).into();
+    rig.write_json("broken", "config.json", &config);
+    let orders = rig.mock.orders().len();
+
+    let (code, text) = td_live(&rig, &feed, &["flatten", "--id", "broken"]);
+    assert_eq!(code, 3, "flat, but stops.json does not record it: {text}");
+    assert!(
+        text.contains("flatten: the stop state could not be read: the stop file was refused")
+            && text.contains(
+                "this flatten only cancels the session's orders and closes its position with \
+                 reduce-only orders, and leaves stops.json as it is"
+            ),
+        "{text}"
+    );
+    assert_eq!(rig.mock.position(SYMBOL), 0.0, "{text}");
+    assert_eq!(rig.resting(), 0, "{text}");
+    // The only new orders are the flatten's closes, each reduce-only.
+    let closes = rig.flatten_orders();
+    assert_eq!(rig.mock.orders().len(), orders + closes.len(), "{text}");
+    assert!(
+        !closes.is_empty() && closes.iter().all(|o| o.reduce_only),
+        "{closes:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(rig.path("broken", "stops.json")).unwrap(),
+        "{"
+    );
+    let State::Ended { reason } = rig.saved_status("broken").state else {
+        panic!("not ended: {text}");
+    };
+    assert!(
+        reason.starts_with(
+            "flattened by the owner: the session's orders were cancelled and the venue position \
+             is flat; stops.json could not be saved, so it does not record this flatten: the \
+             stop state could not be read"
+        ),
+        "{reason}"
+    );
+    // Its stop file stays refused, so it is never opened again.
+    assert!(matches!(
+        rig.open("broken"),
+        Err(LiveError::StopFile { .. })
+    ));
+}
+
 #[test]
 fn a_flatten_leaves_an_order_of_another_session_alone() {
     let rig = Rig::new();
