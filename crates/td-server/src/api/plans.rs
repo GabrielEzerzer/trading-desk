@@ -914,20 +914,20 @@ pub(crate) fn session_link(
         None => {
             let latest = latest_verdicts(runs_dir, std::slice::from_ref(entry), Some(entry.name))?
                 .into_iter()
-                .find(|row| row.instrument == *instrument)
-                .and_then(|row| {
-                    let record = read_record(&runs_dir.join(row.run_id.as_str()))?;
-                    Some((row.run_id, record))
-                });
-            if let Some((id, record)) = &latest {
-                if !record.references.is_empty() {
+                .find(|row| row.instrument == *instrument);
+            match latest {
+                // Judged from the row, so a record that cannot be read again does not let the
+                // session start unlinked.
+                Some(row) if !row.references.is_empty() => {
                     return Err(bad(format!(
-                        "{}; it is the strategy's latest verdict, so name a verdict judged without them to start a session",
-                        paper_cannot_feed(id, &record.references)
+                        "{}; it is the strategy's latest verdict on {instrument}, so name a verdict judged without them in `verdict_run_id`, or run a test without them first",
+                        paper_cannot_feed(&row.run_id, &row.references)
                     )));
                 }
+                Some(row) => read_record(&runs_dir.join(row.run_id.as_str()))
+                    .map(|record| (row.run_id, record)),
+                None => None,
             }
-            latest
         }
     };
     let json = |value: Result<Value, serde_json::Error>| {
