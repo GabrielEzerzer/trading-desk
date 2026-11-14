@@ -6,6 +6,7 @@
 //! rather than sharing a module with it, to keep this change off a file another branch is
 //! changing; move both onto one `tests/common` module once that branch has merged.
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,14 +21,14 @@ use td_core::{
     Side, TimeInForce, Timeframe, Venue,
 };
 use td_data::DataError;
-use td_data::live::{Rest, SharedStream};
+use td_data::live::{FeedEvent, Rest, SharedStream};
 use td_engine::{
     Context, DayRollover, EngineError, ParamValue, Params, StopRule, StopRules, StopState, Strategy,
 };
 use td_live::cli::{Cli, Env, execute};
 use td_live::{
-    GuardTiming, LiveConfig, LiveError, LiveSession, LiveStatus, Outcome, State, StopHandle,
-    live_dir, run_guarded,
+    GuardTiming, LiveConfig, LiveError, LiveSession, LiveStatus, OpenFeed, Outcome, State,
+    StopHandle, live_dir, run_guarded, run_guarded_on,
 };
 use td_mock_bybit::{Fault, MockVenue, TEST_KEY, TEST_SECRET};
 use td_orders::{Client, ClientOrderId, DemoKeys, Endpoint, Timing};
@@ -192,6 +193,7 @@ fn script(buy_on: i64, buy2_on: i64, close_on: i64, stops: StopRules) -> LiveCon
         fees: None,
         max_leverage: 1.0,
         stops,
+        references: Vec::new(),
     }
 }
 
@@ -294,12 +296,53 @@ impl Feed {
         self.tx.send(frame).expect("feed server");
     }
 
-    fn opener(&self) -> impl FnOnce() -> Arc<SharedStream> + Send + 'static {
+    fn opener(&self) -> impl Fn(&InstrumentId) -> Arc<SharedStream> + Send + 'static {
         let (url, opened) = (self.url.clone(), self.opened.clone());
-        move || {
+        move |_: &InstrumentId| {
             opened.store(true, Ordering::SeqCst);
-            Arc::new(SharedStream::open(instrument().id, url))
+            Arc::new(SharedStream::open(instrument().id, url.clone()))
         }
+    }
+}
+
+/// Feeds the test scripts: each instrument's events are the ones sent for it, and dropping its
+/// sender ends that feed.
+///
+/// shortcut: a copy of tests/live_session.rs's, as the rest of this rig is (see the header).
+struct Scripted {
+    lanes: HashMap<String, mpsc::UnboundedSender<FeedEvent>>,
+}
+
+impl Scripted {
+    fn new(symbols: &[&str]) -> (Scripted, OpenFeed) {
+        let (mut lanes, mut receivers) = (HashMap::new(), HashMap::new());
+        for symbol in symbols {
+            let (tx, rx) = mpsc::unbounded_channel();
+            lanes.insert(symbol.to_string(), tx);
+            receivers.insert(symbol.to_string(), rx);
+        }
+        let receivers = Mutex::new(receivers);
+        let open: OpenFeed = Box::new(move |id, _, tx| {
+            let mut rx = receivers
+                .lock()
+                .unwrap()
+                .remove(&id.symbol)
+                .expect("one feed per instrument");
+            tokio::spawn(async move {
+                while let Some(event) = rx.recv().await {
+                    if tx.send(event).await.is_err() {
+                        return;
+                    }
+                }
+            })
+        });
+        (Scripted { lanes }, open)
+    }
+
+    fn bar(&self, symbol: &str, open_time: Millis) {
+        self.lanes[symbol]
+            .send(FeedEvent::Bar(flat(open_time)))
+            .expect("feed");
     }
 }
 
@@ -409,6 +452,29 @@ impl Rig {
         );
         let thread = std::thread::spawn(move || {
             run_guarded(live, rest, opener, timing, &handle, &mut |line| {
+                out.lock().unwrap().push(line.to_string())
+            })
+        });
+        Guarded {
+            lines,
+            stop,
+            thread,
+        }
+    }
+
+    /// [`Rig::guard`] on the feeds `open` gives, holding a traded bar for at most `wait`.
+    fn guard_on(
+        &self,
+        live: LiveSession,
+        open: OpenFeed,
+        wait: Duration,
+        timing: GuardTiming,
+    ) -> Guarded {
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let stop = StopHandle::new();
+        let (rest, out, handle) = (self.rest.clone(), lines.clone(), stop.clone());
+        let thread = std::thread::spawn(move || {
+            run_guarded_on(live, rest, open, wait, timing, &handle, &mut |line| {
                 out.lock().unwrap().push(line.to_string())
             })
         });
@@ -797,6 +863,46 @@ fn the_timer_fires_a_stop_with_no_bar_arriving() {
     );
     assert_ended_flat(&rig, "timer", StopRule::MaxLoss);
     assert_eq!(rig.saved_status("timer").last_bar, Some(rig.bar(0)));
+}
+
+/// While a traded bar is held for its reference bar, the strategy is not stepped, but the guard's
+/// checks go on: a stop that fires then halts the run and flattens the position as it would
+/// between any two bars, and the held bar is never fed.
+#[test]
+fn a_stop_that_fires_while_a_bar_is_held_for_its_reference_still_flattens() {
+    let rig = Rig::new();
+    let other = InstrumentId {
+        symbol: "ETHUSDT".into(),
+        ..instrument().id
+    };
+    let mut cfg = config(0, wide());
+    cfg.references = vec![other];
+    let live = rig.create("held", cfg).expect("creates");
+    let (feeds, open) = Scripted::new(&[SYMBOL, "ETHUSDT"]);
+    let run = rig.guard_on(live, open, Duration::from_secs(60), quick());
+    run.wait_line("check: no stop fired");
+    feeds.bar(SYMBOL, rig.bar(0));
+    feeds.bar("ETHUSDT", rig.bar(0));
+    rig.wait("entry and its stop", |r| {
+        r.mock.position(SYMBOL) == QTY && r.resting() == 1
+    });
+    run.wait_line(&format!("bar fed: {}", rig.bar(0)));
+    // Bar 1 comes without its reference bar and is held for it.
+    feeds.bar(SYMBOL, rig.bar(1));
+    // Time for a bar that was not held to be fed.
+    std::thread::sleep(Duration::from_millis(500));
+    rig.lose(11_000.0);
+    let (outcome, text) = run.finish();
+    assert!(
+        matches!(&outcome, Outcome::Fired { fired, left: None, unsaved: None } if fired.rule == StopRule::MaxLoss),
+        "{outcome:?}\n{text}"
+    );
+    assert_ended_flat(&rig, "held", StopRule::MaxLoss);
+    assert_eq!(
+        rig.saved_status("held").last_bar,
+        Some(rig.bar(0)),
+        "the held bar was not fed"
+    );
 }
 
 #[test]

@@ -9,8 +9,8 @@
 //! `start` links the session to what it was started from, as a paper session is linked
 //! ([`td_engine::session_link`]): the strategy's code hash, plan and rule, and the saved verdict
 //! `--verdict` names, or else the strategy's latest verdict on the instrument, read from the runs
-//! folder under the data folder. A verdict judged with reference instruments is refused before
-//! anything is written or sent: a live session feeds its strategy none. `status` shows the link
+//! folder under the data folder. A verdict judged with other reference instruments than the ones
+//! `--reference` names is refused before anything is written or sent. `status` shows the link
 //! with its checks against the strategy as this `td-live` build has it ([`td_engine::LinkState`]),
 //! and, with a verdict, a check of what the session started with against that verdict.
 //!
@@ -73,6 +73,11 @@ pub struct StartArgs {
     /// The venue's symbol of a linear perpetual settled in USDT, for example BTCUSDT.
     #[arg(long)]
     pub symbol: String,
+    /// A reference instrument whose closed bars the strategy reads beside its own: the venue's
+    /// symbol of another linear perpetual settled in USDT. Repeat it for each, in the order the
+    /// strategy's test named them.
+    #[arg(long = "reference")]
+    pub references: Vec<String>,
     /// The bar length the strategy runs on, for example 1h.
     #[arg(long, value_parser = parse_timeframe)]
     pub timeframe: Timeframe,
@@ -172,21 +177,24 @@ fn run(cli: Cli, env: &Env, out: &mut dyn FnMut(&str)) -> Result<u8, String> {
             let data = data_dir(args.data_dir.clone())?;
             refuse_unended(&data).map_err(|e| e.to_string())?;
             // Before the venue is asked anything, so a refused verdict sends nothing.
-            let linked_on = InstrumentId {
-                venue: Venue::Bybit,
-                symbol: args.symbol.clone(),
-                kind: InstrumentKind::Perpetual,
-            };
-            let link = start_link(&data, &args, &linked_on)?;
+            let linked_on = perpetual(&args.symbol);
+            let references: Vec<InstrumentId> =
+                args.references.iter().map(|s| perpetual(s)).collect();
+            td_engine::check_reference_ids(&linked_on, &references).map_err(|e| e.to_string())?;
+            let link = start_link(&data, &args, &linked_on, &references)?;
             let client = (env.connect)()?;
             let config = start_config(&args, &client)?;
             // `Client::instrument_info` already refuses an answer for another symbol; this keeps
             // the link and the session on one instrument should that change.
-            if config.instrument.id != linked_on {
-                return Err(format!(
-                    "the venue lists {} as {}; give the symbol as the venue writes it",
-                    args.symbol, config.instrument.id.symbol
-                ));
+            for (given, listed) in std::iter::once((&args.symbol, &config.instrument.id))
+                .chain(args.references.iter().zip(&config.references))
+            {
+                if *listed != perpetual(given) {
+                    return Err(format!(
+                        "the venue lists {given} as {}; give the symbol as the venue writes it",
+                        listed.symbol
+                    ));
+                }
             }
             let live = LiveSession::create(&data, &args.id, config, link, client, env.build)
                 .map_err(|e| e.to_string())?;
@@ -231,6 +239,14 @@ fn run(cli: Cli, env: &Env, out: &mut dyn FnMut(&str)) -> Result<u8, String> {
             out(&format!("status: {}", pretty(status)));
             out(&format!("stops: {}", pretty(stops)));
             let config = &saved.config;
+            if !config.references.is_empty() {
+                let names: Vec<String> = config
+                    .references
+                    .iter()
+                    .map(|r| clean(&r.to_string(), MAX_TEXT))
+                    .collect();
+                out(&format!("reference instruments: {}", names.join(", ")));
+            }
             let link = saved.link.as_ref();
             for line in link_lines(
                 &config.strategy,
@@ -274,14 +290,11 @@ fn limits(live: &LiveSession) -> String {
 }
 
 fn guarded(live: LiveSession, env: &Env, out: &mut dyn FnMut(&str)) -> u8 {
-    let (stream, id) = (
-        env.stream.clone(),
-        live.config().config.instrument.id.clone(),
-    );
+    let stream = env.stream.clone();
     let outcome = run_guarded(
         live,
         env.rest.clone(),
-        move || stream(id),
+        move |id: &InstrumentId| stream(id.clone()),
         env.timing,
         &env.stop,
         out,
@@ -301,13 +314,15 @@ fn flatten(
     Ok(outcome.exit_code())
 }
 
-/// The link of a session started with `args` on `instrument`: from the verdict `--verdict` names,
-/// or the strategy's latest on the instrument. `None` for a strategy that is not registered, which
-/// has no saved verdicts; naming a verdict for one is refused.
+/// The link of a session started with `args` on `instrument`, feeding `references`: from the
+/// verdict `--verdict` names, or the strategy's latest on the instrument, which must have been
+/// judged with exactly those reference instruments. `None` for a strategy that is not registered,
+/// which has no saved verdicts; naming a verdict for one is refused.
 fn start_link(
     data: &Path,
     args: &StartArgs,
     instrument: &InstrumentId,
+    references: &[InstrumentId],
 ) -> Result<Option<SessionLink>, String> {
     let Some(entry) = td_engine::strategies()
         .into_iter()
@@ -326,7 +341,7 @@ fn start_link(
         &entry,
         instrument,
         args.verdict.as_deref(),
-        None,
+        references,
         "with --verdict",
     )
     .map(Some)
@@ -474,32 +489,47 @@ fn started_as_judged(
     (plan, code)
 }
 
-/// The session's config: the instrument from the venue's own listing, which must be a linear
-/// perpetual that trades and settles in the route's settle coin, and the stop rules from the
-/// flags. The engine's default slippage and the venue's default fees apply.
-fn start_config(args: &StartArgs, client: &Client) -> Result<LiveConfig, String> {
-    let params: Params = serde_json::from_str(&args.params)
-        .map_err(|e| format!("--params is not a JSON object of parameter values: {e}"))?;
-    let info = client
-        .instrument_info(&args.symbol)
-        .map_err(|e| e.to_string())?;
+/// `symbol` as the instrument `td-live` takes it: a perpetual on the route's venue.
+fn perpetual(symbol: &str) -> InstrumentId {
+    InstrumentId {
+        venue: Venue::Bybit,
+        symbol: symbol.to_string(),
+        kind: InstrumentKind::Perpetual,
+    }
+}
+
+/// The venue's listing of `symbol`, which must be a linear perpetual that trades and settles in
+/// the route's settle coin.
+fn listing(client: &Client, symbol: &str) -> Result<td_orders::InstrumentInfo, String> {
+    let info = client.instrument_info(symbol).map_err(|e| e.to_string())?;
     if info.contract_type != "LinearPerpetual"
         || info.status != "Trading"
         || info.settle_coin != SETTLE_COIN
     {
         return Err(format!(
-            "{} is not a trading linear perpetual settled in {SETTLE_COIN}",
-            args.symbol
+            "{symbol} is not a trading linear perpetual settled in {SETTLE_COIN}"
         ));
     }
+    Ok(info)
+}
+
+/// The session's config: the instrument and each reference instrument from the venue's own
+/// listing ([`listing`]), and the stop rules from the flags. The engine's default slippage and
+/// the venue's default fees apply.
+fn start_config(args: &StartArgs, client: &Client) -> Result<LiveConfig, String> {
+    let params: Params = serde_json::from_str(&args.params)
+        .map_err(|e| format!("--params is not a JSON object of parameter values: {e}"))?;
+    let info = listing(client, &args.symbol)?;
+    let references = args
+        .references
+        .iter()
+        .map(|symbol| listing(client, symbol).map(|r| perpetual(&r.symbol)))
+        .collect::<Result<Vec<_>, String>>()
+        .map_err(|e| format!("reference instrument: {e}"))?;
     let fees = td_data::default_fees(Venue::Bybit, InstrumentKind::Perpetual)
         .map_err(|e| e.to_string())?;
     let instrument = Instrument {
-        id: InstrumentId {
-            venue: Venue::Bybit,
-            symbol: info.symbol,
-            kind: InstrumentKind::Perpetual,
-        },
+        id: perpetual(&info.symbol),
         base: info.base_coin,
         quote: info.quote_coin,
         tick_size: info.tick_size,
@@ -522,6 +552,7 @@ fn start_config(args: &StartArgs, client: &Client) -> Result<LiveConfig, String>
             open_notional_cap: args.notional_cap,
             rollover: args.rollover,
         },
+        references,
     })
 }
 

@@ -498,7 +498,7 @@ pub(crate) fn session_link(
         entry,
         instrument,
         verdict.map(RunId::as_str),
-        Some(references),
+        references,
         "in `verdict_run_id`",
     )
     .map_err(verdict_error)

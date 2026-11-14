@@ -57,12 +57,15 @@ use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use td_core::{Instrument, Millis, OrderId, OrderRequest, OrderType, Side, TimeInForce};
+use td_core::{
+    Instrument, InstrumentId, Millis, OrderId, OrderRequest, OrderType, Side, TimeInForce,
+};
 use td_data::live::{Rest, SharedStream};
-use td_engine::{StopFired, StopRules, StopState};
+use td_engine::{REFERENCE_WAIT, StopFired, StopRules, StopState};
 use td_orders::{CancelOutcome, Client, ClientOrderId, Error as RouteError, Position};
 
 use crate::ids::{self, Role};
+use crate::run::{OpenFeed, stream_feeds};
 use crate::session::{
     LiveError, LiveSession, LiveStatus, STATUS_FILE, SavedConfig, State, check_id, live_dir,
     read_json, session_dir, take_lock, write_synced,
@@ -824,9 +827,11 @@ impl Flattener<'_> {
 
 /// Runs `live` with its stops until it ends, and returns how. See the module documentation.
 ///
-/// `rest` and `stream` are the run's feed, as `LiveSession::run` takes them. `out` gets one line
-/// per event: a bar fed, the orders the session holds, a check whose result changed, a fired stop
-/// and each flatten step, a halt. `stop` ends the run as Ctrl-C does.
+/// `rest` reads warm-up bars, missed minutes and funding rates. `stream` gives the live minute
+/// stream of an instrument, the traded one and each reference instrument; each instrument's feed
+/// is built on it by the same feed code. `out` gets one line per event: a bar fed, the orders the
+/// session holds, a check whose result changed, a fired stop and each flatten step, a halt.
+/// `stop` ends the run as Ctrl-C does.
 pub fn run_guarded<S>(
     live: LiveSession,
     rest: Arc<dyn Rest>,
@@ -836,8 +841,38 @@ pub fn run_guarded<S>(
     out: &mut dyn FnMut(&str),
 ) -> Outcome
 where
-    S: FnOnce() -> Arc<SharedStream> + Send + 'static,
+    S: Fn(&InstrumentId) -> Arc<SharedStream> + Send + 'static,
 {
+    let open = stream_feeds(stream, rest.clone(), live.config().config.timeframe);
+    guarded_on(live, rest, open, REFERENCE_WAIT, timing, stop, out)
+}
+
+/// [`run_guarded`] on the feeds `open` gives, holding a traded bar for its reference bars for at
+/// most `wait`, for this crate's own integration tests. It is not part of the API: only the
+/// `test-run` feature, which the crate turns on for its tests alone, builds it.
+#[doc(hidden)]
+#[cfg(feature = "test-run")]
+pub fn run_guarded_on(
+    live: LiveSession,
+    rest: Arc<dyn Rest>,
+    open: OpenFeed,
+    wait: Duration,
+    timing: GuardTiming,
+    stop: &StopHandle,
+    out: &mut dyn FnMut(&str),
+) -> Outcome {
+    guarded_on(live, rest, open, wait, timing, stop, out)
+}
+
+fn guarded_on(
+    live: LiveSession,
+    rest: Arc<dyn Rest>,
+    open: OpenFeed,
+    wait: Duration,
+    timing: GuardTiming,
+    stop: &StopHandle,
+    out: &mut dyn FnMut(&str),
+) -> Outcome {
     let (tx, rx) = mpsc::channel();
     let guard = Arc::new(Guard {
         dir: live.dir().to_path_buf(),
@@ -919,7 +954,7 @@ where
             reason
         }
     };
-    let mut run = Some(live.run(rest, stream, after_bar));
+    let mut run = Some(live.run(rest, open, wait, after_bar));
     // Why the run ended, once it has, and the session it gave back. Set when `run` is taken.
     let mut ended: Option<(String, LiveSession)> = None;
     let mut halted = false;

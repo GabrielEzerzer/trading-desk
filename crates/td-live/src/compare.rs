@@ -11,7 +11,8 @@
 //! without the venue: the fills are the venue's fills as the session recorded them, with the
 //! venue's prices and fees, and the equity is the session's own model of the account from them.
 //! The backtest runs on exactly the bars the log holds, warm-up bars included, with the funding
-//! the session was fed given at each rate's due time; nothing is downloaded. The two are paired
+//! the session was fed given at each rate's due time and the reference bars the log holds for
+//! each bar; nothing is downloaded. The two are paired
 //! with [`td_engine::compare_with_backtest`]. A rate the session was charged on a later bar than
 //! the one it was due in lands on another bar in the backtest, as in a paper session's comparison
 //! (td-server's `ComparedBars`), and the report counts those rates.
@@ -28,8 +29,8 @@ use serde::Deserialize;
 use td_core::{AccountCurrency, Candle, Fill, Millis, OrderId, Side, Timeframe};
 use td_data::time::format_minute;
 use td_engine::{
-    BacktestConfig, Broker, BrokerEvent, EngineError, Order, Portfolio, Recorded, Session,
-    SessionComparison, compare_with_backtest, run_strategy,
+    BacktestConfig, Broker, BrokerEvent, EngineError, Order, Portfolio, Recorded, ReferenceBars,
+    Session, SessionComparison, compare_with_backtest, run_strategy_with_references,
 };
 
 use crate::BrokerRecord;
@@ -218,6 +219,8 @@ struct Replayed {
     session: Session,
     /// Every bar the log holds, warm-up bars first.
     bars: Vec<Candle>,
+    /// Each reference instrument's bars the log holds, as the session was fed them.
+    references: Vec<ReferenceBars>,
     /// The open time of the first live bar.
     live_from: Option<Millis>,
     /// Every funding rate fed, warm-up bars' included, at its due time, for the backtest.
@@ -246,6 +249,10 @@ fn replay(saved: &SavedConfig, lines: &[Line], build: BuildStrategy) -> Result<R
         }),
     )
     .map_err(|e| e.to_string())?;
+    session
+        .name_references(config.references.clone())
+        .map_err(|e| e.to_string())?;
+    let mut references: Vec<Vec<Candle>> = vec![Vec::new(); config.references.len()];
     let (mut bars, mut live_from, mut due, mut cut_short) = (Vec::new(), None, Vec::new(), None);
     let mut charged = Vec::new();
     let bad = |i: usize, why: String| format!("line {} of the log: {why}", i + 1);
@@ -262,9 +269,12 @@ fn replay(saved: &SavedConfig, lines: &[Line], build: BuildStrategy) -> Result<R
         let funding = pairs(&line.funding);
         bars.push(line.bar);
         due.extend(line.funding.iter().map(|f| (f.due, f.rate)));
+        for (bars, slot) in references.iter_mut().zip(&line.references) {
+            bars.extend(*slot);
+        }
         if line.warm_up {
             session
-                .warm_up(line.bar, &funding)
+                .feed(line.bar, None, &funding, &line.references, true)
                 .map_err(|e| bad(i, e.to_string()))?;
             i += 1;
             continue;
@@ -292,7 +302,7 @@ fn replay(saved: &SavedConfig, lines: &[Line], build: BuildStrategy) -> Result<R
                 }
             }
         }
-        match session.on_bar(line.bar, &funding) {
+        match session.feed(line.bar, None, &funding, &line.references, false) {
             Ok(()) | Err(EngineError::StrategyFailed(_)) => {}
             Err(e) => return Err(bad(i, e.to_string())),
         }
@@ -322,9 +332,19 @@ fn replay(saved: &SavedConfig, lines: &[Line], build: BuildStrategy) -> Result<R
     }
     let cut_short = cut_short.map(|bar| (bar, script.past_record));
     drop(script);
+    let references = config
+        .references
+        .iter()
+        .zip(references)
+        .map(|(instrument, bars)| ReferenceBars {
+            instrument: instrument.clone(),
+            bars,
+        })
+        .collect();
     Ok(Replayed {
         session,
         bars,
+        references,
         live_from,
         due,
         charged,
@@ -388,12 +408,20 @@ pub(crate) fn compare(
         close_at_end: false,
         // As the session's own account (`SavedConfig::money`).
         account_currency: AccountCurrency::Quote,
-        references: Vec::new(),
+        references: config.references.clone(),
         series: Vec::new(),
     };
     let result = catch_unwind(AssertUnwindSafe(|| {
         let strategy = build(&config.strategy, &config.params)?;
-        run_strategy(&backtest, strategy, &replayed.bars, &[], &replayed.due)
+        run_strategy_with_references(
+            &backtest,
+            strategy,
+            &replayed.bars,
+            &[],
+            &replayed.due,
+            &replayed.references,
+            &[],
+        )
     }))
     .map_err(|p| format!("the backtest panicked: {}", panic_message(&*p)))?
     .map_err(|e| format!("the backtest beside the session failed: {e}"))?;

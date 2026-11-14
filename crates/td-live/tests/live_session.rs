@@ -1,6 +1,7 @@
 //! A `LiveSession` against the mock venue on 127.0.0.1, fed closed minutes by a scripted stream on
 //! 127.0.0.1 and a fake REST source. The strategy is a test double defined here.
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -12,14 +13,16 @@ use td_core::{
     AccountCurrency, Candle, FeeSchedule, Instrument, InstrumentId, InstrumentKind, Millis,
     OrderRequest, OrderType, Side, TimeInForce, Timeframe, Venue,
 };
-use td_data::live::{Greeting, KlineUpdate, Rest, SharedStream};
+use td_data::live::{FeedEvent, Greeting, KlineUpdate, Rest, SharedStream, run_feed_on};
+use td_data::time::format_minute;
 use td_data::{DataError, DataSource, Http, InstrumentList, LiveStream, MinuteHistory};
 use td_engine::{
-    BacktestConfig, Context, DayRollover, EngineError, ParamValue, Params, Session, SessionConfig,
-    StopRules, Strategy, run_strategy,
+    BacktestConfig, Context, DayRollover, EngineError, ParamValue, Params, REFERENCE_WAIT,
+    ReferenceBars, Session, SessionConfig, StopRules, Strategy, run_strategy,
+    run_strategy_with_references,
 };
 use td_live::{
-    GuardTiming, LiveConfig, LiveError, LiveRun, LiveSession, LiveStatus, Outcome, State,
+    GuardTiming, LiveConfig, LiveError, LiveRun, LiveSession, LiveStatus, OpenFeed, Outcome, State,
     StopHandle, VenueHandle, live_dir, run_guarded,
 };
 use td_mock_bybit::{Fault, MockVenue, TEST_KEY, TEST_SECRET};
@@ -151,6 +154,9 @@ impl Strategy for Double {
 }
 
 fn build(name: &str, params: &Params) -> Result<Box<dyn Strategy>, EngineError> {
+    if name == "sees_reference" {
+        return Ok(Box::new(SeesReference(params.int("tag")?)));
+    }
     if name != "double" {
         return td_engine::build_strategy(name, params);
     }
@@ -191,6 +197,7 @@ fn config(buy_on: i64, close_on: i64, stop: bool) -> LiveConfig {
             open_notional_cap: 1e12,
             rollover: DayRollover::default(),
         },
+        references: Vec::new(),
     }
 }
 
@@ -201,23 +208,44 @@ fn eager_config() -> LiveConfig {
 }
 
 fn flat(open_time: Millis) -> Candle {
+    priced(open_time, PRICE)
+}
+
+fn priced(open_time: Millis, price: f64) -> Candle {
     Candle {
         open_time,
-        open: PRICE,
-        high: PRICE,
-        low: PRICE,
-        close: PRICE,
+        open: price,
+        high: price,
+        low: price,
+        close: price,
         volume: 1.0,
-        quote_volume: PRICE,
+        quote_volume: price,
     }
 }
 
+/// The reference instrument the reference tests name.
+const OTHER: &str = "ETHUSDT";
+
+fn other() -> InstrumentId {
+    InstrumentId {
+        symbol: OTHER.into(),
+        ..instrument().id
+    }
+}
+
+/// A bar of [`OTHER`], at a price no bar of the traded instrument has.
+fn other_bar(open_time: Millis) -> Candle {
+    priced(open_time, 3000.0)
+}
+
 /// Minutes from `start` on, [`WARM_UP`] hourly bars before it less those opening at a time in
-/// `missing`, the funding `rates`, and a clock fixed at `start`. Funding reads after the first
+/// `missing` ([`OTHER`]'s bars at [`other_bar`]'s price, less those in `reference_missing`), the
+/// funding `rates`, and a clock fixed at `start`. Funding reads after the first
 /// `funding_works_for` fail.
 struct FakeRest {
     start: Millis,
     missing: Mutex<Vec<Millis>>,
+    reference_missing: Mutex<Vec<Millis>>,
     warm_up_failures: Mutex<u32>,
     warm_up_reads: AtomicU32,
     rates: Mutex<Vec<(Millis, f64)>>,
@@ -228,7 +256,7 @@ struct FakeRest {
 impl Rest for FakeRest {
     fn klines(
         &self,
-        _: &InstrumentId,
+        id: &InstrumentId,
         timeframe: Timeframe,
         from: Millis,
         to: Millis,
@@ -252,12 +280,17 @@ impl Rest for FakeRest {
         } else {
             to.min(self.start)
         };
-        let missing = self.missing.lock().unwrap();
+        let reference = id.symbol == OTHER;
+        let missing = if reference {
+            self.reference_missing.lock().unwrap()
+        } else {
+            self.missing.lock().unwrap()
+        };
         let mut t = from.max(first).div_euclid(step) * step;
         let mut out = Vec::new();
         while t < to {
             if t >= from && (step == MIN || !missing.contains(&t)) {
-                out.push(flat(t));
+                out.push(if reference { other_bar(t) } else { flat(t) });
             }
             t += step;
         }
@@ -348,12 +381,87 @@ impl Feed {
         self.tx.send(frame).expect("feed server");
     }
 
-    fn opener(&self) -> impl FnOnce() -> Arc<SharedStream> + Send + 'static {
+    /// The run's feeds on this stream, as `run_guarded` builds them.
+    fn opener(&self, rest: &Arc<FakeRest>) -> OpenFeed {
         let (url, opened) = (self.url.clone(), self.opened.clone());
-        move || {
+        feeds(rest, move |_| {
             opened.store(true, Ordering::SeqCst);
-            Arc::new(SharedStream::open(instrument().id, url))
+            Arc::new(SharedStream::open(instrument().id, url.clone()))
+        })
+    }
+}
+
+/// Each instrument's feed on the stream `stream` gives, backfilled from `rest`, built as
+/// `run_guarded` builds it.
+fn feeds<S>(rest: &Arc<FakeRest>, stream: S) -> OpenFeed
+where
+    S: Fn(&InstrumentId) -> Arc<SharedStream> + Send + 'static,
+{
+    let rest: Arc<dyn Rest> = rest.clone();
+    Box::new(move |id, start, tx| {
+        tokio::spawn(run_feed_on(
+            stream(id),
+            Timeframe::H1,
+            Some(start),
+            rest.clone(),
+            tx,
+        ))
+    })
+}
+
+/// Feeds the test scripts: each instrument's events are the ones sent for it, and dropping its
+/// sender ends that feed. Records the bar each feed was opened from.
+struct Scripted {
+    lanes: HashMap<String, mpsc::UnboundedSender<FeedEvent>>,
+    opened: Arc<Mutex<Vec<(String, Millis)>>>,
+}
+
+impl Scripted {
+    fn new(symbols: &[&str]) -> (Scripted, OpenFeed) {
+        let (mut lanes, mut receivers) = (HashMap::new(), HashMap::new());
+        for symbol in symbols {
+            let (tx, rx) = mpsc::unbounded_channel();
+            lanes.insert(symbol.to_string(), tx);
+            receivers.insert(symbol.to_string(), rx);
         }
+        let receivers = Mutex::new(receivers);
+        let opened = Arc::new(Mutex::new(Vec::new()));
+        let seen = opened.clone();
+        let open: OpenFeed = Box::new(move |id, start, tx| {
+            seen.lock().unwrap().push((id.symbol.clone(), start));
+            let mut rx = receivers
+                .lock()
+                .unwrap()
+                .remove(&id.symbol)
+                .expect("one feed per instrument");
+            tokio::spawn(async move {
+                while let Some(event) = rx.recv().await {
+                    if tx.send(event).await.is_err() {
+                        return;
+                    }
+                }
+            })
+        });
+        (Scripted { lanes, opened }, open)
+    }
+
+    fn send(&self, symbol: &str, event: FeedEvent) {
+        self.lanes[symbol].send(event).expect("feed");
+    }
+
+    /// The traded instrument's bar opening at `open_time`.
+    fn traded(&self, open_time: Millis) {
+        self.send(SYMBOL, FeedEvent::Bar(flat(open_time)));
+    }
+
+    /// The reference instrument's bar opening at `open_time`.
+    fn reference(&self, open_time: Millis) {
+        self.send(OTHER, FeedEvent::Bar(other_bar(open_time)));
+    }
+
+    /// Ends `symbol`'s feed.
+    fn end(&mut self, symbol: &str) {
+        self.lanes.remove(symbol);
     }
 }
 
@@ -384,6 +492,7 @@ impl Rig {
             rest: Arc::new(FakeRest {
                 start,
                 missing: Mutex::new(Vec::new()),
+                reference_missing: Mutex::new(Vec::new()),
                 warm_up_failures: Mutex::new(0),
                 warm_up_reads: AtomicU32::new(0),
                 rates: Mutex::new(Vec::new()),
@@ -408,7 +517,11 @@ impl Rig {
     }
 
     fn run(&self, live: LiveSession, feed: &Feed) -> LiveRun {
-        td_live::run_unguarded(live, self.rest.clone(), feed.opener(), |_, _| None)
+        self.run_on(live, feed.opener(&self.rest), REFERENCE_WAIT)
+    }
+
+    fn run_on(&self, live: LiveSession, open: OpenFeed, wait: Duration) -> LiveRun {
+        td_live::run_unguarded(live, self.rest.clone(), open, wait, |_, _| None)
     }
 
     fn feed(&self) -> Feed {
@@ -540,6 +653,9 @@ fn a_round_trip_trades_at_the_venue_and_its_log_status_and_fills_match_the_venue
     assert_eq!(count("warm_up"), 3);
     assert_eq!(count("sending"), 2);
     assert_eq!(count("record"), 6);
+    // A session without references saves its files as one made before sessions took them.
+    assert_eq!(count("references"), 0);
+    assert!(rig.config_json("trip").get("references").is_none());
 
     // Reopening replays the log to the same state, without a request to the venue.
     let (orders, fills) = (live.session().orders().to_vec(), fills.to_vec());
@@ -1188,7 +1304,8 @@ fn the_owner_reads_the_venue_after_each_bar_and_can_halt_the_run() {
     let run = td_live::run_unguarded(
         live,
         rig.rest.clone(),
-        feed.opener(),
+        feed.opener(&rig.rest),
+        REFERENCE_WAIT,
         move |status: &LiveStatus, handle: &VenueHandle| {
             let position = handle.venue_position().expect("position").size;
             let equity = handle.equity().expect("equity").equity;
@@ -2023,11 +2140,16 @@ fn a_feed_that_ends_halts_the_run() {
     let feed = rig.feed();
     let url = feed.url.clone();
     let live = rig.create("ended", config(0, 99, false)).expect("creates");
-    let run = td_live::run_unguarded(
+    let run = rig.run_on(
         live,
-        rig.rest.clone(),
-        move || Arc::new(SharedStream::open_on(&PANICKY, instrument().id, url)),
-        |_, _| None,
+        feeds(&rig.rest, move |_| {
+            Arc::new(SharedStream::open_on(
+                &PANICKY,
+                instrument().id,
+                url.clone(),
+            ))
+        }),
+        REFERENCE_WAIT,
     );
     wait_until(&run, "running", |s| s.state == State::Running);
     feed.text("boom".into());
@@ -2060,7 +2182,13 @@ fn a_feed_that_ends_halts_a_guarded_run_with_exit_code_one() {
         let outcome = run_guarded(
             live,
             rest,
-            move || Arc::new(SharedStream::open_on(&PANICKY, instrument().id, url)),
+            move |_: &InstrumentId| {
+                Arc::new(SharedStream::open_on(
+                    &PANICKY,
+                    instrument().id,
+                    url.clone(),
+                ))
+            },
             GuardTiming::default(),
             &StopHandle::new(),
             &mut |line| lines.push(line.to_string()),
@@ -2533,10 +2661,10 @@ fn a_session_saved_without_a_link_loads_resumes_and_shows_status() {
     assert!(text.contains("resumed session old"), "{text}");
 }
 
-/// A live session feeds its strategy no reference instruments, so it is never started from a
-/// verdict judged with them, named or latest; nor from a run that is not a saved verdict of the
-/// strategy on the instrument. Each refusal comes before the session's folder is made and before
-/// any request reaches the venue.
+/// A session started without `--reference` is never started from a verdict judged with reference
+/// instruments, named or latest; nor from a run that is not a saved verdict of the strategy on the
+/// instrument. Each refusal comes before the session's folder is made and before any request
+/// reaches the venue.
 #[test]
 fn start_refuses_a_verdict_it_cannot_run_before_writing_or_asking_the_venue_anything() {
     let rig = Rig::new();
@@ -2563,8 +2691,8 @@ fn start_refuses_a_verdict_it_cannot_run_before_writing_or_asking_the_venue_anyt
         assert!(!rig.data().join("live").exists(), "{extra:?}");
     };
     let feeds_none = format!(
-        "run {NEWER} was judged with the reference instruments {reference}, and a live session \
-         cannot feed reference instruments yet"
+        "run {NEWER} was judged with the reference instruments {reference}, and the session does \
+         not feed {reference}"
     );
     // The latest verdict was judged with a reference.
     refused(
@@ -2594,10 +2722,105 @@ fn start_refuses_a_verdict_it_cannot_run_before_writing_or_asking_the_venue_anyt
     );
     refused(&["--verdict", r"..\runs"], &["is not a run id"]);
 
-    // A verdict judged without references still starts the session.
+    // With the reference named, the verdict judged without it is refused, naming it.
+    refused(
+        &["--reference", OTHER, "--verdict", OLDER],
+        &[&format!(
+            "run {OLDER} was judged with no reference instruments, and the session also feeds \
+             {reference}"
+        )],
+    );
+
+    // A verdict judged without references still starts the session, which saves none.
     let (code, text) = rig.start_linked(&feed, "plain", &["--verdict", OLDER]);
     assert_eq!(code, 0, "{text}");
-    assert_eq!(rig.config_json("plain")["link"]["verdict"]["run_id"], OLDER);
+    let plain = rig.config_json("plain");
+    assert_eq!(plain["link"]["verdict"]["run_id"], OLDER);
+    assert!(plain.get("references").is_none(), "{plain}");
+
+    // And with the reference named, the latest verdict, judged with it, links. One session trades
+    // on an account at a time, so the first is ended.
+    let (code, text) = rig.td_live(&feed, &["flatten", "--id", "plain"]);
+    assert_eq!(code, 0, "{text}");
+    rig.mock.add_instrument(&other_instrument(), 3000.0);
+    let (code, text) = rig.start_linked(&feed, "fed", &["--reference", OTHER]);
+    assert_eq!(code, 0, "{text}");
+    let fed = rig.config_json("fed");
+    assert_eq!(fed["link"]["verdict"]["run_id"], NEWER);
+    assert_eq!(
+        fed["references"],
+        serde_json::to_value([reference]).unwrap(),
+        "{fed}"
+    );
+    let (code, text) = rig.td_live(&feed, &["status", "--id", "fed"]);
+    assert_eq!(code, 0, "{text}");
+    assert!(
+        text.contains(&format!("reference instruments: {}", other())),
+        "{text}"
+    );
+    let (_, text) = rig.td_live(&feed, &["status", "--id", "plain"]);
+    assert!(!text.contains("reference instruments"), "{text}");
+}
+
+/// [`OTHER`] as the venue lists it.
+fn other_instrument() -> Instrument {
+    Instrument {
+        id: other(),
+        base: "ETH".into(),
+        tick_size: 0.01,
+        lot_size: 0.01,
+        min_qty: 0.01,
+        min_notional: 5.0,
+        ..instrument()
+    }
+}
+
+/// `start` refuses a reference instrument it cannot feed: the traded instrument and one named
+/// twice before the venue is asked anything, and one the venue does not list as a trading linear
+/// perpetual before anything is written or sent. `LiveSession::create` refuses one on another
+/// venue, which `--reference` cannot name, before writing anything.
+#[test]
+fn start_refuses_a_reference_it_cannot_feed() {
+    let rig = Rig::new();
+    let feed = rig.feed();
+    let requests = rig.mock.requests().len();
+    let refused = |extra: &[&str], why: &str, asks: bool| {
+        let (code, text) = rig.start_linked(&feed, "refused", extra);
+        assert_eq!(code, 1, "{extra:?}: {text}");
+        assert!(text.contains(why), "{extra:?}: {why:?} not in {text}");
+        assert!(!rig.data().join("live").exists(), "{extra:?}");
+        assert_eq!(rig.sends(), 0, "{extra:?}");
+        if !asks {
+            assert_eq!(rig.mock.requests().len(), requests, "{extra:?}: {text}");
+        }
+    };
+    refused(
+        &["--reference", SYMBOL],
+        &format!(
+            "{} is the traded instrument, so it cannot also be a reference",
+            instrument().id
+        ),
+        false,
+    );
+    refused(
+        &["--reference", OTHER, "--reference", OTHER],
+        &format!("{} is named twice", other()),
+        false,
+    );
+    refused(&["--reference", OTHER], "reference instrument: ", true);
+
+    let mut cfg = config(-1, -1, false);
+    cfg.references = vec![InstrumentId {
+        venue: Venue::Binance,
+        ..other()
+    }];
+    let err = rig.create("venue", cfg).err().expect("refused");
+    assert!(
+        err.to_string()
+            .contains("a reference instrument must be on the same venue"),
+        "{err}"
+    );
+    assert!(!rig.data().join("live").exists());
 }
 
 /// A live session feeds its strategy no series, so it is never started from a verdict judged with
@@ -3201,5 +3424,363 @@ fn compare_prints_the_saved_config_without_control_characters() {
     assert!(
         text.contains(" with a backtest of double on bybit:BTC [2JUSDT:perpetual 1h "),
         "{text}"
+    );
+}
+
+// ---- reference instruments ----
+
+/// One bar a [`SeesReference`] strategy saw: its open time, whether it was a warm-up bar, and
+/// what `Context::reference` gave for [`OTHER`].
+type SeenBar = (Millis, bool, Option<Vec<Option<Candle>>>);
+
+/// What every [`SeesReference`] strategy saw, with its tag. A static, since `build` is a plain
+/// function: each test reads its own tag.
+static SEEN_REFERENCE: Mutex<Vec<(i64, SeenBar)>> = Mutex::new(Vec::new());
+
+/// Never trades; records each bar it sees under its tag.
+struct SeesReference(i64);
+
+impl Strategy for SeesReference {
+    fn on_bar(&mut self, ctx: &mut Context, bar: &Candle) {
+        let seen = (
+            bar.open_time,
+            ctx.is_warming_up(),
+            ctx.reference(&other()).map(<[_]>::to_vec),
+        );
+        let mut all = SEEN_REFERENCE.lock().unwrap_or_else(|p| p.into_inner());
+        all.push((self.0, seen));
+    }
+}
+
+/// Takes what the strategies tagged `tag` saw, in order.
+fn seen_reference(tag: i64) -> Vec<SeenBar> {
+    let mut all = SEEN_REFERENCE.lock().unwrap_or_else(|p| p.into_inner());
+    let (mine, rest): (Vec<_>, Vec<_>) = all.drain(..).partition(|(t, _)| *t == tag);
+    *all = rest;
+    mine.into_iter().map(|(_, seen)| seen).collect()
+}
+
+/// A session of [`SeesReference`] tagged `tag`, reading [`OTHER`].
+fn sees_reference(tag: i64) -> LiveConfig {
+    LiveConfig {
+        strategy: "sees_reference".into(),
+        params: Params::new().with("tag", ParamValue::Int(tag)),
+        references: vec![other()],
+        ..config(-1, -1, false)
+    }
+}
+
+/// What [`SeesReference`] tagged `tag` sees in a backtest of `bars` with `reference`'s bars,
+/// warmed up on the bars before `live_from`.
+fn seen_reference_in_backtest(
+    cfg: &LiveConfig,
+    bars: &[Candle],
+    live_from: Millis,
+    reference: Vec<Candle>,
+    tag: i64,
+) -> Vec<SeenBar> {
+    let config = BacktestConfig {
+        strategy: cfg.strategy.clone(),
+        params: cfg.params.clone(),
+        instrument: cfg.instrument.clone(),
+        timeframe: cfg.timeframe,
+        from: live_from,
+        to: bars.last().expect("bars").open_time + cfg.timeframe.duration_ms(),
+        starting_cash: 100_000.0,
+        slippage_bps: cfg.slippage_bps,
+        fee_override: cfg.fees,
+        max_leverage: cfg.max_leverage,
+        warmup_from: Some(bars[0].open_time),
+        close_at_end: false,
+        references: cfg.references.clone(),
+        series: Vec::new(),
+        account_currency: AccountCurrency::Quote,
+    };
+    let references = [ReferenceBars {
+        instrument: other(),
+        bars: reference,
+    }];
+    let strategy = Box::new(SeesReference(tag));
+    run_strategy_with_references(&config, strategy, bars, &[], &[], &references, &[])
+        .expect("runs");
+    seen_reference(tag)
+}
+
+/// Waits for the run to end on its own, or fails after 20 s.
+fn wait_finished(run: LiveRun) -> (LiveSession, Result<(), LiveError>) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !run.is_finished() {
+        assert!(Instant::now() < deadline, "the run did not end");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    run.wait()
+}
+
+/// The resting stops the mock holds.
+fn resting_stops(rig: &Rig) -> usize {
+    rig.mock
+        .orders()
+        .iter()
+        .filter(|o| o.status == "Untriggered" && o.trigger == Some(STOP))
+        .count()
+}
+
+/// Warm-up from history with a bucket missing, then live bars of its own and of the reference
+/// arriving in either order, a reference bar late, a bucket the reference feed dropped and one it
+/// went past. At every step the session shows its strategy exactly the reference bars a backtest
+/// over the same bars shows it; a resume replays them without asking the venue, and `compare`
+/// runs both its replay and its backtest on the logged bars.
+#[test]
+fn a_live_session_and_a_backtest_show_the_strategy_the_same_reference_bars() {
+    let rig = Rig::new();
+    rig.rest.reference_missing.lock().unwrap().push(rig.bar(-2));
+    let tag = 1;
+    let cfg = sees_reference(tag);
+    let (feeds, open) = Scripted::new(&[SYMBOL, OTHER]);
+    let live = rig.create("refs", cfg.clone()).expect("creates");
+    let run = rig.run_on(live, open, Duration::from_secs(20));
+    // Bar 0: its own bar first; bar 1: the reference's first.
+    feeds.traded(rig.bar(0));
+    feeds.reference(rig.bar(0));
+    feeds.reference(rig.bar(1));
+    feeds.traded(rig.bar(1));
+    wait_for_bar(&run, rig.bar(1));
+    // Bar 2: its reference bar comes late, and the bar waits for it.
+    feeds.traded(rig.bar(2));
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(run.status().last_bar, Some(rig.bar(1)), "bar 2 is held");
+    feeds.reference(rig.bar(2));
+    // Bar 3: the reference feed dropped its bucket. Bar 4: it went on to bar 5 with none at 4.
+    feeds.send(OTHER, FeedEvent::Dropped(rig.bar(3)));
+    feeds.traded(rig.bar(3));
+    feeds.traded(rig.bar(4));
+    feeds.reference(rig.bar(5));
+    feeds.traded(rig.bar(5));
+    wait_for_bar(&run, rig.bar(5));
+    let (live, ended) = run.stop();
+    ended.expect("stopped cleanly");
+    assert_eq!(
+        feeds.opened.lock().unwrap().clone(),
+        [
+            (SYMBOL.to_string(), rig.bar(0)),
+            (OTHER.to_string(), rig.bar(0))
+        ],
+        "each feed opened from the first live bar"
+    );
+
+    let in_live = seen_reference(tag);
+    let bars = live.session().bars().to_vec();
+    assert_eq!(in_live.len(), WARM_UP as usize + 6);
+    let reference: Vec<Candle> = (-WARM_UP..=5)
+        .filter(|i| ![-2, 3, 4].contains(i))
+        .map(|i| other_bar(rig.bar(i)))
+        .collect();
+    let in_backtest = seen_reference_in_backtest(&cfg, &bars, rig.bar(0), reference, tag);
+    assert_eq!(in_live, in_backtest);
+    let last = in_live.last().and_then(|s| s.2.clone()).expect("a series");
+    let shown = |i: i64| last[(WARM_UP + i) as usize];
+    assert_eq!(shown(-2), None, "missing from history");
+    assert_eq!(
+        shown(2),
+        Some(other_bar(rig.bar(2))),
+        "the late bar went with its bar"
+    );
+    assert_eq!((shown(3), shown(4)), (None, None), "dropped and gone past");
+    assert_eq!(shown(5), Some(other_bar(rig.bar(5))));
+    let warnings = &live.status().warnings;
+    let unseen: Vec<_> = warnings
+        .iter()
+        .filter(|w| w.contains("the strategy sees no bar of the reference instrument"))
+        .collect();
+    assert_eq!(unseen.len(), 2, "bars 3 and 4: {warnings:?}");
+    assert!(unseen[0].contains(&format_minute(rig.bar(3))), "{unseen:?}");
+
+    // Every line, warm-up lines included, holds the bar's reference slot.
+    let log = rig.log("refs");
+    assert_eq!(log.len(), WARM_UP as usize + 6);
+    for line in &log {
+        assert_eq!(
+            line["references"].as_array().map(Vec::len),
+            Some(1),
+            "{line}"
+        );
+    }
+    assert_eq!(log[1]["references"][0], serde_json::Value::Null);
+
+    // A resume replays the log to the same sightings without a request to the venue.
+    drop(live);
+    let requests = rig.mock.requests().len();
+    let reopened = rig.open("refs").expect("reopens");
+    assert_eq!(rig.mock.requests().len(), requests);
+    assert_eq!(seen_reference(tag), in_live, "the replay");
+    drop(reopened);
+
+    // `compare` replays the log and runs its backtest on the logged reference bars.
+    let (code, text) = rig.td_live(&rig.feed(), &["compare", "--id", "refs"]);
+    assert_eq!(code, 0, "{text}");
+    assert_eq!(seen_reference(tag), [in_live.clone(), in_live].concat());
+}
+
+/// A resumed session with references starts every feed from the bar after its last one, and the
+/// strategy goes on seeing the reference bars it would in one uninterrupted run.
+#[test]
+fn a_resumed_session_backfills_every_feed_from_its_last_bar() {
+    let rig = Rig::new();
+    let tag = 2;
+    let (feeds, open) = Scripted::new(&[SYMBOL, OTHER]);
+    let run = rig.run_on(
+        rig.create("again", sees_reference(tag)).expect("creates"),
+        open,
+        Duration::from_secs(20),
+    );
+    feeds.traded(rig.bar(0));
+    feeds.reference(rig.bar(0));
+    wait_for_bar(&run, rig.bar(0));
+    let (live, ended) = run.stop();
+    ended.expect("stopped cleanly");
+    drop(live);
+
+    let (feeds, open) = Scripted::new(&[SYMBOL, OTHER]);
+    let live = rig.open("again").expect("reopens");
+    let run = rig.run_on(live, open, Duration::from_secs(20));
+    feeds.reference(rig.bar(1));
+    feeds.traded(rig.bar(1));
+    wait_for_bar(&run, rig.bar(1));
+    let (live, ended) = run.stop();
+    ended.expect("stopped cleanly");
+    assert_eq!(
+        feeds.opened.lock().unwrap().clone(),
+        [
+            (SYMBOL.to_string(), rig.bar(1)),
+            (OTHER.to_string(), rig.bar(1))
+        ]
+    );
+    let seen = seen_reference(tag);
+    let last = seen.last().and_then(|s| s.2.clone()).expect("a series");
+    assert_eq!(last.len(), WARM_UP as usize + 2);
+    assert_eq!(
+        &last[WARM_UP as usize..],
+        [Some(other_bar(rig.bar(0))), Some(other_bar(rig.bar(1)))]
+    );
+    assert_eq!(live.status().last_bar, Some(rig.bar(1)));
+}
+
+/// A reference bar within the wait goes with its bar. One that does not come within it halts the
+/// run on the same path as a failed read, naming the reference and the bar: nothing is sent for
+/// the held bar, the position stays with its stop resting at the venue, and `flatten` closes it.
+#[test]
+fn a_reference_bar_that_does_not_come_within_the_wait_halts_with_the_stop_resting() {
+    let rig = Rig::new();
+    let mut cfg = config(0, 2, true);
+    cfg.references = vec![other()];
+    let (feeds, open) = Scripted::new(&[SYMBOL, OTHER]);
+    let live = rig.create("behind", cfg).expect("creates");
+    let run = rig.run_on(live, open, Duration::from_secs(1));
+    feeds.traded(rig.bar(0));
+    feeds.reference(rig.bar(0));
+    // Bar 1's reference bar comes after it, within the wait.
+    feeds.traded(rig.bar(1));
+    std::thread::sleep(Duration::from_millis(300));
+    feeds.reference(rig.bar(1));
+    wait_for_bar(&run, rig.bar(1));
+    assert_eq!(rig.mock.position(SYMBOL), QTY);
+    assert_eq!(resting_stops(&rig), 1);
+    let sends = rig.sends();
+    // Bar 2, on which the strategy would cancel its stop and sell, never gets its reference bar.
+    feeds.traded(rig.bar(2));
+    let (live, ended) = wait_finished(run);
+    let Err(LiveError::Halted(reason)) = &ended else {
+        panic!("not halted: {ended:?}");
+    };
+    assert!(
+        reason.starts_with(&format!(
+            "no bar of the reference instrument {} opening at {} came within 1 s of the traded \
+             bar, so that bar was not fed and nothing was sent for it",
+            other(),
+            format_minute(rig.bar(2))
+        )),
+        "{reason}"
+    );
+    assert_eq!(rig.sends(), sends, "nothing sent for the held bar");
+    assert_eq!(live.status().last_bar, Some(rig.bar(1)));
+    assert_eq!(
+        rig.saved_status("behind").state,
+        State::Halted {
+            reason: reason.clone()
+        }
+    );
+    assert_eq!(rig.mock.position(SYMBOL), QTY);
+    assert_eq!(resting_stops(&rig), 1, "the stop still rests");
+    drop(live);
+
+    let (code, text) = rig.td_live(&rig.feed(), &["flatten", "--id", "behind"]);
+    assert_eq!(code, 0, "{text}");
+    assert_eq!(rig.mock.position(SYMBOL), 0.0);
+}
+
+/// A reference feed that ends halts the run as a held bar's wait does, naming the reference and
+/// the next bar; the position and its stop stay, and the session resumes.
+#[test]
+fn a_reference_feed_that_ends_halts_the_run_with_the_stop_resting() {
+    let rig = Rig::new();
+    let mut cfg = config(0, 99, true);
+    cfg.references = vec![other()];
+    let (mut feeds, open) = Scripted::new(&[SYMBOL, OTHER]);
+    let live = rig.create("ended", cfg).expect("creates");
+    let run = rig.run_on(live, open, Duration::from_secs(20));
+    feeds.traded(rig.bar(0));
+    feeds.reference(rig.bar(0));
+    wait_for_bar(&run, rig.bar(0));
+    wait_until(&run, "the stop resting", |_| resting_stops(&rig) == 1);
+    let sends = rig.sends();
+    feeds.end(OTHER);
+    let (live, ended) = wait_finished(run);
+    let Err(LiveError::Halted(reason)) = &ended else {
+        panic!("not halted: {ended:?}");
+    };
+    assert!(
+        reason.starts_with(&format!(
+            "the live feed of the reference instrument {} ended, so the bar at {} cannot be fed",
+            other(),
+            format_minute(rig.bar(1))
+        )),
+        "{reason}"
+    );
+    assert_eq!(rig.sends(), sends);
+    assert_eq!(rig.mock.position(SYMBOL), QTY);
+    assert_eq!(resting_stops(&rig), 1);
+    drop(live);
+    rig.open("ended").expect("a halt resumes");
+}
+
+/// A bar released more than one bar length after its close goes through the broker as any bar
+/// does, so the broker's rule on stale decisions holds: the order decided on it is not sent.
+#[test]
+fn an_order_decided_on_a_bar_released_long_after_its_close_is_not_sent() {
+    let mock = MockVenue::start();
+    mock.add_instrument(&instrument(), PRICE);
+    let start = Timeframe::H1.floor(mock.now()) - 10 * HOUR;
+    let rig = Rig::at(mock, start);
+    let mut cfg = config(0, 99, false);
+    cfg.references = vec![other()];
+    let (feeds, open) = Scripted::new(&[SYMBOL, OTHER]);
+    let live = rig.create("late", cfg).expect("creates");
+    let run = rig.run_on(live, open, Duration::from_secs(20));
+    feeds.traded(rig.bar(0));
+    std::thread::sleep(Duration::from_millis(200));
+    feeds.reference(rig.bar(0));
+    feeds.traded(rig.bar(1));
+    feeds.reference(rig.bar(1));
+    wait_for_bar(&run, rig.bar(1));
+    let (live, ended) = run.stop();
+    ended.expect("stopped cleanly");
+    assert_eq!(rig.mock.request_count(CREATE), 0);
+    assert!(
+        live.session().orders().iter().any(|o| matches!(
+            &o.status,
+            td_engine::OrderStatus::Cancelled(r) if r.contains("more than one bar")
+        )),
+        "{:?}",
+        live.session().orders()
     );
 }
