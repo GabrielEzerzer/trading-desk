@@ -779,7 +779,7 @@ pub fn run_battery_with_references(
             // The firm rule sets no time limit of its own (see `FirmLimits`), so the pass odds
             // run to the rule's `pass_horizon_days`. With the two horizons equal, both odds come
             // from the same paths.
-            let breach = stats::prop_firm_odds(&daily, lows, &traded, &spec).ok();
+            let breach = stats::prop_firm_odds(&daily, lows, &traded, &spec, attempt.as_ref()).ok();
             let pass = if limits.pass_horizon_days == limits.breach_horizon_days {
                 breach
             } else {
@@ -787,7 +787,7 @@ pub fn run_battery_with_references(
                     horizon_days: limits.pass_horizon_days as usize,
                     ..spec
                 };
-                stats::prop_firm_odds(&daily, lows, &traded, &spec).ok()
+                stats::prop_firm_odds(&daily, lows, &traded, &spec, None).ok()
             };
             result.prop_firm_odds = pass.zip(breach).map(|(p, b)| PropFirmOdds {
                 pass: p.pass,
@@ -3181,7 +3181,7 @@ mod tests {
         );
 
         // The two horizons are equal, so one run of the odds gives both.
-        let odds = |traded: &[bool]| {
+        let odds_with = |traded: &[bool], terms: Option<&crate::AttemptTerms>| {
             let spec = PropFirmSpec {
                 target: firm.profit_target,
                 second_target: None,
@@ -3204,8 +3204,9 @@ mod tests {
                 DayRollover::default(),
             )
             .unwrap();
-            stats::prop_firm_odds(&daily, Some(&lows), traded, &spec).unwrap()
+            stats::prop_firm_odds(&daily, Some(&lows), traded, &spec, terms).unwrap()
         };
+        let odds = |traded: &[bool]| odds_with(traded, None);
         let fills = odds(&traded);
         let every_day = odds(&vec![true; daily.len()]);
         assert_eq!(r.prop_firm_odds, Some(fills));
@@ -3217,6 +3218,48 @@ mod tests {
             fills.pass < every_day.pass,
             "{fills:?} against {every_day:?}"
         );
+
+        // With attempt terms, the breach odds walk the funded account with their payouts, on the
+        // same flags: a payout every day that fixes the floor at the start leaves no room above
+        // it, so more paths breach.
+        let terms = crate::AttemptTerms {
+            account_size: 100_000.0,
+            evaluation_fee: 500.0,
+            pass_fee: 0.0,
+            refund_fee_with_first_payout: false,
+            profit_split: 0.8,
+            days_to_first_payout: 1,
+            calendar_days_to_first_payout: None,
+            payout_interval_days: 1,
+            min_payout: 0.0,
+            payout_cap: None,
+            max_payouts: None,
+            payout_locks_floor: true,
+            funded_horizon_days: 30,
+            evaluation_size: 1.0,
+            funded_size: 1.0,
+            reduced_edge_factor: 0.5,
+        };
+        let rule = VerdictRule::PropFirm {
+            firm,
+            limits: crate::PropFirmLimits::default(),
+            attempt: Some(terms),
+        };
+        let priced = run_battery(
+            &BatterySpec {
+                rule: &rule,
+                ..spec
+            },
+            &bars,
+            &[],
+            &[],
+            None,
+        )
+        .unwrap();
+        let paying = odds_with(&traded, Some(&terms));
+        assert_eq!(priced.prop_firm_odds, Some(paying));
+        assert_eq!(paying.pass, fills.pass);
+        assert!(paying.breach > fills.breach, "{paying:?} against {fills:?}");
     }
 
     /// A rule that states its firm's day has the attempt walks read that day: each day's return,
@@ -3284,7 +3327,7 @@ mod tests {
                 mean_block: stats::default_block_len(daily.len()),
                 seed: derive_seed(seed, SEED_PROP_FIRM),
             };
-            stats::prop_firm_odds(&daily, Some(&lows), &traded, &spec).unwrap()
+            stats::prop_firm_odds(&daily, Some(&lows), &traded, &spec, None).unwrap()
         };
         assert_eq!(r.prop_firm_odds, Some(odds(ny)));
         // The four-hour bars close at 00:00 UTC, after 17:00 New York, so the days differ.
