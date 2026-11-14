@@ -1004,7 +1004,9 @@ impl Core {
     /// venue about it on the first confirmed fill when that placement's outcome is unknown, and
     /// resizes it when the fill turns out different. What goes out when the venue does not take it depends
     /// on what `qty` rests on ([`Basis`]); a resize that fails faults the broker. Nothing goes out
-    /// once the stop guard has stopped all sending: it cancels and closes everything itself.
+    /// when the stop guard has stopped all sending before this is called: it cancels and closes
+    /// everything itself, and reads the venue again once the run has ended, so it also cancels a
+    /// stop this placed after passing that check.
     fn protect(&mut self, entry: OrderId, qty: f64, last: f64, basis: Basis) {
         if self.sending_stopped() {
             return;
@@ -1305,8 +1307,8 @@ impl Core {
 
     /// Sends a reduce-only market order for `qty` under order `id`'s `c` id, against the side its
     /// stop would close. Never sent once the broker has faulted, while an order carried over a
-    /// restart is unresolved, or once the stop guard has stopped all sending (its flatten closes
-    /// the position itself).
+    /// restart is unresolved, or when the stop guard has stopped all sending before this is called
+    /// (its flatten closes the position itself, reading the venue again once the run has ended).
     fn close_at_market(&mut self, id: OrderId, qty: f64, last: f64) -> Result<(), CloseFailed> {
         if self.sending_stopped() {
             return Err(CloseFailed::Refused(

@@ -31,17 +31,21 @@
 //! - **When a stop fires**, in this order: the fired state is saved to `stops.json` (a save that
 //!   fails does not hold the flatten back; it is tried again at the start of each round, before
 //!   each close and when the flatten ends, and the outcome names a save that never went
-//!   through); the broker stops sending and the run is asked to halt; every open order on the
-//!   instrument with the session's prefix is cancelled and the venue's position is closed with a
-//!   reduce-only market order for the size the venue reports, through the route directly (not the
-//!   broker, whose "send nothing once faulted" rule stays as it is); then the venue is read again,
-//!   and the cancel and close repeat, a pause apart and for a bounded number of rounds, until the
-//!   run has finished, the position is flat and no order of the session rests. Each step is
-//!   recorded in `stops.json`. A close whose outcome is unknown is settled by reading the venue on
-//!   the next round, never by sending it again. Each close carries a new `f` id whose number is
-//!   saved before it is sent, so a crash and a retry do not reuse an id while the disk takes the
-//!   save, and a reduce-only order can never take the position past flat. The session's status
-//!   becomes [`State::Ended`].
+//!   through); the broker's gate stops passing anything and the run is asked to halt; every open
+//!   order on the instrument with the session's prefix is cancelled and the venue's position is
+//!   closed with a reduce-only market order for the size the venue reports, through the route
+//!   directly (not the broker, whose "send nothing once faulted" rule stays as it is); then the
+//!   venue is read again, and the cancel and close repeat, a pause apart and for a bounded number
+//!   of rounds, until the run has finished, the position is flat and no order of the session
+//!   rests. A send of the bar in hand that passed its check before the gate stopped can still go
+//!   out: an order that is not reduce-only has then passed the cap, and a protective stop is
+//!   reduce-only. The flatten cannot end flat before the run has finished and reads the venue
+//!   again after that, so it cancels or closes what such a send left. Each step is recorded in
+//!   `stops.json`. A close whose outcome is unknown is settled by reading the venue on the next
+//!   round, never by sending it again. Each close carries a new `f` id whose number is saved
+//!   before it is sent, so a crash and a retry do not reuse an id while the disk takes the save,
+//!   and a reduce-only order can never take the position past flat. The session's status becomes
+//!   [`State::Ended`].
 //! - **After the run ends** for another reason (a halt, a fault, a feed that ended), the guard
 //!   keeps checking while the process lives and the venue position is not known to be flat.
 //!
@@ -201,10 +205,15 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 /// The broker's gate: every order it places passes here first. It holds the session's rules for
 /// the pre-trade notional cap and the guard's two levels of stopping: a halt on a venue it cannot
-/// read, after which only reduce-only orders go out, and a fired stop, after which nothing does.
+/// read, after which only reduce-only orders go out, and a fired stop, after which it passes
+/// nothing.
 pub(crate) struct SendGate {
     rules: StopRules,
-    /// Set when a stop fires: the broker sends nothing more, its protective stops included.
+    /// Set when a stop fires: from then on the gate passes no order, and the broker starts no
+    /// protective stop or close of its own. A send that passed its check before this was set can
+    /// still go out: an order that is not reduce-only has then passed the cap, and a protective
+    /// stop or close is reduce-only. The guard's flatten cannot report flat until the run has
+    /// ended and reads the venue again after that, so it cancels or closes what such a send left.
     stopped: Mutex<Option<String>>,
     /// Set when the venue could not be read for the bound: orders that are not reduce-only are
     /// refused, and the broker's protective stops and closes still go out.
@@ -225,7 +234,9 @@ impl SendGate {
         }
     }
 
-    /// Stops all sending through the broker; the first reason given is kept.
+    /// Stops the gate passing anything, and the broker starting a protective stop or close; the
+    /// first reason given is kept. A send already past its check can still go out (see the
+    /// `stopped` field).
     pub fn stop(&self, reason: &str) {
         lock(&self.stopped).get_or_insert_with(|| reason.to_string());
     }
@@ -568,8 +579,9 @@ impl Guard {
     }
 
     /// The reason a check gives the run to halt, or `None` to go on. A fired stop also stops the
-    /// broker sending anything; the last allowed failure stops it sending anything that is not
-    /// reduce-only, so an entry already filled still gets its protective stop.
+    /// gate passing anything (see [`SendGate::stop`] for a send already past it); the last allowed
+    /// failure stops it passing anything that is not reduce-only, so an entry already filled still
+    /// gets its protective stop.
     fn halt_reason(&self, check: &Check) -> Option<String> {
         match check {
             Check::Fired(fired) => {
@@ -638,8 +650,10 @@ impl Flattener<'_> {
     /// `done(wait)` says whether the run has finished; with `wait` it first waits for it to. It is
     /// asked before each round's reads, so an order the run had in flight when it was halted shows
     /// in them. A round that finds the venue clean while the run is still ending waits for it
-    /// (the run has been halted and sending has stopped, so it is finishing at most one route
-    /// call, which the route's timeouts bound) and reads again.
+    /// (the run has been halted and the gate passes nothing, so it is finishing the bar in hand,
+    /// whose route calls the route's timeouts bound; a send that passed its check before the gate
+    /// stopped can still go out in it) and reads again, so what such a send left is cancelled or
+    /// closed.
     fn run(
         &self,
         record: &mut StopRecord,
@@ -994,7 +1008,7 @@ fn stop_guarded(
     }
 }
 
-/// A fired stop: stops sending, halts the run, flattens, and records how it ended.
+/// A fired stop: stops the gate, halts the run, flattens, and records how it ended.
 fn fire(
     guard: &Guard,
     prefix: &str,
@@ -1009,9 +1023,13 @@ fn fire(
     if let Some(run) = &run {
         // shortcut: the run takes the halt between bars, so a bar it is already reading reads
         // the venue while the flatten works, sees a cancel or an `f` close the broker does not
-        // hold, and faults. The fault sends nothing and the flatten goes on to flat, but the
-        // `faulted` marker is left on a session the flatten ends. Wait for the bar in hand to
-        // end before the first send if that marker misleads in practice.
+        // hold, and faults. The fault sends nothing more. That bar can still send an order or a
+        // protective stop that passed its check before the gate stopped (an order that is not
+        // reduce-only has then passed the cap); the flatten cannot report flat until the run has
+        // ended and reads the venue again after that, so it cancels or closes what such a send
+        // left. The flatten goes on to flat, but the `faulted` marker is left on a session the
+        // flatten ends. Wait for the bar in hand to end before the first send if that marker
+        // misleads in practice.
         run.halt(reason.clone());
     }
     out(&format!("stop fired: {fired}"));
