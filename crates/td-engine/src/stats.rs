@@ -598,8 +598,9 @@ impl Evaluation {
 /// out first.
 ///
 /// With `payouts`, the funded account takes its payouts by those terms ([`walk_funded`]): a payout
-/// takes profit out of the balance and moves no floor (unless the terms lock the floor at the
-/// first payout), so it brings the balance nearer the floor.
+/// takes profit out of the balance, or returns it to the start with `payout_resets_balance`, and
+/// moves no floor (unless the terms lock the floor at the first payout), so it brings the balance
+/// nearer the floor.
 /// Everything else keeps the breach walk's meaning: the size tested, not the terms' sizes, and the
 /// days to the end of the path, not the terms' funded horizon. Without `payouts` the funded account
 /// takes none ([`first_breach`]).
@@ -727,7 +728,7 @@ pub fn prop_firm_odds(
 ) -> Result<PropFirmOdds, StatsError> {
     check_days(daily_returns, lows, traded)?;
     spec.check()?;
-    check_terms(payouts)?;
+    check_terms(spec, payouts)?;
     let lows = lows.unwrap_or(daily_returns);
     let mut draw = Resampler::new(daily_returns.len(), spec.mean_block, spec.seed);
     let (mut passed, mut breached) = (0usize, 0usize);
@@ -761,11 +762,18 @@ pub fn prop_firm_odds(
     })
 }
 
-/// Refuses attempt terms out of their range.
-fn check_terms(terms: Option<&AttemptTerms>) -> Result<(), StatsError> {
+/// Refuses attempt terms out of their range, and a payout that returns the balance to the start
+/// under a trailing floor, which can stand at or above the start (see the `prop_firm` rule's
+/// validation).
+fn check_terms(spec: &PropFirmSpec, terms: Option<&AttemptTerms>) -> Result<(), StatsError> {
     if terms.is_some_and(|t| t.validate().is_err()) {
         return Err(StatsError::InvalidSpec(
             "the attempt terms are out of range",
+        ));
+    }
+    if terms.is_some_and(|t| t.payout_resets_balance) && spec.drawdown == DrawdownMode::Trailing {
+        return Err(StatsError::InvalidSpec(
+            "a payout that returns the balance to the start needs a static drawdown",
         ));
     }
     Ok(())
@@ -839,7 +847,12 @@ struct Funded {
 /// above the floor in force if that is higher, up to the cap, and is made when the trader's share
 /// reaches the smallest payout. The amount leaves the balance and moves no floor: a trailing
 /// floor keeps its peak. With `payout_locks_floor`, the first payout fixes the floor where it
-/// stands, or at the start if that is higher. The account ends at a breach or when `returns` run
+/// stands, or at the start if that is higher. With `payout_resets_balance`, a payout returns the
+/// balance to the start of 1 instead, whatever `size` is, and the profit above the cap is lost;
+/// the terms refuse a locked floor and [`check_terms`] a trailing one with it, so the floor stays
+/// the static one under the start and each payout's profit is measured from the start. The day
+/// after a payout starts from the balance it left, which is the start after a reset, for the
+/// daily loss limit as for a day's return. The account ends at a breach or when `returns` run
 /// out.
 ///
 /// shortcut: the funded account keeps the evaluation's loss limits; give it its own once a firm
@@ -900,12 +913,18 @@ fn walk_funded(
         // at most the balance above this level (a cap only takes less) and moves neither the
         // peak nor a fixed floor, so the floor in force after it is at most this level: the floor
         // as it was, or fixed at this level when the payout locks it. The balance is left at or
-        // above that floor, static or trailing, locked or not.
+        // above that floor, static or trailing, locked or not. A payout that returns the balance
+        // to the start has a static floor under it, so this level is the start, where it leaves
+        // the balance.
         let floor = fixed.unwrap_or_else(|| spec.floor(peak)).max(1.0);
         let profit = out.balance - floor;
         let amount = terms.payout_cap.map_or(profit, |cap| profit.min(cap));
         if amount > 0.0 && terms.profit_split * amount * terms.account_size >= terms.min_payout {
-            out.balance -= amount;
+            if terms.payout_resets_balance {
+                out.balance = 1.0;
+            } else {
+                out.balance -= amount;
+            }
             out.gross += amount;
             out.payouts += 1;
             last = Some(day);
@@ -1005,7 +1024,7 @@ pub fn prop_firm_attempt(
 ) -> Result<PropFirmAttempt, StatsError> {
     check_days(daily_returns, lows, traded)?;
     spec.check()?;
-    check_terms(Some(terms))?;
+    check_terms(spec, Some(terms))?;
     let n = daily_returns.len();
     let mean = daily_returns.iter().sum::<f64>() / n as f64;
     // The reduction never adds edge: a negative mean is left as it is.
@@ -2253,6 +2272,7 @@ mod tests {
             payout_cap: None,
             max_payouts: None,
             payout_locks_floor: false,
+            payout_resets_balance: false,
             funded_horizon_days: 10,
             evaluation_size: 1.0,
             funded_size: 1.0,
@@ -2410,6 +2430,62 @@ mod tests {
             (unlocked.payouts, unlocked.gross, unlocked.balance),
             (2, 0.25 + 0.171875, 1.0)
         );
+    }
+
+    #[test]
+    fn a_payout_that_resets_the_balance_pays_up_to_the_cap_and_loses_the_rest() {
+        // The floor static at 0.75, a daily loss limit of 0.125 of the start, a payout due every
+        // day, capped at 0.0625. With each payout returning the balance to the start, all exact
+        // in binary:
+        //   day 1  +25%       1.25        pays the cap of 0.0625, loses 0.1875: back to 1.0
+        //   day 2  +3.125%    1.03125     profit from the start, 0.03125, under the cap: 1.0
+        //   day 3  -10.9375%  0.890625    loses 0.109375 of the start, inside the daily limit
+        //   day 4  +25%       1.11328125  pays the cap, loses 0.05078125: back to 1.0
+        let spec = PropFirmSpec {
+            daily_loss_limit: 0.125,
+            max_drawdown: 0.25,
+            ..unlimited(10)
+        };
+        let reset = AttemptTerms {
+            payout_cap: Some(0.0625),
+            payout_resets_balance: true,
+            ..terms()
+        };
+        let path = [0.25, 0.03125, -0.109375, 0.25];
+        let f = funded(&spec, &reset, &path);
+        assert_eq!(
+            (f.payouts, f.gross, f.balance, f.breached),
+            (3, 0.0625 + 0.03125 + 0.0625, 1.0, None)
+        );
+        // Off, the profit above the cap stays in the account: day 1 leaves 1.1875, day 2 closes
+        // at 1.224609375 and pays the cap again, leaving 1.162109375 (595/512), and day 3's fall
+        // of 0.109375 of that is 0.127105712890625 of the start, through the daily limit.
+        let kept = AttemptTerms {
+            payout_resets_balance: false,
+            ..reset
+        };
+        let f = funded(&spec, &kept, &path);
+        assert_eq!(
+            (f.payouts, f.gross, f.balance, f.breached),
+            (2, 0.125, 1.035003662109375, Some(3))
+        );
+        // At half size the start is still the balance of 1: +25% is +12.5%, 1.125, which pays
+        // the cap and returns to 1.0.
+        let half = AttemptTerms {
+            funded_size: 0.5,
+            ..reset
+        };
+        let f = funded(&spec, &half, &[0.25]);
+        assert_eq!((f.payouts, f.gross, f.balance), (1, 0.0625, 1.0));
+        // The walks refuse it under a trailing floor, which can stand at or above the start.
+        let trailing = PropFirmSpec {
+            drawdown: DrawdownMode::Trailing,
+            ..spec
+        };
+        let x = [0.01, -0.01];
+        assert!(prop_firm_attempt(&x, None, &every_day(&x), &trailing, &reset).is_err());
+        assert!(prop_firm_odds(&x, None, &every_day(&x), &trailing, Some(&reset)).is_err());
+        assert!(prop_firm_attempt(&x, None, &every_day(&x), &spec, &reset).is_ok());
     }
 
     #[test]

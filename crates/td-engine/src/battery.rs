@@ -3235,6 +3235,7 @@ mod tests {
             payout_cap: None,
             max_payouts: None,
             payout_locks_floor: true,
+            payout_resets_balance: false,
             funded_horizon_days: 30,
             evaluation_size: 1.0,
             funded_size: 1.0,
