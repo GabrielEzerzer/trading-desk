@@ -9,7 +9,7 @@ A workspace for my own trading: one Electron desktop app with two sections on on
 - `crates/td-data`: venue clients, history download, the candle store and live feeds.
 - `crates/td-server`: the localhost API binary the app starts as a sidecar.
 - `crates/td-orders`: the order route to Bybit's demo-trading REST API for USDT perpetuals: market, reduce-only market and resting reduce-only stop orders, cancel and amend, and the reads a broker reconciles from. It can reach only the demo host and 127.0.0.1; the crate header lists its guards. `examples/demo-smoke.rs` sends real demo orders and runs only with `--confirm-send-orders`.
-- `crates/td-live`: `VenueBroker`, the engine `Broker` that sends a session's orders through `td-orders` and reports the venue's fills, with a per-bar record for replay and a fault on any disagreement with the venue.
+- `crates/td-live`: `VenueBroker`, the engine `Broker` that sends a session's orders through `td-orders` and reports the venue's fills, with a per-bar record for replay and a fault on any disagreement with the venue; and `LiveSession`, a strategy run on live closed bars through it, saved under `<data_dir>/live/<id>/` and resumed after a restart by replaying its log without touching the venue. A library for now: nothing starts it yet.
 - `mock/bybit` (`td-mock-bybit`): a stateful mock of Bybit's v5 REST API on 127.0.0.1 that `td-orders` and `td-live` test against, with fault injection and the documented response examples in `fixtures/`. Test harness only.
 - `gui/shared`: the shared GUI package. For now it holds `src/api-types.ts`, generated from td-server's types with `cargo run -p td-server --bin gen-api-types`; never edit it by hand.
 
