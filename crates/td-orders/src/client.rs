@@ -1,50 +1,56 @@
-//! The signed request loop: clock, timeouts, rate limits and the classification of every answer
-//! into accepted, refused, not sent, or unknown.
+//! The signed request loop: clock, timeouts, rate limits, the time budget, and the classification
+//! of every answer into accepted, refused, not sent, or unknown.
 //!
-//! Rate limits, as <https://bybit-exchange.github.io/docs/v5/rate-limit> and
-//! <https://bybit-exchange.github.io/docs/v5/error> describe them (read 2026-11-14):
-//! - Per account and endpoint, a rolling one-second window. Each answer carries
-//!   `X-Bapi-Limit-Status` (requests left), `X-Bapi-Limit` and `X-Bapi-Limit-Reset-Timestamp`. Over
-//!   the limit the body says `retCode` 10006, "Too many visits!".
-//! - Per IP, 600 requests in 5 seconds. Over it the answer is HTTP 403 "access too frequent" and
-//!   the IP is blocked for at least 10 minutes; `retCode` 10018 is the same limit.
-//! - HTTP 429 is "system level frequency protection. Please retry when encounter this".
+//! What the venue documents, read 2026-11-14:
+//! - <https://bybit-exchange.github.io/docs/v5/rate-limit>: per account and endpoint, a rolling
+//!   one-second window. Each answer carries `X-Bapi-Limit-Status` (requests left), `X-Bapi-Limit` and
+//!   `X-Bapi-Limit-Reset-Timestamp`. Over the limit the body says `retCode` 10006, "Too many
+//!   visits!". Per IP, 600 requests in 5 seconds; over it the answer is HTTP 403 "access too
+//!   frequent" and the IP is blocked for at least 10 minutes; `retCode` 10018 is the same limit.
+//!   HTTP 429 is "system level frequency protection. Please retry when encounter this".
+//! - <https://bybit-exchange.github.io/docs/v5/guide>: the venue accepts a request only when
+//!   `server_time - recv_window <= timestamp < server_time + 1000`, and answers 10002 otherwise.
+//! - <https://bybit-exchange.github.io/docs/v5/error>: `retCode` 429, "The trading service is
+//!   experiencing a high server load. Please retry if you encounter this issue"; 10429, "System
+//!   level frequency protection" (listed with the WebSocket order-entry codes); 110079, "The order
+//!   is processing and can not be operated, please try again later"; 40004, "the order is modified
+//!   during the process of replacing, please check the order status again"; 10014, "Invalid
+//!   duplicate request"; 10000 and 10016, a server timeout and a server error.
 //!
-//! A rate-limited request was not accepted, so it is sent again after the reset (10006) or a short
-//! pause (429), a few times. An IP block is returned at once: waiting ten minutes is the caller's
-//! decision.
+//! Only three kinds of answer say that the venue refused a request before processing it, and each
+//! rests on one documented statement:
+//! - 10006 rests on the rate-limit page: the request is over the account's per-request limit for
+//!   the endpoint, as the answer's own `X-Bapi-Limit-Status` shows. It is sent again after the
+//!   reset the venue gives, at most [`RATE_LIMIT_RETRIES`] times and only when the reset is within
+//!   [`LONGEST_RATE_WAIT`] and the time budget.
+//! - 10002 rests on the guide's rule: a request whose timestamp is outside that window is not
+//!   accepted. The clock offset is measured again and the request sent once more.
+//! - HTTP 403 and 10018 rest on the rate-limit page's IP block: the IP's requests are refused. They
+//!   are returned at once; waiting ten minutes is the caller's decision.
 //!
-//! Other answers that do not mean "refused", from the error page (read 2026-11-14):
-//! - `retCode` 429, "The trading service is experiencing a high server load. Please retry if you
-//!   encounter this issue", and 10429, "System level frequency protection" (listed with the
-//!   WebSocket order-entry codes, with the same meaning as HTTP 429): sent again after a short
-//!   pause, like a rate limit.
-//! - 110079, "The order is processing and can not be operated, please try again later": sent again
-//!   after a short pause, within the same bounds; when they run out the answer goes back as the
-//!   venue gave it, except on a create (below).
+//! Every other answer that is neither an acceptance nor a `retCode` refusal leaves open whether an
+//! order request was taken, so it goes back as unknown at once and is never sent again here: a
+//! timeout, a dropped connection, an unreadable or oversized answer, HTTP 429, any other status
+//! outside 2xx (a redirect included: a server may apply a POST and then redirect), the body codes
+//! 429, 10429 and 110079 (the venue asks for a retry but does not say the request was not taken),
+//! 40004, 10014, and the server errors 10000 and 10016. The caller then asks the venue (`orders`).
+//! A read changes nothing, so a read answered 429 (HTTP or body) or 10429 waits and goes again
+//! within the same bounds, and a read whose answer never arrived is tried again ([`Client::read`]).
 //!
-//! The page asks for a retry, but nothing proves that a body 429 or 10429, or a 110079 to a
-//! create, was not taken. Once an order request has been sent again after one of them, any later
-//! answer short of an acceptance (a duplicate id, a refusal, the retries running out, an IP block)
-//! leaves the earlier attempt's outcome open: it goes back as unknown and the caller asks the
-//! venue. An HTTP 429, a 10006 and a timestamp refusal still count as not taken, as the rate-limit
-//! and guide pages describe them, so a resend after one of them does not. Reads are not affected.
-//! - 40004, "the order is modified during the process of replacing, please check the order status
-//!   again", and 10014, "Invalid duplicate request": the outcome is unknown, so the caller asks the
-//!   venue, as after a timeout.
+//! The client measures its clock offset from `GET /v5/market/time` on the same host when it is
+//! built and on a 10002. A server time more than a day from the local clock is refused. Numbers the
+//! venue sends (server time, rate-limit resets) go through checked or saturating arithmetic, and no
+//! answer body is read past [`MAX_BODY_BYTES`].
 //!
-//! Timestamps: the venue accepts a request when
-//! `server_time - recv_window <= timestamp < server_time + 1000` (guide page), and answers 10002
-//! otherwise. The client measures its offset from `GET /v5/market/time` on the same host when it
-//! is built, and on a 10002 measures again and retries once. A server time more than a day from
-//! the local clock is refused. Numbers the venue sends (server time, rate-limit resets) go through
-//! checked or saturating arithmetic, and no answer body is read past [`MAX_BODY_BYTES`].
+//! A `place`, `cancel` or `amend_stop` passes its deadline to every request it makes: each
+//! request's timeout, the clock resync, each rate-limit wait and each pause is cut to what is left,
+//! and nothing is sent once it has passed.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io::Read;
 use std::sync::Mutex;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use reqwest::Url;
 use reqwest::blocking::Client as Http;
@@ -54,14 +60,13 @@ use reqwest::redirect::Policy;
 use td_core::Millis;
 
 use crate::guard::{Endpoint, same_origin};
-use crate::orders::CREATE;
 use crate::wire::{self, ServerTime};
 use crate::{ClientOrderId, DemoKeys, Error};
 
 /// The user agent on every request. Nothing identifying goes in headers, URLs or payloads.
 const USER_AGENT: &str = "trading-desk";
 
-/// How many times a request answered 10006 or 429 is sent again.
+/// How many times a request refused with 10006, or a read answered 429 or 10429, is sent again.
 const RATE_LIMIT_RETRIES: u32 = 3;
 /// The longest wait for a rate-limit reset; a later reset is returned as an error.
 const LONGEST_RATE_WAIT: Duration = Duration::from_secs(3);
@@ -73,12 +78,12 @@ pub(crate) const MAX_BODY_BYTES: u64 = 4 * 1024 * 1024;
 /// The furthest the venue's server time may be from the local clock.
 const MAX_CLOCK_OFFSET_MS: i64 = 24 * 60 * 60 * 1000;
 
-pub(crate) const RET_TIMESTAMP: i64 = 10002;
+const RET_TIMESTAMP: i64 = 10002;
 const RET_RATE_LIMIT: i64 = 10006;
 const RET_IP_RATE_LIMIT: i64 = 10018;
 const RET_SERVER_TIMEOUT: i64 = 10000;
 const RET_SERVER_ERROR: i64 = 10016;
-/// Load and frequency protection answered in the body: sent again like a rate limit.
+/// Load and frequency protection answered in the body.
 const RET_HIGH_LOAD: i64 = 429;
 const RET_FREQUENCY_PROTECTION: i64 = 10429;
 /// "The order is processing and can not be operated, please try again later."
@@ -88,22 +93,28 @@ const RET_CHECK_STATUS: i64 = 40004;
 /// "Invalid duplicate request."
 const RET_DUPLICATE_REQUEST: i64 = 10014;
 
-/// The route's timeouts and pauses. [`Timing::default`] is what the route uses against the venue;
-/// tests against the mock shorten it. [`Client::with_timing`] refuses values outside the ranges
-/// below, so no caller can set a timeout in minutes.
+/// The route's timeouts, pauses and time budget. [`Timing::default`] is what the route uses
+/// against the venue; tests against the mock shorten it. [`Client::with_timing`] refuses values
+/// outside the ranges below, so no caller can set a request timeout in minutes or a budget over
+/// two minutes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Timing {
     /// Time to open a connection: 50 ms to 30 s. Default 5 s.
     pub connect_timeout: Duration,
-    /// Time for a whole request and its answer: 50 ms to 30 s. Default 10 s.
+    /// Time for a whole request and its answer, connection included: 50 ms to 30 s. Default 10 s.
     pub request_timeout: Duration,
     /// The `X-BAPI-RECV-WINDOW` sent with each request: 100 ms to 60 s. Default 5 s, the venue's
-    /// own default. A request whose answer was lost is never resent before this window has passed
-    /// since it was signed, so the venue would refuse it as expired if it arrived late.
+    /// own default. The venue accepts a request signed at time `t` only until `t` plus this
+    /// window, so the lookup after a request of unknown outcome goes on until it has passed.
     pub recv_window: Duration,
-    /// The pause between lookups when an outcome is unknown, and the margin added to the receive
-    /// window: 10 ms to 10 s. Default 1 s.
+    /// The pause between lookup rounds, and the margin added to the receive window for clock
+    /// error: 10 ms to 10 s. Default 1 s.
     pub settle: Duration,
+    /// The longest one `place`, `cancel` or `amend_stop` may take, its lookups included: 1 s to
+    /// 120 s. Default 30 s: room for a request that times out (10 s), a lookup that spans the
+    /// receive window and its margin (6 s), and a resend of a cancel or amend with its own
+    /// confirmation. Reads have no budget.
+    pub operation_budget: Duration,
 }
 
 impl Default for Timing {
@@ -113,6 +124,7 @@ impl Default for Timing {
             request_timeout: Duration::from_secs(10),
             recv_window: Duration::from_secs(5),
             settle: Duration::from_secs(1),
+            operation_budget: Duration::from_secs(30),
         }
     }
 }
@@ -125,12 +137,13 @@ impl Timing {
         let ok = within(self.connect_timeout, 50, 30_000)
             && within(self.request_timeout, 50, 30_000)
             && within(self.recv_window, 100, 60_000)
-            && within(self.settle, 10, 10_000);
+            && within(self.settle, 10, 10_000)
+            && within(self.operation_budget, 1_000, 120_000);
         if ok {
             Ok(())
         } else {
             Err(Error::InvalidTiming {
-                reason: "a timeout, receive window or pause is outside its allowed range",
+                reason: "a timeout, receive window, pause or budget is outside its allowed range",
             })
         }
     }
@@ -140,12 +153,14 @@ impl Timing {
 /// Call it from a thread that may block. It is `Send + Sync`; one client per session keeps the
 /// clock offset, rate-limit state and the set of client ids it has sent.
 ///
-/// With [`Timing::default`], a `place`, `cancel` or `amend_stop` makes at most 39 requests (three
-/// sends and three lookups of up to 12 reads) with at most 27 s of pauses between them, so against
-/// a venue that answers each one just inside the 10 s request timeout it blocks for at most about
-/// 7 minutes; if the venue also answers with every rate-limit, retry and clock answer the client
-/// waits on, each of those requests can take up to 84 s (five attempts, a clock resync and 24 s of
-/// rate-limit waits), for at most about 55 minutes.
+/// A `place`, `cancel` or `amend_stop` returns within about its time budget
+/// ([`Timing::operation_budget`], 30 s with [`Timing::default`]): before each request, clock
+/// resync, rate-limit wait and pause it takes what is left of the budget, cuts the request's
+/// timeout (10 s by default, connection included) or the wait to it, and sends nothing once it
+/// has run out. What can run past the budget is the time to sign a request and parse an answer.
+/// Reads are not under the budget: each request in a read is bounded by the request timeout and
+/// is tried at most three times, each try with up to three rate-limit waits of at most 3 s and
+/// one clock resync.
 pub struct Client {
     endpoint: Endpoint,
     base: Url,
@@ -178,24 +193,16 @@ pub(crate) enum Method {
     Post(serde_json::Value),
 }
 
-/// What [`Client::call`] remembers across the attempts at one request.
-#[derive(Default)]
-struct Attempts {
-    /// The timestamp the latest attempt was signed with.
-    last_sent: Millis,
-    /// The answer after which an order request was sent again although that answer does not
-    /// prove the attempt was not taken.
-    unproven: Option<i64>,
-}
-
 /// How a signed request ended, short of success.
 pub(crate) enum Failure {
-    /// The venue did not take the request (rate limited, timestamp refused, HTTP 4xx): sending it
-    /// again cannot duplicate anything.
+    /// The venue did not take the request: it was never sent, or the venue refused it before
+    /// processing it (the module documentation lists those answers). Sending it again cannot
+    /// duplicate anything.
     NotSent(Error),
     /// The request may or may not have been applied. `sent_at` is the timestamp it was signed with.
     Unknown { reason: String, sent_at: Millis },
-    /// The venue answered with a non-zero `retCode`. The message has been scrubbed.
+    /// The venue answered with a non-zero `retCode` that refuses the request. The message has
+    /// been scrubbed.
     Venue { code: i64, message: String },
 }
 
@@ -243,7 +250,7 @@ impl Client {
             limits: Mutex::new(HashMap::new()),
             sent: Mutex::new(HashSet::new()),
         };
-        client.sync_clock()?;
+        client.sync_clock(timing.request_timeout)?;
         Ok(client)
     }
 
@@ -252,13 +259,19 @@ impl Client {
         local_now().saturating_add(*self.offset_ms.lock().unwrap())
     }
 
-    /// Measures the offset between the venue's server time and the local clock. A server time
-    /// more than a day away is refused and the offset left as it was.
-    pub(crate) fn sync_clock(&self) -> Result<(), Error> {
+    /// Measures the offset between the venue's server time and the local clock, with `timeout`
+    /// for the request. A server time more than a day away is refused and the offset left as it
+    /// was.
+    fn sync_clock(&self, timeout: Duration) -> Result<(), Error> {
         const PATH: &str = "/v5/market/time";
         let url = self.url(PATH)?;
         let before = local_now();
-        let response = self.http.get(url).send().map_err(|e| transport(PATH, &e))?;
+        let response = self
+            .http
+            .get(url)
+            .timeout(timeout)
+            .send()
+            .map_err(|e| transport(PATH, &e))?;
         let status = response.status().as_u16();
         if !(200..300).contains(&status) {
             return Err(Error::HttpStatus {
@@ -313,53 +326,54 @@ impl Client {
         Ok(url)
     }
 
-    /// Sends one request and classifies the answer. Rate limits (10006, HTTP and body 429, 10429),
-    /// an order still processing (110079) and one timestamp refusal are handled here by sending
-    /// again, since the venue says it did not take the request. Everything else goes back to the
-    /// caller.
-    ///
-    /// Nothing proves that a body 429 or 10429, or a 110079 to a create, was not taken. Once an
-    /// order request has been sent again after one of them, a later refusal or "not sent" (the
-    /// retries running out included) does not settle whether an earlier attempt was taken, so it
-    /// goes back as [`Failure::Unknown`], signed at the last attempt's time.
+    /// The timeout for the next request: the request timeout, cut to what is left before
+    /// `deadline`. `None` once the deadline has passed.
+    fn timeout_within(&self, deadline: Option<Instant>) -> Option<Duration> {
+        match deadline {
+            None => Some(self.timing.request_timeout),
+            Some(end) => {
+                let left = end.saturating_duration_since(Instant::now());
+                (!left.is_zero()).then(|| left.min(self.timing.request_timeout))
+            }
+        }
+    }
+
+    /// Sends one request and classifies the answer as the module documentation describes. A
+    /// 10006 and one timestamp refusal are sent again here, and so is a read answered 429 or
+    /// 10429; every other answer goes back to the caller. With a `deadline`, each request's
+    /// timeout and each wait is cut to what is left of it, and nothing is sent once it has passed.
     pub(crate) fn call(
         &self,
         path: &'static str,
         method: &Method,
-    ) -> Result<serde_json::Value, Failure> {
-        let mut attempts = Attempts::default();
-        let result = self.send(path, method, &mut attempts);
-        let Some(code) = attempts.unproven else {
-            return result;
-        };
-        match result {
-            Err(failure @ (Failure::NotSent(_) | Failure::Venue { .. })) => Err(Failure::Unknown {
-                reason: format!(
-                    "the venue answered {code} to an earlier attempt, which does not prove that \
-                     attempt was not taken; then {}",
-                    failure_error(failure)
-                ),
-                sent_at: attempts.last_sent,
-            }),
-            other => other,
-        }
-    }
-
-    /// The request loop behind [`Client::call`].
-    fn send(
-        &self,
-        path: &'static str,
-        method: &Method,
-        attempts: &mut Attempts,
+        deadline: Option<Instant>,
     ) -> Result<serde_json::Value, Failure> {
         let mut resynced = false;
         let mut rate_retries = 0;
         let signed = !matches!(method, Method::Public(_));
         let order_request = matches!(method, Method::Post(_));
+        let out_of_time = || {
+            Failure::NotSent(Error::Transport {
+                endpoint: path,
+                reason: "the time budget ran out before the request was sent".into(),
+            })
+        };
+        let limited = |ip_block| {
+            Failure::NotSent(Error::RateLimited {
+                endpoint: path,
+                ip_block,
+            })
+        };
         loop {
-            self.wait_for_limit(path);
+            self.wait_for_limit(path, deadline);
+            let Some(timeout) = self.timeout_within(deadline) else {
+                return Err(out_of_time());
+            };
             let timestamp = self.server_now();
-            attempts.last_sent = timestamp;
+            let unknown = |reason: String| Failure::Unknown {
+                reason,
+                sent_at: timestamp,
+            };
             let mut url = self.url(path).map_err(Failure::NotSent)?;
             let (payload, body) = match method {
                 Method::Get(query) | Method::Public(query) => {
@@ -388,14 +402,9 @@ impl Client {
                 None => self.http.get(url),
                 Some(body) => self.http.post(url).body(body),
             };
-            let response = match request.headers(headers).send() {
+            let response = match request.headers(headers).timeout(timeout).send() {
                 Ok(r) => r,
-                Err(e) => {
-                    return Err(Failure::Unknown {
-                        reason: transport_reason(&e).into(),
-                        sent_at: timestamp,
-                    });
-                }
+                Err(e) => return Err(unknown(transport_reason(&e).into())),
             };
             let status = response.status().as_u16();
             self.note_limit(path, response.headers());
@@ -404,46 +413,33 @@ impl Client {
                 Ok(b) => b,
                 // A read changes nothing, so its error goes back as is; an order request's answer
                 // was unreadable, so whether it was applied is unknown.
-                Err(BodyFailure::TooLarge) if !matches!(method, Method::Post(_)) => {
+                Err(BodyFailure::TooLarge) if !order_request => {
                     return Err(Failure::NotSent(Error::ResponseTooLarge { endpoint: path }));
                 }
-                Err(e) => {
-                    return Err(Failure::Unknown {
-                        reason: match e {
-                            BodyFailure::TooLarge => {
-                                format!("the answer was longer than {MAX_BODY_BYTES} bytes")
-                            }
-                            BodyFailure::Failed(reason) => reason.into(),
-                        },
-                        sent_at: timestamp,
-                    });
+                Err(BodyFailure::TooLarge) => {
+                    return Err(unknown(format!(
+                        "the answer was longer than {MAX_BODY_BYTES} bytes"
+                    )));
                 }
+                Err(BodyFailure::Failed(reason)) => return Err(unknown(reason.into())),
             };
             match status {
-                403 => {
-                    return Err(Failure::NotSent(Error::RateLimited {
-                        endpoint: path,
-                        ip_block: true,
-                    }));
-                }
-                429 => {
+                200..=299 => {}
+                403 => return Err(limited(true)),
+                429 if !order_request => {
                     rate_retries += 1;
-                    if rate_retries > RATE_LIMIT_RETRIES {
-                        return Err(Failure::NotSent(Error::RateLimited {
-                            endpoint: path,
-                            ip_block: false,
-                        }));
+                    if rate_retries > RATE_LIMIT_RETRIES
+                        || !pause(self.timing.settle * rate_retries, deadline)
+                    {
+                        return Err(limited(false));
                     }
-                    std::thread::sleep(self.timing.settle * rate_retries);
                     continue;
                 }
-                500..=599 => {
-                    return Err(Failure::Unknown {
-                        reason: format!("the venue answered HTTP {status}"),
-                        sent_at: timestamp,
-                    });
+                // A 5xx, or any other status to an order request (HTTP 429 and redirects
+                // included): nothing the venue documents says the request was not taken.
+                _ if status >= 500 || order_request => {
+                    return Err(unknown(format!("the venue answered HTTP {status}")));
                 }
-                200..=299 => {}
                 _ => {
                     return Err(Failure::NotSent(Error::HttpStatus {
                         endpoint: path,
@@ -453,72 +449,54 @@ impl Client {
             }
             let env = match wire::envelope(path, &body) {
                 Ok(env) => env,
-                Err(_) => {
-                    return Err(Failure::Unknown {
-                        reason: "the answer was not the documented JSON".into(),
-                        sent_at: timestamp,
-                    });
-                }
+                Err(_) => return Err(unknown("the answer was not the documented JSON".into())),
             };
             match env.ret_code {
                 0 => return Ok(env.result),
+                // Refused before processing (the rate-limit page): wait for the reset the venue
+                // gives and send again.
                 RET_RATE_LIMIT => {
                     rate_retries += 1;
                     let wait = reset
                         .map(|r| Duration::from_millis(millis_until(r, self.server_now())))
                         .unwrap_or(self.timing.settle);
-                    if rate_retries > RATE_LIMIT_RETRIES || wait > LONGEST_RATE_WAIT {
-                        return Err(Failure::NotSent(Error::RateLimited {
-                            endpoint: path,
-                            ip_block: false,
-                        }));
+                    if rate_retries > RATE_LIMIT_RETRIES
+                        || wait > LONGEST_RATE_WAIT
+                        || !pause(wait, deadline)
+                    {
+                        return Err(limited(false));
                     }
-                    std::thread::sleep(wait);
                 }
-                RET_HIGH_LOAD | RET_FREQUENCY_PROTECTION => {
-                    if order_request {
-                        attempts.unproven = Some(env.ret_code);
-                    }
+                RET_HIGH_LOAD | RET_FREQUENCY_PROTECTION if !order_request => {
                     rate_retries += 1;
-                    if rate_retries > RATE_LIMIT_RETRIES {
-                        return Err(Failure::NotSent(Error::RateLimited {
-                            endpoint: path,
-                            ip_block: false,
-                        }));
+                    if rate_retries > RATE_LIMIT_RETRIES
+                        || !pause(self.timing.settle * rate_retries, deadline)
+                    {
+                        return Err(limited(false));
                     }
-                    std::thread::sleep(self.timing.settle * rate_retries);
                 }
-                RET_PROCESSING => {
-                    if path == CREATE {
-                        attempts.unproven = Some(env.ret_code);
-                    }
-                    rate_retries += 1;
-                    if rate_retries > RATE_LIMIT_RETRIES {
-                        return Err(Failure::Venue {
-                            code: env.ret_code,
-                            message: self.keys.scrub(&env.ret_msg, &signature),
-                        });
-                    }
-                    std::thread::sleep(self.timing.settle * rate_retries);
+                RET_HIGH_LOAD | RET_FREQUENCY_PROTECTION | RET_PROCESSING if order_request => {
+                    return Err(unknown(format!(
+                        "the venue answered {}, which asks for a retry but does not say the \
+                         request was not taken",
+                        env.ret_code
+                    )));
                 }
                 RET_CHECK_STATUS | RET_DUPLICATE_REQUEST => {
-                    return Err(Failure::Unknown {
-                        reason: format!(
-                            "the venue answered {}, which leaves the outcome open",
-                            env.ret_code
-                        ),
-                        sent_at: timestamp,
-                    });
+                    return Err(unknown(format!(
+                        "the venue answered {}, which leaves the outcome open",
+                        env.ret_code
+                    )));
                 }
-                RET_IP_RATE_LIMIT => {
-                    return Err(Failure::NotSent(Error::RateLimited {
-                        endpoint: path,
-                        ip_block: true,
-                    }));
-                }
+                RET_IP_RATE_LIMIT => return Err(limited(true)),
+                // Refused before processing (the guide's timestamp rule): measure the clock again
+                // and send once more.
                 RET_TIMESTAMP if !resynced => {
                     resynced = true;
-                    self.sync_clock().map_err(Failure::NotSent)?;
+                    let Some(timeout) = self.timeout_within(deadline) else {
+                        return Err(out_of_time());
+                    };
+                    self.sync_clock(timeout).map_err(Failure::NotSent)?;
                 }
                 RET_TIMESTAMP => {
                     return Err(Failure::NotSent(Error::TimestampRejected {
@@ -527,10 +505,10 @@ impl Client {
                     }));
                 }
                 RET_SERVER_TIMEOUT | RET_SERVER_ERROR => {
-                    return Err(Failure::Unknown {
-                        reason: format!("the venue answered server error {}", env.ret_code),
-                        sent_at: timestamp,
-                    });
+                    return Err(unknown(format!(
+                        "the venue answered server error {}",
+                        env.ret_code
+                    )));
                 }
                 code => {
                     return Err(Failure::Venue {
@@ -568,7 +546,7 @@ impl Client {
             if attempt > 0 {
                 std::thread::sleep(self.timing.settle);
             }
-            match self.call(path, &method) {
+            match self.call(path, &method, None) {
                 Ok(v) => return Ok(v),
                 Err(Failure::Unknown { reason, .. }) => last = reason,
                 Err(failure) => return Err(failure_error(failure)),
@@ -580,20 +558,22 @@ impl Client {
         })
     }
 
-    /// One read with no retry, for the lookups that resolve an unknown outcome (they have their
-    /// own rounds).
+    /// One read with no retry, within `deadline`, for the lookups of an order operation (they
+    /// have their own rounds).
     pub(crate) fn get_once(
         &self,
         path: &'static str,
         query: Vec<(&'static str, String)>,
+        deadline: Instant,
     ) -> Result<serde_json::Value, Error> {
-        self.call(path, &Method::Get(query)).map_err(|f| match f {
-            Failure::Unknown { reason, .. } => Error::Transport {
-                endpoint: path,
-                reason,
-            },
-            other => failure_error(other),
-        })
+        self.call(path, &Method::Get(query), Some(deadline))
+            .map_err(|f| match f {
+                Failure::Unknown { reason, .. } => Error::Transport {
+                    endpoint: path,
+                    reason,
+                },
+                other => failure_error(other),
+            })
     }
 
     fn headers(
@@ -638,13 +618,17 @@ impl Client {
         }
     }
 
-    /// Waits, at most [`LONGEST_RATE_WAIT`], when the last answer from `path` said no requests
-    /// were left until a reset still to come.
-    fn wait_for_limit(&self, path: &'static str) {
+    /// Waits, at most [`LONGEST_RATE_WAIT`] and never past `deadline`, when the last answer from
+    /// `path` said no requests were left until a reset still to come.
+    fn wait_for_limit(&self, path: &'static str, deadline: Option<Instant>) {
         let reset = self.limits.lock().unwrap().get(path).copied();
         if let Some(reset) = reset {
-            let wait = millis_until(reset, self.server_now());
-            std::thread::sleep(Duration::from_millis(wait).min(LONGEST_RATE_WAIT));
+            let mut wait = Duration::from_millis(millis_until(reset, self.server_now()))
+                .min(LONGEST_RATE_WAIT);
+            if let Some(end) = deadline {
+                wait = wait.min(end.saturating_duration_since(Instant::now()));
+            }
+            std::thread::sleep(wait);
         }
     }
 
@@ -661,6 +645,15 @@ impl Client {
     pub(crate) fn release_id(&self, id: &ClientOrderId) {
         self.sent.lock().unwrap().remove(id.as_str());
     }
+}
+
+/// Sleeps for `wait` and says so, or says no at once when `deadline` would pass first.
+pub(crate) fn pause(wait: Duration, deadline: Option<Instant>) -> bool {
+    if deadline.is_some_and(|end| Instant::now() + wait >= end) {
+        return false;
+    }
+    std::thread::sleep(wait);
+    true
 }
 
 /// The public error for a failure the caller gets as is.

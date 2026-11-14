@@ -35,6 +35,7 @@ fn proxy_variables_are_ignored() {
         request_timeout: Duration::from_secs(2),
         recv_window: Duration::from_secs(5),
         settle: Duration::from_millis(50),
+        operation_budget: Duration::from_secs(10),
     };
     let keys = DemoKeys::for_loopback(TEST_KEY, TEST_SECRET).unwrap();
     let client = Client::with_timing(Endpoint::Loopback(mock.port()), keys, timing);

@@ -75,11 +75,15 @@ pub enum Error {
     #[error("order {id} is no longer open (status {status})")]
     OrderClosed { id: String, status: String },
 
-    /// An order whose request's answer was lost, found on the venue with status `Rejected` before
-    /// any resend. Found after a resend, it is [`Error::OutcomeUnknown`] instead.
+    /// A create whose answer left its outcome open, found on the venue with status `Rejected`.
+    /// The create was sent once, so the record is that create's.
     #[error("the venue lists order {id} as rejected (reason {reason})")]
     OrderRejected { id: String, reason: String },
 
+    /// The venue may or may not have applied the request, and asking it did not settle which.
+    /// After a `place` the id stays spent: ask later with `Client::order_by_client_id` (or the
+    /// executions) and never send the id again; an empty answer does not prove the order was not
+    /// placed. After a `cancel` or `amend_stop`, read the order before acting on it.
     #[error("the outcome of the {action} request for {id} is unknown: {reason}")]
     OutcomeUnknown {
         action: Action,

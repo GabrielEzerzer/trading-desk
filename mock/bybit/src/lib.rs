@@ -69,7 +69,8 @@ pub enum Fault {
     /// Answer 302 with this `Location`.
     Redirect(String),
     /// Answer this `retCode` without applying the request, with the venue's documented message
-    /// for 40004, 10014, 110079, 429 and 10429.
+    /// for 40004, 10014, 110079, 429 and 10429. `Answer(0)` acknowledges a request it never
+    /// applies.
     Answer(i64),
     /// Check the request, then answer `retCode` `answer` (or close the connection when `None`)
     /// at once and apply the request `after` later, as a venue still processing it would.

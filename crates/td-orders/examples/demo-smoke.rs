@@ -15,8 +15,9 @@
 //!
 //! Steps: check the symbol is flat with no open orders; market buy and confirm the fill from the
 //! executions; rest a reduce-only stop far below the price, read it back, amend it and cancel it;
-//! resend the first order's client id and expect a refusal; close with a reduce-only market sell;
-//! reconcile. Each step prints one line, and the last line is PASS or FAIL. Nothing printed
+//! send the first order's client id again from a new client and expect the venue to refuse it (an
+//! observation of the venue; the route relies on it nowhere); close with a reduce-only market
+//! sell; reconcile. Each step prints one line, and the last line is PASS or FAIL. Nothing printed
 //! contains a key, a signature or a response body. A failure once the buy may be on the account
 //! says that a position, and possibly a stop, may be left open.
 
@@ -132,10 +133,11 @@ fn order_size(instrument: &Instrument, last: f64, mark: f64) -> Result<(f64, f64
         instrument.round_qty((needed / instrument.lot_size - 1e-9).ceil() * instrument.lot_size);
     let high = last.max(mark);
     let notional = qty * high;
-    if notional > MAX_NOTIONAL {
+    // Written so that a NaN quantity or price fails the check.
+    if !(notional.is_finite() && notional <= MAX_NOTIONAL) {
         return Err(format!(
-            "the smallest order, {qty} at {high}, is worth {notional:.2} {SETTLE_COIN}, over the \
-             {MAX_NOTIONAL} ceiling; nothing was sent"
+            "the smallest order, {qty} at {high}, is worth {notional:.2} {SETTLE_COIN}, which is not \
+             within the {MAX_NOTIONAL} ceiling; nothing was sent"
         ));
     }
     Ok((qty, notional))
@@ -302,11 +304,12 @@ fn run(symbol: &str, bought: &mut bool) -> Result<(), String> {
     check(open.is_empty(), "an order is still open after the cancel")?;
     step("cancel", "no open orders");
 
-    // A new client has no record of the id, so the venue is the one that must refuse it.
+    // A new client has no record of the id, so only the venue can refuse it. This observes how the
+    // venue treats a closed order's id; the route never sends an id twice and does not depend on it.
     let second = Client::new(Endpoint::Demo, DemoKeys::from_env().map_err(e("keys"))?)
         .map_err(e("second client"))?;
     match second.place(&instrument, &market(Side::Buy, false), &buy_id, last) {
-        Err(Error::DuplicateClientId { .. }) => step("resend", "the venue refused the used id"),
+        Err(Error::DuplicateClientId { .. }) => step("repeat id", "the venue refused the used id"),
         Ok(p) => {
             return Err(format!(
                 "the venue accepted a used client id as order {:?}; close it by hand",
@@ -315,7 +318,7 @@ fn run(symbol: &str, bought: &mut bool) -> Result<(), String> {
         }
         Err(other) => {
             return Err(format!(
-                "resend: expected a duplicate-id refusal, got {other}"
+                "repeat id: expected a duplicate-id refusal, got {other}"
             ));
         }
     }
@@ -422,6 +425,15 @@ mod tests {
             let i = instrument(0.001, 0.001, min_notional);
             assert_eq!(order_size(&i, 65000.0, 65000.0).unwrap().0, 0.002);
         }
+    }
+
+    #[test]
+    fn a_size_that_is_not_a_number_is_refused() {
+        // A quantity step of 1e-16 is finer than the grid rounding handles, and the quantity
+        // comes out as NaN; a ceiling check written as `notional > MAX_NOTIONAL` lets it through.
+        let i = instrument(1e-16, 0.001, 5.0);
+        let err = order_size(&i, 65000.0, 65000.0).unwrap_err();
+        assert!(err.contains("ceiling"), "{err}");
     }
 
     #[test]

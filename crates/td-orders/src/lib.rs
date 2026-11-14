@@ -21,20 +21,25 @@
 //!   Keys from the environment are refused by the loopback endpoint
 //!   ([`Error::DemoKeysOnLoopback`]), and keys made for the mock by the demo one
 //!   ([`Error::LoopbackKeysOnDemo`]), so the demo account's keys never reach a local port.
-//! - **One order per id.** A client refuses to send an id twice, and a request whose answer never
-//!   arrived is resolved by asking the venue before anything is sent again (see the `ids` and
-//!   `orders` module docs for what the venue documents and the rule built on it). When the venue
-//!   cannot be asked the answer is [`Error::OutcomeUnknown`]; nothing is resent blind.
+//! - **One order per id.** A client refuses to send an id twice, and sends a create once. An answer
+//!   that leaves open whether the venue took it (a timeout, a dropped connection, a server error,
+//!   a load or frequency answer) is resolved by asking the venue, never by sending it again; only a
+//!   rate-limit (10006) or timestamp (10002) refusal, which the venue documents as a refusal before
+//!   processing, is sent again. A lookup that finds nothing is [`Error::OutcomeUnknown`], never
+//!   "not placed". A cancel or amend is confirmed by reads after the venue acknowledges it (see the
+//!   `ids`, `client` and `orders` module docs for what the venue documents and the rules built on
+//!   it).
 //! - **Venue filters.** An order is checked with `Instrument::validate_order` (lot and tick grid,
 //!   minimum quantity, minimum notional with the reduce-only exemption) before it is sent, and its
 //!   numbers are written as exact decimals on the grid.
 //! - **Position mode.** Orders are one-way (`positionIdx` 0). An account in hedge mode is
 //!   [`Error::HedgeMode`]; the route never changes account settings.
-//! - **Rate limits, clock, timeouts.** Rate-limited requests wait and go again a few times; an IP
-//!   block is returned at once. The clock offset is measured against the venue's server time when
-//!   the client is built and again on a timestamp rejection, and a server time more than a day
-//!   from the local clock is refused ([`Error::ServerTimeOutOfRange`]). Timeouts are seconds
-//!   ([`Timing`]).
+//! - **Rate limits, clock, timeouts.** A request refused with 10006 waits for the venue's reset and
+//!   goes again a few times; a read answered 429 does too, while an order request answered 429 is
+//!   looked up; an IP block is returned at once. The clock offset is measured against the venue's
+//!   server time when the client is built and again on a timestamp rejection, and a server time
+//!   more than a day from the local clock is refused ([`Error::ServerTimeOutOfRange`]). Timeouts
+//!   are seconds, and each place, cancel and amend runs within one time budget ([`Timing`]).
 //! - **Answers.** A response body is read up to 4 MiB after decompression and refused past it
 //!   ([`Error::ResponseTooLarge`]). Negative quantities, sizes and prices are refused.
 //!

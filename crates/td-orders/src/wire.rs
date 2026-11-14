@@ -79,14 +79,25 @@ pub enum OrderStatus {
     Triggered,
     /// A conditional order cancelled before it triggered.
     Deactivated,
-    /// A status this route does not know, kept as the venue spelled it, without control characters
-    /// and cut to 200 characters.
+    /// A status this route does not know, kept as the venue spelled it, without hidden characters
+    /// ([`hidden`]) and cut to 200 characters.
     Other(String),
 }
 
-/// Text from the venue as the crate keeps it: control characters removed, at most 200 characters.
+/// Text from the venue as the crate keeps it: hidden characters removed, at most 200 characters.
 pub(crate) fn venue_text(text: &str) -> String {
-    text.chars().filter(|c| !c.is_control()).take(200).collect()
+    text.chars().filter(|&c| !hidden(c)).take(200).collect()
+}
+
+/// A character that changes how text shows without showing itself: control characters, and the
+/// zero-width, line and paragraph separator, bidirectional, invisible-operator and byte-order
+/// format characters, which could hide or reorder text in a log or a terminal.
+pub(crate) fn hidden(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{200B}'..='\u{200F}' | '\u{2028}'..='\u{202E}' | '\u{2060}'..='\u{206F}' | '\u{FEFF}'
+        )
 }
 
 impl OrderStatus {
@@ -761,6 +772,17 @@ mod tests {
         assert_eq!(kept.chars().count(), 200);
         assert!(kept.starts_with("Odd[2J"), "{kept:?}");
         assert!(OrderStatus::parse(&raw).is_open());
+    }
+
+    #[test]
+    fn venue_text_drops_zero_width_bidirectional_and_byte_order_characters() {
+        let raw = "a\u{200B}b\u{200F}c\u{2028}d\u{202E}e\u{2060}f\u{206F}g\u{FEFF}h\u{7}i";
+        assert_eq!(venue_text(raw), "abcdefghi");
+        // Visible text outside those ranges is kept.
+        assert_eq!(
+            venue_text("\u{394} 100 \u{2013} ok"),
+            "\u{394} 100 \u{2013} ok"
+        );
     }
 
     #[test]

@@ -82,10 +82,10 @@ impl DemoKeys {
 
     /// Replaces a venue message that contains the key, the secret or `signature` (the venue's
     /// signature error can echo the signed text, which holds the key), and trims the rest.
-    /// Control characters go first, so a credential split by one is found whole, and the cut to
-    /// length comes last, so a credential at the cut is found whole too.
+    /// Hidden characters ([`wire::hidden`]) go first, so a credential split by one is found
+    /// whole, and the cut to length comes last, so a credential at the cut is found whole too.
     pub(crate) fn scrub(&self, message: &str, signature: &str) -> String {
-        let plain: String = message.chars().filter(|c| !c.is_control()).collect();
+        let plain: String = message.chars().filter(|&c| !wire::hidden(c)).collect();
         let leaks = [self.key.as_str(), self.secret.as_str(), signature]
             .iter()
             .any(|s| !s.is_empty() && plain.contains(s));
@@ -163,9 +163,15 @@ mod tests {
     }
 
     #[test]
-    fn scrub_finds_a_credential_split_by_control_characters_or_at_the_cut() {
+    fn scrub_finds_a_credential_split_by_hidden_characters_or_at_the_cut() {
         let keys = DemoKeys::for_loopback("KEYVALUE123", "SECRETVALUE456").unwrap();
-        for split in ["KEYV\u{0}ALUE123", "KEY\nVALUE123", "SECRET\u{7}\rVALUE456"] {
+        for split in [
+            "KEYV\u{0}ALUE123",
+            "KEY\nVALUE123",
+            "SECRET\u{7}\rVALUE456",
+            "KEYV\u{200B}ALUE123",
+            "SECRET\u{FEFF}VALUE\u{202E}456",
+        ] {
             let shown = keys.scrub(&format!("error {split} end"), "");
             assert!(
                 !shown.contains("KEYVALUE123") && !shown.contains("SECRETVALUE456"),

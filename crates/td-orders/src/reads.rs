@@ -21,6 +21,7 @@
 //!   (<https://bybit-exchange.github.io/docs/v5/demo>).
 
 use std::collections::HashSet;
+use std::time::Instant;
 
 use td_core::{Instrument, Millis};
 
@@ -106,14 +107,16 @@ impl Client {
         id: &ClientOrderId,
     ) -> Result<Option<VenueOrder>, Error> {
         check_instrument(instrument)?;
-        self.order_by_client_id_with(instrument, id, false)
+        self.order_by_client_id_with(instrument, id, None)
     }
 
+    /// [`Client::order_by_client_id`] without the instrument check. With a `deadline`, each
+    /// request is sent once and within it, for the lookups of an order operation.
     pub(crate) fn order_by_client_id_with(
         &self,
         instrument: &Instrument,
         id: &ClientOrderId,
-        once: bool,
+        deadline: Option<Instant>,
     ) -> Result<Option<VenueOrder>, Error> {
         for path in [REALTIME, HISTORY] {
             let query = vec![
@@ -121,10 +124,9 @@ impl Client {
                 ("symbol", instrument.id.symbol.clone()),
                 ("orderLinkId", id.as_str().to_string()),
             ];
-            let value = if once {
-                self.get_once(path, query)?
-            } else {
-                self.get(path, query)?
+            let value = match deadline {
+                Some(deadline) => self.get_once(path, query, deadline)?,
+                None => self.get(path, query)?,
             };
             let page: Page<RawOrder> = wire::from_value(path, value)?;
             // Asked by orderLinkId the venue lists that order only; check rather than trust it.
@@ -138,11 +140,12 @@ impl Client {
         Ok(None)
     }
 
-    /// The executions for one client id in the last 7 days, one request.
+    /// The executions for one client id in the last 7 days, one request within `deadline`.
     pub(crate) fn executions_for_id(
         &self,
         instrument: &Instrument,
         id: &ClientOrderId,
+        deadline: Instant,
     ) -> Result<Vec<Execution>, Error> {
         let query = vec![
             ("category", CATEGORY.to_string()),
@@ -150,7 +153,7 @@ impl Client {
             ("orderLinkId", id.as_str().to_string()),
         ];
         let page: Page<RawExecution> =
-            wire::from_value(EXECUTIONS, self.get_once(EXECUTIONS, query)?)?;
+            wire::from_value(EXECUTIONS, self.get_once(EXECUTIONS, query, deadline)?)?;
         page.list
             .into_iter()
             .map(|r| r.into_execution(EXECUTIONS))
