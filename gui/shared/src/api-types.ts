@@ -2012,7 +2012,10 @@ multiplier: number,
  */
 window_returns: Array<number>, 
 /**
- * The windows compounded, as the stitched curve compounds them.
+ * The windows compounded, as the stitched curve compounds them. For a `prop_firm` rule whose
+ * strategy sizes from the starting cash, the starting cash plus each window's own money
+ * change, over the starting cash, less one, as its out-of-sample return is read. Either way,
+ * windows after the compounded account reached zero add nothing.
  */
 total_return: number, };
 
@@ -2030,7 +2033,9 @@ shift_bars: number,
  */
 windows: number, 
 /**
- * The stitched out-of-sample return; `None` when the walk-forward could not run.
+ * The stitched out-of-sample return; `None` when the walk-forward could not run. For a
+ * `prop_firm` rule whose strategy sizes from the starting cash, read on this run's own test
+ * windows' money changes, added, as the main run's return is.
  */
 oos_return: number | null, error: string | null, };
 

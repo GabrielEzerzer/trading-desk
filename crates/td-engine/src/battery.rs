@@ -229,7 +229,10 @@ pub struct CostStress {
     pub multiplier: f64,
     /// Each window's return at the stressed costs.
     pub window_returns: Vec<f64>,
-    /// The windows compounded, as the stitched curve compounds them.
+    /// The windows compounded, as the stitched curve compounds them. For a `prop_firm` rule whose
+    /// strategy sizes from the starting cash, the starting cash plus each window's own money
+    /// change, over the starting cash, less one, as its out-of-sample return is read. Either way,
+    /// windows after the compounded account reached zero add nothing.
     pub total_return: f64,
 }
 
@@ -242,7 +245,9 @@ pub struct StartOffset {
     pub shift_bars: usize,
     /// The windows that fit.
     pub windows: usize,
-    /// The stitched out-of-sample return; `None` when the walk-forward could not run.
+    /// The stitched out-of-sample return; `None` when the walk-forward could not run. For a
+    /// `prop_firm` rule whose strategy sizes from the starting cash, read on this run's own test
+    /// windows' money changes, added, as the main run's return is.
     pub oos_return: Option<f64>,
     pub error: Option<String>,
 }
@@ -608,6 +613,13 @@ pub fn run_battery_with_references(
         evidence.plateau_positive_share = p.positive_share;
     }
     let cash = base.starting_cash;
+    // A `prop_firm` rule whose strategy sizes from the starting cash: its out-of-sample return and
+    // kind lines (step 4), its return at higher costs (5) and its start offsets (6) read the test
+    // windows' own money changes, added from window to window.
+    let sizes_from_cash = matches!(
+        rule,
+        VerdictRule::PropFirm { limits, .. } if limits.sizes_from_starting_cash
+    );
     if let Some(wf) = &wf {
         let m = &wf.metrics;
         evidence.oos_return = m.total_return;
@@ -719,26 +731,22 @@ pub fn run_battery_with_references(
             // A strategy sized from the starting cash is read on the test windows' own money
             // changes, added from window to window, and its lines on the starting-cash reading;
             // otherwise on the stitched curve, and its lines on each fall's own start.
-            let per_cash = limits.sizes_from_starting_cash.then_some(cash);
-            // shortcut: with `sizes_from_starting_cash` the evidence layer's out-of-sample return
-            // reads this curve, but these figures still read the compounding curve. Each judged
-            // one's pass can differ for a fixed-size strategy whose window returns are large
-            // against their sum. The return at higher costs compounds its windows: windows of
-            // +9.9% and -9.6% read -0.65% where this curve reads +0.3%, and for a profitable
-            // strategy it can read above the return it stresses (windows of +10% each read +20%
-            // here, and +9.8% each at higher costs compound to +20.56%). The start offsets'
-            // returns are their own walk-forwards' compounded ones, so their sign can differ from
-            // this curve's and fail the same-sign count. Each plateau direction's stitched return
-            // and objective compound, and so does R1's objective they are judged against. The
-            // lowest equity line reads the stitched lows, above zero after two windows of -60%
-            // where this curve is below it, a test that already fails the return. The Sharpe
-            // warning reads the stitched days, whose returns differ from this curve's by each
-            // window's own level, so only a figure near its limit can move. Shown but not judged
-            // by this kind: the daily bootstrap, likewise, and the trade bootstrap and breakdown,
-            // whose stitched trades carry the curve's level. The profitable windows, the trade,
-            // day and window counts, the luck test and the peak leverage read each window's own
-            // run, the same on either curve. Read the judged figures on this curve if a rule sized
-            // from the starting cash needs them to agree.
+            let per_cash = sizes_from_cash.then_some(cash);
+            // shortcut: with `sizes_from_starting_cash` the evidence layer's out-of-sample return,
+            // the return at higher costs and the start offsets read this curve (each on its own
+            // windows), but these figures still read the compounding curve. Each judged one's
+            // pass can differ for a fixed-size strategy whose window returns are large against
+            // their sum. Each plateau direction's stitched return and objective compound, and so
+            // does R1's objective they are judged against. The lowest equity line reads the
+            // stitched lows, above zero after two windows of -60% where this curve is below it, a
+            // test that already fails the return. The Sharpe warning reads the stitched days,
+            // whose returns differ from this curve's by each window's own level, so only a figure
+            // near its limit can move. Shown but not judged by this kind: the daily bootstrap,
+            // likewise, and the trade bootstrap and breakdown, whose stitched trades carry the
+            // curve's level. The profitable windows, the trade, day and window counts, the luck
+            // test and the peak leverage read each window's own run, the same on either curve.
+            // Read the judged figures on this curve if a rule sized from the starting cash needs
+            // them to agree.
             let fixed_curve = per_cash.map(|_| {
                 let (equity, ranges) = tester::stitch_fixed_size(cash, &wf.windows);
                 (EquitySeries::new(cash, &equity, plan.timeframe), ranges)
@@ -881,7 +889,7 @@ pub fn run_battery_with_references(
         let stressed_fees = stressed(fees, ev.cost_stress);
         let stressed_asks = widened(bars, asks, ev.cost_stress);
         let mut window_returns = Vec::with_capacity(wf.windows.len());
-        let mut level = 1.0f64;
+        let mut ends = Vec::with_capacity(wf.windows.len());
         for w in &wf.windows {
             let config = BacktestConfig {
                 fee_override: Some(stressed_fees),
@@ -890,16 +898,15 @@ pub fn run_battery_with_references(
             };
             let r = run_with_references(&config, bars, &stressed_asks, funding, references)?;
             meter.tick()?;
-            let growth = r.equity.last().map_or(1.0, |p| p.equity / cash);
-            window_returns.push(growth - 1.0);
-            // Once the account is gone, later windows trade nothing, as in the stitched curve.
-            level = if level > 0.0 { level * growth } else { 0.0 };
+            let end = r.equity.last().map(|p| p.equity);
+            window_returns.push(end.map_or(1.0, |e| e / cash) - 1.0);
+            ends.push(end);
         }
         meter.base += windows - wf.windows.len();
         let stress = CostStress {
             multiplier: ev.cost_stress,
             window_returns,
-            total_return: level.max(0.0) - 1.0,
+            total_return: stressed_total_return(cash, &ends, sizes_from_cash),
         };
         evidence.stressed_return = Some(stress.total_return);
         result.cost_stress = Some(stress);
@@ -927,6 +934,13 @@ pub fn run_battery_with_references(
                     references,
                     Some(&meter.step()),
                 ) {
+                    // A strategy sized from the starting cash is read on this run's own windows'
+                    // money changes, added, as the main run's return is.
+                    Ok(r) if sizes_from_cash => {
+                        let (equity, _) = tester::stitch_fixed_size(cash, &r.windows);
+                        let series = EquitySeries::new(cash, &equity, plan.timeframe);
+                        offset.oos_return = metrics::total_return(&series.values);
+                    }
                     Ok(r) => offset.oos_return = r.metrics.total_return,
                     Err(
                         e @ (TesterError::NoQualifyingRun { .. } | TesterError::InvalidSpec(_)),
@@ -1278,6 +1292,28 @@ fn stressed(fees: FeeSchedule, multiplier: f64) -> FeeSchedule {
         maker: fees.maker * multiplier,
         taker: fees.taker * multiplier,
         per_unit: fees.per_unit * multiplier,
+    }
+}
+
+/// R4's total return from each stressed test window's last equity (`None` for a window with no
+/// equity, which changes nothing). The windows compound, as the stitched curve compounds them.
+/// With `fixed_size`, each window's own money change is added to the starting cash instead, as
+/// [`tester::stitch_fixed_size`] adds them, and the total is that over the starting cash, less
+/// one. Either way, once the compounded account is at or below zero, later windows add nothing,
+/// as in both curves: the account is gone.
+fn stressed_total_return(cash: f64, ends: &[Option<f64>], fixed_size: bool) -> f64 {
+    let (mut level, mut money) = (1.0f64, cash);
+    for &end in ends {
+        let growth = end.map_or(1.0, |e| e / cash);
+        if level > 0.0 {
+            money += end.map_or(0.0, |e| e - cash);
+        }
+        level = if level > 0.0 { level * growth } else { 0.0 };
+    }
+    if fixed_size {
+        money / cash - 1.0
+    } else {
+        level.max(0.0) - 1.0
     }
 }
 
@@ -2278,6 +2314,33 @@ mod tests {
         // Perpetual funding is modelled, so a perpetual has no carry to warn of.
         assert_eq!(InstrumentKind::Perpetual.rules().unmodelled_carry, None);
         assert_eq!(InstrumentKind::Spot.rules().unmodelled_carry, None);
+    }
+
+    /// The return at higher costs compounds its windows, unless the strategy sizes from the
+    /// starting cash: then it is the starting cash plus each window's own money change, over the
+    /// starting cash, less one, so it never reads above the return it stresses from compounding
+    /// alone. Every figure here is exact in binary.
+    #[test]
+    fn the_return_at_higher_costs_adds_the_windows_when_sized_from_the_starting_cash() {
+        let cash = 128.0;
+        let total = |ends: &[Option<f64>]| {
+            (
+                stressed_total_return(cash, ends, false),
+                stressed_total_return(cash, ends, true),
+            )
+        };
+        // Two windows of +12.5%: compounded +26.5625%, added +25%.
+        assert_eq!(total(&[Some(144.0), Some(144.0)]), (0.265625, 0.25));
+        // +12.5% and -11.71875%: compounded a loss, added a gain.
+        assert_eq!(
+            total(&[Some(144.0), Some(113.0)]),
+            (-0.0068359375, 0.0078125)
+        );
+        // A window that takes the compounded account to zero leaves later windows flat on
+        // either reading, as both stitched curves do.
+        assert_eq!(total(&[Some(256.0), Some(0.0), Some(192.0)]), (-1.0, 0.0));
+        // A window with no equity changes nothing.
+        assert_eq!(total(&[None, Some(160.0)]), (0.25, 0.25));
     }
 
     #[test]
@@ -3669,6 +3732,90 @@ mod tests {
             assert!(attempt.full.payouts_per_funded.is_some(), "{attempt:?}");
             assert_eq!(on.prop_firm_attempt, Some(attempt), "{drawdown:?}");
         }
+    }
+
+    /// With `sizes_from_starting_cash`, the return at higher costs adds the stressed windows' own
+    /// returns, and each start offset is read on its own walk-forward's windows, added, and its
+    /// sign counted against the added return. Without the field both compound, as before. The
+    /// limits and the trade sample are loose so that steps 5 and 6 run.
+    #[test]
+    fn a_rule_sized_from_the_starting_cash_reads_its_stressed_return_and_offsets_added() {
+        let (mut plan, bars) = sma_plan(sma_axes());
+        plan.evidence.min_sample.trades = 10;
+        let cash = plan.backtest.starting_cash;
+        let battery = |sized: bool| {
+            let VerdictRule::PropFirm { firm, limits, .. } =
+                firm_rule(DrawdownMode::Static, 10, None)
+            else {
+                unreachable!()
+            };
+            let rule = VerdictRule::PropFirm {
+                firm: crate::FirmLimits {
+                    daily_loss: 0.5,
+                    max_drawdown: 0.5,
+                    ..firm
+                },
+                limits: crate::PropFirmLimits {
+                    sizes_from_starting_cash: sized,
+                    ..limits
+                },
+                attempt: None,
+            };
+            let spec = BatterySpec {
+                strategy: "sma_cross",
+                plan: &plan,
+                rule: &rule,
+                instrument: &test_instrument(),
+                seed: 7,
+            };
+            run_battery(&spec, &bars, &[], &[], None).unwrap()
+        };
+        let (on, off) = (battery(true), battery(false));
+
+        // The stressed windows are the same runs; on adds their returns, off compounds them.
+        let (stress, stress_off) = (on.cost_stress.unwrap(), off.cost_stress.unwrap());
+        assert_eq!(stress.window_returns, stress_off.window_returns);
+        let added: f64 = stress.window_returns.iter().sum();
+        let compounded = stress
+            .window_returns
+            .iter()
+            .map(|r| 1.0 + r)
+            .product::<f64>()
+            - 1.0;
+        assert!((added - compounded).abs() > 1e-6, "{stress:?}");
+        assert!((stress.total_return - added).abs() < 1e-12, "{stress:?}");
+        assert!(
+            (stress_off.total_return - compounded).abs() < 1e-12,
+            "{stress_off:?}"
+        );
+        assert_eq!(on.evidence.stressed_return, Some(stress.total_return));
+        assert_eq!(off.evidence.stressed_return, Some(stress_off.total_return));
+
+        // Each offset's walk-forward, rerun: on reads its windows added, off its stitched return.
+        let base = plan.backtest_config("sma_cross", test_instrument());
+        let (_, traded) = select_bars(&base, &bars).unwrap();
+        assert_eq!(on.start_offsets.len(), off.start_offsets.len());
+        assert!(!on.start_offsets.is_empty());
+        let mut differ = 0;
+        for (o, f) in on.start_offsets.iter().zip(&off.start_offsets) {
+            let mut spec = plan.walk_forward_spec("sma_cross", test_instrument());
+            spec.sweep.base.to = traded[traded.len() - o.shift_bars].open_time;
+            let Ok(r) = walk_forward_with_references(&spec, &bars, &[], &[], &[], None) else {
+                assert!(o.error.is_some() && f.error.is_some(), "{o:?}");
+                continue;
+            };
+            let (equity, _) = tester::stitch_fixed_size(cash, &r.windows);
+            let fixed =
+                metrics::total_return(&EquitySeries::new(cash, &equity, plan.timeframe).values);
+            assert_eq!(o.oos_return, fixed, "{o:?}");
+            assert_eq!(f.oos_return, r.metrics.total_return, "{f:?}");
+            differ += usize::from(fixed != r.metrics.total_return);
+        }
+        assert!(differ > 0);
+        let sign = on.evidence.oos_return.map(crate::strategies::direction);
+        let same = on.start_offsets.iter();
+        let same = same.filter(|o| o.oos_return.map(crate::strategies::direction) == sign);
+        assert_eq!(on.evidence.start_offsets_same_sign, same.count());
     }
 
     /// A rule sized from the starting cash judges the return of the account that trades the
