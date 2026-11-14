@@ -11,8 +11,12 @@
 //! - The minimum notional applies to orders that are not reduce-only.
 //! - A test can cap the next market order's fill ([`crate::MockVenue::cap_next_fill`]); the order
 //!   then rests `PartiallyFilled` until [`crate::MockVenue::fill_rest`] fills the rest.
+//! - Instruments info lists every instrument as a `Trading` `LinearPerpetual` settled in its quote
+//!   coin, and the ticker's mark price is the last price.
 
 use std::collections::HashMap;
+use std::io::Write;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use hmac::{Hmac, KeyInit, Mac};
@@ -50,6 +54,15 @@ pub(crate) struct Order {
     pub price_on_created: f64,
     pub created: i64,
     pub updated: i64,
+    pub reject_reason: String,
+    /// With a lag set: until when the lists show the order as `before` (`None`: not at all).
+    pub lagged: Option<Lagged>,
+}
+
+#[derive(Clone)]
+pub(crate) struct Lagged {
+    pub until: i64,
+    pub before: Option<Box<Order>>,
 }
 
 impl Order {
@@ -73,6 +86,8 @@ pub(crate) struct Exec {
     pub order_qty: f64,
     pub time: i64,
     pub seq: u64,
+    /// When the executions list starts showing it.
+    pub visible_from: i64,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -101,6 +116,8 @@ pub(crate) struct State {
     pub hedge: bool,
     pub id_rule: IdRule,
     pub history_delay_ms: i64,
+    pub lag_ms: i64,
+    pub spot_borrow: f64,
     pub echo_credentials: bool,
     /// Whether real-time queries by id list closed orders (the venue's recent-closed cache, which
     /// it clears on a restart).
@@ -128,6 +145,8 @@ impl State {
             hedge: false,
             id_rule: IdRule::Always,
             history_delay_ms: 0,
+            lag_ms: 0,
+            spot_borrow: 0.0,
             echo_credentials: false,
             closed_cache: true,
             faults_once: Vec::new(),
@@ -162,6 +181,47 @@ impl State {
             .map(|(_, f)| f.clone())
     }
 
+    /// Called before order `i` changes: with a lag set, the lists go on showing it as it was until
+    /// the lag has passed since its latest change.
+    fn touch(&mut self, i: usize) {
+        let lag = self.lag_ms;
+        if lag <= 0 {
+            return;
+        }
+        let now = self.now();
+        let o = &mut self.orders[i];
+        match &mut o.lagged {
+            Some(l) if now < l.until => l.until = now + lag,
+            _ => {
+                let mut before = o.clone();
+                before.lagged = None;
+                o.lagged = Some(Lagged {
+                    until: now + lag,
+                    before: Some(Box::new(before)),
+                });
+            }
+        }
+    }
+
+    /// The order as the lists show it now, if at all.
+    fn listed<'a>(&self, o: &'a Order, now: i64) -> Option<&'a Order> {
+        match &o.lagged {
+            Some(l) if now < l.until => l.before.as_deref(),
+            _ => Some(o),
+        }
+    }
+
+    pub fn cancel_after_partial_fill(&mut self, link_id: &str, qty: f64) {
+        let i = self
+            .orders
+            .iter()
+            .position(|o| o.link_id == link_id && o.is_open())
+            .expect("no open order with that link id");
+        let price = self.markets[&self.orders[i].symbol].price;
+        self.fill(i, price, qty);
+        self.orders[i].status = "PartiallyFilledCanceled";
+    }
+
     /// Moves the price and triggers resting stops it crosses.
     pub fn set_price(&mut self, symbol: &str, price: f64) {
         self.markets.get_mut(symbol).expect("unknown symbol").price = price;
@@ -183,6 +243,7 @@ impl State {
             };
             if qty <= 0.0 {
                 let now = self.now();
+                self.touch(i);
                 let o = &mut self.orders[i];
                 o.status = "Deactivated";
                 o.updated = now;
@@ -203,6 +264,7 @@ impl State {
     }
 
     fn fill(&mut self, index: usize, price: f64, qty: f64) {
+        self.touch(index);
         let now = self.now();
         let (symbol, side, order_id, link_id, order_qty) = {
             let o = &self.orders[index];
@@ -258,6 +320,7 @@ impl State {
             order_qty,
             time: now,
             seq,
+            visible_from: now + self.lag_ms.max(0),
         });
     }
 
@@ -303,6 +366,7 @@ impl State {
             order_qty: 0.0,
             time,
             seq,
+            visible_from: 0,
         });
         self.wallet -= fee;
     }
@@ -316,7 +380,7 @@ impl State {
 }
 
 /// Answers one request: faults first, then authentication, then the endpoint.
-pub(crate) fn handle(state: &std::sync::Mutex<State>, req: Request) -> Reply {
+pub(crate) fn handle(state: &Arc<Mutex<State>>, req: Request) -> Reply {
     let fault = {
         let mut s = state.lock().unwrap();
         s.log.push(Logged {
@@ -366,10 +430,53 @@ pub(crate) fn handle(state: &std::sync::Mutex<State>, req: Request) -> Reply {
             return respond(502, vec![], "<html>502 Bad Gateway</html>".into());
         }
         Some(Fault::DropBeforeApply) => return Reply::Drop,
+        Some(Fault::Answer(code)) => {
+            let body = envelope(*code, answer_message(*code), json!({}), now);
+            return respond(200, limit_headers(now), body.to_string());
+        }
+        // Checked now, as the venue checks a request when it arrives; applied later.
+        Some(Fault::ApplyLater { after, answer })
+            if state.lock().unwrap().authenticate(&req).is_ok() =>
+        {
+            let (later, after) = (state.clone(), *after);
+            let answer = *answer;
+            std::thread::spawn(move || {
+                std::thread::sleep(after);
+                let _ = later.lock().unwrap().route(&req, None);
+            });
+            return match answer {
+                Some(code) => {
+                    let body = envelope(code, answer_message(code), json!({}), now);
+                    respond(200, limit_headers(now), body.to_string())
+                }
+                None => Reply::Drop,
+            };
+        }
         _ => {}
     }
-    let (status, body) = state.lock().unwrap().dispatch(&req);
+    let reject = match &fault {
+        Some(Fault::RejectThenDrop(reason)) => Some(reason.as_str()),
+        _ => None,
+    };
+    let (status, body) = state.lock().unwrap().dispatch(&req, reject);
     match fault {
+        Some(Fault::RejectThenDrop(_)) => Reply::Drop,
+        Some(Fault::HugeBody) => {
+            let mut text = body.to_string();
+            // JSON allows trailing whitespace.
+            text.extend(std::iter::repeat_n(' ', 5 * 1024 * 1024));
+            let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            gz.write_all(text.as_bytes()).unwrap();
+            let mut headers = limit_headers(now);
+            headers.push(("Content-Type".into(), "application/json".into()));
+            headers.push(("Content-Encoding".into(), "gzip".into()));
+            Reply::Respond {
+                status,
+                headers,
+                body: gz.finish().unwrap(),
+                delay: Duration::ZERO,
+            }
+        }
         Some(Fault::DropAfterApply) => Reply::Drop,
         Some(Fault::ServerErrorAfterApply) => {
             respond(502, vec![], "<html>502 Bad Gateway</html>".into())
@@ -377,7 +484,7 @@ pub(crate) fn handle(state: &std::sync::Mutex<State>, req: Request) -> Reply {
         Some(Fault::Hang(delay)) => Reply::Respond {
             status,
             headers: limit_headers(now),
-            body: body.to_string(),
+            body: body.to_string().into_bytes(),
             delay,
         },
         _ => respond(status, limit_headers(now), body.to_string()),
@@ -391,8 +498,27 @@ fn respond(status: u16, mut headers: Vec<(String, String)>, body: String) -> Rep
     Reply::Respond {
         status,
         headers,
-        body,
+        body: body.into_bytes(),
         delay: Duration::ZERO,
+    }
+}
+
+/// The venue's documented message for the codes [`Fault::Answer`] is used with (error page, read
+/// 2026-11-14).
+fn answer_message(code: i64) -> &'static str {
+    match code {
+        40004 => {
+            "the order is modified during the process of replacing , please check the order status \
+             again"
+        }
+        10014 => "Invalid duplicate request.",
+        110079 => "The order is processing and can not be operated, please try again later",
+        429 => {
+            "The trading service is experiencing a high server load. Please retry if you encounter \
+             this issue."
+        }
+        10429 => "System level frequency protection",
+        _ => "refused by the mock venue",
     }
 }
 
@@ -415,19 +541,37 @@ fn envelope(code: i64, msg: &str, result: Value, now: i64) -> Value {
 }
 
 impl State {
-    fn dispatch(&mut self, req: &Request) -> (u16, Value) {
+    /// Answers a request; `reject` records a create as rejected with that reason instead.
+    fn dispatch(&mut self, req: &Request, reject: Option<&str>) -> (u16, Value) {
         let now = self.now();
-        if req.method == "GET" && req.path == "/v5/market/time" {
-            let nanos = now as i128 * 1_000_000 + 123_456;
-            let result = json!({
-                "timeSecond": (now / 1000).to_string(),
-                "timeNano": nanos.to_string(),
-            });
-            return (200, envelope(0, "OK", result, now));
+        if req.method == "GET" && req.path.starts_with("/v5/market/") {
+            let params: HashMap<String, String> = req.params().into_iter().collect();
+            let result = match req.path.as_str() {
+                "/v5/market/time" => {
+                    let nanos = now as i128 * 1_000_000 + 123_456;
+                    Ok(json!({
+                        "timeSecond": (now / 1000).to_string(),
+                        "timeNano": nanos.to_string(),
+                    }))
+                }
+                "/v5/market/instruments-info" => self.instruments_info(&params),
+                "/v5/market/tickers" => self.tickers(&params),
+                _ => return (404, envelope(10017, "Route not found.", json!({}), now)),
+            };
+            return match result {
+                Ok(v) => (200, envelope(0, "OK", v, now)),
+                Err((code, msg)) => (200, envelope(code, &msg, json!({}), now)),
+            };
         }
         if let Err((code, msg)) = self.authenticate(req) {
             return (200, envelope(code, &self.echo(&msg, req), json!({}), now));
         }
+        self.route(req, reject)
+    }
+
+    /// Applies an authenticated request to its endpoint.
+    fn route(&mut self, req: &Request, reject: Option<&str>) -> (u16, Value) {
+        let now = self.now();
         let params: HashMap<String, String> = req.params().into_iter().collect();
         let body: Value = if req.method == "POST" {
             match serde_json::from_str(&req.body) {
@@ -441,7 +585,7 @@ impl State {
             Value::Null
         };
         let result = match (req.method.as_str(), req.path.as_str()) {
-            ("POST", "/v5/order/create") => self.create(&body),
+            ("POST", "/v5/order/create") => self.create(&body, reject),
             ("POST", "/v5/order/cancel") => self.cancel(&body),
             ("POST", "/v5/order/amend") => self.amend(&body),
             ("GET", "/v5/order/realtime") => self.realtime(&params),
@@ -516,7 +660,7 @@ impl State {
             .ok_or((10001, "params error: symbol invalid".to_string()))
     }
 
-    fn create(&mut self, b: &Value) -> VenueResult {
+    fn create(&mut self, b: &Value, reject: Option<&str>) -> VenueResult {
         linear(b.get("category").and_then(Value::as_str))?;
         let symbol = str_field(b, "symbol")?;
         let (inst, price) = {
@@ -608,13 +752,19 @@ impl State {
         };
         let now = self.now();
         let order_id = self.next_id();
+        let lagged = (self.lag_ms > 0).then(|| Lagged {
+            until: now + self.lag_ms,
+            before: None,
+        });
         self.orders.push(Order {
             order_id: order_id.clone(),
             link_id: link.clone(),
             symbol,
             side,
             qty,
-            status: if trigger.is_some() {
+            status: if reject.is_some() {
+                "Rejected"
+            } else if trigger.is_some() {
                 "Untriggered"
             } else {
                 "New"
@@ -628,8 +778,10 @@ impl State {
             price_on_created: price,
             created: now,
             updated: now,
+            reject_reason: reject.unwrap_or("EC_NoError").into(),
+            lagged,
         });
-        if trigger.is_none() {
+        if trigger.is_none() && reject.is_none() {
             let i = self.orders.len() - 1;
             match self.cap_next_fill.take() {
                 Some(cap) if cap < fill_qty => {
@@ -667,6 +819,7 @@ impl State {
 
     fn cancel(&mut self, b: &Value) -> VenueResult {
         let i = self.find_open(b)?;
+        self.touch(i);
         let now = self.now();
         let o = &mut self.orders[i];
         o.status = if o.status == "Untriggered" {
@@ -709,6 +862,7 @@ impl State {
             }
             None => None,
         };
+        self.touch(i);
         let now = self.now();
         let o = &mut self.orders[i];
         if let Some(t) = trigger {
@@ -729,9 +883,11 @@ impl State {
         }
         let link = p.get("orderLinkId").map(String::as_str).unwrap_or("");
         let id = p.get("orderId").map(String::as_str).unwrap_or("");
+        let now = self.now();
         let mut list: Vec<&Order> = self
             .orders
             .iter()
+            .filter_map(|o| self.listed(o, now))
             .filter(|o| symbol.is_empty() || o.symbol == symbol)
             .filter(|o| {
                 // Asked by id, closed orders are listed too (the venue's recent-500 cache).
@@ -758,6 +914,7 @@ impl State {
         let mut list: Vec<&Order> = self
             .orders
             .iter()
+            .filter_map(|o| self.listed(o, now))
             .filter(|o| !o.is_open())
             .filter(|o| o.updated + self.history_delay_ms <= now)
             .filter(|o| {
@@ -798,6 +955,7 @@ impl State {
             .execs
             .iter()
             .enumerate()
+            .filter(|(_, e)| e.visible_from <= now)
             .filter(|(_, e)| symbol.is_empty() || e.symbol == symbol)
             .filter(|(_, e)| {
                 if link.is_empty() {
@@ -872,7 +1030,7 @@ impl State {
             return Err((10001, "accountType only support UNIFIED".into()));
         }
         let upnl = self.upnl();
-        let equity = self.wallet + upnl;
+        let equity = self.wallet + upnl - self.spot_borrow;
         let wants_usdt = p
             .get("coin")
             .is_none_or(|c| c.split(',').any(|c| c == "USDT"));
@@ -885,7 +1043,7 @@ impl State {
                 "unrealisedPnl": num_text(upnl),
                 "cumRealisedPnl": num_text(self.cum_realised),
                 "locked": "0",
-                "borrowAmount": "0",
+                "borrowAmount": num_text(self.spot_borrow),
                 "totalOrderIM": "0",
                 "totalPositionIM": "0",
                 "totalPositionMM": "0",
@@ -918,6 +1076,46 @@ impl State {
         }))
     }
 
+    fn instruments_info(&self, p: &HashMap<String, String>) -> VenueResult {
+        linear(p.get("category").map(String::as_str))?;
+        let symbol = p.get("symbol").cloned().unwrap_or_default();
+        let inst = &self.market(&symbol)?.instrument;
+        Ok(json!({
+            "category": "linear",
+            "list": [{
+                "symbol": symbol,
+                "contractType": "LinearPerpetual",
+                "status": "Trading",
+                "baseCoin": inst.base,
+                "quoteCoin": inst.quote,
+                "settleCoin": inst.quote,
+                "priceFilter": { "tickSize": num_text(inst.tick_size) },
+                "lotSizeFilter": {
+                    "minOrderQty": num_text(inst.min_qty),
+                    "qtyStep": num_text(inst.lot_size),
+                    "minNotionalValue": num_text(inst.min_notional),
+                },
+            }],
+            "nextPageCursor": "",
+        }))
+    }
+
+    fn tickers(&self, p: &HashMap<String, String>) -> VenueResult {
+        linear(p.get("category").map(String::as_str))?;
+        let symbol = p.get("symbol").cloned().unwrap_or_default();
+        let m = self.market(&symbol)?;
+        let price = fmt_step(m.price, m.instrument.tick_size);
+        Ok(json!({
+            "category": "linear",
+            "list": [{
+                "symbol": symbol,
+                "lastPrice": price,
+                "markPrice": price,
+                "indexPrice": price,
+            }],
+        }))
+    }
+
     pub(crate) fn order_json(&self, o: &Order, history: bool) -> Value {
         let inst = &self.markets[&o.symbol].instrument;
         let tick = |x: f64| fmt_step(x, inst.tick_size);
@@ -939,7 +1137,7 @@ impl State {
             "orderStatus": o.status,
             "createType": "CreateByUser",
             "cancelType": if o.status == "Cancelled" || o.status == "Deactivated" { "CancelByUser" } else { "UNKNOWN" },
-            "rejectReason": "EC_NoError",
+            "rejectReason": o.reject_reason,
             "avgPrice": avg,
             "leavesQty": fmt_step(if o.is_open() { o.qty - o.cum_qty } else { 0.0 }, inst.lot_size),
             "leavesValue": "0",
@@ -1205,10 +1403,13 @@ mod tests {
     #[test]
     fn every_field_the_mock_sends_is_in_the_documented_shape() {
         let mut s = state();
-        let r = s.create(&json!({
-            "category": "linear", "symbol": "BTCUSDT", "side": "Buy", "orderType": "Market",
-            "qty": "0.002", "positionIdx": 0, "orderLinkId": "a1",
-        }));
+        let r = s.create(
+            &json!({
+                "category": "linear", "symbol": "BTCUSDT", "side": "Buy", "orderType": "Market",
+                "qty": "0.002", "positionIdx": 0, "orderLinkId": "a1",
+            }),
+            None,
+        );
         assert_keys_documented(&r.unwrap(), "order-create.json", false);
         let o = s.orders[0].clone();
         assert_keys_documented(&s.order_json(&o, false), "order-realtime.json", true);
@@ -1245,6 +1446,77 @@ mod tests {
                 "{k} is not a documented coin field"
             );
         }
+        let info = s.instruments_info(&p).unwrap();
+        assert_keys_documented(&info, "instruments-info.json", false);
+        let entry = &info["list"][0];
+        assert_keys_documented(entry, "instruments-info.json", true);
+        let documented = fixture("instruments-info.json");
+        let documented = &documented["result"]["list"][0];
+        for filter in ["priceFilter", "lotSizeFilter"] {
+            for k in entry[filter].as_object().unwrap().keys() {
+                assert!(documented[filter].get(k).is_some(), "{filter}.{k}");
+            }
+        }
+        let tickers = s.tickers(&p).unwrap();
+        assert_keys_documented(&tickers, "market-tickers.json", false);
+        assert_keys_documented(&tickers["list"][0], "market-tickers.json", true);
+    }
+
+    fn fixture(name: &str) -> Value {
+        let path = format!("{}/fixtures/{name}", env!("CARGO_MANIFEST_DIR"));
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn with_a_lag_the_lists_show_the_order_as_it_was() {
+        let mut s = state();
+        s.lag_ms = 60_000;
+        let p: HashMap<String, String> = [
+            ("category".into(), "linear".into()),
+            ("symbol".into(), "BTCUSDT".into()),
+            ("orderLinkId".into(), "l1".into()),
+        ]
+        .into();
+        let listed = |s: &State| s.realtime(&p).unwrap()["list"].as_array().unwrap().clone();
+        s.create(
+            &json!({
+                "category": "linear", "symbol": "BTCUSDT", "side": "Buy", "orderType": "Market",
+                "qty": "0.010", "positionIdx": 0, "orderLinkId": "l0",
+            }),
+            None,
+        )
+        .unwrap();
+        s.create(
+            &json!({
+                "category": "linear", "symbol": "BTCUSDT", "side": "Sell", "orderType": "Market",
+                "qty": "0.010", "positionIdx": 0, "orderLinkId": "l1", "reduceOnly": true,
+                "triggerPrice": "60000.0", "triggerDirection": 2,
+            }),
+            None,
+        )
+        .unwrap();
+        // A new order is not listed, and neither are the executions of a new fill.
+        assert!(listed(&s).is_empty());
+        let mut p0 = p.clone();
+        p0.insert("orderLinkId".into(), "l0".into());
+        assert!(
+            s.executions(&p0).unwrap()["list"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(s.positions["BTCUSDT"].size, 0.01, "positions do not lag");
+        // Once listed, a cancelled order shows as it was until the lag has passed.
+        for o in &mut s.orders {
+            o.lagged = None;
+        }
+        s.cancel(&json!({"category": "linear", "symbol": "BTCUSDT", "orderLinkId": "l1"}))
+            .unwrap();
+        assert_eq!(s.orders[1].status, "Deactivated");
+        assert_eq!(listed(&s)[0]["orderStatus"], "Untriggered");
+        s.lag_ms = 0;
+        s.orders[1].lagged.as_mut().unwrap().until = 0;
+        assert_eq!(listed(&s)[0]["orderStatus"], "Deactivated");
     }
 
     #[test]
@@ -1268,14 +1540,14 @@ mod tests {
                 "qty": "0.010", "positionIdx": 0, "orderLinkId": link, "reduceOnly": reduce,
             })
         };
-        s.create(&order("Buy", "o1", false)).unwrap();
+        s.create(&order("Buy", "o1", false), None).unwrap();
         s.set_price("BTCUSDT", 66000.0);
-        s.create(&order("Sell", "o2", true)).unwrap();
+        s.create(&order("Sell", "o2", true), None).unwrap();
         let fees = round8(65000.0 * 0.01 * 0.00055) + round8(66000.0 * 0.01 * 0.00055);
         assert!((s.wallet - (100_000.0 + 10.0 - fees)).abs() < 1e-9);
         assert_eq!(s.positions["BTCUSDT"].size, 0.0);
         // A second reduce-only order has nothing to reduce.
-        let err = s.create(&order("Sell", "o3", true)).unwrap_err();
+        let err = s.create(&order("Sell", "o3", true), None).unwrap_err();
         assert_eq!(err.0, 110017);
     }
 }

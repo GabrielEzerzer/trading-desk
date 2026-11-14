@@ -39,6 +39,9 @@ pub enum Error {
     #[error("keys made for the loopback mock cannot be used with the demo service")]
     LoopbackKeysOnDemo,
 
+    #[error("keys for the demo service cannot be sent to a loopback port")]
+    DemoKeysOnLoopback,
+
     #[error("invalid timing: {reason}")]
     InvalidTiming { reason: &'static str },
 
@@ -72,6 +75,11 @@ pub enum Error {
     #[error("order {id} is no longer open (status {status})")]
     OrderClosed { id: String, status: String },
 
+    /// An order whose request's answer was lost, found on the venue with status `Rejected` before
+    /// any resend. Found after a resend, it is [`Error::OutcomeUnknown`] instead.
+    #[error("the venue lists order {id} as rejected (reason {reason})")]
+    OrderRejected { id: String, reason: String },
+
     #[error("the outcome of the {action} request for {id} is unknown: {reason}")]
     OutcomeUnknown {
         action: Action,
@@ -87,6 +95,15 @@ pub enum Error {
 
     #[error("the venue rejected the request timestamp after a clock resync: {code} {message}")]
     TimestampRejected { code: i64, message: String },
+
+    #[error("the venue's server time is more than a day from the local clock")]
+    ServerTimeOutOfRange,
+
+    #[error(
+        "{endpoint} answered with more than {} bytes",
+        crate::client::MAX_BODY_BYTES
+    )]
+    ResponseTooLarge { endpoint: &'static str },
 
     #[error("request to {endpoint} failed: {reason}")]
     Transport {

@@ -9,17 +9,28 @@
 //! The page does not say whether a reduce-only conditional order may be placed with no position;
 //! the route does not depend on it.
 //!
-//! Resolution, when a place, cancel or amend got no answer (timeout, dropped connection, a 5xx or
-//! the venue's own server error): the venue is asked about the client id (real-time orders, order
-//! history, executions), in a few rounds a settle pause apart.
-//! - Place: an order or an execution for the id means it was placed. The request is sent again,
-//!   with the same id, only after the original's receive window has passed and two rounds in a row
-//!   found nothing; a `110072` (duplicate id) answer to that resend means the original got through,
-//!   and the order is looked up, never placed twice. If the venue cannot be asked, the answer is
-//!   [`Error::OutcomeUnknown`].
+//! Resolution, when a place, cancel or amend got no answer (timeout, dropped connection, a 5xx,
+//! the venue's own server error, or one of the answers the `client` module lists as leaving the
+//! outcome open): the venue is asked about the client id (real-time orders, order history,
+//! executions), in a few rounds a settle pause apart.
+//! - Place: an order record or an execution for the id means it was placed, unless the record
+//!   says the venue rejected it. A rejected record found before any resend is
+//!   [`Error::OrderRejected`]; found after one, it may be the original's while the resend was
+//!   accepted, so it is [`Error::OutcomeUnknown`]. The request is sent again, with the same id,
+//!   only after the original's receive window has passed and two rounds in a row found nothing;
+//!   a `110072` (duplicate id) answer to that resend means the original got through, and the
+//!   order is looked up, never placed twice. Any other answer to the resend that is not an
+//!   acceptance (a refusal, a rate limit, a timestamp refusal) is [`Error::OutcomeUnknown`] and
+//!   the id stays spent: the lists may lag behind an original that was accepted, and the original
+//!   can cause the refusal (a reduce-only close refused because the position is already flat). If
+//!   the venue cannot be asked, the answer is also [`Error::OutcomeUnknown`].
 //! - Cancel and amend cannot create an order, and an amend sets absolute values, so while the
-//!   order is still open with the old values they are sent again; a closed order or the requested
-//!   values settle the outcome.
+//!   order is still open with the old values they are sent again; a closed order record or the
+//!   requested values settle the outcome. Once an attempt's outcome is unknown, an answer that
+//!   attempt could have caused (a refusal, an order the lists do not show, a record still open
+//!   after the venue said it is not) is [`Error::OutcomeUnknown`], never a final refusal or "not
+//!   found". Executions with no order record say the order traded but not whether it is still
+//!   open, so they are also [`Error::OutcomeUnknown`], with the executed quantity.
 
 use std::time::Duration;
 
@@ -34,7 +45,7 @@ use crate::wire::{self, Ack, OrderStatus, VenueOrder};
 use crate::{Action, Client, ClientOrderId, Error};
 
 pub(crate) const CATEGORY: &str = "linear";
-const CREATE: &str = "/v5/order/create";
+pub(crate) const CREATE: &str = "/v5/order/create";
 const CANCEL: &str = "/v5/order/cancel";
 const AMEND: &str = "/v5/order/amend";
 
@@ -67,10 +78,53 @@ pub enum CancelOutcome {
 /// What the venue knows about a client id.
 pub(crate) enum Seen {
     Order(VenueOrder),
-    /// Executions but no order record yet (order history may lag): the order existed and filled.
+    /// Executions but no order record yet (order history may lag): the order existed and traded
+    /// `qty` in all, and whether it is still open is unknown.
     Executed {
         order_id: String,
+        qty: f64,
     },
+}
+
+/// An order's state, as far as what was seen tells it.
+enum State {
+    Open,
+    Closed(OrderStatus),
+    /// Executions and no record: traded this much, open or not unknown.
+    Traded(f64),
+}
+
+impl Seen {
+    fn state(&self) -> State {
+        match self {
+            Seen::Order(o) if o.status.is_open() => State::Open,
+            Seen::Order(o) => State::Closed(o.status.clone()),
+            Seen::Executed { qty, .. } => State::Traded(*qty),
+        }
+    }
+}
+
+/// The reason for an outcome left unknown by executions with no order record.
+fn traded(qty: f64) -> String {
+    format!(
+        "the venue shows {qty} executed for the id but no order record, so whether the order is \
+         still open is unknown"
+    )
+}
+
+/// `err` as it stands when no earlier attempt's outcome is unknown; otherwise an unknown outcome,
+/// since the earlier attempt may have caused it.
+fn unless_earlier(
+    earlier: &Option<String>,
+    err: Error,
+    unknown: impl Fn(String) -> Error,
+) -> Error {
+    match earlier {
+        None => err,
+        Some(reason) => unknown(format!(
+            "{reason}; then {err}, which the earlier attempt may have caused"
+        )),
+    }
 }
 
 enum Lookup {
@@ -132,8 +186,26 @@ impl Client {
         for resend in 0..=RESENDS {
             self.wait_past_window(sent_at);
             match self.settled_lookup(instrument, id) {
+                Lookup::Found(Seen::Order(o)) if o.status == OrderStatus::Rejected => {
+                    let why = match o.reject_reason.as_str() {
+                        "" | "EC_NoError" => "none given".into(),
+                        r => self.scrub(r),
+                    };
+                    // Before any resend the record can only be the original's. After one, it may
+                    // still be the original's while the resend, under the same id, was accepted.
+                    if resend == 0 {
+                        return Err(Error::OrderRejected {
+                            id: id.to_string(),
+                            reason: why,
+                        });
+                    }
+                    return Err(unknown(format!(
+                        "{reason}; the venue lists the id as rejected (reason {why}), but a resend \
+                         under the same id was sent and may have been accepted"
+                    )));
+                }
                 Lookup::Found(Seen::Order(o)) => return Ok(placed(o.order_id)),
-                Lookup::Found(Seen::Executed { order_id }) => return Ok(placed(order_id)),
+                Lookup::Found(Seen::Executed { order_id, .. }) => return Ok(placed(order_id)),
                 Lookup::CannotAsk(why) => {
                     return Err(unknown(format!(
                         "{reason}; the venue could not be asked: {why}"
@@ -147,7 +219,9 @@ impl Client {
                 Lookup::Absent if resend == RESENDS => break,
                 Lookup::Absent => {}
             }
-            // The venue holds no order for the id and the original can no longer be accepted.
+            // The venue lists no order for the id and the original can no longer be accepted. The
+            // lists may still lag behind an original that was, so only an acceptance or a
+            // duplicate-id answer to the resend says anything; the id stays spent whatever comes.
             match self.call(CREATE, &body) {
                 Ok(v) => match wire::from_value::<Ack>(CREATE, v) {
                     Ok(ack) => return Ok(placed(ack.order_id)),
@@ -162,11 +236,13 @@ impl Client {
                     sent_at = 0;
                 }
                 Err(Failure::Venue { code, message }) => {
-                    return Err(reject(instrument, code, message));
+                    return Err(unknown(format!(
+                        "{reason}; the resend was refused with {code} {message}, which an \
+                         accepted original may have caused"
+                    )));
                 }
                 Err(Failure::NotSent(e)) => {
-                    self.release_id(id);
-                    return Err(e);
+                    return Err(unknown(format!("{reason}; the resend was not taken: {e}")));
                 }
                 Err(Failure::Unknown {
                     reason: r,
@@ -196,44 +272,65 @@ impl Client {
             id: id.to_string(),
             reason,
         };
-        let mut reason = String::new();
+        let mut earlier: Option<String> = None;
         for _ in 0..=RESENDS {
-            match self.call(CANCEL, &body) {
+            let reason = match self.call(CANCEL, &body) {
                 Ok(_) => return Ok(CancelOutcome::Cancelled),
                 Err(Failure::Venue { code, message }) if RET_NOT_OPEN.contains(&code) => {
+                    let refused = Error::Rejected { code, message };
                     return match self.settled_lookup(instrument, id) {
-                        Lookup::Found(seen) => match closed_status(&seen) {
-                            Some(status) => Ok(CancelOutcome::AlreadyClosed(status)),
-                            None => Err(Error::Rejected { code, message }),
+                        Lookup::Found(seen) => match seen.state() {
+                            State::Closed(s) if s.is_cancelled() => Ok(CancelOutcome::Cancelled),
+                            State::Closed(s) => Ok(CancelOutcome::AlreadyClosed(s)),
+                            State::Open => Err(unless_earlier(&earlier, refused, unknown)),
+                            State::Traded(qty) => Err(unknown(traded(qty))),
                         },
-                        Lookup::Absent => Err(Error::OrderNotFound { id: id.to_string() }),
+                        Lookup::Absent => Err(unless_earlier(
+                            &earlier,
+                            Error::OrderNotFound { id: id.to_string() },
+                            unknown,
+                        )),
                         Lookup::CannotAsk(why) => Err(unknown(format!(
                             "the venue answered {code} and could not then be asked: {why}"
                         ))),
                     };
                 }
                 Err(Failure::Venue { code, message }) => {
-                    return Err(Error::Rejected { code, message });
+                    return Err(unless_earlier(
+                        &earlier,
+                        Error::Rejected { code, message },
+                        unknown,
+                    ));
                 }
-                Err(Failure::NotSent(e)) => return Err(e),
-                Err(Failure::Unknown { reason: r, .. }) => reason = r,
-            }
+                Err(Failure::NotSent(e)) => return Err(unless_earlier(&earlier, e, unknown)),
+                Err(Failure::Unknown { reason, .. }) => reason,
+            };
             match self.settled_lookup(instrument, id) {
-                Lookup::Found(seen) => match closed_status(&seen) {
-                    Some(s) if s.is_cancelled() => return Ok(CancelOutcome::Cancelled),
-                    Some(s) => return Ok(CancelOutcome::AlreadyClosed(s)),
-                    None => {} // still open: cancel again
+                Lookup::Found(seen) => match seen.state() {
+                    State::Closed(s) if s.is_cancelled() => return Ok(CancelOutcome::Cancelled),
+                    State::Closed(s) => return Ok(CancelOutcome::AlreadyClosed(s)),
+                    State::Open => {} // cancel again
+                    State::Traded(qty) => {
+                        return Err(unknown(format!("{reason}; {}", traded(qty))));
+                    }
                 },
-                Lookup::Absent => return Err(Error::OrderNotFound { id: id.to_string() }),
+                // A cancelled order may be missing from the lists for a moment.
+                Lookup::Absent => {
+                    return Err(unknown(format!(
+                        "{reason}; the venue then listed no order for the id"
+                    )));
+                }
                 Lookup::CannotAsk(why) => {
                     return Err(unknown(format!(
                         "{reason}; the venue could not be asked: {why}"
                     )));
                 }
             }
+            earlier = Some(reason);
         }
         Err(unknown(format!(
-            "{reason}; the order was still open after {RESENDS} resends"
+            "{}; the order was still open after {RESENDS} resends",
+            earlier.unwrap_or_default()
         )))
     }
 
@@ -276,28 +373,38 @@ impl Client {
             id: id.to_string(),
             status: status.to_string(),
         };
-        let mut reason = String::new();
+        let mut earlier: Option<String> = None;
         for _ in 0..=RESENDS {
-            match self.call(AMEND, &body) {
+            let reason = match self.call(AMEND, &body) {
                 Ok(_) => return Ok(()),
                 Err(Failure::Venue { code, message }) if RET_NOT_OPEN.contains(&code) => {
-                    return match self.settled_lookup(instrument, id) {
-                        Lookup::Found(seen) => match closed_status(&seen) {
-                            Some(status) => Err(closed(status)),
-                            None => Err(Error::Rejected { code, message }),
+                    let refused = Error::Rejected { code, message };
+                    return Err(match self.settled_lookup(instrument, id) {
+                        Lookup::Found(seen) => match seen.state() {
+                            State::Closed(s) => closed(s),
+                            State::Open => unless_earlier(&earlier, refused, unknown),
+                            State::Traded(qty) => unknown(traded(qty)),
                         },
-                        Lookup::Absent => Err(Error::OrderNotFound { id: id.to_string() }),
-                        Lookup::CannotAsk(why) => Err(unknown(format!(
+                        Lookup::Absent => unless_earlier(
+                            &earlier,
+                            Error::OrderNotFound { id: id.to_string() },
+                            unknown,
+                        ),
+                        Lookup::CannotAsk(why) => unknown(format!(
                             "the venue answered {code} and could not then be asked: {why}"
-                        ))),
-                    };
+                        )),
+                    });
                 }
                 Err(Failure::Venue { code, message }) => {
-                    return Err(Error::Rejected { code, message });
+                    return Err(unless_earlier(
+                        &earlier,
+                        Error::Rejected { code, message },
+                        unknown,
+                    ));
                 }
-                Err(Failure::NotSent(e)) => return Err(e),
-                Err(Failure::Unknown { reason: r, .. }) => reason = r,
-            }
+                Err(Failure::NotSent(e)) => return Err(unless_earlier(&earlier, e, unknown)),
+                Err(Failure::Unknown { reason, .. }) => reason,
+            };
             match self.settled_lookup(instrument, id) {
                 Lookup::Found(Seen::Order(o)) if o.status.is_open() => {
                     let done = trigger.is_none_or(|t| o.trigger_price == Some(t))
@@ -307,19 +414,26 @@ impl Client {
                     }
                     // Still the old values: amend again.
                 }
-                Lookup::Found(seen) => {
-                    return Err(closed(closed_status(&seen).unwrap_or(OrderStatus::Filled)));
+                Lookup::Found(Seen::Order(o)) => return Err(closed(o.status)),
+                Lookup::Found(Seen::Executed { qty, .. }) => {
+                    return Err(unknown(format!("{reason}; {}", traded(qty))));
                 }
-                Lookup::Absent => return Err(Error::OrderNotFound { id: id.to_string() }),
+                Lookup::Absent => {
+                    return Err(unknown(format!(
+                        "{reason}; the venue then listed no order for the id"
+                    )));
+                }
                 Lookup::CannotAsk(why) => {
                     return Err(unknown(format!(
                         "{reason}; the venue could not be asked: {why}"
                     )));
                 }
             }
+            earlier = Some(reason);
         }
         Err(unknown(format!(
-            "{reason}; the order still had its old values after {RESENDS} resends"
+            "{}; the order still had its old values after {RESENDS} resends",
+            earlier.unwrap_or_default()
         )))
     }
 
@@ -368,18 +482,10 @@ impl Client {
             return Ok(Some(Seen::Order(order)));
         }
         let execs = self.executions_for_id(instrument, id)?;
-        Ok(execs.into_iter().next().map(|e| Seen::Executed {
-            order_id: e.order_id,
+        Ok(execs.first().map(|e| Seen::Executed {
+            order_id: e.order_id.clone(),
+            qty: execs.iter().map(|e| e.qty).sum(),
         }))
-    }
-}
-
-/// The closed status of what was seen, `None` while the order is open.
-fn closed_status(seen: &Seen) -> Option<OrderStatus> {
-    match seen {
-        Seen::Order(o) if o.status.is_open() => None,
-        Seen::Order(o) => Some(o.status.clone()),
-        Seen::Executed { .. } => Some(OrderStatus::Filled),
     }
 }
 

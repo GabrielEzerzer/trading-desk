@@ -21,3 +21,5 @@ td-mock-bybit.workspace = true
 [[example]]
 name = "demo-smoke"
 path = "examples/demo-smoke.rs"
+# `cargo test` runs the example's unit tests (its sizing); its main never runs there.
+test = true

@@ -14,23 +14,47 @@
 //! pause (429), a few times. An IP block is returned at once: waiting ten minutes is the caller's
 //! decision.
 //!
+//! Other answers that do not mean "refused", from the error page (read 2026-11-14):
+//! - `retCode` 429, "The trading service is experiencing a high server load. Please retry if you
+//!   encounter this issue", and 10429, "System level frequency protection" (listed with the
+//!   WebSocket order-entry codes, with the same meaning as HTTP 429): sent again after a short
+//!   pause, like a rate limit.
+//! - 110079, "The order is processing and can not be operated, please try again later": sent again
+//!   after a short pause, within the same bounds; when they run out the answer goes back as the
+//!   venue gave it, except on a create (below).
+//!
+//! The page asks for a retry, but nothing proves that a body 429 or 10429, or a 110079 to a
+//! create, was not taken. Once an order request has been sent again after one of them, any later
+//! answer short of an acceptance (a duplicate id, a refusal, the retries running out, an IP block)
+//! leaves the earlier attempt's outcome open: it goes back as unknown and the caller asks the
+//! venue. An HTTP 429, a 10006 and a timestamp refusal still count as not taken, as the rate-limit
+//! and guide pages describe them, so a resend after one of them does not. Reads are not affected.
+//! - 40004, "the order is modified during the process of replacing, please check the order status
+//!   again", and 10014, "Invalid duplicate request": the outcome is unknown, so the caller asks the
+//!   venue, as after a timeout.
+//!
 //! Timestamps: the venue accepts a request when
 //! `server_time - recv_window <= timestamp < server_time + 1000` (guide page), and answers 10002
 //! otherwise. The client measures its offset from `GET /v5/market/time` on the same host when it
-//! is built, and on a 10002 measures again and retries once.
+//! is built, and on a 10002 measures again and retries once. A server time more than a day from
+//! the local clock is refused. Numbers the venue sends (server time, rate-limit resets) go through
+//! checked or saturating arithmetic, and no answer body is read past [`MAX_BODY_BYTES`].
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::io::Read;
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use reqwest::Url;
 use reqwest::blocking::Client as Http;
+use reqwest::blocking::Response;
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
 use reqwest::redirect::Policy;
 use td_core::Millis;
 
 use crate::guard::{Endpoint, same_origin};
+use crate::orders::CREATE;
 use crate::wire::{self, ServerTime};
 use crate::{ClientOrderId, DemoKeys, Error};
 
@@ -43,12 +67,26 @@ const RATE_LIMIT_RETRIES: u32 = 3;
 const LONGEST_RATE_WAIT: Duration = Duration::from_secs(3);
 /// How many times a read whose answer never arrived is tried in all.
 const READ_ATTEMPTS: u32 = 3;
+/// The most of an answer body that is read, after decompression. The largest answer the route
+/// asks for (a page of 100 executions) is tens of kilobytes.
+pub(crate) const MAX_BODY_BYTES: u64 = 4 * 1024 * 1024;
+/// The furthest the venue's server time may be from the local clock.
+const MAX_CLOCK_OFFSET_MS: i64 = 24 * 60 * 60 * 1000;
 
 pub(crate) const RET_TIMESTAMP: i64 = 10002;
 const RET_RATE_LIMIT: i64 = 10006;
 const RET_IP_RATE_LIMIT: i64 = 10018;
 const RET_SERVER_TIMEOUT: i64 = 10000;
 const RET_SERVER_ERROR: i64 = 10016;
+/// Load and frequency protection answered in the body: sent again like a rate limit.
+const RET_HIGH_LOAD: i64 = 429;
+const RET_FREQUENCY_PROTECTION: i64 = 10429;
+/// "The order is processing and can not be operated, please try again later."
+const RET_PROCESSING: i64 = 110079;
+/// "The order is modified during the process of replacing, please check the order status again."
+const RET_CHECK_STATUS: i64 = 40004;
+/// "Invalid duplicate request."
+const RET_DUPLICATE_REQUEST: i64 = 10014;
 
 /// The route's timeouts and pauses. [`Timing::default`] is what the route uses against the venue;
 /// tests against the mock shorten it. [`Client::with_timing`] refuses values outside the ranges
@@ -101,6 +139,13 @@ impl Timing {
 /// A blocking client for the venue's demo-trading v5 REST API, USDT perpetuals (`linear`) only.
 /// Call it from a thread that may block. It is `Send + Sync`; one client per session keeps the
 /// clock offset, rate-limit state and the set of client ids it has sent.
+///
+/// With [`Timing::default`], a `place`, `cancel` or `amend_stop` makes at most 39 requests (three
+/// sends and three lookups of up to 12 reads) with at most 27 s of pauses between them, so against
+/// a venue that answers each one just inside the 10 s request timeout it blocks for at most about
+/// 7 minutes; if the venue also answers with every rate-limit, retry and clock answer the client
+/// waits on, each of those requests can take up to 84 s (five attempts, a clock resync and 24 s of
+/// rate-limit waits), for at most about 55 minutes.
 pub struct Client {
     endpoint: Endpoint,
     base: Url,
@@ -128,7 +173,19 @@ impl fmt::Debug for Client {
 
 pub(crate) enum Method {
     Get(Vec<(&'static str, String)>),
+    /// A GET of a public market endpoint, sent without the key or a signature.
+    Public(Vec<(&'static str, String)>),
     Post(serde_json::Value),
+}
+
+/// What [`Client::call`] remembers across the attempts at one request.
+#[derive(Default)]
+struct Attempts {
+    /// The timestamp the latest attempt was signed with.
+    last_sent: Millis,
+    /// The answer after which an order request was sent again although that answer does not
+    /// prove the attempt was not taken.
+    unproven: Option<i64>,
 }
 
 /// How a signed request ended, short of success.
@@ -152,8 +209,13 @@ impl Client {
     /// the clock offset against the same host's server time.
     pub fn with_timing(endpoint: Endpoint, keys: DemoKeys, timing: Timing) -> Result<Self, Error> {
         let base = endpoint.base_url()?;
-        if keys.loopback_only() && endpoint == Endpoint::Demo {
-            return Err(Error::LoopbackKeysOnDemo);
+        match endpoint {
+            Endpoint::Demo if keys.loopback_only() => return Err(Error::LoopbackKeysOnDemo),
+            // Whatever listens on a local port would get the real key and a valid signature.
+            Endpoint::Loopback(_) if !keys.loopback_only() => {
+                return Err(Error::DemoKeysOnLoopback);
+            }
+            _ => {}
         }
         timing.check()?;
         let http = Http::builder()
@@ -187,10 +249,11 @@ impl Client {
 
     /// The venue's current time by this client's clock, in milliseconds.
     pub fn server_now(&self) -> Millis {
-        local_now() + *self.offset_ms.lock().unwrap()
+        local_now().saturating_add(*self.offset_ms.lock().unwrap())
     }
 
-    /// Measures the offset between the venue's server time and the local clock.
+    /// Measures the offset between the venue's server time and the local clock. A server time
+    /// more than a day away is refused and the offset left as it was.
     pub(crate) fn sync_clock(&self) -> Result<(), Error> {
         const PATH: &str = "/v5/market/time";
         let url = self.url(PATH)?;
@@ -203,7 +266,13 @@ impl Client {
                 status,
             });
         }
-        let body = response.bytes().map_err(|e| transport(PATH, &e))?;
+        let body = read_capped(response).map_err(|e| match e {
+            BodyFailure::TooLarge => Error::ResponseTooLarge { endpoint: PATH },
+            BodyFailure::Failed(reason) => Error::Transport {
+                endpoint: PATH,
+                reason: reason.into(),
+            },
+        })?;
         let after = local_now();
         let env = wire::envelope(PATH, &body)?;
         if env.ret_code != 0 {
@@ -217,9 +286,19 @@ impl Client {
             endpoint: PATH,
             reason: "timeNano is not a number".into(),
         })?;
-        let server = (nanos / 1_000_000) as i64;
-        *self.offset_ms.lock().unwrap() = server - (before + after) / 2;
+        let local = before + (after - before) / 2;
+        let offset = i64::try_from(nanos / 1_000_000)
+            .ok()
+            .and_then(|server| server.checked_sub(local))
+            .filter(|offset| offset.abs() <= MAX_CLOCK_OFFSET_MS)
+            .ok_or(Error::ServerTimeOutOfRange)?;
+        *self.offset_ms.lock().unwrap() = offset;
         Ok(())
+    }
+
+    /// A venue message with any credential withheld, as every error in the crate holds it.
+    pub(crate) fn scrub(&self, message: &str) -> String {
+        self.keys.scrub(message, "")
     }
 
     fn url(&self, path: &'static str) -> Result<Url, Error> {
@@ -234,22 +313,56 @@ impl Client {
         Ok(url)
     }
 
-    /// Sends one signed request and classifies the answer. Rate limits (10006, 429) and one
-    /// timestamp refusal are handled here by sending again, since the venue did not take the
-    /// request. Everything else goes back to the caller.
+    /// Sends one request and classifies the answer. Rate limits (10006, HTTP and body 429, 10429),
+    /// an order still processing (110079) and one timestamp refusal are handled here by sending
+    /// again, since the venue says it did not take the request. Everything else goes back to the
+    /// caller.
+    ///
+    /// Nothing proves that a body 429 or 10429, or a 110079 to a create, was not taken. Once an
+    /// order request has been sent again after one of them, a later refusal or "not sent" (the
+    /// retries running out included) does not settle whether an earlier attempt was taken, so it
+    /// goes back as [`Failure::Unknown`], signed at the last attempt's time.
     pub(crate) fn call(
         &self,
         path: &'static str,
         method: &Method,
     ) -> Result<serde_json::Value, Failure> {
+        let mut attempts = Attempts::default();
+        let result = self.send(path, method, &mut attempts);
+        let Some(code) = attempts.unproven else {
+            return result;
+        };
+        match result {
+            Err(failure @ (Failure::NotSent(_) | Failure::Venue { .. })) => Err(Failure::Unknown {
+                reason: format!(
+                    "the venue answered {code} to an earlier attempt, which does not prove that \
+                     attempt was not taken; then {}",
+                    failure_error(failure)
+                ),
+                sent_at: attempts.last_sent,
+            }),
+            other => other,
+        }
+    }
+
+    /// The request loop behind [`Client::call`].
+    fn send(
+        &self,
+        path: &'static str,
+        method: &Method,
+        attempts: &mut Attempts,
+    ) -> Result<serde_json::Value, Failure> {
         let mut resynced = false;
         let mut rate_retries = 0;
+        let signed = !matches!(method, Method::Public(_));
+        let order_request = matches!(method, Method::Post(_));
         loop {
             self.wait_for_limit(path);
             let timestamp = self.server_now();
+            attempts.last_sent = timestamp;
             let mut url = self.url(path).map_err(Failure::NotSent)?;
             let (payload, body) = match method {
-                Method::Get(query) => {
+                Method::Get(query) | Method::Public(query) => {
                     if !query.is_empty() {
                         url.query_pairs_mut()
                             .extend_pairs(query.iter().map(|(k, v)| (*k, v.as_str())));
@@ -262,10 +375,15 @@ impl Client {
                 }
             };
             let recv_window = self.timing.recv_window.as_millis() as u64;
-            let signature = self.keys.sign(timestamp, recv_window, &payload);
-            let headers = self
-                .headers(timestamp, recv_window, &signature, body.is_some())
-                .map_err(Failure::NotSent)?;
+            let (signature, headers) = if signed {
+                let signature = self.keys.sign(timestamp, recv_window, &payload);
+                let headers = self
+                    .headers(timestamp, recv_window, &signature, body.is_some())
+                    .map_err(Failure::NotSent)?;
+                (signature, headers)
+            } else {
+                (String::new(), HeaderMap::new())
+            };
             let request = match body {
                 None => self.http.get(url),
                 Some(body) => self.http.post(url).body(body),
@@ -282,11 +400,21 @@ impl Client {
             let status = response.status().as_u16();
             self.note_limit(path, response.headers());
             let reset = header_i64(response.headers(), "x-bapi-limit-reset-timestamp");
-            let body = match response.bytes() {
+            let body = match read_capped(response) {
                 Ok(b) => b,
+                // A read changes nothing, so its error goes back as is; an order request's answer
+                // was unreadable, so whether it was applied is unknown.
+                Err(BodyFailure::TooLarge) if !matches!(method, Method::Post(_)) => {
+                    return Err(Failure::NotSent(Error::ResponseTooLarge { endpoint: path }));
+                }
                 Err(e) => {
                     return Err(Failure::Unknown {
-                        reason: transport_reason(&e).into(),
+                        reason: match e {
+                            BodyFailure::TooLarge => {
+                                format!("the answer was longer than {MAX_BODY_BYTES} bytes")
+                            }
+                            BodyFailure::Failed(reason) => reason.into(),
+                        },
                         sent_at: timestamp,
                     });
                 }
@@ -337,7 +465,7 @@ impl Client {
                 RET_RATE_LIMIT => {
                     rate_retries += 1;
                     let wait = reset
-                        .map(|r| Duration::from_millis((r - self.server_now()).max(0) as u64))
+                        .map(|r| Duration::from_millis(millis_until(r, self.server_now())))
                         .unwrap_or(self.timing.settle);
                     if rate_retries > RATE_LIMIT_RETRIES || wait > LONGEST_RATE_WAIT {
                         return Err(Failure::NotSent(Error::RateLimited {
@@ -346,6 +474,41 @@ impl Client {
                         }));
                     }
                     std::thread::sleep(wait);
+                }
+                RET_HIGH_LOAD | RET_FREQUENCY_PROTECTION => {
+                    if order_request {
+                        attempts.unproven = Some(env.ret_code);
+                    }
+                    rate_retries += 1;
+                    if rate_retries > RATE_LIMIT_RETRIES {
+                        return Err(Failure::NotSent(Error::RateLimited {
+                            endpoint: path,
+                            ip_block: false,
+                        }));
+                    }
+                    std::thread::sleep(self.timing.settle * rate_retries);
+                }
+                RET_PROCESSING => {
+                    if path == CREATE {
+                        attempts.unproven = Some(env.ret_code);
+                    }
+                    rate_retries += 1;
+                    if rate_retries > RATE_LIMIT_RETRIES {
+                        return Err(Failure::Venue {
+                            code: env.ret_code,
+                            message: self.keys.scrub(&env.ret_msg, &signature),
+                        });
+                    }
+                    std::thread::sleep(self.timing.settle * rate_retries);
+                }
+                RET_CHECK_STATUS | RET_DUPLICATE_REQUEST => {
+                    return Err(Failure::Unknown {
+                        reason: format!(
+                            "the venue answered {}, which leaves the outcome open",
+                            env.ret_code
+                        ),
+                        sent_at: timestamp,
+                    });
                 }
                 RET_IP_RATE_LIMIT => {
                     return Err(Failure::NotSent(Error::RateLimited {
@@ -386,7 +549,20 @@ impl Client {
         path: &'static str,
         query: Vec<(&'static str, String)>,
     ) -> Result<serde_json::Value, Error> {
-        let method = Method::Get(query);
+        self.read(path, Method::Get(query))
+    }
+
+    /// A read of a public market endpoint: like [`Client::get`], without the key or a signature,
+    /// through the same host checks and HTTP client.
+    pub(crate) fn get_public(
+        &self,
+        path: &'static str,
+        query: Vec<(&'static str, String)>,
+    ) -> Result<serde_json::Value, Error> {
+        self.read(path, Method::Public(query))
+    }
+
+    fn read(&self, path: &'static str, method: Method) -> Result<serde_json::Value, Error> {
         let mut last = String::new();
         for attempt in 0..READ_ATTEMPTS {
             if attempt > 0 {
@@ -467,7 +643,7 @@ impl Client {
     fn wait_for_limit(&self, path: &'static str) {
         let reset = self.limits.lock().unwrap().get(path).copied();
         if let Some(reset) = reset {
-            let wait = (reset - self.server_now()).max(0) as u64;
+            let wait = millis_until(reset, self.server_now());
             std::thread::sleep(Duration::from_millis(wait).min(LONGEST_RATE_WAIT));
         }
     }
@@ -503,6 +679,39 @@ fn header_i64(headers: &HeaderMap, name: &str) -> Option<i64> {
     headers.get(name)?.to_str().ok()?.trim().parse().ok()
 }
 
+/// Milliseconds from `now` until `at`, zero when `at` has passed, for any `at` the venue sends.
+fn millis_until(at: Millis, now: Millis) -> u64 {
+    u64::try_from(at.saturating_sub(now)).unwrap_or(0)
+}
+
+enum BodyFailure {
+    TooLarge,
+    Failed(&'static str),
+}
+
+/// Reads an answer body, decompressed, up to [`MAX_BODY_BYTES`].
+fn read_capped(response: Response) -> Result<Vec<u8>, BodyFailure> {
+    let mut body = Vec::new();
+    response
+        .take(MAX_BODY_BYTES + 1)
+        .read_to_end(&mut body)
+        .map_err(|e| {
+            BodyFailure::Failed(
+                match e.get_ref().and_then(|i| i.downcast_ref::<reqwest::Error>()) {
+                    Some(inner) => transport_reason(inner),
+                    None if e.kind() == std::io::ErrorKind::TimedOut => {
+                        "timed out before the answer arrived"
+                    }
+                    None => "the connection failed before the answer arrived",
+                },
+            )
+        })?;
+    if body.len() as u64 > MAX_BODY_BYTES {
+        return Err(BodyFailure::TooLarge);
+    }
+    Ok(body)
+}
+
 fn local_now() -> Millis {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -528,5 +737,31 @@ fn transport(endpoint: &'static str, e: &reqwest::Error) -> Error {
     Error::Transport {
         endpoint,
         reason: transport_reason(e).into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::TcpListener;
+
+    use super::*;
+
+    #[test]
+    fn keys_that_are_not_loopback_only_never_reach_a_local_port() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let keys = DemoKeys::from_values("not-a-real-key", "not-a-real-secret", false).unwrap();
+        let err = Client::new(Endpoint::Loopback(port), keys).unwrap_err();
+        assert_eq!(err, Error::DemoKeysOnLoopback);
+        // The refusal comes before the clock sync, the first request a client makes.
+        assert!(listener.accept().is_err(), "the local port was contacted");
+    }
+
+    #[test]
+    fn a_reset_time_from_the_venue_cannot_overflow_the_wait() {
+        assert_eq!(millis_until(i64::MIN, 1_700_000_000_000), 0);
+        assert_eq!(millis_until(i64::MAX, -1), u64::try_from(i64::MAX).unwrap());
+        assert_eq!(millis_until(1_000, 400), 600);
     }
 }

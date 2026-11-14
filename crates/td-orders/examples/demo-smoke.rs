@@ -2,20 +2,23 @@
 //! to the demo account, so it runs only with `--confirm-send-orders`:
 //!
 //! ```text
-//! cargo run -p td-orders --example demo-smoke -- --confirm-send-orders \
-//!     --symbol BTCUSDT --price 65000 --tick 0.1 --lot 0.001 --min-qty 0.001 --min-notional 5
+//! cargo run -p td-orders --example demo-smoke -- --confirm-send-orders --symbol <SYMBOL>
 //! ```
 //!
-//! The keys come from `BYBIT_DEMO_API_KEY` and `BYBIT_DEMO_API_SECRET`. `--price` is roughly the
-//! current price, used for the notional check and to place the stop far below it; the filters are
-//! the symbol's `tickSize`, `qtyStep`, `minOrderQty` and `minNotionalValue` from the venue's
-//! instruments-info page. The order size is the smallest the filters allow.
+//! The keys come from `BYBIT_DEMO_API_KEY` and `BYBIT_DEMO_API_SECRET`. The symbol must be a USDT
+//! perpetual that is trading. Its tick size, quantity step, minimum quantity and minimum notional
+//! come from the venue's public instruments info, and its last and mark prices from its public
+//! ticker, both read from the demo host. The order quantity is the smallest the venue allows: the
+//! minimum quantity, raised only as far as the minimum notional requires at the last price. Nothing
+//! is sent when the last and mark prices are more than 2% apart, or when the order is worth more
+//! than [`MAX_NOTIONAL`] at the higher of the two.
 //!
 //! Steps: check the symbol is flat with no open orders; market buy and confirm the fill from the
 //! executions; rest a reduce-only stop far below the price, read it back, amend it and cancel it;
 //! resend the first order's client id and expect a refusal; close with a reduce-only market sell;
 //! reconcile. Each step prints one line, and the last line is PASS or FAIL. Nothing printed
-//! contains a key, a signature or a response body.
+//! contains a key, a signature or a response body. A failure once the buy may be on the account
+//! says that a position, and possibly a stop, may be left open.
 
 use std::process::ExitCode;
 use std::time::Duration;
@@ -24,77 +27,75 @@ use td_core::{
     FeeSchedule, Instrument, InstrumentId, InstrumentKind, OrderRequest, OrderType, Rounding, Side,
     TimeInForce, Venue,
 };
-use td_orders::{CancelOutcome, Client, ClientOrderId, DemoKeys, Endpoint, Error, ExecKind};
+use td_orders::{
+    CancelOutcome, Client, ClientOrderId, DemoKeys, Endpoint, Error, ExecKind, SETTLE_COIN,
+};
 
-const USAGE: &str = "usage: demo-smoke --confirm-send-orders --symbol <SYMBOL> --price <PRICE> \
---tick <TICK> --lot <LOT> --min-qty <MIN_QTY> --min-notional <MIN_NOTIONAL>";
+/// The most one order may be worth, in the settle coin. Checked before any order is sent.
+const MAX_NOTIONAL: f64 = 250.0;
+/// How far apart, as a fraction of the lower, the last and mark prices may be.
+const MAX_PRICE_GAP: f64 = 0.02;
 
-struct Args {
-    symbol: String,
-    price: f64,
-    tick: f64,
-    lot: f64,
-    min_qty: f64,
-    min_notional: f64,
-}
+const USAGE: &str = "usage: demo-smoke --confirm-send-orders --symbol <SYMBOL>";
 
-fn parse_args() -> Result<Args, String> {
-    let raw: Vec<String> = std::env::args().skip(1).collect();
-    if !raw.iter().any(|a| a == "--confirm-send-orders") {
+fn parse_args() -> Result<String, String> {
+    let mut confirmed = false;
+    let mut symbol = None;
+    let mut raw = std::env::args().skip(1);
+    while let Some(arg) = raw.next() {
+        match arg.as_str() {
+            "--confirm-send-orders" => confirmed = true,
+            "--symbol" if symbol.is_none() => {
+                symbol = Some(
+                    raw.next()
+                        .ok_or(format!("--symbol needs a value\n{USAGE}"))?,
+                );
+            }
+            other => return Err(format!("unexpected argument {other:?}\n{USAGE}")),
+        }
+    }
+    if !confirmed {
         return Err(format!(
             "refusing to send orders without --confirm-send-orders\n{USAGE}"
         ));
     }
-    let value = |name: &str| -> Result<String, String> {
-        let at = raw
-            .iter()
-            .position(|a| a == name)
-            .ok_or(format!("missing {name}\n{USAGE}"))?;
-        raw.get(at + 1)
-            .cloned()
-            .ok_or(format!("{name} needs a value\n{USAGE}"))
-    };
-    let number = |name: &str| -> Result<f64, String> {
-        let v: f64 = value(name)?
-            .parse()
-            .map_err(|_| format!("{name} is not a number"))?;
-        if v.is_finite() && v >= 0.0 {
-            Ok(v)
-        } else {
-            Err(format!("{name} must be a finite number, zero or more"))
-        }
-    };
-    let args = Args {
-        symbol: value("--symbol")?,
-        price: number("--price")?,
-        tick: number("--tick")?,
-        lot: number("--lot")?,
-        min_qty: number("--min-qty")?,
-        min_notional: number("--min-notional")?,
-    };
-    if args.price == 0.0 || args.tick == 0.0 || args.lot == 0.0 {
-        return Err("--price, --tick and --lot must be above zero".into());
+    let symbol = symbol.ok_or(format!("missing --symbol\n{USAGE}"))?;
+    if symbol.is_empty() || !symbol.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        return Err("--symbol must be letters and digits only".into());
     }
-    Ok(args)
+    Ok(symbol)
 }
 
 fn main() -> ExitCode {
-    let args = match parse_args() {
-        Ok(a) => a,
+    let symbol = match parse_args() {
+        Ok(s) => s,
         Err(e) => {
             eprintln!("{e}");
             return ExitCode::from(2);
         }
     };
-    match run(&args) {
+    let mut bought = false;
+    match run(&symbol, &mut bought) {
         Ok(()) => {
             println!("PASS");
             ExitCode::SUCCESS
         }
         Err(e) => {
-            println!("FAIL: {e}");
+            println!("FAIL: {}", failure(&e, &symbol, bought));
             ExitCode::FAILURE
         }
+    }
+}
+
+/// A failure line's text: once the buy may be on the account, it says what may be left open.
+fn failure(err: &str, symbol: &str, bought: bool) -> String {
+    if bought {
+        format!(
+            "{err}. A position on {symbol}, and possibly a reduce-only stop, may be open on the \
+             demo account; check them and close them by hand"
+        )
+    } else {
+        err.to_string()
     }
 }
 
@@ -111,19 +112,68 @@ fn e(what: &'static str) -> impl Fn(Error) -> String {
     move |err| format!("{what}: {err}")
 }
 
-fn run(args: &Args) -> Result<(), String> {
+/// The smallest order the venue allows, and what it is worth at the higher of the last and mark
+/// prices: the minimum quantity, raised to the next step on the grid only when the minimum notional
+/// at the last price needs more. The small slack keeps a quantity already on the grid from being
+/// pushed a step up by float noise in the division. A wrong last price would both set the
+/// quantity and hide it from the ceiling, so prices more than [`MAX_PRICE_GAP`] apart are refused
+/// and the ceiling is checked at the higher one.
+fn order_size(instrument: &Instrument, last: f64, mark: f64) -> Result<(f64, f64), String> {
+    let gap_ok = last > 0.0 && mark > 0.0 && (last - mark).abs() <= MAX_PRICE_GAP * last.min(mark);
+    if !gap_ok {
+        return Err(format!(
+            "the last price {last} and the mark price {mark} are more than {}% apart; nothing \
+             was sent",
+            MAX_PRICE_GAP * 100.0
+        ));
+    }
+    let needed = instrument.min_qty.max(instrument.min_notional / last);
+    let qty =
+        instrument.round_qty((needed / instrument.lot_size - 1e-9).ceil() * instrument.lot_size);
+    let high = last.max(mark);
+    let notional = qty * high;
+    if notional > MAX_NOTIONAL {
+        return Err(format!(
+            "the smallest order, {qty} at {high}, is worth {notional:.2} {SETTLE_COIN}, over the \
+             {MAX_NOTIONAL} ceiling; nothing was sent"
+        ));
+    }
+    Ok((qty, notional))
+}
+
+/// Runs the steps. `bought` is set once the market buy may be on the account.
+fn run(symbol: &str, bought: &mut bool) -> Result<(), String> {
+    let client = Client::new(Endpoint::Demo, DemoKeys::from_env().map_err(e("keys"))?)
+        .map_err(e("connect"))?;
+    let start = client.server_now();
+
+    let info = client
+        .instrument_info(symbol)
+        .map_err(e("instrument info"))?;
+    check(
+        info.contract_type == "LinearPerpetual"
+            && info.status == "Trading"
+            && info.settle_coin == SETTLE_COIN,
+        format!(
+            "{symbol} is a {:?} {:?} contract settled in {:?}, not a trading {SETTLE_COIN} \
+             perpetual",
+            info.status, info.contract_type, info.settle_coin
+        ),
+    )?;
+    let ticker = client.ticker(symbol).map_err(e("ticker"))?;
+    let (price, mark) = (ticker.last_price, ticker.mark_price);
     let instrument = Instrument {
         id: InstrumentId {
             venue: Venue::Bybit,
-            symbol: args.symbol.clone(),
+            symbol: symbol.into(),
             kind: InstrumentKind::Perpetual,
         },
-        base: String::new(),
-        quote: "USDT".into(),
-        tick_size: args.tick,
-        lot_size: args.lot,
-        min_qty: args.min_qty,
-        min_notional: args.min_notional,
+        base: info.base_coin,
+        quote: info.quote_coin,
+        tick_size: info.tick_size,
+        lot_size: info.qty_step,
+        min_qty: info.min_order_qty,
+        min_notional: info.min_notional,
         // Fees are not used to send orders.
         fees: FeeSchedule {
             maker: 0.0,
@@ -131,18 +181,17 @@ fn run(args: &Args) -> Result<(), String> {
             per_unit: 0.0,
         },
     };
-    // The smallest quantity that meets the minimum quantity and, with a 10% margin for the price
-    // moving, the minimum notional.
-    let by_notional = (args.min_notional * 1.1 / args.price / args.lot).ceil() * args.lot;
-    let qty = instrument.round_qty(args.min_qty.max(by_notional).max(args.lot));
+    let (qty, notional) = order_size(&instrument, price, mark)?;
     let run_id = std::process::id();
     let id =
         |tag: &str| ClientOrderId::new(format!("smoke-{run_id}-{tag}")).map_err(e("client id"));
-
-    let client = Client::new(Endpoint::Demo, DemoKeys::from_env().map_err(e("keys"))?)
-        .map_err(e("connect"))?;
-    let start = client.server_now();
-    step("connect", format!("clock synced, order size {qty}"));
+    step(
+        "connect",
+        format!(
+            "clock synced, order size {qty} at last price {price} (mark {mark}), worth at most \
+             {notional:.2} {SETTLE_COIN}"
+        ),
+    );
 
     let position = client.position(&instrument).map_err(e("position"))?;
     check(
@@ -166,9 +215,9 @@ fn run(args: &Args) -> Result<(), String> {
         client_tag: None,
     };
     let buy_id = id("buy")?;
-    let buy = client
-        .place(&instrument, &market(Side::Buy, false), &buy_id, args.price)
-        .map_err(e("market buy"))?;
+    let buy = client.place(&instrument, &market(Side::Buy, false), &buy_id, price);
+    *bought = matches!(buy, Ok(_) | Err(Error::OutcomeUnknown { .. }));
+    let buy = buy.map_err(e("market buy"))?;
     let mut fills = Vec::new();
     for _ in 0..10 {
         fills = client
@@ -177,14 +226,14 @@ fn run(args: &Args) -> Result<(), String> {
             .into_iter()
             .filter(|x| x.kind == ExecKind::Trade && x.client_id == buy_id.as_str())
             .collect();
-        if (fills.iter().map(|x| x.qty).sum::<f64>() - qty).abs() < args.lot / 2.0 {
+        if (fills.iter().map(|x| x.qty).sum::<f64>() - qty).abs() < instrument.lot_size / 2.0 {
             break;
         }
         std::thread::sleep(Duration::from_millis(500));
     }
     let filled: f64 = fills.iter().map(|x| x.qty).sum();
     check(
-        (filled - qty).abs() < args.lot / 2.0,
+        (filled - qty).abs() < instrument.lot_size / 2.0,
         format!("the buy filled {filled} of {qty}"),
     )?;
     check(
@@ -198,13 +247,13 @@ fn run(args: &Args) -> Result<(), String> {
 
     let position = client.position(&instrument).map_err(e("position"))?;
     check(
-        (position.size - qty).abs() < args.lot / 2.0,
+        (position.size - qty).abs() < instrument.lot_size / 2.0,
         format!("the position is {} after the buy", position.size),
     )?;
     let last = if position.mark_price > 0.0 {
         position.mark_price
     } else {
-        args.price
+        price
     };
 
     let stop_id = id("stop")?;
@@ -260,7 +309,7 @@ fn run(args: &Args) -> Result<(), String> {
         Err(Error::DuplicateClientId { .. }) => step("resend", "the venue refused the used id"),
         Ok(p) => {
             return Err(format!(
-                "the venue accepted a used client id as order {}; close it by hand",
+                "the venue accepted a used client id as order {:?}; close it by hand",
                 p.order_id
             ));
         }
@@ -313,4 +362,76 @@ fn run(args: &Args) -> Result<(), String> {
         ),
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn instrument(lot_size: f64, min_qty: f64, min_notional: f64) -> Instrument {
+        Instrument {
+            id: InstrumentId {
+                venue: Venue::Bybit,
+                symbol: "BTCUSDT".into(),
+                kind: InstrumentKind::Perpetual,
+            },
+            base: "BTC".into(),
+            quote: "USDT".into(),
+            tick_size: 0.1,
+            lot_size,
+            min_qty,
+            min_notional,
+            fees: FeeSchedule {
+                maker: 0.0,
+                taker: 0.0,
+                per_unit: 0.0,
+            },
+        }
+    }
+
+    #[test]
+    fn a_last_price_far_from_the_mark_is_refused() {
+        // A last price of 1 would size the order at 5 and value it at 5, under the ceiling.
+        let i = instrument(0.001, 0.001, 5.0);
+        let err = order_size(&i, 1.0, 65000.0).unwrap_err();
+        assert!(err.contains("apart"), "{err}");
+        assert!(order_size(&i, 65000.0, 1.0).is_err());
+        assert!(order_size(&i, 65000.0, 66400.0).is_err(), "2.15% apart");
+        assert!(order_size(&i, 65000.0, 66200.0).is_ok(), "1.85% apart");
+    }
+
+    #[test]
+    fn the_ceiling_is_checked_at_the_higher_price() {
+        // 0.0051 at the last price 49000 is worth 249.90, under the ceiling; at the mark price
+        // 49900, 1.8% higher, it is worth 254.49, over it.
+        let i = instrument(0.0001, 0.001, 249.0);
+        let err = order_size(&i, 49000.0, 49900.0).unwrap_err();
+        assert!(err.contains("ceiling"), "{err}");
+        let (qty, notional) = order_size(&i, 49000.0, 49000.0).unwrap();
+        assert_eq!(qty, 0.0051);
+        assert!((notional - 249.9).abs() < 1e-9, "{notional}");
+    }
+
+    #[test]
+    fn the_quantity_is_the_minimum_raised_only_as_far_as_the_notional_needs() {
+        let (qty, notional) = order_size(&instrument(0.001, 0.001, 5.0), 65000.0, 65010.0).unwrap();
+        assert_eq!(qty, 0.001);
+        assert!((notional - 65.01).abs() < 1e-9, "{notional}");
+        // 100 at 65000 needs 0.00154, so the next step up; 130 needs exactly 0.002, which stays.
+        for min_notional in [100.0, 130.0] {
+            let i = instrument(0.001, 0.001, min_notional);
+            assert_eq!(order_size(&i, 65000.0, 65000.0).unwrap().0, 0.002);
+        }
+    }
+
+    #[test]
+    fn a_failure_after_the_buy_says_what_may_be_left_open() {
+        assert_eq!(failure("ticker: x", "BTCUSDT", false), "ticker: x");
+        let shown = failure("stop: x", "BTCUSDT", true);
+        assert!(
+            shown.starts_with("stop: x. A position on BTCUSDT"),
+            "{shown}"
+        );
+        assert!(shown.contains("reduce-only stop"), "{shown}");
+    }
 }
