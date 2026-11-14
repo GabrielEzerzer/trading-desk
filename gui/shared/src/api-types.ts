@@ -226,7 +226,15 @@ close_at_end?: boolean,
  * quote currency, the default, or its base currency, as a dollar account trading USD/JPY
  * (FX only; see [`Session::new`]). Left out of the saved result when it is the default.
  */
-account_currency?: AccountCurrency, };
+account_currency?: AccountCurrency, 
+/**
+ * Instruments on the same venue whose closed bars at `timeframe` the strategy can read beside
+ * its own, aligned to them ([`crate::Context::reference`]). They are read-only: orders,
+ * fills, costs and the account stay on `instrument`. Their bars are given to the run with
+ * [`run_with_references`] and are part of the data fingerprint. Left out of the saved result
+ * when there are none, the default.
+ */
+references?: Array<InstrumentId>, };
 
 export type BacktestResult = { config: BacktestConfig, 
 /**
@@ -1677,7 +1685,8 @@ risk_of_ruin: number | null,
  */
 return_without_best_trade: number | null, 
 /**
- * The worst loss within one day, on the firm's day when its rule states one.
+ * The worst loss within one day, on the firm's day when its rule states one, as a fraction
+ * of that day's starting balance: what an attempt started that morning would have lost.
  */
 worst_daily_loss: number | null, 
 /**
@@ -1844,9 +1853,12 @@ export type PropFirmOdds = {
  */
 pass: number, 
 /**
- * The fraction of paths that breach a limit within the horizon, trading on after reaching
- * the target as a funded account would. The `prop_firm` kind rule asks for at most 0.10
- * over 90 days.
+ * The fraction of paths that breach a limit within the horizon: in a phase of the
+ * evaluation, or after the last phase passes, trading on as the funded account from a fresh
+ * balance and a fresh peak, as a firm starts each phase and the funded account again at the
+ * account size. With attempt terms the funded account takes its payouts by them, which
+ * leave the balance and move no floor, unless the terms lock the floor at the first payout;
+ * without them it takes none. The `prop_firm` kind rule asks for at most 0.10 over 90 days.
  */
 breach: number, paths: number, 
 /**
@@ -1870,14 +1882,17 @@ export type PropFirmAttempt = {
  */
 full: AttemptFigures, 
 /**
- * From the daily returns with their mean scaled by `reduced_edge_factor` and their shape
- * unchanged. The `prop_firm` kind rule asks for its `value` to be above zero.
+ * From the daily returns with a positive mean scaled by `reduced_edge_factor` and their
+ * shape unchanged; with a negative mean, the same as `full`, since a reduction never adds
+ * edge. The `prop_firm` kind rule asks for its `value` to be above zero.
  */
 reduced: AttemptFigures, 
 /**
  * From the daily returns with their mean removed (a factor of 0) and their shape unchanged:
  * what the terms alone are worth, with no edge. A positive value here says the terms pay for
  * an attempt by themselves, so a positive `reduced` value does not show that the edge does.
+ * With a negative mean, removing it reads better than `full`: this is the terms without an
+ * edge, not a reduction of the one the test shows.
  * Reported only: no line of the verdict judges it. `None` in a result saved before it
  * existed.
  */
@@ -2406,7 +2421,15 @@ strategy: string,
  * Some of the plan's instruments, run in the plan's order; every one of them when left out.
  * Each must be one of the plan's.
  */
-instruments?: Array<InstrumentId>, };
+instruments?: Array<InstrumentId>, 
+/**
+ * Reference instruments every run of each battery names
+ * ([`td_engine::BacktestConfig::references`]): the strategy reads their bars beside its own
+ * but trades only the plan's instrument. Each must be on the venue of every instrument run,
+ * and the store must hold their bars over the plan's period; they are not downloaded. None
+ * when left out.
+ */
+references?: Array<InstrumentId>, };
 
 /**
  * What a plan job kept: one entry per instrument whose battery finished or reached the luck test
@@ -2497,7 +2520,12 @@ runs: number,
  * this instrument, this one included; batteries saved before code hashes were recorded count
  * together as one version. Keyed by strategy name like `runs`.
  */
-code_versions: number, };
+code_versions: number, 
+/**
+ * The reference instruments the battery's runs named; left out when none. A verdict with
+ * references and one without share a row, the newer winning as above.
+ */
+references?: Array<InstrumentId>, };
 
 /**
  * A saved run in full.
@@ -2659,7 +2687,8 @@ fees?: FeeSchedule,
 /**
  * The saved verdict (a plan run's id) the session is started from: a verdict of the same
  * strategy on the same instrument. Left out, the strategy's latest verdict on the instrument
- * as `GET /verdicts` gives it, if it has one. Refused on a manual session.
+ * as `GET /verdicts` gives it, if it has one. Refused on a manual session, and for a verdict
+ * judged with reference instruments, named or latest, since a session cannot feed them.
  */
 verdict_run_id?: RunId, };
 

@@ -1,6 +1,6 @@
 use td_core::{
-    Candle, FeeSchedule, Fill, Instrument, Millis, OrderId, OrderRequest, OrderType, Rounding,
-    Side, Timeframe,
+    Candle, FeeSchedule, Fill, Instrument, InstrumentId, Millis, OrderId, OrderRequest, OrderType,
+    Rounding, Side, Timeframe,
 };
 
 use crate::broker::ENTRY_CANCELLED;
@@ -32,6 +32,8 @@ pub struct Context<'a> {
     pub(crate) portfolio: &'a Portfolio,
     /// The funding events fed with the bars so far, oldest first; see [`Context::funding`].
     pub(crate) funding: &'a [(Millis, f64)],
+    /// Each reference instrument's bars, one slot per bar in `bars`; see [`Context::reference`].
+    pub(crate) references: &'a [(InstrumentId, Vec<Option<Candle>>)],
     pub(crate) broker: &'a mut dyn Broker,
     pub(crate) orders: &'a mut Vec<Order>,
     pub(crate) warming_up: bool,
@@ -128,6 +130,25 @@ impl Context<'_> {
     /// bar. It is empty for a kind without funding (spot, FX).
     pub fn funding(&self) -> &[(Millis, f64)] {
         self.funding
+    }
+
+    /// The closed bars of `instrument`, one of the reference instruments the run names
+    /// ([`crate::BacktestConfig::references`]), aligned to [`Context::bars`]: one slot per bar
+    /// there, warm-up bars included, holding the reference bar that opens at that bar's open time,
+    /// or `None` where the reference instrument has no bar. Both are on the run's timeframe, so the
+    /// last slot is the reference bar that closed with the current bar, and no slot holds a bar
+    /// that closes after it. A missing bar stays `None`; it is never filled from the one before. A
+    /// reference bar at a time the run has no bar of its own is not shown. `None` when the run does
+    /// not name `instrument`, as in a run that names no references.
+    ///
+    /// A reference instrument is only read: an order for it is rejected, since orders, fills,
+    /// costs and the account stay on [`Context::instrument`]. Backtests, sweeps, out-of-sample and
+    /// walk-forward runs and the battery supply it; a paper session names none (see the README).
+    pub fn reference(&self, instrument: &InstrumentId) -> Option<&[Option<Candle>]> {
+        self.references
+            .iter()
+            .find(|(id, _)| id == instrument)
+            .map(|(_, slots)| slots.as_slice())
     }
 
     pub fn open_orders(&self) -> &[Order] {

@@ -54,6 +54,12 @@ pub enum EngineError {
     #[error("invalid session config: {0}")]
     InvalidConfig(&'static str),
 
+    /// The reference instruments a run names ([`crate::BacktestConfig::references`]) or the bars
+    /// given for them: one on another venue, the traded instrument itself, one named twice, or bars
+    /// that do not match the names.
+    #[error("reference instruments: {0}")]
+    InvalidReferences(String),
+
     #[error("unknown strategy {0:?}")]
     UnknownStrategy(String),
 

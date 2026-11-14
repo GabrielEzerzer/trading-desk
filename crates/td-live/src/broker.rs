@@ -44,8 +44,9 @@ const ENTRY_NOT_SENT: &str = "its entry was not sent";
 const ENTRY_CLOSED: &str = "its entry closed unfilled at the venue";
 const RESTARTED: &str = "cancelled: the session restarted before the order's outcome was known, \
                          and the venue holds no such order";
-/// Why no close at market goes out for a fill whose stop the venue did not take while going live.
-const NO_CLOSE_ON_RESTART: &str = "a session going live after a restart sends no close at market";
+/// Why no close at market goes out while an order carried over a restart is unresolved
+/// (`Core::restart_unresolved`).
+const NO_CLOSE_ON_RESTART: &str = "no close at market goes out for an order carried over a restart";
 
 /// What kind of disagreement stopped the broker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -79,6 +80,9 @@ pub enum FaultKind {
     /// A replayed session made calls that differ from the record, went past it, or was handed a
     /// record made for another session or holding values no live run makes.
     ReplayDiverged,
+    /// Part of the position this session owes a stop for has none of the session's reduce-only
+    /// stops resting at the venue to cover it.
+    Uncovered,
 }
 
 impl fmt::Display for FaultKind {
@@ -97,6 +101,7 @@ impl fmt::Display for FaultKind {
             FaultKind::VenueUnreadable => "venue unreadable",
             FaultKind::IdCollision => "id collision",
             FaultKind::ReplayDiverged => "replay diverged",
+            FaultKind::Uncovered => "uncovered position",
         })
     }
 }
@@ -164,6 +169,12 @@ struct Book {
     pending: Vec<BrokerEvent>,
     /// The signed sum of the fills reported.
     tally: f64,
+    /// The quantity this session owes a stop for: each fill of an entry that asked for a stop
+    /// adds what it opens, any fill takes off what it closes (a stop's own fill, a close at
+    /// market, a strategy's exit), and a stop the session cancelled takes off what it had not
+    /// filled. Never more than the tally's size. A record made before this field existed is
+    /// refused when loaded: no released version wrote one.
+    owed: f64,
     /// Server time when the broker was built: earlier executions are not this session's to judge.
     floor: Millis,
     /// The time of the newest execution processed.
@@ -190,6 +201,13 @@ struct Tracked {
     /// A cancel was sent: its outcome was lost, or it took and the next read settles any fill
     /// made before it.
     cancel_asked: bool,
+    /// An order carried over a restart whose outcome the venue has not settled: an entry whose
+    /// outcome was unknown, or an entry's stop sent with an unknown outcome
+    /// ([`At::Unsettled`]), from when going live starts until the venue settles it. While any
+    /// order is carried, no close at market goes out (`Core::restart_unresolved`). A record made
+    /// before this field existed loads it as false.
+    #[serde(default)]
+    carried: bool,
 }
 
 /// Where an order stands at the venue.
@@ -205,8 +223,13 @@ enum At {
     /// At the venue under its `o` id.
     Live,
     /// An entry's attached stop whose first placement, made before the entry's fill was
-    /// confirmed, did not rest: it is placed under its `s` id on the first fill the venue confirms.
+    /// confirmed, the venue refused: it is placed under its `s` id on the first fill the venue
+    /// confirms.
     Unplaced,
+    /// An entry's attached stop sent under its `o` id whose outcome is unknown: it may rest. On
+    /// the first fill the venue confirms, the venue is asked about it before anything else goes
+    /// out for the fill (`Core::settle_stop`); going live after a restart asks at once.
+    Unsettled,
     /// An entry's attached stop at the venue under its `s` id.
     Cover,
     /// A stop replaced by a close at market under its `c` id.
@@ -222,12 +245,10 @@ enum Basis {
     /// The quantity sent: the venue took the entry but its fill is not confirmed yet. A stop the
     /// venue does not take is placed on the first confirmed fill; nothing is closed for it.
     Sent,
-    /// A fill the venue confirmed in this call. A stop the venue refuses is replaced by a close
-    /// at market for the fill.
+    /// A fill the venue confirmed, or listed while going live. A stop the venue refuses is
+    /// replaced by a close at market for the fill, unless an order carried over a restart is
+    /// unresolved.
     Filled,
-    /// A fill the venue lists for an entry adopted while going live after a restart. Only a
-    /// reduce-only stop goes out for it, never a close at market.
-    Restart,
 }
 
 /// The broker the session owns. See the crate documentation.
@@ -389,13 +410,14 @@ impl VenueHandle {
             .push_back(record);
     }
 
-    /// Ends a replay: resolves the orders whose request outcome was lost and those the session
-    /// submitted past the record by asking the venue, and reconciles the venue with the recorded
-    /// state. An order the venue holds is adopted, with any protective stop it already holds for
-    /// it; one it does not hold is refused, never sent. The only orders this sends are reduce-only
-    /// stops, and their resizes, for fills the venue lists. Every record must have been replayed.
-    /// A fault the records carry is restored, and then nothing is sent and the fault is returned.
-    /// Does nothing more on a broker that is not replaying.
+    /// Ends a replay: resolves the orders whose request outcome was lost, the stops sent with an
+    /// unknown outcome and the orders the session submitted past the record by asking the venue,
+    /// and reconciles the venue with the recorded state. An order the venue holds is adopted, with
+    /// any protective stop it already holds for it; one it does not hold is refused, never sent.
+    /// The only orders this sends are reduce-only stops, and their resizes, for fills the venue
+    /// lists. Every record must have been replayed. A fault the records carry is restored, and
+    /// then nothing is sent and the fault is returned. Does nothing more on a broker that is not
+    /// replaying.
     pub fn go_live(&self) -> Result<(), BrokerFault> {
         let mut core = lock(&self.core);
         core.go_live();
@@ -498,6 +520,23 @@ fn stop_order(entry: &Order, qty: f64) -> Option<Order> {
     })
 }
 
+/// The quantity owed a stop after a fill of signed quantity `fill` on signed position
+/// `position`: what the fill closes is no longer owed, and a fill of an entry that asked for a
+/// stop (`stopped`) owes one for what it opens.
+fn owe(owed: f64, position: f64, fill: f64, stopped: bool) -> f64 {
+    let closes = if position * fill < 0.0 {
+        fill.abs().min(position.abs())
+    } else {
+        0.0
+    };
+    let owed = (owed - closes).max(0.0);
+    if stopped {
+        owed + fill.abs() - closes
+    } else {
+        owed
+    }
+}
+
 /// The venue refused a stop because the market is already through its trigger.
 fn through_market(error: &RouteError) -> bool {
     matches!(
@@ -513,7 +552,8 @@ fn through_market(error: &RouteError) -> bool {
 /// How placing a stop under an `s` id went.
 enum Covered {
     Placed,
-    /// Its outcome is unknown, or the venue already held the id.
+    /// Its outcome is unknown, or the venue already held the id with an order that is not this
+    /// cover or could not be read.
     Unknown(String),
     /// It was not taken, or not sent because the broker faulted.
     Refused(String),
@@ -628,6 +668,7 @@ impl Core {
                 open: true,
                 announced: 0.0,
                 cancel_asked: false,
+                carried: false,
             },
         );
     }
@@ -654,6 +695,7 @@ impl Core {
     fn refuse(&mut self, id: OrderId, reason: &str) {
         let t = self.tracked(id);
         t.at = At::Refused;
+        t.carried = false;
         let stop = t.order.attached_stop;
         self.book.pending.push(BrokerEvent::Cancelled {
             id,
@@ -665,6 +707,11 @@ impl Core {
                 reason: ENTRY_NOT_SENT.into(),
             });
         }
+    }
+
+    /// Whether an order carried over a restart is still unresolved ([`Tracked::carried`]).
+    fn restart_unresolved(&self) -> bool {
+        self.book.orders.values().any(|t| t.carried)
     }
 
     fn is_stale(&self, order: &Order) -> bool {
@@ -770,9 +817,10 @@ impl Core {
 
     /// Takes an order the venue already holds, unless it was created before the order was
     /// decided, which means another session used the prefix. An entry's attached stop is then
-    /// taken from the venue if it holds it, and otherwise placed as for an entry just sent. While
-    /// going live after a restart (`restart`) a stop goes out only for the fill the venue lists;
-    /// an entry with none gets its stop when the next bar reads its fill.
+    /// taken from the venue if it holds it, and otherwise placed as for an entry just sent. For an
+    /// entry adopted while going live after a restart, or carried over it (`restart`), a stop goes
+    /// out only for the fill the venue lists; an entry with none gets its stop when the next bar
+    /// reads its fill.
     fn adopt(&mut self, id: OrderId, found: &VenueOrder, restart: bool) {
         let submitted_at = self.book.orders[&id.0].order.submitted_at;
         if found.created < submitted_at {
@@ -802,17 +850,18 @@ impl Core {
         }
         if found.filled_qty > 0.0 {
             let price = found.avg_price.unwrap_or(decision_close);
-            self.protect(id, found.filled_qty, price, Basis::Restart);
+            self.protect(id, found.filled_qty, price, Basis::Filled);
         }
     }
 
     /// Takes the stop the venue already holds under the id of adopted entry `entry`'s attached
     /// stop, placed before a restart. Returns whether the entry still needs protecting: true when
     /// the venue lists no such stop (a placement under the same id then cannot double it: the
-    /// venue refuses the id, and its quantity is read as below) or holds it open, so it is resized
-    /// to the fill as any stop. A stop the venue already closed is settled by the reads, as any
-    /// stop found closed. A stop the venue cannot be asked about is a fault: placing one in its
-    /// place could leave the quantity of the one already there unknown.
+    /// venue refuses the id, and its quantity is read as below), holds it open, so it is resized
+    /// to the fill as any stop, or closed it with nothing filled, so the fill's stop goes out
+    /// under the cover id ([`Core::take_stop`]). A stop the venue closed after a fill is settled by
+    /// the reads, as any stop found closed. A stop the venue cannot be asked about is a fault:
+    /// placing one in its place could leave the quantity of the one already there unknown.
     fn adopt_stop(&mut self, entry: OrderId, stop: OrderId) -> bool {
         let cid = self.id(Role::Order, stop);
         match self.client.order_by_client_id(&self.instrument, &cid) {
@@ -834,7 +883,11 @@ impl Core {
 
     /// Takes `found`, the venue order under the id for `role` of entry `entry`'s attached stop,
     /// as that stop with the venue's quantity, unless it is not the stop the session intends,
-    /// which is a fault. Returns whether it is open, `None` on the fault.
+    /// which is a fault. Returns whether the entry's fill still needs protecting: true when the
+    /// stop is open, and when the venue closed it under its `o` id with nothing filled, which
+    /// holds it as unplaced so the fill's stop goes out under the `s` id, as for a stop the venue
+    /// refused. False when it closed after a fill, which the reads settle as any stop found
+    /// closed; `None` on the fault.
     fn take_stop(&mut self, entry: OrderId, role: Role, found: &VenueOrder) -> Option<bool> {
         let e = &self.book.orders[&entry.0].order;
         let order = stop_order(e, found.qty).expect("the entry carries the stop");
@@ -856,8 +909,18 @@ impl Core {
         } else {
             At::Live
         };
+        let id = order.id;
         self.track_stop(order, at);
-        Some(found.status.is_open())
+        if found.status.is_open() {
+            return Some(true);
+        }
+        // shortcut: a cover closed with nothing filled is left to the reads, which fault while a
+        // position is held, since no id is left for another stop.
+        if role == Role::Order && found.filled_qty <= 0.0 {
+            self.unplaced(id);
+            return Some(true);
+        }
+        Some(false)
     }
 
     /// Waits briefly for an entry's fill and places its stop for the quantity filled. When the
@@ -894,8 +957,9 @@ impl Core {
     }
 
     /// Makes the entry's attached stop cover `qty`: places it the first time, places it under its
-    /// `s` id on the first confirmed fill when its first placement did not rest, and resizes it
-    /// when the fill turns out different. What goes out when the venue does not take it depends
+    /// `s` id on the first confirmed fill when the venue refused its first placement, asks the
+    /// venue about it on the first confirmed fill when that placement's outcome is unknown, and
+    /// resizes it when the fill turns out different. What goes out when the venue does not take it depends
     /// on what `qty` rests on ([`Basis`]); a resize that fails faults the broker.
     fn protect(&mut self, entry: OrderId, qty: f64, last: f64, basis: Basis) {
         let Some(order) = stop_order(&self.book.orders[&entry.0].order, qty) else {
@@ -907,6 +971,9 @@ impl Core {
             None => self.place_stop(entry, order, Role::Order, last, basis),
             Some((At::Unplaced, _)) if basis != Basis::Sent => {
                 self.place_stop(entry, order, Role::Cover, last, basis)
+            }
+            Some((At::Unsettled, _)) if basis != Basis::Sent => {
+                self.settle_stop(entry, id, qty, last, basis)
             }
             Some((At::Live | At::Cover, sent)) if (qty - sent).abs() > half => {
                 self.resize(id, sent, qty, last, basis)
@@ -934,16 +1001,36 @@ impl Core {
             Some(Err(RouteError::DuplicateClientId { .. })) => {
                 self.take_duplicate(entry, id, role, qty, last, basis)
             }
-            // The entry's fill is not confirmed, so nothing is closed for it and nothing faults:
-            // whether or not the venue takes a reduce-only stop with no position to reduce, the
-            // stop goes out under its `s` id on the first fill the venue confirms.
-            // shortcut: until then a fill the entry made has no stop, for up to one bar, until
-            // the next bar reads its executions. Look for the fill again within this call, or
-            // between bars, if that window matters in practice.
-            Some(Err(_)) | None if basis == Basis::Sent => self.unplaced(id),
-            Some(Err(e @ RouteError::OutcomeUnknown { .. })) if role == Role::Order => {
-                self.cover_unknown(id, qty, venue_text(&e), last, basis)
+            // It may rest. Nothing is known to rest for it, and the venue is asked about it
+            // before anything else goes out for a fill: at once for a confirmed fill, and on the
+            // first fill the venue confirms otherwise.
+            Some(Err(RouteError::OutcomeUnknown { .. })) if role == Role::Order => {
+                self.unplaced(id);
+                self.tracked(id).at = At::Unsettled;
+                if basis != Basis::Sent {
+                    self.settle_stop(entry, id, qty, last, basis);
+                }
             }
+            // The entry's fill is not confirmed, so nothing is closed for it and nothing faults.
+            // shortcut: until the stop goes out a fill the entry made has no stop, for up to one
+            // bar, until the next bar reads its executions. Look for the fill again within this
+            // call, or between bars, if that window matters in practice.
+            //
+            // Not sent (the route freed the id), or not sent because the broker faulted: the stop
+            // goes out again under the same `o` id on the first fill the venue confirms.
+            Some(Err(
+                RouteError::RateLimited { .. }
+                | RouteError::TimestampRejected { .. }
+                | RouteError::Transport { .. },
+            ))
+            | None
+                if basis == Basis::Sent =>
+            {
+                self.book.orders.remove(&id.0);
+            }
+            // Refused by the venue: whether or not it takes a reduce-only stop with no position
+            // to reduce, the stop goes out under its `s` id on the first fill the venue confirms.
+            Some(Err(_)) if basis == Basis::Sent => self.unplaced(id),
             Some(Err(e @ RouteError::OutcomeUnknown { .. })) => {
                 self.unplaced(id);
                 self.raise(
@@ -954,14 +1041,15 @@ impl Core {
                     ),
                 );
             }
-            Some(Err(e)) => self.refused_stop(id, &cid, qty, venue_text(&e), last, basis),
-            None => self.refused_stop(id, &cid, qty, FAULTED.into(), last, basis),
+            Some(Err(e)) => self.refused_stop(id, &cid, qty, venue_text(&e), last),
+            None => self.refused_stop(id, &cid, qty, FAULTED.into(), last),
         }
     }
 
     /// The venue already holds the id for `role` that stop `id` was just placed under, from
-    /// before a restart: the stop is taken with the venue's quantity and resized to `qty`. One
-    /// the venue cannot be asked about, or that is not the stop the session intends, is a fault.
+    /// before a restart: the stop is taken with the venue's quantity and protects `qty` as any
+    /// stop ([`Core::take_stop`]). One the venue cannot be asked about, or that is not the stop the
+    /// session intends, is a fault.
     fn take_duplicate(
         &mut self,
         entry: OrderId,
@@ -990,76 +1078,93 @@ impl Core {
                 );
             }
         };
-        // A stop the venue already closed is settled by the reads, as any stop found closed.
-        if self.take_stop(entry, role, &found) == Some(true)
-            && (qty - found.qty).abs() > self.half_lot()
-        {
-            self.resize(id, found.qty, qty, last, basis);
+        if self.take_stop(entry, role, &found) == Some(true) {
+            self.protect(entry, qty, last, basis);
         }
     }
 
-    /// The outcome of stop `id`'s first placement, for a confirmed fill of `qty`, is unknown
-    /// (`why`): a cover stop for the fill goes out under its `s` id, then the broker faults. Only
-    /// when the venue refuses the cover is the fill closed at market, and never while going live
-    /// after a restart; the broker faults when that is not done or fails.
-    fn cover_unknown(&mut self, id: OrderId, qty: f64, why: String, last: f64, basis: Basis) {
+    /// Stop `id` was sent under its `o` id and its outcome is unknown; a fill of `qty` the venue
+    /// confirmed needs covering. The venue is asked about the `o` stop before anything goes out,
+    /// with two looks as for any order of unknown outcome. When it holds it, it is taken with the
+    /// venue's quantity and protects the fill as any stop: resized when open, and replaced under
+    /// the `s` id when closed with nothing filled; nothing faults. When the venue cannot be
+    /// asked, nothing is sent and the broker faults.
+    ///
+    /// When neither look shows it, a reduce-only stop for the fill goes out under the `s` id
+    /// and the broker faults at once, saying the fill is covered by the `s` stop and that the `o`
+    /// stop's outcome is unknown, so it may also rest. This is the one exception to the rule that
+    /// an order whose outcome is unknown is settled by asking the venue and never by sending
+    /// again: a second reduce-only stop cannot add to the position, and a fill with no stop is
+    /// the worse harm. If the venue refuses that cover, the fill is closed at market (never while
+    /// an order carried over a restart is unresolved) and the broker faults either way.
+    fn settle_stop(&mut self, entry: OrderId, id: OrderId, qty: f64, last: f64, basis: Basis) {
         let (cid, cover) = (self.id(Role::Order, id), self.id(Role::Cover, id));
+        match self.find(id) {
+            Ok(Some(found)) => {
+                if self.take_stop(entry, Role::Order, &found) == Some(true) {
+                    self.protect(entry, qty, last, basis);
+                }
+                return;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                return self.raise(
+                    FaultKind::ProtectionFailed,
+                    format!(
+                        "the outcome of stop {cid} is unknown and the venue could not be asked about it ({}), so the fill of {qty} may or may not be covered; nothing was sent",
+                        venue_text(&e)
+                    ),
+                );
+            }
+        }
         let covered = match self.place_cover(id, qty, last, basis) {
             Covered::Placed => {
-                self.tracked(id).at = At::Cover;
-                format!("the fill is covered by {cover}")
-            }
-            Covered::Unknown(e) => {
-                self.unplaced(id);
+                let t = self.tracked(id);
+                t.at = At::Cover;
+                t.sent = qty;
+                t.order.request.qty = qty;
                 format!(
-                    "the outcome of placing {cover} for it is unknown too ({e}), so the fill may or may not be covered"
+                    "the fill of {qty} is covered by {cover}, and {cid} may also rest at the venue"
                 )
             }
+            Covered::Unknown(e) => format!(
+                "the outcome of placing {cover} for the fill of {qty} is unknown too ({e}), so the fill may or may not be covered"
+            ),
             Covered::Refused(e) => {
-                let failed = if basis == Basis::Restart {
-                    NO_CLOSE_ON_RESTART.to_string()
-                } else {
-                    match self.close_at_market(id, qty, last) {
-                        Ok(()) => return,
-                        Err(CloseFailed::Refused(c) | CloseFailed::Unknown(c)) => {
-                            format!("closing at market failed ({c})")
-                        }
-                    }
-                };
-                self.unplaced(id);
-                format!(
-                    "placing {cover} for it failed ({e}) and {failed}, so the fill is not covered"
-                )
+                let closed = self.close_at_market(id, qty, last).map_err(
+                    |(CloseFailed::Refused(c) | CloseFailed::Unknown(c))| {
+                        format!("closing at market failed ({c})")
+                    },
+                );
+                match closed {
+                    Ok(()) => format!(
+                        "placing {cover} for the fill of {qty} failed ({e}), so the position was closed at market under {}",
+                        self.id(Role::Close, id)
+                    ),
+                    Err(failed) => format!(
+                        "placing {cover} for the fill of {qty} failed ({e}) and {failed}, so the fill is not covered"
+                    ),
+                }
             }
         };
         self.raise(
             FaultKind::ProtectionFailed,
             format!(
-                "the outcome of stop {cid} for the fill of {qty} is unknown ({why}); {covered}"
+                "the outcome of stop {cid} is unknown and the venue does not show it; {covered}"
             ),
         );
     }
 
-    /// The venue refused stop `id` (under `cid`) for `qty` outright (`why`). A confirmed fill is
-    /// closed at market instead, except while going live after a restart; the broker faults when
-    /// that is not done or fails.
-    fn refused_stop(
-        &mut self,
-        id: OrderId,
-        cid: &ClientOrderId,
-        qty: f64,
-        why: String,
-        last: f64,
-        basis: Basis,
-    ) {
-        let failed = if basis == Basis::Restart {
-            NO_CLOSE_ON_RESTART.to_string()
-        } else {
-            match self.close_at_market(id, qty, last) {
-                Ok(()) => return,
-                Err(CloseFailed::Refused(e) | CloseFailed::Unknown(e)) => {
-                    format!("closing at market failed ({e})")
-                }
+    /// The venue did not take stop `id` (under `cid`) for `qty` (`why`): it refused it, or the
+    /// route did not send it. A confirmed fill whose stop the venue will not take now is closed at
+    /// market rather than left to wait, since flat is the safe side; while an order carried over a
+    /// restart is unresolved nothing is closed. The broker faults when the close is not done or
+    /// fails.
+    fn refused_stop(&mut self, id: OrderId, cid: &ClientOrderId, qty: f64, why: String, last: f64) {
+        let failed = match self.close_at_market(id, qty, last) {
+            Ok(()) => return,
+            Err(CloseFailed::Refused(e) | CloseFailed::Unknown(e)) => {
+                format!("closing at market failed ({e})")
             }
         };
         self.unplaced(id);
@@ -1078,9 +1183,31 @@ impl Core {
         };
         match self.venue_place(&request, &cover, last, basis != Basis::Sent) {
             Some(Ok(())) => Covered::Placed,
-            Some(Err(
-                e @ (RouteError::OutcomeUnknown { .. } | RouteError::DuplicateClientId { .. }),
-            )) => Covered::Unknown(venue_text(&e)),
+            Some(Err(e @ RouteError::OutcomeUnknown { .. })) => Covered::Unknown(venue_text(&e)),
+            // The venue already holds the id: it is the cover only if it is this stop, open, for
+            // this quantity.
+            Some(Err(e @ RouteError::DuplicateClientId { .. })) => {
+                match self.client.order_by_client_id(&self.instrument, &cover) {
+                    Ok(Some(found))
+                        if found.status.is_open()
+                            && (found.qty - qty).abs() <= self.half_lot()
+                            && self.is_stop_of(&found, &self.book.orders[&id.0].order) =>
+                    {
+                        Covered::Placed
+                    }
+                    Ok(Some(found)) => {
+                        Covered::Unknown(format!("the venue already holds {}", describe(&found)))
+                    }
+                    Ok(None) => {
+                        Covered::Unknown(format!("{}, and lists no order under it", venue_text(&e)))
+                    }
+                    Err(r) => Covered::Unknown(format!(
+                        "{}, and it could not be read: {}",
+                        venue_text(&e),
+                        venue_text(&r)
+                    )),
+                }
+            }
             Some(Err(e)) => Covered::Refused(venue_text(&e)),
             None => Covered::Refused(FAULTED.into()),
         }
@@ -1130,8 +1257,12 @@ impl Core {
     }
 
     /// Sends a reduce-only market order for `qty` under order `id`'s `c` id, against the side its
-    /// stop would close. Never sent once the broker has faulted.
+    /// stop would close. Never sent once the broker has faulted, nor while an order carried over a
+    /// restart is unresolved.
     fn close_at_market(&mut self, id: OrderId, qty: f64, last: f64) -> Result<(), CloseFailed> {
+        if self.restart_unresolved() {
+            return Err(CloseFailed::Refused(NO_CLOSE_ON_RESTART.into()));
+        }
         let stop = &self.book.orders[&id.0].order;
         let request = OrderRequest {
             instrument: stop.request.instrument.clone(),
@@ -1144,11 +1275,31 @@ impl Core {
         };
         let cid = self.id(Role::Close, id);
         match self.venue_place(&request, &cid, last, false) {
-            Some(Ok(()) | Err(RouteError::DuplicateClientId { .. })) => {
+            Some(Ok(())) => {
                 let t = self.tracked(id);
                 t.at = At::Closing;
                 t.sent = qty;
                 Ok(())
+            }
+            // The venue already holds the id: that close stands, for the venue's quantity.
+            Some(Err(e @ RouteError::DuplicateClientId { .. })) => {
+                match self.client.order_by_client_id(&self.instrument, &cid) {
+                    Ok(Some(found)) => {
+                        let t = self.tracked(id);
+                        t.at = At::Closing;
+                        t.sent = found.qty;
+                        Ok(())
+                    }
+                    Ok(None) => Err(CloseFailed::Unknown(format!(
+                        "{}, and the venue lists no order under it",
+                        venue_text(&e)
+                    ))),
+                    Err(r) => Err(CloseFailed::Unknown(format!(
+                        "{}, and it could not be read: {}",
+                        venue_text(&e),
+                        venue_text(&r)
+                    ))),
+                }
             }
             Some(Err(e @ RouteError::OutcomeUnknown { .. })) => {
                 Err(CloseFailed::Unknown(venue_text(&e)))
@@ -1340,6 +1491,8 @@ impl Core {
         let since = self.book.cursor.saturating_sub(LOOKBACK_MS);
         let executions = self.client.executions_since(&self.instrument, since)?;
         let mut groups: Vec<(OrderId, Vec<Execution>)> = Vec::new();
+        // The position as of each execution, in the venue's order, for the quantity owed a stop.
+        let mut position = self.book.tally;
         for e in executions {
             if self.book.seen.contains_key(&e.exec_id) {
                 continue;
@@ -1385,7 +1538,10 @@ impl Core {
             let reportable = match (ours, tracked) {
                 (
                     Some((Role::Order, _)),
-                    Some((id, At::Live | At::Unknown { .. } | At::Intent | At::Closing)),
+                    Some((
+                        id,
+                        At::Live | At::Unknown { .. } | At::Intent | At::Unsettled | At::Closing,
+                    )),
                 ) => Some(id),
                 (Some((Role::Close, _)), Some((id, At::Closing)))
                 | (Some((Role::Cover, _)), Some((id, At::Cover))) => Some(id),
@@ -1412,6 +1568,15 @@ impl Core {
                 );
                 break;
             };
+            let order = &self.book.orders[&id.0].order;
+            let fill = order.request.side.sign() * e.qty;
+            self.book.owed = owe(
+                self.book.owed,
+                position,
+                fill,
+                order.attached_stop.is_some(),
+            );
+            position += fill;
             match groups.iter_mut().find(|(g, _)| *g == id) {
                 Some((_, list)) => list.push(e),
                 None => groups.push((id, vec![e])),
@@ -1434,7 +1599,8 @@ impl Core {
                 Liquidity::Maker
             };
             let t = self.tracked(id);
-            if matches!(t.at, At::Unknown { .. } | At::Intent) {
+            let settled = matches!(t.at, At::Unknown { .. } | At::Intent);
+            if settled {
                 t.at = At::Live;
             }
             t.reported += qty;
@@ -1465,12 +1631,18 @@ impl Core {
                     events.push(BrokerEvent::Placed(s.order.clone()));
                 }
             }
+            // The fill settles an order carried over a restart once it is protected, so no close
+            // at market goes out for this fill.
+            if settled {
+                self.tracked(id).carried = false;
+            }
         }
         Ok(())
     }
 
-    /// Asks the venue about each order whose outcome is unknown: adopted when it holds the id,
-    /// refused when two asks find nothing, and a fault after [`UNKNOWN_TRIES`] failed asks.
+    /// Asks the venue about each order whose outcome is unknown: adopted when it holds the id (one
+    /// carried over a restart as going live adopts one, and settled once adopted), refused when
+    /// two asks find nothing, and a fault after [`UNKNOWN_TRIES`] failed asks.
     fn resolve_unknown(&mut self) {
         let unknown: Vec<(OrderId, u32)> = self
             .book
@@ -1484,7 +1656,11 @@ impl Core {
         for (id, tries) in unknown {
             let tries = tries.saturating_add(1);
             match self.find(id) {
-                Ok(Some(found)) => self.adopt(id, &found, false),
+                Ok(Some(found)) => {
+                    let carried = self.book.orders[&id.0].carried;
+                    self.adopt(id, &found, carried);
+                    self.tracked(id).carried = false;
+                }
                 Ok(None) => self.refuse(id, NOT_HELD),
                 Err(e) if tries >= UNKNOWN_TRIES => self.raise(
                     FaultKind::UnresolvedOrder,
@@ -1515,7 +1691,8 @@ impl Core {
     }
 
     /// Settles the orders the venue no longer lists and compares the venue with what the session
-    /// holds. Returns the first disagreement.
+    /// holds, then checks the quantity it owes a stop for is covered by its stops resting at the
+    /// venue. Returns the first disagreement.
     fn reconcile(
         &mut self,
         open: &[VenueOrder],
@@ -1546,13 +1723,15 @@ impl Core {
                 self.tracked(id).at = At::Done;
                 continue;
             }
-            let (reported, cancel_asked, stop, side, attached, held) = (
+            let (reported, sent, cancel_asked, stop, side, attached, held, announced) = (
                 t.reported,
+                t.sent,
                 t.cancel_asked,
                 is_stop(&t.order),
                 t.order.request.side,
                 t.order.attached_stop,
                 t.open,
+                t.announced,
             );
             let Some(found) = self.client.order_by_client_id(&self.instrument, &cid)? else {
                 return Ok(Some((
@@ -1572,31 +1751,40 @@ impl Core {
                     ),
                 )));
             }
+            let nothing_to_reduce = match side {
+                Side::Sell => self.book.tally <= half,
+                Side::Buy => self.book.tally >= -half,
+            };
+            let status = venue_text(&found.status);
+            // A stop (or its close at market) the venue closed with part or none of it filled,
+            // that the session did not cancel, leaves the rest of the position unprotected.
+            if stop && !cancel_asked && !nothing_to_reduce {
+                return Ok(Some((
+                    FaultKind::MissingOrder,
+                    format!(
+                        "stop {cid} is {status} at the venue with {reported} of {sent} filled and \
+                         a position of {} still open with no stop covering it",
+                        self.book.tally
+                    ),
+                )));
+            }
+            // An entry's attached stop the session cancelled is no longer owed for what it did not
+            // fill. Only an announced attached stop is held open, so only one can be cancelled.
+            if stop && cancel_asked && announced > 0.0 {
+                self.book.owed = (self.book.owed - (sent - reported)).max(0.0);
+            }
             if reported > 0.0 {
                 // Part filled, the rest closed: the session already holds it filled.
                 self.tracked(id).at = At::Done;
                 continue;
             }
             // Closed with nothing filled.
-            let nothing_to_reduce = match side {
-                Side::Sell => self.book.tally <= half,
-                Side::Buy => self.book.tally >= -half,
-            };
-            let status = venue_text(&found.status);
             let reason = if cancel_asked {
                 "cancelled at the venue".to_string()
             } else if !stop {
                 format!("the venue closed it unfilled ({status})")
-            } else if nothing_to_reduce {
-                format!("the venue closed it ({status}): the position it would reduce is gone")
             } else {
-                return Ok(Some((
-                    FaultKind::MissingOrder,
-                    format!(
-                        "stop {cid} is {status} at the venue with a position of {} still open",
-                        self.book.tally
-                    ),
-                )));
+                format!("the venue closed it ({status}): the position it would reduce is gone")
             };
             // Its attached stop goes with it. One already placed because the entry's fill could
             // not be confirmed must not rest without a position; one whose placement did not
@@ -1629,7 +1817,9 @@ impl Core {
                 events.push(BrokerEvent::Cancelled { id, reason });
             }
         }
-        Ok(self.position_check(position, self.book.tally))
+        Ok(self
+            .position_check(position, self.book.tally)
+            .or_else(|| self.uncovered(open, position, self.book.owed)))
     }
 
     /// How venue order `o`, open under `t`'s id, differs from what the session holds, if it
@@ -1666,8 +1856,10 @@ impl Core {
         for o in open {
             let known = match ids::parse(&self.prefix, &o.client_id) {
                 Some((Role::Order, id)) => self.book.orders.get(&id.0).is_some_and(|t| {
-                    matches!(t.at, At::Live | At::Unknown { .. } | At::Intent)
-                        && (t.open || t.reported > 0.0 || self.awaits_announcement(id, o))
+                    matches!(
+                        t.at,
+                        At::Live | At::Unknown { .. } | At::Intent | At::Unsettled
+                    ) && (t.open || t.reported > 0.0 || self.awaits_announcement(id, o))
                 }),
                 Some((Role::Cover, id)) => self.book.orders.get(&id.0).is_some_and(|t| {
                     t.at == At::Cover
@@ -1711,6 +1903,48 @@ impl Core {
                 .any(|e| e.order.attached_stop.is_some_and(|s| s.id == id))
     }
 
+    /// The fault when `owed`, the quantity this session owes a stop for, capped at the venue's
+    /// `position`, is not covered by what is left of this session's reduce-only stops in `open`,
+    /// the venue's open orders, on the side that closes it.
+    fn uncovered(
+        &self,
+        open: &[VenueOrder],
+        position: f64,
+        owed: f64,
+    ) -> Option<(FaultKind, String)> {
+        let owed = owed.min(position.abs());
+        if owed <= self.half_lot() {
+            return None;
+        }
+        let closing = if position > 0.0 {
+            Side::Sell
+        } else {
+            Side::Buy
+        };
+        let covered: f64 = open
+            .iter()
+            .filter(|o| {
+                matches!(
+                    ids::parse(&self.prefix, &o.client_id),
+                    Some((Role::Order | Role::Cover, _))
+                ) && o.reduce_only
+                    && o.trigger_price.is_some()
+                    && o.side == closing
+            })
+            .map(|o| (o.qty - o.filled_qty).max(0.0))
+            .fold(0.0, |sum, left| sum + left);
+        (owed - covered > self.half_lot()).then(|| {
+            (
+                FaultKind::Uncovered,
+                format!(
+                    "this session owes a stop for {owed} of the position of {position}, but its \
+                     stops resting at the venue cover {covered}, so {} is not covered",
+                    owed - covered
+                ),
+            )
+        })
+    }
+
     fn position_check(&self, position: f64, expected: f64) -> Option<(FaultKind, String)> {
         ((position - expected).abs() > self.half_lot()).then(|| {
             (
@@ -1745,6 +1979,16 @@ impl Core {
         let book = &record.book;
         if !book.tally.is_finite() {
             return Err("the record's position tally is not a finite number".into());
+        }
+        if !(book.owed.is_finite()
+            && book.owed >= 0.0
+            && book.owed <= book.tally.abs() + self.half_lot())
+        {
+            return Err(
+                "the record owes a stop for a quantity that is negative, not finite or more than \
+                 its position"
+                    .into(),
+            );
         }
         if book.cursor < book.floor {
             return Err("the record's execution cursor is before its floor".into());
@@ -2050,17 +2294,55 @@ impl Core {
             .filter(|t| t.open && matches!(t.at, At::Intent | At::Unknown { .. }))
             .map(|t| t.order.id)
             .collect();
+        // Entries' stops sent with an unknown outcome, with their entries.
+        let unsettled: Vec<(OrderId, OrderId)> = self
+            .book
+            .orders
+            .values()
+            .filter_map(|e| {
+                let stop = e.order.attached_stop?.id;
+                let at = self.book.orders.get(&stop.0)?.at;
+                (at == At::Unsettled).then_some((e.order.id, stop))
+            })
+            .collect();
+        // Each is carried over the restart until the venue settles it, so no close at market goes
+        // out meanwhile, not even for a fill the adoptions below protect.
+        for &id in intents.iter().chain(unsettled.iter().map(|(_, stop)| stop)) {
+            self.tracked(id).carried = true;
+        }
         // The record may say an order was sent, or the crashed run may have sent it after the
         // last record; only the venue knows. Nothing is sent from the record.
         for id in intents {
             match self.find(id) {
-                Ok(Some(found)) => self.adopt(id, &found, true),
+                Ok(Some(found)) => {
+                    self.adopt(id, &found, true);
+                    self.tracked(id).carried = false;
+                }
                 Ok(None) => {
                     let order = &self.book.orders[&id.0].order;
                     let why = unsupported(&order.request, order.attached_stop.is_some());
                     self.refuse(id, why.unwrap_or(RESTARTED));
                 }
+                // The reads settle it once live, under the same rule as here.
                 Err(_) => self.tracked(id).at = At::Unknown { tries: 1 },
+            }
+        }
+        // A stop whose outcome is unknown is taken if the venue holds it and held as unplaced if
+        // two looks find nothing, so the entry's first confirmed fill finds it settled. One the
+        // venue cannot be asked about stays carried, and that fill asks again.
+        for (entry, id) in unsettled {
+            match self.find(id) {
+                Ok(Some(found)) => {
+                    self.take_stop(entry, Role::Order, &found);
+                }
+                Ok(None) => {
+                    self.unplaced(id);
+                    self.tracked(id).carried = false;
+                }
+                // shortcut: one whose entry never fills is never asked about again, so it stays
+                // carried and no close at market goes out for the rest of the session. Ask about
+                // it on each bar's reads, as for an entry of unknown outcome, if that matters.
+                Err(_) => {}
             }
         }
         // A venue that cannot be read now is reconciled on the next bar, as any bar's reads.
@@ -2069,14 +2351,15 @@ impl Core {
         }
     }
 
-    /// The reconcile at the end of a replay: the venue's open orders must be the session's, and
-    /// its position the recorded fills plus this session's executions not yet reported.
+    /// The reconcile at the end of a replay: the venue's open orders must be the session's, its
+    /// position the recorded fills plus this session's executions not yet reported, and the
+    /// quantity the session owes a stop for covered by its stops resting at the venue.
     fn verify(&mut self) -> Result<(), RouteError> {
         let executions = self.client.executions_since(
             &self.instrument,
             self.book.cursor.saturating_sub(LOOKBACK_MS),
         )?;
-        let mut expected = self.book.tally;
+        let (mut expected, mut owed) = (self.book.tally, self.book.owed);
         for e in executions {
             if self.book.seen.contains_key(&e.exec_id) || e.kind != ExecKind::Trade {
                 continue;
@@ -2085,7 +2368,12 @@ impl Core {
                 ids::parse(&self.prefix, &e.client_id)
                 && let Some(t) = self.book.orders.get(&id.0)
             {
-                expected += t.order.request.side.sign() * e.qty;
+                let fill = t.order.request.side.sign() * e.qty;
+                // What these fills closed is no longer owed. An entry's fill read here owes its
+                // stop from the first bar that reads it, once the stop has had its chance to go
+                // out.
+                owed = owe(owed, expected, fill, false);
+                expected += fill;
             }
         }
         let open = self.client.open_orders(&self.instrument)?;
@@ -2093,6 +2381,7 @@ impl Core {
         if let Some((kind, message)) = self
             .unknown_open(&open)
             .or_else(|| self.position_check(position, expected))
+            .or_else(|| self.uncovered(&open, position, owed))
         {
             self.raise(kind, message);
         }

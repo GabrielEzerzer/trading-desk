@@ -69,6 +69,7 @@ use td_core::{
 use crate::metrics::{self, DAY_MS, EquitySeries};
 use crate::plan::check_start_offsets;
 use crate::portfolio::next_position;
+use crate::reference::ReferenceBars;
 use crate::risk::{self, DayRollover};
 use crate::rng::derive_seed;
 use crate::runner::select_bars;
@@ -77,7 +78,7 @@ use crate::stats::{
     PropFirmOdds, PropFirmSpec, RuinSpec,
 };
 use crate::strategies::direction;
-use crate::tester::stitched_headline;
+use crate::tester::{self, stitched_headline};
 use crate::verdict::{
     IntegrityInputs, OosIntegrityInputs, TradingDayTest, evaluate_integrity, evaluate_oos_integrity,
 };
@@ -86,8 +87,8 @@ use crate::{
     EvidenceInputs, Headline, KindInputs, MAX_RUNS, Objective, Order, Outcome, Params,
     PermutationResult, PermutationSpec, PortfolioBenchmark, Progress, SweepResult, SweepSpec,
     TestPlan, TesterError, Trade, TradeSide, Verdict, VerdictRule, WalkForwardResult,
-    WalkForwardSpec, combine, evaluate, evaluate_evidence, permutation_test, run, sweep,
-    walk_forward,
+    WalkForwardSpec, combine, evaluate, evaluate_evidence, permutation_test_with_references,
+    run_with_references, sweep_with_references, walk_forward_with_references,
 };
 
 /// The seed streams of the battery's seeded steps, derived from its seed.
@@ -355,6 +356,22 @@ pub fn run_battery(
     funding: &[(Millis, f64)],
     progress: Option<Progress>,
 ) -> Result<BatteryResult, TesterError> {
+    run_battery_with_references(spec, bars, asks, funding, &[], progress)
+}
+
+/// [`run_battery`] with reference instruments: the plan's runs name each of `references`, in
+/// this order ([`crate::BacktestConfig::references`]), and every run, sweep, walk-forward and
+/// luck test is given their bars, as [`crate::run_with_references`] takes them. The luck test
+/// shuffles the traded bars and the reference bars with one permutation
+/// ([`crate::permutation_test_with_references`]); R4 widens the traded instrument's spread only.
+pub fn run_battery_with_references(
+    spec: &BatterySpec,
+    bars: &[Candle],
+    asks: &[Candle],
+    funding: &[(Millis, f64)],
+    references: &[ReferenceBars],
+    progress: Option<Progress>,
+) -> Result<BatteryResult, TesterError> {
     let BatterySpec {
         strategy,
         plan,
@@ -371,9 +388,13 @@ pub fn run_battery(
     }
     rule.validate()
         .map_err(|e| TesterError::InvalidSpec(e.to_string()))?;
-    let base = plan.backtest_config(strategy, instrument.clone());
-    let sweep_spec = plan.sweep_spec(strategy, instrument.clone());
-    let wf_spec = plan.walk_forward_spec(strategy, instrument.clone());
+    let names: Vec<_> = references.iter().map(|r| r.instrument.clone()).collect();
+    let mut base = plan.backtest_config(strategy, instrument.clone());
+    base.references.clone_from(&names);
+    let mut sweep_spec = plan.sweep_spec(strategy, instrument.clone());
+    sweep_spec.base.references.clone_from(&names);
+    let mut wf_spec = plan.walk_forward_spec(strategy, instrument.clone());
+    wf_spec.sweep.base.references = names;
     wf_spec.check()?;
     let ev = &plan.evidence;
     check_start_offsets(wf_spec.windows.test_bars, ev.start_offsets)
@@ -400,7 +421,8 @@ pub fn run_battery(
     // 1. Integrity: I1 to I3.
     let (open_buckets, dropped_buckets) = bucket_counts(&base, &traded);
     let split = (traded.len() >= 2).then(|| traded[traded.len() / 2].open_time);
-    let base_checks = repeat_and_prefix(&base, bars, asks, funding, split, &mut meter)?;
+    let data = (bars, asks, funding, references);
+    let base_checks = repeat_and_prefix(&base, data, split, &mut meter)?;
     let mut integrity_inputs = IntegrityInputs {
         dropped_share: (open_buckets > 0).then(|| dropped_buckets as f64 / open_buckets as f64),
         repeat_differences: Some(base_checks.0),
@@ -444,7 +466,14 @@ pub fn run_battery(
     }
 
     // 2. The sweep over the full period.
-    let swept = sweep(&sweep_spec, bars, asks, funding, Some(&meter.step()))?;
+    let swept = sweep_with_references(
+        &sweep_spec,
+        bars,
+        asks,
+        funding,
+        references,
+        Some(&meter.step()),
+    )?;
     meter.base += per_sweep;
 
     // 3. R1: the rolling walk-forward, stitched.
@@ -455,7 +484,14 @@ pub fn run_battery(
         };
         (None, Some(error))
     } else {
-        match walk_forward(&wf_spec, bars, asks, funding, Some(&meter.step())) {
+        match walk_forward_with_references(
+            &wf_spec,
+            bars,
+            asks,
+            funding,
+            references,
+            Some(&meter.step()),
+        ) {
             Ok(wf) => (Some(wf), None),
             Err(e @ (TesterError::NoQualifyingRun { .. } | TesterError::InvalidSpec(_))) => {
                 (None, Some(e.to_string()))
@@ -481,7 +517,7 @@ pub fn run_battery(
                 params: w.params.clone(),
                 ..base.clone()
             };
-            let checks = repeat_and_prefix(&config, bars, asks, funding, split, &mut meter)?;
+            let checks = repeat_and_prefix(&config, data, split, &mut meter)?;
             checked.push((&w.params, checks));
         }
         meter.base += 3 * (windows - wf.windows.len());
@@ -527,7 +563,7 @@ pub fn run_battery(
                         ..w.out_of_sample.config.clone()
                     };
                     // A set the strategy refuses is left out, as a sweep leaves its row unranked.
-                    match run(&config, bars, asks, funding) {
+                    match run_with_references(&config, bars, asks, funding, references) {
                         Ok(r) => window.push((steps, r)),
                         Err(EngineError::InvalidParam { .. }) => {}
                         Err(e) => return Err(e.into()),
@@ -552,6 +588,7 @@ pub fn run_battery(
     // For a `prop_firm` rule, the worst attempt's fall as a share of the starting cash, on the
     // reading (static or trailing) its drawdown line judges, for `sizing_warning`.
     let mut fixed_size_drawdown = None;
+    let mut fixed_size_daily_loss = None;
     if let Some(p) = &plateau {
         evidence.plateau_median_ratio = p.median_ratio;
         evidence.plateau_positive_share = p.positive_share;
@@ -646,7 +683,8 @@ pub fn run_battery(
                 _ => None,
             },
             return_without_best_trade: breakdown.return_without_best_trade,
-            worst_daily_loss: worst_daily_loss(&series, &wf.equity_extremes, cash, None),
+            worst_daily_loss: worst_daily_loss(&series, &wf.equity_extremes, cash, None)
+                .map(|f| f.own),
             intrabar_drawdown_static: m.static_drawdown_intrabar,
             intrabar_drawdown_trailing: risk::trailing_drawdown(cash, &wf.equity_extremes)
                 .map(|d| d.amount / cash),
@@ -664,8 +702,10 @@ pub fn run_battery(
             // The firm's day, for its daily loss line, its drawdown line's attempts and the
             // attempt walks alike. Without one, the walks read UTC days, the days of `daily`.
             let rollover = firm.day_rollover.unwrap_or_default();
-            kind.worst_daily_loss =
+            let daily_loss =
                 worst_daily_loss(&series, &wf.equity_extremes, cash, firm.day_rollover);
+            kind.worst_daily_loss = daily_loss.map(|f| f.own);
+            fixed_size_daily_loss = daily_loss.map(|f| f.cash);
             // A trailing floor that stops at a lock stops counting the peak once it reaches the
             // lock plus the drawdown above the start, as the attempt walks apply it.
             let peak_cap = match firm.drawdown {
@@ -692,9 +732,10 @@ pub fn run_battery(
             // firm's test, or with any fill without one.
             let step = plan.timeframe.duration_ms();
             let ends: Vec<Millis> = days.iter().map(|d| d.end).collect();
+            // The windows' own fills, so a trade's value is judged at the size tested.
             let traded = traded_days(
                 &ends,
-                &wf.fills,
+                &tester::tested_fills(cash, &wf.windows),
                 step,
                 firm.trading_day.as_ref(),
                 cash,
@@ -726,7 +767,7 @@ pub fn run_battery(
             // The firm rule sets no time limit of its own (see `FirmLimits`), so the pass odds
             // run to the rule's `pass_horizon_days`. With the two horizons equal, both odds come
             // from the same paths.
-            let breach = stats::prop_firm_odds(&daily, lows, &traded, &spec).ok();
+            let breach = stats::prop_firm_odds(&daily, lows, &traded, &spec, attempt.as_ref()).ok();
             let pass = if limits.pass_horizon_days == limits.breach_horizon_days {
                 breach
             } else {
@@ -734,7 +775,7 @@ pub fn run_battery(
                     horizon_days: limits.pass_horizon_days as usize,
                     ..spec
                 };
-                stats::prop_firm_odds(&daily, lows, &traded, &spec).ok()
+                stats::prop_firm_odds(&daily, lows, &traded, &spec, None).ok()
             };
             result.prop_firm_odds = pass.zip(breach).map(|(p, b)| PropFirmOdds {
                 pass: p.pass,
@@ -763,10 +804,16 @@ pub fn run_battery(
         plan.backtest.max_leverage,
     ));
     let kind_lines = evaluate(rule, &kind);
-    let sizing = fixed_size_drawdown.and_then(|fixed_size| {
-        let line = kind_lines.iter().find(|l| l.id == "max_drawdown")?;
-        sizing_warning(line, fixed_size)
-    });
+    let sizing: Vec<String> = [
+        ("worst_daily_loss", fixed_size_daily_loss),
+        ("max_drawdown", fixed_size_drawdown),
+    ]
+    .into_iter()
+    .filter_map(|(id, fixed_size)| {
+        let line = kind_lines.iter().find(|l| l.id == id)?;
+        sizing_warning(line, fixed_size?)
+    })
+    .collect();
 
     // 5 to 7 run only when their lines could still change the verdict.
     let decided =
@@ -784,7 +831,7 @@ pub fn run_battery(
                 slippage_bps: w.out_of_sample.config.slippage_bps * ev.cost_stress,
                 ..w.out_of_sample.config.clone()
             };
-            let r = run(&config, bars, &stressed_asks, funding)?;
+            let r = run_with_references(&config, bars, &stressed_asks, funding, references)?;
             meter.tick()?;
             let growth = r.equity.last().map_or(1.0, |p| p.equity / cash);
             window_returns.push(growth - 1.0);
@@ -815,7 +862,14 @@ pub fn run_battery(
                 // it, so that bar exists.
                 let mut spec: WalkForwardSpec = wf_spec.clone();
                 spec.sweep.base.to = traded[traded.len() - shift].open_time;
-                match walk_forward(&spec, bars, asks, funding, Some(&meter.step())) {
+                match walk_forward_with_references(
+                    &spec,
+                    bars,
+                    asks,
+                    funding,
+                    references,
+                    Some(&meter.step()),
+                ) {
                     Ok(r) => offset.oos_return = r.metrics.total_return,
                     Err(
                         e @ (TesterError::NoQualifyingRun { .. } | TesterError::InvalidSpec(_)),
@@ -842,7 +896,14 @@ pub fn run_battery(
             permutations,
             seed: derive_seed(seed, SEED_LUCK),
         };
-        match permutation_test(&spec, bars, asks, funding, Some(&meter.step())) {
+        match permutation_test_with_references(
+            &spec,
+            bars,
+            asks,
+            funding,
+            references,
+            Some(&meter.step()),
+        ) {
             Ok(p) => {
                 evidence.luck_p = Some(p.p_value);
                 let smallest = 1.0 / (p.qualified_copies as f64 + 1.0);
@@ -1111,26 +1172,40 @@ fn carry_warning(carry: Carry, trades: &[Trade], timeframe: Timeframe) -> Option
     })
 }
 
-/// The warning for a `prop_firm` drawdown line, `line`, that passes on each attempt's fall as a
-/// share of the attempt's own starting balance, when `fixed_size`, the worst attempt's fall as a
-/// share of the starting cash, would fail it. The line then passes only because it assumes the
-/// position size grows with the balance, which the engine cannot check ([`attempt_drawdowns`]).
+/// The warning for a `prop_firm` line, `line`, that passes on a fall as a share of the balance it
+/// started from, when `fixed_size`, the same worst fall as a share of the starting cash, would
+/// fail it. The line then passes only because it assumes the position size grows with the
+/// balance, which the engine cannot check. For the drawdown line the fall is the worst attempt's
+/// ([`attempt_drawdowns`]); for the worst-daily-loss line, the worst day's ([`worst_daily_loss`]).
 fn sizing_warning(line: &Criterion, fixed_size: f64) -> Option<String> {
     let (value, limit) = (line.value?, line.limit?);
     let percent = |x: f64| format!("{:.2}%", x * 100.0);
-    (line.outcome == Outcome::Pass && !line.comparison.holds(Some(fixed_size), limit)).then(|| {
-        format!(
-            "The max drawdown line passed on the assumption that position size grows with the \
+    if line.outcome != Outcome::Pass || line.comparison.holds(Some(fixed_size), limit) {
+        return None;
+    }
+    if line.id == "worst_daily_loss" {
+        return Some(format!(
+            "The worst daily loss line passed on the assumption that position size grows with \
+             the balance: its worst day, as the line measures it, lost {} of that day's starting \
+             balance. In money, the worst day lost {} of the starting balance, over the line's \
+             limit of {}. If the strategy trades a fixed position size set from the starting \
+             balance, that is what an account at the starting balance would have lost in a day.",
+            percent(value),
+            percent(fixed_size),
+            percent(limit)
+        ));
+    }
+    Some(format!(
+        "The max drawdown line passed on the assumption that position size grows with the \
              balance: its worst attempt's drawdown, as the line measures it, was {} of that \
              attempt's starting balance. In money, the worst attempt's drawdown was {} of the \
              starting balance, over the line's limit of {}. If the strategy trades a fixed \
              position size set from the starting balance, that is what an account started fresh \
              would have lost.",
-            percent(value),
-            percent(fixed_size),
-            percent(limit)
-        )
-    })
+        percent(value),
+        percent(fixed_size),
+        percent(limit)
+    ))
 }
 
 /// R4's fees: every fee of `fees`, the per-unit commission too, times `multiplier`.
@@ -1142,23 +1217,29 @@ fn stressed(fees: FeeSchedule, multiplier: f64) -> FeeSchedule {
     }
 }
 
+/// The data a battery's runs are given: bars, asks, funding and reference bars.
+type BatteryData<'a> = (
+    &'a [Candle],
+    &'a [Candle],
+    &'a [(Millis, f64)],
+    &'a [ReferenceBars],
+);
+
 /// I2 and I3 on one backtest, in three counted runs: the backtest twice, then once on the bars
 /// before `split` alone. Returns I2's and I3's differences; I3's is `None` without a split.
 fn repeat_and_prefix(
     config: &BacktestConfig,
-    bars: &[Candle],
-    asks: &[Candle],
-    funding: &[(Millis, f64)],
+    (bars, asks, funding, references): BatteryData,
     split: Option<Millis>,
     meter: &mut Meter,
 ) -> Result<(usize, Option<usize>), TesterError> {
-    let first = run(config, bars, asks, funding)?;
+    let first = run_with_references(config, bars, asks, funding, references)?;
     meter.tick()?;
-    let again = run(config, bars, asks, funding)?;
+    let again = run_with_references(config, bars, asks, funding, references)?;
     meter.tick()?;
     let prefix = match split {
         Some(at) => {
-            let half = run(
+            let half = run_with_references(
                 &BacktestConfig {
                     to: at,
                     ..config.clone()
@@ -1166,6 +1247,7 @@ fn repeat_and_prefix(
                 bars,
                 asks,
                 funding,
+                references,
             )?;
             Some(prefix_differences(&first.orders, &half.orders, at))
         }
@@ -1342,7 +1424,9 @@ fn daily_lows(
 /// With a firm's `test`, only a fill that passes it marks its day ([`TradingDayTest`]). The
 /// fills are replayed per instrument with [`next_position`], the portfolio's rule, to know what
 /// each one closes and at what average entry; `cash`, the starting balance, and `account`, the
-/// account currency, turn a closed trade's value into a share of the balance.
+/// account currency, turn a closed trade's value into a share of the balance. The battery passes
+/// the walk-forward windows' own fills ([`tester::tested_fills`]), not the stitched ones, whose
+/// quantities carry each window's scale, so that value is at the size the strategy was tested at.
 ///
 /// shortcut: one set of flags, at the size the strategy was tested at, serves the evaluation and
 /// the funded account, so `VerdictRule::validate` refuses a `min_trade_size` with an attempt whose
@@ -1393,15 +1477,27 @@ fn traded_days(
     traded
 }
 
-/// The prop-firm worst daily loss inside bars, as a fraction of the starting balance, on days
-/// ending at `rollover`, the firm's day; without one, the worse of the days ending at midnight UTC
-/// and at 17:00 New York. `None` without equity ranges.
+/// The prop-firm worst daily loss inside bars, on days ending at `rollover`, the firm's day;
+/// without one, the worse of the days ending at midnight UTC and at 17:00 New York. Each day's
+/// fall is read as a share of that day's starting balance ([`Fall::own`], what the line judges),
+/// as an attempt started that morning measures it and as the attempt walks compound each day on
+/// a fresh balance, and as a share of `cash`, the starting cash ([`Fall::cash`]). Each reading
+/// is its own worst, which need not be the same day. `None` without equity ranges.
+///
+/// The walk-forward curve compounds from window to window, so the two differ by the curve's level:
+/// a day that loses 4% of a balance standing at 0.6 of the starting cash loses 2.4% of the
+/// starting cash.
+///
+/// shortcut: judging each day's fall against its own starting balance assumes the position size
+/// grows with the balance, as for the drawdown line ([`attempt_drawdowns`]); the verdict warns when
+/// the starting-cash reading would fail a line that passes (`sizing_warning`). Judge the line on
+/// the starting-cash reading once a plan can say its strategy trades a fixed size.
 fn worst_daily_loss(
     series: &EquitySeries,
     ranges: &[crate::EquityRange],
     cash: f64,
     rollover: Option<DayRollover>,
-) -> Option<f64> {
+) -> Option<Fall> {
     if ranges.is_empty() {
         return None;
     }
@@ -1413,17 +1509,24 @@ fn worst_daily_loss(
         .copied()
         .map(|rollover| {
             let days = risk::daily_pnl(series, Some(ranges), rollover);
-            risk::worst_daily_loss_intraday(&days, cash)
+            Some(Fall {
+                own: risk::worst_daily_loss_intraday_own(&days)?,
+                cash: risk::worst_daily_loss_intraday(&days, cash)?,
+            })
         })
-        .collect::<Option<Vec<f64>>>()?
+        .collect::<Option<Vec<Fall>>>()?
         .into_iter()
-        .reduce(f64::max)
+        .reduce(|a, b| Fall {
+            own: a.own.max(b.own),
+            cash: a.cash.max(b.cash),
+        })
 }
 
-/// The worst fall of [`attempt_drawdowns`]' attempts on one reading, static or trailing.
+/// A worst fall read two ways: the worst of [`attempt_drawdowns`]' attempts on one reading,
+/// static or trailing, or the worst day of [`worst_daily_loss`].
 #[derive(Debug, Clone, Copy, PartialEq)]
-struct AttemptFall {
-    /// As a fraction of each attempt's own starting equity: what the drawdown line judges.
+struct Fall {
+    /// As a fraction of each attempt's, or each day's, own starting equity: what the line judges.
     own: f64,
     /// As a fraction of the starting cash: what a fresh account at the starting balance would
     /// lose trading the same fixed size.
@@ -1446,7 +1549,7 @@ struct AttemptFall {
 /// attempt holds a bar.
 ///
 /// Each reading also gives the worst of the same attempts' falls, in money, as a fraction of the
-/// curve's first value, the starting cash ([`AttemptFall::cash`]).
+/// curve's first value, the starting cash ([`Fall::cash`]).
 ///
 /// `peak_cap`, for a trailing floor that stops rising at a lock, is how far above an attempt's
 /// start the peak counts, as a fraction of that start: the firm's `trailing_floor_lock` plus its
@@ -1474,7 +1577,7 @@ fn attempt_drawdowns(
     rollover: DayRollover,
     horizon: usize,
     peak_cap: Option<f64>,
-) -> (Option<AttemptFall>, Option<AttemptFall>) {
+) -> (Option<Fall>, Option<Fall>) {
     let (times, values) = (&series.times, &series.values);
     if ranges.is_empty() || ranges.len() + 1 != values.len() || horizon == 0 {
         return (None, None);
@@ -1495,19 +1598,19 @@ fn attempt_drawdowns(
                 let low = bars.iter().map(|r| r.low).reduce(f64::min);
                 let fixed = risk::static_drawdown(start, low)
                     .zip(low)
-                    .map(|(own, low)| AttemptFall {
+                    .map(|(own, low)| Fall {
                         own,
                         cash: (start - low).max(0.0) / cash,
                     });
                 let trailing = match peak_cap {
-                    None => risk::trailing_drawdown(start, bars).map(|d| AttemptFall {
+                    None => risk::trailing_drawdown(start, bars).map(|d| Fall {
                         own: d.amount / start,
                         cash: d.amount / cash,
                     }),
                     Some(cap) => {
                         let own = capped_fall(start, bars, start * (1.0 + cap)) / start;
                         let fixed_size = capped_fall(start, bars, start + cash * cap) / cash;
-                        (own.is_finite() && fixed_size.is_finite()).then_some(AttemptFall {
+                        (own.is_finite() && fixed_size.is_finite()).then_some(Fall {
                             own,
                             cash: fixed_size,
                         })
@@ -1518,9 +1621,9 @@ fn attempt_drawdowns(
         })
         .unzip();
     // Each share's worst, which need not be the same attempt's.
-    let worst = |falls: Vec<Option<AttemptFall>>| {
-        let falls = falls.into_iter().collect::<Option<Vec<AttemptFall>>>()?;
-        Some(AttemptFall {
+    let worst = |falls: Vec<Option<Fall>>| {
+        let falls = falls.into_iter().collect::<Option<Vec<Fall>>>()?;
+        Some(Fall {
             own: falls.iter().map(|f| f.own).reduce(f64::max)?,
             cash: falls.iter().map(|f| f.cash).reduce(f64::max)?,
         })
@@ -1639,6 +1742,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::run;
     use crate::{AttachedStop, OrderStatus};
 
     fn order(submitted_at: Millis, qty: f64, status: OrderStatus) -> Order {
@@ -1729,6 +1833,7 @@ mod tests {
             warmup_from: None,
             close_at_end: false,
             account_currency: td_core::AccountCurrency::Quote,
+            references: Vec::new(),
         }
     }
 
@@ -2302,23 +2407,25 @@ mod tests {
         };
         let line = |(series, ranges): &(EquitySeries, Vec<crate::EquityRange>), rollover| {
             let kind = KindInputs {
-                worst_daily_loss: worst_daily_loss(series, ranges, 100.0, rollover),
+                worst_daily_loss: worst_daily_loss(series, ranges, 100.0, rollover).map(|f| f.own),
                 ..KindInputs::default()
             };
             let rule = firm_rule(DrawdownMode::Static, 90, rollover);
             kind_line(&rule, &kind, "worst_daily_loss")
         };
         let (utc, ny) = (Some(DayRollover::default()), Some(DayRollover::NewYork1700));
-        // From 22:00 to 02:00 UTC: 2% on each UTC day, 4% on the New York day that starts at
+        // From 22:00 to 02:00 UTC: 2 of 100 on the first UTC day and 2 of the 98 the second
+        // starts at, 4 of 100 on the New York day that starts at
         // 22:00.
         let late = falling(22);
         assert_eq!(line(&late, None), (Some(0.04), Outcome::Fail));
-        assert_eq!(line(&late, utc), (Some(0.02), Outcome::Pass));
+        assert_eq!(line(&late, utc), (Some(2.0 / 98.0), Outcome::Pass));
         assert_eq!(line(&late, ny), (Some(0.04), Outcome::Fail));
-        // From 20:00 to 24:00 UTC: 4% on the UTC day, 2% on each New York day around 22:00.
+        // From 20:00 to 24:00 UTC: 4 of 100 on the UTC day; on the New York days around 22:00,
+        // 2 of 100 and 2 of the 98 the second starts at.
         let early = falling(20);
         assert_eq!(line(&early, None), (Some(0.04), Outcome::Fail));
-        assert_eq!(line(&early, ny), (Some(0.02), Outcome::Pass));
+        assert_eq!(line(&early, ny), (Some(2.0 / 98.0), Outcome::Pass));
         assert_eq!(line(&early, utc), (Some(0.04), Outcome::Fail));
     }
 
@@ -2416,9 +2523,7 @@ mod tests {
     }
 
     /// The static and trailing falls as shares of each attempt's own start, which the line judges.
-    fn own(
-        (fixed, trailing): (Option<AttemptFall>, Option<AttemptFall>),
-    ) -> (Option<f64>, Option<f64>) {
+    fn own((fixed, trailing): (Option<Fall>, Option<Fall>)) -> (Option<f64>, Option<f64>) {
         (fixed.map(|f| f.own), trailing.map(|f| f.own))
     }
 
@@ -2630,6 +2735,130 @@ mod tests {
 
     const NO_DAYS: [usize; 0] = [];
 
+    /// A walk-forward window on a balance of 10,000 whose test run ends at `end` and holds
+    /// `fills`, the rest taken from `template`.
+    fn window(template: &BacktestResult, end: f64, fills: Vec<Fill>) -> crate::WindowResult {
+        let mut out_of_sample = template.clone();
+        out_of_sample.equity = vec![
+            EquityPoint {
+                time: 0,
+                equity: 10_000.0,
+            },
+            EquityPoint {
+                time: 1,
+                equity: end,
+            },
+        ];
+        out_of_sample.fills = fills;
+        crate::WindowResult {
+            train_from: 0,
+            train_to: 0,
+            test_from: 0,
+            test_to: 0,
+            params: template.config.params.clone(),
+            in_sample: Headline::new(&template.metrics),
+            out_of_sample,
+        }
+    }
+
+    /// A trade's value is judged at the size the strategy was tested at, not at the stitched
+    /// curve's level in its window: the stitched fills carry each window's scale.
+    #[test]
+    fn a_trades_value_is_judged_at_the_size_tested_not_at_the_stitched_curves_level() {
+        let (plan, bars) = sma_plan(sma_axes());
+        let r = sma_battery(&plan, &bars, 7);
+        let wf = r.walk_forward.as_ref().unwrap();
+        let template = &wf.windows[0].out_of_sample;
+        // One of 1 bought on day 1 and sold on day 3 at `price`, scaled by `scale`.
+        let trade = |price: f64, scale: f64| {
+            vec![
+                day_fill(1, Side::Buy, scale, price),
+                day_fill(3, Side::Sell, scale, price),
+            ]
+        };
+        // The second window's fills as the battery reads them, after a first window that ends at
+        // `first_end` of the 10,000 start.
+        let tested = |first_end: f64, price: f64| {
+            let windows = [
+                window(template, first_end, Vec::new()),
+                window(template, 10_000.0, trade(price, 1.0)),
+            ];
+            tester::tested_fills(10_000.0, &windows)
+        };
+        let at_least = |size| day_test(false, Some(size), None);
+
+        // The first window ends 25% up, so the stitched account trades 1.25 of each: a trade of
+        // 4,000, 0.4 of the balance as tested, reads 0.5 stitched and met a minimum of 0.45.
+        let up = tested(12_500.0, 4_000.0);
+        assert_eq!(up, trade(4_000.0, 1.0));
+        assert_eq!(flagged_days(&up, at_least(0.45)), NO_DAYS);
+        assert_eq!(flagged_days(&trade(4_000.0, 1.25), at_least(0.45)), [3]);
+        // The mirror: 25% down, a trade of 5,000 is 0.5 as tested and reads 0.375 stitched.
+        let down = tested(7_500.0, 5_000.0);
+        assert_eq!(flagged_days(&down, at_least(0.45)), [3]);
+        assert_eq!(flagged_days(&trade(5_000.0, 0.75), at_least(0.45)), NO_DAYS);
+        // A window after the stitched account is gone is left out, as the stitched fills leave it.
+        assert!(tested(0.0, 5_000.0).is_empty());
+
+        // Without a smallest size the scale changes nothing: on a real walk-forward the windows'
+        // own fills give the stitched fills' flags.
+        let cash = plan.backtest.starting_cash;
+        let series = EquitySeries::new(cash, &wf.equity, plan.timeframe);
+        let ends: Vec<Millis> = risk::daily_pnl(&series, None, DayRollover::default())
+            .iter()
+            .map(|d| d.end)
+            .collect();
+        let own = tester::tested_fills(cash, &wf.windows);
+        assert_ne!(own, wf.fills);
+        let step = plan.timeframe.duration_ms();
+        let quote = td_core::AccountCurrency::Quote;
+        for test in [
+            None,
+            day_test(false, None, None),
+            day_test(true, None, None),
+            day_test(false, None, Some(0.001)),
+        ] {
+            let flags =
+                |fills: &[Fill]| traded_days(&ends, fills, step, test.as_ref(), cash, quote);
+            assert_eq!(flags(&own), flags(&wf.fills), "{test:?}");
+            assert!(flags(&own).contains(&true), "{test:?}");
+        }
+
+        // With a smallest size where the two differ on this curve, the battery's odds count the
+        // trading days of the windows' own fills.
+        let count = |fills: &[Fill], size: f64| {
+            let test = at_least(size);
+            let flags = traded_days(&ends, fills, step, test.as_ref(), cash, quote);
+            flags.iter().filter(|&&t| t).count()
+        };
+        let size = (1..=100)
+            .map(|k| f64::from(k) / 100.0)
+            .find(|&size| count(&own, size) != count(&wf.fills, size))
+            .unwrap();
+        let VerdictRule::PropFirm { firm, limits, .. } = firm_rule(DrawdownMode::Static, 10, None)
+        else {
+            unreachable!()
+        };
+        let rule = VerdictRule::PropFirm {
+            firm: crate::FirmLimits {
+                trading_day: at_least(size),
+                ..firm
+            },
+            limits,
+            attempt: None,
+        };
+        let spec = BatterySpec {
+            strategy: "sma_cross",
+            plan: &plan,
+            rule: &rule,
+            instrument: &test_instrument(),
+            seed: 7,
+        };
+        let sized = run_battery(&spec, &bars, &[], &[], None).unwrap();
+        let odds = sized.prop_firm_odds.unwrap();
+        assert_eq!(odds.trading_days, Some(count(&own, size)), "{size}");
+    }
+
     #[test]
     fn a_firms_trading_day_test_counts_only_the_closing_fill_of_a_large_enough_trade() {
         // Buy 1 at 1,000 on day 1 and sell it at 1,010 on day 3: a trade worth 1,000, 10% of the
@@ -2816,7 +3045,7 @@ mod tests {
         );
 
         // The two horizons are equal, so one run of the odds gives both.
-        let odds = |traded: &[bool]| {
+        let odds_with = |traded: &[bool], terms: Option<&crate::AttemptTerms>| {
             let spec = PropFirmSpec {
                 target: firm.profit_target,
                 second_target: None,
@@ -2839,8 +3068,9 @@ mod tests {
                 DayRollover::default(),
             )
             .unwrap();
-            stats::prop_firm_odds(&daily, Some(&lows), traded, &spec).unwrap()
+            stats::prop_firm_odds(&daily, Some(&lows), traded, &spec, terms).unwrap()
         };
+        let odds = |traded: &[bool]| odds_with(traded, None);
         let fills = odds(&traded);
         let every_day = odds(&vec![true; daily.len()]);
         assert_eq!(r.prop_firm_odds, Some(fills));
@@ -2852,6 +3082,48 @@ mod tests {
             fills.pass < every_day.pass,
             "{fills:?} against {every_day:?}"
         );
+
+        // With attempt terms, the breach odds walk the funded account with their payouts, on the
+        // same flags: a payout every day that fixes the floor at the start leaves no room above
+        // it, so more paths breach.
+        let terms = crate::AttemptTerms {
+            account_size: 100_000.0,
+            evaluation_fee: 500.0,
+            pass_fee: 0.0,
+            refund_fee_with_first_payout: false,
+            profit_split: 0.8,
+            days_to_first_payout: 1,
+            calendar_days_to_first_payout: None,
+            payout_interval_days: 1,
+            min_payout: 0.0,
+            payout_cap: None,
+            max_payouts: None,
+            payout_locks_floor: true,
+            funded_horizon_days: 30,
+            evaluation_size: 1.0,
+            funded_size: 1.0,
+            reduced_edge_factor: 0.5,
+        };
+        let rule = VerdictRule::PropFirm {
+            firm,
+            limits: crate::PropFirmLimits::default(),
+            attempt: Some(terms),
+        };
+        let priced = run_battery(
+            &BatterySpec {
+                rule: &rule,
+                ..spec
+            },
+            &bars,
+            &[],
+            &[],
+            None,
+        )
+        .unwrap();
+        let paying = odds_with(&traded, Some(&terms));
+        assert_eq!(priced.prop_firm_odds, Some(paying));
+        assert_eq!(paying.pass, fills.pass);
+        assert!(paying.breach > fills.breach, "{paying:?} against {fills:?}");
     }
 
     /// A rule that states its firm's day has the attempt walks read that day: each day's return,
@@ -2919,7 +3191,7 @@ mod tests {
                 mean_block: stats::default_block_len(daily.len()),
                 seed: derive_seed(seed, SEED_PROP_FIRM),
             };
-            stats::prop_firm_odds(&daily, Some(&lows), &traded, &spec).unwrap()
+            stats::prop_firm_odds(&daily, Some(&lows), &traded, &spec, None).unwrap()
         };
         assert_eq!(r.prop_firm_odds, Some(odds(ny)));
         // The four-hour bars close at 00:00 UTC, after 17:00 New York, so the days differ.
@@ -2927,7 +3199,7 @@ mod tests {
         let extremes = &wf.equity_extremes;
         assert_eq!(
             r.kind.worst_daily_loss,
-            worst_daily_loss(&series, extremes, cash, Some(ny))
+            worst_daily_loss(&series, extremes, cash, Some(ny)).map(|f| f.own)
         );
         assert_eq!(
             (
@@ -2998,12 +3270,132 @@ mod tests {
             let line = drawdown_line(&between);
             assert_eq!((line.value, line.outcome), (Some(fall.own), Outcome::Pass));
             let warning = sizing_warning(&line, fall.cash).unwrap();
-            assert_eq!(between.verdict.warnings, [warning], "{drawdown:?}");
+            assert_eq!(drawdown_warnings(&between), [warning], "{drawdown:?}");
 
             let above = battery(drawdown, fall.cash * 1.01 / share);
             assert_eq!(drawdown_line(&above).outcome, Outcome::Pass);
-            assert!(above.verdict.warnings.is_empty(), "{drawdown:?}");
+            assert!(drawdown_warnings(&above).is_empty(), "{drawdown:?}");
         }
+    }
+
+    /// The verdict's warnings that start with `text`.
+    fn warnings_starting(r: &BatteryResult, text: &str) -> Vec<String> {
+        let warnings = r.verdict.warnings.iter();
+        warnings.filter(|w| w.starts_with(text)).cloned().collect()
+    }
+
+    fn drawdown_warnings(r: &BatteryResult) -> Vec<String> {
+        warnings_starting(r, "The max drawdown line")
+    }
+
+    fn daily_loss_warnings(r: &BatteryResult) -> Vec<String> {
+        warnings_starting(r, "The worst daily loss line")
+    }
+
+    /// A rule like [`firm_rule`] whose firm allows a daily loss of `daily_loss`.
+    fn daily_loss_rule(daily_loss: f64, day_rollover: Option<DayRollover>) -> VerdictRule {
+        let VerdictRule::PropFirm { firm, limits, .. } =
+            firm_rule(DrawdownMode::Static, 10, day_rollover)
+        else {
+            unreachable!()
+        };
+        VerdictRule::PropFirm {
+            firm: crate::FirmLimits { daily_loss, ..firm },
+            limits,
+            attempt: None,
+        }
+    }
+
+    /// The worst-daily-loss line reads each day's fall as a share of that day's starting balance,
+    /// on a curve that compounds: a day that loses 4% of a balance standing at 0.6 of the starting
+    /// cash is 4%, and fails a line of 2.5% (a firm's 5% judged at half), though it is 2.4% of the
+    /// starting cash. After gains the other way: 2% of a balance at 1.5 times the starting cash
+    /// passes, though it is 3% of the starting cash, and the warning carries both figures.
+    #[test]
+    fn the_daily_loss_line_reads_each_day_on_its_own_starting_balance() {
+        let judge = |values: &[f64]| {
+            let (series, ranges) = curve(10 * DAY_MS, DAY_MS, values);
+            let fall = worst_daily_loss(&series, &ranges, 100.0, None).unwrap();
+            let kind = KindInputs {
+                worst_daily_loss: Some(fall.own),
+                ..KindInputs::default()
+            };
+            let line = crate::evaluate(&daily_loss_rule(0.05, None), &kind)
+                .into_iter()
+                .find(|l| l.id == "worst_daily_loss")
+                .unwrap();
+            let warning = sizing_warning(&line, fall.cash);
+            (fall, line, warning)
+        };
+        let near = |a: f64, b: f64| assert!((a - b).abs() < 1e-12, "{a} against {b}");
+
+        let (fall, line, warning) = judge(&[60.0, 57.6]);
+        near(fall.own, 0.04);
+        near(fall.cash, 0.024);
+        assert_eq!(line.limit, Some(0.025));
+        assert_eq!((line.value, line.outcome), (Some(fall.own), Outcome::Fail));
+        assert_eq!(warning, None);
+
+        let (fall, line, warning) = judge(&[150.0, 147.0]);
+        near(fall.own, 0.02);
+        near(fall.cash, 0.03);
+        assert_eq!(line.outcome, Outcome::Pass);
+        let warning = warning.unwrap();
+        assert!(
+            warning.contains("lost 2.00% of that day's starting balance"),
+            "{warning}"
+        );
+        assert!(
+            warning.contains("lost 3.00% of the starting balance"),
+            "{warning}"
+        );
+        assert!(warning.contains("limit of 2.50%"), "{warning}");
+    }
+
+    /// The battery puts the worst-daily-loss line's sizing warning on the verdict, from the reading
+    /// the line judges: with the line's limit between the worst day's fall as a share of its own
+    /// start and as a share of the starting cash, the line passes and the verdict warns; with the
+    /// limit above both, it does not.
+    #[test]
+    fn the_battery_warns_when_the_daily_loss_line_passes_only_on_its_sizing() {
+        let (plan, bars) = sma_plan(sma_axes());
+        let battery = |daily_loss| {
+            let rule = daily_loss_rule(daily_loss, None);
+            let spec = BatterySpec {
+                strategy: "sma_cross",
+                plan: &plan,
+                rule: &rule,
+                instrument: &test_instrument(),
+                seed: 7,
+            };
+            run_battery(&spec, &bars, &[], &[], None).unwrap()
+        };
+        let daily_line = |r: &BatteryResult| {
+            r.verdict
+                .criteria
+                .iter()
+                .find(|l| l.layer == crate::Layer::Kind && l.id == "worst_daily_loss")
+                .unwrap()
+                .clone()
+        };
+        let share = crate::PropFirmLimits::default().share_of_firm_limits;
+        let r = battery(0.06);
+        let wf = r.walk_forward.as_ref().unwrap();
+        let cash = plan.backtest.starting_cash;
+        let series = EquitySeries::new(cash, &wf.equity, plan.timeframe);
+        let fall = worst_daily_loss(&series, &wf.equity_extremes, cash, None).unwrap();
+        // The curve grows well above its start, so its days read smaller on their own start.
+        assert!(fall.own < fall.cash, "{fall:?}");
+
+        let between = battery((fall.own + fall.cash) / 2.0 / share);
+        let line = daily_line(&between);
+        assert_eq!((line.value, line.outcome), (Some(fall.own), Outcome::Pass));
+        let warning = sizing_warning(&line, fall.cash).unwrap();
+        assert_eq!(daily_loss_warnings(&between), [warning]);
+
+        let above = battery(fall.cash * 1.01 / share);
+        assert_eq!(daily_line(&above).outcome, Outcome::Pass);
+        assert!(daily_loss_warnings(&above).is_empty());
     }
 
     /// A decimal parameter swept over whole numbers: the chosen sets hold `equity_fraction` as the

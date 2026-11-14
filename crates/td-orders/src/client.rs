@@ -20,9 +20,10 @@
 //! Only three kinds of answer say that the venue refused a request before processing it, and each
 //! rests on one documented statement:
 //! - 10006 rests on the rate-limit page: the request is over the account's per-request limit for
-//!   the endpoint, as the answer's own `X-Bapi-Limit-Status` shows. It is sent again after the
-//!   reset the venue gives, at most [`RATE_LIMIT_RETRIES`] times and only when the reset is within
-//!   [`LONGEST_RATE_WAIT`] and the time budget.
+//!   the endpoint. The `retCode` alone is taken as that answer; `X-Bapi-Limit-Status` is read only
+//!   for the wait. It is sent again after the reset the venue gives, at most
+//!   [`RATE_LIMIT_RETRIES`] times and only when the reset is within [`LONGEST_RATE_WAIT`] and the
+//!   time budget.
 //! - 10002 rests on the guide's rule: a request whose timestamp is outside that window is not
 //!   accepted. The clock offset is measured again and the request sent once more.
 //! - HTTP 403 and 10018 rest on the rate-limit page's IP block: the IP's requests are refused. They
@@ -34,6 +35,9 @@
 //! outside 2xx (a redirect included: a server may apply a POST and then redirect), the body codes
 //! 429, 10429 and 110079 (the venue asks for a retry but does not say the request was not taken),
 //! 40004, 10014, and the server errors 10000 and 10016. The caller then asks the venue (`orders`).
+//! So does any `retCode` refusal of an order request that was sent more than once: if the venue
+//! was wrong to refuse an earlier send, that send may have been applied, and a duplicate-id or
+//! other refusal of the next one may follow from it.
 //! A read changes nothing, so a read answered 429 (HTTP or body) or 10429 waits and goes again
 //! within the same bounds, and a read whose answer never arrived is tried again ([`Client::read`]).
 //!
@@ -44,7 +48,9 @@
 //!
 //! A `place`, `cancel` or `amend_stop` passes its deadline to every request it makes: each
 //! request's timeout, the clock resync, each rate-limit wait and each pause is cut to what is left,
-//! and nothing is sent once it has passed.
+//! and nothing is sent once it has passed. An order request is sent again only while a whole
+//! request timeout is left, so its answer, or the lookup after it, fits in the budget; the first
+//! send of an operation is cut to what is left instead.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -157,7 +163,8 @@ impl Timing {
 /// ([`Timing::operation_budget`], 30 s with [`Timing::default`]): before each request, clock
 /// resync, rate-limit wait and pause it takes what is left of the budget, cuts the request's
 /// timeout (10 s by default, connection included) or the wait to it, and sends nothing once it
-/// has run out. What can run past the budget is the time to sign a request and parse an answer.
+/// has run out; an order request is not sent again with less than a request timeout left. What
+/// can run past the budget is the time to sign a request and parse an answer.
 /// Reads are not under the budget: each request in a read is bounded by the request timeout and
 /// is tried at most three times, each try with up to three rate-limit waits of at most 3 s and
 /// one clock resync.
@@ -199,8 +206,9 @@ pub(crate) enum Failure {
     /// processing it (the module documentation lists those answers). Sending it again cannot
     /// duplicate anything.
     NotSent(Error),
-    /// The request may or may not have been applied. `sent_at` is the timestamp it was signed with.
-    Unknown { reason: String, sent_at: Millis },
+    /// The request may or may not have been applied. `sent` is the local instant it was stamped,
+    /// so a lookup's window is measured on the local clock, which a clock resync cannot move.
+    Unknown { reason: String, sent: Instant },
     /// The venue answered with a non-zero `retCode` that refuses the request. The message has
     /// been scrubbed.
     Venue { code: i64, message: String },
@@ -326,6 +334,12 @@ impl Client {
         Ok(url)
     }
 
+    /// Whether a whole request timeout is left before `deadline`, as an order request sent again
+    /// needs.
+    pub(crate) fn room_to_resend(&self, deadline: Instant) -> bool {
+        deadline.saturating_duration_since(Instant::now()) >= self.timing.request_timeout
+    }
+
     /// The timeout for the next request: the request timeout, cut to what is left before
     /// `deadline`. `None` once the deadline has passed.
     fn timeout_within(&self, deadline: Option<Instant>) -> Option<Duration> {
@@ -341,7 +355,8 @@ impl Client {
     /// Sends one request and classifies the answer as the module documentation describes. A
     /// 10006 and one timestamp refusal are sent again here, and so is a read answered 429 or
     /// 10429; every other answer goes back to the caller. With a `deadline`, each request's
-    /// timeout and each wait is cut to what is left of it, and nothing is sent once it has passed.
+    /// timeout and each wait is cut to what is left of it, nothing is sent once it has passed,
+    /// and an order request is not sent again with less than a request timeout left.
     pub(crate) fn call(
         &self,
         path: &'static str,
@@ -350,12 +365,13 @@ impl Client {
     ) -> Result<serde_json::Value, Failure> {
         let mut resynced = false;
         let mut rate_retries = 0;
+        let mut sends = 0u32;
         let signed = !matches!(method, Method::Public(_));
         let order_request = matches!(method, Method::Post(_));
         let out_of_time = || {
             Failure::NotSent(Error::Transport {
                 endpoint: path,
-                reason: "the time budget ran out before the request was sent".into(),
+                reason: "too little of the time budget was left to send the request".into(),
             })
         };
         let limited = |ip_block| {
@@ -369,10 +385,15 @@ impl Client {
             let Some(timeout) = self.timeout_within(deadline) else {
                 return Err(out_of_time());
             };
+            // Every earlier send was refused before processing, so not sending frees the id.
+            if order_request && sends > 0 && deadline.is_some_and(|d| !self.room_to_resend(d)) {
+                return Err(out_of_time());
+            }
             let timestamp = self.server_now();
+            let stamped = Instant::now();
             let unknown = |reason: String| Failure::Unknown {
                 reason,
-                sent_at: timestamp,
+                sent: stamped,
             };
             let mut url = self.url(path).map_err(Failure::NotSent)?;
             let (payload, body) = match method {
@@ -402,6 +423,7 @@ impl Client {
                 None => self.http.get(url),
                 Some(body) => self.http.post(url).body(body),
             };
+            sends += 1;
             let response = match request.headers(headers).timeout(timeout).send() {
                 Ok(r) => r,
                 Err(e) => return Err(unknown(transport_reason(&e).into())),
@@ -496,7 +518,18 @@ impl Client {
                     let Some(timeout) = self.timeout_within(deadline) else {
                         return Err(out_of_time());
                     };
-                    self.sync_clock(timeout).map_err(Failure::NotSent)?;
+                    // The request was refused before processing, so a failed resync leaves it
+                    // not sent. It is reported on the request's own endpoint as the documented
+                    // not-sent error, whatever the time endpoint answered.
+                    self.sync_clock(timeout).map_err(|e| {
+                        Failure::NotSent(Error::Transport {
+                            endpoint: path,
+                            reason: format!(
+                                "the venue refused the request timestamp, and the clock resync \
+                                 failed: {e}"
+                            ),
+                        })
+                    })?;
                 }
                 RET_TIMESTAMP => {
                     return Err(Failure::NotSent(Error::TimestampRejected {
@@ -508,6 +541,15 @@ impl Client {
                     return Err(unknown(format!(
                         "the venue answered server error {}",
                         env.ret_code
+                    )));
+                }
+                // An earlier send the venue refused may have been applied after all, and this
+                // refusal may follow from it.
+                code if order_request && sends > 1 => {
+                    return Err(unknown(format!(
+                        "the venue refused a send that followed a rate-limit or timestamp \
+                         refusal with {code} {}, which the earlier send may have caused",
+                        self.keys.scrub(&env.ret_msg, &signature)
                     )));
                 }
                 code => {

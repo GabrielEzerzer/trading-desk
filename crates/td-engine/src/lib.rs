@@ -29,6 +29,7 @@ mod params;
 mod permute;
 mod plan;
 mod portfolio;
+mod reference;
 mod registry;
 mod results;
 pub mod risk;
@@ -50,7 +51,7 @@ mod private_strategies_build;
 pub use battery::{
     BatteryResult, BatteryRuns, BatterySpec, Breakdown, CostStress, IntegrityReport,
     PlateauDirection, PlateauReport, RegimeResult, SideResult, StartOffset, battery_runs,
-    run_battery,
+    run_battery, run_battery_with_references,
 };
 pub use broker::{AttachedStop, Broker, BrokerEvent, Order, OrderStatus, SimBroker};
 pub use compare::{
@@ -68,6 +69,7 @@ pub use plan::{
     date,
 };
 pub use portfolio::Portfolio;
+pub use reference::ReferenceBars;
 pub use registry::{StrategyEntry, build_strategy, code_hash, find_strategy, strategies};
 pub use results::{
     PlanRun, RunId, RunKind, RunSummary, SavedRun, StoreError, list, load, save, save_with_files,
@@ -75,7 +77,8 @@ pub use results::{
 pub use risk::{DayRollover, EquityRange};
 pub use runner::{
     BacktestConfig, BacktestResult, Benchmark, ENGINE_REVISION, Rerun, config_fingerprint,
-    data_fingerprint, default_slippage_bps, rerun, run, run_strategy,
+    config_fingerprint_with_references, data_fingerprint, default_slippage_bps, rerun, run,
+    run_strategy, run_with_references,
 };
 pub use session::{
     CLOSE_OUT_TAG, EquityPoint, LIQUIDATION_TAG, MAINTENANCE_MARGIN_RATE, Session, SessionConfig,
@@ -87,7 +90,9 @@ pub use tester::{
     Direction, Headline, MAX_RUNS, Metric, Objective, OosResult, OosSpec, ParamAxis, ParamSpace,
     PermutationResult, PermutationSpec, Progress, Split, SweepMode, SweepResult, SweepRow,
     SweepSpec, TesterError, WalkForwardResult, WalkForwardSpec, Window, WindowMode, WindowResult,
-    WindowSpec, out_of_sample, permutation_test, stitch, sweep, walk_forward,
+    WindowSpec, out_of_sample, out_of_sample_with_references, permutation_test,
+    permutation_test_with_references, stitch, sweep, sweep_with_references, walk_forward,
+    walk_forward_with_references,
 };
 pub use trades::{
     BarFunding, Trade, TradeSide, TradeStops, attach_stops, build_trades, build_trades_with_fills,
