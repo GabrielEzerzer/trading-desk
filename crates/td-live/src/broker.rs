@@ -1679,8 +1679,9 @@ impl Core {
                 self.tracked(id).at = At::Done;
                 continue;
             }
-            let (reported, cancel_asked, stop, side, attached, held) = (
+            let (reported, sent, cancel_asked, stop, side, attached, held) = (
                 t.reported,
+                t.sent,
                 t.cancel_asked,
                 is_stop(&t.order),
                 t.order.request.side,
@@ -1705,31 +1706,35 @@ impl Core {
                     ),
                 )));
             }
+            let nothing_to_reduce = match side {
+                Side::Sell => self.book.tally <= half,
+                Side::Buy => self.book.tally >= -half,
+            };
+            let status = venue_text(&found.status);
+            // A stop (or its close at market) the venue closed with part or none of it filled,
+            // that the session did not cancel, leaves the rest of the position unprotected.
+            if stop && !cancel_asked && !nothing_to_reduce {
+                return Ok(Some((
+                    FaultKind::MissingOrder,
+                    format!(
+                        "stop {cid} is {status} at the venue with {reported} of {sent} filled and \
+                         a position of {} still open",
+                        self.book.tally
+                    ),
+                )));
+            }
             if reported > 0.0 {
                 // Part filled, the rest closed: the session already holds it filled.
                 self.tracked(id).at = At::Done;
                 continue;
             }
             // Closed with nothing filled.
-            let nothing_to_reduce = match side {
-                Side::Sell => self.book.tally <= half,
-                Side::Buy => self.book.tally >= -half,
-            };
-            let status = venue_text(&found.status);
             let reason = if cancel_asked {
                 "cancelled at the venue".to_string()
             } else if !stop {
                 format!("the venue closed it unfilled ({status})")
-            } else if nothing_to_reduce {
-                format!("the venue closed it ({status}): the position it would reduce is gone")
             } else {
-                return Ok(Some((
-                    FaultKind::MissingOrder,
-                    format!(
-                        "stop {cid} is {status} at the venue with a position of {} still open",
-                        self.book.tally
-                    ),
-                )));
+                format!("the venue closed it ({status}): the position it would reduce is gone")
             };
             // Its attached stop goes with it. One already placed because the entry's fill could
             // not be confirmed must not rest without a position; one whose placement did not

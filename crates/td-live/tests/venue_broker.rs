@@ -1221,6 +1221,72 @@ fn a_cancelled_stop_that_filled_partly_first_reports_its_fill() {
 }
 
 #[test]
+fn a_stop_the_venue_closes_after_a_part_fill_with_the_position_still_held_faults() {
+    let mut rig = Rig::new(vec![
+        (0, Act::Submit(market(Side::Buy, 0.004, false))),
+        (1, Act::Submit(stop(Side::Sell, 0.004, 60000.0))),
+    ]);
+    rig.bar();
+    rig.bar();
+    // The stop triggers and fills 0.002; the venue closes the rest.
+    rig.mock.cancel_after_partial_fill("t-o2", 0.002);
+    rig.bar();
+    let fault = rig.handle.fault().expect("faulted");
+    assert_eq!(fault.kind, FaultKind::MissingOrder);
+    assert!(
+        fault.message.contains("stop t-o2") && fault.message.contains("still open"),
+        "{fault}"
+    );
+    assert_eq!(rig.mock.position(SYMBOL), 0.002);
+}
+
+#[test]
+fn a_stop_the_venue_closes_after_a_part_fill_with_no_position_left_does_not_fault() {
+    let mut rig = Rig::new(vec![
+        (0, Act::Submit(market(Side::Buy, 0.004, false))),
+        (1, Act::Submit(stop(Side::Sell, 0.004, 60000.0))),
+        (1, Act::Submit(market(Side::Sell, 0.002, true))),
+    ]);
+    rig.bar();
+    rig.bar();
+    rig.bar();
+    assert_eq!(rig.mock.position(SYMBOL), 0.002);
+    rig.mock.cancel_after_partial_fill("t-o2", 0.002);
+    rig.bar();
+    assert_eq!(rig.handle.fault(), None);
+    assert_eq!(rig.mock.position(SYMBOL), 0.0);
+    assert_eq!(rig.session.portfolio().position(), 0.0);
+    assert_eq!(rig.status(2), OrderStatus::Filled);
+}
+
+#[test]
+fn a_refused_stops_close_at_market_that_fills_in_part_faults_on_the_next_bar() {
+    let mut rig = Rig::new(vec![(
+        0,
+        Act::SubmitWithStop(market(Side::Buy, 0.004, false), 64000.0),
+    )]);
+    // The entry fills below its stop's trigger, so the stop is refused and closed at market;
+    // the close fills 0.002 and the venue closes the rest.
+    rig.mock.set_price(SYMBOL, 63500.0);
+    rig.mock.cap_ioc("t-c2", 0.002);
+    rig.bar();
+    assert!(rig.mock.orders_with_link_id("t-o2").is_empty());
+    assert_eq!(
+        rig.mock.orders_with_link_id("t-c2")[0].status,
+        "PartiallyFilledCanceled"
+    );
+    assert_eq!(rig.mock.position(SYMBOL), 0.002);
+    assert_eq!(rig.handle.fault(), None);
+    rig.bar();
+    let fault = rig.handle.fault().expect("faulted");
+    assert_eq!(fault.kind, FaultKind::MissingOrder);
+    assert!(
+        fault.message.contains("t-c2") && fault.message.contains("still open"),
+        "{fault}"
+    );
+}
+
+#[test]
 fn go_live_adopts_an_entry_and_the_stop_it_placed_before_the_restart() {
     let slot: Arc<Mutex<Option<VenueHandle>>> = Arc::new(Mutex::new(None));
     let taken: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));

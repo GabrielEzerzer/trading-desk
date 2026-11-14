@@ -138,6 +138,9 @@ pub(crate) struct State {
     pub next: u64,
     /// The quantity the next market order fills, when a test caps it.
     pub cap_next_fill: Option<f64>,
+    /// The order link id whose market order fills only the quantity given and closes the rest,
+    /// as the venue does to an immediate-or-cancel order it cannot fill in full.
+    pub cap_ioc: Option<(String, f64)>,
 }
 
 impl State {
@@ -164,6 +167,7 @@ impl State {
             log: Vec::new(),
             next: 1,
             cap_next_fill: None,
+            cap_ioc: None,
         }
     }
 
@@ -802,6 +806,11 @@ impl State {
         });
         if trigger.is_none() && reject.is_none() {
             let i = self.orders.len() - 1;
+            if let Some((_, cap)) = self.cap_ioc.take_if(|(l, _)| l.as_str() == link) {
+                self.fill(i, price, cap);
+                self.orders[i].status = "PartiallyFilledCanceled";
+                return Ok(json!({ "orderId": order_id, "orderLinkId": link }));
+            }
             match self.cap_next_fill.take() {
                 Some(cap) if cap < fill_qty => {
                     if cap > 0.0 {

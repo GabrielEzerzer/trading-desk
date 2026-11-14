@@ -267,6 +267,12 @@ impl MockVenue {
         self.state.lock().unwrap().cap_next_fill = Some(qty);
     }
 
+    /// Makes the market order with `link_id`, when it is created, fill only `qty` and close the
+    /// rest `PartiallyFilledCanceled`, as an immediate-or-cancel order the venue fills in part.
+    pub fn cap_ioc(&self, link_id: &str, qty: f64) {
+        self.state.lock().unwrap().cap_ioc = Some((link_id.to_string(), qty));
+    }
+
     /// Fills the rest of the partially filled order with `link_id` at the current price.
     pub fn fill_rest(&self, link_id: &str) {
         self.state.lock().unwrap().fill_rest(link_id);
