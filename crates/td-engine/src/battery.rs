@@ -69,6 +69,7 @@ use td_core::{
 use crate::metrics::{self, DAY_MS, EquitySeries};
 use crate::plan::check_start_offsets;
 use crate::portfolio::next_position;
+use crate::reference::ReferenceBars;
 use crate::risk::{self, DayRollover};
 use crate::rng::derive_seed;
 use crate::runner::select_bars;
@@ -86,8 +87,8 @@ use crate::{
     EvidenceInputs, Headline, KindInputs, MAX_RUNS, Objective, Order, Outcome, Params,
     PermutationResult, PermutationSpec, PortfolioBenchmark, Progress, SweepResult, SweepSpec,
     TestPlan, TesterError, Trade, TradeSide, Verdict, VerdictRule, WalkForwardResult,
-    WalkForwardSpec, combine, evaluate, evaluate_evidence, permutation_test, run, sweep,
-    walk_forward,
+    WalkForwardSpec, combine, evaluate, evaluate_evidence, permutation_test_with_references,
+    run_with_references, sweep_with_references, walk_forward_with_references,
 };
 
 /// The seed streams of the battery's seeded steps, derived from its seed.
@@ -355,6 +356,22 @@ pub fn run_battery(
     funding: &[(Millis, f64)],
     progress: Option<Progress>,
 ) -> Result<BatteryResult, TesterError> {
+    run_battery_with_references(spec, bars, asks, funding, &[], progress)
+}
+
+/// [`run_battery`] with reference instruments: the plan's runs name each of `references`, in
+/// this order ([`crate::BacktestConfig::references`]), and every run, sweep, walk-forward and
+/// luck test is given their bars, as [`crate::run_with_references`] takes them. The luck test
+/// shuffles the traded bars and the reference bars with one permutation
+/// ([`crate::permutation_test_with_references`]); R4 widens the traded instrument's spread only.
+pub fn run_battery_with_references(
+    spec: &BatterySpec,
+    bars: &[Candle],
+    asks: &[Candle],
+    funding: &[(Millis, f64)],
+    references: &[ReferenceBars],
+    progress: Option<Progress>,
+) -> Result<BatteryResult, TesterError> {
     let BatterySpec {
         strategy,
         plan,
@@ -371,9 +388,13 @@ pub fn run_battery(
     }
     rule.validate()
         .map_err(|e| TesterError::InvalidSpec(e.to_string()))?;
-    let base = plan.backtest_config(strategy, instrument.clone());
-    let sweep_spec = plan.sweep_spec(strategy, instrument.clone());
-    let wf_spec = plan.walk_forward_spec(strategy, instrument.clone());
+    let names: Vec<_> = references.iter().map(|r| r.instrument.clone()).collect();
+    let mut base = plan.backtest_config(strategy, instrument.clone());
+    base.references.clone_from(&names);
+    let mut sweep_spec = plan.sweep_spec(strategy, instrument.clone());
+    sweep_spec.base.references.clone_from(&names);
+    let mut wf_spec = plan.walk_forward_spec(strategy, instrument.clone());
+    wf_spec.sweep.base.references = names;
     wf_spec.check()?;
     let ev = &plan.evidence;
     check_start_offsets(wf_spec.windows.test_bars, ev.start_offsets)
@@ -400,7 +421,8 @@ pub fn run_battery(
     // 1. Integrity: I1 to I3.
     let (open_buckets, dropped_buckets) = bucket_counts(&base, &traded);
     let split = (traded.len() >= 2).then(|| traded[traded.len() / 2].open_time);
-    let base_checks = repeat_and_prefix(&base, bars, asks, funding, split, &mut meter)?;
+    let data = (bars, asks, funding, references);
+    let base_checks = repeat_and_prefix(&base, data, split, &mut meter)?;
     let mut integrity_inputs = IntegrityInputs {
         dropped_share: (open_buckets > 0).then(|| dropped_buckets as f64 / open_buckets as f64),
         repeat_differences: Some(base_checks.0),
@@ -444,7 +466,14 @@ pub fn run_battery(
     }
 
     // 2. The sweep over the full period.
-    let swept = sweep(&sweep_spec, bars, asks, funding, Some(&meter.step()))?;
+    let swept = sweep_with_references(
+        &sweep_spec,
+        bars,
+        asks,
+        funding,
+        references,
+        Some(&meter.step()),
+    )?;
     meter.base += per_sweep;
 
     // 3. R1: the rolling walk-forward, stitched.
@@ -455,7 +484,14 @@ pub fn run_battery(
         };
         (None, Some(error))
     } else {
-        match walk_forward(&wf_spec, bars, asks, funding, Some(&meter.step())) {
+        match walk_forward_with_references(
+            &wf_spec,
+            bars,
+            asks,
+            funding,
+            references,
+            Some(&meter.step()),
+        ) {
             Ok(wf) => (Some(wf), None),
             Err(e @ (TesterError::NoQualifyingRun { .. } | TesterError::InvalidSpec(_))) => {
                 (None, Some(e.to_string()))
@@ -481,7 +517,7 @@ pub fn run_battery(
                 params: w.params.clone(),
                 ..base.clone()
             };
-            let checks = repeat_and_prefix(&config, bars, asks, funding, split, &mut meter)?;
+            let checks = repeat_and_prefix(&config, data, split, &mut meter)?;
             checked.push((&w.params, checks));
         }
         meter.base += 3 * (windows - wf.windows.len());
@@ -527,7 +563,7 @@ pub fn run_battery(
                         ..w.out_of_sample.config.clone()
                     };
                     // A set the strategy refuses is left out, as a sweep leaves its row unranked.
-                    match run(&config, bars, asks, funding) {
+                    match run_with_references(&config, bars, asks, funding, references) {
                         Ok(r) => window.push((steps, r)),
                         Err(EngineError::InvalidParam { .. }) => {}
                         Err(e) => return Err(e.into()),
@@ -784,7 +820,7 @@ pub fn run_battery(
                 slippage_bps: w.out_of_sample.config.slippage_bps * ev.cost_stress,
                 ..w.out_of_sample.config.clone()
             };
-            let r = run(&config, bars, &stressed_asks, funding)?;
+            let r = run_with_references(&config, bars, &stressed_asks, funding, references)?;
             meter.tick()?;
             let growth = r.equity.last().map_or(1.0, |p| p.equity / cash);
             window_returns.push(growth - 1.0);
@@ -815,7 +851,14 @@ pub fn run_battery(
                 // it, so that bar exists.
                 let mut spec: WalkForwardSpec = wf_spec.clone();
                 spec.sweep.base.to = traded[traded.len() - shift].open_time;
-                match walk_forward(&spec, bars, asks, funding, Some(&meter.step())) {
+                match walk_forward_with_references(
+                    &spec,
+                    bars,
+                    asks,
+                    funding,
+                    references,
+                    Some(&meter.step()),
+                ) {
                     Ok(r) => offset.oos_return = r.metrics.total_return,
                     Err(
                         e @ (TesterError::NoQualifyingRun { .. } | TesterError::InvalidSpec(_)),
@@ -842,7 +885,14 @@ pub fn run_battery(
             permutations,
             seed: derive_seed(seed, SEED_LUCK),
         };
-        match permutation_test(&spec, bars, asks, funding, Some(&meter.step())) {
+        match permutation_test_with_references(
+            &spec,
+            bars,
+            asks,
+            funding,
+            references,
+            Some(&meter.step()),
+        ) {
             Ok(p) => {
                 evidence.luck_p = Some(p.p_value);
                 let smallest = 1.0 / (p.qualified_copies as f64 + 1.0);
@@ -1142,23 +1192,29 @@ fn stressed(fees: FeeSchedule, multiplier: f64) -> FeeSchedule {
     }
 }
 
+/// The data a battery's runs are given: bars, asks, funding and reference bars.
+type BatteryData<'a> = (
+    &'a [Candle],
+    &'a [Candle],
+    &'a [(Millis, f64)],
+    &'a [ReferenceBars],
+);
+
 /// I2 and I3 on one backtest, in three counted runs: the backtest twice, then once on the bars
 /// before `split` alone. Returns I2's and I3's differences; I3's is `None` without a split.
 fn repeat_and_prefix(
     config: &BacktestConfig,
-    bars: &[Candle],
-    asks: &[Candle],
-    funding: &[(Millis, f64)],
+    (bars, asks, funding, references): BatteryData,
     split: Option<Millis>,
     meter: &mut Meter,
 ) -> Result<(usize, Option<usize>), TesterError> {
-    let first = run(config, bars, asks, funding)?;
+    let first = run_with_references(config, bars, asks, funding, references)?;
     meter.tick()?;
-    let again = run(config, bars, asks, funding)?;
+    let again = run_with_references(config, bars, asks, funding, references)?;
     meter.tick()?;
     let prefix = match split {
         Some(at) => {
-            let half = run(
+            let half = run_with_references(
                 &BacktestConfig {
                     to: at,
                     ..config.clone()
@@ -1166,6 +1222,7 @@ fn repeat_and_prefix(
                 bars,
                 asks,
                 funding,
+                references,
             )?;
             Some(prefix_differences(&first.orders, &half.orders, at))
         }
@@ -1639,6 +1696,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::run;
     use crate::{AttachedStop, OrderStatus};
 
     fn order(submitted_at: Millis, qty: f64, status: OrderStatus) -> Order {
@@ -1729,6 +1787,7 @@ mod tests {
             warmup_from: None,
             close_at_end: false,
             account_currency: td_core::AccountCurrency::Quote,
+            references: Vec::new(),
         }
     }
 

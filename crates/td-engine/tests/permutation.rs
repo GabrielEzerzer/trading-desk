@@ -103,6 +103,7 @@ fn spec(permutations: usize, seed: u64) -> PermutationSpec {
         warmup_from: None,
         close_at_end: false,
         account_currency: td_core::AccountCurrency::Quote,
+        references: Vec::new(),
     };
     PermutationSpec {
         sweep: SweepSpec {

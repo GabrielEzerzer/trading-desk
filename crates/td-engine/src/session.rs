@@ -2,8 +2,8 @@ use std::ops::Range;
 
 use serde::{Deserialize, Serialize};
 use td_core::{
-    AccountCurrency, Candle, FeeSchedule, Fill, Instrument, Liquidity, Millis, OrderId,
-    OrderRequest, OrderType, Rounding, Side, TimeInForce, Timeframe,
+    AccountCurrency, Candle, FeeSchedule, Fill, Instrument, InstrumentId, Liquidity, Millis,
+    OrderId, OrderRequest, OrderType, Rounding, Side, TimeInForce, Timeframe,
 };
 
 use crate::broker::ENTRY_CANCELLED;
@@ -83,6 +83,9 @@ pub struct Session {
     /// Every funding event fed, with a warm-up bar or a live one, oldest first: what
     /// [`Context::funding`] returns.
     funding: Vec<(Millis, f64)>,
+    /// Each reference instrument's bars, one slot per bar fed, warm-up bars included: what
+    /// [`Context::reference`] returns. Empty unless [`Session::name_references`] named some.
+    references: Vec<(InstrumentId, Vec<Option<Candle>>)>,
     trade_stops: Vec<TradeStops>,
     /// The reason the strategy stopped the run on the bar being fed ([`Context::fail`]).
     failure: Option<String>,
@@ -163,6 +166,7 @@ impl Session {
             equity: Vec::new(),
             bar_funding: Vec::new(),
             funding: Vec::new(),
+            references: Vec::new(),
             trade_stops: Vec::new(),
             failure: None,
         })
@@ -237,8 +241,46 @@ impl Session {
         ask: Option<Candle>,
         funding: &[(Millis, f64)],
     ) -> Result<(), EngineError> {
+        self.feed(bar, ask, funding, &[], false)
+    }
+
+    /// Names the reference instruments whose bars come with every bar fed from now on, warm-up
+    /// bars included, in this order (see [`Context::reference`]). Called once, before the first
+    /// bar; without it the session has none.
+    pub(crate) fn name_references(&mut self, ids: Vec<InstrumentId>) {
+        debug_assert!(self.bars.is_empty() && self.references.is_empty());
+        self.references = ids.into_iter().map(|id| (id, Vec::new())).collect();
+    }
+
+    /// Feeds a bar as [`Session::warm_up`] does when `warming_up`, and as
+    /// [`Session::on_bar_with_ask`] does otherwise, with `references`: one slot per reference
+    /// instrument [`Session::name_references`] named, in its order, holding that instrument's bar
+    /// opening at the bar's open time or `None`. They are checked with the bar, before anything
+    /// changes.
+    pub(crate) fn feed(
+        &mut self,
+        bar: Candle,
+        ask: Option<Candle>,
+        funding: &[(Millis, f64)],
+        references: &[Option<Candle>],
+        warming_up: bool,
+    ) -> Result<(), EngineError> {
+        if warming_up {
+            // Every live bar records an equity point.
+            if !self.equity.is_empty() {
+                return Err(EngineError::WarmUpAfterLive);
+            }
+            self.check_bar(&bar, funding)?;
+            self.check_references(&bar, references)?;
+            self.record_funding(funding);
+            self.record_references(references);
+            self.bars.push(bar);
+            self.call_strategy(&bar, self.fills.len(), true);
+            return self.strategy_failure();
+        }
         self.check_bar(&bar, funding)?;
         self.check_ask(&bar, ask)?;
+        self.check_references(&bar, references)?;
         let ask_bar = ask.unwrap_or(bar);
 
         // Funding due at the open, or in the gap before it, is owed by the position held going
@@ -323,6 +365,7 @@ impl Session {
         }
         self.bar_funding.push(charged);
         self.record_funding(funding);
+        self.record_references(references);
         // A short closes with a buy, at the ask.
         let mark = if self.portfolio.position() < 0.0 {
             ask_bar.close
@@ -360,15 +403,43 @@ impl Session {
     /// funding events join what [`Context::funding`] shows, as a live bar's do. It is an error once
     /// a bar has been fed with `on_bar`.
     pub fn warm_up(&mut self, bar: Candle, funding: &[(Millis, f64)]) -> Result<(), EngineError> {
-        // Every live bar records an equity point.
-        if !self.equity.is_empty() {
-            return Err(EngineError::WarmUpAfterLive);
+        self.feed(bar, None, funding, &[], true)
+    }
+
+    /// Checks that `references` holds one slot per named reference instrument, each empty or a
+    /// valid bar opening at `bar`'s open time.
+    fn check_references(
+        &self,
+        bar: &Candle,
+        references: &[Option<Candle>],
+    ) -> Result<(), EngineError> {
+        if references.len() != self.references.len() {
+            return Err(EngineError::InvalidReferences(format!(
+                "{} reference bars were fed with the bar at {}, for {} reference instruments",
+                references.len(),
+                bar.open_time,
+                self.references.len()
+            )));
         }
-        self.check_bar(&bar, funding)?;
-        self.record_funding(funding);
-        self.bars.push(bar);
-        self.call_strategy(&bar, self.fills.len(), true);
-        self.strategy_failure()
+        for ((id, _), reference) in self.references.iter().zip(references) {
+            if let Some(r) = reference {
+                if r.open_time != bar.open_time {
+                    return Err(EngineError::InvalidReferences(format!(
+                        "the bar of {id} fed with the bar at {} opens at {}",
+                        bar.open_time, r.open_time
+                    )));
+                }
+                r.validate()?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Adds each reference instrument's slot fed with a bar to what [`Context::reference`] shows.
+    fn record_references(&mut self, references: &[Option<Candle>]) {
+        for ((_, slots), reference) in self.references.iter_mut().zip(references) {
+            slots.push(*reference);
+        }
     }
 
     /// Adds the funding events fed with a bar to what [`Context::funding`] shows. Events from one
@@ -481,6 +552,7 @@ impl Session {
             max_leverage: self.max_leverage,
             portfolio: &self.portfolio,
             funding: &self.funding,
+            references: &self.references,
             broker: &mut *self.broker,
             orders: &mut self.orders,
             warming_up: false,
@@ -647,6 +719,7 @@ impl Session {
             max_leverage: self.max_leverage,
             portfolio: &self.portfolio,
             funding: &self.funding,
+            references: &self.references,
             broker: &mut *self.broker,
             orders: &mut self.orders,
             warming_up,

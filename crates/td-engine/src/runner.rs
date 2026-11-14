@@ -6,11 +6,12 @@ use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
 use td_core::{
-    AccountCurrency, Candle, FeeSchedule, Fill, Instrument, InstrumentKind, Millis, OrderId, Side,
-    Timeframe,
+    AccountCurrency, Candle, FeeSchedule, Fill, Instrument, InstrumentId, InstrumentKind, Millis,
+    OrderId, Side, Timeframe,
 };
 
 use crate::metrics::{self, DAY_MS, DAYS_PER_YEAR, EquitySeries, MetricsReport};
+use crate::reference::{Aligned, ReferenceBars, align, row};
 use crate::risk::{self, EquityRange, Intrabar};
 use crate::session::{check_quote, funding_ranges, sorted_funding};
 use crate::{
@@ -107,6 +108,38 @@ pub struct BacktestConfig {
     /// (FX only; see [`Session::new`]). Left out of the saved result when it is the default.
     #[serde(default, skip_serializing_if = "AccountCurrency::is_quote")]
     pub account_currency: AccountCurrency,
+    /// Instruments on the same venue whose closed bars at `timeframe` the strategy can read beside
+    /// its own, aligned to them ([`crate::Context::reference`]). They are read-only: orders,
+    /// fills, costs and the account stay on `instrument`. Their bars are given to the run with
+    /// [`run_with_references`] and are part of the data fingerprint. Left out of the saved result
+    /// when there are none, the default.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub references: Vec<InstrumentId>,
+}
+
+impl BacktestConfig {
+    /// Refuses reference instruments on another venue than `instrument`'s, `instrument` itself as
+    /// a reference, and one named twice.
+    pub fn check_references(&self) -> Result<(), EngineError> {
+        let traded = &self.instrument.id;
+        for (i, id) in self.references.iter().enumerate() {
+            let refuse = |why: String| Err(EngineError::InvalidReferences(why));
+            if id.venue != traded.venue {
+                return refuse(format!(
+                    "{id} is on another venue than {traded}; a reference instrument must be on the same venue"
+                ));
+            }
+            if id == traded {
+                return refuse(format!(
+                    "{id} is the traded instrument, so it cannot also be a reference"
+                ));
+            }
+            if self.references[..i].contains(id) {
+                return refuse(format!("{id} is named twice"));
+            }
+        }
+        Ok(())
+    }
 }
 
 impl<'de> Deserialize<'de> for BacktestConfig {
@@ -134,6 +167,8 @@ impl<'de> Deserialize<'de> for BacktestConfig {
             close_at_end: bool,
             #[serde(default)]
             account_currency: AccountCurrency,
+            #[serde(default)]
+            references: Vec<InstrumentId>,
         }
         let g = Given::deserialize(deserializer)?;
         Ok(BacktestConfig {
@@ -152,6 +187,7 @@ impl<'de> Deserialize<'de> for BacktestConfig {
             warmup_from: g.warmup_from,
             close_at_end: g.close_at_end,
             account_currency: g.account_currency,
+            references: g.references,
         })
     }
 }
@@ -265,7 +301,22 @@ pub fn run(
     asks: &[Candle],
     funding: &[(Millis, f64)],
 ) -> Result<BacktestResult, EngineError> {
-    run_built(config, bars, asks, funding, || {
+    run_with_references(config, bars, asks, funding, &[])
+}
+
+/// [`run`] for a configuration that names reference instruments
+/// ([`BacktestConfig::references`]), with the bars of each at the run's timeframe. The strategy
+/// reads them through [`crate::Context::reference`], aligned to its own bars by open time, and the
+/// data fingerprint covers the reference bars it was shown. [`run`] is this with none given, so it
+/// refuses a configuration that names references.
+pub fn run_with_references(
+    config: &BacktestConfig,
+    bars: &[Candle],
+    asks: &[Candle],
+    funding: &[(Millis, f64)],
+    references: &[ReferenceBars],
+) -> Result<BacktestResult, EngineError> {
+    run_built(config, bars, asks, funding, references, || {
         build_strategy(&config.strategy, &config.params)
     })
 }
@@ -281,7 +332,7 @@ pub fn run_strategy(
     asks: &[Candle],
     funding: &[(Millis, f64)],
 ) -> Result<BacktestResult, EngineError> {
-    run_built(config, bars, asks, funding, || Ok(strategy))
+    run_built(config, bars, asks, funding, &[], || Ok(strategy))
 }
 
 /// The metrics [`run`] would report, without the parts of its result a sweep row does not keep:
@@ -291,8 +342,9 @@ pub(crate) fn run_metrics(
     bars: &[Candle],
     asks: &[Candle],
     funding: &[(Millis, f64)],
+    references: &[ReferenceBars],
 ) -> Result<MetricsReport, EngineError> {
-    let sim = simulate(config, bars, asks, funding, || {
+    let sim = simulate(config, bars, asks, funding, references, || {
         build_strategy(&config.strategy, &config.params)
     })?;
     Ok(sim.report)
@@ -300,11 +352,12 @@ pub(crate) fn run_metrics(
 
 /// The backtest of [`run`], building the strategy with `build` once the data has been checked, so
 /// a bad range or ask is reported before an unknown strategy, as it always was.
-fn run_built(
+pub(crate) fn run_built(
     config: &BacktestConfig,
     bars: &[Candle],
     asks: &[Candle],
     funding: &[(Millis, f64)],
+    references: &[ReferenceBars],
     build: impl FnOnce() -> Result<Box<dyn Strategy>, EngineError>,
 ) -> Result<BacktestResult, EngineError> {
     let Simulated {
@@ -315,13 +368,14 @@ fn run_built(
         funding,
         ranges,
         seen,
+        references,
         session,
         fills,
         trades,
         series,
         intrabar,
         report,
-    } = simulate(config, bars, asks, funding, build)?;
+    } = simulate(config, bars, asks, funding, references, build)?;
     let benchmark = benchmark(
         config,
         &bars,
@@ -343,7 +397,7 @@ fn run_built(
         config: config.clone(),
         engine_version: env!("CARGO_PKG_VERSION").to_string(),
         engine_revision: ENGINE_REVISION,
-        data_fingerprint: data_fingerprint(&used_bars, &used_asks, &funding[seen]),
+        data_fingerprint: fingerprint(&used_bars, &used_asks, &funding[seen], &references),
         equity: session.equity().to_vec(),
         orders: session.orders().to_vec(),
         fills,
@@ -369,6 +423,8 @@ struct Simulated {
     ranges: Vec<Range<usize>>,
     /// The range of `funding` the strategy has seen by the last bar.
     seen: Range<usize>,
+    /// The reference instruments' bars, aligned to the warm-up and traded bars.
+    references: Aligned,
     session: Session,
     fills: Vec<Fill>,
     trades: Vec<Trade>,
@@ -383,9 +439,11 @@ fn simulate(
     bars: &[Candle],
     asks: &[Candle],
     funding: &[(Millis, f64)],
+    references: &[ReferenceBars],
     build: impl FnOnce() -> Result<Box<dyn Strategy>, EngineError>,
 ) -> Result<Simulated, EngineError> {
     let (warmup, traded) = select_bars(config, bars)?;
+    let references = align_used(config, &warmup, &traded, references)?;
     let warmup_asks = match_asks(config.instrument.id.kind, bars, asks, &warmup)?;
     let traded_asks = match_asks(config.instrument.id.kind, bars, asks, &traded)?;
     // The session checks each traded bar's ask as it is fed, but warm-up bars are fed without one.
@@ -404,15 +462,17 @@ fn simulate(
         account_currency: config.account_currency,
     };
     let mut session = Session::new(strategy, config.instrument.clone(), tf, session_config)?;
-    for (bar, range) in warmup.iter().zip(warmup_ranges) {
-        session.warm_up(*bar, &funding[range])?;
+    session.name_references(references.iter().map(|(id, _)| id.clone()).collect());
+    for (j, (bar, range)) in warmup.iter().zip(warmup_ranges).enumerate() {
+        session.feed(*bar, None, &funding[range], &row(&references, j), true)?;
     }
     let mut positions = Vec::with_capacity(bars.len());
     // The bar whose close decides the close-out, so it fills at the last bar's open.
     let close_out_at = bars.len().checked_sub(2).filter(|_| config.close_at_end);
     for (i, ((bar, ask), range)) in bars.iter().zip(&traded_asks).zip(&ranges).enumerate() {
         let events = &funding[range.clone()];
-        session.on_bar_with_ask(*bar, *ask, events)?;
+        let slots = row(&references, warmup.len() + i);
+        session.feed(*bar, *ask, events, &slots, false)?;
         positions.push(session.portfolio().position());
         if close_out_at == Some(i) {
             session.close_out();
@@ -460,6 +520,7 @@ fn simulate(
         funding,
         ranges,
         seen,
+        references,
         session,
         fills,
         trades,
@@ -467,6 +528,21 @@ fn simulate(
         intrabar,
         report,
     })
+}
+
+/// The bars given for `config`'s reference instruments, aligned to its warm-up and traded bars
+/// (see [`align`]); empty, without copying the bars, when it names none and none are given.
+fn align_used(
+    config: &BacktestConfig,
+    warmup: &[Candle],
+    traded: &[Candle],
+    references: &[ReferenceBars],
+) -> Result<Aligned, EngineError> {
+    if config.references.is_empty() && references.is_empty() {
+        return Ok(Vec::new());
+    }
+    let used: Vec<Candle> = warmup.iter().chain(traded).copied().collect();
+    align(config, &used, references)
 }
 
 /// How [`simulate`] feeds sorted `funding` with the bars: the range of it taken with each warm-up
@@ -614,7 +690,20 @@ pub fn config_fingerprint(
     asks: &[Candle],
     funding: &[(Millis, f64)],
 ) -> Result<String, EngineError> {
+    config_fingerprint_with_references(config, bars, asks, funding, &[])
+}
+
+/// [`config_fingerprint`] for a configuration that names reference instruments, with their bars
+/// as [`run_with_references`] takes them: the fingerprint that run would record.
+pub fn config_fingerprint_with_references(
+    config: &BacktestConfig,
+    bars: &[Candle],
+    asks: &[Candle],
+    funding: &[(Millis, f64)],
+    references: &[ReferenceBars],
+) -> Result<String, EngineError> {
     let (warmup, traded) = select_bars(config, bars)?;
+    let references = align_used(config, &warmup, &traded, references)?;
     let mut used_asks = match_asks(config.instrument.id.kind, bars, asks, &warmup)?;
     used_asks.extend(match_asks(config.instrument.id.kind, bars, asks, &traded)?);
     let funding = sorted_funding(funding);
@@ -624,7 +713,7 @@ pub fn config_fingerprint(
     // No session runs here to check the traded bars' asks, so every ask is checked.
     check_quotes(&used, &used_asks)?;
     let used_asks: Vec<Candle> = used_asks.into_iter().flatten().collect();
-    Ok(data_fingerprint(&used, &used_asks, &funding[seen]))
+    Ok(fingerprint(&used, &used_asks, &funding[seen], &references))
 }
 
 /// Runs a saved result's configuration again on `bars`, `asks` and `funding`, as [`run`] takes
@@ -873,14 +962,30 @@ fn annualised_alpha_beta(times: &[Millis], returns: &(Vec<f64>, Vec<f64>)) -> Op
 /// count and each ask in the same form as a bar follow. Without asks nothing is added, so a
 /// fingerprint from before asks existed is unchanged.
 pub fn data_fingerprint(bars: &[Candle], asks: &[Candle], funding: &[(Millis, f64)]) -> String {
+    fingerprint(bars, asks, funding, &[])
+}
+
+/// [`data_fingerprint`], followed, when a run names reference instruments, by each one's id as
+/// `venue:symbol:kind` (its byte length as a little-endian u64, then its UTF-8 bytes), its slot
+/// count, and per slot a 0 byte for a missing bar or a 1 byte and the bar in the form above.
+/// Without references nothing is added, so a fingerprint is what it was before they existed.
+fn fingerprint(
+    bars: &[Candle],
+    asks: &[Candle],
+    funding: &[(Millis, f64)],
+    references: &[(InstrumentId, Vec<Option<Candle>>)],
+) -> String {
     let mut h = Sha256::new();
+    let candle = |h: &mut Sha256, b: &Candle| {
+        h.update(b.open_time.to_le_bytes());
+        for v in [b.open, b.high, b.low, b.close, b.volume, b.quote_volume] {
+            h.update(v.to_bits().to_le_bytes());
+        }
+    };
     let candles = |h: &mut Sha256, candles: &[Candle]| {
         h.update((candles.len() as u64).to_le_bytes());
         for b in candles {
-            h.update(b.open_time.to_le_bytes());
-            for v in [b.open, b.high, b.low, b.close, b.volume, b.quote_volume] {
-                h.update(v.to_bits().to_le_bytes());
-            }
+            candle(h, b);
         }
     };
     candles(&mut h, bars);
@@ -891,6 +996,21 @@ pub fn data_fingerprint(bars: &[Candle], asks: &[Candle], funding: &[(Millis, f6
     }
     if !asks.is_empty() {
         candles(&mut h, asks);
+    }
+    for (id, slots) in references {
+        let id = id.to_string();
+        h.update((id.len() as u64).to_le_bytes());
+        h.update(id.as_bytes());
+        h.update((slots.len() as u64).to_le_bytes());
+        for slot in slots {
+            match slot {
+                Some(b) => {
+                    h.update([1u8]);
+                    candle(&mut h, b);
+                }
+                None => h.update([0u8]),
+            }
+        }
     }
     hex(&h.finalize())
 }
@@ -956,11 +1076,12 @@ mod tests {
             warmup_from: Some(20 * HOUR),
             close_at_end: true,
             account_currency: AccountCurrency::Quote,
+            references: Vec::new(),
         };
         let full = run(&config, &bars, &[], &funding).unwrap();
         assert!(full.metrics.trades > 2, "{:?}", full.metrics);
         assert_eq!(
-            run_metrics(&config, &bars, &[], &funding).unwrap(),
+            run_metrics(&config, &bars, &[], &funding, &[]).unwrap(),
             full.metrics
         );
 
@@ -972,7 +1093,7 @@ mod tests {
             "{refused:?}"
         );
         assert_eq!(
-            run_metrics(&config, &bars, &[], &funding)
+            run_metrics(&config, &bars, &[], &funding, &[])
                 .unwrap_err()
                 .to_string(),
             refused.to_string()
@@ -1040,6 +1161,7 @@ mod tests {
             warmup_from: Some(0),
             close_at_end: false,
             account_currency: AccountCurrency::Quote,
+            references: Vec::new(),
         };
         let seen = FundingSeen::default();
         let strategy = Box::new(SeesFunding(seen.clone()));
@@ -1196,6 +1318,7 @@ mod tests {
                     warmup_from: None,
                     close_at_end: false,
                     account_currency: AccountCurrency::Quote,
+                    references: Vec::new(),
                 },
                 axes: Vec::new(),
                 mode: SweepMode::Grid,

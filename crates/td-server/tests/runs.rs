@@ -469,6 +469,7 @@ fn config(kind: InstrumentKind, days: i64) -> BacktestConfig {
         close_at_end: false,
         max_leverage: 1.0,
         account_currency: td_core::AccountCurrency::Quote,
+        references: Vec::new(),
     }
 }
 

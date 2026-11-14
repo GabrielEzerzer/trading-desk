@@ -9,7 +9,7 @@
 //! Results do not depend on the number of threads: every run is independent and deterministic,
 //! and the ranking breaks ties on the grid order.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ops::{ControlFlow, Range};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -18,13 +18,16 @@ use serde::{Deserialize, Serialize};
 use td_core::{Candle, Fill, Millis, Side, Timeframe};
 
 use crate::metrics::{self, EquitySeries, MetricsReport};
-use crate::permute::permute_quotes;
+use crate::permute::permute_with_references;
+use crate::reference::{ReferenceBars, align};
 use crate::risk::{EquityRange, Intrabar};
 use crate::rng::{SplitMix64, derive_seed};
-use crate::runner::{compare, config_fingerprint, hold_over, match_asks, run_metrics, select_bars};
+use crate::runner::{
+    compare, config_fingerprint_with_references, hold_over, match_asks, run_metrics, select_bars,
+};
 use crate::{
     BacktestConfig, BacktestResult, Benchmark, EngineError, EquityPoint, ParamKind, ParamSpec,
-    ParamValue, Params, Trade, find_strategy, run,
+    ParamValue, Params, Trade, find_strategy, run_with_references,
 };
 
 /// The most backtests one sweep may run: the grid size, or the sample count in random mode. A
@@ -615,8 +618,21 @@ pub fn sweep(
     funding: &[(Millis, f64)],
     progress: Option<Progress>,
 ) -> Result<SweepResult, TesterError> {
+    sweep_with_references(spec, bars, asks, funding, &[], progress)
+}
+
+/// [`sweep`] for a base configuration that names reference instruments, with their bars as
+/// [`crate::run_with_references`] takes them. Every run is given them.
+pub fn sweep_with_references(
+    spec: &SweepSpec,
+    bars: &[Candle],
+    asks: &[Candle],
+    funding: &[(Millis, f64)],
+    references: &[ReferenceBars],
+    progress: Option<Progress>,
+) -> Result<SweepResult, TesterError> {
     let plan = Plan::new(spec)?;
-    sweep_planned(spec, &plan, bars, asks, funding, progress)
+    sweep_planned(spec, &plan, bars, asks, funding, references, progress)
 }
 
 fn sweep_planned(
@@ -625,16 +641,19 @@ fn sweep_planned(
     bars: &[Candle],
     asks: &[Candle],
     funding: &[(Millis, f64)],
+    references: &[ReferenceBars],
     progress: Option<Progress>,
 ) -> Result<SweepResult, TesterError> {
-    let data_fingerprint = config_fingerprint(&spec.base, bars, asks, funding)?;
-    let rows = ranked_rows(spec, plan, bars, asks, funding, progress)?;
+    let data_fingerprint =
+        config_fingerprint_with_references(&spec.base, bars, asks, funding, references)?;
+    let rows = ranked_rows(spec, plan, bars, asks, funding, references, progress)?;
     let best = match rows.first() {
-        Some(top) if top.qualified => Some(run(
+        Some(top) if top.qualified => Some(run_with_references(
             &with_params(&spec.base, &top.params),
             bars,
             asks,
             funding,
+            references,
         )?),
         _ => None,
     };
@@ -654,6 +673,7 @@ fn ranked_rows(
     bars: &[Candle],
     asks: &[Candle],
     funding: &[(Millis, f64)],
+    references: &[ReferenceBars],
     progress: Option<Progress>,
 ) -> Result<Vec<SweepRow>, TesterError> {
     let total = plan.indices.len();
@@ -667,7 +687,7 @@ fn ranked_rows(
             if stopped.load(Ordering::Relaxed) {
                 return None;
             }
-            let row = run_row(spec, plan, index, bars, asks, funding);
+            let row = run_row(spec, plan, index, bars, asks, funding, references);
             let n = done.fetch_add(1, Ordering::Relaxed) + 1;
             if let Some(report) = progress
                 && report(n, total).is_break()
@@ -722,9 +742,11 @@ fn run_row(
     bars: &[Candle],
     asks: &[Candle],
     funding: &[(Millis, f64)],
+    references: &[ReferenceBars],
 ) -> Result<SweepRow, EngineError> {
     let params = plan.params(&spec.base.params, index).resolve(&plan.specs)?;
-    match run_metrics(&with_params(&spec.base, &params), bars, asks, funding) {
+    let config = with_params(&spec.base, &params);
+    match run_metrics(&config, bars, asks, funding, references) {
         Ok(metrics) => {
             let h = Headline::new(&metrics);
             let qualified = h.trades >= spec.min_trades && h.value(spec.objective.metric).is_some();
@@ -838,6 +860,22 @@ pub fn permutation_test(
     funding: &[(Millis, f64)],
     progress: Option<Progress>,
 ) -> Result<PermutationResult, TesterError> {
+    permutation_test_with_references(spec, bars, asks, funding, &[], progress)
+}
+
+/// [`permutation_test`] for a base configuration that names reference instruments, with their
+/// bars as [`crate::run_with_references`] takes them. Each copy shuffles the traded bars and the
+/// reference bars at the same times with one permutation (`permute_with_references`), so a
+/// reference bar moves with the traded bar of its time and the copies keep how the instruments
+/// moved together, but not when.
+pub fn permutation_test_with_references(
+    spec: &PermutationSpec,
+    bars: &[Candle],
+    asks: &[Candle],
+    funding: &[(Millis, f64)],
+    references: &[ReferenceBars],
+    progress: Option<Progress>,
+) -> Result<PermutationResult, TesterError> {
     let copies = spec.permutations;
     if copies == 0 {
         return Err(TesterError::InvalidSpec(
@@ -854,33 +892,38 @@ pub fn permutation_test(
         });
     }
     let base = &spec.sweep.base;
-    let data_fingerprint = config_fingerprint(base, bars, asks, funding)?;
+    let data_fingerprint =
+        config_fingerprint_with_references(base, bars, asks, funding, references)?;
     let total = per_sweep * (copies + 1);
     let objective = spec.sweep.objective;
-    let best_of =
-        |sweep_no: usize, bars: &[Candle], asks: &[Candle]| -> Result<Option<f64>, TesterError> {
-            let offset = sweep_no * per_sweep;
-            let sweep_progress = |done: usize, _: usize| match progress {
-                Some(report) => report(offset + done, total),
-                None => ControlFlow::Continue(()),
-            };
-            let rows = ranked_rows(
-                &spec.sweep,
-                &plan,
-                bars,
-                asks,
-                funding,
-                Some(&sweep_progress),
-            )?;
-            Ok(rows
-                .first()
-                .filter(|top| top.qualified)
-                .and_then(|top| objective_value(top, objective)))
+    let best_of = |sweep_no: usize,
+                   bars: &[Candle],
+                   asks: &[Candle],
+                   references: &[ReferenceBars]|
+     -> Result<Option<f64>, TesterError> {
+        let offset = sweep_no * per_sweep;
+        let sweep_progress = |done: usize, _: usize| match progress {
+            Some(report) => report(offset + done, total),
+            None => ControlFlow::Continue(()),
         };
+        let rows = ranked_rows(
+            &spec.sweep,
+            &plan,
+            bars,
+            asks,
+            funding,
+            references,
+            Some(&sweep_progress),
+        )?;
+        Ok(rows
+            .first()
+            .filter(|top| top.qualified)
+            .and_then(|top| objective_value(top, objective)))
+    };
 
     // The real sweep ran, so every traded bar has its ask on a market with quotes, and there
     // are none on the others.
-    let real_best = best_of(0, bars, asks)?.ok_or(TesterError::NoQualifyingRun {
+    let real_best = best_of(0, bars, asks, references)?.ok_or(TesterError::NoQualifyingRun {
         min_trades: spec.sweep.min_trades,
         window: None,
     })?;
@@ -909,12 +952,20 @@ pub fn permutation_test(
             .collect::<Result<_, _>>()?
     };
     let original_asks: Vec<Candle> = traded_asks.iter().map(|&j| asks[j]).collect();
+    // Each reference's bar at each traded bar's time, or `None`, in the base's order.
+    let original_references = align(base, &originals, references)?;
+    let slots: Vec<Vec<Option<Candle>>> = original_references
+        .iter()
+        .map(|(_, slots)| slots.clone())
+        .collect();
+    let traded_times: HashSet<Millis> = originals.iter().map(|b| b.open_time).collect();
     let mut copy = bars.to_vec();
     let mut copy_asks = asks.to_vec();
     let mut permuted_best = Vec::with_capacity(copies);
     for k in 0..copies {
-        let (shuffled, shuffled_asks) =
-            permute_quotes(&originals, &original_asks, derive_seed(spec.seed, k as u64))
+        let seed = derive_seed(spec.seed, k as u64);
+        let (shuffled, shuffled_asks, shuffled_references) =
+            permute_with_references(&originals, &original_asks, &slots, seed)
                 .map_err(EngineError::from)?;
         for (&i, bar) in traded.iter().zip(shuffled) {
             copy[i] = bar;
@@ -922,7 +973,25 @@ pub fn permutation_test(
         for (&j, ask) in traded_asks.iter().zip(shuffled_asks) {
             copy_asks[j] = ask;
         }
-        permuted_best.push(best_of(k + 1, &copy, &copy_asks)?);
+        // Each reference keeps its bars at other times, and takes its shuffled ones at the traded
+        // bars' times.
+        let copy_references: Vec<ReferenceBars> = original_references
+            .iter()
+            .zip(shuffled_references)
+            .map(|((id, _), shuffled)| {
+                let given = references.iter().find(|r| &r.instrument == id);
+                let kept = given
+                    .into_iter()
+                    .flat_map(|r| &r.bars)
+                    .filter(|b| !traded_times.contains(&b.open_time))
+                    .copied();
+                ReferenceBars {
+                    instrument: id.clone(),
+                    bars: kept.chain(shuffled.into_iter().flatten()).collect(),
+                }
+            })
+            .collect();
+        permuted_best.push(best_of(k + 1, &copy, &copy_asks, &copy_references)?);
     }
 
     let (qualified_copies, at_least_as_good, p_value) =
@@ -1029,6 +1098,19 @@ pub fn out_of_sample(
     funding: &[(Millis, f64)],
     progress: Option<Progress>,
 ) -> Result<OosResult, TesterError> {
+    out_of_sample_with_references(spec, bars, asks, funding, &[], progress)
+}
+
+/// [`out_of_sample`] for a base configuration that names reference instruments, with their bars
+/// as [`crate::run_with_references`] takes them. Both segments' runs are given them.
+pub fn out_of_sample_with_references(
+    spec: &OosSpec,
+    bars: &[Candle],
+    asks: &[Candle],
+    funding: &[(Millis, f64)],
+    references: &[ReferenceBars],
+    progress: Option<Progress>,
+) -> Result<OosResult, TesterError> {
     let base = &spec.sweep.base;
     refuse_base_warmup(&spec.sweep)?;
     let plan = Plan::new(&spec.sweep)?;
@@ -1046,7 +1128,7 @@ pub fn out_of_sample(
     is_spec.base.to = split_at;
     // Close out like the out-of-sample run, so both sides count a position held at the end alike.
     is_spec.base.close_at_end = true;
-    let in_sample = sweep_planned(&is_spec, &plan, bars, asks, funding, progress)?;
+    let in_sample = sweep_planned(&is_spec, &plan, bars, asks, funding, references, progress)?;
     let best = in_sample
         .best
         .as_ref()
@@ -1060,7 +1142,7 @@ pub fn out_of_sample(
         close_at_end: true,
         ..with_params(base, &best.config.params)
     };
-    let out_of_sample = run(&oos_config, bars, asks, funding)?;
+    let out_of_sample = run_with_references(&oos_config, bars, asks, funding, references)?;
 
     let degradation = degradation(
         spec.sweep.objective.metric,
@@ -1070,7 +1152,9 @@ pub fn out_of_sample(
     Ok(OosResult {
         spec: spec.clone(),
         engine_version: env!("CARGO_PKG_VERSION").to_string(),
-        data_fingerprint: config_fingerprint(base, bars, asks, funding)?,
+        data_fingerprint: config_fingerprint_with_references(
+            base, bars, asks, funding, references,
+        )?,
         split_at,
         in_sample,
         out_of_sample,
@@ -1310,6 +1394,20 @@ pub fn walk_forward(
     funding: &[(Millis, f64)],
     progress: Option<Progress>,
 ) -> Result<WalkForwardResult, TesterError> {
+    walk_forward_with_references(spec, bars, asks, funding, &[], progress)
+}
+
+/// [`walk_forward`] for a base configuration that names reference instruments, with their bars
+/// as [`crate::run_with_references`] takes them. Every train and test run is given them; the
+/// buy-and-hold benchmark holds the traded instrument only.
+pub fn walk_forward_with_references(
+    spec: &WalkForwardSpec,
+    bars: &[Candle],
+    asks: &[Candle],
+    funding: &[(Millis, f64)],
+    references: &[ReferenceBars],
+    progress: Option<Progress>,
+) -> Result<WalkForwardResult, TesterError> {
     let base = &spec.sweep.base;
     refuse_base_warmup(&spec.sweep)?;
     let plan = Plan::new(&spec.sweep)?;
@@ -1350,7 +1448,15 @@ pub fn walk_forward(
             Some(report) => report(offset + done, total),
             None => ControlFlow::Continue(()),
         };
-        let swept = sweep_planned(&train, &plan, bars, asks, funding, Some(&window_progress))?;
+        let swept = sweep_planned(
+            &train,
+            &plan,
+            bars,
+            asks,
+            funding,
+            references,
+            Some(&window_progress),
+        )?;
         let best = swept.best.ok_or(TesterError::NoQualifyingRun {
             min_trades: spec.sweep.min_trades,
             window: Some(k),
@@ -1369,7 +1475,7 @@ pub fn walk_forward(
             test_to,
             params: best.config.params,
             in_sample: Headline::new(&best.metrics),
-            out_of_sample: run(&test_config, bars, asks, funding)?,
+            out_of_sample: run_with_references(&test_config, bars, asks, funding, references)?,
         });
     }
 
@@ -1392,7 +1498,9 @@ pub fn walk_forward(
     Ok(WalkForwardResult {
         spec: spec.clone(),
         engine_version: env!("CARGO_PKG_VERSION").to_string(),
-        data_fingerprint: config_fingerprint(base, bars, asks, funding)?,
+        data_fingerprint: config_fingerprint_with_references(
+            base, bars, asks, funding, references,
+        )?,
         windows: results,
         equity,
         metrics,
@@ -1845,7 +1953,7 @@ fn stitched_report(base: &BacktestConfig, runs: &[Segment]) -> Stitched {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::permute_bars;
+    use crate::{permute_bars, run};
 
     /// On a market with quotes a copy keeps each hour's spread. A strategy with no edge that is in
     /// the market only in the one hour whose spread is tight would otherwise beat every copy on
@@ -1928,6 +2036,7 @@ mod tests {
                     warmup_from: None,
                     close_at_end: true,
                     account_currency: td_core::AccountCurrency::Quote,
+                    references: Vec::new(),
                 },
                 axes: vec![ParamAxis {
                     name: "hour".into(),
@@ -2007,6 +2116,7 @@ mod tests {
                     warmup_from: Some(0),
                     close_at_end: false,
                     account_currency: td_core::AccountCurrency::Quote,
+                    references: Vec::new(),
                 },
                 axes: vec![ParamAxis {
                     name: "slow".into(),
@@ -2314,6 +2424,7 @@ mod tests {
             warmup_from: None,
             close_at_end: true,
             account_currency: td_core::AccountCurrency::Quote,
+            references: Vec::new(),
         };
         let window = |from: i64, to: i64| {
             let config = BacktestConfig {
