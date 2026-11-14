@@ -1268,7 +1268,7 @@ pub fn evaluate(rule: &VerdictRule, x: &KindInputs) -> Vec<Criterion> {
                 lines.push(line(
                     "attempt_value",
                     &format!(
-                        "Value of one attempt with the mean daily return scaled by {}",
+                        "Value of one attempt with a positive mean daily return scaled by {}",
                         terms.reduced_edge_factor
                     ),
                     x.attempt_value,
@@ -3455,7 +3455,7 @@ mod tests {
         assert_eq!(pass.id, "attempt_value");
         assert_eq!(
             pass.name,
-            "Value of one attempt with the mean daily return scaled by 0.5"
+            "Value of one attempt with a positive mean daily return scaled by 0.5"
         );
         assert_eq!((pass.limit, pass.unit), (Some(0.0), Unit::Quote));
         assert_eq!(pass.outcome, Outcome::Pass);
