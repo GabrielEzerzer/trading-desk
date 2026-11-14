@@ -2198,6 +2198,42 @@ mod tests {
     }
 
     #[test]
+    fn a_second_payout_is_measured_from_the_floor_a_locking_payout_fixed() {
+        // A trailing drawdown of 0.125 with no lock of its own, a cap of 0.2 a payout, payouts
+        // from day 1 every day, and the first payout locks the floor. All exact in binary:
+        //   day 1  +25%    1.25, peak 1.25: the floor is 1.25 - 0.125 = 1.125. The payout takes
+        //                  the 0.125 above it, which leaves 1.125, and fixes the floor there.
+        //   day 2  +12.5%  1.125 * 1.125 = 1.265625, peak 1.265625. Measured from the fixed
+        //                  floor of 1.125 the payout takes 0.140625, under the cap, and leaves
+        //                  1.125. A trailing floor would now be 1.140625 and allow only 0.125.
+        let trailing = PropFirmSpec {
+            max_drawdown: 0.125,
+            drawdown: DrawdownMode::Trailing,
+            ..unlimited(10)
+        };
+        let lock = AttemptTerms {
+            payout_cap: Some(0.2),
+            payout_locks_floor: true,
+            ..terms()
+        };
+        let f = funded(&trailing, &lock, &[0.25, 0.125]);
+        assert_eq!(
+            (f.payouts, f.gross, f.balance),
+            (2, 0.125 + 0.140625, 1.125)
+        );
+        // Without the lock the second payout is measured from the trailing floor.
+        let unlocked = AttemptTerms {
+            payout_locks_floor: false,
+            ..lock
+        };
+        let f = funded(&trailing, &unlocked, &[0.25, 0.125]);
+        assert_eq!(
+            (f.payouts, f.gross, f.balance),
+            (2, 0.125 + 0.125, 1.140625)
+        );
+    }
+
+    #[test]
     fn a_payout_does_not_unlock_a_trailing_floor_that_reached_its_lock() {
         // A trailing drawdown of 0.1 whose floor locks at the start, payouts from day 1, no cap:
         //   day 1  +12%  1.12, peak 1.12: the floor is min(1.12 - 0.1, 1.0) = 1.0, at its lock.
