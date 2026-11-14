@@ -80,7 +80,7 @@ use crate::stats::{
     PropFirmOdds, PropFirmSpec, RuinSpec,
 };
 use crate::strategies::direction;
-use crate::tester::{self, stitched_headline};
+use crate::tester::{self, Sizing, stitched_headline};
 use crate::verdict::{
     IntegrityInputs, OosIntegrityInputs, TradingDayTest, evaluate_integrity, evaluate_oos_integrity,
 };
@@ -1475,7 +1475,7 @@ fn plateau(
                     Some((&w.out_of_sample, r))
                 })
                 .unzip();
-            let h = stitched_headline(base, &moved);
+            let h = stitched_headline(base, &moved, Sizing::Compounding);
             PlateauDirection {
                 steps: steps.clone(),
                 windows: moved.len(),
@@ -1485,7 +1485,8 @@ fn plateau(
                 } else {
                     h.total_return
                 },
-                reference: stitched_headline(base, &own).value(objective.metric),
+                reference: stitched_headline(base, &own, Sizing::Compounding)
+                    .value(objective.metric),
             }
         })
         .collect();
@@ -4105,7 +4106,7 @@ mod tests {
             w
         })
         .collect();
-        let wf = tester::with_windows(&sma_walk_forward(), windows);
+        let wf = tester::with_windows(&sma_walk_forward(), windows, Sizing::Compounding);
         let cash = 10_000.0;
         let fixed = fixed_curve(&wf);
         let lows = |r: &[crate::EquityRange]| r.iter().map(|x| x.low).collect::<Vec<f64>>();
@@ -4154,7 +4155,7 @@ mod tests {
                     w
                 })
                 .collect();
-            let wf = tester::with_windows(&base, windows);
+            let wf = tester::with_windows(&base, windows, Sizing::Compounding);
             let fixed = fixed_curve(&wf);
             oos_readings(&wf, cash, sized.then_some(&fixed)).1
         };
@@ -4403,11 +4404,18 @@ mod tests {
                 moved.push(run(&config, &bars, &[], &[]).unwrap());
                 own.push(&w.out_of_sample);
             }
-            let h = stitched_headline(&base, &moved.iter().collect::<Vec<_>>());
+            let h = stitched_headline(
+                &base,
+                &moved.iter().collect::<Vec<_>>(),
+                Sizing::Compounding,
+            );
             assert_eq!(d.windows, moved.len(), "{d:?}");
             assert_eq!(d.objective, h.value(metric), "{d:?}");
             assert_eq!(d.total_return, h.total_return, "{d:?}");
-            assert_eq!(d.reference, stitched_headline(&base, &own).value(metric));
+            assert_eq!(
+                d.reference,
+                stitched_headline(&base, &own, Sizing::Compounding).value(metric)
+            );
         }
     }
 
@@ -4454,7 +4462,7 @@ mod tests {
         );
         assert_eq!(flat.objective, flat.reference);
         let odd: Vec<&BacktestResult> = runs.iter().skip(1).step_by(2).map(|w| &w[0].1).collect();
-        let h = stitched_headline(&base, &odd);
+        let h = stitched_headline(&base, &odd, Sizing::Compounding);
         assert_eq!((cliff.windows, cliff.total_return), (2, h.total_return));
         assert!(h.total_return.unwrap() < 0.0, "{h:?}");
         let settings = &plan.evidence.plateau;

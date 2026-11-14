@@ -1487,7 +1487,7 @@ pub fn walk_forward_with_references(
         metrics,
         trades,
         fills,
-    } = stitched_report(base, &segments);
+    } = stitched_report(base, &segments, Sizing::Compounding);
     let benchmark = stitched_benchmark(base, &results, bars, asks, funding, &series, &metrics)?;
     let param_changes = results
         .windows(2)
@@ -1734,6 +1734,42 @@ fn segment_scales(starting_cash: f64, segments: &[&[EquityPoint]]) -> Vec<f64> {
         .collect()
 }
 
+/// How the test windows' runs, each its own backtest from the starting cash, are put together
+/// into one account.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Sizing {
+    /// Each window compounds on the account where the last ended, as if the strategy's size grew
+    /// with the balance: its run is scaled by that balance over the starting cash. Once the
+    /// account is at or below zero, every later window counts for nothing. A walk-forward's own
+    /// stitched figures are these.
+    Compounding,
+    /// Each window adds its own money changes, at the size it was tested at, to the account where
+    /// the last ended, as for a strategy that trades a fixed size set from the starting cash. This
+    /// account's own level decides whether it is gone: once it is at or below zero, every later
+    /// window stays flat and counts for nothing. The window that took it there counts in full.
+    FixedSize,
+}
+
+/// The factor each segment's trades, fills, positions and funding are taken at with `sizing`:
+/// [`segment_scales`] when compounding; at a fixed size, 1 for each segment the account counts and
+/// 0 for those after it is gone (see [`Sizing::FixedSize`]).
+fn segment_factors(starting_cash: f64, segments: &[&[EquityPoint]], sizing: Sizing) -> Vec<f64> {
+    if sizing == Sizing::Compounding {
+        return segment_scales(starting_cash, segments);
+    }
+    let mut level = starting_cash;
+    segments
+        .iter()
+        .map(|seg| {
+            let counted = level > 0.0;
+            if let (true, Some(last)) = (counted, seg.last()) {
+                level += last.equity - starting_cash;
+            }
+            f64::from(u8::from(counted))
+        })
+        .collect()
+}
+
 /// Stitches equity curves that each start from `starting_cash` into one curve, compounding:
 /// each segment's per-bar returns (its first one measured from the starting cash) are applied
 /// to the stitched equity where the previous segment ended. That is the same as multiplying the
@@ -1768,10 +1804,10 @@ pub(crate) fn tested_fills(starting_cash: f64, windows: &[WindowResult]) -> Vec<
 /// window's own fills, with the windows [`stitch_fixed_size`] holds flat left out, those after
 /// that curve reached zero, so the fills span the windows that curve counts.
 pub(crate) fn fixed_size_fills(starting_cash: f64, windows: &[WindowResult]) -> Vec<Fill> {
-    counted_fills(
-        windows,
-        fixed_size_counted(starting_cash, &test_curves(windows)),
-    )
+    let counted = segment_factors(starting_cash, &test_curves(windows), Sizing::FixedSize)
+        .into_iter()
+        .map(|s| s != 0.0);
+    counted_fills(windows, counted)
 }
 
 /// The closed trades of the windows [`stitch_fixed_size`] counts, counted as a walk-forward's
@@ -1779,10 +1815,10 @@ pub(crate) fn fixed_size_fills(starting_cash: f64, windows: &[WindowResult]) -> 
 /// are not still open. The stitched count leaves out the windows after the stitched curve reached
 /// zero; this one leaves out those after the fixed-size curve did.
 pub(crate) fn fixed_size_trades(starting_cash: f64, windows: &[WindowResult]) -> usize {
-    fixed_size_counted(starting_cash, &test_curves(windows))
+    segment_factors(starting_cash, &test_curves(windows), Sizing::FixedSize)
         .into_iter()
         .zip(windows)
-        .filter(|&(c, _)| c)
+        .filter(|&(s, _)| s != 0.0)
         .map(|(_, w)| w.out_of_sample.trades.iter().filter(|t| !t.open).count())
         .sum()
 }
@@ -1802,24 +1838,6 @@ fn counted_fills(windows: &[WindowResult], counted: impl IntoIterator<Item = boo
         .zip(windows)
         .filter(|&(c, _)| c)
         .flat_map(|(_, w)| w.out_of_sample.fills.iter().cloned())
-        .collect()
-}
-
-/// Whether each segment counts on the fixed-size curve: while that curve's level before it, the
-/// starting cash plus the money changes of the segments counted before it, is above zero. The
-/// segment that takes the level to zero or below counts in full; every later one does not, as
-/// the account is gone and stays gone.
-fn fixed_size_counted(starting_cash: f64, segments: &[&[EquityPoint]]) -> Vec<bool> {
-    let mut level = starting_cash;
-    segments
-        .iter()
-        .map(|seg| {
-            let counted = level > 0.0;
-            if let (true, Some(last)) = (counted, seg.last()) {
-                level += last.equity - starting_cash;
-            }
-            counted
-        })
         .collect()
 }
 
@@ -1859,12 +1877,13 @@ fn add_segments(
     let has_ranges = segments.iter().all(|(e, r)| r.len() == e.len());
     let (mut equity, mut ranges) = (Vec::new(), Vec::new());
     let mut level = starting_cash;
-    for (&(points, extremes), counted) in segments
-        .iter()
-        .zip(fixed_size_counted(starting_cash, &curves))
+    for (&(points, extremes), s) in
+        segments
+            .iter()
+            .zip(segment_factors(starting_cash, &curves, Sizing::FixedSize))
     {
         let moved = |x: f64| {
-            if counted {
+            if s != 0.0 {
                 level + (x - starting_cash)
             } else {
                 level
@@ -1917,11 +1936,15 @@ fn run_segment(r: &BacktestResult) -> Segment<'_> {
     }
 }
 
-/// The headline metrics of `runs`, one test run per walk-forward window in order, stitched as a
-/// walk-forward stitches its own test runs (see [`WalkForwardResult`]).
-pub(crate) fn stitched_headline(base: &BacktestConfig, runs: &[&BacktestResult]) -> Headline {
+/// The headline metrics of `runs`, one test run per walk-forward window in order, stitched with
+/// `sizing` (see [`stitched_report`]).
+pub(crate) fn stitched_headline(
+    base: &BacktestConfig,
+    runs: &[&BacktestResult],
+    sizing: Sizing,
+) -> Headline {
     let segments: Vec<Segment> = runs.iter().map(|r| run_segment(r)).collect();
-    Headline::new(&stitched_report(base, &segments).metrics)
+    Headline::new(&stitched_report(base, &segments, sizing).metrics)
 }
 
 /// The total return of `runs`, one test run per walk-forward window in order, stitched as
@@ -1931,21 +1954,18 @@ pub(crate) fn fixed_size_total_return(
     base: &BacktestConfig,
     runs: &[&BacktestResult],
 ) -> Option<f64> {
-    let cash = base.starting_cash;
-    let segments: Vec<(&[EquityPoint], &[EquityRange])> =
-        runs.iter().map(|r| (&r.equity[..], &[][..])).collect();
-    let (equity, _) = add_segments(cash, &segments);
-    metrics::total_return(&EquitySeries::new(cash, &equity, base.timeframe).values)
+    stitched_headline(base, runs, Sizing::FixedSize).total_return
 }
 
-/// `wf` with its windows replaced by `windows`, stitched as [`walk_forward`] stitches its test
-/// runs: the curve, its ranges, the metrics, the trades and the fills. The rest is kept.
+/// `wf` with its windows replaced by `windows`, stitched with `sizing`: the curve, its ranges, the
+/// metrics, the trades and the fills. The rest is kept.
 #[cfg(test)]
 pub(crate) fn with_windows(
     wf: &WalkForwardResult,
     windows: Vec<WindowResult>,
+    sizing: Sizing,
 ) -> WalkForwardResult {
-    let st = stitched_report(&wf.spec.sweep.base, &test_segments(&windows));
+    let st = stitched_report(&wf.spec.sweep.base, &test_segments(&windows), sizing);
     WalkForwardResult {
         windows,
         equity: st.equity,
@@ -1994,7 +2014,7 @@ fn stitched_benchmark(
             funding_paid: h.funding_paid,
         })
         .collect();
-    let stitched = stitched_report(base, &segments);
+    let stitched = stitched_report(base, &segments, Sizing::Compounding);
     // `windows` fails unless at least one window fits, so there is a first.
     Ok(compare(
         held[0].qty,
@@ -2020,34 +2040,57 @@ struct Stitched {
     fills: Vec<Fill>,
 }
 
-/// The stitched curve and its metrics. Trades, fills, positions and funding of each segment are
-/// scaled by the segment's factor, so trade P&L adds up to the stitched equity's changes. A
-/// segment with factor 0 (after ruin) contributes no trades or fills: zero-sized ones would
-/// count as trades in the statistics without having traded anything.
+/// The stitched curve and its metrics, with `sizing` (see [`Sizing`]). Trades, fills, positions
+/// and funding of each segment are scaled by the segment's factor ([`segment_factors`]), so trade
+/// P&L adds up to the stitched equity's changes. A segment with factor 0 (after the account is
+/// gone) contributes no trades or fills: zero-sized ones would count as trades in the statistics
+/// without having traded anything.
 ///
-/// Each segment's equity range through a bar is scaled by the same factor, since the stitched
-/// account holds the scaled position, so the intrabar metrics are those of the stitched account.
-/// They are left out (as in a result without ranges) unless every segment has a range per bar.
-/// The peak leverage, a ratio the scaling leaves unchanged, is the highest of the segments with a
-/// factor above 0.
-fn stitched_report(base: &BacktestConfig, runs: &[Segment]) -> Stitched {
+/// When compounding, each segment's equity and its range through a bar are scaled by the same
+/// factor ([`stitch`]), since the stitched account holds the scaled position. At a fixed size each
+/// is moved to start where the last segment ended, so a segment adds its own money changes, and a
+/// segment after the account is gone stays flat. Either way the intrabar metrics are those of the
+/// stitched account. They are left out (as in a result without ranges) unless every segment has a
+/// range per bar. The peak leverage, a ratio the compounding scale leaves unchanged, is the
+/// highest of the segments with a factor above 0.
+///
+/// shortcut: at a fixed size the peak leverage is still the highest of the counted segments' own,
+/// which is the stitched account's only while that account stands at the starting cash; it holds
+/// the same position on a balance above or below it. Read it from each bar's notional over the
+/// stitched equity when a verdict line comes to judge it for an account at a fixed size.
+fn stitched_report(base: &BacktestConfig, runs: &[Segment], sizing: Sizing) -> Stitched {
     let cash = base.starting_cash;
     let segments: Vec<&[EquityPoint]> = runs.iter().map(|r| r.equity).collect();
-    let equity = stitch(cash, &segments);
-    let scales = segment_scales(cash, &segments);
+    let scales = segment_factors(cash, &segments, sizing);
     let lot = base.instrument.lot_size;
-    let mut positions = Vec::with_capacity(equity.len());
+    let points = segments.iter().map(|s| s.len()).sum();
+    let mut equity: Vec<EquityPoint> = Vec::with_capacity(points);
+    let mut positions = Vec::with_capacity(points);
     let mut fills: Vec<Fill> = Vec::new();
     let mut trades: Vec<Trade> = Vec::new();
     let mut funding = 0.0;
-    let mut ranges: Vec<EquityRange> = Vec::with_capacity(equity.len());
+    let mut ranges: Vec<EquityRange> = Vec::with_capacity(points);
     let mut peak_leverage: Option<f64> = None;
     let has_ranges = runs.iter().all(|r| r.ranges.len() == r.equity.len());
+    // The stitched equity where the last segment ended.
+    let mut level = cash;
     for (r, s) in runs.iter().zip(scales) {
-        ranges.extend(r.ranges.iter().map(|x| EquityRange {
-            low: x.low * s,
-            high: x.high * s,
+        let place = |x: f64| match sizing {
+            Sizing::Compounding => x * s,
+            Sizing::FixedSize if s == 0.0 => level,
+            Sizing::FixedSize => level + (x - cash),
+        };
+        equity.extend(r.equity.iter().map(|p| EquityPoint {
+            time: p.time,
+            equity: place(p.equity),
         }));
+        ranges.extend(r.ranges.iter().map(|x| EquityRange {
+            low: place(x.low),
+            high: place(x.high),
+        }));
+        if let Some(last) = equity.last() {
+            level = last.equity;
+        }
         // The position after each bar's fills, rebuilt from the fills (a fill's time is the open
         // time of the bar it filled on) and snapped to the lot size against rounding error.
         let mut position = 0.0;
@@ -2520,6 +2563,72 @@ mod tests {
         assert_eq!(ok.windows(15).unwrap().len(), 1);
     }
 
+    /// sma_cross on hourly bars of a perpetual, from a balance of 10,000.
+    fn hourly_config() -> BacktestConfig {
+        use td_core::{FeeSchedule, Instrument, InstrumentId, InstrumentKind, Timeframe, Venue};
+        let instrument = Instrument {
+            id: InstrumentId {
+                venue: Venue::Binance,
+                symbol: "TESTUSDT".into(),
+                kind: InstrumentKind::Perpetual,
+            },
+            base: "TEST".into(),
+            quote: "USDT".into(),
+            tick_size: 0.01,
+            lot_size: 0.001,
+            min_qty: 0.001,
+            min_notional: 1.0,
+            fees: FeeSchedule {
+                maker: 0.001,
+                taker: 0.002,
+                per_unit: 0.0,
+            },
+        };
+        BacktestConfig {
+            strategy: "sma_cross".into(),
+            params: Params::new()
+                .with("fast", ParamValue::Int(1))
+                .with("slow", ParamValue::Int(3)),
+            instrument,
+            timeframe: Timeframe::H1,
+            from: 0,
+            to: 40 * 3_600_000,
+            starting_cash: 10_000.0,
+            slippage_bps: 0.0,
+            fee_override: None,
+            max_leverage: 1.0,
+            warmup_from: None,
+            close_at_end: true,
+            account_currency: td_core::AccountCurrency::Quote,
+            references: Vec::new(),
+        }
+    }
+
+    /// The equity and ranges of `segments` stitched at a fixed size from `cash` by
+    /// [`stitched_report`].
+    fn added(
+        cash: f64,
+        segments: &[(&[EquityPoint], &[EquityRange])],
+    ) -> (Vec<EquityPoint>, Vec<EquityRange>) {
+        let base = BacktestConfig {
+            starting_cash: cash,
+            ..hourly_config()
+        };
+        let runs: Vec<Segment> = segments
+            .iter()
+            .map(|&(equity, ranges)| Segment {
+                equity,
+                ranges,
+                peak_leverage: None,
+                fills: &[],
+                trades: &[],
+                funding_paid: 0.0,
+            })
+            .collect();
+        let st = stitched_report(&base, &runs, Sizing::FixedSize);
+        (st.equity, st.ranges)
+    }
+
     #[test]
     fn stitching_for_a_fixed_size_adds_each_window_from_where_the_last_ended() {
         let range = |low: f64, high: f64| EquityRange { low, high };
@@ -2531,8 +2640,7 @@ mod tests {
         let b_ranges = [range(90.0, 100.0), range(95.0, 105.0)];
         let c = [point(4, 100.0)];
         let c_ranges = [range(100.0, 100.0)];
-        let (equity, ranges) =
-            add_segments(100.0, &[(&a, &a_ranges), (&b, &b_ranges), (&c, &c_ranges)]);
+        let (equity, ranges) = added(100.0, &[(&a, &a_ranges), (&b, &b_ranges), (&c, &c_ranges)]);
         // The second window adds its own money from 120, where compounding would scale it by
         // 1.2 (114 and 126): its fall of 5 and its dip of 10 stay 5 and 10 of the starting cash.
         let values: Vec<f64> = equity.iter().map(|p| p.equity).collect();
@@ -2550,12 +2658,12 @@ mod tests {
             ]
         );
         // A window without a range per point leaves the ranges out.
-        let (_, ranges) = add_segments(100.0, &[(&a, &a_ranges), (&b, &b_ranges[..1])]);
+        let (_, ranges) = added(100.0, &[(&a, &a_ranges), (&b, &b_ranges[..1])]);
         assert!(ranges.is_empty());
         // A window that takes the stitched equity to zero leaves this account at 20, so the
         // window after it still counts here, and adds nothing because it is flat.
         let ruin = [point(2, 0.0)];
-        let (equity, ranges) = add_segments(
+        let (equity, ranges) = added(
             100.0,
             &[
                 (&a, &a_ranges),
@@ -2580,7 +2688,7 @@ mod tests {
                 .collect();
             let segments: Vec<(&[EquityPoint], &[EquityRange])> =
                 curves.iter().map(|c| (&c[..], &[][..])).collect();
-            let (equity, _) = add_segments(128.0, &segments);
+            let (equity, _) = added(128.0, &segments);
             equity.iter().map(|p| p.equity).collect::<Vec<f64>>()
         };
         // The compounded account is gone after the second window; this one is at 128 and goes on.
@@ -2616,28 +2724,10 @@ mod tests {
         assert_eq!(segment_scales(100.0, &[&a, &z, &c]), [1.0, 0.5, 0.0]);
     }
 
-    #[test]
-    fn segments_after_ruin_add_no_trades_or_fills_to_the_stitched_lists() {
-        use td_core::{FeeSchedule, Instrument, InstrumentId, InstrumentKind, Timeframe, Venue};
+    /// sma_cross's test run from bar `from` to bar `to` of forty hourly bars that rise one unit
+    /// each, on [`hourly_config`], as a walk-forward window. It trades.
+    fn rising_window(from: i64, to: i64) -> WindowResult {
         const HOUR: Millis = 3_600_000;
-        let instrument = Instrument {
-            id: InstrumentId {
-                venue: Venue::Binance,
-                symbol: "TESTUSDT".into(),
-                kind: InstrumentKind::Perpetual,
-            },
-            base: "TEST".into(),
-            quote: "USDT".into(),
-            tick_size: 0.01,
-            lot_size: 0.001,
-            min_qty: 0.001,
-            min_notional: 1.0,
-            fees: FeeSchedule {
-                maker: 0.001,
-                taker: 0.002,
-                per_unit: 0.0,
-            },
-        };
         let bars: Vec<Candle> = (0..40)
             .map(|i| {
                 let p = 100.0 + i as f64;
@@ -2652,53 +2742,83 @@ mod tests {
                 }
             })
             .collect();
-        let base = BacktestConfig {
-            strategy: "sma_cross".into(),
-            params: Params::new()
-                .with("fast", ParamValue::Int(1))
-                .with("slow", ParamValue::Int(3)),
-            instrument,
-            timeframe: Timeframe::H1,
-            from: 0,
-            to: 40 * HOUR,
-            starting_cash: 10_000.0,
-            slippage_bps: 0.0,
-            fee_override: None,
-            max_leverage: 1.0,
-            warmup_from: None,
-            close_at_end: true,
-            account_currency: td_core::AccountCurrency::Quote,
-            references: Vec::new(),
+        let base = hourly_config();
+        let config = BacktestConfig {
+            from: from * HOUR,
+            to: to * HOUR,
+            ..base.clone()
         };
-        let window = |from: i64, to: i64| {
-            let config = BacktestConfig {
-                from: from * HOUR,
-                to: to * HOUR,
-                ..base.clone()
-            };
-            let out_of_sample = run(&config, &bars, &[], &[]).unwrap();
-            assert!(!out_of_sample.trades.is_empty() && !out_of_sample.fills.is_empty());
-            WindowResult {
-                train_from: 0,
-                train_to: config.from,
-                test_from: config.from,
-                test_to: config.to,
-                params: base.params.clone(),
-                in_sample: Headline::new(&out_of_sample.metrics),
-                out_of_sample,
-            }
-        };
-        let mut ruined = window(0, 20);
+        let out_of_sample = run(&config, &bars, &[], &[]).unwrap();
+        assert!(!out_of_sample.trades.is_empty() && !out_of_sample.fills.is_empty());
+        WindowResult {
+            train_from: 0,
+            train_to: config.from,
+            test_from: config.from,
+            test_to: config.to,
+            params: base.params,
+            in_sample: Headline::new(&out_of_sample.metrics),
+            out_of_sample,
+        }
+    }
+
+    #[test]
+    fn segments_after_ruin_add_no_trades_or_fills_to_the_stitched_lists() {
+        let base = hourly_config();
+        let mut ruined = rising_window(0, 20);
         // Make the first segment end the account; the second then has factor 0.
         ruined.out_of_sample.equity.last_mut().unwrap().equity = 0.0;
-        let windows = [ruined, window(20, 40)];
+        let windows = [ruined, rising_window(20, 40)];
         let first = &windows[0].out_of_sample;
-        let st = stitched_report(&base, &test_segments(&windows));
+        let st = stitched_report(&base, &test_segments(&windows), Sizing::Compounding);
         assert_eq!(st.trades, first.trades);
         assert_eq!(st.fills, first.fills);
         assert_eq!(st.metrics.trades, first.metrics.trades);
         assert_eq!(st.metrics.fees_paid, first.metrics.fees_paid);
         assert!(st.equity[20..].iter().all(|p| p.equity == 0.0));
+    }
+
+    /// At a fixed size every counted window's trades, fills and funding enter at the size it was
+    /// tested at, and its equity adds its own money changes; compounding scales them by the
+    /// account's level. After a first window that ends at twice the starting cash, the second's
+    /// are its own, where compounding takes them at twice that.
+    #[test]
+    fn at_a_fixed_size_each_counted_window_enters_at_its_own_size() {
+        let base = hourly_config();
+        let mut doubled = rising_window(0, 20);
+        doubled.out_of_sample.equity.last_mut().unwrap().equity = 20_000.0;
+        let windows = [doubled, rising_window(20, 40)];
+        let (first, second) = (&windows[0].out_of_sample, &windows[1].out_of_sample);
+        let fixed = stitched_report(&base, &test_segments(&windows), Sizing::FixedSize);
+        assert_eq!(fixed.fills, [&first.fills[..], &second.fills[..]].concat());
+        assert_eq!(
+            fixed.trades,
+            [&first.trades[..], &second.trades[..]].concat()
+        );
+        assert_eq!(
+            fixed.metrics.trades,
+            first.metrics.trades + second.metrics.trades
+        );
+        assert_eq!(
+            fixed.metrics.fees_paid,
+            first.metrics.fees_paid + second.metrics.fees_paid
+        );
+        let tail: Vec<f64> = fixed.equity[first.equity.len()..]
+            .iter()
+            .map(|p| p.equity)
+            .collect();
+        let added: Vec<f64> = second
+            .equity
+            .iter()
+            .map(|p| 20_000.0 + (p.equity - 10_000.0))
+            .collect();
+        assert_eq!(tail, added);
+        let compounded = stitched_report(&base, &test_segments(&windows), Sizing::Compounding);
+        let n = first.fills.len();
+        assert_eq!(compounded.fills[n].qty, second.fills[0].qty * 2.0);
+        assert_eq!(
+            compounded.trades[first.trades.len()].net_pnl,
+            second.trades[0].net_pnl * 2.0
+        );
     }
 
     #[test]
