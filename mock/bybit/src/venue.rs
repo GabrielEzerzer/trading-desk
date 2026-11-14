@@ -9,6 +9,9 @@
 //! - Market orders fill in full at the price the test set, as takers, at the instrument's taker
 //!   fee. A reduce-only market order is cut to the position's size.
 //! - The minimum notional applies to orders that are not reduce-only.
+//! - A test can cap the next market order's fill ([`crate::MockVenue::cap_next_fill`]); the order
+//!   then rests `PartiallyFilled` until [`crate::MockVenue::fill_rest`] fills the rest. A cap of
+//!   zero leaves it `New` and unfilled.
 //! - Instruments info lists every instrument as a `Trading` `LinearPerpetual` settled in its quote
 //!   coin, and the ticker's mark price is the last price.
 
@@ -133,6 +136,11 @@ pub(crate) struct State {
     pub faults_always: Vec<(String, Fault)>,
     pub log: Vec<Logged>,
     pub next: u64,
+    /// The quantity the next market order fills, when a test caps it.
+    pub cap_next_fill: Option<f64>,
+    /// The order link id whose market order fills only the quantity given and closes the rest,
+    /// as the venue does to an immediate-or-cancel order it cannot fill in full.
+    pub cap_ioc: Option<(String, f64)>,
 }
 
 impl State {
@@ -158,6 +166,8 @@ impl State {
             faults_always: Vec::new(),
             log: Vec::new(),
             next: 1,
+            cap_next_fill: None,
+            cap_ioc: None,
         }
     }
 
@@ -221,6 +231,14 @@ impl State {
             .iter()
             .position(|o| o.link_id == link_id && o.is_open())
             .expect("no open order with that link id");
+        if qty <= 0.0 {
+            self.touch(i);
+            let now = self.now();
+            let o = &mut self.orders[i];
+            o.status = "Cancelled";
+            o.updated = now;
+            return;
+        }
         let price = self.markets[&self.orders[i].symbol].price;
         self.fill(i, price, qty);
         self.orders[i].status = "PartiallyFilledCanceled";
@@ -326,6 +344,18 @@ impl State {
             seq,
             visible_from: now + self.lag_ms.max(0),
         });
+    }
+
+    /// Fills the rest of the partially filled order with `link_id` at the current price.
+    pub fn fill_rest(&mut self, link_id: &str) {
+        let i = self
+            .orders
+            .iter()
+            .position(|o| o.link_id == link_id && o.status == "PartiallyFilled")
+            .expect("no partially filled order with that link id");
+        let price = self.markets[&self.orders[i].symbol].price;
+        let rest = self.orders[i].qty - self.orders[i].cum_qty;
+        self.fill(i, price, rest);
     }
 
     pub fn add_exec(
@@ -776,7 +806,20 @@ impl State {
         });
         if trigger.is_none() && reject.is_none() {
             let i = self.orders.len() - 1;
-            self.fill(i, price, fill_qty);
+            if let Some((_, cap)) = self.cap_ioc.take_if(|(l, _)| l.as_str() == link) {
+                self.fill(i, price, cap);
+                self.orders[i].status = "PartiallyFilledCanceled";
+                return Ok(json!({ "orderId": order_id, "orderLinkId": link }));
+            }
+            match self.cap_next_fill.take() {
+                Some(cap) if cap < fill_qty => {
+                    if cap > 0.0 {
+                        self.fill(i, price, cap);
+                        self.orders[i].status = "PartiallyFilled";
+                    }
+                }
+                _ => self.fill(i, price, fill_qty),
+            }
         }
         Ok(json!({ "orderId": order_id, "orderLinkId": link }))
     }

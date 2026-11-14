@@ -1,0 +1,21 @@
+[package]
+name = "td-live"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+# The broker that sends a session's orders through the order route to a venue's demo-trading
+# environment, so the strategy code a backtest runs can trade there.
+
+[dependencies]
+serde.workspace = true
+td-core.workspace = true
+td-engine.workspace = true
+td-orders.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+td-mock-bybit.workspace = true

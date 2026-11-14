@@ -195,7 +195,8 @@ impl MockVenue {
     }
 
     /// Fills `qty` of the open order with `link_id` at the last price and cancels the rest, as the
-    /// venue does to an order cancelled after a partial fill.
+    /// venue does to an order cancelled after a partial fill. With `qty` zero the order ends
+    /// `Cancelled` unfilled.
     pub fn cancel_after_partial_fill(&self, link_id: &str, qty: f64) {
         self.state
             .lock()
@@ -258,6 +259,32 @@ impl MockVenue {
         let mut s = self.state.lock().unwrap();
         s.faults_once.clear();
         s.faults_always.clear();
+    }
+
+    /// Makes the next market order fill only `qty`; it then rests `PartiallyFilled` until
+    /// [`MockVenue::fill_rest`], or `New` and unfilled when `qty` is zero.
+    pub fn cap_next_fill(&self, qty: f64) {
+        self.state.lock().unwrap().cap_next_fill = Some(qty);
+    }
+
+    /// Makes the market order with `link_id`, when it is created, fill only `qty` and close the
+    /// rest `PartiallyFilledCanceled`, as an immediate-or-cancel order the venue fills in part.
+    pub fn cap_ioc(&self, link_id: &str, qty: f64) {
+        self.state.lock().unwrap().cap_ioc = Some((link_id.to_string(), qty));
+    }
+
+    /// Fills the rest of the partially filled order with `link_id` at the current price.
+    pub fn fill_rest(&self, link_id: &str) {
+        self.state.lock().unwrap().fill_rest(link_id);
+    }
+
+    /// Sets the signed position on `symbol` with no execution, as a change the execution list
+    /// does not show.
+    pub fn set_position(&self, symbol: &str, size: f64, avg_price: f64) {
+        let mut s = self.state.lock().unwrap();
+        let pos = s.positions.entry(symbol.into()).or_default();
+        pos.size = size;
+        pos.avg = if size == 0.0 { 0.0 } else { avg_price };
     }
 
     /// Adds a funding fee execution on `symbol` at the current time.

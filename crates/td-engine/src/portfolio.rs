@@ -134,7 +134,10 @@ impl Portfolio {
     ///
     /// shortcut: a spot account is always in the quote currency ([`crate::Session::new`] refuses
     /// a base account there), so the spot cash movement `qty * price` is not converted.
-    pub(crate) fn apply_fill(&mut self, side: Side, qty: f64, price: f64, fee: f64) {
+    ///
+    /// Public so a broker outside the engine can work out the account its fills leave, on a copy;
+    /// a session's own portfolio is only reachable read-only.
+    pub fn apply_fill(&mut self, side: Side, qty: f64, price: f64, fee: f64) {
         let dq = side.sign() * qty;
         let pos = self.position;
         self.cash -= fee;
