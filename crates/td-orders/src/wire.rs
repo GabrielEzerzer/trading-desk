@@ -1,0 +1,884 @@
+//! The venue's JSON, read into the route's own types, and numbers written as exact decimals.
+//!
+//! Field names and meanings come from the v5 pages for real-time orders
+//! (<https://bybit-exchange.github.io/docs/v5/order/open-order>), order history
+//! (`.../order/order-list`), executions (`.../order/execution`), positions (`.../position`), wallet
+//! balance (`.../account/wallet-balance`), instruments info (`.../market/instrument`), tickers
+//! (`.../market/tickers`) and the enums (`.../enum`), read on 2026-11-14. The mock venue's fixtures
+//! under `mock/bybit/fixtures/` hold the shapes, and the tests below parse them.
+//!
+//! Quantities, sizes, executed quantities and prices are refused when negative, which the venue
+//! never sends for them; P&L, fees, funding and balances keep their sign.
+
+use serde::Deserialize;
+use serde::de::DeserializeOwned;
+use td_core::{Liquidity, Millis, Side};
+
+use crate::Error;
+
+/// The envelope every v5 answer comes in.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct Envelope {
+    pub ret_code: i64,
+    #[serde(default)]
+    pub ret_msg: String,
+    #[serde(default)]
+    pub result: serde_json::Value,
+}
+
+/// Reads `value` as `T`. A failure names the endpoint and the kind of mismatch, never the value:
+/// serde's own messages can quote the offending text.
+pub(crate) fn from_value<T: DeserializeOwned>(
+    endpoint: &'static str,
+    value: serde_json::Value,
+) -> Result<T, Error> {
+    serde_json::from_value(value).map_err(|e| Error::BadResponse {
+        endpoint,
+        reason: format!(
+            "the result does not have the documented shape ({:?})",
+            e.classify()
+        ),
+    })
+}
+
+pub(crate) fn envelope(endpoint: &'static str, body: &[u8]) -> Result<Envelope, Error> {
+    serde_json::from_slice(body).map_err(|e| Error::BadResponse {
+        endpoint,
+        reason: format!(
+            "the body is not the documented JSON ({:?} at line {} column {})",
+            e.classify(),
+            e.line(),
+            e.column()
+        ),
+    })
+}
+
+/// A page of a list endpoint.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct Page<T> {
+    #[serde(default = "Vec::new")]
+    pub list: Vec<T>,
+    #[serde(default)]
+    pub next_page_cursor: String,
+}
+
+/// An order's status, as the venue's `orderStatus` enum names it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OrderStatus {
+    New,
+    PartiallyFilled,
+    /// A conditional order waiting for its trigger.
+    Untriggered,
+    Rejected,
+    PartiallyFilledCanceled,
+    Filled,
+    Cancelled,
+    /// A conditional order passing from untriggered to new.
+    Triggered,
+    /// A conditional order cancelled before it triggered.
+    Deactivated,
+    /// A status this route does not know, kept as the venue spelled it, without hidden characters
+    /// ([`hidden`]) and cut to 200 characters; the client's reads look for a credential in the
+    /// whole status before it is cut, and withhold it when one is there.
+    Other(String),
+}
+
+/// Text from the venue as the crate keeps it: hidden characters removed, at most 200 characters.
+/// It does not look for credentials; a venue message that may echo one goes through the client's
+/// scrub instead.
+pub fn venue_text(text: &str) -> String {
+    text.chars().filter(|&c| !hidden(c)).take(200).collect()
+}
+
+/// A character that changes how text shows without showing itself: control characters, the soft
+/// hyphen, the combining grapheme joiner, the Arabic letter mark, the Mongolian vowel separator,
+/// tag characters, and the zero-width, line and paragraph separator, bidirectional,
+/// invisible-operator and byte-order format characters, which could hide or reorder text in a log
+/// or a terminal.
+pub(crate) fn hidden(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{AD}'
+                | '\u{34F}'
+                | '\u{61C}'
+                | '\u{180E}'
+                | '\u{200B}'..='\u{200F}'
+                | '\u{2028}'..='\u{202E}'
+                | '\u{2060}'..='\u{206F}'
+                | '\u{FEFF}'
+                | '\u{E0000}'..='\u{E007F}'
+        )
+}
+
+impl OrderStatus {
+    fn parse(s: &str) -> Self {
+        match s {
+            "New" => Self::New,
+            "PartiallyFilled" => Self::PartiallyFilled,
+            "Untriggered" => Self::Untriggered,
+            "Rejected" => Self::Rejected,
+            "PartiallyFilledCanceled" => Self::PartiallyFilledCanceled,
+            "Filled" => Self::Filled,
+            "Cancelled" => Self::Cancelled,
+            "Triggered" => Self::Triggered,
+            "Deactivated" => Self::Deactivated,
+            other => Self::Other(venue_text(other)),
+        }
+    }
+
+    /// Whether the order can still fill, be cancelled or be amended. `Triggered` is an instant on
+    /// the way to `New`, so it counts as open. An unknown status counts as open, so the route
+    /// never treats an order it does not understand as finished.
+    pub fn is_open(&self) -> bool {
+        matches!(
+            self,
+            Self::New
+                | Self::PartiallyFilled
+                | Self::Untriggered
+                | Self::Triggered
+                | Self::Other(_)
+        )
+    }
+
+    /// Whether the order was cancelled (before or after a partial fill) or deactivated.
+    pub fn is_cancelled(&self) -> bool {
+        matches!(
+            self,
+            Self::Cancelled | Self::Deactivated | Self::PartiallyFilledCanceled
+        )
+    }
+}
+
+impl std::fmt::Display for OrderStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Other(s) => f.write_str(s),
+            known => write!(f, "{known:?}"),
+        }
+    }
+}
+
+/// An order as the venue reports it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VenueOrder {
+    pub order_id: String,
+    /// The `orderLinkId`; empty for an order placed without one (by hand on the venue's site).
+    pub client_id: String,
+    pub symbol: String,
+    pub side: Side,
+    pub status: OrderStatus,
+    pub qty: f64,
+    pub filled_qty: f64,
+    /// The average fill price, when anything has filled.
+    pub avg_price: Option<f64>,
+    /// The trigger price of a conditional order; `None` for a plain order.
+    pub trigger_price: Option<f64>,
+    pub reduce_only: bool,
+    /// The venue's reject reason enum, `EC_NoError` when there is none. The client's reads keep
+    /// it as they keep an unknown status: scrubbed whole, then cut to 200 characters.
+    pub reject_reason: String,
+    pub created: Millis,
+    pub updated: Millis,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RawOrder {
+    order_id: String,
+    #[serde(default)]
+    order_link_id: String,
+    symbol: String,
+    side: String,
+    order_status: String,
+    qty: String,
+    #[serde(default)]
+    cum_exec_qty: String,
+    #[serde(default)]
+    avg_price: String,
+    #[serde(default)]
+    trigger_price: String,
+    #[serde(default)]
+    reduce_only: bool,
+    #[serde(default)]
+    reject_reason: String,
+    created_time: String,
+    updated_time: String,
+}
+
+impl RawOrder {
+    /// The order. Its free text, an unknown status and the reject reason, goes whole through
+    /// `scrub` (the client's credential check, which then cuts it), so a credential at the cut is
+    /// found whole. A known status parses to its variant.
+    pub(crate) fn into_order(
+        self,
+        endpoint: &'static str,
+        scrub: impl Fn(&str) -> String,
+    ) -> Result<VenueOrder, Error> {
+        Ok(VenueOrder {
+            side: side(endpoint, &self.side)?,
+            status: match OrderStatus::parse(&self.order_status) {
+                OrderStatus::Other(_) => OrderStatus::Other(scrub(&self.order_status)),
+                known => known,
+            },
+            qty: unsigned(endpoint, "qty", num(endpoint, "qty", &self.qty)?)?,
+            filled_qty: unsigned_or_zero(endpoint, "cumExecQty", &self.cum_exec_qty)?,
+            avg_price: positive_or_none(endpoint, "avgPrice", &self.avg_price)?,
+            trigger_price: positive_or_none(endpoint, "triggerPrice", &self.trigger_price)?,
+            reduce_only: self.reduce_only,
+            created: millis(endpoint, "createdTime", &self.created_time)?,
+            updated: millis(endpoint, "updatedTime", &self.updated_time)?,
+            order_id: self.order_id,
+            client_id: self.order_link_id,
+            symbol: self.symbol,
+            reject_reason: scrub(&self.reject_reason),
+        })
+    }
+}
+
+/// What an execution was, as the venue's `execType` enum names it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExecKind {
+    /// A fill of one of the account's orders.
+    Trade,
+    /// A fill from auto-deleveraging.
+    AdlTrade,
+    /// A funding fee.
+    Funding,
+    /// A liquidation (takeover) fill.
+    BustTrade,
+    /// A close from delivery or delisting.
+    Delivery,
+    Settle,
+    BlockTrade,
+    MovePosition,
+    /// A type this route does not know, kept as the venue spelled it, without hidden characters
+    /// ([`hidden`]) and cut to 200 characters; the client's reads look for a credential in the
+    /// whole type before it is cut, and withhold it when one is there.
+    Other(String),
+}
+
+impl ExecKind {
+    fn parse(s: &str) -> Self {
+        match s {
+            "Trade" => Self::Trade,
+            "AdlTrade" => Self::AdlTrade,
+            "Funding" => Self::Funding,
+            "BustTrade" => Self::BustTrade,
+            "Delivery" => Self::Delivery,
+            "Settle" => Self::Settle,
+            "BlockTrade" => Self::BlockTrade,
+            "MovePosition" => Self::MovePosition,
+            other => Self::Other(venue_text(other)),
+        }
+    }
+}
+
+/// One execution on the account: a fill, a funding fee, a liquidation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Execution {
+    pub exec_id: String,
+    pub order_id: String,
+    /// The `orderLinkId` of the order filled; empty for executions with no order of the account's
+    /// own (funding) or an order placed without one.
+    pub client_id: String,
+    pub symbol: String,
+    /// `None` when the venue sends no side, as it may for a funding fee.
+    pub side: Option<Side>,
+    pub price: f64,
+    pub qty: f64,
+    /// The fee paid in the settle coin; negative for a rebate.
+    pub fee: f64,
+    pub liquidity: Liquidity,
+    pub time: Millis,
+    pub kind: ExecKind,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RawExecution {
+    exec_id: String,
+    #[serde(default)]
+    order_id: String,
+    #[serde(default)]
+    order_link_id: String,
+    symbol: String,
+    #[serde(default)]
+    side: String,
+    exec_price: String,
+    exec_qty: String,
+    exec_fee: String,
+    exec_type: String,
+    #[serde(default)]
+    is_maker: bool,
+    exec_time: String,
+}
+
+impl RawExecution {
+    /// The execution. An unknown type goes whole through `scrub`, as in [`RawOrder::into_order`].
+    pub(crate) fn into_execution(
+        self,
+        endpoint: &'static str,
+        scrub: impl Fn(&str) -> String,
+    ) -> Result<Execution, Error> {
+        Ok(Execution {
+            side: match self.side.as_str() {
+                "" => None,
+                s => Some(side(endpoint, s)?),
+            },
+            price: unsigned_or_zero(endpoint, "execPrice", &self.exec_price)?,
+            qty: unsigned_or_zero(endpoint, "execQty", &self.exec_qty)?,
+            fee: num_or_zero(endpoint, "execFee", &self.exec_fee)?,
+            liquidity: if self.is_maker {
+                Liquidity::Maker
+            } else {
+                Liquidity::Taker
+            },
+            time: millis(endpoint, "execTime", &self.exec_time)?,
+            kind: match ExecKind::parse(&self.exec_type) {
+                ExecKind::Other(_) => ExecKind::Other(scrub(&self.exec_type)),
+                known => known,
+            },
+            exec_id: self.exec_id,
+            order_id: self.order_id,
+            client_id: self.order_link_id,
+            symbol: self.symbol,
+        })
+    }
+}
+
+/// The account's one-way position on a symbol.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Position {
+    pub symbol: String,
+    /// Signed size in the base asset: positive long, negative short, zero flat.
+    pub size: f64,
+    /// The average entry price; zero when flat.
+    pub avg_price: f64,
+    pub unrealised_pnl: f64,
+    pub mark_price: f64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RawPosition {
+    pub position_idx: i64,
+    pub symbol: String,
+    #[serde(default)]
+    side: String,
+    size: String,
+    #[serde(default)]
+    avg_price: String,
+    #[serde(default)]
+    unrealised_pnl: String,
+    #[serde(default)]
+    mark_price: String,
+}
+
+impl RawPosition {
+    pub(crate) fn into_position(self, endpoint: &'static str) -> Result<Position, Error> {
+        let size = unsigned(endpoint, "size", num(endpoint, "size", &self.size)?)?;
+        let sign = match self.side.as_str() {
+            "Buy" => 1.0,
+            "Sell" => -1.0,
+            "" | "None" if size == 0.0 => 0.0,
+            _ => {
+                return Err(Error::BadResponse {
+                    endpoint,
+                    reason: "a position with a size has no side".into(),
+                });
+            }
+        };
+        Ok(Position {
+            size: sign * size,
+            avg_price: unsigned_or_zero(endpoint, "avgPrice", &self.avg_price)?,
+            unrealised_pnl: num_or_zero(endpoint, "unrealisedPnl", &self.unrealised_pnl)?,
+            mark_price: unsigned_or_zero(endpoint, "markPrice", &self.mark_price)?,
+            symbol: self.symbol,
+        })
+    }
+}
+
+/// The account's equity in the settle coin, and the account total.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Equity {
+    /// The settle coin the first three fields are in.
+    pub coin: String,
+    /// The coin's `walletBalance`: deposits plus realised P&L less fees.
+    pub wallet_balance: f64,
+    /// The coin's `unrealisedPnl` on open positions.
+    pub unrealised_pnl: f64,
+    /// The coin's `equity` as the venue reports it: the wallet balance less spot borrowing, plus
+    /// unrealised P&L and option value.
+    pub equity: f64,
+    /// The venue's `totalEquity`: the whole account's equity in USD across every coin.
+    pub account_total_equity_usd: f64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RawWallet {
+    pub total_equity: String,
+    #[serde(default)]
+    pub coin: Vec<RawCoin>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RawCoin {
+    pub coin: String,
+    pub wallet_balance: String,
+    #[serde(default)]
+    pub unrealised_pnl: String,
+    pub equity: String,
+}
+
+/// A linear contract's trading rules, from the venue's public instruments info.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InstrumentInfo {
+    pub symbol: String,
+    /// `LinearPerpetual` for a perpetual.
+    pub contract_type: String,
+    /// `Trading` while the contract trades.
+    pub status: String,
+    pub base_coin: String,
+    pub quote_coin: String,
+    pub settle_coin: String,
+    pub tick_size: f64,
+    pub qty_step: f64,
+    pub min_order_qty: f64,
+    /// The smallest order value in the settle coin; zero when the venue gives none.
+    pub min_notional: f64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RawInstrument {
+    symbol: String,
+    contract_type: String,
+    status: String,
+    base_coin: String,
+    quote_coin: String,
+    settle_coin: String,
+    price_filter: RawPriceFilter,
+    lot_size_filter: RawLotSizeFilter,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawPriceFilter {
+    tick_size: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawLotSizeFilter {
+    qty_step: String,
+    min_order_qty: String,
+    #[serde(default)]
+    min_notional_value: String,
+}
+
+impl RawInstrument {
+    pub(crate) fn into_info(self, endpoint: &'static str) -> Result<InstrumentInfo, Error> {
+        let lot = self.lot_size_filter;
+        Ok(InstrumentInfo {
+            tick_size: positive(endpoint, "tickSize", &self.price_filter.tick_size)?,
+            qty_step: positive(endpoint, "qtyStep", &lot.qty_step)?,
+            min_order_qty: positive(endpoint, "minOrderQty", &lot.min_order_qty)?,
+            min_notional: unsigned_or_zero(endpoint, "minNotionalValue", &lot.min_notional_value)?,
+            symbol: self.symbol,
+            contract_type: self.contract_type,
+            status: self.status,
+            base_coin: self.base_coin,
+            quote_coin: self.quote_coin,
+            settle_coin: self.settle_coin,
+        })
+    }
+}
+
+/// A contract's last traded price and mark price, from the venue's public tickers.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Ticker {
+    pub symbol: String,
+    pub last_price: f64,
+    pub mark_price: f64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RawTicker {
+    pub symbol: String,
+    last_price: String,
+    mark_price: String,
+}
+
+impl RawTicker {
+    pub(crate) fn into_ticker(self, endpoint: &'static str) -> Result<Ticker, Error> {
+        Ok(Ticker {
+            last_price: positive(endpoint, "lastPrice", &self.last_price)?,
+            mark_price: positive(endpoint, "markPrice", &self.mark_price)?,
+            symbol: self.symbol,
+        })
+    }
+}
+
+/// The server time answer.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ServerTime {
+    pub time_nano: String,
+}
+
+/// The order id in a create, amend or cancel answer.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct Ack {
+    pub order_id: String,
+}
+
+fn side(endpoint: &'static str, s: &str) -> Result<Side, Error> {
+    match s {
+        "Buy" => Ok(Side::Buy),
+        "Sell" => Ok(Side::Sell),
+        _ => Err(Error::BadResponse {
+            endpoint,
+            reason: "a side is neither Buy nor Sell".into(),
+        }),
+    }
+}
+
+pub(crate) fn num(endpoint: &'static str, field: &str, s: &str) -> Result<f64, Error> {
+    s.parse::<f64>()
+        .ok()
+        .filter(|x| x.is_finite())
+        .ok_or_else(|| Error::BadResponse {
+            endpoint,
+            reason: format!("{field} is not a number"),
+        })
+}
+
+pub(crate) fn num_or_zero(endpoint: &'static str, field: &str, s: &str) -> Result<f64, Error> {
+    if s.is_empty() {
+        Ok(0.0)
+    } else {
+        num(endpoint, field, s)
+    }
+}
+
+/// `None` for an empty or zero value, which the venue sends for a field that does not apply.
+fn positive_or_none(endpoint: &'static str, field: &str, s: &str) -> Result<Option<f64>, Error> {
+    let x = unsigned_or_zero(endpoint, field, s)?;
+    Ok((x != 0.0).then_some(x))
+}
+
+/// A quantity, size or price, which is never negative.
+fn unsigned(endpoint: &'static str, field: &str, x: f64) -> Result<f64, Error> {
+    if x < 0.0 {
+        return Err(Error::BadResponse {
+            endpoint,
+            reason: format!("{field} is negative"),
+        });
+    }
+    Ok(x)
+}
+
+fn unsigned_or_zero(endpoint: &'static str, field: &str, s: &str) -> Result<f64, Error> {
+    unsigned(endpoint, field, num_or_zero(endpoint, field, s)?)
+}
+
+/// A step, minimum or price that must be above zero.
+fn positive(endpoint: &'static str, field: &str, s: &str) -> Result<f64, Error> {
+    let x = num(endpoint, field, s)?;
+    if x <= 0.0 {
+        return Err(Error::BadResponse {
+            endpoint,
+            reason: format!("{field} is not above zero"),
+        });
+    }
+    Ok(x)
+}
+
+fn millis(endpoint: &'static str, field: &str, s: &str) -> Result<Millis, Error> {
+    s.parse().map_err(|_| Error::BadResponse {
+        endpoint,
+        reason: format!("{field} is not a timestamp"),
+    })
+}
+
+/// Writes `value`, which must already be a multiple of `step`, with exactly as many decimals as
+/// `step` has, so the venue gets `0.3`, never `0.30000000000000004`. The engine's rounding
+/// (`Instrument::round_price`, `round_qty`) gives the float nearest the decimal; this only prints
+/// it. A value that does not print back to itself is refused rather than sent.
+pub(crate) fn decimal(value: f64, step: f64) -> Result<String, Error> {
+    // Rust prints a float as the shortest decimal that reads back to it, and never in exponent
+    // form, so the digits after the point are the step's decimals.
+    let step_text = step.to_string();
+    let decimals = step_text.split_once('.').map_or(0, |(_, frac)| frac.len());
+    let text = format!("{value:.decimals$}");
+    if text.parse::<f64>() != Ok(value) {
+        return Err(Error::Unsupported {
+            what: "a number that cannot be written exactly on the instrument's grid",
+        });
+    }
+    Ok(text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decimals_follow_the_step() {
+        assert_eq!(decimal(0.3, 0.1).unwrap(), "0.3");
+        assert_eq!(decimal(65000.5, 0.1).unwrap(), "65000.5");
+        assert_eq!(decimal(65000.0, 0.1).unwrap(), "65000.0");
+        assert_eq!(decimal(0.001, 0.001).unwrap(), "0.001");
+        assert_eq!(decimal(12.0, 1.0).unwrap(), "12");
+        assert_eq!(decimal(1005.0, 5.0).unwrap(), "1005");
+        assert_eq!(decimal(0.00012345, 0.00000001).unwrap(), "0.00012345");
+        // A rounded value prints clean even where float arithmetic does not.
+        let i = td_core::Instrument {
+            lot_size: 0.1,
+            ..test_instrument()
+        };
+        assert_eq!(decimal(i.round_qty(3.0 * 0.1), 0.1).unwrap(), "0.3");
+    }
+
+    #[test]
+    fn a_value_off_the_grid_is_refused() {
+        assert!(decimal(0.30000000000000004, 0.1).is_err());
+        assert!(decimal(0.0015, 0.001).is_err());
+    }
+
+    fn test_instrument() -> td_core::Instrument {
+        td_core::Instrument {
+            id: td_core::InstrumentId {
+                venue: td_core::Venue::Bybit,
+                symbol: "BTCUSDT".into(),
+                kind: td_core::InstrumentKind::Perpetual,
+            },
+            base: "BTC".into(),
+            quote: "USDT".into(),
+            tick_size: 0.1,
+            lot_size: 0.001,
+            min_qty: 0.001,
+            min_notional: 5.0,
+            fees: td_core::FeeSchedule {
+                maker: 0.0002,
+                taker: 0.00055,
+                per_unit: 0.0,
+            },
+        }
+    }
+
+    fn fixture(name: &str) -> serde_json::Value {
+        let path = format!(
+            "{}/../../mock/bybit/fixtures/{name}",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
+        let env: Envelope = serde_json::from_str(&text).unwrap();
+        assert_eq!(env.ret_code, 0, "{name}");
+        env.result
+    }
+
+    #[test]
+    fn the_documented_shapes_parse() {
+        let orders: Page<RawOrder> = from_value("t", fixture("order-realtime.json")).unwrap();
+        let order = orders
+            .list
+            .into_iter()
+            .next()
+            .unwrap()
+            .into_order("t", venue_text)
+            .unwrap();
+        assert_eq!(order.status, OrderStatus::Untriggered);
+        assert_eq!(order.trigger_price, Some(58000.0));
+        assert!(order.reduce_only);
+        assert_eq!(order.avg_price, None);
+
+        let history: Page<RawOrder> = from_value("t", fixture("order-history.json")).unwrap();
+        let order = history
+            .list
+            .into_iter()
+            .next()
+            .unwrap()
+            .into_order("t", venue_text)
+            .unwrap();
+        assert_eq!(order.status, OrderStatus::Filled);
+        assert_eq!(order.avg_price, Some(65000.1));
+
+        let execs: Page<RawExecution> = from_value("t", fixture("execution-list.json")).unwrap();
+        let execs: Vec<Execution> = execs
+            .list
+            .into_iter()
+            .map(|e| e.into_execution("t", venue_text).unwrap())
+            .collect();
+        assert_eq!(execs[0].kind, ExecKind::Trade);
+        assert_eq!(execs[0].liquidity, Liquidity::Taker);
+        assert_eq!(execs[0].fee, 0.03575005);
+        assert_eq!(execs[1].kind, ExecKind::Funding);
+
+        let positions: Page<RawPosition> = from_value("t", fixture("position-list.json")).unwrap();
+        let p = positions.list.into_iter().next().unwrap();
+        assert_eq!(p.position_idx, 0);
+        assert_eq!(p.into_position("t").unwrap().size, 0.001);
+
+        let wallets: Page<RawWallet> = from_value("t", fixture("wallet-balance.json")).unwrap();
+        assert_eq!(wallets.list[0].coin[0].coin, "USDT");
+        assert_eq!(wallets.list[0].coin[0].equity, "50000.00742");
+
+        let infos: Page<RawInstrument> = from_value("t", fixture("instruments-info.json")).unwrap();
+        let info = infos
+            .list
+            .into_iter()
+            .next()
+            .unwrap()
+            .into_info("t")
+            .unwrap();
+        assert_eq!(
+            (
+                info.tick_size,
+                info.qty_step,
+                info.min_order_qty,
+                info.min_notional
+            ),
+            (0.1, 0.001, 0.001, 5.0)
+        );
+        assert_eq!(
+            (info.contract_type.as_str(), info.status.as_str()),
+            ("LinearPerpetual", "Trading")
+        );
+        assert_eq!(info.settle_coin, "USDT");
+
+        let tickers: Page<RawTicker> = from_value("t", fixture("market-tickers.json")).unwrap();
+        let ticker = tickers
+            .list
+            .into_iter()
+            .next()
+            .unwrap()
+            .into_ticker("t")
+            .unwrap();
+        assert_eq!(ticker.symbol, "BTCUSDT");
+        assert!(ticker.last_price > 0.0 && ticker.mark_price > 0.0);
+
+        let time: ServerTime = from_value("t", fixture("market-time.json")).unwrap();
+        assert_eq!(time.time_nano, "1688639403423213947");
+
+        for name in ["order-create.json", "order-amend.json", "order-cancel.json"] {
+            let ack: Ack = from_value("t", fixture(name)).unwrap();
+            assert!(!ack.order_id.is_empty());
+        }
+    }
+
+    #[test]
+    fn statuses_sort_into_open_and_closed() {
+        for open in [
+            "New",
+            "PartiallyFilled",
+            "Untriggered",
+            "Triggered",
+            "Later",
+        ] {
+            assert!(OrderStatus::parse(open).is_open(), "{open}");
+        }
+        for closed in [
+            "Rejected",
+            "PartiallyFilledCanceled",
+            "Filled",
+            "Cancelled",
+            "Deactivated",
+        ] {
+            assert!(!OrderStatus::parse(closed).is_open(), "{closed}");
+        }
+    }
+
+    #[test]
+    fn an_unknown_status_or_execution_type_is_kept_without_control_characters_and_cut_short() {
+        let raw = format!("Odd\u{1b}[2J\r\n{}", "y".repeat(500));
+        let OrderStatus::Other(kept) = OrderStatus::parse(&raw) else {
+            panic!("not kept as Other");
+        };
+        assert!(!kept.chars().any(char::is_control), "{kept:?}");
+        assert_eq!(kept.chars().count(), 200);
+        assert!(kept.starts_with("Odd[2J"), "{kept:?}");
+        assert!(OrderStatus::parse(&raw).is_open());
+        let ExecKind::Other(kept) = ExecKind::parse(&raw) else {
+            panic!("not kept as Other");
+        };
+        assert!(!kept.chars().any(char::is_control), "{kept:?}");
+        assert_eq!(kept.chars().count(), 200);
+    }
+
+    #[test]
+    fn venue_text_drops_zero_width_bidirectional_and_byte_order_characters() {
+        let raw = "a\u{200B}b\u{200F}c\u{2028}d\u{202E}e\u{2060}f\u{206F}g\u{FEFF}h\u{7}i";
+        assert_eq!(venue_text(raw), "abcdefghi");
+        let raw = "a\u{AD}b\u{61C}c\u{180E}d\u{34F}e\u{E0000}f\u{E0041}g\u{E007F}h";
+        assert_eq!(venue_text(raw), "abcdefgh");
+        // Visible text outside those ranges is kept.
+        assert_eq!(
+            venue_text("\u{394} 100 \u{2013} ok"),
+            "\u{394} 100 \u{2013} ok"
+        );
+    }
+
+    #[test]
+    fn negative_quantities_and_prices_are_refused_and_signed_amounts_kept() {
+        let order = |field: &str, value: &str| {
+            let mut v = fixture("order-history.json")["list"][0].clone();
+            v[field] = serde_json::json!(value);
+            serde_json::from_value::<RawOrder>(v)
+                .unwrap()
+                .into_order("t", venue_text)
+        };
+        assert!(order("qty", "0.002").is_ok());
+        for field in ["qty", "cumExecQty", "avgPrice", "triggerPrice"] {
+            assert!(order(field, "-1").is_err(), "{field}");
+        }
+        let exec = |field: &str, value: &str| {
+            let mut v = fixture("execution-list.json")["list"][0].clone();
+            v[field] = serde_json::json!(value);
+            serde_json::from_value::<RawExecution>(v)
+                .unwrap()
+                .into_execution("t", venue_text)
+        };
+        for field in ["execQty", "execPrice"] {
+            assert!(exec(field, "-1").is_err(), "{field}");
+        }
+        assert_eq!(exec("execFee", "-0.5").unwrap().fee, -0.5);
+        let position = |field: &str, value: &str| {
+            let mut v = fixture("position-list.json")["list"][0].clone();
+            v[field] = serde_json::json!(value);
+            serde_json::from_value::<RawPosition>(v)
+                .unwrap()
+                .into_position("t")
+        };
+        for field in ["size", "avgPrice", "markPrice"] {
+            assert!(position(field, "-1").is_err(), "{field}");
+        }
+        assert_eq!(
+            position("unrealisedPnl", "-3").unwrap().unrealised_pnl,
+            -3.0
+        );
+        let mut info = fixture("instruments-info.json")["list"][0].clone();
+        info["priceFilter"]["tickSize"] = serde_json::json!("0");
+        let info: RawInstrument = serde_json::from_value(info).unwrap();
+        assert!(info.into_info("t").is_err());
+    }
+
+    #[test]
+    fn a_bad_body_error_quotes_nothing_from_the_body() {
+        let err = envelope("e", br#"{"retCode": "SECRET-ECHO"}"#)
+            .err()
+            .unwrap();
+        assert!(!err.to_string().contains("SECRET-ECHO"), "{err}");
+        let err = from_value::<Ack>("e", serde_json::json!({"orderId": ["SECRET-ECHO"]}))
+            .err()
+            .unwrap();
+        assert!(!format!("{err} {err:?}").contains("SECRET-ECHO"));
+    }
+}
