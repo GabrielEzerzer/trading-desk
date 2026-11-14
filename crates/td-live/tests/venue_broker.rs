@@ -19,6 +19,8 @@ const CREATE: &str = "/v5/order/create";
 const CANCEL: &str = "/v5/order/cancel";
 const AMEND: &str = "/v5/order/amend";
 const REALTIME: &str = "/v5/order/realtime";
+const HISTORY: &str = "/v5/order/history";
+const EXECUTIONS: &str = "/v5/execution/list";
 const HOUR: Millis = 3_600_000;
 
 fn instrument() -> Instrument {
@@ -40,6 +42,21 @@ fn instrument() -> Instrument {
             per_unit: 0.0,
         },
     }
+}
+
+/// The instrument under another symbol.
+fn instrument_named(symbol: &str) -> Instrument {
+    let mut instrument = instrument();
+    instrument.id.symbol = symbol.into();
+    instrument.base = symbol.trim_end_matches("USDT").into();
+    instrument
+}
+
+/// A mock venue listing the instrument.
+fn venue() -> Arc<MockVenue> {
+    let mock = Arc::new(MockVenue::start());
+    mock.add_instrument(&instrument(), PRICE);
+    mock
 }
 
 fn client_for(mock: &MockVenue) -> Arc<Client> {
@@ -78,6 +95,22 @@ enum Act {
     Submit(OrderRequest),
     SubmitWithStop(OrderRequest, f64),
     Cancel(u64),
+    /// Runs test code at that point of the bar, after the broker's reads; a replay leaves it out.
+    Run(Arc<dyn Fn() + Send + Sync>),
+}
+
+fn run(f: impl Fn() + Send + Sync + 'static) -> Act {
+    Act::Run(Arc::new(f))
+}
+
+/// An act that loses the answer to the next create (`fault` says whether the venue applied it)
+/// and makes every read by client id fail until the faults are cleared.
+fn lose_next_create(mock: &Arc<MockVenue>, fault: Fault) -> Act {
+    let mock = mock.clone();
+    run(move || {
+        mock.inject(CREATE, fault.clone());
+        mock.inject_always(REALTIME, Fault::DropBeforeApply);
+    })
 }
 
 /// Submits the scripted orders on the bars they are keyed to (0 is the first bar fed), and
@@ -100,6 +133,10 @@ impl Strategy for Script {
                     )
                 }
                 Act::Cancel(id) => format!("{at}: cancel {}", ctx.cancel(OrderId(*id))),
+                Act::Run(f) => {
+                    f();
+                    format!("{at}: run")
+                }
             };
             self.results.lock().unwrap().push(result);
         }
@@ -118,7 +155,7 @@ fn config(starting_cash: f64, max_leverage: f64) -> SessionConfig {
 }
 
 struct Rig {
-    mock: MockVenue,
+    mock: Arc<MockVenue>,
     session: Session,
     handle: VenueHandle,
     results: Arc<Mutex<Vec<String>>>,
@@ -131,13 +168,21 @@ struct Rig {
 impl Rig {
     /// A session whose first bar is the last closed hour, so its orders are fresh.
     fn new(acts: Vec<(usize, Act)>) -> Rig {
-        let mock = MockVenue::start();
-        mock.add_instrument(&instrument(), PRICE);
+        Rig::with(venue(), acts)
+    }
+
+    /// [`Rig::new`] on `mock`, for acts that need the mock.
+    fn with(mock: Arc<MockVenue>, acts: Vec<(usize, Act)>) -> Rig {
         let start = Timeframe::H1.floor(mock.now()) - HOUR;
         Rig::on(mock, acts, start, config(10_000.0, 1.0))
     }
 
-    fn on(mock: MockVenue, acts: Vec<(usize, Act)>, start: Millis, config: SessionConfig) -> Rig {
+    fn on(
+        mock: Arc<MockVenue>,
+        acts: Vec<(usize, Act)>,
+        start: Millis,
+        config: SessionConfig,
+    ) -> Rig {
         let (session, handle, results) = Rig::session(&mock, &acts, config);
         Rig {
             mock,
@@ -155,23 +200,12 @@ impl Rig {
         acts: &[(usize, Act)],
         config: SessionConfig,
     ) -> (Session, VenueHandle, Arc<Mutex<Vec<String>>>) {
-        let (broker, handle) =
-            VenueBroker::new(client_for(mock), instrument(), Timeframe::H1, "t").unwrap();
-        let results = Arc::new(Mutex::new(Vec::new()));
-        let script = Script {
-            acts: acts.to_vec(),
-            bar: 0,
-            results: results.clone(),
-        };
-        let session = Session::with_broker(
-            Box::new(script),
-            instrument(),
-            Timeframe::H1,
-            config,
-            Box::new(broker),
-        )
-        .unwrap();
-        (session, handle, results)
+        session_on(mock, acts, config, "t", instrument())
+    }
+
+    /// Just before the close of the last bar fed: a manual order accepted then is decided on it.
+    fn accepted(&self) -> Millis {
+        self.start + self.fed as Millis * HOUR - 1
     }
 
     fn candle(&self, i: usize, low: f64) -> Candle {
@@ -213,6 +247,33 @@ impl Rig {
     fn results(&self) -> Vec<String> {
         self.results.lock().unwrap().clone()
     }
+}
+
+/// A session under `prefix` on `instrument`, running the scripted acts on a venue broker.
+fn session_on(
+    mock: &MockVenue,
+    acts: &[(usize, Act)],
+    config: SessionConfig,
+    prefix: &str,
+    instrument: Instrument,
+) -> (Session, VenueHandle, Arc<Mutex<Vec<String>>>) {
+    let (broker, handle) =
+        VenueBroker::new(client_for(mock), instrument.clone(), Timeframe::H1, prefix).unwrap();
+    let results = Arc::new(Mutex::new(Vec::new()));
+    let script = Script {
+        acts: acts.to_vec(),
+        bar: 0,
+        results: results.clone(),
+    };
+    let session = Session::with_broker(
+        Box::new(script),
+        instrument,
+        Timeframe::H1,
+        config,
+        Box::new(broker),
+    )
+    .unwrap();
+    (session, handle, results)
 }
 
 fn close(a: f64, b: f64) -> bool {
@@ -410,9 +471,12 @@ fn a_resting_stop_cancels_and_one_that_already_filled_does_not() {
 
 #[test]
 fn a_place_whose_answer_is_lost_after_it_reached_the_venue_is_one_order_filled_once() {
-    let mut rig = Rig::new(vec![(0, Act::Submit(market(Side::Buy, 0.004, false)))]);
-    rig.mock.inject(CREATE, Fault::DropAfterApply);
-    rig.mock.inject_always(REALTIME, Fault::DropBeforeApply);
+    let mock = venue();
+    let lose = lose_next_create(&mock, Fault::DropAfterApply);
+    let mut rig = Rig::with(
+        mock,
+        vec![(0, lose), (0, Act::Submit(market(Side::Buy, 0.004, false)))],
+    );
     rig.bar();
     rig.mock.clear_faults();
     assert_eq!(rig.mock.orders_with_link_id("t-o1").len(), 1);
@@ -427,12 +491,18 @@ fn a_place_whose_answer_is_lost_after_it_reached_the_venue_is_one_order_filled_o
 
 #[test]
 fn a_place_whose_answer_is_lost_before_it_reached_the_venue_is_cancelled_not_resent() {
-    let mut rig = Rig::new(vec![(
-        0,
-        Act::SubmitWithStop(market(Side::Buy, 0.004, false), 60000.0),
-    )]);
-    rig.mock.inject(CREATE, Fault::DropBeforeApply);
-    rig.mock.inject_always(REALTIME, Fault::DropBeforeApply);
+    let mock = venue();
+    let lose = lose_next_create(&mock, Fault::DropBeforeApply);
+    let mut rig = Rig::with(
+        mock,
+        vec![
+            (0, lose),
+            (
+                0,
+                Act::SubmitWithStop(market(Side::Buy, 0.004, false), 60000.0),
+            ),
+        ],
+    );
     rig.bar();
     rig.mock.clear_faults();
     rig.bar();
@@ -449,9 +519,12 @@ fn a_place_whose_answer_is_lost_before_it_reached_the_venue_is_cancelled_not_res
 
 #[test]
 fn an_unknown_outcome_the_venue_cannot_settle_faults_after_three_asks() {
-    let mut rig = Rig::new(vec![(0, Act::Submit(market(Side::Buy, 0.004, false)))]);
-    rig.mock.inject(CREATE, Fault::DropBeforeApply);
-    rig.mock.inject_always(REALTIME, Fault::DropBeforeApply);
+    let mock = venue();
+    let lose = lose_next_create(&mock, Fault::DropBeforeApply);
+    let mut rig = Rig::with(
+        mock,
+        vec![(0, lose), (0, Act::Submit(market(Side::Buy, 0.004, false)))],
+    );
     for _ in 0..3 {
         assert_eq!(rig.fault_kind(), None);
         rig.bar();
@@ -471,8 +544,7 @@ fn an_unknown_outcome_the_venue_cannot_settle_faults_after_three_asks() {
 
 #[test]
 fn a_stale_decision_is_not_sent() {
-    let mock = MockVenue::start();
-    mock.add_instrument(&instrument(), PRICE);
+    let mock = venue();
     let start = Timeframe::H1.floor(mock.now()) - 10 * HOUR;
     let acts = vec![(0, Act::Submit(market(Side::Buy, 0.004, false)))];
     let mut rig = Rig::on(mock, acts, start, config(10_000.0, 1.0));
@@ -488,8 +560,7 @@ fn a_stale_decision_is_not_sent() {
 
 #[test]
 fn a_stale_decision_the_venue_already_holds_is_adopted() {
-    let mock = MockVenue::start();
-    mock.add_instrument(&instrument(), PRICE);
+    let mock = venue();
     let start = Timeframe::H1.floor(mock.now()) - 10 * HOUR;
     let mut rig = Rig::on(mock, vec![], start, config(10_000.0, 1.0));
     rig.bar();
@@ -573,8 +644,7 @@ fn an_open_order_the_broker_does_not_know_faults() {
 
 #[test]
 fn a_bar_on_which_the_session_would_liquidate_faults_in_that_bar() {
-    let mock = MockVenue::start();
-    mock.add_instrument(&instrument(), PRICE);
+    let mock = venue();
     let start = Timeframe::H1.floor(mock.now()) - HOUR;
     let acts = vec![(0, Act::Submit(market(Side::Buy, 0.004, false)))];
     // 260 of position on 100 of cash: the session's model liquidates near 40200.
@@ -604,7 +674,13 @@ fn run_recorded(rig: &mut Rig, bars: usize) -> Vec<String> {
 
 /// A second session on the same venue, same prefix and script, replaying `records`.
 fn replayed(rig: &Rig, records: &[String]) -> (Session, VenueHandle) {
-    let (mut session, handle, _) = Rig::session(&rig.mock, &rig.acts, config(10_000.0, 1.0));
+    let acts: Vec<_> = rig
+        .acts
+        .iter()
+        .filter(|(_, act)| !matches!(act, Act::Run(_)))
+        .cloned()
+        .collect();
+    let (mut session, handle, _) = Rig::session(&rig.mock, &acts, config(10_000.0, 1.0));
     for (i, text) in records.iter().enumerate() {
         let record: BrokerRecord = serde_json::from_str(text).unwrap();
         handle.replay(record);
@@ -719,4 +795,425 @@ fn records_hold_the_events_the_session_was_given() {
         text.contains(&serde_json::to_string(&fill).unwrap()),
         "{text}"
     );
+}
+
+fn record(text: &str) -> BrokerRecord {
+    serde_json::from_str(text).unwrap()
+}
+
+#[test]
+fn after_a_fault_go_live_sends_no_order_and_no_cancel() {
+    let mut rig = Rig::new(vec![
+        (0, Act::Submit(market(Side::Buy, 0.004, false))),
+        (1, Act::Submit(stop(Side::Sell, 0.004, 60000.0))),
+    ]);
+    let mut records = run_recorded(&mut rig, 2);
+    // A manual order decided on a later bar whose create is lost before it reaches the venue.
+    let accepted = rig.start + 3 * HOUR + 1;
+    rig.mock.inject(CREATE, Fault::DropBeforeApply);
+    rig.mock.inject_always(REALTIME, Fault::DropBeforeApply);
+    let manual = market(Side::Buy, 0.002, false);
+    assert_eq!(
+        rig.session.submit(manual.clone(), accepted).unwrap().id,
+        OrderId(3)
+    );
+    rig.mock.clear_faults();
+    records.push(serde_json::to_string(&rig.handle.take_record()).unwrap());
+    // Another session that reuses the prefix sends the same id before the restart.
+    let other = client_for(&rig.mock);
+    other
+        .place(
+            &instrument(),
+            &manual,
+            &ClientOrderId::new("t-o3").unwrap(),
+            PRICE,
+        )
+        .unwrap();
+    let sends = rig.sends();
+    let (mut session, handle) = replayed(&rig, &records[..2]);
+    handle.replay(record(&records[2]));
+    session.submit(manual.clone(), accepted).unwrap();
+    // Past the record: one more order and a cancel of the resting stop.
+    session.submit(manual, accepted).unwrap();
+    assert!(session.cancel(OrderId(2), "manual"));
+    let fault = handle.go_live().expect_err("the reused id faults");
+    assert_eq!(fault.kind, FaultKind::IdCollision, "{fault}");
+    assert_eq!(rig.sends(), sends, "nothing placed or cancelled after it");
+    assert!(rig.mock.orders_with_link_id("t-o4").is_empty());
+    assert_eq!(
+        rig.mock.orders_with_link_id("t-o2")[0].status,
+        "Untriggered"
+    );
+}
+
+#[test]
+fn a_stop_for_a_fill_confirmed_in_the_faulting_bar_is_still_placed_and_nothing_else_is() {
+    let mock = venue();
+    let lose = lose_next_create(&mock, Fault::DropAfterApply);
+    let mut rig = Rig::with(
+        mock,
+        vec![
+            (0, lose),
+            (
+                0,
+                Act::SubmitWithStop(market(Side::Buy, 0.004, false), 60000.0),
+            ),
+            (1, Act::Submit(market(Side::Buy, 0.002, false))),
+        ],
+    );
+    rig.bar();
+    rig.mock.clear_faults();
+    assert_eq!(rig.mock.position(SYMBOL), 0.004);
+    assert!(
+        rig.mock.orders_with_link_id("t-o2").is_empty(),
+        "the outcome of the entry is unknown, so its stop waits"
+    );
+    let sends = rig.sends();
+    // A trade of another session lands after the entry's fill, so the bar that reads the fill
+    // faults too.
+    rig.mock.seed_trades(SYMBOL, 1, rig.mock.now() + 1, 1);
+    rig.bar();
+    assert_eq!(rig.fault_kind(), Some(FaultKind::ForeignExecution));
+    let resting = rig.mock.orders_with_link_id("t-o2");
+    assert_eq!(resting.len(), 1, "the confirmed fill is protected");
+    assert_eq!(resting[0].status, "Untriggered");
+    assert_eq!(resting[0].qty, 0.004);
+    assert_eq!(rig.sends(), sends + 1, "and nothing else goes out");
+    rig.bar();
+    assert_eq!(rig.sends(), sends + 1);
+    assert!(matches!(rig.status(3), OrderStatus::Cancelled(_)));
+}
+
+#[test]
+fn a_replayed_cancel_of_an_order_whose_outcome_is_unknown_is_refused_as_live() {
+    let mut rig = Rig::new(vec![]);
+    let mut records = run_recorded(&mut rig, 1);
+    rig.mock.inject(CREATE, Fault::DropBeforeApply);
+    rig.mock.inject_always(REALTIME, Fault::DropBeforeApply);
+    let manual = market(Side::Buy, 0.004, false);
+    let accepted = rig.accepted();
+    rig.session.submit(manual.clone(), accepted).unwrap();
+    rig.mock.clear_faults();
+    records.push(serde_json::to_string(&rig.handle.take_record()).unwrap());
+    let (mut session, handle) = replayed(&rig, &records[..1]);
+    handle.replay(record(&records[1]));
+    session.submit(manual, accepted).unwrap();
+    assert!(
+        !session.cancel(OrderId(1), "manual"),
+        "the live path refuses to cancel an order whose outcome is unknown"
+    );
+    handle.go_live().unwrap();
+    session.on_bar(rig.candle(1, PRICE), &[]).unwrap();
+    assert_eq!(handle.fault(), None);
+    assert_eq!(session.orders()[0].status, OrderStatus::Filled);
+    assert_eq!(session.portfolio().position(), rig.mock.position(SYMBOL));
+    assert_eq!(
+        rig.mock.request_count(CREATE),
+        2,
+        "the lost create, then one send"
+    );
+    assert_eq!(rig.mock.request_count(CANCEL), 0);
+}
+
+#[test]
+fn a_record_made_under_another_prefix_or_instrument_is_refused() {
+    let mut rig = Rig::new(vec![(0, Act::Submit(market(Side::Buy, 0.004, false)))]);
+    let records = run_recorded(&mut rig, 1);
+    let sends = rig.sends();
+    let (mut session, handle, _) = session_on(
+        &rig.mock,
+        &rig.acts,
+        config(10_000.0, 1.0),
+        "u",
+        instrument(),
+    );
+    handle.replay(record(&records[0]));
+    session.on_bar(rig.candle(0, PRICE), &[]).unwrap();
+    assert_eq!(
+        handle.fault().map(|f| f.kind),
+        Some(FaultKind::ReplayDiverged)
+    );
+    assert!(handle.go_live().is_err());
+    assert_eq!(rig.sends(), sends);
+    let (_, handle, _) = session_on(
+        &rig.mock,
+        &[],
+        config(10_000.0, 1.0),
+        "t",
+        instrument_named("ETHUSDT"),
+    );
+    handle.replay(record(&records[0]));
+    let fault = handle.fault().expect("refused");
+    assert_eq!(fault.kind, FaultKind::ReplayDiverged);
+    assert!(fault.message.contains("instrument"), "{fault}");
+}
+
+type Edit = fn(&mut serde_json::Value, &serde_json::Value);
+
+#[test]
+fn an_edited_record_is_refused_and_nothing_is_sent() {
+    let mock = venue();
+    let lose = lose_next_create(&mock, Fault::DropBeforeApply);
+    let mut rig = Rig::with(
+        mock,
+        vec![(0, lose), (0, Act::Submit(market(Side::Buy, 0.004, false)))],
+    );
+    let records = run_recorded(&mut rig, 1);
+    rig.mock.clear_faults();
+    let sell = serde_json::to_value(Side::Sell).unwrap();
+    let edits: [(&str, Edit); 3] = [
+        ("quantity", |order, _| {
+            order["order"]["request"]["qty"] = serde_json::json!(0.003)
+        }),
+        ("side", |order, sell| {
+            order["order"]["request"]["side"] = sell.clone()
+        }),
+        ("negative sent", |order, _| {
+            order["sent"] = serde_json::json!(-0.004)
+        }),
+    ];
+    for (what, edit) in edits {
+        let mut value: serde_json::Value = serde_json::from_str(&records[0]).unwrap();
+        edit(&mut value["book"]["orders"]["1"], &sell);
+        let creates = rig.mock.request_count(CREATE);
+        let (_session, handle) = replayed(&rig, &[value.to_string()]);
+        assert_eq!(
+            handle.fault().map(|f| f.kind),
+            Some(FaultKind::ReplayDiverged),
+            "{what}"
+        );
+        assert!(handle.go_live().is_err(), "{what}");
+        assert_eq!(rig.mock.request_count(CREATE), creates, "{what}");
+    }
+}
+
+#[test]
+fn a_record_whose_cursor_is_near_the_lowest_time_does_not_panic() {
+    let mut rig = Rig::new(vec![]);
+    let records = run_recorded(&mut rig, 1);
+    let mut value: serde_json::Value = serde_json::from_str(&records[0]).unwrap();
+    value["book"]["floor"] = serde_json::json!(i64::MIN);
+    value["book"]["cursor"] = serde_json::json!(i64::MIN + 5);
+    let sends = rig.sends();
+    let (mut session, handle) = replayed(&rig, &[value.to_string()]);
+    let _ = handle.go_live();
+    session.on_bar(rig.candle(1, PRICE), &[]).unwrap();
+    assert_eq!(rig.sends(), sends);
+}
+
+/// An entry of 0.004 that fills 0.002 at first, so its stop is placed for 0.002; then the rest
+/// fills and resizing the stop is refused, and so is the next create when `create_fails`.
+/// Returns the rig after the bar that reads the rest, with the records of every bar.
+fn failed_resize(create_fails: bool) -> (Rig, Vec<String>) {
+    let mut rig = Rig::new(vec![(
+        0,
+        Act::SubmitWithStop(market(Side::Buy, 0.004, false), 60000.0),
+    )]);
+    rig.mock.cap_next_fill(0.002);
+    let mut records = run_recorded(&mut rig, 2);
+    assert_eq!(rig.mock.orders_with_link_id("t-o2")[0].qty, 0.002);
+    rig.mock.fill_rest("t-o1");
+    rig.mock.inject(AMEND, Fault::Answer(10001));
+    if create_fails {
+        rig.mock.inject(CREATE, Fault::Answer(10001));
+    }
+    records.extend(run_recorded(&mut rig, 1));
+    (rig, records)
+}
+
+#[test]
+fn a_fault_survives_a_restart_and_go_live_sends_nothing() {
+    let (rig, records) = failed_resize(true);
+    let fault = rig.handle.fault().expect("faulted");
+    assert_eq!(fault.kind, FaultKind::ProtectionFailed);
+    assert!(fault.message.contains("not covered"), "{fault}");
+    assert_eq!(rig.mock.position(SYMBOL), 0.004);
+    assert_eq!(rig.mock.orders_with_link_id("t-o2")[0].qty, 0.002);
+    let sends = rig.sends();
+    let (_session, handle) = replayed(&rig, &records);
+    assert_eq!(handle.go_live(), Err(fault));
+    assert_eq!(rig.sends(), sends);
+}
+
+#[test]
+fn a_stop_that_cannot_be_resized_gets_a_cover_for_the_rest_before_the_fault() {
+    let (rig, _) = failed_resize(false);
+    let fault = rig.handle.fault().expect("faulted");
+    assert_eq!(fault.kind, FaultKind::ProtectionFailed);
+    assert!(fault.message.contains("t-s2 now covers"), "{fault}");
+    let cover = rig.mock.orders_with_link_id("t-s2");
+    assert_eq!(cover.len(), 1);
+    assert_eq!(cover[0].status, "Untriggered");
+    assert_eq!(cover[0].qty, 0.002);
+    assert_eq!(cover[0].side, Side::Sell);
+    assert_eq!(cover[0].trigger, Some(60000.0));
+    assert!(cover[0].reduce_only);
+}
+
+#[test]
+fn while_the_venue_cannot_be_read_an_opening_order_is_not_sent() {
+    let mut rig = Rig::new(vec![
+        (0, Act::Submit(market(Side::Buy, 0.004, false))),
+        (1, Act::Submit(market(Side::Buy, 0.002, false))),
+    ]);
+    rig.bar();
+    rig.mock.inject_always(EXECUTIONS, Fault::DropBeforeApply);
+    rig.bar();
+    assert_eq!(rig.mock.request_count(CREATE), 1);
+    rig.mock.clear_faults();
+    rig.bar();
+    match rig.status(2) {
+        OrderStatus::Cancelled(r) => assert!(r.contains("could not be read"), "{r}"),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(rig.status(1), OrderStatus::Filled);
+    assert_eq!(rig.handle.fault(), None);
+}
+
+#[test]
+fn an_accepted_entry_whose_fill_cannot_be_confirmed_gets_its_stop_at_once() {
+    let mock = venue();
+    let blind = mock.clone();
+    let mut rig = Rig::with(
+        mock,
+        vec![
+            (
+                0,
+                run(move || {
+                    blind.inject_always(REALTIME, Fault::DropBeforeApply);
+                    blind.inject_always(HISTORY, Fault::DropBeforeApply);
+                }),
+            ),
+            (
+                0,
+                Act::SubmitWithStop(market(Side::Buy, 0.004, false), 60000.0),
+            ),
+        ],
+    );
+    rig.bar();
+    rig.mock.clear_faults();
+    let resting = rig.mock.orders_with_link_id("t-o2");
+    assert_eq!(resting.len(), 1, "{:?}", rig.handle.fault());
+    assert_eq!(resting[0].status, "Untriggered");
+    assert_eq!(resting[0].qty, 0.004);
+    rig.bar();
+    assert_eq!(rig.status(2), OrderStatus::Open);
+    assert_eq!(rig.handle.fault(), None);
+}
+
+#[test]
+fn a_record_handed_to_a_broker_that_acted_live_faults() {
+    let mut rig = Rig::new(vec![]);
+    rig.bar();
+    let record = rig.handle.take_record();
+    rig.handle.replay(record);
+    assert_eq!(rig.fault_kind(), Some(FaultKind::ReplayDiverged));
+}
+
+#[test]
+fn resolving_an_unknown_order_does_not_read_old_executions_again() {
+    let mut rig = Rig::new(vec![(0, Act::Submit(market(Side::Buy, 0.004, false)))]);
+    rig.bar();
+    rig.bar();
+    // A manual stop whose create reaches the venue but whose answer is lost.
+    rig.mock.inject(CREATE, Fault::DropAfterApply);
+    rig.mock.inject_always(REALTIME, Fault::DropBeforeApply);
+    let accepted = rig.accepted();
+    rig.session
+        .submit(stop(Side::Sell, 0.004, 60000.0), accepted)
+        .unwrap();
+    rig.mock.clear_faults();
+    // A later order fills two minutes on, so the entry's execution leaves the lookback.
+    rig.mock.set_skew(120_000);
+    rig.session
+        .submit(market(Side::Buy, 0.002, false), accepted)
+        .unwrap();
+    rig.bar();
+    assert_eq!(rig.handle.fault(), None);
+    rig.bar();
+    assert_eq!(rig.handle.fault(), None);
+    assert_eq!(rig.status(2), OrderStatus::Open);
+    assert_eq!(rig.status(3), OrderStatus::Filled);
+    assert_eq!(rig.session.portfolio().position(), 0.006);
+}
+
+#[test]
+fn a_cancel_go_live_cannot_send_faults() {
+    let mut rig = Rig::new(vec![
+        (0, Act::Submit(market(Side::Buy, 0.004, false))),
+        (1, Act::Submit(stop(Side::Sell, 0.004, 60000.0))),
+    ]);
+    let records = run_recorded(&mut rig, 2);
+    let (mut session, handle) = replayed(&rig, &records);
+    assert!(session.cancel(OrderId(2), "manual"));
+    rig.mock.inject(CANCEL, Fault::Answer(10001));
+    let fault = handle.go_live().expect_err("faulted");
+    assert_eq!(fault.kind, FaultKind::UnknownOpenOrder, "{fault}");
+    assert!(fault.message.contains("t-o2"), "{fault}");
+}
+
+#[test]
+fn a_cancelled_stop_that_filled_partly_first_reports_its_fill() {
+    let mut rig = Rig::new(vec![
+        (0, Act::Submit(market(Side::Buy, 0.004, false))),
+        (1, Act::Submit(stop(Side::Sell, 0.004, 60000.0))),
+    ]);
+    rig.bar();
+    rig.bar();
+    rig.mock.cancel_after_partial_fill("t-o2", 0.002);
+    assert!(rig.session.cancel(OrderId(2), "manual"));
+    rig.bar();
+    assert_eq!(rig.handle.fault(), None);
+    assert_eq!(rig.session.portfolio().position(), 0.002);
+    assert_eq!(rig.mock.position(SYMBOL), 0.002);
+    assert_eq!(rig.status(2), OrderStatus::Filled);
+}
+
+#[test]
+fn go_live_adopts_an_entry_and_the_stop_it_placed_before_the_restart() {
+    let slot: Arc<Mutex<Option<VenueHandle>>> = Arc::new(Mutex::new(None));
+    let taken: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let (from, into) = (slot.clone(), taken.clone());
+    // The record is taken in the middle of bar 1, before its orders go out, and the live run
+    // stops after them.
+    let mut rig = Rig::new(vec![
+        (
+            1,
+            run(move || {
+                let handle = from.lock().unwrap().clone().unwrap();
+                let text = serde_json::to_string(&handle.take_record()).unwrap();
+                into.lock().unwrap().push(text);
+            }),
+        ),
+        (
+            1,
+            Act::SubmitWithStop(market(Side::Buy, 0.004, false), 60000.0),
+        ),
+    ]);
+    *slot.lock().unwrap() = Some(rig.handle.clone());
+    let mut records = run_recorded(&mut rig, 1);
+    rig.bar();
+    records.extend(taken.lock().unwrap().iter().cloned());
+    assert_eq!(rig.mock.orders_with_link_id("t-o2").len(), 1);
+    let creates = rig.mock.request_count(CREATE);
+    let (mut session, handle) = replayed(&rig, &records);
+    handle.go_live().unwrap();
+    assert_eq!(
+        rig.mock.request_count(CREATE),
+        creates,
+        "nothing created twice"
+    );
+    assert_eq!(rig.mock.orders_with_link_id("t-o2").len(), 1);
+    let resting: Vec<_> = handle.resting_orders().iter().map(|o| o.id).collect();
+    assert_eq!(
+        resting,
+        [OrderId(1)],
+        "the entry until its fill is reported; the stop waits for the bar that announces it"
+    );
+    session.on_bar(rig.candle(2, PRICE), &[]).unwrap();
+    assert_eq!(handle.fault(), None);
+    assert_eq!(session.orders()[0].status, OrderStatus::Filled);
+    assert_eq!(session.orders()[1].status, OrderStatus::Open);
+    assert_eq!(handle.resting_orders()[0].id, OrderId(2));
+    assert_eq!(rig.mock.request_count(CREATE), creates);
 }
