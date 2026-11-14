@@ -450,14 +450,14 @@ impl Rig {
 fn wait_until(run: &LiveRun, what: &str, done: impl Fn(&LiveStatus) -> bool) {
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
+        // Whether the run had ended is read before its status, so a status written just before
+        // it ended, such as a halt, is still read once after the end.
+        let finished = run.is_finished();
         let status = run.status();
         if done(&status) {
             return;
         }
-        assert!(
-            !run.is_finished(),
-            "the run ended before {what}: {status:?}"
-        );
+        assert!(!finished, "the run ended before {what}: {status:?}");
         assert!(
             Instant::now() < deadline,
             "no {what} within 20 s: {status:?}"
@@ -830,9 +830,10 @@ fn a_venue_that_cannot_be_read_gets_no_adding_order_and_halts_the_session_on_the
     ] {
         rig.mock.inject_always(path, Fault::DropBeforeApply);
     }
-    let creates = rig.mock.request_count(CREATE);
+    let sent = || [CREATE, CANCEL, AMEND].map(|p| rig.mock.request_count(p));
+    let before = sent();
 
-    // One bar without a read: a warning, still running, nothing sent.
+    // One bar without a read: a warning, still running, nothing sent, cancelled or amended.
     feed.minute(rig.bar(3));
     wait_for_bar(&run, rig.bar(2));
     let status = run.status();
@@ -844,7 +845,7 @@ fn a_venue_that_cannot_be_read_gets_no_adding_order_and_halts_the_session_on_the
             .any(|w| w.contains("the venue could not be read")),
         "{status:?}"
     );
-    assert_eq!(rig.mock.request_count(CREATE), creates, "nothing sent");
+    assert_eq!(sent(), before, "creates, cancels and amends");
 
     // Two more: the third halts the run on the broker's fault.
     feed.minute(rig.bar(5));
@@ -866,8 +867,9 @@ fn a_venue_that_cannot_be_read_gets_no_adding_order_and_halts_the_session_on_the
     assert!(error.to_string().contains(fault.as_str()), "{error}");
     assert_eq!(live.status().last_bar, Some(rig.bar(4)));
 
-    // The venue received no order while it could not be read, so nothing added to the position.
-    assert_eq!(rig.mock.request_count(CREATE), creates, "nothing sent");
+    // The venue received no order, cancel or amend while it could not be read, so nothing added
+    // to the position and the stop was left as it was.
+    assert_eq!(sent(), before, "creates, cancels and amends");
     assert_eq!(rig.mock.orders().len(), 2);
     assert_eq!(rig.mock.position(SYMBOL), QTY);
     // The adds the strategy decided were cancelled with the broker's reason, never sent.
@@ -894,6 +896,55 @@ fn a_venue_that_cannot_be_read_gets_no_adding_order_and_halts_the_session_on_the
         matches!(&refused, LiveError::StillFaulted(f) if f == fault),
         "{refused}"
     );
+}
+
+/// The other half of the broker's rule for a venue it cannot read, seen through a running session:
+/// a reduce-only order the strategy decides still goes out, so a position can be closed while the
+/// venue's reads fail.
+#[test]
+fn a_reduce_only_order_still_goes_out_while_the_venue_cannot_be_read() {
+    let rig = Rig::new();
+    let feed = rig.feed();
+    feed.minute(rig.bar(2));
+    let run = rig.run(
+        rig.create("close", config(0, 3, false)).expect("creates"),
+        &feed,
+    );
+
+    // Bar 0 bought; by the end of bar 1 the venue holds the position.
+    wait_for_bar(&run, rig.bar(1));
+    assert_eq!(rig.mock.position(SYMBOL), QTY);
+    assert_eq!(rig.mock.orders().len(), 1);
+
+    // From bar 2 on the venue cannot be read; bar 3 sells the position reduce-only.
+    for path in [
+        "/v5/execution/list",
+        "/v5/order/realtime",
+        "/v5/position/list",
+        WALLET,
+    ] {
+        rig.mock.inject_always(path, Fault::DropBeforeApply);
+    }
+    feed.minute(rig.bar(4));
+    wait_for_bar(&run, rig.bar(3));
+    let status = run.status();
+    let (_live, ended) = run.stop();
+    ended.expect("stopped cleanly");
+
+    assert_eq!(status.state, State::Running);
+    assert!(
+        status
+            .warnings
+            .iter()
+            .any(|w| w.contains("the venue could not be read")),
+        "{status:?}"
+    );
+    let orders = rig.mock.orders();
+    assert_eq!(orders.len(), 2, "{orders:?}");
+    assert_eq!(orders[1].side, Side::Sell);
+    assert!(orders[1].reduce_only);
+    assert_eq!(orders[1].qty, QTY);
+    assert_eq!(rig.mock.position(SYMBOL), 0.0);
 }
 
 #[test]
@@ -2285,9 +2336,10 @@ fn start_links_the_session_to_the_latest_verdict_or_the_one_named_and_status_che
     assert_eq!(link["plan"], serde_json::to_value(&entry.plan).unwrap());
     assert_eq!(link["rule"], serde_json::to_value(entry.rule).unwrap());
 
-    // The session started with the code, plan and rule the verdict judged. The verdict's engine
-    // and code are this build's. The strategy's plan does not test this venue's perpetual, so the
-    // plan check fails and the link is stale, as the verdict list would show it.
+    // The session started with the code, plan and rule the verdict judged, on the engine that
+    // judged it. The verdict's engine and code are this build's. The strategy's plan does not
+    // test this venue's perpetual, so both plan checks fail and the link is stale, as the verdict
+    // list would show it.
     let status = link_status(&rig, &feed, "latest");
     assert!(
         status.contains(&format!(
@@ -2298,7 +2350,7 @@ fn start_links_the_session_to_the_latest_verdict_or_the_one_named_and_status_che
     assert!(
         status.contains(
             "link checks of what the session started with against the verdict: plan and rule \
-             matches, code matches\n"
+             does not match, code matches, engine revision matches\n"
         ),
         "{status}"
     );
@@ -2326,7 +2378,8 @@ fn start_links_the_session_to_the_latest_verdict_or_the_one_named_and_status_che
     let status = link_status(&rig, &feed, "latest");
     assert!(
         status.contains(
-            "against the verdict: plan and rule matches, code does not match\nlink checks of the \
+            "against the verdict: plan and rule does not match, code does not match, engine revision \
+             matches\nlink checks of the \
              verdict against the strategy as this td-live build has it: engine revision matches, \
              plan and rule does not match, code matches"
         ),
@@ -2340,6 +2393,14 @@ fn start_links_the_session_to_the_latest_verdict_or_the_one_named_and_status_che
     let status = link_status(&rig, &feed, "latest");
     assert!(
         status.contains("engine revision does not match, plan and rule does not match"),
+        "{status}"
+    );
+    // The session was made by this engine, not the one the verdict was judged by.
+    assert!(
+        status.contains(
+            "against the verdict: plan and rule does not match, code does not match, engine revision \
+             does not match\n"
+        ),
         "{status}"
     );
 
@@ -2382,8 +2443,7 @@ fn a_link_without_a_verdict_is_current_until_the_code_or_plan_it_started_with_ch
         format!(
             "link: started with no saved verdict of {LINKED} on {on}; the strategy's code hash was {}\n\
              link checks of what the session started with against the strategy as this td-live \
-             build has it: plan and rule matches, code matches; no engine check is made, since the \
-             link saves no engine revision\n\
+             build has it: plan and rule matches, code matches, engine revision matches\n\
              link: current",
             td_engine::code_hash(LINKED).unwrap()
         )
@@ -2396,10 +2456,24 @@ fn a_link_without_a_verdict_is_current_until_the_code_or_plan_it_started_with_ch
     let status = link_status(&rig, &feed, "unjudged");
     assert!(
         status.contains(
-            "plan and rule matches, code does not match; no engine check is made, since the link \
-             saves no engine revision\nlink: stale; the code or plan of the strategy as this \
-             td-live build has it may not be what the session started with; a running session \
-             keeps the code it was started with until it is restarted"
+            "plan and rule matches, code does not match, engine revision matches\nlink: stale; \
+             the code, plan or engine of the strategy as this td-live build has it may not be \
+             what the session started with; a running session keeps the code it was started \
+             with until it is restarted"
+        ),
+        "{status}"
+    );
+
+    // As if the session had been made by another engine revision than this build's; the link
+    // saves none, so the one in its config is checked.
+    let mut other_engine = started.clone();
+    other_engine["engine_revision"] = (td_engine::ENGINE_REVISION + 1).into();
+    rig.write_config_json("unjudged", &other_engine);
+    let status = link_status(&rig, &feed, "unjudged");
+    assert!(
+        status.contains(
+            "plan and rule matches, code matches, engine revision does not match\nlink: stale; \
+             the code, plan or engine"
         ),
         "{status}"
     );
@@ -2413,11 +2487,11 @@ fn a_link_without_a_verdict_is_current_until_the_code_or_plan_it_started_with_ch
     rig.write_config_json("unjudged", &replanned);
     let status = link_status(&rig, &feed, "unjudged");
     assert!(
-        status.contains("plan and rule does not match, code matches; no engine check"),
+        status.contains("plan and rule does not match, code matches, engine revision matches"),
         "{status}"
     );
     assert!(
-        status.contains("\nlink: stale; the code or plan"),
+        status.contains("\nlink: stale; the code, plan or engine"),
         "{status}"
     );
 }
@@ -2673,6 +2747,43 @@ fn status_refuses_a_link_in_place_of_the_session_folder_or_its_config() {
     }
 }
 
+/// The status and stop files `status` prints are read only from a plain folder and plain files:
+/// a link in place of the session folder, `status.json` or `stops.json` is refused before either
+/// is read.
+#[test]
+fn the_saved_files_status_prints_refuse_a_link_in_place_of_the_folder_or_either_file() {
+    let rig = Rig::new();
+    drop(rig.create("real", config(0, 99, false)).expect("creates"));
+    let refused = |id: &str, what: &str| {
+        let read = td_live::saved_files(rig.data(), id);
+        assert!(
+            matches!(read, Err(LiveError::Link(_))),
+            "{what}: {:?}",
+            read.map(|_| "read")
+        );
+    };
+    match link_dir(
+        &live_dir(rig.data(), "real"),
+        &live_dir(rig.data(), "linked"),
+    ) {
+        Ok(()) => refused("linked", "the folder"),
+        Err(why) => println!("skipped the folder link: it could not be made: {why}"),
+    }
+    for file in ["status.json", "stops.json"] {
+        let saved = rig.path("real", file);
+        let outside = rig.data().join("elsewhere");
+        fs::create_dir_all(&outside).expect("folder");
+        let target = outside.join(file);
+        fs::rename(&saved, &target).expect("move the file out");
+        match link_file(&target, &saved) {
+            Ok(()) => refused("real", file),
+            Err(why) => println!("skipped the {file} link: it could not be made: {why}"),
+        }
+        let _ = fs::remove_file(&saved).or_else(|_| fs::remove_dir(&saved));
+        fs::rename(&target, &saved).expect("move the file back");
+    }
+}
+
 // ---- `td-live compare` ----
 
 /// Runs session `id` on live bars 0 to 2: it buys on bar 0 and adds on every bar after. The venue
@@ -2866,8 +2977,52 @@ fn compare_counts_the_orders_of_a_bar_the_log_ends_part_way_through_as_unfilled(
         text.contains(&format!(
             "it ends on the sending line of the bar opening at {}, which the session writes \
              before it sends or cancels, and the replay sent and cancelled nothing on that bar",
-            rig.bar(0)
+            at(rig.bar(0))
         )),
+        "{text}"
+    );
+}
+
+/// A recorded call too long to print in full is cut short where the replay error shows it, so the
+/// error keeps its end, which says where the replay differs from the record.
+#[test]
+fn compare_keeps_the_end_of_a_replay_error_whose_recorded_call_is_long() {
+    let rig = Rig::new();
+    let feed = rig.feed();
+    compared_session(&rig, &feed, "long");
+    let mut log = rig.log("long");
+    // A bar call that reports events, with them repeated, under a time that is not its bar's.
+    let (at, call) = log
+        .iter()
+        .enumerate()
+        .find_map(|(i, line)| {
+            let calls = line["record"]["calls"].as_array()?;
+            calls
+                .iter()
+                .position(|c| c["Bar"]["events"].as_array().is_some_and(|e| !e.is_empty()))
+                .map(|c| (i, c))
+        })
+        .expect("a bar call with events");
+    let bar = log[at]["bar"]["open_time"].as_i64().unwrap();
+    let recorded = &mut log[at]["record"]["calls"][call]["Bar"];
+    let events = recorded["events"].as_array().unwrap().clone();
+    recorded["events"] = events
+        .iter()
+        .cycle()
+        .take(20 * events.len())
+        .cloned()
+        .collect();
+    recorded["open_time"] = (bar + 1).into();
+    write_log(&rig, "long", &log);
+
+    let (code, text) = rig.td_live(&feed, &["compare", "--id", "long"]);
+    assert_eq!(code, 1, "{text}");
+    assert!(
+        text.contains("does not replay with the strategy as it is now: the record has Some(Bar"),
+        "{text}"
+    );
+    assert!(
+        text.ends_with(&format!("… where the session fed the bar opening at {bar}")),
         "{text}"
     );
 }
