@@ -1,16 +1,18 @@
 //! A stateful mock of the venue's v5 REST API on 127.0.0.1, for `td-orders`' tests. Test harness,
 //! never app code.
 //!
-//! It serves the endpoints the order route uses (server time, create, cancel, amend, real-time
-//! orders, order history, executions, positions, wallet balance) over real HTTP, so the tests run
+//! It serves the endpoints the order route uses (server time, instruments info, tickers, create,
+//! cancel, amend, real-time orders, order history, executions, positions, wallet balance) over
+//! real HTTP, so the tests run
 //! the real client with its signing. It checks the API key, the HMAC signature over the exact query
 //! string or body, and the receive window; enforces the client-id rule ([`IdRule`]); applies the
 //! instrument's lot, tick, minimum quantity and minimum notional filters; fills market orders at
 //! the price the test sets; holds reduce-only stops and triggers them when the test moves the
 //! price; and keeps positions, executions with fees, and the USDT wallet.
 //!
-//! A test can inject a [`Fault`] into the next request on a path, or into every one. Response
-//! shapes follow the documented examples kept in `fixtures/`.
+//! A test can inject a [`Fault`] into the next request on a path, or into every one, and can make
+//! the order lists lag ([`MockVenue::set_lag`]). Response shapes follow the documented examples
+//! kept in `fixtures/`.
 
 // The order JSON has more fields than serde_json's json! macro expands at the default limit.
 #![recursion_limit = "256"]
@@ -66,6 +68,22 @@ pub enum Fault {
     ServerErrorAfterApply,
     /// Answer 302 with this `Location`.
     Redirect(String),
+    /// Answer this `retCode` without applying the request, with the venue's documented message
+    /// for 40004, 10014, 110079, 429 and 10429. `Answer(0)` acknowledges a request it never
+    /// applies.
+    Answer(i64),
+    /// Check the request, then answer `retCode` `answer` (or close the connection when `None`)
+    /// at once and apply the request `after` later, as a venue still processing it would.
+    ApplyLater {
+        after: Duration,
+        answer: Option<i64>,
+    },
+    /// Record the order a create asks for as `Rejected` with this reject reason, without filling
+    /// it, then close the connection without answering.
+    RejectThenDrop(String),
+    /// Apply the request, then answer with its JSON padded past 5 MiB and gzip-compressed, so the
+    /// compressed answer is small and the decompressed one is not.
+    HugeBody,
 }
 
 /// An order as the mock holds it.
@@ -162,6 +180,30 @@ impl MockVenue {
         self.state.lock().unwrap().history_delay_ms = ms;
     }
 
+    /// Makes the real-time orders, the order history and the executions show what a create,
+    /// cancel, amend, fill or trigger did only this long after it happened: until then a new order
+    /// or execution is missing from them and a changed order shows as it was. Positions and the
+    /// wallet do not lag, and the client-id rule and cancel and amend act on the current state.
+    pub fn set_lag(&self, ms: i64) {
+        self.state.lock().unwrap().lag_ms = ms;
+    }
+
+    /// Has the account borrow this much USDT on spot, which the venue's coin `equity` subtracts
+    /// and `walletBalance` does not.
+    pub fn set_spot_borrow(&self, amount: f64) {
+        self.state.lock().unwrap().spot_borrow = amount;
+    }
+
+    /// Fills `qty` of the open order with `link_id` at the last price and cancels the rest, as the
+    /// venue does to an order cancelled after a partial fill. With `qty` zero the order ends
+    /// `Cancelled` unfilled.
+    pub fn cancel_after_partial_fill(&self, link_id: &str, qty: f64) {
+        self.state
+            .lock()
+            .unwrap()
+            .cancel_after_partial_fill(link_id, qty);
+    }
+
     /// Turns the real-time endpoint's list of recent closed orders on or off; off is the venue
     /// just after a restart, when closed orders show only in the (possibly delayed) history.
     pub fn set_closed_cache(&self, on: bool) {
@@ -198,7 +240,7 @@ impl MockVenue {
     }
 
     /// Makes the next market order fill only `qty`; it then rests `PartiallyFilled` until
-    /// [`MockVenue::fill_rest`].
+    /// [`MockVenue::fill_rest`], or `New` and unfilled when `qty` is zero.
     pub fn cap_next_fill(&self, qty: f64) {
         self.state.lock().unwrap().cap_next_fill = Some(qty);
     }

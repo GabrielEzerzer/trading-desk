@@ -10,6 +10,7 @@ license.workspace = true
 # never app code.
 
 [dependencies]
+flate2.workspace = true
 hmac.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
