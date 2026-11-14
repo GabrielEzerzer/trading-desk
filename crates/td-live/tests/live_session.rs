@@ -2673,6 +2673,43 @@ fn status_refuses_a_link_in_place_of_the_session_folder_or_its_config() {
     }
 }
 
+/// The status and stop files `status` prints are read only from a plain folder and plain files:
+/// a link in place of the session folder, `status.json` or `stops.json` is refused before either
+/// is read.
+#[test]
+fn the_saved_files_status_prints_refuse_a_link_in_place_of_the_folder_or_either_file() {
+    let rig = Rig::new();
+    drop(rig.create("real", config(0, 99, false)).expect("creates"));
+    let refused = |id: &str, what: &str| {
+        let read = td_live::saved_files(rig.data(), id);
+        assert!(
+            matches!(read, Err(LiveError::Link(_))),
+            "{what}: {:?}",
+            read.map(|_| "read")
+        );
+    };
+    match link_dir(
+        &live_dir(rig.data(), "real"),
+        &live_dir(rig.data(), "linked"),
+    ) {
+        Ok(()) => refused("linked", "the folder"),
+        Err(why) => println!("skipped the folder link: it could not be made: {why}"),
+    }
+    for file in ["status.json", "stops.json"] {
+        let saved = rig.path("real", file);
+        let outside = rig.data().join("elsewhere");
+        fs::create_dir_all(&outside).expect("folder");
+        let target = outside.join(file);
+        fs::rename(&saved, &target).expect("move the file out");
+        match link_file(&target, &saved) {
+            Ok(()) => refused("real", file),
+            Err(why) => println!("skipped the {file} link: it could not be made: {why}"),
+        }
+        let _ = fs::remove_file(&saved).or_else(|_| fs::remove_dir(&saved));
+        fs::rename(&target, &saved).expect("move the file back");
+    }
+}
+
 // ---- `td-live compare` ----
 
 /// Runs session `id` on live bars 0 to 2: it buys on bar 0 and adds on every bar after. The venue

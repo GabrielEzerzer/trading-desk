@@ -1294,13 +1294,15 @@ pub(crate) fn flatten_unfinished(data_dir: &Path, id: &str) -> Result<bool, Live
 }
 
 /// The saved status and stop state of the session `id`, as their files hold them, for the
-/// `status` command. Touches no venue and takes no lock.
+/// `status` command. Touches no venue and takes no lock. A link or junction in place of the
+/// session folder or any of its files is refused before anything is read, as for the session's
+/// other reads.
 pub fn saved_files(
     data_dir: &Path,
     id: &str,
 ) -> Result<(serde_json::Value, serde_json::Value), LiveError> {
     check_id(id)?;
-    let dir = live_dir(data_dir, id);
+    let dir = session_dir(data_dir, id)?;
     if !dir.join(crate::session::CONFIG_FILE).exists() {
         return Err(LiveError::NotFound(dir));
     }
