@@ -747,8 +747,11 @@ struct Funded {
 /// Walks a funded account along `returns`, from a fresh balance of 1 under the challenge's loss
 /// limits, with each day's return and its low (`lows`, checked against the limits as in
 /// [`walk_evaluation`]) multiplied by the terms' funded size. The first payout waits
-/// until the account has held `days_to_first_payout` days that `traded` marks; each later one
-/// waits `payout_interval_days` days of the series, traded or not. A payout is asked for at
+/// until the account has held `days_to_first_payout` days that `traded` marks, and, with
+/// `calendar_days_to_first_payout`, until that many days of the series have passed since the
+/// first day `traded` marks; each later one waits `payout_interval_days` days of the series,
+/// traded or not. A day of the series is a calendar day: the daily returns hold a day of zero for
+/// a day without bars. A payout is asked for at
 /// the close of every day the terms allow one, for all the profit above the starting balance, or
 /// above the floor in force if that is higher, up to the cap, and is made when the trader's share
 /// reaches the smallest payout. The amount leaves the balance and moves no floor: a trailing
@@ -774,6 +777,7 @@ fn walk_funded(
     traded: &[bool],
 ) -> Funded {
     let first = terms.days_to_first_payout as usize;
+    let wait = terms.calendar_days_to_first_payout.map(|w| w as usize);
     let interval = terms.payout_interval_days as usize;
     let most = terms.max_payouts.map_or(usize::MAX, |m| m as usize);
     let mut out = Funded {
@@ -783,9 +787,12 @@ fn walk_funded(
     };
     // The floor a payout fixed, with `payout_locks_floor`.
     let (mut peak, mut fixed, mut last) = (1.0f64, None::<f64>, None::<usize>);
-    let mut trading_days = 0usize;
+    let (mut trading_days, mut first_traded) = (0usize, None::<usize>);
     for (((day, &r), &low), &t) in (1..).zip(returns).zip(lows).zip(traded) {
         trading_days += usize::from(t);
+        if t && first_traded.is_none() {
+            first_traded = Some(day);
+        }
         let prev = out.balance;
         out.balance *= 1.0 + terms.funded_size * r;
         let floor = fixed.unwrap_or_else(|| spec.floor(peak));
@@ -794,7 +801,10 @@ fn walk_funded(
         }
         peak = peak.max(out.balance);
         let due = match last {
-            None => trading_days >= first,
+            None => {
+                trading_days >= first
+                    && wait.is_none_or(|w| first_traded.is_some_and(|f| day - f >= w))
+            }
             Some(last) => day - last >= interval,
         };
         if !due || out.payouts >= most {
@@ -1975,6 +1985,7 @@ mod tests {
             refund_fee_with_first_payout: false,
             profit_split: 0.75,
             days_to_first_payout: 1,
+            calendar_days_to_first_payout: None,
             payout_interval_days: 1,
             min_payout: 0.0,
             payout_cap: None,
@@ -2177,6 +2188,52 @@ mod tests {
         // Counting every day as a trading day, the first payout comes on day 3.
         let f = funded(&floor_75, &rules, &path[..5]);
         assert_eq!((f.payouts, f.gross, f.balance), (1, 0.25, 1.0));
+    }
+
+    #[test]
+    fn a_calendar_wait_counts_from_the_first_trading_day_and_both_waits_must_be_met() {
+        // The floor at 0.75, a first payout 3 calendar days after the first trading day, the
+        // next 1 day after it, no cap. The account trades on days 2 and 7 only:
+        //   day 1   0           no trade yet: the wait has not started
+        //   day 2  +25%  trade  1.25, the first trading day
+        //   day 3   0           1 day after it
+        //   day 4   0           2 days
+        //   day 5   0           3 days: pays the 0.25 of profit, on a day with no trade, 1.0
+        //   day 6  +25%         1.25, 1 day after the payout: pays again, 1.0
+        let floor_75 = PropFirmSpec {
+            max_drawdown: 0.25,
+            ..unlimited(10)
+        };
+        let rules = AttemptTerms {
+            calendar_days_to_first_payout: Some(3),
+            ..terms()
+        };
+        let path = [0.0, 0.25, 0.0, 0.0, 0.0, 0.25, 0.0];
+        let traded = [false, true, false, false, false, false, true];
+        let after = |rules: &AttemptTerms, days: usize| {
+            let f = walk_funded(
+                &floor_75,
+                rules,
+                &path[..days],
+                &path[..days],
+                &traded[..days],
+            );
+            (f.payouts, f.gross, f.balance)
+        };
+        assert_eq!(after(&rules, 4), (0, 0.0, 1.25));
+        assert_eq!(after(&rules, 5), (1, 0.25, 1.0));
+        assert_eq!(after(&rules, 6), (2, 0.5, 1.0));
+        // Asking for 2 trading days as well: the calendar wait is met on day 5, but the second
+        // trading day comes only on day 7. Nothing is paid before it, so day 6 grows 1.25 to
+        // 1.5625, and day 7 pays the whole 0.5625 of profit.
+        let both = AttemptTerms {
+            days_to_first_payout: 2,
+            ..rules
+        };
+        assert_eq!(after(&both, 6), (0, 0.0, 1.5625));
+        assert_eq!(after(&both, 7), (1, 0.5625, 1.0));
+        // Without the calendar wait the first trading day pays at once, as before the field.
+        assert_eq!(after(&terms(), 2), (1, 0.25, 1.0));
     }
 
     #[test]

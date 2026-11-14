@@ -1174,6 +1174,13 @@ profit_split: number,
  */
 days_to_first_payout: number, 
 /**
+ * A wait in calendar days before the first payout, counted from the funded account's first
+ * trading day (as `days_to_first_payout` counts them): the first payout may be asked for at
+ * the close of the day this many days after that one, traded or not. With both set, both
+ * must be met. `None` sets no such wait, and is left out of JSON.
+ */
+calendar_days_to_first_payout?: number | null, 
+/**
  * The days from one payout to the earliest next one, traded or not.
  */
 payout_interval_days: number, 
