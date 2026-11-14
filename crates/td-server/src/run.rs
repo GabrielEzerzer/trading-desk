@@ -325,7 +325,13 @@ async fn drive(
     let mut held: VecDeque<(Candle, Instant)> = VecDeque::new();
     loop {
         let next = match held.front() {
+            // Queued events first: after the loop has been busy feeding earlier bars, the wait of
+            // the bar in front may have run out with its reference bar already queued. The wait
+            // stops the session only once nothing is queued; while the bar is held nothing is fed,
+            // so each event is a quick update and the queue empties as soon as the loop has caught
+            // up with the feeds.
             Some(&(bar, arrived)) => tokio::select! {
+                biased;
                 next = rx.recv() => next,
                 () = tokio::time::sleep_until(arrived + wait) => {
                     let behind = held_references.slots(bar.open_time).err().unwrap_or_default();
@@ -1243,6 +1249,80 @@ mod tests {
         let (time, series) = seen.lock().expect("lock").last().cloned().expect("a bar");
         assert_eq!(time, T + 10 * MIN);
         assert_eq!(series.expect("a series").last(), Some(&Some(reference[10])));
+    }
+
+    /// [`Records`], keeping the run loop busy for a while on the bar opening at a given time.
+    struct Busy(Records, Millis, Duration);
+
+    impl td_engine::Strategy for Busy {
+        fn on_bar(&mut self, ctx: &mut td_engine::Context, bar: &Candle) {
+            if bar.open_time == self.1 {
+                std::thread::sleep(self.2);
+            }
+            td_engine::Strategy::on_bar(&mut self.0, ctx, bar);
+        }
+    }
+
+    /// Traded bars held while the loop is busy feeding an earlier one outlast their wait, and
+    /// their reference bars are queued by the time the loop gets back to them: each goes with its
+    /// reference bar and the session carries on. With the wait and the queue tried in random order,
+    /// each of the 15 such bars would stop the session half the time.
+    #[tokio::test]
+    async fn a_held_bar_past_its_wait_goes_with_a_reference_bar_queued_while_the_loop_was_busy() {
+        let own: Vec<Candle> = (0..26).map(|i| priced(T + i * MIN, 100.0)).collect();
+        let reference: Vec<Candle> = (0..26).map(|i| priced(T + i * MIN, 50.0)).collect();
+        // Every traded bar is held before the first reference bar comes.
+        let feeds = scripted(vec![
+            (
+                "TESTUSDT",
+                std::iter::once(Step::Send(FeedEvent::Connected))
+                    .chain((10..26).map(|i| Step::Send(FeedEvent::Bar(own[i]))))
+                    .collect(),
+            ),
+            (
+                OTHER,
+                [
+                    Step::Send(FeedEvent::Connected),
+                    Step::Late(Duration::from_millis(100), FeedEvent::Bar(reference[10])),
+                ]
+                .into_iter()
+                .chain((11..26).map(|i| Step::Send(FeedEvent::Bar(reference[i]))))
+                .collect(),
+            ),
+        ]);
+        let dir = tempfile::tempdir().expect("temp dir");
+        let seen = Seen::default();
+        let mut config = crate::paper::tests::config();
+        config.instrument.id = spot("TESTUSDT");
+        config.references = vec![spot(OTHER)];
+        let mut paper = PaperSession::create(dir.path(), "busy", config).expect("creates");
+        // Feeding the first live bar takes longer than the wait of the bars held behind it.
+        let busy = Duration::from_millis(1500);
+        paper.swap_strategy(Box::new(Busy(
+            Records(Arc::clone(&seen)),
+            T + 10 * MIN,
+            busy,
+        )));
+        let warm_up = history(&own[..10], &reference[..10], T + 10 * MIN + 30_000);
+        let handle = start_feeds(paper, Arc::new(warm_up), feeds, Duration::from_secs(1));
+        let last = T + 25 * MIN;
+        until(&handle, "the last live bar or an error", |s| {
+            last_bar(s) == Some(last) || matches!(s.status(), Status::Error(_))
+        })
+        .await;
+        {
+            let s = lock(handle.session());
+            assert_eq!(*s.status(), Status::Live);
+            assert_eq!(last_bar(&s), Some(last));
+        }
+        handle.stop().await;
+        let seen = seen.lock().expect("lock").clone();
+        assert_eq!(seen.len(), 26);
+        for (i, (time, series)) in seen.iter().enumerate().skip(10) {
+            assert_eq!(*time, own[i].open_time);
+            let latest = series.as_ref().and_then(|series| series.last().copied());
+            assert_eq!(latest, Some(Some(reference[i])), "bar {i}");
+        }
     }
 
     /// A reference feed that disconnects or drops a bucket warns and goes on, the strategy seeing
