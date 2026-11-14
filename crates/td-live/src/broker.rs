@@ -857,10 +857,11 @@ impl Core {
     /// Takes the stop the venue already holds under the id of adopted entry `entry`'s attached
     /// stop, placed before a restart. Returns whether the entry still needs protecting: true when
     /// the venue lists no such stop (a placement under the same id then cannot double it: the
-    /// venue refuses the id, and its quantity is read as below) or holds it open, so it is resized
-    /// to the fill as any stop. A stop the venue already closed is settled by the reads, as any
-    /// stop found closed. A stop the venue cannot be asked about is a fault: placing one in its
-    /// place could leave the quantity of the one already there unknown.
+    /// venue refuses the id, and its quantity is read as below), holds it open, so it is resized
+    /// to the fill as any stop, or closed it with nothing filled, so the fill's stop goes out
+    /// under the cover id ([`Core::take_stop`]). A stop the venue closed after a fill is settled by
+    /// the reads, as any stop found closed. A stop the venue cannot be asked about is a fault:
+    /// placing one in its place could leave the quantity of the one already there unknown.
     fn adopt_stop(&mut self, entry: OrderId, stop: OrderId) -> bool {
         let cid = self.id(Role::Order, stop);
         match self.client.order_by_client_id(&self.instrument, &cid) {
@@ -882,7 +883,11 @@ impl Core {
 
     /// Takes `found`, the venue order under the id for `role` of entry `entry`'s attached stop,
     /// as that stop with the venue's quantity, unless it is not the stop the session intends,
-    /// which is a fault. Returns whether it is open, `None` on the fault.
+    /// which is a fault. Returns whether the entry's fill still needs protecting: true when the
+    /// stop is open, and when the venue closed it under its `o` id with nothing filled, which
+    /// holds it as unplaced so the fill's stop goes out under the `s` id, as for a stop the venue
+    /// refused. False when it closed after a fill, which the reads settle as any stop found
+    /// closed; `None` on the fault.
     fn take_stop(&mut self, entry: OrderId, role: Role, found: &VenueOrder) -> Option<bool> {
         let e = &self.book.orders[&entry.0].order;
         let order = stop_order(e, found.qty).expect("the entry carries the stop");
@@ -904,8 +909,18 @@ impl Core {
         } else {
             At::Live
         };
+        let id = order.id;
         self.track_stop(order, at);
-        Some(found.status.is_open())
+        if found.status.is_open() {
+            return Some(true);
+        }
+        // shortcut: a cover closed with nothing filled is left to the reads, which fault while a
+        // position is held, since no id is left for another stop.
+        if role == Role::Order && found.filled_qty <= 0.0 {
+            self.unplaced(id);
+            return Some(true);
+        }
+        Some(false)
     }
 
     /// Waits briefly for an entry's fill and places its stop for the quantity filled. When the
@@ -1032,8 +1047,9 @@ impl Core {
     }
 
     /// The venue already holds the id for `role` that stop `id` was just placed under, from
-    /// before a restart: the stop is taken with the venue's quantity and resized to `qty`. One
-    /// the venue cannot be asked about, or that is not the stop the session intends, is a fault.
+    /// before a restart: the stop is taken with the venue's quantity and protects `qty` as any
+    /// stop ([`Core::take_stop`]). One the venue cannot be asked about, or that is not the stop the
+    /// session intends, is a fault.
     fn take_duplicate(
         &mut self,
         entry: OrderId,
@@ -1062,20 +1078,19 @@ impl Core {
                 );
             }
         };
-        // A stop the venue already closed is settled by the reads, as any stop found closed.
-        if self.take_stop(entry, role, &found) == Some(true)
-            && (qty - found.qty).abs() > self.half_lot()
-        {
-            self.resize(id, found.qty, qty, last, basis);
+        if self.take_stop(entry, role, &found) == Some(true) {
+            self.protect(entry, qty, last, basis);
         }
     }
 
     /// Stop `id` was sent under its `o` id and its outcome is unknown; a fill of `qty` the venue
-    /// confirmed needs covering. The venue is asked about the `o` stop once, before anything goes
-    /// out. When it holds it, it is taken with the venue's quantity and resized to the fill, and
-    /// nothing faults. When the venue cannot be asked, nothing is sent and the broker faults.
+    /// confirmed needs covering. The venue is asked about the `o` stop before anything goes out,
+    /// with two looks as for any order of unknown outcome. When it holds it, it is taken with the
+    /// venue's quantity and protects the fill as any stop: resized when open, and replaced under
+    /// the `s` id when closed with nothing filled; nothing faults. When the venue cannot be
+    /// asked, nothing is sent and the broker faults.
     ///
-    /// When the venue does not show it, a reduce-only stop for the fill goes out under the `s` id
+    /// When neither look shows it, a reduce-only stop for the fill goes out under the `s` id
     /// and the broker faults at once, saying the fill is covered by the `s` stop and that the `o`
     /// stop's outcome is unknown, so it may also rest. This is the one exception to the rule that
     /// an order whose outcome is unknown is settled by asking the venue and never by sending
@@ -1084,14 +1099,10 @@ impl Core {
     /// an order carried over a restart is unresolved) and the broker faults either way.
     fn settle_stop(&mut self, entry: OrderId, id: OrderId, qty: f64, last: f64, basis: Basis) {
         let (cid, cover) = (self.id(Role::Order, id), self.id(Role::Cover, id));
-        match self.client.order_by_client_id(&self.instrument, &cid) {
+        match self.find(id) {
             Ok(Some(found)) => {
-                // A stop the venue already closed is settled by the reads, as any stop found
-                // closed.
-                if self.take_stop(entry, Role::Order, &found) == Some(true)
-                    && (qty - found.qty).abs() > self.half_lot()
-                {
-                    self.resize(id, found.qty, qty, last, basis);
+                if self.take_stop(entry, Role::Order, &found) == Some(true) {
+                    self.protect(entry, qty, last, basis);
                 }
                 return;
             }

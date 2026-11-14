@@ -18,12 +18,13 @@
 //!   filled. If the venue refuses that early stop, nothing is closed and the stop goes out under
 //!   the cover id on the first confirmed fill; if the route did not send it, it goes out under its
 //!   own id then; if its outcome is unknown, the venue is asked about it on the first confirmed
-//!   fill (see "Unknown outcomes"). An entry that closes unfilled owes nothing for a stop that
-//!   did not rest. For a confirmed fill, a stop the venue does not take now is replaced by a
-//!   reduce-only market order, since flat is the safe side (not while an order carried over a
-//!   restart is unresolved; see "Records"); if the close fails or is not sent, the broker faults.
-//!   A stop that cannot be resized faults the broker, after one more reduce-only stop is placed
-//!   for the part of the fill the first one does not cover.
+//!   fill (see "Unknown outcomes"). A stop the venue shows closed with nothing filled is treated
+//!   as one it refused. An entry that closes unfilled owes nothing for a stop that did not rest.
+//!   For a confirmed fill, a stop the venue does not take now is replaced by a reduce-only market
+//!   order, since flat is the safe side (not while an order carried over a restart is
+//!   unresolved; see "Records"); if the close fails or is not sent, the broker faults. A stop that
+//!   cannot be resized faults the broker, after one more reduce-only stop is placed for the part
+//!   of the fill the first one does not cover.
 //! - **Unreadable venue.** While the venue could not be read on the last bar, only reduce-only
 //!   orders go out; any other order is cancelled with a reason on the next bar. Three bars in a
 //!   row without a full read is a fault.
@@ -37,10 +38,12 @@
 //!   with an attached stop at once, so a fill it may have made gets its stop), and the broker
 //!   faults after three failed asks. An order the route reports as not sent goes out again, if at
 //!   all, under the same id. There is one exception. When an entry's stop has an unknown outcome
-//!   and the venue has confirmed the entry's fill, the venue is first asked about that stop. If
-//!   it holds the stop, the stop is kept and resized to the fill. If it does not show the stop, a
-//!   second reduce-only stop for the fill goes out under the cover id and the broker faults at
-//!   once, saying the fill is covered by the second stop and that the first may also rest. A
+//!   and the venue has confirmed the entry's fill, the venue is first asked about that stop, with
+//!   two looks. If it holds the stop open, the stop is kept and resized to the fill; if it shows
+//!   the stop closed with nothing filled, the fill's stop goes out under the cover id. If neither
+//!   look shows the stop, a second reduce-only stop for the fill goes out under the cover id and
+//!   the broker faults at once, saying the fill is covered by the second stop and that the first
+//!   may also rest. A
 //!   second reduce-only stop cannot add to the position, and a fill with no stop is the worse
 //!   harm. If the venue refuses that second stop, the fill is closed at market (not while an
 //!   order carried over a restart is unresolved) and the broker faults all the same. If the venue

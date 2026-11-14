@@ -2348,3 +2348,100 @@ fn going_live_closes_nothing_for_an_adopted_entry_whose_stop_is_refused() {
     assert!(rig.mock.orders_with_link_id("t-c2").is_empty(), "no close");
     assert_eq!(rig.mock.position(SYMBOL), 0.004);
 }
+
+/// An entry with a stop whose fill is read at once, with `stop_create` on its stop's create and the
+/// route's three lookup rounds after it unable to ask the venue; `then` runs after those faults.
+fn unknown_stop_for_a_confirmed_fill(stop_create: Fault, then: fn(&MockVenue)) -> Rig {
+    let mock = venue();
+    let faults = mock.clone();
+    let lose = run(move || {
+        faults.inject(CREATE, Fault::Hang(Duration::ZERO));
+        faults.inject(CREATE, stop_create.clone());
+        faults.inject(REALTIME, Fault::Hang(Duration::ZERO));
+        for _ in 0..3 {
+            faults.inject(REALTIME, Fault::DropBeforeApply);
+        }
+        then(&faults);
+    });
+    Rig::counted(
+        mock,
+        vec![
+            (0, lose),
+            (
+                0,
+                Act::SubmitWithStop(market(Side::Buy, 0.004, false), 60000.0),
+            ),
+        ],
+    )
+}
+
+#[test]
+fn a_stop_of_unknown_outcome_the_venue_shows_only_on_the_second_look_is_kept_and_nothing_is_sent() {
+    // The broker's first look finds the stop in neither list, as on a venue whose lists lag.
+    let mut rig = unknown_stop_for_a_confirmed_fill(Fault::DropAfterApply, |faults| {
+        faults.inject(REALTIME, Fault::Answer(0));
+        faults.inject(HISTORY, Fault::Answer(0));
+    });
+    rig.bar();
+    assert_eq!(rig.handle.fault(), None);
+    let resting = rig.mock.orders_with_link_id("t-o2");
+    assert_eq!(resting.len(), 1);
+    assert_eq!(resting[0].status, "Untriggered");
+    assert_eq!(resting[0].qty, 0.004);
+    assert!(
+        rig.mock.orders_with_link_id("t-s2").is_empty(),
+        "nothing sent under s"
+    );
+    assert_eq!(rig.mock.request_count(CREATE), 2);
+    rig.bar();
+    assert_eq!(rig.handle.fault(), None);
+    assert_eq!(rig.status(2), OrderStatus::Open);
+}
+
+#[test]
+fn a_stop_of_unknown_outcome_the_venue_shows_closed_unfilled_is_replaced_under_the_cover_id() {
+    // The venue rejected the stop and the answer was lost.
+    let mut rig =
+        unknown_stop_for_a_confirmed_fill(Fault::RejectThenDrop("rejected".into()), |_| {});
+    rig.bar();
+    assert_eq!(rig.handle.fault(), None);
+    assert_eq!(rig.mock.orders_with_link_id("t-o2")[0].status, "Rejected");
+    let cover = rig.mock.orders_with_link_id("t-s2");
+    assert_eq!(cover.len(), 1);
+    assert_eq!(cover[0].status, "Untriggered");
+    assert_eq!(cover[0].qty, 0.004);
+    assert_eq!(cover[0].trigger, Some(60000.0));
+    assert!(cover[0].reduce_only);
+    assert!(rig.mock.orders_with_link_id("t-c2").is_empty(), "no close");
+    rig.bar();
+    assert_eq!(rig.handle.fault(), None);
+    assert_eq!(rig.status(2), OrderStatus::Open);
+}
+
+#[test]
+fn after_a_restart_an_entrys_stop_the_venue_closed_unfilled_is_replaced_under_the_cover_id() {
+    // Seen by the adoption's lookup, or only once the venue refuses the stop's id as a duplicate.
+    for hidden in [false, true] {
+        let (rig, records) = restart_after_partial_fill();
+        rig.mock.cancel_after_partial_fill("t-o2", 0.0);
+        if hidden {
+            // The entry's lookup passes; the stop's finds it in neither list.
+            rig.mock.inject(REALTIME, Fault::Hang(Duration::ZERO));
+            rig.mock.inject(REALTIME, Fault::Answer(0));
+            rig.mock.inject(HISTORY, Fault::Answer(0));
+        }
+        let (mut session, handle) = replayed(&rig, &records);
+        handle.go_live().unwrap();
+        assert_eq!(handle.fault(), None, "hidden {hidden}");
+        assert_eq!(rig.mock.orders_with_link_id("t-o2")[0].status, "Cancelled");
+        let cover = rig.mock.orders_with_link_id("t-s2");
+        assert_eq!(cover.len(), 1, "hidden {hidden}");
+        assert_eq!(cover[0].status, "Untriggered");
+        assert_eq!(cover[0].qty, 0.004, "the stop covers the whole fill");
+        assert!(rig.mock.orders_with_link_id("t-c2").is_empty(), "no close");
+        session.on_bar(rig.candle(2, PRICE), &[]).unwrap();
+        assert_eq!(handle.fault(), None, "hidden {hidden}");
+        assert_eq!(session.orders()[1].status, OrderStatus::Open);
+        assert_eq!(session.orders()[1].request.qty, 0.004);
+    }
+}

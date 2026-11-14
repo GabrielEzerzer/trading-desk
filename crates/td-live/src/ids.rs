@@ -11,9 +11,10 @@
 //!   executions are reported as fills of order `n`.
 //! - `s`: a second reduce-only stop for an entry's fill, sent at most once: for the part of the
 //!   fill stop `n` does not cover when resizing stop `n` fails, just before the broker faults; for
-//!   the confirmed fill when stop `n`'s create ended with its outcome unknown, just before the
-//!   broker faults; or for the first confirmed fill when stop `n`, placed before the fill was
-//!   confirmed, did not rest.
+//!   the confirmed fill when stop `n`'s create ended with its outcome unknown and the venue does
+//!   not show it, just before the broker faults; or for the first confirmed fill when stop `n`
+//!   did not rest: the venue refused it, shows it closed with nothing filled, or did not show it
+//!   to going live after a restart.
 //! - `x`: reserved for orders the session sends itself outside the engine, such as a later
 //!   "close the position" action. This crate sends none; an execution carrying one is a fault
 //!   until that action exists.
