@@ -553,6 +553,15 @@ pub struct PropFirmOdds {
     /// over 90 days.
     pub breach: f64,
     pub paths: usize,
+    /// The days the paths were drawn from, one per daily return. `None` in a result saved before
+    /// it existed.
+    #[serde(default)]
+    pub days: Option<usize>,
+    /// How many of `days` count as trading days: the days the traded flags mark, so a reader can
+    /// see how sparse the days are that the firm's minimum and the wait before the first payout
+    /// count. `None` in a result saved before it existed.
+    #[serde(default)]
+    pub trading_days: Option<usize>,
 }
 
 /// Walks one path of days, each its return and its low (see [`prop_firm_odds`]), on one balance
@@ -680,6 +689,8 @@ pub fn prop_firm_odds(
         pass: passed as f64 / spec.paths as f64,
         breach: breached as f64 / spec.paths as f64,
         paths: spec.paths,
+        days: Some(traded.len()),
+        trading_days: Some(traded.iter().filter(|&&t| t).count()),
     })
 }
 
@@ -703,7 +714,7 @@ pub struct AttemptFigures {
     pub value: f64,
 }
 
-/// The value of a prop-firm attempt at the edge the test shows and at a reduced one.
+/// The value of a prop-firm attempt at the edge the test shows, at a reduced one and at none.
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct PropFirmAttempt {
@@ -712,6 +723,13 @@ pub struct PropFirmAttempt {
     /// From the daily returns with their mean scaled by `reduced_edge_factor` and their shape
     /// unchanged. The `prop_firm` kind rule asks for its `value` to be above zero.
     pub reduced: AttemptFigures,
+    /// From the daily returns with their mean removed (a factor of 0) and their shape unchanged:
+    /// what the terms alone are worth, with no edge. A positive value here says the terms pay for
+    /// an attempt by themselves, so a positive `reduced` value does not show that the edge does.
+    /// Reported only: no line of the verdict judges it. `None` in a result saved before it
+    /// existed.
+    #[serde(default)]
+    pub zero_edge: Option<AttemptFigures>,
     pub reduced_edge_factor: f64,
     pub paths: usize,
 }
@@ -729,8 +747,11 @@ struct Funded {
 /// Walks a funded account along `returns`, from a fresh balance of 1 under the challenge's loss
 /// limits, with each day's return and its low (`lows`, checked against the limits as in
 /// [`walk_evaluation`]) multiplied by the terms' funded size. The first payout waits
-/// until the account has held `days_to_first_payout` days that `traded` marks; each later one
-/// waits `payout_interval_days` days of the series, traded or not. A payout is asked for at
+/// until the account has held `days_to_first_payout` days that `traded` marks, and, with
+/// `calendar_days_to_first_payout`, until that many days of the series have passed since the
+/// first day `traded` marks; each later one waits `payout_interval_days` days of the series,
+/// traded or not. A day of the series is a calendar day: the daily returns hold a day of zero for
+/// a day without bars. A payout is asked for at
 /// the close of every day the terms allow one, for all the profit above the starting balance, or
 /// above the floor in force if that is higher, up to the cap, and is made when the trader's share
 /// reaches the smallest payout. The amount leaves the balance and moves no floor: a trailing
@@ -756,6 +777,7 @@ fn walk_funded(
     traded: &[bool],
 ) -> Funded {
     let first = terms.days_to_first_payout as usize;
+    let wait = terms.calendar_days_to_first_payout.map(|w| w as usize);
     let interval = terms.payout_interval_days as usize;
     let most = terms.max_payouts.map_or(usize::MAX, |m| m as usize);
     let mut out = Funded {
@@ -765,9 +787,12 @@ fn walk_funded(
     };
     // The floor a payout fixed, with `payout_locks_floor`.
     let (mut peak, mut fixed, mut last) = (1.0f64, None::<f64>, None::<usize>);
-    let mut trading_days = 0usize;
+    let (mut trading_days, mut first_traded) = (0usize, None::<usize>);
     for (((day, &r), &low), &t) in (1..).zip(returns).zip(lows).zip(traded) {
         trading_days += usize::from(t);
+        if t && first_traded.is_none() {
+            first_traded = Some(day);
+        }
         let prev = out.balance;
         out.balance *= 1.0 + terms.funded_size * r;
         let floor = fixed.unwrap_or_else(|| spec.floor(peak));
@@ -776,7 +801,10 @@ fn walk_funded(
         }
         peak = peak.max(out.balance);
         let due = match last {
-            None => trading_days >= first,
+            None => {
+                trading_days >= first
+                    && wait.is_none_or(|w| first_traded.is_some_and(|f| day - f >= w))
+            }
             Some(last) => day - last >= interval,
         };
         if !due || out.payouts >= most {
@@ -876,8 +904,9 @@ impl Tally {
 ///
 /// The second set of figures subtracts `(1 - reduced_edge_factor) * mean` from every daily
 /// return and from its low before the size multiplier, so the mean becomes
-/// `reduced_edge_factor * mean` and the days keep their shape, their dips and their flags. Both
-/// sets use the same draws, so they differ by the edge alone.
+/// `reduced_edge_factor * mean` and the days keep their shape, their dips and their flags. The
+/// third set subtracts the whole mean the same way, a factor of 0. All three use the same draws,
+/// so they differ by the edge alone.
 pub fn prop_firm_attempt(
     daily_returns: &[f64],
     lows: Option<&[f64]>,
@@ -898,9 +927,11 @@ pub fn prop_firm_attempt(
     let lows = lows.unwrap_or(daily_returns);
     let reduced: Vec<f64> = daily_returns.iter().map(|r| r - shift).collect();
     let reduced_lows: Vec<f64> = lows.iter().map(|l| l - shift).collect();
+    let centred: Vec<f64> = daily_returns.iter().map(|r| r - mean).collect();
+    let centred_lows: Vec<f64> = lows.iter().map(|l| l - mean).collect();
     let days = spec.horizon_days + terms.funded_horizon_days as usize;
     let mut draw = Resampler::new(n, spec.mean_block, spec.seed);
-    let (mut full, mut low) = (Tally::default(), Tally::default());
+    let (mut full, mut low, mut none) = (Tally::default(), Tally::default(), Tally::default());
     let mut path = Vec::with_capacity(days);
     let mut flags = Vec::with_capacity(days);
     let mut returns = Vec::with_capacity(days);
@@ -917,6 +948,7 @@ pub fn prop_firm_attempt(
         for (series, series_lows, tally) in [
             (daily_returns, lows, &mut full),
             (&reduced[..], &reduced_lows[..], &mut low),
+            (&centred[..], &centred_lows[..], &mut none),
         ] {
             returns.clear();
             returns.extend(path.iter().map(|&i| series[i]));
@@ -931,6 +963,7 @@ pub fn prop_firm_attempt(
     Ok(PropFirmAttempt {
         full: full.figures(),
         reduced: low.figures(),
+        zero_edge: Some(none.figures()),
         reduced_edge_factor: terms.reduced_edge_factor,
         paths: spec.paths,
     })
@@ -1952,6 +1985,7 @@ mod tests {
             refund_fee_with_first_payout: false,
             profit_split: 0.75,
             days_to_first_payout: 1,
+            calendar_days_to_first_payout: None,
             payout_interval_days: 1,
             min_payout: 0.0,
             payout_cap: None,
@@ -2157,6 +2191,52 @@ mod tests {
     }
 
     #[test]
+    fn a_calendar_wait_counts_from_the_first_trading_day_and_both_waits_must_be_met() {
+        // The floor at 0.75, a first payout 3 calendar days after the first trading day, the
+        // next 1 day after it, no cap. The account trades on days 2 and 7 only:
+        //   day 1   0           no trade yet: the wait has not started
+        //   day 2  +25%  trade  1.25, the first trading day
+        //   day 3   0           1 day after it
+        //   day 4   0           2 days
+        //   day 5   0           3 days: pays the 0.25 of profit, on a day with no trade, 1.0
+        //   day 6  +25%         1.25, 1 day after the payout: pays again, 1.0
+        let floor_75 = PropFirmSpec {
+            max_drawdown: 0.25,
+            ..unlimited(10)
+        };
+        let rules = AttemptTerms {
+            calendar_days_to_first_payout: Some(3),
+            ..terms()
+        };
+        let path = [0.0, 0.25, 0.0, 0.0, 0.0, 0.25, 0.0];
+        let traded = [false, true, false, false, false, false, true];
+        let after = |rules: &AttemptTerms, days: usize| {
+            let f = walk_funded(
+                &floor_75,
+                rules,
+                &path[..days],
+                &path[..days],
+                &traded[..days],
+            );
+            (f.payouts, f.gross, f.balance)
+        };
+        assert_eq!(after(&rules, 4), (0, 0.0, 1.25));
+        assert_eq!(after(&rules, 5), (1, 0.25, 1.0));
+        assert_eq!(after(&rules, 6), (2, 0.5, 1.0));
+        // Asking for 2 trading days as well: the calendar wait is met on day 5, but the second
+        // trading day comes only on day 7. Nothing is paid before it, so day 6 grows 1.25 to
+        // 1.5625, and day 7 pays the whole 0.5625 of profit.
+        let both = AttemptTerms {
+            days_to_first_payout: 2,
+            ..rules
+        };
+        assert_eq!(after(&both, 6), (0, 0.0, 1.5625));
+        assert_eq!(after(&both, 7), (1, 0.5625, 1.0));
+        // Without the calendar wait the first trading day pays at once, as before the field.
+        assert_eq!(after(&terms(), 2), (1, 0.25, 1.0));
+    }
+
+    #[test]
     fn a_payout_never_moves_the_floor() {
         // A trailing drawdown of 0.125, no lock, payouts from day 1, no cap. All exact in binary:
         //   day 1  +25%     1.25, peak 1.25: the floor is 1.25 - 0.125 = 1.125. The payout takes
@@ -2172,6 +2252,42 @@ mod tests {
         };
         let f = funded(&trailing, &terms(), &[0.25, -0.0625, 0.25]);
         assert_eq!((f.payouts, f.gross, f.balance), (1, 0.125, 1.0546875));
+    }
+
+    #[test]
+    fn a_second_payout_is_measured_from_the_floor_a_locking_payout_fixed() {
+        // A trailing drawdown of 0.125 with no lock of its own, a cap of 0.2 a payout, payouts
+        // from day 1 every day, and the first payout locks the floor. All exact in binary:
+        //   day 1  +25%    1.25, peak 1.25: the floor is 1.25 - 0.125 = 1.125. The payout takes
+        //                  the 0.125 above it, which leaves 1.125, and fixes the floor there.
+        //   day 2  +12.5%  1.125 * 1.125 = 1.265625, peak 1.265625. Measured from the fixed
+        //                  floor of 1.125 the payout takes 0.140625, under the cap, and leaves
+        //                  1.125. A trailing floor would now be 1.140625 and allow only 0.125.
+        let trailing = PropFirmSpec {
+            max_drawdown: 0.125,
+            drawdown: DrawdownMode::Trailing,
+            ..unlimited(10)
+        };
+        let lock = AttemptTerms {
+            payout_cap: Some(0.2),
+            payout_locks_floor: true,
+            ..terms()
+        };
+        let f = funded(&trailing, &lock, &[0.25, 0.125]);
+        assert_eq!(
+            (f.payouts, f.gross, f.balance),
+            (2, 0.125 + 0.140625, 1.125)
+        );
+        // Without the lock the second payout is measured from the trailing floor.
+        let unlocked = AttemptTerms {
+            payout_locks_floor: false,
+            ..lock
+        };
+        let f = funded(&trailing, &unlocked, &[0.25, 0.125]);
+        assert_eq!(
+            (f.payouts, f.gross, f.balance),
+            (2, 0.125 + 0.125, 1.140625)
+        );
     }
 
     #[test]
@@ -2426,6 +2542,55 @@ mod tests {
         // The edge is worth something: without it an attempt passes less and is worth less.
         assert!(zero.reduced.pass < zero.full.pass, "{zero:?}");
         assert!(zero.reduced.value < zero.full.value, "{zero:?}");
+    }
+
+    #[test]
+    fn the_zero_edge_figures_remove_the_whole_mean_and_match_the_full_edge_without_drift() {
+        let spec = attempt_spec();
+        let terms = AttemptTerms {
+            funded_horizon_days: 60,
+            ..terms()
+        };
+        // A driftless series: symmetric() * 4 has a sample mean of exactly 0, so removing it
+        // changes nothing, and the zero-edge figures are the full-edge ones on the same draws.
+        let flat: Vec<f64> = symmetric().iter().map(|r| r * 4.0).collect();
+        let a = prop_firm_attempt(&flat, None, &every_day(&flat), &spec, &terms).unwrap();
+        assert_eq!(a.zero_edge, Some(a.full));
+        // A series whose drift is small next to its spread (a mean of 1e-5 against a spread of
+        // about 0.014): the zero-edge value equals the full-edge value within the noise of the
+        // paths, four standard errors of the mean of one attempt's value.
+        let near: Vec<f64> = flat.iter().map(|r| r + 1e-5).collect();
+        let b = prop_firm_attempt(&near, None, &every_day(&near), &spec, &terms).unwrap();
+        let zero = b.zero_edge.unwrap();
+        // One attempt's value lies between losing the fee and paying out every gain of 60
+        // funded days of at most 3% each (no day here gains more than 2.5%).
+        let spread =
+            terms.evaluation_fee + terms.profit_split * terms.account_size * 1.03f64.powi(60);
+        let se = spread / (spec.paths as f64).sqrt();
+        assert!(
+            (zero.value - b.full.value).abs() < 4.0 * se,
+            "{zero:?} {:?}",
+            b.full
+        );
+        // With an edge, removing all of it gives the figures of a factor of 0, and is worth less
+        // than the reduced edge, which is worth less than the full one.
+        let x = edged();
+        let half = prop_firm_attempt(&x, None, &every_day(&x), &spec, &terms).unwrap();
+        let none = AttemptTerms {
+            reduced_edge_factor: 0.0,
+            ..terms
+        };
+        let at_zero = prop_firm_attempt(&x, None, &every_day(&x), &spec, &none).unwrap();
+        assert_eq!(half.zero_edge, Some(at_zero.reduced));
+        let zero = half.zero_edge.unwrap();
+        assert!(zero.value < half.reduced.value, "{half:?}");
+        assert!(half.reduced.value < half.full.value, "{half:?}");
+        // A result saved before the field existed loads without it.
+        let mut saved = serde_json::to_value(half).unwrap();
+        saved.as_object_mut().unwrap().remove("zero_edge");
+        let back: PropFirmAttempt = serde_json::from_value(saved).unwrap();
+        assert_eq!(back.zero_edge, None);
+        assert_eq!((back.full, back.reduced), (half.full, half.reduced));
     }
 
     #[test]

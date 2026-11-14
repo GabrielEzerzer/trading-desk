@@ -25,10 +25,16 @@
 //!   that leaves open whether the venue took it (a timeout, a dropped connection, a server error,
 //!   a load or frequency answer) is resolved by asking the venue, never by sending it again; only a
 //!   rate-limit (10006) or timestamp (10002) refusal, which the venue documents as a refusal before
-//!   processing, is sent again. A lookup that finds nothing is [`Error::OutcomeUnknown`], never
-//!   "not placed". A cancel or amend is confirmed by reads after the venue acknowledges it (see the
-//!   `ids`, `client` and `orders` module docs for what the venue documents and the rules built on
-//!   it).
+//!   processing, is sent again, and a refusal of that resend is looked up too. An order `place`
+//!   returns as not taken frees its id, and the caller retries it under that id, never a new one
+//!   ([`Client::place`] lists those errors). A lookup that finds nothing is
+//!   [`Error::OutcomeUnknown`], never "not placed": the caller keeps the order as possibly live
+//!   under its original id, across a restart, keeps asking the venue about it,
+//!   counts its possible fill in its exposure, and never sends the same order again under another
+//!   id because a lookup came back empty; a timeout or a spent time budget does not withdraw the
+//!   request ([`Error::OutcomeUnknown`] has the full contract). A cancel or amend is confirmed by
+//!   reads after the venue acknowledges it (see the `ids`, `client` and `orders` module docs for
+//!   what the venue documents and the rules built on it).
 //! - **Venue filters.** An order is checked with `Instrument::validate_order` (lot and tick grid,
 //!   minimum quantity, minimum notional with the reduce-only exemption) before it is sent, and its
 //!   numbers are written as exact decimals on the grid.
@@ -65,4 +71,5 @@ pub use orders::{CancelOutcome, Placed};
 pub use reads::SETTLE_COIN;
 pub use wire::{
     Equity, ExecKind, Execution, InstrumentInfo, OrderStatus, Position, Ticker, VenueOrder,
+    venue_text,
 };

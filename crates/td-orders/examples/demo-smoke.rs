@@ -30,6 +30,7 @@ use td_core::{
 };
 use td_orders::{
     CancelOutcome, Client, ClientOrderId, DemoKeys, Endpoint, Error, ExecKind, SETTLE_COIN,
+    venue_text,
 };
 
 /// The most one order may be worth, in the settle coin. Checked before any order is sent.
@@ -159,7 +160,9 @@ fn run(symbol: &str, bought: &mut bool) -> Result<(), String> {
         format!(
             "{symbol} is a {:?} {:?} contract settled in {:?}, not a trading {SETTLE_COIN} \
              perpetual",
-            info.status, info.contract_type, info.settle_coin
+            venue_text(&info.status),
+            venue_text(&info.contract_type),
+            venue_text(&info.settle_coin)
         ),
     )?;
     let ticker = client.ticker(symbol).map_err(e("ticker"))?;
@@ -313,7 +316,7 @@ fn run(symbol: &str, bought: &mut bool) -> Result<(), String> {
         Ok(p) => {
             return Err(format!(
                 "the venue accepted a used client id as order {:?}; close it by hand",
-                p.order_id
+                venue_text(&p.order_id)
             ));
         }
         Err(other) => {

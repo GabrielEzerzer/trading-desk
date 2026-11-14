@@ -215,6 +215,28 @@ impl MockVenue {
         self.state.lock().unwrap().echo_credentials = on;
     }
 
+    /// Gives the orders with `link_id` this `orderStatus`, as a venue that sends a status the
+    /// client does not know would. The mock counts any status but its own open ones as closed,
+    /// except that the real-time list shows an order with a status the mock does not know among
+    /// the open ones, as the venue would show an order it still counts open.
+    pub fn set_order_status(&self, link_id: &str, status: &'static str) {
+        for o in &mut self.state.lock().unwrap().orders {
+            if o.link_id == link_id {
+                o.status = status;
+            }
+        }
+    }
+
+    /// Gives the executions with `link_id` this `execType`, as a venue that sends a type the
+    /// client does not know would.
+    pub fn set_exec_type(&self, link_id: &str, exec_type: &'static str) {
+        for e in &mut self.state.lock().unwrap().execs {
+            if e.link_id == link_id {
+                e.exec_type = exec_type;
+            }
+        }
+    }
+
     /// Injects `fault` into the next request on `path`.
     pub fn inject(&self, path: &str, fault: Fault) {
         self.state

@@ -271,6 +271,7 @@ impl<M: FillModel> SimBroker<M> {
             qty,
             fee,
             liquidity,
+            close_out: false,
         })
     }
 }

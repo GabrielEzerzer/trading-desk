@@ -13,12 +13,13 @@ use td_core::{
 use td_data::live::Rest;
 use td_data::{DataError, resample};
 use td_engine::{
-    Context, ENGINE_REVISION, LIQUIDATION_TAG, Order, OrderStatus, ParamValue, Params, Session,
-    SessionConfig, Strategy, build_strategy, run_backtest,
+    BacktestConfig, Context, ENGINE_REVISION, LIQUIDATION_TAG, Order, OrderStatus, ParamValue,
+    Params, Session, SessionConfig, Strategy, build_strategy, run_backtest, run_strategy,
 };
 use td_server::{
-    Funding, MANUAL_STRATEGY, ManualError, ManualOrder, ManualOrderType, OrderSource, PaperConfig,
-    PaperError, PaperHandle, PaperSession, SessionEvent, Status, TradeSource, paper_dir,
+    FedBar, Funding, MANUAL_STRATEGY, ManualError, ManualOrder, ManualOrderType, OrderSource,
+    PaperConfig, PaperError, PaperHandle, PaperSession, SessionEvent, Status, TradeSource,
+    paper_dir,
 };
 use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::Message;
@@ -665,6 +666,28 @@ async fn live_session_stops_and_resumes(kind: InstrumentKind) {
             .count(),
         history.len()
     );
+    // Each warm-up line carries the venue's rates due in its bar, from the first warm-up bar's
+    // open on, so the strategy sees them and a replay feeds them again: here the rate due at the
+    // first warm-up bar's open, an hour before the session went live. They are not charged.
+    let warm_up_funding: Vec<(Millis, Vec<Funding>)> = log
+        .lines()
+        .map(|l| serde_json::from_str::<FedBar>(l).expect("a bar line"))
+        .filter(|fed| fed.warm_up && !fed.funding.is_empty())
+        .map(|fed| (fed.bar.open_time, fed.funding))
+        .collect();
+    if kind == InstrumentKind::Perpetual {
+        let due = T0 - HOUR;
+        let rate = funding.iter().find(|f| f.0 == due).expect("a rate").1;
+        assert_eq!(history[0].open_time, due);
+        let fed = Funding {
+            time: due,
+            rate,
+            due,
+        };
+        assert_eq!(warm_up_funding, [(due, vec![fed])]);
+    } else {
+        assert!(warm_up_funding.is_empty());
+    }
 
     // Second run, after minutes 70 to 149 went by while stopped, the funding time at 02:00
     // among them: REST backfills them.
@@ -677,7 +700,11 @@ async fn live_session_stops_and_resumes(kind: InstrumentKind) {
     let ref_dir = tempfile::tempdir().expect("temp dir");
     let mut reference = PaperSession::create(ref_dir.path(), "ref", cfg).expect("creates");
     for bar in &history {
-        reference.feed(*bar, Vec::new(), true).expect("warm-up bar");
+        let funding = warm_up_funding
+            .iter()
+            .find(|(open, _)| *open == bar.open_time)
+            .map_or_else(Vec::new, |(_, funding)| funding.clone());
+        reference.feed(*bar, funding, true).expect("warm-up bar");
     }
     feed_all(
         &mut reference,
@@ -717,6 +744,236 @@ async fn a_live_spot_session_warms_up_trades_stops_and_resumes_with_the_missed_m
 #[tokio::test(flavor = "multi_thread")]
 async fn a_live_perpetual_session_resumed_across_a_funding_time_charges_each_rate_once() {
     live_session_stops_and_resumes(InstrumentKind::Perpetual).await;
+}
+
+/// A rate due after the last warm-up bar the venue gave, before the session went live, comes with
+/// the first live bar, at its own time, so the strategy still sees it as a backtest shows it.
+/// Nothing is held then, so it costs nothing, and the funding clock does not give it again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rate_due_after_the_last_warm_up_bar_comes_with_the_first_live_bar() {
+    let tf = Timeframe::M5;
+    // The venue's bars stop an hour before the session goes live at T0.
+    let history = resample(InstrumentKind::Spot, &minutes(-120..-60), tf, false).candles;
+    let (before, after, live) = ((T0 - 2 * HOUR, 0.0001), (T0 - HOUR, 0.0003), (T0, 0.0002));
+    let rest = Arc::new(FakeRest {
+        funding: vec![before, after, live],
+        ..FakeRest::new(minutes(0..30), history, T0 + 30_000)
+    });
+    let dir = tempfile::tempdir().expect("temp dir");
+    let cfg = config(InstrumentKind::Perpetual, tf);
+    let paper = PaperSession::create(dir.path(), "gap", cfg).expect("creates");
+    let stream: Vec<String> = minutes(0..20).iter().map(frame).collect();
+    let handle = td_server::start_with_stream(paper, rest, serve(stream).await);
+    wait_for_bar(&handle, T0 + 10 * MIN).await;
+    let session = unwrap_session(handle.stop().await);
+    assert_eq!(session.live_from(), Some(T0));
+    let charged = |(due, rate): (Millis, f64)| Funding {
+        time: due,
+        rate,
+        due,
+    };
+    assert_eq!(session.funding(), [charged(after), charged(live)]);
+    assert_eq!(session.portfolio().funding_paid(), 0.0);
+}
+
+/// What a strategy saw on each bar it was called on: the bar's open time, whether it was a warm-up
+/// bar, and [`Context::funding`].
+type Seen = Vec<(Millis, bool, Vec<(Millis, f64)>)>;
+
+/// Never trades; records what [`Context::funding`] gives it on each bar.
+struct SeesFunding(Arc<Mutex<Seen>>);
+
+impl Strategy for SeesFunding {
+    fn on_bar(&mut self, ctx: &mut Context, bar: &Candle) {
+        let seen = (bar.open_time, ctx.is_warming_up(), ctx.funding().to_vec());
+        self.0.lock().expect("lock").push(seen);
+    }
+}
+
+/// What a strategy saw in the paper session `id`: each line of its log fed to a session running
+/// [`SeesFunding`] as the paper session fed it and as a reopen replays it, warm-up lines as warm-up
+/// and each rate at its `time`.
+fn seen_in_paper(dir: &std::path::Path, id: &str, cfg: &PaperConfig) -> Seen {
+    let log = fs::read_to_string(paper_dir(dir, id).join("events.jsonl")).expect("reads");
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let money = SessionConfig {
+        starting_cash: cfg.starting_cash,
+        slippage_bps: cfg.slippage_bps,
+        fees: cfg.fees,
+        max_leverage: cfg.max_leverage,
+        account_currency: td_core::AccountCurrency::Quote,
+    };
+    let strategy = Box::new(SeesFunding(seen.clone()));
+    let mut session =
+        Session::new(strategy, cfg.instrument.clone(), cfg.timeframe, money).expect("session");
+    for line in log.lines() {
+        let fed: FedBar = serde_json::from_str(line).expect("a bar line");
+        let funding: Vec<(Millis, f64)> = fed.funding.iter().map(|f| (f.time, f.rate)).collect();
+        let fed = if fed.warm_up {
+            session.warm_up(fed.bar, &funding)
+        } else {
+            session.on_bar(fed.bar, &funding)
+        };
+        fed.expect("feeds");
+    }
+    seen.lock().expect("lock").clone()
+}
+
+/// What a strategy sees in a backtest of `bars` given the venue's `funding`, warmed up on the bars
+/// before `live_from` and trading from it.
+fn seen_in_backtest(
+    cfg: &PaperConfig,
+    bars: &[Candle],
+    live_from: Millis,
+    funding: &[(Millis, f64)],
+) -> Seen {
+    let config = BacktestConfig {
+        strategy: "sees_funding".into(),
+        params: Params::new(),
+        instrument: cfg.instrument.clone(),
+        timeframe: cfg.timeframe,
+        from: live_from,
+        to: bars.last().expect("bars").open_time + cfg.timeframe.duration_ms(),
+        starting_cash: cfg.starting_cash,
+        slippage_bps: cfg.slippage_bps,
+        fee_override: cfg.fees,
+        max_leverage: cfg.max_leverage,
+        warmup_from: Some(bars[0].open_time),
+        close_at_end: false,
+        account_currency: td_core::AccountCurrency::Quote,
+    };
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let strategy = Box::new(SeesFunding(seen.clone()));
+    run_strategy(&config, strategy, bars, &[], funding).expect("runs");
+    seen.lock().expect("lock").clone()
+}
+
+/// A paper session shows its strategy, on every bar, the funding a backtest of the same bars shows
+/// it, times and rates: a rate due where warm-up bars are missing, and one due after the last
+/// warm-up bar before the session went live, keep their settlement times.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_paper_session_shows_its_strategy_the_funding_a_backtest_of_its_bars_shows() {
+    let tf = Timeframe::M5;
+    // The venue's bars run from three hours before the session goes live at T0 to an hour and a
+    // half before it, without the two bars from 2h05m to 1h55m before it.
+    let missing = [T0 - 2 * HOUR - 5 * MIN, T0 - 2 * HOUR];
+    let history: Vec<Candle> = resample(InstrumentKind::Spot, &minutes(-180..-90), tf, false)
+        .candles
+        .into_iter()
+        .filter(|b| !missing.contains(&b.open_time))
+        .collect();
+    // Before the first warm-up bar, so never seen; at its open; inside the missing bars; inside
+    // the gap before the first live bar; at that bar's open.
+    let funding = vec![
+        (T0 - 4 * HOUR, 0.0005),
+        (T0 - 3 * HOUR, 0.0001),
+        (T0 - 2 * HOUR, -0.0002),
+        (T0 - HOUR, 0.0003),
+        (T0, 0.0004),
+    ];
+    let rest = Arc::new(FakeRest {
+        funding: funding.clone(),
+        ..FakeRest::new(minutes(0..30), history, T0 + 30_000)
+    });
+    let dir = tempfile::tempdir().expect("temp dir");
+    let cfg = config(InstrumentKind::Perpetual, tf);
+    let paper = PaperSession::create(dir.path(), "seen", cfg.clone()).expect("creates");
+    let stream: Vec<String> = minutes(0..20).iter().map(frame).collect();
+    let handle = td_server::start_with_stream(paper, rest, serve(stream).await);
+    wait_for_bar(&handle, T0 + 10 * MIN).await;
+    let session = unwrap_session(handle.stop().await);
+    assert_eq!(session.live_from(), Some(T0));
+
+    let in_paper = seen_in_paper(dir.path(), "seen", &cfg);
+    let bars = session.session().bars();
+    let opens: Vec<Millis> = in_paper.iter().map(|s| s.0).collect();
+    assert_eq!(opens, bars.iter().map(|b| b.open_time).collect::<Vec<_>>());
+    assert_eq!(in_paper, seen_in_backtest(&cfg, bars, T0, &funding));
+    // On the first live bar: every rate from the first warm-up bar's open on, at its own time.
+    let first_live = in_paper.iter().find(|s| !s.1).expect("a live bar");
+    assert_eq!((first_live.0, &first_live.2[..]), (T0, &funding[1..]));
+}
+
+/// A session that stopped part-way through its warm-up, with funding in the warm-up lines it
+/// wrote, finishes the warm-up from the end of its log: no rate is fed twice or left out, and its
+/// strategy sees on every bar what it sees in a session that never stopped.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_warm_up_resumed_from_a_log_with_funding_feeds_each_rate_once() {
+    let tf = Timeframe::M5;
+    let cfg = config(InstrumentKind::Perpetual, tf);
+    // Three hours of warm-up bars before T0, without the two from 2h to 1h55m before it, just
+    // after where the log will end.
+    let missing = [T0 - 2 * HOUR, T0 - 2 * HOUR + 5 * MIN];
+    let history: Vec<Candle> = resample(InstrumentKind::Spot, &minutes(-180..0), tf, false)
+        .candles
+        .into_iter()
+        .filter(|b| !missing.contains(&b.open_time))
+        .collect();
+    let funding: Vec<(Millis, f64)> = (-4..=0)
+        .map(|h| (T0 + h * HOUR, 0.0001 * (5 + h) as f64))
+        .collect();
+    let rest = || {
+        Arc::new(FakeRest {
+            funding: funding.clone(),
+            ..FakeRest::new(minutes(0..30), history.clone(), T0 + 30_000)
+        })
+    };
+    let run = |paper: PaperSession| {
+        let rest = rest();
+        async move {
+            let stream: Vec<String> = minutes(0..20).iter().map(frame).collect();
+            let handle = td_server::start_with_stream(paper, rest, serve(stream).await);
+            wait_for_bar(&handle, T0 + 10 * MIN).await;
+            unwrap_session(handle.stop().await)
+        }
+    };
+
+    // A session that never stopped.
+    let whole_dir = tempfile::tempdir().expect("temp dir");
+    let whole = PaperSession::create(whole_dir.path(), "whole", cfg.clone()).expect("creates");
+    run(whole).await;
+    let whole_log = fs::read_to_string(paper_dir(whole_dir.path(), "whole").join("events.jsonl"))
+        .expect("reads");
+
+    // The same session, stopped after writing its first twelve warm-up lines, up to the bar at
+    // 2h05m before T0: the first of them holds the rate due 3h before, and the rate due 2h before
+    // falls at the end of the last.
+    let dir = tempfile::tempdir().expect("temp dir");
+    drop(PaperSession::create(dir.path(), "cut", cfg.clone()).expect("creates"));
+    let cut: String = whole_log
+        .lines()
+        .take(12)
+        .map(|l| format!("{l}\n"))
+        .collect();
+    let last: FedBar = serde_json::from_str(cut.lines().last().expect("lines")).expect("a line");
+    assert_eq!(last.bar.open_time, T0 - 2 * HOUR - 5 * MIN);
+    fs::write(paper_dir(dir.path(), "cut").join("events.jsonl"), cut).expect("writes");
+    let reopened = PaperSession::open(dir.path(), "cut").expect("opens");
+    assert_eq!(reopened.live_from(), None);
+    let resumed = run(reopened).await;
+    assert_eq!(resumed.live_from(), Some(T0));
+
+    // Every rate from the first warm-up bar's open on was fed once, at its own time.
+    let log = fs::read_to_string(paper_dir(dir.path(), "cut").join("events.jsonl")).expect("reads");
+    let fed: Vec<(Millis, Millis)> = log
+        .lines()
+        .flat_map(|l| {
+            serde_json::from_str::<FedBar>(l)
+                .expect("a bar line")
+                .funding
+        })
+        .map(|f| (f.time, f.due))
+        .collect();
+    let due: Vec<(Millis, Millis)> = funding[1..].iter().map(|&(t, _)| (t, t)).collect();
+    assert_eq!(fed, due);
+
+    // Bar for bar, the strategy saw what it saw in the session that never stopped.
+    let until =
+        |seen: Seen| -> Seen { seen.into_iter().filter(|s| s.0 <= T0 + 10 * MIN).collect() };
+    let in_resumed = until(seen_in_paper(dir.path(), "cut", &cfg));
+    let in_whole = until(seen_in_paper(whole_dir.path(), "whole", &cfg));
+    assert_eq!(in_resumed.len(), history.len() + 3);
+    assert_eq!(in_resumed, in_whole);
 }
 
 #[tokio::test(flavor = "multi_thread")]

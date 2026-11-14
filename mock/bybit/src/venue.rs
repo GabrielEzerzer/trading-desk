@@ -70,6 +70,15 @@ impl Order {
     pub fn is_open(&self) -> bool {
         matches!(self.status, "New" | "PartiallyFilled" | "Untriggered")
     }
+
+    /// Whether the order holds one of the mock's own closed statuses, rather than one a test set
+    /// that the mock does not know.
+    fn is_known_closed(&self) -> bool {
+        matches!(
+            self.status,
+            "Filled" | "Cancelled" | "Deactivated" | "Rejected" | "PartiallyFilledCanceled"
+        )
+    }
 }
 
 #[derive(Clone)]
@@ -908,7 +917,8 @@ impl State {
                 } else if !link.is_empty() {
                     o.link_id == link && (o.is_open() || self.closed_cache)
                 } else {
-                    o.is_open()
+                    // Open, or a status a test set that the mock does not know.
+                    !o.is_known_closed()
                 }
             })
             .collect();
