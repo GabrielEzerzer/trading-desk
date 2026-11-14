@@ -1146,7 +1146,16 @@ trailing_floor_lock?: number | null,
  * return, its low and its trading-day flag on them. `None` measures the line on the worse of
  * days ending at midnight UTC and at 17:00 New York, and walks days ending at midnight UTC.
  */
-day_rollover?: DayRollover | null, };
+day_rollover?: DayRollover | null, 
+/**
+ * The number of days in a row without a trading day (as `min_trading_days` counts them) that
+ * ends the account, in each evaluation phase and on the funded account. The days are the
+ * walks' calendar days, counted as `calendar_days_to_first_payout` counts them, and each
+ * account counts from its own start: the account ends at the close of the day this many
+ * days after its start or its last trading day, with no trading day between. The attempt
+ * walks treat that end as a breach. `None` sets no such limit.
+ */
+max_days_without_trading?: number | null, };
 
 /**
  * The terms of one attempt at a prop-firm challenge: its fees, the funded account it leads to
@@ -1910,8 +1919,9 @@ export type PropFirmOdds = {
  */
 pass: number, 
 /**
- * The fraction of paths that breach a limit within the horizon: in a phase of the
- * evaluation, or after the last phase passes, trading on as the funded account from a fresh
+ * The fraction of paths that breach a limit within the horizon (an account that goes
+ * `max_days_without_trading` days without a trading day counts as breached): in a phase of
+ * the evaluation, or after the last phase passes, trading on as the funded account from a fresh
  * balance and a fresh peak, as a firm starts each phase and the funded account again at the
  * account size. With attempt terms the funded account takes its payouts by them, which
  * leave the balance and move no floor, unless the terms lock the floor at the first payout;
@@ -1925,8 +1935,8 @@ breach: number, paths: number,
 days: number | null, 
 /**
  * How many of `days` count as trading days: the days the traded flags mark, so a reader can
- * see how sparse the days are that the firm's minimum and the wait before the first payout
- * count. `None` in a result saved before it existed.
+ * see how sparse the days are that the firm's minimum, the wait before the first payout and
+ * the limit on days without a trading day count. `None` in a result saved before it existed.
  */
 trading_days: number | null, };
 
