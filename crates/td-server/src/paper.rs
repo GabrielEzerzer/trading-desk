@@ -109,7 +109,8 @@ fn first_engine_revision() -> u32 {
 /// A funding rate fed with a bar.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, TS)]
 pub struct Funding {
-    /// The time the engine was given, inside the bar's window.
+    /// The time the engine was given: `due`, unless the rate came after the bar it is due in; then
+    /// the end of the last bar fed before this one, or this bar's open if it is the first.
     pub time: Millis,
     pub rate: f64,
     /// The venue's funding time. Earlier than `time` when the rate was not yet published when its

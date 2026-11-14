@@ -111,10 +111,13 @@ impl Context<'_> {
     /// event fed to the session with a bar, warm-up bars included. From the first live bar on,
     /// that is the series the cost model charges (a rate charged on a flat position is still
     /// here); the warm-up bars' events, and those in a gap between the last warm-up bar and the
-    /// first live bar, are only history, since nothing is held before the first live bar. In a
-    /// backtest the time is the settlement time; a paper session gives a rate published after its
-    /// own bar closed with a later bar, at a time inside that bar, and a rate due in a gap before a
-    /// bar at that bar's open.
+    /// first live bar, are only history, since nothing is held before the first live bar. The time
+    /// is the settlement time, in a backtest and in a paper session alike, so a paper session shows
+    /// a strategy the series a backtest of the same bars shows it, a rate due in a gap between bars
+    /// included. The one difference: a rate the venue has not yet published when the bar it is due
+    /// in closes reaches a paper session's strategy late, on a later bar, timed at that bar's open
+    /// or, when bars are missing before it, at the end of the last bar fed, and the session warns
+    /// about it.
     ///
     /// The series runs from the first bar fed, warm-up or live, which takes no funding from before
     /// its open (see [`crate::Session::on_bar`]), to the last settlement strictly before the

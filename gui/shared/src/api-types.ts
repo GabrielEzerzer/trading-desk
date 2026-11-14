@@ -2490,7 +2490,8 @@ max_leverage: number, };
  */
 export type Funding = { 
 /**
- * The time the engine was given, inside the bar's window.
+ * The time the engine was given: `due`, unless the rate came after the bar it is due in; then
+ * the end of the last bar fed before this one, or this bar's open if it is the first.
  */
 time: number, rate: number, 
 /**
