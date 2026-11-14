@@ -10,7 +10,8 @@
 //!   fee. A reduce-only market order is cut to the position's size.
 //! - The minimum notional applies to orders that are not reduce-only.
 //! - A test can cap the next market order's fill ([`crate::MockVenue::cap_next_fill`]); the order
-//!   then rests `PartiallyFilled` until [`crate::MockVenue::fill_rest`] fills the rest.
+//!   then rests `PartiallyFilled` until [`crate::MockVenue::fill_rest`] fills the rest. A cap of
+//!   zero leaves it `New` and unfilled.
 //! - Instruments info lists every instrument as a `Trading` `LinearPerpetual` settled in its quote
 //!   coin, and the ticker's mark price is the last price.
 
@@ -217,6 +218,14 @@ impl State {
             .iter()
             .position(|o| o.link_id == link_id && o.is_open())
             .expect("no open order with that link id");
+        if qty <= 0.0 {
+            self.touch(i);
+            let now = self.now();
+            let o = &mut self.orders[i];
+            o.status = "Cancelled";
+            o.updated = now;
+            return;
+        }
         let price = self.markets[&self.orders[i].symbol].price;
         self.fill(i, price, qty);
         self.orders[i].status = "PartiallyFilledCanceled";
@@ -786,8 +795,10 @@ impl State {
             let i = self.orders.len() - 1;
             match self.cap_next_fill.take() {
                 Some(cap) if cap < fill_qty => {
-                    self.fill(i, price, cap);
-                    self.orders[i].status = "PartiallyFilled";
+                    if cap > 0.0 {
+                        self.fill(i, price, cap);
+                        self.orders[i].status = "PartiallyFilled";
+                    }
                 }
                 _ => self.fill(i, price, fill_qty),
             }

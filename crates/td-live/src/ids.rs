@@ -6,10 +6,14 @@
 //! - `o`: the engine order `n` itself: a strategy's order, a manual order through
 //!   `Session::submit`, or an attached stop once its entry fills.
 //! - `c`: the reduce-only market order sent in place of stop `n` when the venue will not take the
-//!   stop (its trigger is already through the market). Its executions are reported as fills of
-//!   order `n`.
-//! - `s`: a second reduce-only stop for the part of an entry's fill that stop `n` does not cover,
-//!   sent once when resizing stop `n` fails, just before the broker faults.
+//!   stop (its trigger is already through the market, or it refuses the stop for a confirmed
+//!   fill), or when stop `n`'s outcome is unknown and the venue refuses the `s` stop too. Its
+//!   executions are reported as fills of order `n`.
+//! - `s`: a second reduce-only stop for an entry's fill, sent at most once: for the part of the
+//!   fill stop `n` does not cover when resizing stop `n` fails, just before the broker faults; for
+//!   the confirmed fill when stop `n`'s create ended with its outcome unknown, just before the
+//!   broker faults; or for the first confirmed fill when stop `n`, placed before the fill was
+//!   confirmed, did not rest.
 //! - `x`: reserved for orders the session sends itself outside the engine, such as a later
 //!   "close the position" action. This crate sends none; an execution carrying one is a fault
 //!   until that action exists.
@@ -38,7 +42,8 @@ const _: () = assert!(PREFIX_MAX_LEN + 2 + MAX_DIGITS <= CLIENT_ID_MAX_LEN);
 pub(crate) enum Role {
     Order,
     Close,
-    /// A second stop covering the part of an entry's fill that stop `n` does not.
+    /// A second stop for an entry's fill: the part stop `n` does not cover, or all of it when stop
+    /// `n` did not rest or its outcome is unknown.
     Cover,
     /// Reserved; never sent by this crate.
     Session,

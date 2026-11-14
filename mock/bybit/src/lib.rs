@@ -195,7 +195,8 @@ impl MockVenue {
     }
 
     /// Fills `qty` of the open order with `link_id` at the last price and cancels the rest, as the
-    /// venue does to an order cancelled after a partial fill.
+    /// venue does to an order cancelled after a partial fill. With `qty` zero the order ends
+    /// `Cancelled` unfilled.
     pub fn cancel_after_partial_fill(&self, link_id: &str, qty: f64) {
         self.state
             .lock()
@@ -239,7 +240,7 @@ impl MockVenue {
     }
 
     /// Makes the next market order fill only `qty`; it then rests `PartiallyFilled` until
-    /// [`MockVenue::fill_rest`].
+    /// [`MockVenue::fill_rest`], or `New` and unfilled when `qty` is zero.
     pub fn cap_next_fill(&self, qty: f64) {
         self.state.lock().unwrap().cap_next_fill = Some(qty);
     }
