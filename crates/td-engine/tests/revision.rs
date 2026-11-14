@@ -43,6 +43,12 @@ const MEASURED: &[(u32, &str, &str, &str)] = &[
         "9bd8ed6281880a1c",
         "59a7ed0e243197cd",
     ),
+    (
+        10,
+        "69f1a2fba8cbfe54",
+        "c8bab269298757e3",
+        "2476c1f429d50ad8",
+    ),
 ];
 
 fn repo_file(path: &str) -> String {

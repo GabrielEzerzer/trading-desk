@@ -120,7 +120,14 @@ export type Fill = { order_id: OrderId, instrument: InstrumentId, side: Side, ti
  * The fee paid, in the account currency: the quote asset, or the base currency on a
  * base-currency account. Negative for a rebate.
  */
-fee: number, liquidity: Liquidity, };
+fee: number, liquidity: Liquidity, 
+/**
+ * True for a fill of the end-of-run close-out, the order a backtest submits to close what is
+ * open when it is told to end flat (each walk-forward test window does): the strategy did
+ * not choose it. False for every other fill, and then left out of JSON, so a fill saved
+ * before the field existed reads as false and every other fill is written as it was.
+ */
+close_out?: boolean, };
 
 /**
  * The currency an account holds and reports money in, against the instrument it trades.
@@ -1832,7 +1839,18 @@ pass: number,
  * the target as a funded account would. The `prop_firm` kind rule asks for at most 0.10
  * over 90 days.
  */
-breach: number, paths: number, };
+breach: number, paths: number, 
+/**
+ * The days the paths were drawn from, one per daily return. `None` in a result saved before
+ * it existed.
+ */
+days: number | null, 
+/**
+ * How many of `days` count as trading days: the days the traded flags mark, so a reader can
+ * see how sparse the days are that the firm's minimum and the wait before the first payout
+ * count. `None` in a result saved before it existed.
+ */
+trading_days: number | null, };
 
 /**
  * The value of a prop-firm attempt at the edge the test shows and at a reduced one.
@@ -2598,7 +2616,14 @@ export type PaperFill = { source: OrderSource, order_id: OrderId, instrument: In
  * The fee paid, in the account currency: the quote asset, or the base currency on a
  * base-currency account. Negative for a rebate.
  */
-fee: number, liquidity: Liquidity, };
+fee: number, liquidity: Liquidity, 
+/**
+ * True for a fill of the end-of-run close-out, the order a backtest submits to close what is
+ * open when it is told to end flat (each walk-forward test window does): the strategy did
+ * not choose it. False for every other fill, and then left out of JSON, so a fill saved
+ * before the field existed reads as false and every other fill is written as it was.
+ */
+close_out?: boolean, };
 
 /**
  * Whose fills make up a trade. A liquidation's fill does not count: it only closes a trade that

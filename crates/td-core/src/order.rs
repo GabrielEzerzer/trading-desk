@@ -90,6 +90,16 @@ pub struct Fill {
     /// base-currency account. Negative for a rebate.
     pub fee: f64,
     pub liquidity: Liquidity,
+    /// True for a fill of the end-of-run close-out, the order a backtest submits to close what is
+    /// open when it is told to end flat (each walk-forward test window does): the strategy did
+    /// not choose it. False for every other fill, and then left out of JSON, so a fill saved
+    /// before the field existed reads as false and every other fill is written as it was.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub close_out: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 #[cfg(test)]

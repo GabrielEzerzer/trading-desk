@@ -553,6 +553,15 @@ pub struct PropFirmOdds {
     /// over 90 days.
     pub breach: f64,
     pub paths: usize,
+    /// The days the paths were drawn from, one per daily return. `None` in a result saved before
+    /// it existed.
+    #[serde(default)]
+    pub days: Option<usize>,
+    /// How many of `days` count as trading days: the days the traded flags mark, so a reader can
+    /// see how sparse the days are that the firm's minimum and the wait before the first payout
+    /// count. `None` in a result saved before it existed.
+    #[serde(default)]
+    pub trading_days: Option<usize>,
 }
 
 /// Walks one path of days, each its return and its low (see [`prop_firm_odds`]), on one balance
@@ -680,6 +689,8 @@ pub fn prop_firm_odds(
         pass: passed as f64 / spec.paths as f64,
         breach: breached as f64 / spec.paths as f64,
         paths: spec.paths,
+        days: Some(traded.len()),
+        trading_days: Some(traded.iter().filter(|&&t| t).count()),
     })
 }
 

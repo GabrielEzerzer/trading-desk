@@ -5,5 +5,5 @@
 # to move results updates these values in the same PR, beside the ENGINE_REVISION bump in
 # crates/td-engine/src/runner.rs. Every change to these values also appends a row to MEASURED in
 # crates/td-engine/tests/revision.rs, whose test fails until it does.
-dev c1ad6b64d1a62ad0
-test 9bd8ed6281880a1c
+dev 69f1a2fba8cbfe54
+test c8bab269298757e3

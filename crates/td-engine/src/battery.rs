@@ -733,6 +733,8 @@ pub fn run_battery(
                 pass: p.pass,
                 breach: b.breach,
                 paths: b.paths,
+                days: b.days,
+                trading_days: b.trading_days,
             });
             kind.pass_probability = result.prop_firm_odds.map(|o| o.pass);
             kind.breach_probability = result.prop_firm_odds.map(|o| o.breach);
@@ -1339,9 +1341,14 @@ fn daily_lows(
 /// `evaluation_size` or `funded_size` is not 1; build flags per size to lift that refusal, once a
 /// plan needs a smallest trade size and another size together.
 ///
-/// shortcut: a walk-forward test window closes its open position at its end, and that fill can
-/// pass the test, so up to one day per window is a trading day the strategy would not have had
-/// if it had held on; skip those fills once a fill says it is a window's close-out.
+/// A close-out fill ([`Fill::close_out`]), which closes what a walk-forward test window still
+/// holds at its end, marks no day, with or without a test: the strategy did not choose it, and
+/// would have held on. It is still replayed, so the next fill sees the position it left.
+///
+/// shortcut: the fills that reopen a position at the start of the next test window still count,
+/// without a test or with one that does not ask for a close, though a strategy that had held on
+/// would not have made them; mark a window's first fills too if a plan's strategy holds across
+/// windows often enough for that to matter.
 fn traded_days(
     ends: &[Millis],
     fills: &[Fill],
@@ -1366,7 +1373,7 @@ fn traded_days(
             (*pos, *avg) = next_position(*pos, *avg, dq, f.price);
             test.passes(close)
         });
-        if !counts {
+        if !counts || f.close_out {
             continue;
         }
         // A close after the last day's end is on no day of the curve.
@@ -2122,6 +2129,7 @@ mod tests {
             qty,
             fee: 0.0,
             liquidity: td_core::Liquidity::Taker,
+            close_out: false,
         }
     }
 
@@ -2527,6 +2535,35 @@ mod tests {
     }
 
     #[test]
+    fn a_windows_close_out_is_no_trading_day_but_the_strategys_own_close_that_day_is() {
+        // Bought on day 1 and held across a test window's end, which closes it out on day 3.
+        let close_out = Fill {
+            close_out: true,
+            ..day_fill(3, Side::Sell, 1.0, 1_050.0)
+        };
+        let held = [day_fill(1, Side::Buy, 1.0, 1_000.0), close_out.clone()];
+        assert_eq!(flagged_days(&held, None), [1]);
+        assert_eq!(flagged_days(&held, day_test(true, None, None)), NO_DAYS);
+        assert_eq!(
+            flagged_days(&held, day_test(false, Some(0.05), Some(0.01))),
+            NO_DAYS
+        );
+        // The same day, the strategy also opens and closes a trade of its own: that close counts.
+        let own = [
+            day_fill(1, Side::Buy, 1.0, 1_000.0),
+            close_out,
+            day_fill(3, Side::Buy, 1.0, 1_050.0),
+            day_fill(3, Side::Sell, 1.0, 1_070.0),
+        ];
+        assert_eq!(flagged_days(&own, None), [1, 3]);
+        assert_eq!(flagged_days(&own, day_test(true, None, None)), [3]);
+        assert_eq!(
+            flagged_days(&own, day_test(false, Some(0.05), Some(0.01))),
+            [3]
+        );
+    }
+
+    #[test]
     fn a_close_that_moves_less_than_the_smallest_move_is_not_a_trading_day() {
         let at = |price| {
             [
@@ -2643,11 +2680,14 @@ mod tests {
         );
         // On UTC days the firm's days are the daily returns' own, to the last bit.
         assert_eq!(days.iter().map(day_return).collect::<Vec<_>>(), daily);
-        // A four-hour bar lies inside one UTC day, so a fill's day is the day its bar opened.
+        // A four-hour bar lies inside one UTC day, so a fill's day is the day its bar opened. A
+        // window's close-out marks no day.
         let first = series.times[0].div_euclid(DAY_MS);
+        assert!(wf.fills.iter().any(|f| f.close_out));
         let filled: BTreeSet<usize> = wf
             .fills
             .iter()
+            .filter(|f| !f.close_out)
             .map(|f| (f.time.div_euclid(DAY_MS) - first) as usize)
             .collect();
         let flagged: BTreeSet<usize> = (0..daily.len()).filter(|&d| traded[d]).collect();
@@ -2688,6 +2728,9 @@ mod tests {
         let fills = odds(&traded);
         let every_day = odds(&vec![true; daily.len()]);
         assert_eq!(r.prop_firm_odds, Some(fills));
+        // The result says how many of the days counted.
+        assert_eq!(fills.days, Some(daily.len()));
+        assert_eq!(fills.trading_days, Some(flagged.len()));
         assert!(r.kind.limits_inside_day);
         assert!(
             fills.pass < every_day.pass,

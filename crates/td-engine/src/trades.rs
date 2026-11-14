@@ -541,6 +541,7 @@ mod tests {
             qty,
             fee,
             liquidity: Liquidity::Taker,
+            close_out: false,
         }
     }
 

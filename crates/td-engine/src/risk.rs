@@ -447,6 +447,7 @@ mod tests {
             qty,
             fee,
             liquidity,
+            close_out: false,
         }
     }
 
@@ -580,6 +581,7 @@ mod tests {
             fills[0].clone(),
             Fill {
                 liquidity: Liquidity::Maker,
+                close_out: false,
                 ..fills[1].clone()
             },
         ];

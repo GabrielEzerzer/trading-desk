@@ -47,7 +47,7 @@ pub fn default_slippage_bps(instrument: &Instrument) -> f64 {
 /// in the same change. `tests/revision.rs` records the checksums and the fixture each revision
 /// gave, and fails when either moves without a new row there; a row at a new revision needs this
 /// bump.
-pub const ENGINE_REVISION: u32 = 9;
+pub const ENGINE_REVISION: u32 = 10;
 
 /// Everything that defines a backtest apart from the data itself.
 ///
@@ -418,7 +418,8 @@ fn simulate(
         }
     }
 
-    let fills = session.fills().to_vec();
+    let mut fills = session.fills().to_vec();
+    mark_close_outs(&mut fills, session.orders());
     let account = config.account_currency;
     let pip = config.instrument.pip_size();
     let mut trades = build_trades(
@@ -430,7 +431,7 @@ fn simulate(
         pip,
     );
     attach_stops(&mut trades, session.trade_stops(), account);
-    mark_forced_closes(&mut trades, &fills, session.orders());
+    mark_forced_closes(&mut trades, &fills);
     let series = EquitySeries::new(config.starting_cash, session.equity(), tf);
     let intrabar = risk::intrabar(
         config.starting_cash,
@@ -466,16 +467,25 @@ fn simulate(
     })
 }
 
-/// Marks the trade each fill of the end-of-run close-out order closed (see
-/// [`Session::close_out`]) as force-closed: the last closed trade that exits on the fill's bar.
-fn mark_forced_closes(trades: &mut [Trade], fills: &[Fill], orders: &[Order]) {
+/// Marks each fill of the end-of-run close-out order (see [`Session::close_out`]) as a
+/// close-out ([`Fill::close_out`]).
+fn mark_close_outs(fills: &mut [Fill], orders: &[Order]) {
     for fill in fills {
         let order = fill
             .order_id
             .0
             .checked_sub(1)
             .and_then(|i| orders.get(i as usize));
-        if order.is_some_and(|o| o.request.client_tag.as_deref() == Some(CLOSE_OUT_TAG))
+        fill.close_out =
+            order.is_some_and(|o| o.request.client_tag.as_deref() == Some(CLOSE_OUT_TAG));
+    }
+}
+
+/// Marks the trade each close-out fill closed as force-closed: the last closed trade that exits
+/// on the fill's bar.
+fn mark_forced_closes(trades: &mut [Trade], fills: &[Fill]) {
+    for fill in fills {
+        if fill.close_out
             && let Some(t) = trades
                 .iter_mut()
                 .rev()
@@ -758,6 +768,7 @@ fn hold(
                 qty,
                 fee: account.from_quote(fees.fee(price, qty, fees.taker), price),
                 liquidity: td_core::Liquidity::Taker,
+                close_out: false,
             };
             portfolio.apply_fill(fill.side, fill.qty, fill.price, fill.fee);
             fills.push(fill);
