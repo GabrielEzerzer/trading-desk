@@ -44,8 +44,8 @@ const ENTRY_NOT_SENT: &str = "its entry was not sent";
 const ENTRY_CLOSED: &str = "its entry closed unfilled at the venue";
 const RESTARTED: &str = "cancelled: the session restarted before the order's outcome was known, \
                          and the venue holds no such order";
-/// Why no close at market goes out for a fill whose stop the venue did not take, for an order
-/// adopted while going live or carried over a restart unsettled.
+/// Why no close at market goes out while an order carried over a restart is unresolved
+/// (`Core::restart_unresolved`).
 const NO_CLOSE_ON_RESTART: &str = "no close at market goes out for an order carried over a restart";
 
 /// What kind of disagreement stopped the broker.
@@ -201,9 +201,11 @@ struct Tracked {
     /// A cancel was sent: its outcome was lost, or it took and the next read settles any fill
     /// made before it.
     cancel_asked: bool,
-    /// An order whose outcome going live could not settle after a restart. Until the venue
-    /// settles it, only a reduce-only stop goes out for a fill the venue lists, never a close at
-    /// market. A record made before this field existed loads it as false.
+    /// An order carried over a restart whose outcome the venue has not settled: an entry whose
+    /// outcome was unknown, or an entry's stop sent with an unknown outcome
+    /// ([`At::Unsettled`]), from when going live starts until the venue settles it. While any
+    /// order is carried, no close at market goes out (`Core::restart_unresolved`). A record made
+    /// before this field existed loads it as false.
     #[serde(default)]
     carried: bool,
 }
@@ -226,7 +228,7 @@ enum At {
     Unplaced,
     /// An entry's attached stop sent under its `o` id whose outcome is unknown: it may rest. On
     /// the first fill the venue confirms, the venue is asked about it before anything else goes
-    /// out for the fill (`Core::settle_stop`).
+    /// out for the fill (`Core::settle_stop`); going live after a restart asks at once.
     Unsettled,
     /// An entry's attached stop at the venue under its `s` id.
     Cover,
@@ -243,13 +245,10 @@ enum Basis {
     /// The quantity sent: the venue took the entry but its fill is not confirmed yet. A stop the
     /// venue does not take is placed on the first confirmed fill; nothing is closed for it.
     Sent,
-    /// A fill the venue confirmed in this call. A stop the venue refuses is replaced by a close
-    /// at market for the fill.
+    /// A fill the venue confirmed, or listed while going live. A stop the venue refuses is
+    /// replaced by a close at market for the fill, unless an order carried over a restart is
+    /// unresolved.
     Filled,
-    /// A fill the venue lists for an entry adopted while going live after a restart, or for an
-    /// order carried over the restart until the venue settles it. Only a reduce-only stop goes
-    /// out for it, never a close at market.
-    Restart,
 }
 
 /// The broker the session owns. See the crate documentation.
@@ -411,13 +410,14 @@ impl VenueHandle {
             .push_back(record);
     }
 
-    /// Ends a replay: resolves the orders whose request outcome was lost and those the session
-    /// submitted past the record by asking the venue, and reconciles the venue with the recorded
-    /// state. An order the venue holds is adopted, with any protective stop it already holds for
-    /// it; one it does not hold is refused, never sent. The only orders this sends are reduce-only
-    /// stops, and their resizes, for fills the venue lists. Every record must have been replayed.
-    /// A fault the records carry is restored, and then nothing is sent and the fault is returned.
-    /// Does nothing more on a broker that is not replaying.
+    /// Ends a replay: resolves the orders whose request outcome was lost, the stops sent with an
+    /// unknown outcome and the orders the session submitted past the record by asking the venue,
+    /// and reconciles the venue with the recorded state. An order the venue holds is adopted, with
+    /// any protective stop it already holds for it; one it does not hold is refused, never sent.
+    /// The only orders this sends are reduce-only stops, and their resizes, for fills the venue
+    /// lists. Every record must have been replayed. A fault the records carry is restored, and
+    /// then nothing is sent and the fault is returned. Does nothing more on a broker that is not
+    /// replaying.
     pub fn go_live(&self) -> Result<(), BrokerFault> {
         let mut core = lock(&self.core);
         core.go_live();
@@ -695,6 +695,7 @@ impl Core {
     fn refuse(&mut self, id: OrderId, reason: &str) {
         let t = self.tracked(id);
         t.at = At::Refused;
+        t.carried = false;
         let stop = t.order.attached_stop;
         self.book.pending.push(BrokerEvent::Cancelled {
             id,
@@ -706,6 +707,11 @@ impl Core {
                 reason: ENTRY_NOT_SENT.into(),
             });
         }
+    }
+
+    /// Whether an order carried over a restart is still unresolved ([`Tracked::carried`]).
+    fn restart_unresolved(&self) -> bool {
+        self.book.orders.values().any(|t| t.carried)
     }
 
     fn is_stale(&self, order: &Order) -> bool {
@@ -844,7 +850,7 @@ impl Core {
         }
         if found.filled_qty > 0.0 {
             let price = found.avg_price.unwrap_or(decision_close);
-            self.protect(id, found.filled_qty, price, Basis::Restart);
+            self.protect(id, found.filled_qty, price, Basis::Filled);
         }
     }
 
@@ -1020,8 +1026,8 @@ impl Core {
                     ),
                 );
             }
-            Some(Err(e)) => self.refused_stop(id, &cid, qty, venue_text(&e), last, basis),
-            None => self.refused_stop(id, &cid, qty, FAULTED.into(), last, basis),
+            Some(Err(e)) => self.refused_stop(id, &cid, qty, venue_text(&e), last),
+            None => self.refused_stop(id, &cid, qty, FAULTED.into(), last),
         }
     }
 
@@ -1074,8 +1080,8 @@ impl Core {
     /// stop's outcome is unknown, so it may also rest. This is the one exception to the rule that
     /// an order whose outcome is unknown is settled by asking the venue and never by sending
     /// again: a second reduce-only stop cannot add to the position, and a fill with no stop is
-    /// the worse harm. If the venue refuses that cover, the fill is closed at market (never for
-    /// an order carried over a restart) and the broker faults either way.
+    /// the worse harm. If the venue refuses that cover, the fill is closed at market (never while
+    /// an order carried over a restart is unresolved) and the broker faults either way.
     fn settle_stop(&mut self, entry: OrderId, id: OrderId, qty: f64, last: f64, basis: Basis) {
         let (cid, cover) = (self.id(Role::Order, id), self.id(Role::Cover, id));
         match self.client.order_by_client_id(&self.instrument, &cid) {
@@ -1114,15 +1120,11 @@ impl Core {
                 "the outcome of placing {cover} for the fill of {qty} is unknown too ({e}), so the fill may or may not be covered"
             ),
             Covered::Refused(e) => {
-                let closed = if basis == Basis::Restart {
-                    Err(NO_CLOSE_ON_RESTART.to_string())
-                } else {
-                    self.close_at_market(id, qty, last).map_err(
-                        |(CloseFailed::Refused(c) | CloseFailed::Unknown(c))| {
-                            format!("closing at market failed ({c})")
-                        },
-                    )
-                };
+                let closed = self.close_at_market(id, qty, last).map_err(
+                    |(CloseFailed::Refused(c) | CloseFailed::Unknown(c))| {
+                        format!("closing at market failed ({c})")
+                    },
+                );
                 match closed {
                     Ok(()) => format!(
                         "placing {cover} for the fill of {qty} failed ({e}), so the position was closed at market under {}",
@@ -1144,25 +1146,14 @@ impl Core {
 
     /// The venue did not take stop `id` (under `cid`) for `qty` (`why`): it refused it, or the
     /// route did not send it. A confirmed fill whose stop the venue will not take now is closed at
-    /// market rather than left to wait, since flat is the safe side; for an order carried over a
-    /// restart nothing is closed. The broker faults when the close is not done or fails.
-    fn refused_stop(
-        &mut self,
-        id: OrderId,
-        cid: &ClientOrderId,
-        qty: f64,
-        why: String,
-        last: f64,
-        basis: Basis,
-    ) {
-        let failed = if basis == Basis::Restart {
-            NO_CLOSE_ON_RESTART.to_string()
-        } else {
-            match self.close_at_market(id, qty, last) {
-                Ok(()) => return,
-                Err(CloseFailed::Refused(e) | CloseFailed::Unknown(e)) => {
-                    format!("closing at market failed ({e})")
-                }
+    /// market rather than left to wait, since flat is the safe side; while an order carried over a
+    /// restart is unresolved nothing is closed. The broker faults when the close is not done or
+    /// fails.
+    fn refused_stop(&mut self, id: OrderId, cid: &ClientOrderId, qty: f64, why: String, last: f64) {
+        let failed = match self.close_at_market(id, qty, last) {
+            Ok(()) => return,
+            Err(CloseFailed::Refused(e) | CloseFailed::Unknown(e)) => {
+                format!("closing at market failed ({e})")
             }
         };
         self.unplaced(id);
@@ -1255,8 +1246,12 @@ impl Core {
     }
 
     /// Sends a reduce-only market order for `qty` under order `id`'s `c` id, against the side its
-    /// stop would close. Never sent once the broker has faulted.
+    /// stop would close. Never sent once the broker has faulted, nor while an order carried over a
+    /// restart is unresolved.
     fn close_at_market(&mut self, id: OrderId, qty: f64, last: f64) -> Result<(), CloseFailed> {
+        if self.restart_unresolved() {
+            return Err(CloseFailed::Refused(NO_CLOSE_ON_RESTART.into()));
+        }
         let stop = &self.book.orders[&id.0].order;
         let request = OrderRequest {
             instrument: stop.request.instrument.clone(),
@@ -1593,16 +1588,9 @@ impl Core {
                 Liquidity::Maker
             };
             let t = self.tracked(id);
-            // An order carried over a restart unsettled gets only a reduce-only stop for this
-            // fill. The fill settles it, so its later fills are protected as any.
-            let basis = if t.carried {
-                Basis::Restart
-            } else {
-                Basis::Filled
-            };
-            if matches!(t.at, At::Unknown { .. } | At::Intent) {
+            let settled = matches!(t.at, At::Unknown { .. } | At::Intent);
+            if settled {
                 t.at = At::Live;
-                t.carried = false;
             }
             t.reported += qty;
             let side = t.order.request.side;
@@ -1622,7 +1610,7 @@ impl Core {
                 close_out: false,
             }));
             if let Some(stop) = has_stop {
-                self.protect(id, filled, price, basis);
+                self.protect(id, filled, price, Basis::Filled);
                 if let Some(s) = self.book.orders.get_mut(&stop.id.0)
                     && s.announced != s.sent
                 {
@@ -1632,13 +1620,18 @@ impl Core {
                     events.push(BrokerEvent::Placed(s.order.clone()));
                 }
             }
+            // The fill settles an order carried over a restart once it is protected, so no close
+            // at market goes out for this fill.
+            if settled {
+                self.tracked(id).carried = false;
+            }
         }
         Ok(())
     }
 
     /// Asks the venue about each order whose outcome is unknown: adopted when it holds the id (one
-    /// carried over a restart as going live adopts one), refused when two asks find nothing, and
-    /// a fault after [`UNKNOWN_TRIES`] failed asks.
+    /// carried over a restart as going live adopts one, and settled once adopted), refused when
+    /// two asks find nothing, and a fault after [`UNKNOWN_TRIES`] failed asks.
     fn resolve_unknown(&mut self) {
         let unknown: Vec<(OrderId, u32)> = self
             .book
@@ -1653,8 +1646,9 @@ impl Core {
             let tries = tries.saturating_add(1);
             match self.find(id) {
                 Ok(Some(found)) => {
-                    let carried = std::mem::take(&mut self.tracked(id).carried);
-                    self.adopt(id, &found, carried)
+                    let carried = self.book.orders[&id.0].carried;
+                    self.adopt(id, &found, carried);
+                    self.tracked(id).carried = false;
                 }
                 Ok(None) => self.refuse(id, NOT_HELD),
                 Err(e) if tries >= UNKNOWN_TRIES => self.raise(
@@ -2289,22 +2283,55 @@ impl Core {
             .filter(|t| t.open && matches!(t.at, At::Intent | At::Unknown { .. }))
             .map(|t| t.order.id)
             .collect();
+        // Entries' stops sent with an unknown outcome, with their entries.
+        let unsettled: Vec<(OrderId, OrderId)> = self
+            .book
+            .orders
+            .values()
+            .filter_map(|e| {
+                let stop = e.order.attached_stop?.id;
+                let at = self.book.orders.get(&stop.0)?.at;
+                (at == At::Unsettled).then_some((e.order.id, stop))
+            })
+            .collect();
+        // Each is carried over the restart until the venue settles it, so no close at market goes
+        // out meanwhile, not even for a fill the adoptions below protect.
+        for &id in intents.iter().chain(unsettled.iter().map(|(_, stop)| stop)) {
+            self.tracked(id).carried = true;
+        }
         // The record may say an order was sent, or the crashed run may have sent it after the
         // last record; only the venue knows. Nothing is sent from the record.
         for id in intents {
             match self.find(id) {
-                Ok(Some(found)) => self.adopt(id, &found, true),
+                Ok(Some(found)) => {
+                    self.adopt(id, &found, true);
+                    self.tracked(id).carried = false;
+                }
                 Ok(None) => {
                     let order = &self.book.orders[&id.0].order;
                     let why = unsupported(&order.request, order.attached_stop.is_some());
                     self.refuse(id, why.unwrap_or(RESTARTED));
                 }
                 // The reads settle it once live, under the same rule as here.
-                Err(_) => {
-                    let t = self.tracked(id);
-                    t.at = At::Unknown { tries: 1 };
-                    t.carried = true;
+                Err(_) => self.tracked(id).at = At::Unknown { tries: 1 },
+            }
+        }
+        // A stop whose outcome is unknown is taken if the venue holds it and held as unplaced if
+        // two looks find nothing, so the entry's first confirmed fill finds it settled. One the
+        // venue cannot be asked about stays carried, and that fill asks again.
+        for (entry, id) in unsettled {
+            match self.find(id) {
+                Ok(Some(found)) => {
+                    self.take_stop(entry, Role::Order, &found);
                 }
+                Ok(None) => {
+                    self.unplaced(id);
+                    self.tracked(id).carried = false;
+                }
+                // shortcut: one whose entry never fills is never asked about again, so it stays
+                // carried and no close at market goes out for the rest of the session. Ask about
+                // it on each bar's reads, as for an entry of unknown outcome, if that matters.
+                Err(_) => {}
             }
         }
         // A venue that cannot be read now is reconciled on the next bar, as any bar's reads.

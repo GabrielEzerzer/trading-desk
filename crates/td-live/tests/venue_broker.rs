@@ -1692,21 +1692,22 @@ fn a_confirmed_fill_whose_stop_outcome_is_unknown_and_cover_refused_is_closed_an
 }
 
 /// Faults that hide the venue's order lists, so an entry's fill cannot be confirmed, let the
-/// entry's create through, and lose the answer to its stop's create after the venue applied it.
-fn blind_and_lose_the_stop(mock: &Arc<MockVenue>) -> Act {
+/// entry's create through, and lose the answer to its stop's create with `lost`: after the venue
+/// applied it, or before.
+fn blind_and_lose_the_stop(mock: &Arc<MockVenue>, lost: Fault) -> Act {
     let mock = mock.clone();
     run(move || {
         mock.inject_always(REALTIME, Fault::DropBeforeApply);
         mock.inject_always(HISTORY, Fault::DropBeforeApply);
         mock.inject(CREATE, Fault::Hang(Duration::ZERO));
-        mock.inject(CREATE, Fault::DropAfterApply);
+        mock.inject(CREATE, lost.clone());
     })
 }
 
 #[test]
 fn a_stop_of_unknown_outcome_before_the_fill_is_confirmed_is_looked_up_not_sent_again() {
     let mock = venue();
-    let lose = blind_and_lose_the_stop(&mock);
+    let lose = blind_and_lose_the_stop(&mock, Fault::DropAfterApply);
     let mut rig = Rig::with(
         mock,
         vec![
@@ -2228,4 +2229,122 @@ fn a_record_without_the_quantity_owed_a_stop_or_owing_more_than_its_position_is_
     assert!(fault.message.contains("owes a stop"), "{fault}");
     assert!(handle.go_live().is_err());
     assert_eq!(rig.sends(), sends);
+}
+
+/// A live run of one bar whose entry with a stop fills unconfirmed and whose stop's create is lost
+/// with `lost`, so the stop's outcome is unknown when the run stops; with its record.
+fn unsettled_stop_before_restart(lost: Fault) -> (Rig, Vec<String>) {
+    let mock = venue();
+    let lose = blind_and_lose_the_stop(&mock, lost);
+    let mut rig = Rig::with(
+        mock,
+        vec![
+            (0, lose),
+            (
+                0,
+                Act::SubmitWithStop(market(Side::Buy, 0.004, false), 60000.0),
+            ),
+        ],
+    );
+    let records = run_recorded(&mut rig, 1);
+    rig.mock.clear_faults();
+    assert!(records[0].contains("\"Unsettled\""), "{}", records[0]);
+    assert_eq!(rig.mock.position(SYMBOL), 0.004);
+    (rig, records)
+}
+
+#[test]
+fn after_a_restart_a_stop_of_unknown_outcome_whose_cover_is_refused_closes_nothing_and_faults() {
+    let (rig, records) = unsettled_stop_before_restart(Fault::DropBeforeApply);
+    let (mut session, handle) = replayed(&rig, &records);
+    // Going live cannot ask about the stop, so it stays unresolved.
+    rig.mock.inject_always(REALTIME, Fault::DropBeforeApply);
+    handle.go_live().unwrap();
+    rig.mock.clear_faults();
+    // The first live bar reads the entry's fill; the venue does not show the stop and refuses its
+    // cover.
+    rig.mock.inject(CREATE, Fault::Answer(10001));
+    session.on_bar(rig.candle(1, PRICE), &[]).unwrap();
+    let fault = handle.fault().expect("faulted");
+    assert_eq!(fault.kind, FaultKind::ProtectionFailed, "{fault}");
+    assert!(
+        fault.message.contains("t-s2") && fault.message.contains("no close at market"),
+        "{fault}"
+    );
+    assert!(rig.mock.orders_with_link_id("t-c2").is_empty(), "no close");
+    assert_eq!(rig.mock.position(SYMBOL), 0.004);
+}
+
+#[test]
+fn going_live_asks_about_a_stop_of_unknown_outcome_so_the_first_fill_finds_it_settled() {
+    // Applied before the restart, it is kept; never applied, the fill's stop goes out under the
+    // cover id with no fault, as for a stop the venue refused.
+    for (lost, kept) in [
+        (Fault::DropAfterApply, true),
+        (Fault::DropBeforeApply, false),
+    ] {
+        let (rig, records) = unsettled_stop_before_restart(lost);
+        let (mut session, handle) = replayed(&rig, &records);
+        handle.go_live().unwrap();
+        session.on_bar(rig.candle(1, PRICE), &[]).unwrap();
+        assert_eq!(handle.fault(), None, "kept {kept}");
+        let (resting, other) = if kept {
+            ("t-o2", "t-s2")
+        } else {
+            ("t-s2", "t-o2")
+        };
+        let stop = rig.mock.orders_with_link_id(resting);
+        assert_eq!(stop.len(), 1, "kept {kept}");
+        assert_eq!(stop[0].status, "Untriggered");
+        assert_eq!(stop[0].qty, 0.004);
+        assert!(
+            rig.mock.orders_with_link_id(other).is_empty(),
+            "kept {kept}"
+        );
+        assert_eq!(session.orders()[1].status, OrderStatus::Open);
+    }
+}
+
+#[test]
+fn going_live_closes_nothing_for_an_adopted_entry_whose_stop_is_refused() {
+    let slot: Arc<Mutex<Option<VenueHandle>>> = Arc::new(Mutex::new(None));
+    let taken: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let (from, into) = (slot.clone(), taken.clone());
+    let mock = venue();
+    let blind = blind_and_refuse_the_stop(&mock);
+    // The record is taken in the middle of bar 1, before its entry goes out; the entry fills
+    // unconfirmed, its stop is refused, and the live run stops.
+    let mut rig = Rig::with(
+        mock,
+        vec![
+            (
+                1,
+                run(move || {
+                    let handle = from.lock().unwrap().clone().unwrap();
+                    let text = serde_json::to_string(&handle.take_record()).unwrap();
+                    into.lock().unwrap().push(text);
+                }),
+            ),
+            (1, blind),
+            (
+                1,
+                Act::SubmitWithStop(market(Side::Buy, 0.004, false), 60000.0),
+            ),
+        ],
+    );
+    *slot.lock().unwrap() = Some(rig.handle.clone());
+    let mut records = run_recorded(&mut rig, 1);
+    rig.bar();
+    records.extend(taken.lock().unwrap().iter().cloned());
+    rig.mock.clear_faults();
+    assert!(rig.mock.orders_with_link_id("t-o2").is_empty());
+    assert_eq!(rig.mock.position(SYMBOL), 0.004);
+    let (_session, handle) = replayed(&rig, &records);
+    // Going live adopts the entry and places its stop, which the venue refuses.
+    rig.mock.inject(CREATE, Fault::Answer(10001));
+    let fault = handle.go_live().expect_err("faulted");
+    assert_eq!(fault.kind, FaultKind::ProtectionFailed, "{fault}");
+    assert!(fault.message.contains("no close at market"), "{fault}");
+    assert!(rig.mock.orders_with_link_id("t-c2").is_empty(), "no close");
+    assert_eq!(rig.mock.position(SYMBOL), 0.004);
 }
