@@ -643,7 +643,7 @@ pub fn run_battery(
                 _ => None,
             },
             return_without_best_trade: breakdown.return_without_best_trade,
-            worst_daily_loss: worst_daily_loss(&series, &wf.equity_extremes, cash),
+            worst_daily_loss: worst_daily_loss(&series, &wf.equity_extremes, cash, None),
             intrabar_drawdown_static: m.static_drawdown_intrabar,
             intrabar_drawdown_trailing: risk::trailing_drawdown(cash, &wf.equity_extremes)
                 .map(|d| d.amount / cash),
@@ -658,14 +658,30 @@ pub fn run_battery(
             attempt,
         } = rule
         {
-            // A firm counts trading days, not calendar days: the days of `daily` with a fill that
-            // passes the firm's test, or with any fill without one.
-            let step = plan.timeframe.duration_ms();
-            let traded = traded_days(
+            // The firm's day, for its daily loss line, its drawdown line's attempts and the
+            // attempt walks alike. Without one, the walks read UTC days, the days of `daily`.
+            let rollover = firm.day_rollover.unwrap_or_default();
+            kind.worst_daily_loss =
+                worst_daily_loss(&series, &wf.equity_extremes, cash, firm.day_rollover);
+            (
+                kind.intrabar_drawdown_static,
+                kind.intrabar_drawdown_trailing,
+            ) = attempt_drawdowns(
                 &series,
+                &wf.equity_extremes,
+                rollover,
+                limits.breach_horizon_days as usize,
+            );
+            let days = risk::daily_pnl(&series, None, rollover);
+            let daily: Vec<f64> = days.iter().map(day_return).collect();
+            // A firm counts trading days, not calendar days: the days with a fill that passes the
+            // firm's test, or with any fill without one.
+            let step = plan.timeframe.duration_ms();
+            let ends: Vec<Millis> = days.iter().map(|d| d.end).collect();
+            let traded = traded_days(
+                &ends,
                 &wf.fills,
                 step,
-                daily.len(),
                 firm.trading_day.as_ref(),
                 cash,
                 base.account_currency,
@@ -690,7 +706,7 @@ pub fn run_battery(
             };
             // The loss limits are checked on each day's lowest equity when the curve has its
             // ranges, and at each daily close when it does not.
-            let lows = daily_lows(&series, &wf.equity_extremes, daily.len());
+            let lows = daily_lows(&series, &wf.equity_extremes, daily.len(), rollover);
             let lows = lows.as_deref();
             kind.limits_inside_day = lows.is_some();
             // The firm rule sets no time limit of its own (see `FirmLimits`), so the pass odds
@@ -1236,25 +1252,32 @@ fn daily_returns(series: &EquitySeries) -> Vec<f64> {
         .collect()
 }
 
-/// Each day's lowest return inside the day, one for each of the `days` days of [`daily_returns`]
-/// of `series`: the day's lowest equity ([`risk::DailyPnl::low_equity`], the lowest bar low of the
-/// bars that close in it) against the previous day's close, at or under the day's return. Days end
-/// at midnight UTC, the boundary of the daily returns and the traded flags. A day that starts with
-/// no equity left has a low of zero, as its return is. `None` without equity ranges, or with
-/// ranges that do not match the curve.
-///
-/// shortcut: days roll over at midnight UTC for the returns, the lows and the flags alike, so a
-/// firm that resets its daily loss limit at another hour splits a dip across midnight
-/// differently; roll all three over at the firm's hour once a rule states it.
+/// One day's return, as [`daily_returns`] takes it: with days ending at midnight UTC, the days of
+/// [`risk::daily_pnl`] give exactly [`daily_returns`].
+fn day_return(day: &risk::DailyPnl) -> f64 {
+    if day.start_equity > 0.0 {
+        day.end_equity / day.start_equity - 1.0
+    } else {
+        0.0
+    }
+}
+
+/// Each day's lowest return inside the day, one for each of the `days` days of `series` ending at
+/// `rollover`: the day's lowest equity ([`risk::DailyPnl::low_equity`], the lowest bar low of the
+/// bars that close in it) against the previous day's close, at or under the day's return. The
+/// battery passes the firm's day, the boundary of the walks' returns and traded flags. A day that
+/// starts with no equity left has a low of zero, as its return is. `None` without equity ranges,
+/// or with ranges that do not match the curve.
 fn daily_lows(
     series: &EquitySeries,
     ranges: &[crate::EquityRange],
     days: usize,
+    rollover: DayRollover,
 ) -> Option<Vec<f64>> {
     if ranges.is_empty() {
         return None;
     }
-    let pnl = risk::daily_pnl(series, Some(ranges), DayRollover::default());
+    let pnl = risk::daily_pnl(series, Some(ranges), rollover);
     (pnl.len() == days).then(|| {
         pnl.iter()
             .map(|d| {
@@ -1268,11 +1291,10 @@ fn daily_lows(
     })
 }
 
-/// Whether the strategy traded on each of the `days` days of [`daily_returns`] of `series`: true
-/// on a day that holds a fill. A fill is stamped with the open of its bar, of `step`
-/// milliseconds, and shows in the equity at the bar's close, so it is put on the day that close
-/// falls on, by [`metrics::daily_equity`]'s boundaries (UTC days, a close at exactly 00:00 ending
-/// the day before): the day whose return it moved.
+/// Whether the strategy traded on each of the days that end at `ends` ([`risk::DailyPnl::end`],
+/// ascending): true on a day that holds a fill. A fill is stamped with the open of its bar, of
+/// `step` milliseconds, and shows in the equity at the bar's close, so it is put on the day that
+/// close falls on, a close exactly at a day's end ending that day: the day whose return it moved.
 ///
 /// With a firm's `test`, only a fill that passes it marks its day ([`TradingDayTest`]). The
 /// fills are replayed per instrument with [`next_position`], the portfolio's rule, to know what
@@ -1288,19 +1310,14 @@ fn daily_lows(
 /// pass the test, so up to one day per window is a trading day the strategy would not have had
 /// if it had held on; skip those fills once a fill says it is a window's close-out.
 fn traded_days(
-    series: &EquitySeries,
+    ends: &[Millis],
     fills: &[Fill],
     step: Millis,
-    days: usize,
     test: Option<&TradingDayTest>,
     cash: f64,
     account: AccountCurrency,
 ) -> Vec<bool> {
-    let mut traded = vec![false; days];
-    let Some(first) = series.times.first() else {
-        return traded;
-    };
-    let first_day = first.div_euclid(DAY_MS);
+    let mut traded = vec![false; ends.len()];
     // Each instrument's signed position and average entry price.
     let mut positions: HashMap<&InstrumentId, (f64, f64)> = HashMap::new();
     for f in fills {
@@ -1319,27 +1336,33 @@ fn traded_days(
         if !counts {
             continue;
         }
-        let day = (f.time + step - 1).div_euclid(DAY_MS) - first_day;
-        if let Some(t) = usize::try_from(day).ok().and_then(|d| traded.get_mut(d)) {
+        // A close after the last day's end is on no day of the curve.
+        let close = f.time + step;
+        if let Some(t) = traded.get_mut(ends.partition_point(|&end| end < close)) {
             *t = true;
         }
     }
     traded
 }
 
-/// The prop-firm worst daily loss inside bars, as a fraction of the starting balance: the worse
-/// of the days ending at midnight UTC and at 17:00 New York, since the rule does not say where its
-/// firm rolls the day over. `None` without equity ranges.
+/// The prop-firm worst daily loss inside bars, as a fraction of the starting balance, on days
+/// ending at `rollover`, the firm's day; without one, the worse of the days ending at midnight UTC
+/// and at 17:00 New York. `None` without equity ranges.
 fn worst_daily_loss(
     series: &EquitySeries,
     ranges: &[crate::EquityRange],
     cash: f64,
+    rollover: Option<DayRollover>,
 ) -> Option<f64> {
     if ranges.is_empty() {
         return None;
     }
-    [DayRollover::default(), DayRollover::NewYork1700]
-        .into_iter()
+    let both = [DayRollover::default(), DayRollover::NewYork1700];
+    rollover
+        .as_ref()
+        .map_or(&both[..], std::slice::from_ref)
+        .iter()
+        .copied()
         .map(|rollover| {
             let days = risk::daily_pnl(series, Some(ranges), rollover);
             risk::worst_daily_loss_intraday(&days, cash)
@@ -1347,6 +1370,58 @@ fn worst_daily_loss(
         .collect::<Option<Vec<f64>>>()?
         .into_iter()
         .reduce(f64::max)
+}
+
+/// The prop-firm max drawdowns, static and then trailing, of the worst attempt of `horizon` days
+/// started on a day of `series` (days ending at `rollover`), each measured inside bars as an
+/// account that starts again on that day sees it: as a fraction of the day's starting equity, the
+/// static fall from that equity to the lowest bar low, and the trailing fall from a peak that
+/// starts there and rises with each bar's high ([`risk::trailing_drawdown`]'s amount). Scaling to
+/// the day's starting equity is what the attempt walks do: they compound each day's return on a
+/// fresh balance of 1. An attempt started fewer than `horizon` days before the curve ends runs to
+/// its end, so a curve shorter than `horizon` is one attempt from the start, the whole-curve
+/// figure. A day that starts with no equity left starts no attempt. `None` without equity ranges,
+/// with ranges that do not match the curve, or when no attempt holds a bar.
+///
+/// shortcut: each attempt rescans its bars, O(days x bars per attempt); fold each day to its low,
+/// high and own fall once if this shows in a battery's run time.
+fn attempt_drawdowns(
+    series: &EquitySeries,
+    ranges: &[crate::EquityRange],
+    rollover: DayRollover,
+    horizon: usize,
+) -> (Option<f64>, Option<f64>) {
+    let (times, values) = (&series.times, &series.values);
+    if ranges.is_empty() || ranges.len() + 1 != values.len() || horizon == 0 {
+        return (None, None);
+    }
+    // The index in `series` of each day's last value, its end equity: the bars that close in day
+    // `d` are `ranges[ends[d - 1]..ends[d]]`, from 0 for the first day.
+    let ends: Vec<usize> = risk::daily_pnl(series, None, rollover)
+        .iter()
+        .map(|d| times.partition_point(|&t| t <= d.end) - 1)
+        .collect();
+    let (fixed, trailing): (Vec<_>, Vec<_>) = (0..ends.len())
+        .filter_map(|day| {
+            let first = if day == 0 { 0 } else { ends[day - 1] };
+            let start = values[first];
+            let bars = &ranges[first..ends[(day + horizon).min(ends.len()) - 1]];
+            (start > 0.0 && !bars.is_empty()).then(|| {
+                (
+                    risk::static_drawdown(start, bars.iter().map(|r| r.low)),
+                    risk::trailing_drawdown(start, bars).map(|d| d.amount / start),
+                )
+            })
+        })
+        .unzip();
+    let worst = |falls: Vec<Option<f64>>| {
+        falls
+            .into_iter()
+            .collect::<Option<Vec<f64>>>()?
+            .into_iter()
+            .reduce(f64::max)
+    };
+    (worst(fixed), worst(trailing))
 }
 
 /// `high_risk`'s risk of ruin from the closed trades of the stitched curve: each trade's net P&L
@@ -2005,34 +2080,226 @@ mod tests {
             range(101.0, 104.0),
         ];
         let daily = daily_returns(&series);
-        let lows = daily_lows(&series, &ranges, daily.len()).unwrap();
+        let utc = DayRollover::default();
+        let lows = daily_lows(&series, &ranges, daily.len(), utc).unwrap();
         assert_eq!(lows, [97.0 / 100.0 - 1.0, 96.9 / 102.0 - 1.0]);
         assert!(lows.iter().zip(&daily).all(|(low, r)| low <= r));
         // Without ranges, or with ranges that do not match the days, there are no lows.
-        assert_eq!(daily_lows(&series, &[], daily.len()), None);
-        assert_eq!(daily_lows(&series, &ranges[..3], daily.len()), None);
-        assert_eq!(daily_lows(&series, &ranges, daily.len() + 1), None);
+        assert_eq!(daily_lows(&series, &[], daily.len(), utc), None);
+        assert_eq!(daily_lows(&series, &ranges[..3], daily.len(), utc), None);
+        assert_eq!(daily_lows(&series, &ranges, daily.len() + 1, utc), None);
+        // On days ending at 06:00 UTC the 12:00 bar's dip to 97 is the second day's, against the
+        // first day's close at 06:00, still 100; the third day starts from 102 at 06:00 on day 2.
+        let six = DayRollover::Utc {
+            offset_minutes: 360,
+        };
+        assert_eq!(
+            daily_lows(&series, &ranges, 3, six),
+            Some(vec![0.0, 97.0 / 100.0 - 1.0, 96.9 / 102.0 - 1.0])
+        );
         // A day that starts with nothing has a low of zero, as its return is.
         let gone = EquitySeries {
             times: vec![DAY_MS, 2 * DAY_MS],
             values: vec![0.0, 0.0],
         };
         assert_eq!(daily_returns(&gone), [0.0]);
-        assert_eq!(daily_lows(&gone, &[range(0.0, 0.0)], 1), Some(vec![0.0]));
+        assert_eq!(
+            daily_lows(&gone, &[range(0.0, 0.0)], 1, utc),
+            Some(vec![0.0])
+        );
+    }
+
+    /// A curve of `values` on bars of `step` from `start`, each bar's range spanning its open and
+    /// its close.
+    fn curve(
+        start: Millis,
+        step: Millis,
+        values: &[f64],
+    ) -> (EquitySeries, Vec<crate::EquityRange>) {
+        let series = EquitySeries {
+            times: (0..values.len() as i64).map(|k| start + k * step).collect(),
+            values: values.to_vec(),
+        };
+        let ranges = values
+            .windows(2)
+            .map(|w| crate::EquityRange {
+                low: w[0].min(w[1]),
+                high: w[0].max(w[1]),
+            })
+            .collect();
+        (series, ranges)
+    }
+
+    /// A prop-firm rule whose firm allows a 6% daily loss and a 20% drawdown measured as
+    /// `drawdown` says, judged at half of each (3% and 10%), with attempts of `horizon` days.
+    fn firm_rule(
+        drawdown: DrawdownMode,
+        horizon: u32,
+        day_rollover: Option<DayRollover>,
+    ) -> VerdictRule {
+        VerdictRule::PropFirm {
+            firm: crate::FirmLimits {
+                daily_loss: 0.06,
+                max_drawdown: 0.20,
+                drawdown,
+                profit_target: 0.08,
+                second_target: None,
+                min_trading_days: 0,
+                best_day_share: None,
+                day_target_share: None,
+                trading_day: None,
+                trailing_floor_lock: None,
+                day_rollover,
+            },
+            limits: crate::PropFirmLimits {
+                breach_horizon_days: horizon,
+                ..crate::PropFirmLimits::default()
+            },
+            attempt: None,
+        }
+    }
+
+    /// The value and outcome of the line `id` of `rule` on `kind`.
+    fn kind_line(rule: &VerdictRule, kind: &KindInputs, id: &str) -> (Option<f64>, Outcome) {
+        let line = crate::evaluate(rule, kind)
+            .into_iter()
+            .find(|l| l.id == id)
+            .unwrap();
+        (line.value, line.outcome)
+    }
+
+    /// A rule that says where its firm's day ends has its daily loss line measure that day only;
+    /// without it the line keeps the worse of the UTC and New York days.
+    #[test]
+    fn the_daily_loss_line_measures_the_firms_day_when_the_rule_states_it() {
+        const HOUR: Millis = 3_600_000;
+        // 3 January 2024, outside US daylight saving: 17:00 New York is 22:00 UTC.
+        let start = 19_725 * DAY_MS;
+        // Hourly closes over two days from midnight UTC, flat at 100 but for a fall of 1 an hour
+        // for four hours from `from` hours on.
+        let falling = |from: usize| {
+            let values: Vec<f64> = (0..=48usize)
+                .map(|h| 100.0 - h.saturating_sub(from).min(4) as f64)
+                .collect();
+            curve(start, HOUR, &values)
+        };
+        let line = |(series, ranges): &(EquitySeries, Vec<crate::EquityRange>), rollover| {
+            let kind = KindInputs {
+                worst_daily_loss: worst_daily_loss(series, ranges, 100.0, rollover),
+                ..KindInputs::default()
+            };
+            let rule = firm_rule(DrawdownMode::Static, 90, rollover);
+            kind_line(&rule, &kind, "worst_daily_loss")
+        };
+        let (utc, ny) = (Some(DayRollover::default()), Some(DayRollover::NewYork1700));
+        // From 22:00 to 02:00 UTC: 2% on each UTC day, 4% on the New York day that starts at
+        // 22:00.
+        let late = falling(22);
+        assert_eq!(line(&late, None), (Some(0.04), Outcome::Fail));
+        assert_eq!(line(&late, utc), (Some(0.02), Outcome::Pass));
+        assert_eq!(line(&late, ny), (Some(0.04), Outcome::Fail));
+        // From 20:00 to 24:00 UTC: 4% on the UTC day, 2% on each New York day around 22:00.
+        let early = falling(20);
+        assert_eq!(line(&early, None), (Some(0.04), Outcome::Fail));
+        assert_eq!(line(&early, ny), (Some(0.02), Outcome::Pass));
+        assert_eq!(line(&early, utc), (Some(0.04), Outcome::Fail));
+    }
+
+    /// The drawdown line reads the worst attempt of the breach horizon's length started on a day
+    /// of the curve, each from its own starting balance, not the whole curve as one account.
+    #[test]
+    fn the_drawdown_line_reads_the_worst_attempt_not_the_whole_curve() {
+        // Daily closes from 100, each `(days, step)` moving the balance by `step` a day.
+        let path = |legs: &[(usize, f64)]| -> Vec<f64> {
+            let mut values = vec![100.0];
+            for &(days, step) in legs {
+                for _ in 0..days {
+                    values.push(values[values.len() - 1] * (1.0 + step));
+                }
+            }
+            values
+        };
+        let utc = DayRollover::default();
+        let line = |values: &[f64], drawdown| {
+            let (series, ranges) = curve(10 * DAY_MS, DAY_MS, values);
+            let (fixed, trailing) = attempt_drawdowns(&series, &ranges, utc, 10);
+            let kind = KindInputs {
+                intrabar_drawdown_static: fixed,
+                intrabar_drawdown_trailing: trailing,
+                ..KindInputs::default()
+            };
+            kind_line(&firm_rule(drawdown, 10, None), &kind, "max_drawdown")
+        };
+        let near = |(value, _): (Option<f64>, Outcome), want: f64| {
+            assert!(
+                (value.unwrap() - want).abs() < 1e-12,
+                "{value:?} against {want}"
+            );
+        };
+        let whole = |values: &[f64]| {
+            let (series, ranges) = curve(10 * DAY_MS, DAY_MS, values);
+            let fixed = metrics_static(&series, &ranges);
+            let trailing = risk::trailing_drawdown(100.0, &ranges).unwrap().amount / 100.0;
+            (fixed, trailing)
+        };
+
+        // A slide of 1% a day for 20 days, then a steady rise: 18% under the first balance, over
+        // the 10% limit, but no 10-day attempt loses more than 1 - 0.99^10, 9.6%.
+        let slide = path(&[(20, -0.01), (60, 0.01)]);
+        assert!(whole(&slide).0 > 0.18);
+        assert_eq!(line(&slide, DrawdownMode::Static).1, Outcome::Pass);
+        near(line(&slide, DrawdownMode::Static), 1.0 - 0.99f64.powi(10));
+        // A fall of 2.5% a day for five days after a rise never goes under the first balance, but
+        // an attempt started at the top loses 1 - 0.975^5, 11.9%.
+        let drop = path(&[(30, 0.01), (5, -0.025), (30, 0.01)]);
+        assert_eq!(whole(&drop).0, 0.0);
+        assert_eq!(line(&drop, DrawdownMode::Static).1, Outcome::Fail);
+        near(line(&drop, DrawdownMode::Static), 1.0 - 0.975f64.powi(5));
+
+        // Trailing: a rise and then the same slide is 24% of the first balance under the top,
+        // but no attempt falls more than 9.6% of its own start from its own peak.
+        let top = path(&[(30, 0.01), (20, -0.01)]);
+        assert!(whole(&top).1 > 0.24);
+        assert_eq!(line(&top, DrawdownMode::Trailing).1, Outcome::Pass);
+        near(line(&top, DrawdownMode::Trailing), 1.0 - 0.99f64.powi(10));
+        // A rise to 120 and a fall to 109 inside one attempt is 11% of that attempt's start under
+        // its peak. Static, no attempt loses more than 11 of the 120 it starts at the top with.
+        let mut spike = vec![100.0, 105.0, 110.0, 115.0, 120.0, 116.0, 112.0, 109.0];
+        spike.extend([109.0; 20]);
+        assert_eq!(line(&spike, DrawdownMode::Trailing).1, Outcome::Fail);
+        near(line(&spike, DrawdownMode::Trailing), 0.11);
+        assert_eq!(line(&spike, DrawdownMode::Static).1, Outcome::Pass);
+        near(line(&spike, DrawdownMode::Static), 11.0 / 120.0);
+
+        // A curve shorter than one attempt is one attempt from the start: the whole-curve figures.
+        let (series, ranges) = curve(10 * DAY_MS, DAY_MS, &slide[..8]);
+        let (fixed, trailing) = whole(&slide[..8]);
+        assert_eq!(
+            attempt_drawdowns(&series, &ranges, utc, 10),
+            (Some(fixed), Some(trailing))
+        );
+        // Without ranges, or with ranges that do not match the curve, there is no figure.
+        assert_eq!(attempt_drawdowns(&series, &[], utc, 10), (None, None));
+        assert_eq!(
+            attempt_drawdowns(&series, &ranges[1..], utc, 10),
+            (None, None)
+        );
+    }
+
+    /// The static drawdown of the whole curve from its first value, inside bars, as the metrics
+    /// report it.
+    fn metrics_static(series: &EquitySeries, ranges: &[crate::EquityRange]) -> f64 {
+        risk::static_drawdown(series.values[0], ranges.iter().map(|r| r.low)).unwrap()
     }
 
     /// The days, counted from 1, that `traded_days` marks for `fills` on hourly bars, over five
     /// days that start at day 1's midnight, on a quote account of 10,000.
     fn flagged_days(fills: &[Fill], test: Option<TradingDayTest>) -> Vec<usize> {
-        let series = EquitySeries {
-            times: vec![DAY_MS],
-            values: vec![10_000.0],
-        };
+        let ends: Vec<Millis> = (2..=6).map(|d| d * DAY_MS).collect();
         let traded = traded_days(
-            &series,
+            &ends,
             fills,
             3_600_000,
-            5,
             test.as_ref(),
             10_000.0,
             td_core::AccountCurrency::Quote,
@@ -2158,6 +2425,7 @@ mod tests {
             day_target_share: None,
             trading_day: None,
             trailing_floor_lock: None,
+            day_rollover: None,
         };
         let rule = VerdictRule::PropFirm {
             firm,
@@ -2178,15 +2446,18 @@ mod tests {
         let series = EquitySeries::new(cash, &wf.equity, plan.timeframe);
         let daily = daily_returns(&series);
         let step = plan.timeframe.duration_ms();
+        let days = risk::daily_pnl(&series, None, DayRollover::default());
+        let ends: Vec<Millis> = days.iter().map(|d| d.end).collect();
         let traded = traded_days(
-            &series,
+            &ends,
             &wf.fills,
             step,
-            daily.len(),
             None,
             cash,
             td_core::AccountCurrency::Quote,
         );
+        // On UTC days the firm's days are the daily returns' own, to the last bit.
+        assert_eq!(days.iter().map(day_return).collect::<Vec<_>>(), daily);
         // A four-hour bar lies inside one UTC day, so a fill's day is the day its bar opened.
         let first = series.times[0].div_euclid(DAY_MS);
         let filled: BTreeSet<usize> = wf
@@ -2220,7 +2491,13 @@ mod tests {
                 mean_block: stats::default_block_len(daily.len()),
                 seed: derive_seed(seed, SEED_PROP_FIRM),
             };
-            let lows = daily_lows(&series, &wf.equity_extremes, daily.len()).unwrap();
+            let lows = daily_lows(
+                &series,
+                &wf.equity_extremes,
+                daily.len(),
+                DayRollover::default(),
+            )
+            .unwrap();
             stats::prop_firm_odds(&daily, Some(&lows), traded, &spec).unwrap()
         };
         let fills = odds(&traded);
@@ -2230,6 +2507,90 @@ mod tests {
         assert!(
             fills.pass < every_day.pass,
             "{fills:?} against {every_day:?}"
+        );
+    }
+
+    /// A rule that states its firm's day has the attempt walks read that day: each day's return,
+    /// its low and its trading-day flag, and the daily loss and drawdown lines measure it too.
+    #[test]
+    fn the_attempt_walks_read_the_firms_day() {
+        let (plan, bars) = sma_plan(sma_axes());
+        let seed = 7;
+        let ny = DayRollover::NewYork1700;
+        let VerdictRule::PropFirm { firm, limits, .. } =
+            firm_rule(DrawdownMode::Static, 90, Some(ny))
+        else {
+            unreachable!()
+        };
+        let firm = crate::FirmLimits {
+            daily_loss: 0.05,
+            max_drawdown: 0.10,
+            profit_target: 0.02,
+            min_trading_days: 20,
+            ..firm
+        };
+        let rule = VerdictRule::PropFirm {
+            firm,
+            limits,
+            attempt: None,
+        };
+        let spec = BatterySpec {
+            strategy: "sma_cross",
+            plan: &plan,
+            rule: &rule,
+            instrument: &test_instrument(),
+            seed,
+        };
+        let r = run_battery(&spec, &bars, &[], &[], None).unwrap();
+
+        let wf = r.walk_forward.as_ref().unwrap();
+        let cash = plan.backtest.starting_cash;
+        let series = EquitySeries::new(cash, &wf.equity, plan.timeframe);
+        let odds = |rollover| {
+            let days = risk::daily_pnl(&series, None, rollover);
+            let daily: Vec<f64> = days.iter().map(day_return).collect();
+            let ends: Vec<Millis> = days.iter().map(|d| d.end).collect();
+            let step = plan.timeframe.duration_ms();
+            let traded = traded_days(
+                &ends,
+                &wf.fills,
+                step,
+                None,
+                cash,
+                td_core::AccountCurrency::Quote,
+            );
+            let lows = daily_lows(&series, &wf.equity_extremes, daily.len(), rollover).unwrap();
+            let spec = PropFirmSpec {
+                target: firm.profit_target,
+                second_target: None,
+                min_days: firm.min_trading_days as usize,
+                best_day_share: None,
+                day_target_share: None,
+                trailing_lock: None,
+                daily_loss_limit: firm.daily_loss,
+                max_drawdown: firm.max_drawdown,
+                drawdown: stats::DrawdownMode::Static,
+                horizon_days: 90,
+                paths: DEFAULT_RESAMPLES,
+                mean_block: stats::default_block_len(daily.len()),
+                seed: derive_seed(seed, SEED_PROP_FIRM),
+            };
+            stats::prop_firm_odds(&daily, Some(&lows), &traded, &spec).unwrap()
+        };
+        assert_eq!(r.prop_firm_odds, Some(odds(ny)));
+        // The four-hour bars close at 00:00 UTC, after 17:00 New York, so the days differ.
+        assert_ne!(r.prop_firm_odds, Some(odds(DayRollover::default())));
+        let extremes = &wf.equity_extremes;
+        assert_eq!(
+            r.kind.worst_daily_loss,
+            worst_daily_loss(&series, extremes, cash, Some(ny))
+        );
+        assert_eq!(
+            (
+                r.kind.intrabar_drawdown_static,
+                r.kind.intrabar_drawdown_trailing
+            ),
+            attempt_drawdowns(&series, extremes, ny, 90)
         );
     }
 
