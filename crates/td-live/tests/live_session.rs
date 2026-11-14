@@ -2839,7 +2839,10 @@ fn start_refuses_a_verdict_judged_with_a_series() {
          series yet"
     );
     for (extra, also) in [
-        (&[][..], "name a verdict judged without series with --verdict"),
+        (
+            &[][..],
+            "name a verdict judged without series with --verdict",
+        ),
         (&["--verdict", NEWER][..], ""),
     ] {
         let (code, text) = rig.start_linked(&feed, "refused", extra);
