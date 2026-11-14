@@ -30,7 +30,7 @@ pub struct Context<'a> {
     pub(crate) slippage_bps: f64,
     pub(crate) max_leverage: f64,
     pub(crate) portfolio: &'a Portfolio,
-    /// The funding events fed with the live bars so far, oldest first; see [`Context::funding`].
+    /// The funding events fed with the bars so far, oldest first; see [`Context::funding`].
     pub(crate) funding: &'a [(Millis, f64)],
     pub(crate) broker: &'a mut dyn Broker,
     pub(crate) orders: &'a mut Vec<Order>,
@@ -108,22 +108,21 @@ impl Context<'_> {
     }
 
     /// The funding rates settled on this instrument so far, as `(time, rate)`, oldest first: every
-    /// event the session has applied to the position, which is the series the cost model charges
-    /// (a rate charged on a flat position is still here). In a backtest the time is the
-    /// settlement time; a paper session gives a rate published after its own bar closed with a
-    /// later bar, at a time inside that bar.
+    /// event fed to the session with a bar, warm-up bars included. From the first live bar on,
+    /// that is the series the cost model charges (a rate charged on a flat position is still
+    /// here); the warm-up bars' events, and those in a gap between the last warm-up bar and the
+    /// first live bar, are only history, since nothing is held before the first live bar. In a
+    /// backtest the time is the settlement time; a paper session gives a rate published after its
+    /// own bar closed with a later bar, at a time inside that bar, and a rate due in a gap before a
+    /// bar at that bar's open.
     ///
-    /// The series ends at the last settlement strictly before the current bar's close, the
-    /// current bar's `open_time` plus the timeframe: a bar takes the events in its own window and
-    /// in the gap before it, and a settlement due exactly at the close is the next bar's open, so
-    /// it is charged, and visible, on the next bar. It is empty for a kind without funding (spot,
-    /// FX), on every warm-up bar, where nothing is charged, and until the first settlement of the
-    /// first live bar, which takes no funding from before its open (see [`crate::Session::on_bar`]).
-    ///
-    /// shortcut: a strategy sees no funding from before its first live bar, so a rule that looks
-    /// back over funding has its own warm-up from there. Feed the warm-up bars' funding to the
-    /// session as visible but not charged, and add it to the result's data fingerprint, when a
-    /// strategy needs that history from its first live bar.
+    /// The series runs from the first bar fed, warm-up or live, which takes no funding from before
+    /// its open (see [`crate::Session::on_bar`]), to the last settlement strictly before the
+    /// current bar's close, the current bar's `open_time` plus the timeframe: a bar takes the
+    /// events in its own window and in the gap before it, and a settlement due exactly at the close
+    /// is the next bar's open, so it is visible on the next bar. A backtest feeds every event from
+    /// its first warm-up bar's open, and a paper session the venue's rates from its first warm-up
+    /// bar. It is empty for a kind without funding (spot, FX).
     pub fn funding(&self) -> &[(Millis, f64)] {
         self.funding
     }

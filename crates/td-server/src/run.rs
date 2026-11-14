@@ -200,6 +200,10 @@ async fn drive(
             s.live_from().is_some(),
         )
     };
+    // A warm-up that reads the funding rates gives the clock its start from the same rates, and
+    // leaves the rates after its last bar for the first live bar.
+    let mut warmed = None;
+    let mut after_warm_up = Vec::new();
     let start = match next {
         Some(next) if live => next,
         // Never live: warm up, or finish a warm-up the log holds part of, then go live from now.
@@ -211,18 +215,34 @@ async fn drive(
             let from = next.map_or(earliest, |n| n.max(earliest));
             let store = Store::new(data_dir);
             let bars = warm_up_bars(shared, store, &rest, &id, timeframe, from, end).await?;
+            // The strategy sees every rate from where its bars begin, the end of the log or the
+            // first warm-up bar, each fed with the bar it falls in or the next, uncharged. Without a
+            // bar fed before the first live bar, that bar takes no funding from before its open.
+            let mut rates = Vec::new();
+            if let Some(seen_from) = next.or(bars.first().map(|b| b.open_time))
+                && id.kind.rules().funding
+            {
+                let lookback = seen_from.min(end - FUNDING_LOOKBACK);
+                rates = warm_up_funding(shared, &rest, &id, lookback, end).await?;
+                warmed = Some(FundingClock::new(&rates, end));
+                rates.retain(|&(time, _)| time >= seen_from);
+            }
+            let mut rates = rates.into_iter().peekable();
             let mut s = lock(shared);
             for bar in bars {
-                s.feed(bar, Vec::new(), true)?;
+                let bar_end = bar.open_time + timeframe.duration_ms();
+                let due = std::iter::from_fn(|| rates.next_if(|&(time, _)| time < bar_end));
+                s.feed(bar, funding_at(due, bar.open_time), true)?;
             }
+            after_warm_up.extend(rates);
             end
         }
     };
 
-    let mut funding = if id.kind.rules().funding {
-        Some(funding_clock(shared, &rest, &id, start).await)
-    } else {
-        None
+    let mut funding = match warmed {
+        Some(clock) => Some(clock),
+        None if id.kind.rules().funding => Some(funding_clock(shared, &rest, &id, start).await),
+        None => None,
     };
 
     lock(shared).set_status(Status::Reconnecting);
@@ -256,13 +276,13 @@ async fn drive(
                  the closed minutes among them are backfilled"
             )),
             FeedEvent::Bar(bar) => {
-                let charged = match &mut funding {
-                    Some(clock) => {
-                        let mut warn = |w| lock(shared).warn(w);
-                        clock.for_bar(&rest, &id, timeframe, &bar, &mut warn).await
-                    }
-                    None => Vec::new(),
-                };
+                // Rates after the last warm-up bar, missing from the feed's history, go with the
+                // first live bar, charged at its open on the flat position warm-up leaves.
+                let mut charged = funding_at(after_warm_up.drain(..), bar.open_time);
+                if let Some(clock) = &mut funding {
+                    let mut warn = |w| lock(shared).warn(w);
+                    charged.extend(clock.for_bar(&rest, &id, timeframe, &bar, &mut warn).await);
+                }
                 feed_live(&session, bar, charged).await?;
             }
         }
@@ -340,6 +360,44 @@ async fn warm_up_bars(
     // Bars are fed as they are; one that fails validation would stop the session, so skip it.
     bars.retain(|b| b.validate().is_ok());
     Ok(bars)
+}
+
+/// The funding rates in `[from, to)` for a warm-up, sorted, over REST: one request, retried as
+/// [`warm_up_bars`] retries, so the strategy never sees a series with rates missing.
+async fn warm_up_funding(
+    shared: &Mutex<PaperSession>,
+    rest: &Arc<dyn Rest>,
+    id: &InstrumentId,
+    from: Millis,
+    to: Millis,
+) -> Result<Vec<(Millis, f64)>, PaperError> {
+    let (rest, id) = (Arc::clone(rest), id.clone());
+    let mut rates = retry_rest(
+        move || rest.funding(&id, from, to),
+        |error| {
+            lock(shared).warn(format!("warm-up funding failed, retrying: {error}"));
+            std::future::ready(Ok::<(), PaperError>(()))
+        },
+    )
+    .await?;
+    // As `FundingClock::take` keeps them.
+    rates.retain(|&(time, rate)| (from..to).contains(&time) && rate.is_finite());
+    rates.sort_by_key(|&(time, _)| time);
+    rates.dedup_by_key(|&mut (time, _)| time);
+    Ok(rates)
+}
+
+/// Funding for the bar opening at `open` from rates `(due, rate)` due inside it or before it,
+/// given to the engine at the open when due before it, as [`FundingClock::take`] gives them.
+fn funding_at(rates: impl IntoIterator<Item = (Millis, f64)>, open: Millis) -> Vec<Funding> {
+    rates
+        .into_iter()
+        .map(|(due, rate)| Funding {
+            time: due.max(open),
+            rate,
+            due,
+        })
+        .collect()
 }
 
 /// Sets up funding tracking for a perpetual going live at `start`: the venue's recent rates give

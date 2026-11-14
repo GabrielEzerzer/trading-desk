@@ -17,8 +17,9 @@ use td_engine::{
     SessionConfig, Strategy, build_strategy, run_backtest,
 };
 use td_server::{
-    Funding, MANUAL_STRATEGY, ManualError, ManualOrder, ManualOrderType, OrderSource, PaperConfig,
-    PaperError, PaperHandle, PaperSession, SessionEvent, Status, TradeSource, paper_dir,
+    FedBar, Funding, MANUAL_STRATEGY, ManualError, ManualOrder, ManualOrderType, OrderSource,
+    PaperConfig, PaperError, PaperHandle, PaperSession, SessionEvent, Status, TradeSource,
+    paper_dir,
 };
 use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::Message;
@@ -665,6 +666,28 @@ async fn live_session_stops_and_resumes(kind: InstrumentKind) {
             .count(),
         history.len()
     );
+    // Each warm-up line carries the venue's rates due in its bar, from the first warm-up bar's
+    // open on, so the strategy sees them and a replay feeds them again: here the rate due at the
+    // first warm-up bar's open, an hour before the session went live. They are not charged.
+    let warm_up_funding: Vec<(Millis, Vec<Funding>)> = log
+        .lines()
+        .map(|l| serde_json::from_str::<FedBar>(l).expect("a bar line"))
+        .filter(|fed| fed.warm_up && !fed.funding.is_empty())
+        .map(|fed| (fed.bar.open_time, fed.funding))
+        .collect();
+    if kind == InstrumentKind::Perpetual {
+        let due = T0 - HOUR;
+        let rate = funding.iter().find(|f| f.0 == due).expect("a rate").1;
+        assert_eq!(history[0].open_time, due);
+        let fed = Funding {
+            time: due,
+            rate,
+            due,
+        };
+        assert_eq!(warm_up_funding, [(due, vec![fed])]);
+    } else {
+        assert!(warm_up_funding.is_empty());
+    }
 
     // Second run, after minutes 70 to 149 went by while stopped, the funding time at 02:00
     // among them: REST backfills them.
@@ -677,7 +700,11 @@ async fn live_session_stops_and_resumes(kind: InstrumentKind) {
     let ref_dir = tempfile::tempdir().expect("temp dir");
     let mut reference = PaperSession::create(ref_dir.path(), "ref", cfg).expect("creates");
     for bar in &history {
-        reference.feed(*bar, Vec::new(), true).expect("warm-up bar");
+        let funding = warm_up_funding
+            .iter()
+            .find(|(open, _)| *open == bar.open_time)
+            .map_or_else(Vec::new, |(_, funding)| funding.clone());
+        reference.feed(*bar, funding, true).expect("warm-up bar");
     }
     feed_all(
         &mut reference,
@@ -717,6 +744,36 @@ async fn a_live_spot_session_warms_up_trades_stops_and_resumes_with_the_missed_m
 #[tokio::test(flavor = "multi_thread")]
 async fn a_live_perpetual_session_resumed_across_a_funding_time_charges_each_rate_once() {
     live_session_stops_and_resumes(InstrumentKind::Perpetual).await;
+}
+
+/// A rate due after the last warm-up bar the venue gave, before the session went live, comes with
+/// the first live bar, at its open, so the strategy still sees it. Nothing is held then, so it
+/// costs nothing, and the funding clock does not give it again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rate_due_after_the_last_warm_up_bar_comes_with_the_first_live_bar() {
+    let tf = Timeframe::M5;
+    // The venue's bars stop an hour before the session goes live at T0.
+    let history = resample(InstrumentKind::Spot, &minutes(-120..-60), tf, false).candles;
+    let (before, after, live) = ((T0 - 2 * HOUR, 0.0001), (T0 - HOUR, 0.0003), (T0, 0.0002));
+    let rest = Arc::new(FakeRest {
+        funding: vec![before, after, live],
+        ..FakeRest::new(minutes(0..30), history, T0 + 30_000)
+    });
+    let dir = tempfile::tempdir().expect("temp dir");
+    let cfg = config(InstrumentKind::Perpetual, tf);
+    let paper = PaperSession::create(dir.path(), "gap", cfg).expect("creates");
+    let stream: Vec<String> = minutes(0..20).iter().map(frame).collect();
+    let handle = td_server::start_with_stream(paper, rest, serve(stream).await);
+    wait_for_bar(&handle, T0 + 10 * MIN).await;
+    let session = unwrap_session(handle.stop().await);
+    assert_eq!(session.live_from(), Some(T0));
+    let charged = |(due, rate): (Millis, f64)| Funding {
+        time: T0,
+        rate,
+        due,
+    };
+    assert_eq!(session.funding(), [charged(after), charged(live)]);
+    assert_eq!(session.portfolio().funding_paid(), 0.0);
 }
 
 #[tokio::test(flavor = "multi_thread")]

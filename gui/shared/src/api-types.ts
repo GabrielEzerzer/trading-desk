@@ -231,8 +231,8 @@ engine_version: string,
  */
 engine_revision: number, 
 /**
- * SHA-256 of the bars (warm-up bars first), asks and funding the run used; see
- * [`data_fingerprint`].
+ * SHA-256 of the bars (warm-up bars first), asks and funding the run used, the funding being
+ * every event the strategy could see; see [`data_fingerprint`].
  */
 data_fingerprint: string, 
 /**
