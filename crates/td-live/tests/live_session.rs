@@ -2926,8 +2926,52 @@ fn compare_counts_the_orders_of_a_bar_the_log_ends_part_way_through_as_unfilled(
         text.contains(&format!(
             "it ends on the sending line of the bar opening at {}, which the session writes \
              before it sends or cancels, and the replay sent and cancelled nothing on that bar",
-            rig.bar(0)
+            at(rig.bar(0))
         )),
+        "{text}"
+    );
+}
+
+/// A recorded call too long to print in full is cut short where the replay error shows it, so the
+/// error keeps its end, which says where the replay differs from the record.
+#[test]
+fn compare_keeps_the_end_of_a_replay_error_whose_recorded_call_is_long() {
+    let rig = Rig::new();
+    let feed = rig.feed();
+    compared_session(&rig, &feed, "long");
+    let mut log = rig.log("long");
+    // A bar call that reports events, with them repeated, under a time that is not its bar's.
+    let (at, call) = log
+        .iter()
+        .enumerate()
+        .find_map(|(i, line)| {
+            let calls = line["record"]["calls"].as_array()?;
+            calls
+                .iter()
+                .position(|c| c["Bar"]["events"].as_array().is_some_and(|e| !e.is_empty()))
+                .map(|c| (i, c))
+        })
+        .expect("a bar call with events");
+    let bar = log[at]["bar"]["open_time"].as_i64().unwrap();
+    let recorded = &mut log[at]["record"]["calls"][call]["Bar"];
+    let events = recorded["events"].as_array().unwrap().clone();
+    recorded["events"] = events
+        .iter()
+        .cycle()
+        .take(20 * events.len())
+        .cloned()
+        .collect();
+    recorded["open_time"] = (bar + 1).into();
+    write_log(&rig, "long", &log);
+
+    let (code, text) = rig.td_live(&feed, &["compare", "--id", "long"]);
+    assert_eq!(code, 1, "{text}");
+    assert!(
+        text.contains("does not replay with the strategy as it is now: the record has Some(Bar"),
+        "{text}"
+    );
+    assert!(
+        text.ends_with(&format!("… where the session fed the bar opening at {bar}")),
         "{text}"
     );
 }
