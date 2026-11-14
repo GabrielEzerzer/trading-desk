@@ -48,7 +48,7 @@ pub fn default_slippage_bps(instrument: &Instrument) -> f64 {
 /// in the same change. `tests/revision.rs` records the checksums and the fixture each revision
 /// gave, and fails when either moves without a new row there; a row at a new revision needs this
 /// bump.
-pub const ENGINE_REVISION: u32 = 11;
+pub const ENGINE_REVISION: u32 = 12;
 
 /// Everything that defines a backtest apart from the data itself.
 ///

@@ -394,6 +394,24 @@ pub fn worst_daily_loss_intraday(days: &[DailyPnl], base: f64) -> Option<f64> {
     worst_loss(days, base, |d| d.low_equity)
 }
 
+/// The largest fall inside one day as a share of that day's own starting equity:
+/// `(start_equity - low_equity) / start_equity` at its largest, over the days that start above
+/// zero, since a day that starts with nothing left has nothing to lose. This is the loss an
+/// account started at the day's start would measure against a daily limit set from its own size,
+/// where [`worst_daily_loss_intraday`] measures every day against one base. 0 if no day lost;
+/// `None` with no days or a result that is not finite.
+pub fn worst_daily_loss_intraday_own(days: &[DailyPnl]) -> Option<f64> {
+    if days.is_empty() {
+        return None;
+    }
+    let worst = days
+        .iter()
+        .filter(|d| d.start_equity > 0.0)
+        .map(|d| (d.start_equity - d.low_equity) / d.start_equity)
+        .fold(0.0, f64::max);
+    finite(worst)
+}
+
 fn worst_loss(days: &[DailyPnl], base: f64, to: impl Fn(&DailyPnl) -> f64) -> Option<f64> {
     if days.is_empty() || base <= 0.0 {
         return None;
@@ -809,8 +827,31 @@ mod tests {
         // Day 1 started at 110 and touched 90: 20% of 100 inside the day, 11% by its end.
         approx(worst_daily_loss_intraday(&days, 100.0).unwrap(), 0.2);
         approx(worst_daily_loss(&days, 100.0).unwrap(), 0.11);
+        // As a share of the day's own start: day 0 fell 5 of 100, day 1 20 of 110, day 3 none.
+        approx(worst_daily_loss_intraday_own(&days).unwrap(), 20.0 / 110.0);
         // Wrong lengths give no days.
         assert!(daily_pnl(&s, Some(&r[1..]), DayRollover::default()).is_empty());
+    }
+
+    /// A day that loses 4% of a balance standing at 0.6 of the starting cash loses 2.4% of the
+    /// starting cash: the shares differ by the balance's level. A day that starts with nothing
+    /// left loses nothing of its own start.
+    #[test]
+    fn a_days_loss_as_a_share_of_its_own_start() {
+        let day = |start_equity: f64, low_equity: f64| DailyPnl {
+            end: DAY,
+            start_equity,
+            end_equity: start_equity,
+            low_equity,
+        };
+        let down = [day(100.0, 99.0), day(60.0, 57.6)];
+        approx(worst_daily_loss_intraday(&down, 100.0).unwrap(), 0.024);
+        approx(worst_daily_loss_intraday_own(&down).unwrap(), 0.04);
+        // After gains the other way: 2% of 150 is 3% of 100.
+        let up = [day(150.0, 147.0)];
+        approx(worst_daily_loss_intraday(&up, 100.0).unwrap(), 0.03);
+        approx(worst_daily_loss_intraday_own(&up).unwrap(), 0.02);
+        assert_eq!(worst_daily_loss_intraday_own(&[day(0.0, 0.0)]), Some(0.0));
     }
 
     #[test]
@@ -824,6 +865,8 @@ mod tests {
         assert_eq!(worst_daily_loss(&days, 100.0), Some(0.0));
         assert_eq!(worst_daily_loss(&[], 100.0), None);
         assert_eq!(worst_daily_loss(&days, 0.0), None);
+        assert_eq!(worst_daily_loss_intraday_own(&days), Some(0.0));
+        assert_eq!(worst_daily_loss_intraday_own(&[]), None);
         let one = EquitySeries {
             times: vec![0],
             values: vec![100.0],
