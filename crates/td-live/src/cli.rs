@@ -24,8 +24,8 @@ use clap::{Args, Parser, Subcommand};
 use td_core::{Instrument, InstrumentId, InstrumentKind, Timeframe, Venue};
 use td_data::live::{Rest, SharedStream};
 use td_engine::{
-    DayRollover, LinkState, LinkedVerdict, Params, RUNS_DIR, SessionLink, StopRules,
-    default_slippage_bps, instrument_view,
+    DayRollover, ENGINE_REVISION, LinkState, LinkedVerdict, Params, RUNS_DIR, SessionLink,
+    StopRules, default_slippage_bps, instrument_view,
 };
 use td_orders::{Client, SETTLE_COIN};
 
@@ -231,7 +231,13 @@ fn run(cli: Cli, env: &Env, out: &mut dyn FnMut(&str)) -> Result<u8, String> {
             out(&format!("status: {}", pretty(status)));
             out(&format!("stops: {}", pretty(stops)));
             let config = &saved.config;
-            for line in link_lines(&config.strategy, &config.instrument.id, saved.link.as_ref()) {
+            let link = saved.link.as_ref();
+            for line in link_lines(
+                &config.strategy,
+                &config.instrument.id,
+                link,
+                saved.engine_revision,
+            ) {
                 out(&line);
             }
             Ok(0)
@@ -334,12 +340,15 @@ const KEEPS_ITS_CODE: &str =
 /// The status lines on what a session of `strategy` on `instrument` was started from. The checks
 /// against the strategy ([`LinkState`]) are of the strategy as this `td-live` build has it, which
 /// need not be the build running the session. With a verdict, a further check compares what the
-/// session started with, from the saved link alone, with what that verdict judged
-/// ([`started_as_judged`]); the link is current only when every check matches.
+/// session started with, from the saved link and `engine_revision` (the one saved in the
+/// session's config) alone, with what that verdict judged ([`started_as_judged`]). Without one,
+/// `engine_revision` is checked against this build's. The link is current only when every check
+/// matches.
 fn link_lines(
     strategy: &str,
     instrument: &InstrumentId,
     link: Option<&SessionLink>,
+    engine_revision: u32,
 ) -> Vec<String> {
     let Some(link) = link else {
         return vec![
@@ -380,11 +389,13 @@ fn link_lines(
                 v.engine_revision,
             ));
             let (started_plan, started_code) = started_as_judged(link, v, instrument);
+            let started_engine = engine_revision == v.engine_revision;
             lines.push(format!(
                 "link checks of what the session started with against the verdict: plan and \
-                 rule {}, code {}",
+                 rule {}, code {}, engine revision {}",
                 check(started_plan),
                 check(started_code),
+                check(Some(started_engine)),
             ));
             lines.push(format!(
                 "link checks of the verdict against the strategy as this td-live build has it: \
@@ -393,7 +404,10 @@ fn link_lines(
                 check(state.plan_matches),
                 check(state.code_matches),
             ));
-            let current = !state.stale && started_plan == Some(true) && started_code == Some(true);
+            let current = !state.stale
+                && started_plan == Some(true)
+                && started_code == Some(true)
+                && started_engine;
             lines.push(if current {
                 "link: current".into()
             } else {
@@ -405,21 +419,24 @@ fn link_lines(
             });
         }
         None => {
+            // The link saves no engine revision; the session's config holds the one it was made
+            // with.
+            let engine = engine_revision == ENGINE_REVISION;
             lines.push(format!(
                 "link: started with no saved verdict of {shown_strategy} on {shown_instrument}; \
                  the strategy's code hash was {code}"
             ));
             lines.push(format!(
                 "link checks of what the session started with against the strategy as this \
-                 td-live build has it: plan and rule {}, code {}; no engine check is made, since \
-                 the link saves no engine revision",
+                 td-live build has it: plan and rule {}, code {}, engine revision {}",
                 check(state.plan_matches),
                 check(state.code_matches),
+                check(Some(engine)),
             ));
-            lines.push(if state.stale {
+            lines.push(if state.stale || !engine {
                 format!(
-                    "link: stale; the code or plan of the strategy as this td-live build has it \
-                     may not be what the session started with; {KEEPS_ITS_CODE}"
+                    "link: stale; the code, plan or engine of the strategy as this td-live build \
+                     has it may not be what the session started with; {KEEPS_ITS_CODE}"
                 )
             } else {
                 "link: current".into()
@@ -431,15 +448,21 @@ fn link_lines(
 
 /// Whether the session started with what `verdict` judged, from the saved `link` alone, so the
 /// answer does not depend on the build that runs `status`: its plan and rule, as far as they
-/// concern `instrument` (as [`LinkState`] compares them), and its code hash, `None` when either
-/// hash is missing.
+/// concern `instrument`, with the plan it started with still testing `instrument` (as
+/// [`LinkState`] compares them), and its code hash, `None` when either hash is missing.
 fn started_as_judged(
     link: &SessionLink,
     verdict: &LinkedVerdict,
     instrument: &InstrumentId,
 ) -> (Option<bool>, Option<bool>) {
     let plan = serde_json::to_value(instrument).ok().map(|id| {
+        let tests_it = link
+            .plan
+            .get("instruments")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|tested| tested.contains(&id));
         link.rule == verdict.rule
+            && tests_it
             && instrument_view(link.plan.clone(), &id) == instrument_view(verdict.plan.clone(), &id)
     });
     let code = link
@@ -636,12 +659,15 @@ mod tests {
         (on, link)
     }
 
+    /// The engine revision a session made by this build saves.
+    const ENGINE: u32 = td_engine::ENGINE_REVISION;
+
     /// `td-live status` may be another build than the one running the session, so its checks
     /// against the strategy do not show what the session started with; the saved link does.
     #[test]
     fn a_link_is_stale_when_the_session_started_with_other_code_or_plan_than_its_verdict_judged() {
         let (on, link) = judged_link();
-        let lines = link_lines("sma_cross", &on, Some(&link));
+        let lines = link_lines("sma_cross", &on, Some(&link), ENGINE);
         assert_eq!(lines.len(), 4, "{lines:?}");
         assert_eq!(lines[3], "link: current");
 
@@ -650,11 +676,11 @@ mod tests {
             code_hash: Some("0000000000000000".into()),
             ..link.clone()
         };
-        let lines = link_lines("sma_cross", &on, Some(&started_elsewhere));
+        let lines = link_lines("sma_cross", &on, Some(&started_elsewhere), ENGINE);
         assert_eq!(
             lines[1],
             "link checks of what the session started with against the verdict: plan and rule \
-             matches, code does not match"
+             matches, code does not match, engine revision matches"
         );
         assert_eq!(
             lines[2],
@@ -665,9 +691,30 @@ mod tests {
 
         let mut replanned = link.clone();
         replanned.plan["period"]["from"] = 1.into();
-        let lines = link_lines("sma_cross", &on, Some(&replanned));
+        let lines = link_lines("sma_cross", &on, Some(&replanned), ENGINE);
         assert!(
-            lines[1].ends_with("plan and rule does not match, code matches"),
+            lines[1]
+                .ends_with("plan and rule does not match, code matches, engine revision matches"),
+            "{lines:?}"
+        );
+        assert!(lines[3].starts_with("link: stale; "), "{lines:?}");
+
+        // A plan that no longer tests the session's instrument, though its view of it is the
+        // verdict's, is not what the verdict judged for this session.
+        let mut untested = link.clone();
+        untested.plan["instruments"] = serde_json::json!([]);
+        let lines = link_lines("sma_cross", &on, Some(&untested), ENGINE);
+        assert!(
+            lines[1].contains("plan and rule does not match, code matches"),
+            "{lines:?}"
+        );
+        assert!(lines[3].starts_with("link: stale; "), "{lines:?}");
+
+        // A session made by another engine revision than the verdict was judged by.
+        let lines = link_lines("sma_cross", &on, Some(&link), ENGINE + 1);
+        assert!(
+            lines[1]
+                .ends_with("plan and rule matches, code matches, engine revision does not match"),
             "{lines:?}"
         );
         assert!(lines[3].starts_with("link: stale; "), "{lines:?}");
@@ -677,8 +724,42 @@ mod tests {
             code_hash: None,
             ..link
         };
-        let lines = link_lines("sma_cross", &on, Some(&unhashed));
-        assert!(lines[1].ends_with("code unknown"), "{lines:?}");
+        let lines = link_lines("sma_cross", &on, Some(&unhashed), ENGINE);
+        assert!(
+            lines[1].ends_with("code unknown, engine revision matches"),
+            "{lines:?}"
+        );
         assert!(lines[3].starts_with("link: stale; "), "{lines:?}");
+    }
+
+    /// The link saves no engine revision without a verdict; the session's config holds the one it
+    /// was made with, and that is checked against this build's.
+    #[test]
+    fn a_link_without_a_verdict_checks_the_engine_revision_the_session_was_made_with() {
+        let (on, link) = judged_link();
+        let unjudged = SessionLink {
+            verdict: None,
+            ..link
+        };
+        let lines = link_lines("sma_cross", &on, Some(&unjudged), ENGINE);
+        assert_eq!(
+            lines[1],
+            "link checks of what the session started with against the strategy as this td-live \
+             build has it: plan and rule matches, code matches, engine revision matches"
+        );
+        assert_eq!(lines[2], "link: current");
+
+        let lines = link_lines("sma_cross", &on, Some(&unjudged), ENGINE + 1);
+        assert!(
+            lines[1].ends_with("engine revision does not match"),
+            "{lines:?}"
+        );
+        assert!(
+            lines[2].starts_with(
+                "link: stale; the code, plan or engine of the strategy as this td-live build has \
+                 it may not be what the session started with"
+            ),
+            "{lines:?}"
+        );
     }
 }

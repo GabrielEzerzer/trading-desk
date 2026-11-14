@@ -2285,9 +2285,10 @@ fn start_links_the_session_to_the_latest_verdict_or_the_one_named_and_status_che
     assert_eq!(link["plan"], serde_json::to_value(&entry.plan).unwrap());
     assert_eq!(link["rule"], serde_json::to_value(entry.rule).unwrap());
 
-    // The session started with the code, plan and rule the verdict judged. The verdict's engine
-    // and code are this build's. The strategy's plan does not test this venue's perpetual, so the
-    // plan check fails and the link is stale, as the verdict list would show it.
+    // The session started with the code, plan and rule the verdict judged, on the engine that
+    // judged it. The verdict's engine and code are this build's. The strategy's plan does not
+    // test this venue's perpetual, so both plan checks fail and the link is stale, as the verdict
+    // list would show it.
     let status = link_status(&rig, &feed, "latest");
     assert!(
         status.contains(&format!(
@@ -2298,7 +2299,7 @@ fn start_links_the_session_to_the_latest_verdict_or_the_one_named_and_status_che
     assert!(
         status.contains(
             "link checks of what the session started with against the verdict: plan and rule \
-             matches, code matches\n"
+             does not match, code matches, engine revision matches\n"
         ),
         "{status}"
     );
@@ -2326,7 +2327,8 @@ fn start_links_the_session_to_the_latest_verdict_or_the_one_named_and_status_che
     let status = link_status(&rig, &feed, "latest");
     assert!(
         status.contains(
-            "against the verdict: plan and rule matches, code does not match\nlink checks of the \
+            "against the verdict: plan and rule does not match, code does not match, engine revision \
+             matches\nlink checks of the \
              verdict against the strategy as this td-live build has it: engine revision matches, \
              plan and rule does not match, code matches"
         ),
@@ -2340,6 +2342,14 @@ fn start_links_the_session_to_the_latest_verdict_or_the_one_named_and_status_che
     let status = link_status(&rig, &feed, "latest");
     assert!(
         status.contains("engine revision does not match, plan and rule does not match"),
+        "{status}"
+    );
+    // The session was made by this engine, not the one the verdict was judged by.
+    assert!(
+        status.contains(
+            "against the verdict: plan and rule does not match, code does not match, engine revision \
+             does not match\n"
+        ),
         "{status}"
     );
 
@@ -2382,8 +2392,7 @@ fn a_link_without_a_verdict_is_current_until_the_code_or_plan_it_started_with_ch
         format!(
             "link: started with no saved verdict of {LINKED} on {on}; the strategy's code hash was {}\n\
              link checks of what the session started with against the strategy as this td-live \
-             build has it: plan and rule matches, code matches; no engine check is made, since the \
-             link saves no engine revision\n\
+             build has it: plan and rule matches, code matches, engine revision matches\n\
              link: current",
             td_engine::code_hash(LINKED).unwrap()
         )
@@ -2396,10 +2405,24 @@ fn a_link_without_a_verdict_is_current_until_the_code_or_plan_it_started_with_ch
     let status = link_status(&rig, &feed, "unjudged");
     assert!(
         status.contains(
-            "plan and rule matches, code does not match; no engine check is made, since the link \
-             saves no engine revision\nlink: stale; the code or plan of the strategy as this \
-             td-live build has it may not be what the session started with; a running session \
-             keeps the code it was started with until it is restarted"
+            "plan and rule matches, code does not match, engine revision matches\nlink: stale; \
+             the code, plan or engine of the strategy as this td-live build has it may not be \
+             what the session started with; a running session keeps the code it was started \
+             with until it is restarted"
+        ),
+        "{status}"
+    );
+
+    // As if the session had been made by another engine revision than this build's; the link
+    // saves none, so the one in its config is checked.
+    let mut other_engine = started.clone();
+    other_engine["engine_revision"] = (td_engine::ENGINE_REVISION + 1).into();
+    rig.write_config_json("unjudged", &other_engine);
+    let status = link_status(&rig, &feed, "unjudged");
+    assert!(
+        status.contains(
+            "plan and rule matches, code matches, engine revision does not match\nlink: stale; \
+             the code, plan or engine"
         ),
         "{status}"
     );
@@ -2413,11 +2436,11 @@ fn a_link_without_a_verdict_is_current_until_the_code_or_plan_it_started_with_ch
     rig.write_config_json("unjudged", &replanned);
     let status = link_status(&rig, &feed, "unjudged");
     assert!(
-        status.contains("plan and rule does not match, code matches; no engine check"),
+        status.contains("plan and rule does not match, code matches, engine revision matches"),
         "{status}"
     );
     assert!(
-        status.contains("\nlink: stale; the code or plan"),
+        status.contains("\nlink: stale; the code, plan or engine"),
         "{status}"
     );
 }
