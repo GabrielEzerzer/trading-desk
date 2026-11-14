@@ -48,9 +48,9 @@ pub trait FillModel: Send {
 /// - Limit buy: rests from the close it was decided on, and fills at the limit if the low reaches
 ///   it, in full, even when the low only touches the limit: there is no queue, so a fill that a
 ///   real book would give only as far as the order's place in it allows is taken whole (see
-///   [`touch_only`], which the battery counts). When a bar opens below it, the market passed the limit between the bars, where the
-///   resting order filled: it fills at the limit, not the better open, as of the open. Sells
-///   mirror this. Maker.
+///   `touch_only`, which the battery counts). When a bar opens below it, the market passed the
+///   limit between the bars, where the resting order filled: it fills at the limit, not the
+///   better open, as of the open. Sells mirror this. Maker.
 /// - Limit already marketable at the close it was decided on (a buy at or above that close, a
 ///   sell at or below it): on its first bar it takes liquidity like a market order, at the open
 ///   plus slippage but never past its limit, as a taker. If that bar opens past the limit, it
