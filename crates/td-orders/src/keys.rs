@@ -1,0 +1,167 @@
+//! The demo account's API key and secret, and the v5 request signature.
+//!
+//! Signing, as <https://bybit-exchange.github.io/docs/v5/guide> describes it (read 2026-11-14): the
+//! signed text is `timestamp + api key + recv_window + queryString` for a GET and
+//! `timestamp + api key + recv_window + jsonBodyString` for a POST, signed with HMAC-SHA256 and
+//! written as lowercase hex. It goes with the `X-BAPI-API-KEY`, `X-BAPI-TIMESTAMP`,
+//! `X-BAPI-RECV-WINDOW` and `X-BAPI-SIGN` headers. The query string or body signed is the exact
+//! one sent.
+
+use std::fmt;
+
+use hmac::{Hmac, KeyInit, Mac};
+use sha2::Sha256;
+
+use crate::Error;
+
+/// The environment variable that holds the demo account's API key.
+pub const KEY_VAR: &str = "BYBIT_DEMO_API_KEY";
+/// The environment variable that holds the demo account's API secret.
+pub const SECRET_VAR: &str = "BYBIT_DEMO_API_SECRET";
+
+/// The key and secret of a venue demo-trading account.
+///
+/// It has no `Serialize`, its `Debug` prints neither value, and nothing in the crate displays
+/// them. Keys for the real demo service come only from the environment ([`DemoKeys::from_env`]).
+/// Keys made with [`DemoKeys::for_loopback`] are refused by every endpoint but the loopback one.
+///
+/// shortcut: the strings are not wiped from memory on drop; add `zeroize` if the desk ever holds
+/// keys for an account with real money (it never should, by design).
+#[derive(Clone)]
+pub struct DemoKeys {
+    key: String,
+    secret: String,
+    loopback_only: bool,
+}
+
+impl DemoKeys {
+    /// Reads `BYBIT_DEMO_API_KEY` and `BYBIT_DEMO_API_SECRET`. A missing, empty or non-printable
+    /// value is an error that names the variable, never its value.
+    pub fn from_env() -> Result<Self, Error> {
+        let read = |name: &'static str| {
+            let value = std::env::var(name).map_err(|_| Error::MissingKey { name })?;
+            check_value(name, value)
+        };
+        Ok(DemoKeys {
+            key: read(KEY_VAR)?,
+            secret: read(SECRET_VAR)?,
+            loopback_only: false,
+        })
+    }
+
+    /// Keys for a test against the mock venue on 127.0.0.1. A client built with them for the demo
+    /// service refuses to start.
+    pub fn for_loopback(key: &str, secret: &str) -> Result<Self, Error> {
+        Ok(DemoKeys {
+            key: check_value(KEY_VAR, key.to_string())?,
+            secret: check_value(SECRET_VAR, secret.to_string())?,
+            loopback_only: true,
+        })
+    }
+
+    pub(crate) fn key(&self) -> &str {
+        &self.key
+    }
+
+    pub(crate) fn loopback_only(&self) -> bool {
+        self.loopback_only
+    }
+
+    /// The lowercase hex HMAC-SHA256 of `timestamp + key + recv_window + payload`, where the
+    /// payload is the query string of a GET or the body of a POST.
+    pub(crate) fn sign(&self, timestamp: i64, recv_window: u64, payload: &str) -> String {
+        let text = format!("{timestamp}{}{recv_window}{payload}", self.key);
+        hmac_hex(self.secret.as_bytes(), text.as_bytes())
+    }
+
+    /// Replaces a venue message that contains the key, the secret or `signature` (the venue's
+    /// signature error can echo the signed text, which holds the key), and trims the rest.
+    pub(crate) fn scrub(&self, message: &str, signature: &str) -> String {
+        let leaks = [self.key.as_str(), self.secret.as_str(), signature]
+            .iter()
+            .any(|s| !s.is_empty() && message.contains(s));
+        if leaks {
+            return "(message withheld: it contained a credential)".into();
+        }
+        message
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(200)
+            .collect()
+    }
+}
+
+impl fmt::Debug for DemoKeys {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("DemoKeys(..)")
+    }
+}
+
+fn check_value(name: &'static str, value: String) -> Result<String, Error> {
+    // A header value must be visible ASCII; anything else is a mistake in the variable.
+    if value.is_empty() || !value.bytes().all(|b| b.is_ascii_graphic()) {
+        return Err(Error::InvalidKey { name });
+    }
+    Ok(value)
+}
+
+fn hmac_hex(key: &[u8], data: &[u8]) -> String {
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC takes a key of any length");
+    mac.update(data);
+    mac.finalize()
+        .into_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hmac_matches_rfc_4231_test_case_2() {
+        assert_eq!(
+            hmac_hex(b"Jefe", b"what do ya want for nothing?"),
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
+    }
+
+    #[test]
+    fn signs_timestamp_key_window_and_payload_in_that_order() {
+        let keys = DemoKeys::for_loopback("fake-key", "fake-secret").unwrap();
+        let payload = "category=linear&symbol=BTCUSDT";
+        assert_eq!(
+            keys.sign(1658384314791, 5000, payload),
+            hmac_hex(
+                b"fake-secret",
+                b"1658384314791fake-key5000category=linear&symbol=BTCUSDT"
+            )
+        );
+    }
+
+    #[test]
+    fn debug_shows_neither_value() {
+        let keys = DemoKeys::for_loopback("KEYVALUE123", "SECRETVALUE456").unwrap();
+        let shown = format!("{keys:?} {keys:#?}");
+        assert!(!shown.contains("KEYVALUE123") && !shown.contains("SECRETVALUE456"));
+    }
+
+    #[test]
+    fn scrub_withholds_messages_that_carry_a_credential() {
+        let keys = DemoKeys::for_loopback("KEYVALUE123", "SECRETVALUE456").unwrap();
+        let echoed = "error sign! origin_string[1700000000000KEYVALUE1235000{}]";
+        assert!(!keys.scrub(echoed, "").contains("KEYVALUE123"));
+        assert!(!keys.scrub("sig abc123", "abc123").contains("abc123"));
+        assert_eq!(keys.scrub("Too many visits!", "abc"), "Too many visits!");
+        assert_eq!(keys.scrub(&"x".repeat(500), "").len(), 200);
+    }
+
+    #[test]
+    fn empty_or_unprintable_values_are_refused_by_name() {
+        let err = DemoKeys::for_loopback("", "s").unwrap_err();
+        assert!(matches!(err, Error::InvalidKey { name: KEY_VAR }));
+        let err = DemoKeys::for_loopback("k", "has space").unwrap_err();
+        assert!(matches!(err, Error::InvalidKey { name: SECRET_VAR }));
+    }
+}

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/*"]
+members = ["crates/*", "mock/*"]
 
 [workspace.package]
 version = "0.1.0"
@@ -13,6 +13,7 @@ license = "GPL-3.0-only"
 td-core = { path = "crates/td-core" }
 td-data = { path = "crates/td-data" }
 td-engine = { path = "crates/td-engine" }
+td-mock-bybit = { path = "mock/bybit" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
@@ -39,3 +40,6 @@ subtle = "2.6"
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
 tokio-tungstenite = { version = "0.30.0", features = ["rustls-tls-webpki-roots"] }
 ts-rs = "12"
+
+# td-orders: the order route to a venue's demo-trading REST API, and its mock venue.
+hmac = "0.13"

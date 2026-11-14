@@ -1,0 +1,16 @@
+[package]
+name = "td-mock-bybit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+# A stateful stand-in for the venue's v5 REST API on 127.0.0.1, for td-orders' tests. Test harness,
+# never app code.
+
+[dependencies]
+hmac.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+td-core.workspace = true
