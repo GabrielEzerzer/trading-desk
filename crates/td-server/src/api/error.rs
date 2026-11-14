@@ -104,7 +104,10 @@ impl From<DataError> for ApiError {
             DataError::InstrumentBusy(_) => {
                 ApiError::new(StatusCode::CONFLICT, "conflict", message)
             }
-            DataError::Http { .. } | DataError::Status { .. } | DataError::Api { .. } => {
+            DataError::Http { .. }
+            | DataError::Status { .. }
+            | DataError::Api { .. }
+            | DataError::RateLimited { .. } => {
                 ApiError::new(StatusCode::BAD_GATEWAY, "venue", message)
             }
             _ => ApiError::internal(message),
@@ -179,5 +182,27 @@ mod tests {
                 (status, code, message)
             );
         }
+    }
+
+    /// A download the venue kept rate limiting is the venue failing, with how long it waited.
+    #[test]
+    fn a_rate_limit_that_outlasts_the_retries_is_a_502_saying_how_long_it_waited() {
+        let api = ApiError::from(DataError::RateLimited {
+            url: "https://api.bybit.com/v5/market/kline".into(),
+            tries: 5,
+            waited: std::time::Duration::from_secs(15),
+            answer: "Too many visits!".into(),
+        });
+        assert_eq!(
+            (api.status.as_u16(), api.body.code.as_str()),
+            (502, "venue")
+        );
+        assert!(
+            api.body
+                .message
+                .contains("after 5 tries and 15.0 s of waiting"),
+            "{}",
+            api.body.message
+        );
     }
 }
