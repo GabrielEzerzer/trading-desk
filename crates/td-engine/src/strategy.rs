@@ -30,6 +30,8 @@ pub struct Context<'a> {
     pub(crate) slippage_bps: f64,
     pub(crate) max_leverage: f64,
     pub(crate) portfolio: &'a Portfolio,
+    /// The funding events fed with the bars so far, oldest first; see [`Context::funding`].
+    pub(crate) funding: &'a [(Millis, f64)],
     pub(crate) broker: &'a mut dyn Broker,
     pub(crate) orders: &'a mut Vec<Order>,
     pub(crate) warming_up: bool,
@@ -103,6 +105,29 @@ impl Context<'_> {
         self.portfolio
             .account()
             .from_quote(quote_amount, self.bar().close)
+    }
+
+    /// The funding rates settled on this instrument so far, as `(time, rate)`, oldest first: every
+    /// event fed to the session with a bar, warm-up bars included. From the first live bar on,
+    /// that is the series the cost model charges (a rate charged on a flat position is still
+    /// here); the warm-up bars' events, and those in a gap between the last warm-up bar and the
+    /// first live bar, are only history, since nothing is held before the first live bar. The time
+    /// is the settlement time, in a backtest and in a paper session alike, so a paper session shows
+    /// a strategy the series a backtest of the same bars shows it, a rate due in a gap between bars
+    /// included. The one difference: a rate the venue has not yet published when the bar it is due
+    /// in closes reaches a paper session's strategy late, on a later bar, timed at that bar's open
+    /// or, when bars are missing before it, at the end of the last bar fed, and the session warns
+    /// on the bar it was due in and again when it arrives.
+    ///
+    /// The series runs from the first bar fed, warm-up or live, which takes no funding from before
+    /// its open (see [`crate::Session::on_bar`]), to the last settlement strictly before the
+    /// current bar's close, the current bar's `open_time` plus the timeframe: a bar takes the
+    /// events in its own window and in the gap before it, and a settlement due exactly at the close
+    /// is the next bar's open, so it is visible on the next bar. A backtest feeds every event from
+    /// its first warm-up bar's open, and a paper session the venue's rates from its first warm-up
+    /// bar. It is empty for a kind without funding (spot, FX).
+    pub fn funding(&self) -> &[(Millis, f64)] {
+        self.funding
     }
 
     pub fn open_orders(&self) -> &[Order] {
