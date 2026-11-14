@@ -23,6 +23,18 @@ pub enum DataError {
     #[error("{url} returned an error: {message}")]
     Api { url: String, message: String },
 
+    /// The venue still answered with its rate limit after every retry ([`crate::Http`]).
+    #[error(
+        "{url} still answered with its rate limit after {tries} tries and {:.1} s of waiting: {answer}",
+        .waited.as_secs_f64()
+    )]
+    RateLimited {
+        url: String,
+        tries: u32,
+        waited: std::time::Duration,
+        answer: String,
+    },
+
     #[error("cannot parse {what}: {reason}")]
     Parse { what: String, reason: String },
 
