@@ -2155,6 +2155,69 @@ fn a_stop_the_session_cancelled_owes_nothing_while_the_position_is_held() {
 }
 
 #[test]
+fn after_a_restart_a_stop_the_session_cancelled_owes_nothing_and_nothing_is_sent() {
+    let mut rig = stopped_entry(vec![(1, Act::Cancel(2))]);
+    let records = run_recorded(&mut rig, 2);
+    assert_eq!(rig.results()[1], "1: cancel true");
+    assert_eq!(rig.handle.fault(), None);
+    let sends = rig.sends();
+    let (mut session, handle) = replayed(&rig, &records);
+    handle.go_live().unwrap();
+    assert_eq!(rig.sends(), sends, "going live sends nothing");
+    session.on_bar(rig.candle(2, PRICE), &[]).unwrap();
+    assert_eq!(handle.fault(), None);
+    assert!(matches!(
+        session.orders()[1].status,
+        OrderStatus::Cancelled(_)
+    ));
+    assert_eq!(session.portfolio().position(), 0.004);
+    assert_eq!(rig.sends(), sends);
+}
+
+#[test]
+fn after_a_restart_a_stop_cancelled_after_a_part_fill_takes_off_only_what_it_did_not_fill() {
+    let mock = venue();
+    let faults = mock.clone();
+    // On bar 1 the first stop fills 0.001 and the venue closes the rest; the session's cancel,
+    // sent after, is acknowledged and finds it cancelled, so the run stops with that fill unread.
+    let part_fill = run(move || {
+        faults.cancel_after_partial_fill("t-o2", 0.001);
+        faults.inject(CANCEL, Fault::Answer(0));
+    });
+    let mut rig = Rig::with(
+        mock,
+        vec![
+            (
+                0,
+                Act::SubmitWithStop(market(Side::Buy, 0.004, false), 60000.0),
+            ),
+            (
+                0,
+                Act::SubmitWithStop(market(Side::Buy, 0.004, false), 60000.0),
+            ),
+            (1, part_fill),
+            (1, Act::Cancel(2)),
+        ],
+    );
+    let records = run_recorded(&mut rig, 2);
+    assert_eq!(rig.results()[3], "1: cancel true", "{:?}", rig.results());
+    assert_eq!(rig.handle.fault(), None);
+    // While the session is down the venue drops the second entry's stop with nothing filled.
+    rig.mock.cancel_after_partial_fill("t-o4", 0.0);
+    let sends = rig.sends();
+    let (_session, handle) = replayed(&rig, &records);
+    let fault = handle.go_live().expect_err("faulted");
+    // The cancelled stop takes off the 0.003 it did not fill, and no more, so the second entry's
+    // 0.004 is still owed.
+    assert_eq!(fault.kind, FaultKind::Uncovered, "{fault}");
+    assert!(
+        fault.message.contains("owes a stop for 0.004 of"),
+        "{fault}"
+    );
+    assert_eq!(rig.sends(), sends, "nothing sent");
+}
+
+#[test]
 fn a_stop_missing_from_the_venues_open_orders_faults_though_its_lookup_shows_it_open() {
     let mut rig = stopped_entry(vec![]);
     rig.bar();

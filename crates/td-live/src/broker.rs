@@ -542,6 +542,17 @@ fn owe(owed: f64, position: f64, fill: f64, stopped: bool) -> f64 {
     }
 }
 
+/// What order `t`, which the venue no longer holds open, no longer owes a stop for once `filled`
+/// of it is known to have filled: for an entry's attached stop the session cancelled, the part it
+/// had not filled. Only an announced attached stop is held open, so only one can be cancelled.
+fn released(t: &Tracked, filled: f64) -> f64 {
+    if is_stop(&t.order) && t.cancel_asked && t.announced > 0.0 {
+        (t.sent - filled).max(0.0)
+    } else {
+        0.0
+    }
+}
+
 /// The venue refused a stop because the market is already through its trigger.
 fn through_market(error: &RouteError) -> bool {
     matches!(
@@ -1728,7 +1739,7 @@ impl Core {
                 self.tracked(id).at = At::Done;
                 continue;
             }
-            let (reported, sent, cancel_asked, stop, side, attached, held, announced) = (
+            let (reported, sent, cancel_asked, stop, side, attached, held, unowed) = (
                 t.reported,
                 t.sent,
                 t.cancel_asked,
@@ -1736,7 +1747,7 @@ impl Core {
                 t.order.request.side,
                 t.order.attached_stop,
                 t.open,
-                t.announced,
+                released(t, t.reported),
             );
             let Some(found) = self.client.order_by_client_id(&self.instrument, &cid)? else {
                 return Ok(Some((
@@ -1774,10 +1785,8 @@ impl Core {
                 )));
             }
             // An entry's attached stop the session cancelled is no longer owed for what it did not
-            // fill. Only an announced attached stop is held open, so only one can be cancelled.
-            if stop && cancel_asked && announced > 0.0 {
-                self.book.owed = (self.book.owed - (sent - reported)).max(0.0);
-            }
+            // fill; the bar's executions are read, so `reported` holds all it filled.
+            self.book.owed = (self.book.owed - unowed).max(0.0);
             if reported > 0.0 {
                 // Part filled, the rest closed: the session already holds it filled.
                 self.tracked(id).at = At::Done;
@@ -2353,13 +2362,16 @@ impl Core {
 
     /// The reconcile at the end of a replay: the venue's open orders must be the session's, its
     /// position the recorded fills plus this session's executions not yet reported, and the
-    /// quantity the session owes a stop for covered by its stops resting at the venue.
+    /// quantity the session owes a stop for, less what a stop it cancelled had not filled,
+    /// covered by its stops resting at the venue.
     fn verify(&mut self) -> Result<(), RouteError> {
         let executions = self.client.executions_since(
             &self.instrument,
             self.book.cursor.saturating_sub(LOOKBACK_MS),
         )?;
         let (mut expected, mut owed) = (self.book.tally, self.book.owed);
+        // What each tracked order filled in the executions read here, by id.
+        let mut filled: BTreeMap<u64, f64> = BTreeMap::new();
         for e in executions {
             if self.book.seen.contains_key(&e.exec_id) || e.kind != ExecKind::Trade {
                 continue;
@@ -2374,10 +2386,23 @@ impl Core {
                 // out.
                 owed = owe(owed, expected, fill, false);
                 expected += fill;
+                *filled.entry(id.0).or_default() += e.qty;
             }
         }
         let open = self.client.open_orders(&self.instrument)?;
         let position = self.client.position(&self.instrument)?.size;
+        // A stop the session cancelled before the restart is no longer owed for what it did not
+        // fill, as on a bar's reconcile. The record cannot take that off when the cancel is
+        // confirmed: what the stop filled before the cancel took may only be read here.
+        for t in self.book.orders.values() {
+            let listed = open
+                .iter()
+                .any(|o| o.client_id == self.venue_id(t).as_str());
+            if matches!(t.at, At::Live | At::Cover) && !listed {
+                let done = t.reported + filled.get(&t.order.id.0).copied().unwrap_or(0.0);
+                owed = (owed - released(t, done)).max(0.0);
+            }
+        }
         if let Some((kind, message)) = self
             .unknown_open(&open)
             .or_else(|| self.position_check(position, expected))
