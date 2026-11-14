@@ -1307,16 +1307,14 @@ breach_horizon_days: number,
  * its falls in money stay the same size as the balance grows. When set, the max-drawdown and
  * worst-daily-loss lines judge each fall in money as a share of the starting cash, and the
  * simulated attempts add each day's profit and loss as a share of the starting cash instead
- * of compounding a return on the balance, both read on each walk-forward test window's own
- * money changes, added; that curve's own balance decides when the account is gone. The other
- * lines the verdict judges read the same account, or a figure that is the same on either
- * curve: the out-of-sample return is that curve's last value over the starting cash less
- * one, the lowest-equity line reads its lowest low, the trade count counts the windows it
- * counts, and the return at higher costs, each start offset's return and each plateau
- * neighbour's return are read the same way on their own runs' windows. The one exception is
- * the plateau's median ratio, which compares each neighbour's compounded objective with the
- * chosen sets' compounded objective on the same windows, like with like. The Sharpe,
- * leverage and swap warnings, which do not change the state, read the compounding curve.
+ * of compounding a return on the balance. Every figure the battery reads then comes from one
+ * account that adds each walk-forward test window's own money changes at the size it was
+ * tested at, whose own balance decides when it is gone, and the runs at higher costs, at
+ * each start offset and of each plateau neighbour are put together the same way. The
+ * exceptions read each window's own run (I1 to I3, the share of profitable windows, the day
+ * and window counts and the breakdown's rising and falling returns) or the full-period sweep
+ * (the luck test), and the other kinds' benchmark figures. The lowest-equity line also fails
+ * when a window that account counts reached zero or below in its own run.
  * `false`, the default, reads every fall and every day as a share of the balance it starts
  * from, which is exact for a strategy whose size grows with its balance. `false` is left out
  * of JSON.
@@ -1655,14 +1653,14 @@ luck_p: number | null,
 stressed_return: number | null, 
 /**
  * R5: the neighbours' median objective over R1's, both out of sample
- * ([`crate::PlateauReport`]).
+ * ([`crate::PlateauReport`]). For a `prop_firm` rule with `sizes_from_starting_cash`, every
+ * objective is read at a fixed size, as `oos_return` is.
  */
 plateau_median_ratio: number | null, 
 /**
  * R5: the share of neighbours with a positive out-of-sample return. For a `prop_firm` rule
  * with `sizes_from_starting_cash`, each neighbour's return is read like `oos_return`, on its
- * own windows' money changes added. `plateau_median_ratio` still compares the stitched
- * objectives, both compounded.
+ * own windows' money changes added.
  */
 plateau_positive_share: number | null, 
 /**
@@ -1674,7 +1672,9 @@ start_offsets_same_sign: number, };
 
 /**
  * The out-of-sample statistics the kind rules read, computed by the battery on the stitched
- * walk-forward out-of-sample curve. Fractions are of equity unless said otherwise. A statistic
+ * walk-forward out-of-sample curve, or for a `prop_firm` rule with `sizes_from_starting_cash`,
+ * on the curve that adds each test window's own money changes at a fixed size; the benchmark's
+ * figures are the walk-forward's own either way. Fractions are of equity unless said otherwise. A statistic
  * the battery could not compute is `None` and fails its criterion. Each kind reads only its own
  * fields.
  */
@@ -1769,7 +1769,8 @@ limits_inside_day?: boolean, };
 
 /**
  * The integrity checks read on the stitched walk-forward out-of-sample curve (I4 and I5),
- * computed once it exists.
+ * computed once it exists. For a `prop_firm` rule with `sizes_from_starting_cash`, on the curve
+ * that adds each test window's own money changes at a fixed size instead.
  */
 export type OosIntegrityInputs = { 
 /**
@@ -1777,14 +1778,18 @@ export type OosIntegrityInputs = {
  */
 sharpe: number | null, 
 /**
- * I5: the highest notional over equity inside any bar.
+ * I5: the highest notional over equity inside any bar. For a `prop_firm` rule with
+ * `sizes_from_starting_cash`, the highest of the counted windows' own.
  */
 peak_leverage: number | null, 
 /**
  * I5: the lowest equity inside any bar, over the starting cash. Zero is a bankrupt account:
  * a liquidation leaves the account at exactly zero. For a `prop_firm` rule with
  * `sizes_from_starting_cash`, the lowest low of the curve that adds each test window's own
- * money changes instead, over the starting cash.
+ * money changes instead, or lower, the lowest low of a window that curve counts whose own run
+ * reached zero or below: the backtest stops such a run at zero (a liquidated perpetual, a
+ * spot account) or lets it go negative with the position open (FX), so its money change
+ * shows only part of the loss.
  */
 lowest_equity: number | null, 
 /**
@@ -1801,7 +1806,8 @@ curve: boolean, };
  * test bars as its chosen set was (warmed up on the train bars, closed out at the end). Each
  * direction is judged only on the windows where its set ran: a window where it is off the grid
  * or the strategy refuses it is left out, never filled with the chosen set's own run, which would
- * pull the direction towards R1. Its runs are stitched as R1's curve is, and so are the chosen
+ * pull the direction towards R1. Its runs are stitched as R1's curve is judged, compounding or,
+ * for a `prop_firm` rule sized from the starting cash, at a fixed size, and so are the chosen
  * sets' own runs in the same windows, its reference. A direction that ran in no window is left
  * out.
  *
@@ -1811,8 +1817,7 @@ curve: boolean, };
  * A direction with an undefined objective has the worst ratio (minus infinity with `Maximize`, 0
  * with `Minimize`); one whose reference is undefined, or at or below zero with `Maximize`, has
  * none and is left out of the median. The share is the directions whose stitched return is
- * above zero, or for a `prop_firm` rule sized from the starting cash, whose return with their
- * own windows' money changes added is above zero ([`PlateauDirection::total_return`]).
+ * above zero ([`PlateauDirection::total_return`]).
  *
  * A result saved before R5 moved out of sample reads with `directions` empty and its ratio and
  * share as they were judged then, on the full-period sweep.
@@ -1824,7 +1829,9 @@ export type PlateauReport = {
 best_objective: number | null, directions: Array<PlateauDirection>, median_ratio: number | null, positive_share: number | null, };
 
 /**
- * One of R5's neighbours, stitched over the windows.
+ * One of R5's neighbours, stitched over the windows as R1's curve is judged: for a `prop_firm`
+ * rule with `sizes_from_starting_cash`, at a fixed size, its objective, return and reference
+ * alike.
  */
 export type PlateauDirection = { 
 /**
@@ -1840,9 +1847,7 @@ windows: number,
  */
 objective: number | null, 
 /**
- * The stitched return. For a `prop_firm` rule with `sizes_from_starting_cash`, the return
- * with its windows' own money changes added to the starting cash instead, as R1's return is
- * read for that rule; the objective and the reference still compound.
+ * The stitched return.
  */
 total_return: number | null, 
 /**
@@ -2039,10 +2044,10 @@ multiplier: number,
  */
 window_returns: Array<number>, 
 /**
- * The windows compounded, as the stitched curve compounds them. For a `prop_firm` rule whose
- * strategy sizes from the starting cash, the starting cash plus each window's own money
- * change, over the starting cash, less one, as its out-of-sample return is read. Either way,
- * windows after that account reached zero add nothing.
+ * The windows compounded, as the stitched curve compounds them. For a `prop_firm` rule with
+ * `sizes_from_starting_cash`, added at a fixed size, as its walk-forward is judged: the
+ * starting cash plus each window's own money change, over the starting cash, less one.
+ * Either way, windows after that account reached zero add nothing.
  */
 total_return: number, };
 
@@ -2061,8 +2066,8 @@ shift_bars: number,
 windows: number, 
 /**
  * The stitched out-of-sample return; `None` when the walk-forward could not run. For a
- * `prop_firm` rule whose strategy sizes from the starting cash, read on this run's own test
- * windows' money changes, added, as the main run's return is.
+ * `prop_firm` rule with `sizes_from_starting_cash`, this run's windows stitched at a fixed
+ * size, as the main run is judged.
  */
 oos_return: number | null, error: string | null, };
 

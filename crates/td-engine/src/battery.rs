@@ -179,7 +179,8 @@ pub struct IntegrityReport {
 /// test bars as its chosen set was (warmed up on the train bars, closed out at the end). Each
 /// direction is judged only on the windows where its set ran: a window where it is off the grid
 /// or the strategy refuses it is left out, never filled with the chosen set's own run, which would
-/// pull the direction towards R1. Its runs are stitched as R1's curve is, and so are the chosen
+/// pull the direction towards R1. Its runs are stitched as R1's curve is judged, compounding or,
+/// for a `prop_firm` rule sized from the starting cash, at a fixed size, and so are the chosen
 /// sets' own runs in the same windows, its reference. A direction that ran in no window is left
 /// out.
 ///
@@ -189,8 +190,7 @@ pub struct IntegrityReport {
 /// A direction with an undefined objective has the worst ratio (minus infinity with `Maximize`, 0
 /// with `Minimize`); one whose reference is undefined, or at or below zero with `Maximize`, has
 /// none and is left out of the median. The share is the directions whose stitched return is
-/// above zero, or for a `prop_firm` rule sized from the starting cash, whose return with their
-/// own windows' money changes added is above zero ([`PlateauDirection::total_return`]).
+/// above zero ([`PlateauDirection::total_return`]).
 ///
 /// A result saved before R5 moved out of sample reads with `directions` empty and its ratio and
 /// share as they were judged then, on the full-period sweep.
@@ -205,7 +205,9 @@ pub struct PlateauReport {
     pub positive_share: Option<f64>,
 }
 
-/// One of R5's neighbours, stitched over the windows.
+/// One of R5's neighbours, stitched over the windows as R1's curve is judged: for a `prop_firm`
+/// rule with `sizes_from_starting_cash`, at a fixed size, its objective, return and reference
+/// alike.
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PlateauDirection {
@@ -215,9 +217,7 @@ pub struct PlateauDirection {
     pub windows: usize,
     /// The stitched objective; `None` when it is undefined.
     pub objective: Option<f64>,
-    /// The stitched return. For a `prop_firm` rule with `sizes_from_starting_cash`, the return
-    /// with its windows' own money changes added to the starting cash instead, as R1's return is
-    /// read for that rule; the objective and the reference still compound.
+    /// The stitched return.
     pub total_return: Option<f64>,
     /// The chosen sets' own runs in the same windows, stitched the same way: their objective.
     /// `None` when it is undefined, or in a result saved before directions had it.
@@ -234,10 +234,10 @@ pub struct CostStress {
     pub multiplier: f64,
     /// Each window's return at the stressed costs.
     pub window_returns: Vec<f64>,
-    /// The windows compounded, as the stitched curve compounds them. For a `prop_firm` rule whose
-    /// strategy sizes from the starting cash, the starting cash plus each window's own money
-    /// change, over the starting cash, less one, as its out-of-sample return is read. Either way,
-    /// windows after that account reached zero add nothing.
+    /// The windows compounded, as the stitched curve compounds them. For a `prop_firm` rule with
+    /// `sizes_from_starting_cash`, added at a fixed size, as its walk-forward is judged: the
+    /// starting cash plus each window's own money change, over the starting cash, less one.
+    /// Either way, windows after that account reached zero add nothing.
     pub total_return: f64,
 }
 
@@ -251,8 +251,8 @@ pub struct StartOffset {
     /// The windows that fit.
     pub windows: usize,
     /// The stitched out-of-sample return; `None` when the walk-forward could not run. For a
-    /// `prop_firm` rule whose strategy sizes from the starting cash, read on this run's own test
-    /// windows' money changes, added, as the main run's return is.
+    /// `prop_firm` rule with `sizes_from_starting_cash`, this run's windows stitched at a fixed
+    /// size, as the main run is judged.
     pub oos_return: Option<f64>,
     pub error: Option<String>,
 }
@@ -571,9 +571,8 @@ pub fn run_battery_with_references(
         meter.base += 3 * windows;
     }
 
-    // A `prop_firm` rule whose strategy sizes from the starting cash: every line its verdict
-    // judges reads the test windows' own money changes, added from window to window, or a figure
-    // that is the same on either curve (the list is at step 4).
+    // A `prop_firm` rule whose strategy sizes from the starting cash is judged on the fixed-size
+    // account (the exceptions are listed at step 4).
     let sizes_from_cash = matches!(
         rule,
         VerdictRule::PropFirm { limits, .. } if limits.sizes_from_starting_cash
@@ -634,24 +633,11 @@ pub fn run_battery_with_references(
     let cash = base.starting_cash;
     if let Some(wf) = judged.as_deref() {
         let m = &wf.metrics;
-        // A `prop_firm` rule sized from the starting cash reads the curve that adds each test
-        // window's own money changes (`tester::stitch_fixed_size`), whose own balance decides when
-        // the account is gone. Every line its verdict judges reads that account, or a figure that
-        // is the same on either curve:
-        // - On this curve: R1's return, I5's lowest equity (`oos_readings`), and the kind's daily
-        //   loss, drawdown, pass and breach odds and attempt value (below). R2's trade count
-        //   counts the windows it counts (`tester::fixed_size_trades`), and the trading days
-        //   their fills (`tester::fixed_size_fills`).
-        // - Added the same way on their own runs: R4's return at higher costs (step 5), each R6
-        //   offset's return (step 6) and each R5 direction's return, whose sign R5's share counts.
-        // - The same on either curve: I1 to I3, the profitable windows and the day and window
-        //   counts, which read each window's own run, and the luck test, the full-period sweep's.
-        // - On the compounding curve by decision: R5's median ratio, which compares each
-        //   direction's objective with the chosen sets' on the same windows, both compounded, so
-        //   like with like; reading it here would need every objective metric on this curve.
-        // - On the compounding curve, as warnings that never change the state or as figures this
-        //   kind does not judge: the Sharpe, peak leverage and swap warnings, the daily and trade
-        //   bootstraps, the breakdown, and the other kinds' inputs in `kind`.
+        // With a `prop_firm` rule sized from the starting cash, `wf` is the fixed-size account
+        // (`as_judged`), and every figure reads it, R5's, R4's and R6's runs stitched the same
+        // way, except those that read each window's own run (I1 to I3, the profitable windows,
+        // the day and window counts and the breakdown's rising and falling returns) or the
+        // full-period sweep (the luck test), and the other kinds' benchmark figures.
         evidence.oos_return = m.total_return;
         evidence.profitable_windows = Some(
             wf.windows
@@ -1253,8 +1239,8 @@ fn carry_warning(carry: Carry, trades: &[Trade], timeframe: Timeframe) -> Option
 /// such warning.
 ///
 /// shortcut: the starting-cash figure the warning quotes is read on the stitched curve, whose
-/// money changes carry the curve's level at each window, not on the windows' own money changes
-/// that a rule sized from the starting cash reads ([`tester::stitch_fixed_size`]). Read it there
+/// money changes carry the curve's level at each window, not on the fixed-size account that a
+/// rule sized from the starting cash reads ([`as_judged`]). Read it there
 /// when the warnings may next change, since that moves the figures saved verdicts quote.
 fn sizing_warning(line: &Criterion, fixed_size: f64) -> Option<String> {
     let (value, limit) = (line.value?, line.limit?);
@@ -1300,7 +1286,7 @@ fn stressed(fees: FeeSchedule, multiplier: f64) -> FeeSchedule {
 /// equity, which changes nothing). The windows compound, as the stitched curve compounds them,
 /// and once the compounded account is at or below zero later windows add nothing: the account is
 /// gone. With `fixed_size`, each window's own money change is added to the starting cash instead,
-/// as [`tester::stitch_fixed_size`] adds them, and the total is that over the starting cash, less
+/// as [`Sizing::FixedSize`] adds them, and the total is that over the starting cash, less
 /// one; there the added money decides when the account is gone, as on that curve. That total is
 /// not floored at -100%, as the fixed-size out-of-sample return is not, because the window that
 /// empties the account is counted in full.
@@ -1567,9 +1553,9 @@ fn daily_lows(
 /// fills are replayed per instrument with [`next_position`], the portfolio's rule, to know what
 /// each one closes and at what average entry; `cash`, the starting balance, and `account`, the
 /// account currency, turn a closed trade's value into a share of the balance. The battery passes
-/// the walk-forward windows' own fills ([`tester::tested_fills`], or [`tester::fixed_size_fills`]
-/// for a rule sized from the starting cash), not the stitched ones, whose quantities carry each
-/// window's scale, so that value is at the size the strategy was tested at.
+/// the walk-forward windows' own fills ([`tester::tested_fills`], or the fixed-size account's,
+/// which are those, for a rule sized from the starting cash), not the stitched ones, whose
+/// quantities carry each window's scale, so that value is at the size the strategy was tested at.
 ///
 /// shortcut: one set of flags, at the size the strategy was tested at, serves the evaluation and
 /// the funded account, so `VerdictRule::validate` refuses a `min_trade_size` with an attempt whose
@@ -1634,8 +1620,8 @@ fn traded_days(
 /// Judging each day's fall against its own starting balance assumes the position size grows with
 /// the balance, as for the drawdown line ([`attempt_drawdowns`]), and the verdict warns when the
 /// starting-cash reading would fail a line that passes (`sizing_warning`). A rule whose
-/// `sizes_from_starting_cash` is set judges the starting-cash reading instead, read on the test
-/// windows' own money changes ([`tester::stitch_fixed_size`]).
+/// `sizes_from_starting_cash` is set judges the starting-cash reading instead, read on the
+/// fixed-size account ([`as_judged`]).
 fn worst_daily_loss(
     series: &EquitySeries,
     ranges: &[crate::EquityRange],
@@ -1673,8 +1659,8 @@ struct Fall {
     /// As a fraction of each attempt's, or each day's, own starting equity: what the line judges.
     own: f64,
     /// As a fraction of the starting cash: what a fresh account at the starting balance would
-    /// lose trading the same fixed size. Exact on the curve of the windows' own money changes
-    /// ([`tester::stitch_fixed_size`]); on the stitched curve each window's money carries the
+    /// lose trading the same fixed size. Exact on the fixed-size account ([`as_judged`]); on the
+    /// stitched curve each window's money carries the
     /// curve's level at that window.
     cash: f64,
 }
@@ -1716,8 +1702,8 @@ struct Fall {
 /// where the same fall of 11 on a fresh account of 100 is 11%), so the verdict warns when the
 /// starting-cash reading would fail a line that passes (`sizing_warning`); one that starts after
 /// losses reads higher, which only makes the line stricter. A rule whose
-/// `sizes_from_starting_cash` is set judges the starting-cash reading instead, on the test
-/// windows' own money changes ([`tester::stitch_fixed_size`]).
+/// `sizes_from_starting_cash` is set judges the starting-cash reading instead, on the
+/// fixed-size account ([`as_judged`]).
 ///
 /// shortcut: on that curve an attempt that starts once the test's summed losses have used up the
 /// starting cash is skipped, as a day with no equity left is, so its fall is not counted; such a
