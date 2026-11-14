@@ -650,6 +650,7 @@ pub fn run_battery(
             pass_probability: None,
             breach_probability: None,
             attempt_value: None,
+            limits_inside_day: false,
         };
         if let VerdictRule::PropFirm {
             firm,
@@ -687,10 +688,15 @@ pub fn run_battery(
                 mean_block: stats::default_block_len(daily.len()),
                 seed: derive_seed(seed, SEED_PROP_FIRM),
             };
+            // The loss limits are checked on each day's lowest equity when the curve has its
+            // ranges, and at each daily close when it does not.
+            let lows = daily_lows(&series, &wf.equity_extremes, daily.len());
+            let lows = lows.as_deref();
+            kind.limits_inside_day = lows.is_some();
             // The firm rule sets no time limit of its own (see `FirmLimits`), so the pass odds
             // run to the rule's `pass_horizon_days`. With the two horizons equal, both odds come
             // from the same paths.
-            let breach = stats::prop_firm_odds(&daily, &traded, &spec).ok();
+            let breach = stats::prop_firm_odds(&daily, lows, &traded, &spec).ok();
             let pass = if limits.pass_horizon_days == limits.breach_horizon_days {
                 breach
             } else {
@@ -698,7 +704,7 @@ pub fn run_battery(
                     horizon_days: limits.pass_horizon_days as usize,
                     ..spec
                 };
-                stats::prop_firm_odds(&daily, &traded, &spec).ok()
+                stats::prop_firm_odds(&daily, lows, &traded, &spec).ok()
             };
             result.prop_firm_odds = pass.zip(breach).map(|(p, b)| PropFirmOdds {
                 pass: p.pass,
@@ -714,7 +720,7 @@ pub fn run_battery(
                     ..spec
                 };
                 result.prop_firm_attempt =
-                    stats::prop_firm_attempt(&daily, &traded, &spec, terms).ok();
+                    stats::prop_firm_attempt(&daily, lows, &traded, &spec, terms).ok();
                 kind.attempt_value = result.prop_firm_attempt.map(|a| a.reduced.value);
             }
         }
@@ -1228,6 +1234,38 @@ fn daily_returns(series: &EquitySeries) -> Vec<f64> {
         .windows(2)
         .map(|w| if w[0] > 0.0 { w[1] / w[0] - 1.0 } else { 0.0 })
         .collect()
+}
+
+/// Each day's lowest return inside the day, one for each of the `days` days of [`daily_returns`]
+/// of `series`: the day's lowest equity ([`risk::DailyPnl::low_equity`], the lowest bar low of the
+/// bars that close in it) against the previous day's close, at or under the day's return. Days end
+/// at midnight UTC, the boundary of the daily returns and the traded flags. A day that starts with
+/// no equity left has a low of zero, as its return is. `None` without equity ranges, or with
+/// ranges that do not match the curve.
+///
+/// shortcut: days roll over at midnight UTC for the returns, the lows and the flags alike, so a
+/// firm that resets its daily loss limit at another hour splits a dip across midnight
+/// differently; roll all three over at the firm's hour once a rule states it.
+fn daily_lows(
+    series: &EquitySeries,
+    ranges: &[crate::EquityRange],
+    days: usize,
+) -> Option<Vec<f64>> {
+    if ranges.is_empty() {
+        return None;
+    }
+    let pnl = risk::daily_pnl(series, Some(ranges), DayRollover::default());
+    (pnl.len() == days).then(|| {
+        pnl.iter()
+            .map(|d| {
+                if d.start_equity > 0.0 {
+                    d.low_equity / d.start_equity - 1.0
+                } else {
+                    0.0
+                }
+            })
+            .collect()
+    })
 }
 
 /// Whether the strategy traded on each of the `days` days of [`daily_returns`] of `series`: true
@@ -1943,6 +1981,46 @@ mod tests {
         }
     }
 
+    /// Each day's low is its lowest bar low against the day before's close, on the days of the
+    /// daily returns: a bar closing at midnight belongs to the day it ends.
+    #[test]
+    fn daily_lows_are_each_days_lowest_equity_against_the_close_before() {
+        const HALF: Millis = DAY_MS / 2;
+        // Twelve-hour bars over two days from day 1's midnight, from a balance of 100.
+        let series = EquitySeries {
+            times: vec![
+                DAY_MS,
+                DAY_MS + HALF,
+                2 * DAY_MS,
+                2 * DAY_MS + HALF,
+                3 * DAY_MS,
+            ],
+            values: vec![100.0, 100.0, 102.0, 101.0, 103.0],
+        };
+        let range = |low: f64, high: f64| crate::EquityRange { low, high };
+        let ranges = [
+            range(97.0, 100.0),
+            range(99.0, 102.0),
+            range(96.9, 101.0),
+            range(101.0, 104.0),
+        ];
+        let daily = daily_returns(&series);
+        let lows = daily_lows(&series, &ranges, daily.len()).unwrap();
+        assert_eq!(lows, [97.0 / 100.0 - 1.0, 96.9 / 102.0 - 1.0]);
+        assert!(lows.iter().zip(&daily).all(|(low, r)| low <= r));
+        // Without ranges, or with ranges that do not match the days, there are no lows.
+        assert_eq!(daily_lows(&series, &[], daily.len()), None);
+        assert_eq!(daily_lows(&series, &ranges[..3], daily.len()), None);
+        assert_eq!(daily_lows(&series, &ranges, daily.len() + 1), None);
+        // A day that starts with nothing has a low of zero, as its return is.
+        let gone = EquitySeries {
+            times: vec![DAY_MS, 2 * DAY_MS],
+            values: vec![0.0, 0.0],
+        };
+        assert_eq!(daily_returns(&gone), [0.0]);
+        assert_eq!(daily_lows(&gone, &[range(0.0, 0.0)], 1), Some(vec![0.0]));
+    }
+
     /// The days, counted from 1, that `traded_days` marks for `fills` on hourly bars, over five
     /// days that start at day 1's midnight, on a quote account of 10,000.
     fn flagged_days(fills: &[Fill], test: Option<TradingDayTest>) -> Vec<usize> {
@@ -2142,11 +2220,13 @@ mod tests {
                 mean_block: stats::default_block_len(daily.len()),
                 seed: derive_seed(seed, SEED_PROP_FIRM),
             };
-            stats::prop_firm_odds(&daily, traded, &spec).unwrap()
+            let lows = daily_lows(&series, &wf.equity_extremes, daily.len()).unwrap();
+            stats::prop_firm_odds(&daily, Some(&lows), traded, &spec).unwrap()
         };
         let fills = odds(&traded);
         let every_day = odds(&vec![true; daily.len()]);
         assert_eq!(r.prop_firm_odds, Some(fills));
+        assert!(r.kind.limits_inside_day);
         assert!(
             fills.pass < every_day.pass,
             "{fills:?} against {every_day:?}"
