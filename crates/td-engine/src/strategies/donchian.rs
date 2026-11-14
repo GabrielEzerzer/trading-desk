@@ -274,6 +274,7 @@ fn rule() -> VerdictRule {
             day_target_share: None,
             trading_day: None,
             trailing_floor_lock: None,
+            day_rollover: None,
         },
         limits: PropFirmLimits::default(),
         attempt: None,

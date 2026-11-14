@@ -1124,7 +1124,14 @@ trading_day?: TradingDayTest | null,
  * For a trailing drawdown, the level the floor stops rising at, as a fraction of the starting
  * balance above the start: 0 stops it at the starting balance. `None` lets it trail for ever.
  */
-trailing_floor_lock?: number | null, };
+trailing_floor_lock?: number | null, 
+/**
+ * Where the firm's day ends, for its daily loss limit and its trading days. When set, the
+ * worst-daily-loss line measures these days only, and the attempt walks read each day's
+ * return, its low and its trading-day flag on them. `None` measures the line on the worse of
+ * days ending at midnight UTC and at 17:00 New York, and walks days ending at midnight UTC.
+ */
+day_rollover?: DayRollover | null, };
 
 /**
  * The terms of one attempt at a prop-firm challenge: its fees, the funded account it leads to
@@ -1231,6 +1238,11 @@ min_trade_size?: number | null,
  */
 min_trade_move?: number | null, };
 
+/**
+ * When one trading day ends and the next begins, for the daily P&L and daily loss limits.
+ */
+export type DayRollover = { "kind": "utc", offset_minutes: number, } | { "kind": "new_york1700" };
+
 export type DrawdownMode = "static" | "trailing";
 
 export type PropFirmLimits = { 
@@ -1254,7 +1266,12 @@ pass_horizon_days: number,
 /**
  * The chance of breaching a limit within `breach_horizon_days` must be at most this.
  */
-max_breach_probability: number, breach_horizon_days: number, };
+max_breach_probability: number, 
+/**
+ * Days a simulated attempt runs for the breach odds, and the length of each attempt the
+ * max-drawdown line reads on the test's curve.
+ */
+breach_horizon_days: number, };
 
 export type PortfolioBenchmark = "buy_and_hold" | "cash";
 
@@ -1373,8 +1390,9 @@ export type Verdict = { instrument: InstrumentId, state: VerdictState,
  */
 criteria: Array<Criterion>, 
 /**
- * Costs the runs behind the verdict leave out, each named, so a verdict that rests on one is
- * visible. They do not change the state. Empty in a verdict saved before warnings existed.
+ * Costs the runs behind the verdict leave out, and assumptions a line passed on that the
+ * engine cannot check, each named, so a verdict that rests on one is visible. They do not
+ * change the state. Empty in a verdict saved before warnings existed.
  */
 warnings: Array<string>, };
 
@@ -1645,15 +1663,19 @@ risk_of_ruin: number | null,
  */
 return_without_best_trade: number | null, 
 /**
- * The worst loss within one day.
+ * The worst loss within one day, on the firm's day when its rule states one.
  */
 worst_daily_loss: number | null, 
 /**
- * Max drawdown from the starting balance.
+ * Max drawdown from the starting balance. For a `prop_firm` rule, the worst over attempts of
+ * its `breach_horizon_days` started on each day of the curve, each from its own starting
+ * balance; for the other kinds, over the whole curve.
  */
 intrabar_drawdown_static: number | null, 
 /**
- * Max drawdown from the running peak.
+ * Max drawdown from the running peak, as a fraction of the starting balance, over the same
+ * span as `intrabar_drawdown_static`: for a `prop_firm` rule, each attempt's peak starts at
+ * its own starting balance, and the fall is a fraction of that balance.
  */
 intrabar_drawdown_trailing: number | null, 
 /**
