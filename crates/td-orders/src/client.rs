@@ -21,7 +21,14 @@
 //!   pause, like a rate limit.
 //! - 110079, "The order is processing and can not be operated, please try again later": sent again
 //!   after a short pause, within the same bounds; when they run out the answer goes back as the
-//!   venue gave it.
+//!   venue gave it, except on a create (below).
+//!
+//! The page asks for a retry, but nothing proves that a body 429 or 10429, or a 110079 to a
+//! create, was not taken. Once an order request has been sent again after one of them, any later
+//! answer short of an acceptance (a duplicate id, a refusal, the retries running out, an IP block)
+//! leaves the earlier attempt's outcome open: it goes back as unknown and the caller asks the
+//! venue. An HTTP 429, a 10006 and a timestamp refusal still count as not taken, as the rate-limit
+//! and guide pages describe them, so a resend after one of them does not. Reads are not affected.
 //! - 40004, "the order is modified during the process of replacing, please check the order status
 //!   again", and 10014, "Invalid duplicate request": the outcome is unknown, so the caller asks the
 //!   venue, as after a timeout.
@@ -47,6 +54,7 @@ use reqwest::redirect::Policy;
 use td_core::Millis;
 
 use crate::guard::{Endpoint, same_origin};
+use crate::orders::CREATE;
 use crate::wire::{self, ServerTime};
 use crate::{ClientOrderId, DemoKeys, Error};
 
@@ -131,6 +139,13 @@ impl Timing {
 /// A blocking client for the venue's demo-trading v5 REST API, USDT perpetuals (`linear`) only.
 /// Call it from a thread that may block. It is `Send + Sync`; one client per session keeps the
 /// clock offset, rate-limit state and the set of client ids it has sent.
+///
+/// With [`Timing::default`], a `place`, `cancel` or `amend_stop` makes at most 39 requests (three
+/// sends and three lookups of up to 12 reads) with at most 27 s of pauses between them, so against
+/// a venue that answers each one just inside the 10 s request timeout it blocks for at most about
+/// 7 minutes; if the venue also answers with every rate-limit, retry and clock answer the client
+/// waits on, each of those requests can take up to 84 s (five attempts, a clock resync and 24 s of
+/// rate-limit waits), for at most about 55 minutes.
 pub struct Client {
     endpoint: Endpoint,
     base: Url,
@@ -161,6 +176,16 @@ pub(crate) enum Method {
     /// A GET of a public market endpoint, sent without the key or a signature.
     Public(Vec<(&'static str, String)>),
     Post(serde_json::Value),
+}
+
+/// What [`Client::call`] remembers across the attempts at one request.
+#[derive(Default)]
+struct Attempts {
+    /// The timestamp the latest attempt was signed with.
+    last_sent: Millis,
+    /// The answer after which an order request was sent again although that answer does not
+    /// prove the attempt was not taken.
+    unproven: Option<i64>,
 }
 
 /// How a signed request ended, short of success.
@@ -290,18 +315,51 @@ impl Client {
 
     /// Sends one request and classifies the answer. Rate limits (10006, HTTP and body 429, 10429),
     /// an order still processing (110079) and one timestamp refusal are handled here by sending
-    /// again, since the venue did not take the request. Everything else goes back to the caller.
+    /// again, since the venue says it did not take the request. Everything else goes back to the
+    /// caller.
+    ///
+    /// Nothing proves that a body 429 or 10429, or a 110079 to a create, was not taken. Once an
+    /// order request has been sent again after one of them, a later refusal or "not sent" (the
+    /// retries running out included) does not settle whether an earlier attempt was taken, so it
+    /// goes back as [`Failure::Unknown`], signed at the last attempt's time.
     pub(crate) fn call(
         &self,
         path: &'static str,
         method: &Method,
     ) -> Result<serde_json::Value, Failure> {
+        let mut attempts = Attempts::default();
+        let result = self.send(path, method, &mut attempts);
+        let Some(code) = attempts.unproven else {
+            return result;
+        };
+        match result {
+            Err(failure @ (Failure::NotSent(_) | Failure::Venue { .. })) => Err(Failure::Unknown {
+                reason: format!(
+                    "the venue answered {code} to an earlier attempt, which does not prove that \
+                     attempt was not taken; then {}",
+                    failure_error(failure)
+                ),
+                sent_at: attempts.last_sent,
+            }),
+            other => other,
+        }
+    }
+
+    /// The request loop behind [`Client::call`].
+    fn send(
+        &self,
+        path: &'static str,
+        method: &Method,
+        attempts: &mut Attempts,
+    ) -> Result<serde_json::Value, Failure> {
         let mut resynced = false;
         let mut rate_retries = 0;
         let signed = !matches!(method, Method::Public(_));
+        let order_request = matches!(method, Method::Post(_));
         loop {
             self.wait_for_limit(path);
             let timestamp = self.server_now();
+            attempts.last_sent = timestamp;
             let mut url = self.url(path).map_err(Failure::NotSent)?;
             let (payload, body) = match method {
                 Method::Get(query) | Method::Public(query) => {
@@ -418,6 +476,9 @@ impl Client {
                     std::thread::sleep(wait);
                 }
                 RET_HIGH_LOAD | RET_FREQUENCY_PROTECTION => {
+                    if order_request {
+                        attempts.unproven = Some(env.ret_code);
+                    }
                     rate_retries += 1;
                     if rate_retries > RATE_LIMIT_RETRIES {
                         return Err(Failure::NotSent(Error::RateLimited {
@@ -428,6 +489,9 @@ impl Client {
                     std::thread::sleep(self.timing.settle * rate_retries);
                 }
                 RET_PROCESSING => {
+                    if path == CREATE {
+                        attempts.unproven = Some(env.ret_code);
+                    }
                     rate_retries += 1;
                     if rate_retries > RATE_LIMIT_RETRIES {
                         return Err(Failure::Venue {

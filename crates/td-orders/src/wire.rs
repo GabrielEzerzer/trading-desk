@@ -79,8 +79,14 @@ pub enum OrderStatus {
     Triggered,
     /// A conditional order cancelled before it triggered.
     Deactivated,
-    /// A status this route does not know, kept as the venue spelled it.
+    /// A status this route does not know, kept as the venue spelled it, without control characters
+    /// and cut to 200 characters.
     Other(String),
+}
+
+/// Text from the venue as the crate keeps it: control characters removed, at most 200 characters.
+pub(crate) fn venue_text(text: &str) -> String {
+    text.chars().filter(|c| !c.is_control()).take(200).collect()
 }
 
 impl OrderStatus {
@@ -95,7 +101,7 @@ impl OrderStatus {
             "Cancelled" => Self::Cancelled,
             "Triggered" => Self::Triggered,
             "Deactivated" => Self::Deactivated,
-            other => Self::Other(other.to_string()),
+            other => Self::Other(venue_text(other)),
         }
     }
 
@@ -743,6 +749,18 @@ mod tests {
         ] {
             assert!(!OrderStatus::parse(closed).is_open(), "{closed}");
         }
+    }
+
+    #[test]
+    fn an_unknown_status_is_kept_without_control_characters_and_cut_short() {
+        let raw = format!("Odd\u{1b}[2J\r\n{}", "y".repeat(500));
+        let OrderStatus::Other(kept) = OrderStatus::parse(&raw) else {
+            panic!("not kept as Other");
+        };
+        assert!(!kept.chars().any(char::is_control), "{kept:?}");
+        assert_eq!(kept.chars().count(), 200);
+        assert!(kept.starts_with("Odd[2J"), "{kept:?}");
+        assert!(OrderStatus::parse(&raw).is_open());
     }
 
     #[test]

@@ -75,7 +75,8 @@ pub enum Error {
     #[error("order {id} is no longer open (status {status})")]
     OrderClosed { id: String, status: String },
 
-    /// An order whose request's answer was lost, found on the venue with status `Rejected`.
+    /// An order whose request's answer was lost, found on the venue with status `Rejected` before
+    /// any resend. Found after a resend, it is [`Error::OutcomeUnknown`] instead.
     #[error("the venue lists order {id} as rejected (reason {reason})")]
     OrderRejected { id: String, reason: String },
 

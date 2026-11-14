@@ -14,14 +14,16 @@
 //! outcome open): the venue is asked about the client id (real-time orders, order history,
 //! executions), in a few rounds a settle pause apart.
 //! - Place: an order record or an execution for the id means it was placed, unless the record
-//!   says the venue rejected it. The request is sent again, with the same id, only after the
-//!   original's receive window has passed and two rounds in a row found nothing; a `110072`
-//!   (duplicate id) answer to that resend means the original got through, and the order is looked
-//!   up, never placed twice. Any other answer to the resend that is not an acceptance (a refusal,
-//!   a rate limit, a timestamp refusal) is [`Error::OutcomeUnknown`] and the id stays spent: the
-//!   lists may lag behind an original that was accepted, and the original can cause the refusal (a
-//!   reduce-only close refused because the position is already flat). If the venue cannot be
-//!   asked, the answer is also [`Error::OutcomeUnknown`].
+//!   says the venue rejected it. A rejected record found before any resend is
+//!   [`Error::OrderRejected`]; found after one, it may be the original's while the resend was
+//!   accepted, so it is [`Error::OutcomeUnknown`]. The request is sent again, with the same id,
+//!   only after the original's receive window has passed and two rounds in a row found nothing;
+//!   a `110072` (duplicate id) answer to that resend means the original got through, and the
+//!   order is looked up, never placed twice. Any other answer to the resend that is not an
+//!   acceptance (a refusal, a rate limit, a timestamp refusal) is [`Error::OutcomeUnknown`] and
+//!   the id stays spent: the lists may lag behind an original that was accepted, and the original
+//!   can cause the refusal (a reduce-only close refused because the position is already flat). If
+//!   the venue cannot be asked, the answer is also [`Error::OutcomeUnknown`].
 //! - Cancel and amend cannot create an order, and an amend sets absolute values, so while the
 //!   order is still open with the old values they are sent again; a closed order record or the
 //!   requested values settle the outcome. Once an attempt's outcome is unknown, an answer that
@@ -43,7 +45,7 @@ use crate::wire::{self, Ack, OrderStatus, VenueOrder};
 use crate::{Action, Client, ClientOrderId, Error};
 
 pub(crate) const CATEGORY: &str = "linear";
-const CREATE: &str = "/v5/order/create";
+pub(crate) const CREATE: &str = "/v5/order/create";
 const CANCEL: &str = "/v5/order/cancel";
 const AMEND: &str = "/v5/order/amend";
 
@@ -185,13 +187,22 @@ impl Client {
             self.wait_past_window(sent_at);
             match self.settled_lookup(instrument, id) {
                 Lookup::Found(Seen::Order(o)) if o.status == OrderStatus::Rejected => {
-                    return Err(Error::OrderRejected {
-                        id: id.to_string(),
-                        reason: match o.reject_reason.as_str() {
-                            "" | "EC_NoError" => "none given".into(),
-                            r => self.scrub(r),
-                        },
-                    });
+                    let why = match o.reject_reason.as_str() {
+                        "" | "EC_NoError" => "none given".into(),
+                        r => self.scrub(r),
+                    };
+                    // Before any resend the record can only be the original's. After one, it may
+                    // still be the original's while the resend, under the same id, was accepted.
+                    if resend == 0 {
+                        return Err(Error::OrderRejected {
+                            id: id.to_string(),
+                            reason: why,
+                        });
+                    }
+                    return Err(unknown(format!(
+                        "{reason}; the venue lists the id as rejected (reason {why}), but a resend \
+                         under the same id was sent and may have been accepted"
+                    )));
                 }
                 Lookup::Found(Seen::Order(o)) => return Ok(placed(o.order_id)),
                 Lookup::Found(Seen::Executed { order_id, .. }) => return Ok(placed(order_id)),

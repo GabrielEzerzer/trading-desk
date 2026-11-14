@@ -420,22 +420,23 @@ fn after_a_lost_cancel_or_amend_a_refusal_or_a_missing_order_is_unknown() {
 
 #[test]
 fn a_cancel_that_took_while_its_answer_was_lost_is_reported_cancelled() {
-    // The first cancel is applied a moment after its connection drops; the repeat waits out a
-    // rate limit, is answered "not open", and the lookup shows the order cancelled.
+    // The first cancel is applied a second after its connection drops, after the lookup that
+    // finds the order still open; the repeat waits out a two-second rate limit, is answered "not
+    // open", and the lookup shows the order cancelled.
     let (mock, client) = setup();
     let i = instrument();
     long_with_stop(&mock, &client, "c2-1");
     mock.inject(
         CANCEL,
         Fault::ApplyLater {
-            after: Duration::from_millis(200),
+            after: Duration::from_secs(1),
             answer: None,
         },
     );
     mock.inject(
         CANCEL,
         Fault::RateLimit {
-            reset_after_ms: 1000,
+            reset_after_ms: 2000,
         },
     );
     assert_eq!(
@@ -471,12 +472,13 @@ fn answers_that_leave_the_outcome_open_are_resolved_by_asking() {
     assert_eq!(mock.request_count(CREATE), 2);
     assert_eq!(mock.orders_with_link_id("c3-1").len(), 1);
 
-    // 40004 to an amend the venue applies a moment later.
+    // 40004 to an amend the venue applies a second later, after the lookup that finds the old
+    // values.
     long_with_stop(&mock, &client, "c3-2");
     mock.inject(
         AMEND,
         Fault::ApplyLater {
-            after: Duration::from_millis(200),
+            after: Duration::from_secs(1),
             answer: Some(40004),
         },
     );
@@ -484,7 +486,7 @@ fn answers_that_leave_the_outcome_open_are_resolved_by_asking() {
         .amend_stop(&i, &id("c3-2"), Some(61000.0), None)
         .unwrap();
     assert_eq!(mock.request_count(AMEND), 2);
-    std::thread::sleep(Duration::from_millis(500));
+    std::thread::sleep(Duration::from_millis(1500));
     let o = &mock.orders_with_link_id("c3-2")[0];
     assert_eq!((o.trigger, o.qty), (Some(61000.0), 0.004));
 }
@@ -502,11 +504,10 @@ fn answers_that_mean_try_again_are_sent_again_within_the_bounds() {
         assert_eq!(mock.orders_with_link_id(&link).len(), 1, "{code}");
     }
     assert_eq!(mock.request_count(CREATE), 4);
-    // Past the bounds the request was not taken, so the id is free again.
-    mock.inject_always(CREATE, Fault::Answer(429));
-    let err = client
-        .place(&i, &market(Side::Buy, 0.002, false), &id("c3-l2"), PRICE)
-        .unwrap_err();
+    // A read past the bounds is rate limited (an order request past them is unknown; see
+    // `an_order_request_out_of_load_retries_is_looked_up_not_released`).
+    mock.inject_always("/v5/position/list", Fault::Answer(429));
+    let err = client.position(&i).unwrap_err();
     assert!(
         matches!(
             err,
@@ -518,9 +519,6 @@ fn answers_that_mean_try_again_are_sent_again_within_the_bounds() {
         "{err}"
     );
     mock.clear_faults();
-    client
-        .place(&i, &market(Side::Buy, 0.002, false), &id("c3-l2"), PRICE)
-        .unwrap();
 
     // 110079 to an amend and a cancel of an order the venue is still processing.
     long_with_stop(&mock, &client, "c3-p");
@@ -535,6 +533,77 @@ fn answers_that_mean_try_again_are_sent_again_within_the_bounds() {
         CancelOutcome::Cancelled
     );
     assert_eq!(mock.request_count(CANCEL), 2);
+}
+
+// Nothing proves a body 429 or 10429, or a 110079 to a create, was not taken, so after the client
+// has sent an order request again past one of them, no later refusal or "not sent" is final: the
+// order is looked up (here it is absent) and sent again once the receive window has passed.
+
+#[test]
+fn a_duplicate_id_after_a_load_retry_is_looked_up_not_reported() {
+    let (mock, client) = setup();
+    let i = instrument();
+    let order = market(Side::Buy, 0.002, false);
+    // After an HTTP 429 or a 10006 the first attempt was not taken, so the duplicate is the
+    // venue's own.
+    for (n, first) in [Fault::Http429, Fault::RateLimit { reset_after_ms: 10 }]
+        .into_iter()
+        .enumerate()
+    {
+        mock.inject(CREATE, first.clone());
+        mock.inject(CREATE, Fault::Answer(110072));
+        let err = client
+            .place(&i, &order, &id(&format!("s1-d{n}")), PRICE)
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::DuplicateClientId { .. }),
+            "{first:?}: {err}"
+        );
+    }
+    let before = mock.request_count(CREATE);
+    mock.inject(CREATE, Fault::Answer(429));
+    mock.inject(CREATE, Fault::Answer(110072));
+    let placed = client.place(&i, &order, &id("s1-d2"), PRICE).unwrap();
+    assert_eq!(
+        mock.request_count(CREATE) - before,
+        3,
+        "429, 110072, the resend"
+    );
+    let orders = mock.orders_with_link_id("s1-d2");
+    assert_eq!(orders.len(), 1);
+    assert_eq!(orders[0].order_id, placed.order_id);
+}
+
+#[test]
+fn a_create_still_processing_past_the_retries_is_looked_up_not_refused() {
+    let (mock, client) = setup();
+    let i = instrument();
+    for _ in 0..4 {
+        mock.inject(CREATE, Fault::Answer(110079));
+    }
+    let placed = client
+        .place(&i, &market(Side::Buy, 0.002, false), &id("s1-p"), PRICE)
+        .unwrap();
+    assert_eq!(mock.request_count(CREATE), 5, "four 110079s, the resend");
+    let orders = mock.orders_with_link_id("s1-p");
+    assert_eq!(orders.len(), 1);
+    assert_eq!(orders[0].order_id, placed.order_id);
+}
+
+#[test]
+fn an_order_request_out_of_load_retries_is_looked_up_not_released() {
+    let (mock, client) = setup();
+    let i = instrument();
+    for _ in 0..4 {
+        mock.inject(CREATE, Fault::Answer(429));
+    }
+    let placed = client
+        .place(&i, &market(Side::Buy, 0.002, false), &id("s1-l"), PRICE)
+        .unwrap();
+    assert_eq!(mock.request_count(CREATE), 5, "four 429s, the resend");
+    let orders = mock.orders_with_link_id("s1-l");
+    assert_eq!(orders.len(), 1);
+    assert_eq!(orders[0].order_id, placed.order_id);
 }
 
 #[test]
@@ -557,6 +626,41 @@ fn a_lost_place_the_venue_lists_as_rejected_is_an_error_with_its_reason() {
     );
     assert_eq!(mock.request_count(CREATE), 1);
     assert_eq!(mock.position(SYMBOL), 0.0);
+}
+
+#[test]
+fn a_rejected_record_found_after_a_resend_is_unknown() {
+    // The first create is recorded rejected and its answer lost. The lists lag long enough that
+    // the lookup after the receive window finds nothing, so the create is sent again; the venue
+    // frees a closed order's id, takes the resend and fills it, and that answer is lost too. The
+    // next lookup lists the old rejected record, not yet the new order, while a position is open.
+    let t = timing();
+    let (rw, settle) = (t.recv_window.as_millis(), t.settle.as_millis());
+    let lag = (rw + 2 * settle + 2 * rw + 3 * settle) / 2;
+    let (mock, client) = setup();
+    mock.set_id_rule(IdRule::OpenOnly);
+    mock.set_lag(lag as i64);
+    let i = instrument();
+    mock.inject(
+        CREATE,
+        Fault::RejectThenDrop("EC_NoImmediateQtyToFill".into()),
+    );
+    mock.inject(CREATE, Fault::DropAfterApply);
+    let order = market(Side::Buy, 0.002, false);
+    let err = client.place(&i, &order, &id("c5-2"), PRICE).unwrap_err();
+    assert!(is_unknown(&err, Action::Place), "{err}");
+    assert!(err.to_string().contains("EC_NoImmediateQtyToFill"), "{err}");
+    assert_eq!(mock.request_count(CREATE), 2, "the original and one resend");
+    let statuses: Vec<String> = mock
+        .orders_with_link_id("c5-2")
+        .into_iter()
+        .map(|o| o.status)
+        .collect();
+    assert_eq!(statuses, ["Rejected", "Filled"]);
+    assert_eq!(mock.position(SYMBOL), 0.002);
+    // The id stays claimed.
+    let err = client.place(&i, &order, &id("c5-2"), PRICE).unwrap_err();
+    assert!(matches!(err, Error::ClientIdAlreadyUsed { .. }), "{err}");
 }
 
 #[test]

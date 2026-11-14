@@ -12,7 +12,7 @@ use std::fmt;
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 
-use crate::Error;
+use crate::{Error, wire};
 
 /// The environment variable that holds the demo account's API key.
 pub const KEY_VAR: &str = "BYBIT_DEMO_API_KEY";
@@ -82,18 +82,17 @@ impl DemoKeys {
 
     /// Replaces a venue message that contains the key, the secret or `signature` (the venue's
     /// signature error can echo the signed text, which holds the key), and trims the rest.
+    /// Control characters go first, so a credential split by one is found whole, and the cut to
+    /// length comes last, so a credential at the cut is found whole too.
     pub(crate) fn scrub(&self, message: &str, signature: &str) -> String {
+        let plain: String = message.chars().filter(|c| !c.is_control()).collect();
         let leaks = [self.key.as_str(), self.secret.as_str(), signature]
             .iter()
-            .any(|s| !s.is_empty() && message.contains(s));
+            .any(|s| !s.is_empty() && plain.contains(s));
         if leaks {
             return "(message withheld: it contained a credential)".into();
         }
-        message
-            .chars()
-            .filter(|c| !c.is_control())
-            .take(200)
-            .collect()
+        wire::venue_text(&plain)
     }
 }
 
@@ -161,6 +160,22 @@ mod tests {
         assert!(!keys.scrub("sig abc123", "abc123").contains("abc123"));
         assert_eq!(keys.scrub("Too many visits!", "abc"), "Too many visits!");
         assert_eq!(keys.scrub(&"x".repeat(500), "").len(), 200);
+    }
+
+    #[test]
+    fn scrub_finds_a_credential_split_by_control_characters_or_at_the_cut() {
+        let keys = DemoKeys::for_loopback("KEYVALUE123", "SECRETVALUE456").unwrap();
+        for split in ["KEYV\u{0}ALUE123", "KEY\nVALUE123", "SECRET\u{7}\rVALUE456"] {
+            let shown = keys.scrub(&format!("error {split} end"), "");
+            assert!(
+                !shown.contains("KEYVALUE123") && !shown.contains("SECRETVALUE456"),
+                "{shown:?}"
+            );
+            assert!(shown.contains("withheld"), "{shown:?}");
+        }
+        // A key that straddles the 200-character cut is withheld, not cut in half.
+        let shown = keys.scrub(&format!("{}KEYVALUE123", "x".repeat(195)), "");
+        assert!(!shown.contains("KEYVA"), "{shown:?}");
     }
 
     #[test]
