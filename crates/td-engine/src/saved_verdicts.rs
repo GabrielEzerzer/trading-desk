@@ -535,17 +535,25 @@ pub fn session_link(
             let latest = latest_verdicts(runs_dir, std::slice::from_ref(entry), Some(entry.name))?
                 .into_iter()
                 .find(|row| row.instrument == *instrument);
+            let latest_refused = |id: &RunId, references: &[InstrumentId]| {
+                bad(format!(
+                    "{}; it is the strategy's latest verdict on {instrument}, so name a verdict judged without them {name_one}, or run a test without them first",
+                    cannot_feed(id, references)
+                ))
+            };
             match latest {
                 // Judged from the row, so a record that cannot be read again does not let the
                 // session start unlinked.
                 Some(row) if !row.references.is_empty() => {
-                    return Err(bad(format!(
-                        "{}; it is the strategy's latest verdict on {instrument}, so name a verdict judged without them {name_one}, or run a test without them first",
-                        cannot_feed(&row.run_id, &row.references)
-                    )));
+                    return Err(latest_refused(&row.run_id, &row.references));
                 }
-                Some(row) => read_record(&runs_dir.join(row.run_id.as_str()))
-                    .map(|record| (row.run_id, record)),
+                // And from the record read again, which may have been rewritten since.
+                Some(row) => match read_record(&runs_dir.join(row.run_id.as_str())) {
+                    Some(record) if !record.references.is_empty() => {
+                        return Err(latest_refused(&row.run_id, &record.references));
+                    }
+                    record => record.map(|record| (row.run_id, record)),
+                },
                 None => None,
             }
         }

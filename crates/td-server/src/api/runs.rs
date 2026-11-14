@@ -41,8 +41,9 @@ use td_data::{
     Closures, DataError, Gap, LoadedCandles, MonthQuotes, Store, missing_minutes, resample,
 };
 use td_engine::{
-    BacktestConfig, ENGINE_REVISION, EngineError, ReferenceBars, RunId, RunSummary, SavedRun,
-    StoreError, TesterError, config_fingerprint_with_references,
+    BacktestConfig, ENGINE_REVISION, EngineError, RECORD_FILE, RUNS_DIR, ReferenceBars, RunId,
+    RunSummary, SavedRun, StoreError, TesterError, code_matches,
+    config_fingerprint_with_references,
 };
 use ts_rs::TS;
 
@@ -52,14 +53,8 @@ use super::error::ApiError;
 use super::jobs::{JobCreated, JobCtx, JobError, JobRequest, JobResult, JobStatus};
 use super::source::MarketSource;
 
-/// The folder under the data directory that holds saved runs.
-use td_engine::RUNS_DIR;
-
 /// The file beside a saved run's `result.json` that holds its [`DataReport`].
 const DATA_REPORT_FILE: &str = "data.json";
-
-/// The file beside a saved run's `result.json` that holds its [`RunRecord`].
-use td_engine::RECORD_FILE;
 
 /// The environment variable that sets the data cutoff.
 const DATA_CUTOFF_VAR: &str = "TD_DATA_CUTOFF";
@@ -160,9 +155,6 @@ impl RunRecord {
         }
     }
 }
-
-/// Whether a saved code hash is the strategy's code in this engine (moved to `td_engine`).
-pub use td_engine::code_matches;
 
 /// Missing open time, or time without a funding rate, this long or longer in one stretch means the
 /// store lacks that part of a run's range, and the run is refused: a day. Closures recorded at
