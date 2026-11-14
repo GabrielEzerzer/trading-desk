@@ -1244,6 +1244,10 @@ fn daily_returns(series: &EquitySeries) -> Vec<f64> {
 /// shortcut: the smallest trade size is judged at the size the strategy was tested at, not at the
 /// attempt's `evaluation_size` or `funded_size`, since one set of flags serves both; build flags
 /// per size once a plan trades an attempt at a size that moves trades across the firm's smallest.
+///
+/// shortcut: a walk-forward test window closes its open position at its end, and that fill can
+/// pass the test, so up to one day per window is a trading day the strategy would not have had
+/// if it had held on; skip those fills once a fill says it is a window's close-out.
 fn traded_days(
     series: &EquitySeries,
     fills: &[Fill],
