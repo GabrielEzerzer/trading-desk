@@ -1301,7 +1301,18 @@ max_breach_probability: number,
  * Days a simulated attempt runs for the breach odds, and the length of each attempt the
  * max-drawdown line reads on the test's curve.
  */
-breach_horizon_days: number, };
+breach_horizon_days: number, 
+/**
+ * Whether the strategy trades a fixed quantity or notional set from the starting cash, so
+ * its falls in money stay the same size as the balance grows. When set, the max-drawdown and
+ * worst-daily-loss lines judge each fall in money as a share of the starting cash, and the
+ * simulated attempts add each day's profit and loss as a share of the starting cash instead
+ * of compounding a return on the balance, both read on each walk-forward test window's own
+ * money changes. `false`, the default, reads every fall and every day as a share of the
+ * balance it starts from, which is exact for a strategy whose size grows with its balance.
+ * `false` is left out of JSON.
+ */
+sizes_from_starting_cash?: boolean, };
 
 export type PortfolioBenchmark = "buy_and_hold" | "cash";
 

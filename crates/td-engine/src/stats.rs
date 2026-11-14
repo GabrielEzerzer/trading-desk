@@ -480,9 +480,27 @@ pub struct PropFirmSpec {
     /// The mean block length; [`default_block_len`] of the number of returns is the default.
     pub mean_block: usize,
     pub seed: u64,
+    /// Whether each day's figure is the day's profit and loss as a share of the starting balance,
+    /// added to the balance, as for a strategy that trades a fixed size set from the starting
+    /// cash, rather than a return compounded on the balance the day starts from. A day's low is
+    /// then likewise a share of the starting balance below the day's start. The phase sizes
+    /// still multiply the day's figure, and every limit, target and payout keeps its meaning in
+    /// fractions of the starting balance. `false` compounds.
+    pub sizes_from_starting_cash: bool,
 }
 
 impl PropFirmSpec {
+    /// The balance after a day that starts from `balance` with the day's figure `x` (its return
+    /// or its low, times the size traded): `x` of the starting balance added with
+    /// `sizes_from_starting_cash`, and `x` of `balance` otherwise.
+    fn step(&self, balance: f64, x: f64) -> f64 {
+        if self.sizes_from_starting_cash {
+            balance + x
+        } else {
+            balance * (1.0 + x)
+        }
+    }
+
     /// The floor on a day whose highest close before it is `peak`, the start included.
     fn floor(&self, peak: f64) -> f64 {
         match self.drawdown {
@@ -626,15 +644,15 @@ fn walk_path(
     }
 }
 
-/// Walks days, each its return and its low, on one balance from 1 with a peak that starts there,
-/// and returns the day (counted from 1) it first breached a limit, if it did before the days ran
+/// Walks days, each its return and its low (applied as [`PropFirmSpec::step`] says), on one
+/// balance from 1 with a peak that starts there, and returns the day (counted from 1) it first breached a limit, if it did before the days ran
 /// out: one account, never reset.
 fn first_breach(spec: &PropFirmSpec, days: impl Iterator<Item = (f64, f64)>) -> Option<usize> {
     let (mut equity, mut peak) = (1.0f64, 1.0f64);
     for (day, (r, low)) in (1..).zip(days) {
         let prev = equity;
-        equity *= 1.0 + r;
-        if spec.breached(prev, prev * (1.0 + low), spec.floor(peak)) {
+        equity = spec.step(prev, r);
+        if spec.breached(prev, spec.step(prev, low), spec.floor(peak)) {
             return Some(day);
         }
         peak = peak.max(equity);
@@ -660,8 +678,8 @@ fn first_breach(spec: &PropFirmSpec, days: impl Iterator<Item = (f64, f64)>) -> 
 /// a losing day before the target is reached ends below it.
 ///
 /// shortcut: the size depends only on the phase, not on the balance or the distance to the
-/// target or the floor (returns compound on the balance, as in [`first_breach`]); add a sizing
-/// plan once a plan needs one.
+/// target or the floor (each day's figure applies to the balance as [`PropFirmSpec::step`] says,
+/// as in [`first_breach`]); add a sizing plan once a plan needs one.
 fn walk_evaluation(
     spec: &PropFirmSpec,
     returns: &[f64],
@@ -676,9 +694,9 @@ fn walk_evaluation(
     let mut uncounted = 0.0f64;
     for (((day, &r), &low), &t) in (1..).zip(returns).zip(lows).zip(traded) {
         let prev = equity;
-        equity *= 1.0 + size * r;
+        equity = spec.step(prev, size * r);
         trading_days += usize::from(t);
-        if spec.breached(prev, prev * (1.0 + size * low), spec.floor(peak)) {
+        if spec.breached(prev, spec.step(prev, size * low), spec.floor(peak)) {
             return Evaluation::Breached(day);
         }
         peak = peak.max(equity);
@@ -716,6 +734,10 @@ fn walk_evaluation(
 /// and closes back above it breaches, as a firm that watches equity at every moment counts it.
 /// Without lows they are checked at each daily close, and a dip that recovers by the close is not
 /// seen; lows equal to the returns give exactly that.
+///
+/// With `spec.sizes_from_starting_cash`, each day's return and its low are its money change to
+/// its close and to its lowest equity, as shares of the starting balance, and the walks add them
+/// to the balance ([`PropFirmSpec::step`]).
 ///
 /// `payouts`, the attempt terms when the rule has them, gives the funded account of the breach
 /// odds its payouts ([`walk_path`]); the pass odds do not read them.
@@ -892,9 +914,9 @@ fn walk_funded(
             first_traded = Some(day);
         }
         let prev = out.balance;
-        out.balance *= 1.0 + size * r;
+        out.balance = spec.step(prev, size * r);
         let floor = fixed.unwrap_or_else(|| spec.floor(peak));
-        if spec.breached(prev, prev * (1.0 + size * low), floor) {
+        if spec.breached(prev, spec.step(prev, size * low), floor) {
             out.breached = Some(day);
             break;
         }
@@ -1407,6 +1429,7 @@ mod tests {
             paths: 300,
             mean_block: 3,
             seed: 11,
+            sizes_from_starting_cash: false,
         }
     }
 
@@ -3049,5 +3072,65 @@ mod tests {
         assert_eq!(a.full.pass, attempt(&half).full.pass);
         assert_eq!(a.reduced.pass, a.full.pass);
         assert!((a.full.pass - 0.25).abs() < 0.04, "{a:?}");
+    }
+
+    /// `spec` with each day's figure added as a share of the starting balance.
+    fn sized_from_cash(spec: PropFirmSpec) -> PropFirmSpec {
+        PropFirmSpec {
+            sizes_from_starting_cash: true,
+            ..spec
+        }
+    }
+
+    #[test]
+    fn days_sized_from_the_starting_cash_add_up_where_returns_compound() {
+        // The breach walk, its floor static at 0.75 and no daily limit, all exact in binary:
+        //   day 1  +0.5    compounding 1.5,    adding 1.5
+        //   day 2  -0.5    compounding 0.75,   adding 1.0     compounding reaches the floor
+        //   day 3  -0.25                       adding 0.75    adding reaches it a day later
+        let floor = PropFirmSpec {
+            max_drawdown: 0.25,
+            ..unlimited(10)
+        };
+        let path = [0.5, -0.5, -0.25];
+        assert_eq!(walk(&floor, &path), Some(2));
+        assert_eq!(walk(&sized_from_cash(floor), &path), Some(3));
+        assert_eq!(walk(&sized_from_cash(floor), &path[..2]), None);
+
+        // The evaluation at half size, to a target of 0.5625: the size still multiplies each day.
+        //   day 1  +0.5 at half  compounding 1.25,    adding 1.25
+        //   day 2  +0.5 at half  compounding 1.5625,  adding 1.5     compounding passes
+        //   day 3  +0.125 at half                     adding 1.5625  adding passes a day later
+        let target = PropFirmSpec {
+            target: 0.5625,
+            ..unlimited(10)
+        };
+        let path = [0.5, 0.5, 0.125];
+        let pass = |spec: &PropFirmSpec| {
+            walk_evaluation(spec, &path, &path, &every_day(&path), 0.5).passed()
+        };
+        assert_eq!(pass(&target), Some(2));
+        assert_eq!(pass(&sized_from_cash(target)), Some(3));
+
+        // The funded account, floor static at 0.75, a payout due every day capped at 0.25:
+        //   day 1  +0.5       both 1.5, pay the cap of 0.25: 1.25
+        //   day 2  -0.4375    compounding 0.703125, through the floor: it ends here
+        //                     adding 0.8125, above the floor, no profit to pay
+        //   day 3  +0.5       adding 1.3125, pays the cap again: 1.0625
+        let capped = AttemptTerms {
+            payout_cap: Some(0.25),
+            ..terms()
+        };
+        let path = [0.5, -0.4375, 0.5];
+        let f = funded(&floor, &capped, &path);
+        assert_eq!(
+            (f.payouts, f.gross, f.balance, f.breached),
+            (1, 0.25, 0.703125, Some(2))
+        );
+        let f = funded(&sized_from_cash(floor), &capped, &path);
+        assert_eq!(
+            (f.payouts, f.gross, f.balance, f.breached),
+            (2, 0.5, 1.0625, None)
+        );
     }
 }

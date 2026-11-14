@@ -1770,6 +1770,66 @@ pub(crate) fn tested_fills(starting_cash: f64, windows: &[WindowResult]) -> Vec<
         .collect()
 }
 
+/// The test segments stitched for a strategy that trades a fixed size set from the starting cash:
+/// each window's own equity, and its range through each bar, moved so that it starts where the
+/// previous window ended, so each window adds its own money changes where [`stitch`] compounds
+/// them. Each window is its own backtest from the starting cash, so a change on this curve is
+/// what an account at the starting balance trading that window's fixed size made, where the same
+/// change on the stitched curve is that times the stitched curve's level at the window. The
+/// windows [`stitch`] gives no weight, those after the stitched equity reached zero, stay flat
+/// here, so both curves and [`tested_fills`] span the same windows. The ranges are empty unless
+/// every window has one per point, as on the stitched curve.
+pub(crate) fn stitch_fixed_size(
+    starting_cash: f64,
+    windows: &[WindowResult],
+) -> (Vec<EquityPoint>, Vec<EquityRange>) {
+    let segments: Vec<(&[EquityPoint], &[EquityRange])> = windows
+        .iter()
+        .map(|w| {
+            (
+                &w.out_of_sample.equity[..],
+                &w.out_of_sample.equity_extremes[..],
+            )
+        })
+        .collect();
+    add_segments(starting_cash, &segments)
+}
+
+/// [`stitch_fixed_size`] on each window's equity and its ranges.
+fn add_segments(
+    starting_cash: f64,
+    segments: &[(&[EquityPoint], &[EquityRange])],
+) -> (Vec<EquityPoint>, Vec<EquityRange>) {
+    let curves: Vec<&[EquityPoint]> = segments.iter().map(|&(equity, _)| equity).collect();
+    let has_ranges = segments.iter().all(|(e, r)| r.len() == e.len());
+    let (mut equity, mut ranges) = (Vec::new(), Vec::new());
+    let mut level = starting_cash;
+    for (&(points, extremes), scale) in segments.iter().zip(segment_scales(starting_cash, &curves))
+    {
+        let moved = |x: f64| {
+            if scale == 0.0 {
+                level
+            } else {
+                level + (x - starting_cash)
+            }
+        };
+        equity.extend(points.iter().map(|p| EquityPoint {
+            time: p.time,
+            equity: moved(p.equity),
+        }));
+        if has_ranges {
+            ranges.extend(extremes.iter().map(|x| EquityRange {
+                low: moved(x.low),
+                high: moved(x.high),
+            }));
+        }
+        if let Some(last) = equity.last() {
+            level = last.equity;
+        }
+    }
+    (equity, ranges)
+}
+
 /// One run stitched into a curve: a test run's, or buy and hold's in a test window.
 struct Segment<'a> {
     equity: &'a [EquityPoint],
@@ -2368,6 +2428,53 @@ mod tests {
         }
         assert!(matches!(ok.windows(14), Err(TesterError::InvalidSpec(_))));
         assert_eq!(ok.windows(15).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn stitching_for_a_fixed_size_adds_each_window_from_where_the_last_ended() {
+        let range = |low: f64, high: f64| EquityRange { low, high };
+        // Each window is its own backtest from 100. The first gains 20; the second dips to 90
+        // inside a bar, falls 5 and ends 5 up; the third is flat.
+        let a = [point(0, 110.0), point(1, 120.0)];
+        let a_ranges = [range(100.0, 110.0), range(110.0, 120.0)];
+        let b = [point(2, 95.0), point(3, 105.0)];
+        let b_ranges = [range(90.0, 100.0), range(95.0, 105.0)];
+        let c = [point(4, 100.0)];
+        let c_ranges = [range(100.0, 100.0)];
+        let (equity, ranges) =
+            add_segments(100.0, &[(&a, &a_ranges), (&b, &b_ranges), (&c, &c_ranges)]);
+        // The second window adds its own money from 120, where compounding would scale it by
+        // 1.2 (114 and 126): its fall of 5 and its dip of 10 stay 5 and 10 of the starting cash.
+        let values: Vec<f64> = equity.iter().map(|p| p.equity).collect();
+        assert_eq!(values, [110.0, 120.0, 115.0, 125.0, 125.0]);
+        let times: Vec<Millis> = equity.iter().map(|p| p.time).collect();
+        assert_eq!(times, [0, 1, 2, 3, 4]);
+        assert_eq!(
+            ranges,
+            [
+                range(100.0, 110.0),
+                range(110.0, 120.0),
+                range(110.0, 120.0),
+                range(115.0, 125.0),
+                range(125.0, 125.0),
+            ]
+        );
+        // A window without a range per point leaves the ranges out.
+        let (_, ranges) = add_segments(100.0, &[(&a, &a_ranges), (&b, &b_ranges[..1])]);
+        assert!(ranges.is_empty());
+        // A window after the stitched equity reached zero has no weight there, and stays flat.
+        let ruin = [point(2, 0.0)];
+        let (equity, ranges) = add_segments(
+            100.0,
+            &[
+                (&a, &a_ranges),
+                (&ruin, &[range(0.0, 0.0)]),
+                (&c, &c_ranges),
+            ],
+        );
+        let values: Vec<f64> = equity.iter().map(|p| p.equity).collect();
+        assert_eq!(values, [110.0, 120.0, 20.0, 20.0]);
+        assert_eq!(ranges[3], range(20.0, 20.0));
     }
 
     #[test]

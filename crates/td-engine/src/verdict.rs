@@ -325,6 +325,16 @@ pub struct PropFirmLimits {
     /// Days a simulated attempt runs for the breach odds, and the length of each attempt the
     /// max-drawdown line reads on the test's curve.
     pub breach_horizon_days: u32,
+    /// Whether the strategy trades a fixed quantity or notional set from the starting cash, so
+    /// its falls in money stay the same size as the balance grows. When set, the max-drawdown and
+    /// worst-daily-loss lines judge each fall in money as a share of the starting cash, and the
+    /// simulated attempts add each day's profit and loss as a share of the starting cash instead
+    /// of compounding a return on the balance, both read on each walk-forward test window's own
+    /// money changes. `false`, the default, reads every fall and every day as a share of the
+    /// balance it starts from, which is exact for a strategy whose size grows with its balance.
+    /// `false` is left out of JSON.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub sizes_from_starting_cash: bool,
 }
 
 fn default_pass_horizon_days() -> u32 {
@@ -339,6 +349,7 @@ impl Default for PropFirmLimits {
             pass_horizon_days: default_pass_horizon_days(),
             max_breach_probability: 0.1,
             breach_horizon_days: 90,
+            sizes_from_starting_cash: false,
         }
     }
 }
@@ -3153,6 +3164,40 @@ mod tests {
             ..terms
         };
         assert!(with_attempt(zero).validate().is_err());
+    }
+
+    #[test]
+    fn sizing_from_the_starting_cash_is_left_out_of_json_when_off_and_reads_as_off_when_absent() {
+        // Limits without it are written without its key, and limits saved without the key read
+        // as off.
+        let limits = PropFirmLimits::default();
+        let json = serde_json::to_value(limits).unwrap();
+        assert!(json.get("sizes_from_starting_cash").is_none(), "{json}");
+        let read: PropFirmLimits = serde_json::from_value(json).unwrap();
+        assert!(!read.sizes_from_starting_cash);
+        assert_eq!(read, limits);
+        // Set, it is written and read back, in a rule that validates.
+        let fixed = PropFirmLimits {
+            sizes_from_starting_cash: true,
+            ..limits
+        };
+        let json = serde_json::to_value(fixed).unwrap();
+        assert_eq!(json["sizes_from_starting_cash"], true);
+        assert_eq!(
+            serde_json::from_value::<PropFirmLimits>(json).unwrap(),
+            fixed
+        );
+        let VerdictRule::PropFirm { firm, .. } = prop(DrawdownMode::Static) else {
+            unreachable!()
+        };
+        let rule = VerdictRule::PropFirm {
+            firm,
+            limits: fixed,
+            attempt: Some(attempt_terms()),
+        };
+        assert_eq!(rule.validate(), Ok(()));
+        let json = serde_json::to_value(rule).unwrap();
+        assert_eq!(serde_json::from_value::<VerdictRule>(json).unwrap(), rule);
     }
 
     #[test]
