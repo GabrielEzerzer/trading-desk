@@ -18,8 +18,9 @@
 //! - `f`: the stop guard's own orders when a loss limit fires or the owner flattens the session
 //!   (`crate::guard`): a reduce-only market order that closes the venue's position. Here `n` is
 //!   the guard's own counter, saved in the session's stop-state file before each send, not an
-//!   engine order. The broker does not track these; one seen on a bar is a fault, which is
-//!   harmless because the session has halted before the guard sends one.
+//!   engine order. The broker does not track these, so one a bar reads is a fault. The guard
+//!   sends one only after it has stopped the broker's sending and asked the run to halt, so only
+//!   a bar the run was already reading can see one, and that fault sends nothing.
 //! - `x`: reserved for orders the session sends itself outside the engine, such as a later
 //!   "close the position" action. This crate sends none; an execution carrying one is a fault
 //!   until that action exists.

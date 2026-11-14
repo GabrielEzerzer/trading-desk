@@ -50,6 +50,8 @@ const TICKERS: &str = "/v5/market/tickers";
 const POSITIONS: &str = "/v5/position/list";
 const INSTRUMENTS: &str = "/v5/market/instruments-info";
 const ORDERS: &str = "/v5/order/realtime";
+const HISTORY: &str = "/v5/order/history";
+const EXECUTIONS: &str = "/v5/execution/list";
 const DAY: Millis = 86_400_000;
 const WARM_UP: i64 = 3;
 /// A code the order route treats as a plain refusal; the mock answers it with its own message.
@@ -559,6 +561,90 @@ fn steps(rig: &Rig, id: &str) -> Vec<String> {
         .iter()
         .map(|s| s.as_str().unwrap().to_string())
         .collect()
+}
+
+/// The lines of session `id`'s log.
+fn log(rig: &Rig, id: &str) -> Vec<serde_json::Value> {
+    fs::read_to_string(rig.path(id, "events.jsonl"))
+        .expect("log")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("a log line"))
+        .collect()
+}
+
+/// The broker's record in the last line of session `id`'s log that holds one.
+fn last_record(rig: &Rig, id: &str) -> serde_json::Value {
+    log(rig, id)
+        .into_iter()
+        .rev()
+        .find_map(|line| line.get("record").filter(|r| !r.is_null()).cloned())
+        .expect("a record")
+}
+
+/// Cuts the log's last line, as a process that died before writing it would have left it.
+fn drop_last_line(path: &Path) {
+    let bytes = fs::read(path).expect("log");
+    let body = &bytes[..bytes.len() - 1];
+    let keep = body.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+    fs::write(path, &bytes[..keep]).expect("cut");
+}
+
+/// How a test ends a session it has put in some state.
+#[derive(Debug, Clone, Copy)]
+enum End {
+    /// The maximum loss limit fires while the guard runs.
+    Fire,
+    /// The owner stops the run and runs `td-live flatten`.
+    Flatten,
+}
+
+/// Ends `run` of session `id`, which holds a long and its resting stop, as `end` says, and asserts
+/// that the stop was cancelled, the whole venue position closed by one reduce-only `f` order, and
+/// the session ended. Returns the output.
+fn end_flat(rig: &Rig, id: &str, run: Guarded, feed: &Feed, end: End) -> String {
+    let position = rig.mock.position(SYMBOL);
+    assert!(
+        position > 0.0 && rig.resting() == 1,
+        "{end:?}: nothing to flatten"
+    );
+    let text = match end {
+        End::Fire => {
+            rig.lose(11_000.0);
+            let (outcome, text) = run.finish();
+            assert!(
+                matches!(&outcome, Outcome::Fired { fired, left: None, unsaved: None } if fired.rule == StopRule::MaxLoss),
+                "{outcome:?}\n{text}"
+            );
+            text
+        }
+        End::Flatten => {
+            let (_, ran) = run.stop();
+            let (code, text) = td_live(rig, feed, &["flatten", "--id", id]);
+            assert_eq!(code, 0, "{ran}\n{text}");
+            text
+        }
+    };
+    assert_eq!(rig.mock.position(SYMBOL), 0.0, "{end:?}: {text}");
+    assert_eq!(rig.resting(), 0, "{end:?}: {text}");
+    let closes = rig.flatten_orders();
+    assert_eq!(closes.len(), 1, "{end:?}: {closes:?}");
+    assert!(
+        closes[0].reduce_only && (closes[0].qty - position).abs() < 1e-9,
+        "{end:?}: {closes:?}"
+    );
+    assert!(
+        rig.mock
+            .orders()
+            .iter()
+            .any(|o| o.trigger == Some(STOP) && o.status == "Deactivated"),
+        "{end:?}: the stop was cancelled: {text}"
+    );
+    assert!(
+        matches!(rig.saved_status(id).state, State::Ended { .. }),
+        "{end:?}: {:?}",
+        rig.saved_status(id).state
+    );
+    text
 }
 
 #[test]
@@ -1561,4 +1647,214 @@ fn flatten_ends_a_faulted_session() {
         rig.saved_status("faulty").state,
         State::Ended { .. }
     ));
+}
+
+/// The broker's own fault (here a position change the session did not make) halts the run; the
+/// guard keeps checking, and a fired limit or the owner's flatten still cancels and closes.
+#[test]
+fn a_fired_limit_and_the_owner_s_flatten_cancel_and_close_after_a_broker_fault() {
+    for end in [End::Fire, End::Flatten] {
+        let rig = Rig::new();
+        let feed = rig.feed();
+        let run = rig.entered("broke", wide(), &feed, quick());
+        rig.mock.set_position(SYMBOL, 2.0 * QTY, PRICE);
+        feed.minute(rig.bar(2));
+        rig.wait("the broker's fault", |r| {
+            r.path("broke", "faulted").exists()
+        });
+        run.wait_line("halt:");
+        let fault = fs::read_to_string(rig.path("broke", "faulted")).unwrap();
+        assert!(fault.contains("position mismatch"), "{end:?}: {fault}");
+        end_flat(&rig, "broke", run, &feed, end);
+        // The fault stands: the session is refused for it.
+        assert!(
+            matches!(rig.open("broke"), Err(LiveError::StillFaulted(_))),
+            "{end:?}"
+        );
+    }
+}
+
+/// A second buy whose line the dead process never wrote, resumed while the venue's order history
+/// cannot be read, stays carried over the restart and unresolved, so the broker would close nothing
+/// at market; a fired limit or the owner's flatten still cancels and closes.
+#[test]
+fn a_fired_limit_and_the_owner_s_flatten_cancel_and_close_while_an_order_carried_over_a_restart_is_unresolved()
+ {
+    for end in [End::Fire, End::Flatten] {
+        let rig = Rig::new();
+        let feed = rig.feed();
+        // An entry with its stop on bar 0, then a second buy without one on bar 1.
+        let live = rig
+            .create("carry", script(0, 1, -1, wide()))
+            .expect("creates");
+        let run = rig.guard(live, &feed, bars_only());
+        run.wait_line("check: no stop fired");
+        feed.minute(rig.bar(1));
+        rig.wait("entry and its stop", |r| {
+            r.mock.position(SYMBOL) == QTY && r.resting() == 1
+        });
+        feed.minute(rig.bar(2));
+        run.wait_line(&format!("bar fed: {}", rig.bar(1)));
+        let (outcome, text) = run.stop();
+        assert_eq!(outcome, Outcome::Stopped, "{text}");
+        assert!((rig.mock.position(SYMBOL) - 2.0 * QTY).abs() < 1e-9);
+        // The process died after the second buy went out and before bar 1's line was written.
+        drop_last_line(&rig.path("carry", "events.jsonl"));
+        assert_eq!(log(&rig, "carry").last().unwrap()["sending"], true);
+
+        // Just after a restart the venue lists a closed order only in its history, which cannot
+        // be read while the session goes live.
+        rig.mock.set_closed_cache(false);
+        rig.mock.inject_always(HISTORY, Fault::DropBeforeApply);
+        let sends = rig.sends();
+        let feed = rig.feed();
+        let run = rig.guard(rig.open("carry").expect("reopens"), &feed, quick());
+        rig.wait("the run", |r| {
+            matches!(r.saved_status("carry").state, State::Running)
+        });
+        rig.mock.clear_faults();
+        let order = &last_record(&rig, "carry")["book"]["orders"]["3"];
+        assert_eq!(order["carried"], true, "{end:?}: {order}");
+        assert!(!rig.path("carry", "faulted").exists(), "{end:?}");
+        assert_eq!(rig.sends(), sends, "{end:?}: going live sent nothing");
+        end_flat(&rig, "carry", run, &feed, end);
+    }
+}
+
+/// A bar whose reads failed leaves the broker refusing orders that are not reduce-only; a fired
+/// limit or the owner's flatten still cancels and closes, with the executions still unreadable.
+#[test]
+fn a_fired_limit_and_the_owner_s_flatten_cancel_and_close_after_a_bar_the_venue_could_not_be_read_on()
+ {
+    for end in [End::Fire, End::Flatten] {
+        let rig = Rig::new();
+        let feed = rig.feed();
+        let run = rig.entered("unread", wide(), &feed, quick());
+        run.wait_line(&format!("bar fed: {}", rig.bar(0)));
+        rig.mock.inject_always(EXECUTIONS, Fault::ServerError);
+        feed.minute(rig.bar(2));
+        run.wait_line(&format!("bar fed: {}", rig.bar(1)));
+        let record = last_record(&rig, "unread");
+        assert_eq!(record["book"]["read_failures"], 1, "{end:?}: {record}");
+        end_flat(&rig, "unread", run, &feed, end);
+        assert!(matches!(
+            rig.open("unread"),
+            Err(LiveError::StopFired(_) | LiveError::Ended(_))
+        ));
+    }
+}
+
+/// The guard's check and the broker's bar reads make their own requests and keep their own
+/// counts: a failed read of one is never counted by the other.
+#[test]
+fn the_guard_and_the_broker_each_count_only_their_own_failed_reads() {
+    let rig = Rig::new();
+    let feed = rig.feed();
+    let run = rig.entered("counts", wide(), &feed, bars_only());
+    // Bar 1: the broker cannot read the executions; the guard's check after it passes.
+    rig.mock.inject_always(EXECUTIONS, Fault::ServerError);
+    feed.minute(rig.bar(2));
+    run.wait_line(&format!("bar fed: {}", rig.bar(1)));
+    assert_eq!(last_record(&rig, "counts")["book"]["read_failures"], 1);
+    assert!(!run.text().contains("check failed"), "{}", run.text());
+    // Bar 2: the guard cannot read the equity; the broker reads in full, which clears its count.
+    rig.mock.clear_faults();
+    rig.mock.inject_always(WALLET, Fault::ServerError);
+    feed.minute(rig.bar(3));
+    run.wait_line("check failed (1 of 4");
+    assert_eq!(last_record(&rig, "counts")["book"]["read_failures"], 0);
+    rig.mock.clear_faults();
+    let (outcome, text) = run.stop();
+    assert_eq!(outcome, Outcome::Stopped, "{text}");
+    assert_eq!(rig.resting(), 1, "{text}");
+}
+
+/// The halt is taken between bars, so a bar the run is already reading when a stop fires reads
+/// the venue while the flatten works. The broker faults on what the flatten changed and sends
+/// nothing; the flatten still ends flat.
+#[test]
+fn a_bar_read_while_the_flatten_works_faults_the_broker_which_sends_nothing() {
+    let rig = Rig::new();
+    let feed = rig.feed();
+    let run = rig.entered("race", wide(), &feed, quick());
+    run.wait_line(&format!("bar fed: {}", rig.bar(0)));
+    // Bar 1's first read is answered as the venue stood, then held past the fire and the
+    // flatten's first round; the rest of its reads see what the flatten did.
+    let reads = rig.mock.request_count(EXECUTIONS);
+    rig.mock
+        .inject(EXECUTIONS, Fault::Hang(Duration::from_millis(1200)));
+    feed.minute(rig.bar(2));
+    rig.wait("bar 1's first read", |r| {
+        r.mock.request_count(EXECUTIONS) > reads
+    });
+    let sends = rig.sends();
+    rig.lose(11_000.0);
+    let (outcome, text) = run.finish();
+    assert!(
+        matches!(&outcome, Outcome::Fired { fired, left: None, unsaved: None } if fired.rule == StopRule::MaxLoss),
+        "{outcome:?}\n{text}"
+    );
+    assert_eq!(
+        rig.sends(),
+        sends + 2,
+        "the flatten's cancel and close only: {text}"
+    );
+    assert_eq!(rig.flatten_orders().len(), 1, "{text}");
+    assert_eq!(rig.mock.position(SYMBOL), 0.0, "{text}");
+    assert_eq!(rig.resting(), 0, "{text}");
+    let fault = fs::read_to_string(rig.path("race", "faulted")).expect("the broker faulted");
+    assert!(fault.contains("-f1"), "{fault}");
+    assert!(matches!(
+        rig.saved_status("race").state,
+        State::Ended { .. }
+    ));
+    assert!(matches!(rig.open("race"), Err(LiveError::StillFaulted(_))));
+}
+
+#[test]
+fn a_resume_of_a_record_without_the_quantity_owed_is_refused_and_status_and_flatten_still_work() {
+    let rig = Rig::new();
+    let feed = rig.feed();
+    let (outcome, _) = rig.entered("old", wide(), &feed, bars_only()).stop();
+    assert_eq!(outcome, Outcome::Stopped);
+    // Every record as one written before records carried the quantity owed a stop.
+    let path = rig.path("old", "events.jsonl");
+    let mut stripped = 0;
+    let mut text = String::new();
+    for line in fs::read_to_string(&path).unwrap().lines() {
+        let mut value: serde_json::Value = serde_json::from_str(line).unwrap();
+        if let Some(book) = value.pointer_mut("/record/book") {
+            book.as_object_mut().unwrap().remove("owed").expect("owed");
+            stripped += 1;
+        }
+        text.push_str(&format!("{value}\n"));
+    }
+    assert!(stripped > 0);
+    fs::write(&path, text).unwrap();
+    let status = rig.json("old", "status.json");
+
+    let sends = rig.sends();
+    let feed = rig.feed();
+    let (code, resumed) = resume(&rig, "old", &feed);
+    assert_eq!(code, 1, "{resumed}");
+    assert!(
+        resumed.starts_with("error:") && resumed.contains("missing field `owed`"),
+        "{resumed}"
+    );
+    assert_eq!(rig.sends(), sends, "nothing sent");
+    assert!(!feed.opened.load(Ordering::SeqCst), "no run started");
+    assert_eq!(
+        rig.json("old", "status.json"),
+        status,
+        "the status is untouched"
+    );
+
+    let (code, shown) = td_live(&rig, &feed, &["status", "--id", "old"]);
+    assert_eq!(code, 0, "{shown}");
+    assert!(shown.contains("starting_balance"), "{shown}");
+    let (code, flattened) = td_live(&rig, &feed, &["flatten", "--id", "old"]);
+    assert_eq!(code, 0, "{flattened}");
+    assert_eq!(rig.mock.position(SYMBOL), 0.0, "{flattened}");
+    assert_eq!(rig.resting(), 0, "{flattened}");
+    assert!(matches!(rig.saved_status("old").state, State::Ended { .. }));
 }

@@ -978,6 +978,11 @@ fn fire(
     let reason = format!("a stop fired: {fired}");
     guard.gate.stop(&reason);
     if let Some(run) = &run {
+        // shortcut: the run takes the halt between bars, so a bar it is already reading reads
+        // the venue while the flatten works, sees a cancel or an `f` close the broker does not
+        // hold, and faults. The fault sends nothing and the flatten goes on to flat, but the
+        // `faulted` marker is left on a session the flatten ends. Wait for the bar in hand to
+        // end before the first send if that marker misleads in practice.
         run.halt(reason.clone());
     }
     out(&format!("stop fired: {fired}"));
@@ -1455,5 +1460,30 @@ mod tests {
             close.contains("stopped all sending: a stop fired"),
             "{close}"
         );
+    }
+
+    /// A protective stop or a cover stop is a reduce-only stop. The broker places those without
+    /// asking the gate; were one asked, the cap would still pass it, at any size and with the
+    /// position unreadable, and so would a halt.
+    #[test]
+    fn the_cap_never_refuses_a_reduce_only_stop_and_reads_nothing_for_one() {
+        let (mock, client, gate) = gate_at(QTY);
+        // Judged as exposure, a sell of three times the long would leave a short of 520, above
+        // the cap of 400.
+        let mut stop = market(Side::Sell, 3.0 * QTY, true);
+        stop.order_type = OrderType::Stop { trigger: 60_000.0 };
+        mock.inject_always("/v5/position/list", td_mock_bybit::Fault::ServerError);
+        // The same order without reduce-only is judged, and the unreadable position refuses it.
+        let mut entry = stop.clone();
+        entry.reduce_only = false;
+        let refused = gate
+            .refusal(&client, &instrument(), &entry, PRICE)
+            .expect("an order that is not reduce-only");
+        assert!(refused.contains("could not be read"), "{refused}");
+        let reads = mock.requests().len();
+        assert_eq!(gate.refusal(&client, &instrument(), &stop, PRICE), None);
+        gate.halt("the venue could not be read");
+        assert_eq!(gate.refusal(&client, &instrument(), &stop, PRICE), None);
+        assert_eq!(mock.requests().len(), reads, "nothing is read for it");
     }
 }
