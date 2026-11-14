@@ -188,7 +188,8 @@ pub struct IntegrityReport {
 /// A direction with an undefined objective has the worst ratio (minus infinity with `Maximize`, 0
 /// with `Minimize`); one whose reference is undefined, or at or below zero with `Maximize`, has
 /// none and is left out of the median. The share is the directions whose stitched return is
-/// above zero.
+/// above zero, or for a `prop_firm` rule sized from the starting cash, whose return with their
+/// own windows' money changes added is above zero ([`PlateauDirection::total_return`]).
 ///
 /// A result saved before R5 moved out of sample reads with `directions` empty and its ratio and
 /// share as they were judged then, on the full-period sweep.
@@ -213,6 +214,9 @@ pub struct PlateauDirection {
     pub windows: usize,
     /// The stitched objective; `None` when it is undefined.
     pub objective: Option<f64>,
+    /// The stitched return. For a `prop_firm` rule with `sizes_from_starting_cash`, the return
+    /// with its windows' own money changes added to the starting cash instead, as R1's return is
+    /// read for that rule; the objective and the reference still compound.
     pub total_return: Option<f64>,
     /// The chosen sets' own runs in the same windows, stitched the same way: their objective.
     /// `None` when it is undefined, or in a result saved before directions had it.
@@ -232,7 +236,7 @@ pub struct CostStress {
     /// The windows compounded, as the stitched curve compounds them. For a `prop_firm` rule whose
     /// strategy sizes from the starting cash, the starting cash plus each window's own money
     /// change, over the starting cash, less one, as its out-of-sample return is read. Either way,
-    /// windows after the compounded account reached zero add nothing.
+    /// windows after that account reached zero add nothing.
     pub total_return: f64,
 }
 
@@ -566,6 +570,14 @@ pub fn run_battery_with_references(
         meter.base += 3 * windows;
     }
 
+    // A `prop_firm` rule whose strategy sizes from the starting cash: every line its verdict
+    // judges reads the test windows' own money changes, added from window to window, or a figure
+    // that is the same on either curve (the list is at step 4).
+    let sizes_from_cash = matches!(
+        rule,
+        VerdictRule::PropFirm { limits, .. } if limits.sizes_from_starting_cash
+    );
+
     // 3c. R5's runs: each window's grid neighbours of the set it chose, on its test bars.
     let plateau = match &wf {
         Some(wf) => {
@@ -590,7 +602,13 @@ pub fn run_battery_with_references(
                 runs.push(window);
             }
             meter.base += neighbours * (windows - wf.windows.len());
-            Some(plateau(wf, &runs, &base, sweep_spec.objective))
+            Some(plateau(
+                wf,
+                &runs,
+                &base,
+                sweep_spec.objective,
+                sizes_from_cash,
+            ))
         }
         None => {
             meter.base += neighbours * windows;
@@ -613,16 +631,32 @@ pub fn run_battery_with_references(
         evidence.plateau_positive_share = p.positive_share;
     }
     let cash = base.starting_cash;
-    // A `prop_firm` rule whose strategy sizes from the starting cash: its out-of-sample return and
-    // kind lines (step 4), its return at higher costs (5) and its start offsets (6) read the test
-    // windows' own money changes, added from window to window.
-    let sizes_from_cash = matches!(
-        rule,
-        VerdictRule::PropFirm { limits, .. } if limits.sizes_from_starting_cash
-    );
     if let Some(wf) = &wf {
         let m = &wf.metrics;
-        evidence.oos_return = m.total_return;
+        // A `prop_firm` rule sized from the starting cash reads the curve that adds each test
+        // window's own money changes (`tester::stitch_fixed_size`), whose own balance decides when
+        // the account is gone. Every line its verdict judges reads that account, or a figure that
+        // is the same on either curve:
+        // - On this curve: R1's return, I5's lowest equity (`oos_readings`), and the kind's daily
+        //   loss, drawdown, pass and breach odds and attempt value (below). R2's trade count
+        //   counts the windows it counts (`tester::fixed_size_trades`), and the trading days
+        //   their fills (`tester::fixed_size_fills`).
+        // - Added the same way on their own runs: R4's return at higher costs (step 5), each R6
+        //   offset's return (step 6) and each R5 direction's return, whose sign R5's share counts.
+        // - The same on either curve: I1 to I3, the profitable windows and the day and window
+        //   counts, which read each window's own run, and the luck test, the full-period sweep's.
+        // - On the compounding curve by decision: R5's median ratio, which compares each
+        //   direction's objective with the chosen sets' on the same windows, both compounded, so
+        //   like with like; reading it here would need every objective metric on this curve.
+        // - On the compounding curve, as warnings that never change the state or as figures this
+        //   kind does not judge: the Sharpe, peak leverage and swap warnings, the daily and trade
+        //   bootstraps, the breakdown, and the other kinds' inputs in `kind`.
+        let fixed_curve = sizes_from_cash.then(|| {
+            let (equity, ranges) = tester::stitch_fixed_size(cash, &wf.windows);
+            (EquitySeries::new(cash, &equity, plan.timeframe), ranges)
+        });
+        let (oos_return, oos_trades, lowest_equity) = oos_readings(wf, cash, fixed_curve.as_ref());
+        evidence.oos_return = oos_return;
         evidence.profitable_windows = Some(
             wf.windows
                 .iter()
@@ -635,7 +669,7 @@ pub fn run_battery_with_references(
                 .count() as f64
                 / wf.windows.len() as f64,
         );
-        evidence.oos_trades = m.trades;
+        evidence.oos_trades = oos_trades;
         evidence.oos_days =
             (wf.equity.len() as i64 * plan.timeframe.duration_ms()) as f64 / DAY_MS as f64;
         evidence.windows = wf.windows.len();
@@ -672,12 +706,7 @@ pub fn run_battery_with_references(
         oos_integrity = OosIntegrityInputs {
             sharpe: m.sharpe,
             peak_leverage: m.peak_leverage,
-            lowest_equity: wf
-                .equity_extremes
-                .iter()
-                .map(|r| r.low)
-                .reduce(f64::min)
-                .map(|low| low / cash),
+            lowest_equity,
             curve: true,
         };
 
@@ -732,33 +761,6 @@ pub fn run_battery_with_references(
             // changes, added from window to window, and its lines on the starting-cash reading;
             // otherwise on the stitched curve, and its lines on each fall's own start.
             let per_cash = sizes_from_cash.then_some(cash);
-            // shortcut: with `sizes_from_starting_cash` the evidence layer's out-of-sample return,
-            // the return at higher costs and the start offsets read this curve (each on its own
-            // windows), but these figures still read the compounding curve. Each judged one's
-            // pass can differ for a fixed-size strategy whose window returns are large against
-            // their sum. Each plateau direction's stitched return and objective compound, and so
-            // does R1's objective they are judged against. The lowest equity line reads the
-            // stitched lows, above zero after two windows of -60% where this curve is below it, a
-            // test that already fails the return. Where the compounded account is gone and this
-            // one is not, the stitched figures leave the later windows out: the lowest equity line
-            // reads zero and fails a test whose return can pass, and the trade count leaves those
-            // windows' trades out. The Sharpe warning reads the stitched days,
-            // whose returns differ from this curve's by each window's own level, so only a figure
-            // near its limit can move. Shown but not judged by this kind: the daily bootstrap,
-            // likewise, and the trade bootstrap and breakdown, whose stitched trades carry the
-            // curve's level. The profitable windows, the trade, day and window counts, the luck
-            // test and the peak leverage read each window's own run, the same on either curve.
-            // Read the judged figures on this curve if a rule sized from the starting cash needs
-            // them to agree.
-            let fixed_curve = per_cash.map(|_| {
-                let (equity, ranges) = tester::stitch_fixed_size(cash, &wf.windows);
-                (EquitySeries::new(cash, &equity, plan.timeframe), ranges)
-            });
-            // The return the evidence layer judges is this account's too: the curve's last value
-            // over the starting cash, less one.
-            if let Some((fixed, _)) = &fixed_curve {
-                evidence.oos_return = metrics::total_return(&fixed.values);
-            }
             let (series, ranges) = match &fixed_curve {
                 Some((series, ranges)) => (series, &ranges[..]),
                 None => (&series, &wf.equity_extremes[..]),
@@ -1410,13 +1412,54 @@ fn prefix_differences(full: &[Order], prefix: &[Order], split: Millis) -> usize 
     differing + before.len().abs_diff(prefix.len())
 }
 
+/// R1's return, R2's trade count and I5's lowest equity inside a bar over the starting cash, read
+/// on the walk-forward's stitched curve, or with `fixed`, the curve and ranges that
+/// [`tester::stitch_fixed_size`] gives for a `prop_firm` rule sized from the starting cash: that
+/// curve's last value over the starting cash less one, the closed trades of the windows it counts
+/// ([`tester::fixed_size_trades`]) and its lowest low.
+///
+/// shortcut: a window whose own run was liquidated, at its own zero, leaves the fixed-size curve
+/// above zero when that account held more than the starting cash, so the lowest-equity line
+/// passes it, though such an account would have held the position on and could have lost more;
+/// also judge each window's own lowest equity if a plan's strategy reaches a liquidation.
+fn oos_readings(
+    wf: &WalkForwardResult,
+    cash: f64,
+    fixed: Option<&(EquitySeries, Vec<crate::EquityRange>)>,
+) -> (Option<f64>, usize, Option<f64>) {
+    let lowest = |ranges: &[crate::EquityRange]| {
+        ranges
+            .iter()
+            .map(|r| r.low)
+            .reduce(f64::min)
+            .map(|low| low / cash)
+    };
+    match fixed {
+        Some((series, ranges)) => (
+            metrics::total_return(&series.values),
+            tester::fixed_size_trades(cash, &wf.windows),
+            lowest(ranges),
+        ),
+        None => (
+            wf.metrics.total_return,
+            wf.metrics.trades,
+            lowest(&wf.equity_extremes),
+        ),
+    }
+}
+
 /// R5 from the walk-forward and `runs`, each window's neighbour runs with their steps (see
-/// [`PlateauReport`]).
+/// [`PlateauReport`]). With `fixed_size`, for a `prop_firm` rule sized from the starting cash,
+/// each direction's return, whose sign the share counts, adds its windows' own money changes
+/// ([`tester::fixed_size_total_return`]), as R1's return is read for that rule. The objectives
+/// still compound, the direction's and its reference's alike, so the ratio compares like with
+/// like.
 fn plateau(
     wf: &WalkForwardResult,
     runs: &[Vec<(Vec<i8>, BacktestResult)>],
     base: &BacktestConfig,
     objective: Objective,
+    fixed_size: bool,
 ) -> PlateauReport {
     let steps: BTreeSet<&Vec<i8>> = runs.iter().flatten().map(|(s, _)| s).collect();
     let directions: Vec<PlateauDirection> = steps
@@ -1437,7 +1480,11 @@ fn plateau(
                 steps: steps.clone(),
                 windows: moved.len(),
                 objective: h.value(objective.metric),
-                total_return: h.total_return,
+                total_return: if fixed_size {
+                    tester::fixed_size_total_return(base, &moved)
+                } else {
+                    h.total_return
+                },
                 reference: stitched_headline(base, &own).value(objective.metric),
             }
         })
@@ -1538,8 +1585,9 @@ fn daily_lows(
 /// fills are replayed per instrument with [`next_position`], the portfolio's rule, to know what
 /// each one closes and at what average entry; `cash`, the starting balance, and `account`, the
 /// account currency, turn a closed trade's value into a share of the balance. The battery passes
-/// the walk-forward windows' own fills ([`tester::tested_fills`]), not the stitched ones, whose
-/// quantities carry each window's scale, so that value is at the size the strategy was tested at.
+/// the walk-forward windows' own fills ([`tester::tested_fills`], or [`tester::fixed_size_fills`]
+/// for a rule sized from the starting cash), not the stitched ones, whose quantities carry each
+/// window's scale, so that value is at the size the strategy was tested at.
 ///
 /// shortcut: one set of flags, at the size the strategy was tested at, serves the evaluation and
 /// the funded account, so `VerdictRule::validate` refuses a `min_trade_size` with an attempt whose
@@ -3697,6 +3745,34 @@ mod tests {
             assert_eq!(off.evidence.oos_return, wf.metrics.total_return);
             assert_eq!(oos_line(&off), [wf.metrics.total_return]);
 
+            // The lowest-equity line and the trade count read the same account, and each plateau
+            // direction's return adds its own windows the same way, while its objective and
+            // reference compound; without the field, all read the stitched curve, as before.
+            // These windows' lowest point and trades agree on both curves (the hand-made cases
+            // below tell them apart); the return above, read in the same call, does not.
+            let lowest = |r: &[crate::EquityRange]| {
+                let lows = r.iter().map(|x| x.low);
+                lows.reduce(f64::min).map(|low| low / cash)
+            };
+            assert_eq!(on.oos_integrity.lowest_equity, lowest(&ranges));
+            assert_eq!(off.oos_integrity.lowest_equity, lowest(&wf.equity_extremes));
+            let trades = tester::fixed_size_trades(cash, &wf.windows);
+            assert_eq!(on.evidence.oos_trades, trades);
+            assert_eq!(off.evidence.oos_trades, wf.metrics.trades);
+            let (p_on, p_off) = (on.plateau.as_ref().unwrap(), off.plateau.as_ref().unwrap());
+            let ratio_inputs = |p: &PlateauReport| {
+                let d = p.directions.iter();
+                d.map(|d| (d.steps.clone(), d.objective, d.reference))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(ratio_inputs(p_on), ratio_inputs(p_off));
+            assert_eq!(p_on.median_ratio, p_off.median_ratio);
+            let returns = |p: &PlateauReport| {
+                let d = p.directions.iter();
+                d.map(|d| d.total_return).collect::<Vec<_>>()
+            };
+            assert_ne!(returns(p_on), returns(p_off), "{drawdown:?}");
+
             // The odds walk each day's money change, and its low, over the starting cash, added.
             let days = risk::daily_pnl(&series, None, utc);
             let daily: Vec<f64> = days.iter().map(|d| d.pnl() / cash).collect();
@@ -3955,6 +4031,206 @@ mod tests {
         assert_eq!(outcome(compounded), Outcome::Fail);
     }
 
+    /// A test run on twenty flat hourly bars from a balance of 10,000, to make windows from.
+    fn flat_run() -> BacktestResult {
+        let bars: Vec<Candle> = (0..20)
+            .map(|i| Candle {
+                open_time: i * HOUR,
+                open: 100.0,
+                high: 100.1,
+                low: 99.9,
+                close: 100.0,
+                volume: 1.0,
+                quote_volume: 100.0,
+            })
+            .collect();
+        run(&test_config(), &bars, &[], &[]).unwrap()
+    }
+
+    /// The `k`-th of a row of test windows made by [`window`], its two points at hours `2k` and
+    /// `2k + 1` so the windows follow one another.
+    fn nth_window(template: &BacktestResult, k: usize, end: f64) -> crate::WindowResult {
+        let mut w = window(template, end, Vec::new());
+        for (i, p) in w.out_of_sample.equity.iter_mut().enumerate() {
+            p.time = (2 * k + i) as Millis * HOUR;
+        }
+        w
+    }
+
+    /// sma_cross's walk-forward on [`sma_plan`], whose windows a test replaces.
+    fn sma_walk_forward() -> crate::WalkForwardResult {
+        let (plan, bars) = sma_plan(sma_axes());
+        let spec = plan.walk_forward_spec("sma_cross", test_instrument());
+        let wf = walk_forward_with_references(&spec, &bars, &[], &[], &[], None).unwrap();
+        assert_eq!(wf.spec.sweep.base.starting_cash, 10_000.0);
+        wf
+    }
+
+    /// The curve and ranges a rule sized from the starting cash reads for `wf`, as the battery
+    /// builds them.
+    fn fixed_curve(wf: &crate::WalkForwardResult) -> (EquitySeries, Vec<crate::EquityRange>) {
+        let base = &wf.spec.sweep.base;
+        let (equity, ranges) = tester::stitch_fixed_size(base.starting_cash, &wf.windows);
+        (
+            EquitySeries::new(base.starting_cash, &equity, base.timeframe),
+            ranges,
+        )
+    }
+
+    /// A rule sized from the starting cash reads I5's lowest equity on the fixed-size account.
+    /// Three windows on 10,000 end at 20,000, 0 and 15,000, the second dipping to its own zero
+    /// inside a bar. The compounding account holds twice the size there and is gone, at 0, which
+    /// fails the line; the fixed-size account is at 20,000 when that window loses 10,000, and
+    /// never goes below 10,000. Every figure is exact in binary.
+    #[test]
+    fn the_lowest_equity_line_reads_the_fixed_size_account_when_sized_from_the_starting_cash() {
+        let template = flat_run();
+        let range = |low: f64, high: f64| crate::EquityRange { low, high };
+        let windows = [
+            (
+                20_000.0,
+                [range(10_000.0, 10_000.0), range(10_000.0, 20_000.0)],
+            ),
+            (0.0, [range(10_000.0, 10_000.0), range(0.0, 10_000.0)]),
+            (
+                15_000.0,
+                [range(10_000.0, 10_000.0), range(10_000.0, 15_000.0)],
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(k, (end, ranges))| {
+            let mut w = nth_window(&template, k, end);
+            w.out_of_sample.equity_extremes = ranges.to_vec();
+            w
+        })
+        .collect();
+        let wf = tester::with_windows(&sma_walk_forward(), windows);
+        let cash = 10_000.0;
+        let fixed = fixed_curve(&wf);
+        let lows = |r: &[crate::EquityRange]| r.iter().map(|x| x.low).collect::<Vec<f64>>();
+        assert_eq!(
+            lows(&wf.equity_extremes),
+            [10_000.0, 10_000.0, 20_000.0, 0.0, 0.0, 0.0]
+        );
+        assert_eq!(
+            lows(&fixed.1),
+            [10_000.0, 10_000.0, 20_000.0, 10_000.0, 10_000.0, 10_000.0]
+        );
+        let (_, _, on) = oos_readings(&wf, cash, Some(&fixed));
+        let (_, _, off) = oos_readings(&wf, cash, None);
+        assert_eq!((on, off), (Some(1.0), Some(0.0)));
+        let outcome = |lowest_equity| {
+            let inputs = OosIntegrityInputs {
+                lowest_equity,
+                curve: true,
+                ..OosIntegrityInputs::default()
+            };
+            evaluate_oos_integrity(&inputs, 1.0)
+                .into_iter()
+                .find(|l| l.id == "lowest_equity")
+                .unwrap()
+                .outcome
+        };
+        assert_eq!((outcome(on), outcome(off)), (Outcome::Pass, Outcome::Fail));
+    }
+
+    /// A rule sized from the starting cash counts R2's trades in the windows the fixed-size
+    /// account counts, closed trades only, as the stitched metrics count theirs: each window on
+    /// 10,000 holds one closed trade and one still open.
+    #[test]
+    fn the_trade_count_counts_the_windows_the_fixed_size_account_counts() {
+        let template = flat_run();
+        let base = sma_walk_forward();
+        let cash = 10_000.0;
+        let count = |ends: &[f64], sized: bool| {
+            let windows = ends
+                .iter()
+                .enumerate()
+                .map(|(k, &end)| {
+                    let mut w = nth_window(&template, k, end);
+                    let at = (2 * k) as Millis * HOUR;
+                    w.out_of_sample.trades = vec![trade(at, 1.0, false), trade(at, 1.0, true)];
+                    w
+                })
+                .collect();
+            let wf = tester::with_windows(&base, windows);
+            let fixed = fixed_curve(&wf);
+            oos_readings(&wf, cash, sized.then_some(&fixed)).1
+        };
+        // The compounded account is gone after the second window; the fixed-size one is at
+        // 10,000 and trades on in the third.
+        let ruined = [20_000.0, 0.0, 15_000.0];
+        assert_eq!((count(&ruined, true), count(&ruined, false)), (3, 2));
+        // Two windows of -62.5% leave the fixed-size account at -2,500, gone, so the third
+        // window's trade is left out, while the compounded account still trades there.
+        let gone = [3_750.0, 3_750.0, 25_000.0];
+        assert_eq!((count(&gone, true), count(&gone, false)), (2, 3));
+        // With a minimum of three trades, the sample line passes on the first and is
+        // inconclusive on the second.
+        let mut settings = crate::EvidenceSettings::default();
+        settings.min_sample.trades = 3;
+        let outcome = |oos_trades| {
+            let inputs = EvidenceInputs {
+                oos_trades,
+                ..EvidenceInputs::default()
+            };
+            evaluate_evidence(&settings, &inputs)
+                .into_iter()
+                .find(|l| l.id == "oos_trades")
+                .unwrap()
+                .outcome
+        };
+        assert_eq!(
+            (
+                outcome(count(&ruined, true)),
+                outcome(count(&ruined, false))
+            ),
+            (Outcome::Pass, Outcome::Inconclusive)
+        );
+    }
+
+    /// A rule sized from the starting cash signs each R5 direction on its own windows' money
+    /// changes, added. A neighbour that makes 50% in one window and loses 37.5% in the next is up
+    /// 12.5% on the fixed-size account and down 6.25% compounded (1.5 x 0.625), so it counts as
+    /// profitable only with the field. Its objective and reference compound either way, so the
+    /// ratio does not move. Every figure is exact in binary.
+    #[test]
+    fn each_plateau_direction_is_signed_on_its_own_fixed_size_curve() {
+        let (plan, _) = sma_plan(sma_axes());
+        let wf = sma_walk_forward();
+        assert_eq!(wf.windows.len(), 4);
+        let template = flat_run();
+        // The neighbour runs in the first two windows only.
+        let runs: Vec<Vec<(Vec<i8>, BacktestResult)>> = [Some(15_000.0), Some(6_250.0), None, None]
+            .into_iter()
+            .enumerate()
+            .map(|(k, end)| {
+                end.map(|e| (vec![1, 0], nth_window(&template, k, e).out_of_sample))
+                    .into_iter()
+                    .collect()
+            })
+            .collect();
+        let base = plan.backtest_config("sma_cross", test_instrument());
+        let p = |sized| plateau(&wf, &runs, &base, plan.sweep.objective, sized);
+        let (on, off) = (p(true), p(false));
+        let ([a], [b]) = (on.directions.as_slice(), off.directions.as_slice()) else {
+            panic!("{on:?}")
+        };
+        assert_eq!(
+            (a.total_return, b.total_return),
+            (Some(0.125), Some(-0.0625))
+        );
+        assert_eq!(
+            (on.positive_share, off.positive_share),
+            (Some(1.0), Some(0.0))
+        );
+        assert_eq!(
+            (a.windows, a.objective, a.reference, on.median_ratio),
+            (b.windows, b.objective, b.reference, off.median_ratio)
+        );
+    }
+
     /// The verdict's warnings that start with `text`.
     fn warnings_starting(r: &BatteryResult, text: &str) -> Vec<String> {
         let warnings = r.verdict.warnings.iter();
@@ -4167,7 +4443,7 @@ mod tests {
             })
             .collect();
         let base = plan.backtest_config("sma_cross", test_instrument());
-        let p = plateau(wf, &runs, &base, plan.sweep.objective);
+        let p = plateau(wf, &runs, &base, plan.sweep.objective, false);
 
         let [flat, cliff] = p.directions.as_slice() else {
             panic!("{:?}", p.directions)

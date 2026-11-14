@@ -330,11 +330,18 @@ pub struct PropFirmLimits {
     /// worst-daily-loss lines judge each fall in money as a share of the starting cash, and the
     /// simulated attempts add each day's profit and loss as a share of the starting cash instead
     /// of compounding a return on the balance, both read on each walk-forward test window's own
-    /// money changes. The evidence layer's out-of-sample return reads the same added curve, its
-    /// last value over the starting cash less one, and so do the return at higher costs and each
-    /// start offset's return, each on its own run's windows. `false`, the default, reads every
-    /// fall and every day as a share of the balance it starts from, which is exact for a strategy
-    /// whose size grows with its balance. `false` is left out of JSON.
+    /// money changes, added; that curve's own balance decides when the account is gone. The other
+    /// lines the verdict judges read the same account, or a figure that is the same on either
+    /// curve: the out-of-sample return is that curve's last value over the starting cash less
+    /// one, the lowest-equity line reads its lowest low, the trade count counts the windows it
+    /// counts, and the return at higher costs, each start offset's return and each plateau
+    /// neighbour's return are read the same way on their own runs' windows. The one exception is
+    /// the plateau's median ratio, which compares each neighbour's compounded objective with the
+    /// chosen sets' compounded objective on the same windows, like with like. The Sharpe,
+    /// leverage and swap warnings, which do not change the state, read the compounding curve.
+    /// `false`, the default, reads every fall and every day as a share of the balance it starts
+    /// from, which is exact for a strategy whose size grows with its balance. `false` is left out
+    /// of JSON.
     #[serde(default, skip_serializing_if = "is_false")]
     pub sizes_from_starting_cash: bool,
 }
@@ -1006,7 +1013,9 @@ pub struct OosIntegrityInputs {
     /// I5: the highest notional over equity inside any bar.
     pub peak_leverage: Option<f64>,
     /// I5: the lowest equity inside any bar, over the starting cash. Zero is a bankrupt account:
-    /// a liquidation leaves the account at exactly zero.
+    /// a liquidation leaves the account at exactly zero. For a `prop_firm` rule with
+    /// `sizes_from_starting_cash`, the lowest low of the curve that adds each test window's own
+    /// money changes instead, over the starting cash.
     pub lowest_equity: Option<f64>,
     /// Whether the stitched out-of-sample curve exists. A curve can exist without the equity
     /// ranges inside its bars that I5 reads (a test run that kept none), and the lines then say
@@ -1488,7 +1497,10 @@ pub struct EvidenceInputs {
     pub oos_return: Option<f64>,
     /// R1: the share of walk-forward windows with a positive return.
     pub profitable_windows: Option<f64>,
-    /// R2: closed out-of-sample trades.
+    /// R2: closed out-of-sample trades. For a `prop_firm` rule with `sizes_from_starting_cash`,
+    /// those of the test windows that `oos_return`'s added curve counts: every window up to and
+    /// including the one that took that curve to zero or below, where the stitched count stops
+    /// at the one that took the stitched curve there.
     pub oos_trades: usize,
     /// R2: days of bars covered by the stitched out-of-sample curve, as in
     /// [`MinSample`](crate::MinSample): 24 hours of the market's open bars, so the days it is
@@ -1506,7 +1518,10 @@ pub struct EvidenceInputs {
     /// R5: the neighbours' median objective over R1's, both out of sample
     /// ([`crate::PlateauReport`]).
     pub plateau_median_ratio: Option<f64>,
-    /// R5: the share of neighbours with a positive out-of-sample return.
+    /// R5: the share of neighbours with a positive out-of-sample return. For a `prop_firm` rule
+    /// with `sizes_from_starting_cash`, each neighbour's return is read like `oos_return`, on its
+    /// own windows' money changes added. `plateau_median_ratio` still compares the stitched
+    /// objectives, both compounded.
     pub plateau_positive_share: Option<f64>,
     /// R6: how many start offsets gave a result of the same sign as the main run. For a
     /// `prop_firm` rule with `sizes_from_starting_cash`, each offset's result is read like

@@ -1774,6 +1774,19 @@ pub(crate) fn fixed_size_fills(starting_cash: f64, windows: &[WindowResult]) -> 
     )
 }
 
+/// The closed trades of the windows [`stitch_fixed_size`] counts, counted as a walk-forward's
+/// metrics count the stitched trades ([`MetricsReport::trades`]): each window's own trades that
+/// are not still open. The stitched count leaves out the windows after the stitched curve reached
+/// zero; this one leaves out those after the fixed-size curve did.
+pub(crate) fn fixed_size_trades(starting_cash: f64, windows: &[WindowResult]) -> usize {
+    fixed_size_counted(starting_cash, &test_curves(windows))
+        .into_iter()
+        .zip(windows)
+        .filter(|&(c, _)| c)
+        .map(|(_, w)| w.out_of_sample.trades.iter().filter(|t| !t.open).count())
+        .sum()
+}
+
 /// Each window's test equity.
 fn test_curves(windows: &[WindowResult]) -> Vec<&[EquityPoint]> {
     windows
@@ -1909,6 +1922,39 @@ fn run_segment(r: &BacktestResult) -> Segment<'_> {
 pub(crate) fn stitched_headline(base: &BacktestConfig, runs: &[&BacktestResult]) -> Headline {
     let segments: Vec<Segment> = runs.iter().map(|r| run_segment(r)).collect();
     Headline::new(&stitched_report(base, &segments).metrics)
+}
+
+/// The total return of `runs`, one test run per walk-forward window in order, stitched as
+/// [`stitch_fixed_size`] stitches a walk-forward's test runs: that curve's last value over the
+/// starting cash, less one, as a `prop_firm` rule sized from the starting cash reads R1's return.
+pub(crate) fn fixed_size_total_return(
+    base: &BacktestConfig,
+    runs: &[&BacktestResult],
+) -> Option<f64> {
+    let cash = base.starting_cash;
+    let segments: Vec<(&[EquityPoint], &[EquityRange])> =
+        runs.iter().map(|r| (&r.equity[..], &[][..])).collect();
+    let (equity, _) = add_segments(cash, &segments);
+    metrics::total_return(&EquitySeries::new(cash, &equity, base.timeframe).values)
+}
+
+/// `wf` with its windows replaced by `windows`, stitched as [`walk_forward`] stitches its test
+/// runs: the curve, its ranges, the metrics, the trades and the fills. The rest is kept.
+#[cfg(test)]
+pub(crate) fn with_windows(
+    wf: &WalkForwardResult,
+    windows: Vec<WindowResult>,
+) -> WalkForwardResult {
+    let st = stitched_report(&wf.spec.sweep.base, &test_segments(&windows));
+    WalkForwardResult {
+        windows,
+        equity: st.equity,
+        equity_extremes: st.ranges,
+        metrics: st.metrics,
+        trades: st.trades,
+        fills: st.fills,
+        ..wf.clone()
+    }
 }
 
 /// Buy and hold in each test window, stitched like the test runs and compared with the stitched
