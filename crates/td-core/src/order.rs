@@ -48,7 +48,8 @@ pub enum TimeInForce {
 
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(transparent)]
+// No `#[serde(transparent)]`: serde already writes a one-field tuple struct as its field in
+// JSON, and ts-rs cannot parse that attribute, so it would print a warning on every build.
 pub struct OrderId(pub u64);
 
 /// An order as a strategy or the user submits it. Quantity is in the base asset and always
@@ -110,6 +111,12 @@ mod tests {
     fn side_sign() {
         assert_eq!(Side::Buy.sign() * 2.0, 2.0);
         assert_eq!(Side::Sell.sign() * 2.0, -2.0);
+    }
+
+    #[test]
+    fn an_order_id_is_written_as_its_number() {
+        assert_eq!(serde_json::to_string(&OrderId(7)).unwrap(), "7");
+        assert_eq!(serde_json::from_str::<OrderId>("7").unwrap(), OrderId(7));
     }
 
     #[test]

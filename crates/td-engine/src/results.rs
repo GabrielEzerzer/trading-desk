@@ -62,7 +62,8 @@ pub enum StoreError {
 /// sort by time, then `-` and the first 8 hex digits of the SHA-256 of `result.json`.
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(transparent)]
+// No `#[serde(transparent)]`: serde already writes a one-field tuple struct as its field in
+// JSON, and ts-rs cannot parse that attribute, so it would print a warning on every build.
 pub struct RunId(String);
 
 impl RunId {
@@ -520,6 +521,14 @@ mod tests {
         ] {
             assert!(RunId::parse(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn a_run_id_is_written_as_its_string() {
+        let id = RunId::parse("1762790000123-0a1b2c3d").unwrap();
+        let json = serde_json::to_string(&id).unwrap();
+        assert_eq!(json, r#""1762790000123-0a1b2c3d""#);
+        assert_eq!(serde_json::from_str::<RunId>(&json).unwrap(), id);
     }
 
     #[test]
