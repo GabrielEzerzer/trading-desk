@@ -77,7 +77,7 @@ use crate::stats::{
     PropFirmOdds, PropFirmSpec, RuinSpec,
 };
 use crate::strategies::direction;
-use crate::tester::stitched_headline;
+use crate::tester::{self, stitched_headline};
 use crate::verdict::{
     IntegrityInputs, OosIntegrityInputs, TradingDayTest, evaluate_integrity, evaluate_oos_integrity,
 };
@@ -696,9 +696,10 @@ pub fn run_battery(
             // firm's test, or with any fill without one.
             let step = plan.timeframe.duration_ms();
             let ends: Vec<Millis> = days.iter().map(|d| d.end).collect();
+            // The windows' own fills, so a trade's value is judged at the size tested.
             let traded = traded_days(
                 &ends,
-                &wf.fills,
+                &tester::tested_fills(cash, &wf.windows),
                 step,
                 firm.trading_day.as_ref(),
                 cash,
@@ -1366,7 +1367,9 @@ fn daily_lows(
 /// With a firm's `test`, only a fill that passes it marks its day ([`TradingDayTest`]). The
 /// fills are replayed per instrument with [`next_position`], the portfolio's rule, to know what
 /// each one closes and at what average entry; `cash`, the starting balance, and `account`, the
-/// account currency, turn a closed trade's value into a share of the balance.
+/// account currency, turn a closed trade's value into a share of the balance. The battery passes
+/// the walk-forward windows' own fills ([`tester::tested_fills`]), not the stitched ones, whose
+/// quantities carry each window's scale, so that value is at the size the strategy was tested at.
 ///
 /// shortcut: one set of flags, at the size the strategy was tested at, serves the evaluation and
 /// the funded account, so `VerdictRule::validate` refuses a `min_trade_size` with an attempt whose
@@ -2672,6 +2675,130 @@ mod tests {
     }
 
     const NO_DAYS: [usize; 0] = [];
+
+    /// A walk-forward window on a balance of 10,000 whose test run ends at `end` and holds
+    /// `fills`, the rest taken from `template`.
+    fn window(template: &BacktestResult, end: f64, fills: Vec<Fill>) -> crate::WindowResult {
+        let mut out_of_sample = template.clone();
+        out_of_sample.equity = vec![
+            EquityPoint {
+                time: 0,
+                equity: 10_000.0,
+            },
+            EquityPoint {
+                time: 1,
+                equity: end,
+            },
+        ];
+        out_of_sample.fills = fills;
+        crate::WindowResult {
+            train_from: 0,
+            train_to: 0,
+            test_from: 0,
+            test_to: 0,
+            params: template.config.params.clone(),
+            in_sample: Headline::new(&template.metrics),
+            out_of_sample,
+        }
+    }
+
+    /// A trade's value is judged at the size the strategy was tested at, not at the stitched
+    /// curve's level in its window: the stitched fills carry each window's scale.
+    #[test]
+    fn a_trades_value_is_judged_at_the_size_tested_not_at_the_stitched_curves_level() {
+        let (plan, bars) = sma_plan(sma_axes());
+        let r = sma_battery(&plan, &bars, 7);
+        let wf = r.walk_forward.as_ref().unwrap();
+        let template = &wf.windows[0].out_of_sample;
+        // One of 1 bought on day 1 and sold on day 3 at `price`, scaled by `scale`.
+        let trade = |price: f64, scale: f64| {
+            vec![
+                day_fill(1, Side::Buy, scale, price),
+                day_fill(3, Side::Sell, scale, price),
+            ]
+        };
+        // The second window's fills as the battery reads them, after a first window that ends at
+        // `first_end` of the 10,000 start.
+        let tested = |first_end: f64, price: f64| {
+            let windows = [
+                window(template, first_end, Vec::new()),
+                window(template, 10_000.0, trade(price, 1.0)),
+            ];
+            tester::tested_fills(10_000.0, &windows)
+        };
+        let at_least = |size| day_test(false, Some(size), None);
+
+        // The first window ends 25% up, so the stitched account trades 1.25 of each: a trade of
+        // 4,000, 0.4 of the balance as tested, reads 0.5 stitched and met a minimum of 0.45.
+        let up = tested(12_500.0, 4_000.0);
+        assert_eq!(up, trade(4_000.0, 1.0));
+        assert_eq!(flagged_days(&up, at_least(0.45)), NO_DAYS);
+        assert_eq!(flagged_days(&trade(4_000.0, 1.25), at_least(0.45)), [3]);
+        // The mirror: 25% down, a trade of 5,000 is 0.5 as tested and reads 0.375 stitched.
+        let down = tested(7_500.0, 5_000.0);
+        assert_eq!(flagged_days(&down, at_least(0.45)), [3]);
+        assert_eq!(flagged_days(&trade(5_000.0, 0.75), at_least(0.45)), NO_DAYS);
+        // A window after the stitched account is gone is left out, as the stitched fills leave it.
+        assert!(tested(0.0, 5_000.0).is_empty());
+
+        // Without a smallest size the scale changes nothing: on a real walk-forward the windows'
+        // own fills give the stitched fills' flags.
+        let cash = plan.backtest.starting_cash;
+        let series = EquitySeries::new(cash, &wf.equity, plan.timeframe);
+        let ends: Vec<Millis> = risk::daily_pnl(&series, None, DayRollover::default())
+            .iter()
+            .map(|d| d.end)
+            .collect();
+        let own = tester::tested_fills(cash, &wf.windows);
+        assert_ne!(own, wf.fills);
+        let step = plan.timeframe.duration_ms();
+        let quote = td_core::AccountCurrency::Quote;
+        for test in [
+            None,
+            day_test(false, None, None),
+            day_test(true, None, None),
+            day_test(false, None, Some(0.001)),
+        ] {
+            let flags =
+                |fills: &[Fill]| traded_days(&ends, fills, step, test.as_ref(), cash, quote);
+            assert_eq!(flags(&own), flags(&wf.fills), "{test:?}");
+            assert!(flags(&own).contains(&true), "{test:?}");
+        }
+
+        // With a smallest size where the two differ on this curve, the battery's odds count the
+        // trading days of the windows' own fills.
+        let count = |fills: &[Fill], size: f64| {
+            let test = at_least(size);
+            let flags = traded_days(&ends, fills, step, test.as_ref(), cash, quote);
+            flags.iter().filter(|&&t| t).count()
+        };
+        let size = (1..=100)
+            .map(|k| f64::from(k) / 100.0)
+            .find(|&size| count(&own, size) != count(&wf.fills, size))
+            .unwrap();
+        let VerdictRule::PropFirm { firm, limits, .. } = firm_rule(DrawdownMode::Static, 10, None)
+        else {
+            unreachable!()
+        };
+        let rule = VerdictRule::PropFirm {
+            firm: crate::FirmLimits {
+                trading_day: at_least(size),
+                ..firm
+            },
+            limits,
+            attempt: None,
+        };
+        let spec = BatterySpec {
+            strategy: "sma_cross",
+            plan: &plan,
+            rule: &rule,
+            instrument: &test_instrument(),
+            seed: 7,
+        };
+        let sized = run_battery(&spec, &bars, &[], &[], None).unwrap();
+        let odds = sized.prop_firm_odds.unwrap();
+        assert_eq!(odds.trading_days, Some(count(&own, size)), "{size}");
+    }
 
     #[test]
     fn a_firms_trading_day_test_counts_only_the_closing_fill_of_a_large_enough_trade() {
