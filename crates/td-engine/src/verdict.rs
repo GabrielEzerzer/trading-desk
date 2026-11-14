@@ -121,6 +121,14 @@ pub struct FirmLimits {
     /// days ending at midnight UTC and at 17:00 New York, and walks days ending at midnight UTC.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub day_rollover: Option<DayRollover>,
+    /// The number of days in a row without a trading day (as `min_trading_days` counts them) that
+    /// ends the account, in each evaluation phase and on the funded account. The days are the
+    /// walks' calendar days, counted as `calendar_days_to_first_payout` counts them, and each
+    /// account counts from its own start: the account ends at the close of the day this many
+    /// days after its start or its last trading day, with no trading day between. The attempt
+    /// walks treat that end as a breach. `None` sets no such limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_days_without_trading: Option<u32>,
 }
 
 /// A firm's test for a trading day. A day counts when one of its fills passes the test; each fill
@@ -495,6 +503,11 @@ impl VerdictRule {
                         ));
                     }
                     non_negative("firm.trailing_floor_lock", lock)?;
+                }
+                if firm.max_days_without_trading == Some(0) {
+                    return Err(PlanError(
+                        "firm.max_days_without_trading must be at least 1".to_string(),
+                    ));
                 }
                 if let Some(DayRollover::Utc { offset_minutes }) = firm.day_rollover
                     && offset_minutes.unsigned_abs() >= MINUTES_PER_DAY.unsigned_abs()
@@ -1816,6 +1829,7 @@ mod tests {
             day_target_share: None,
             trading_day: None,
             trailing_floor_lock: None,
+            max_days_without_trading: None,
             day_rollover: None,
         };
         let prop = |limits| VerdictRule::PropFirm {
@@ -2149,6 +2163,7 @@ mod tests {
                 day_target_share: None,
                 trading_day: None,
                 trailing_floor_lock: None,
+                max_days_without_trading: None,
                 day_rollover: None,
             },
             limits: PropFirmLimits::default(),
@@ -2505,6 +2520,7 @@ mod tests {
             day_target_share: None,
             trading_day: None,
             trailing_floor_lock: None,
+            max_days_without_trading: None,
             day_rollover: None,
         };
         let bad = [
@@ -3374,6 +3390,7 @@ mod tests {
         };
         assert_eq!((firm.day_target_share, firm.trading_day), (None, None));
         assert_eq!(firm.day_rollover, None);
+        assert_eq!(firm.max_days_without_trading, None);
         let original: serde_json::Value = serde_json::from_str(saved).unwrap();
         assert_eq!(serde_json::to_value(rule).unwrap(), original);
         // The firm's day reads and writes back in the rollover's own form.
@@ -3428,6 +3445,32 @@ mod tests {
     }
 
     #[test]
+    fn the_days_without_trading_limit_is_left_out_of_json_when_off_and_reads_when_set() {
+        let VerdictRule::PropFirm { firm, limits, .. } = prop(DrawdownMode::Static) else {
+            unreachable!()
+        };
+        let json = serde_json::to_value(firm).unwrap();
+        assert!(json.get("max_days_without_trading").is_none(), "{json}");
+        let limited = FirmLimits {
+            max_days_without_trading: Some(30),
+            ..firm
+        };
+        let json = serde_json::to_value(limited).unwrap();
+        assert_eq!(json["max_days_without_trading"], 30);
+        assert_eq!(serde_json::from_value::<FirmLimits>(json).unwrap(), limited);
+        let rule = VerdictRule::PropFirm {
+            firm: limited,
+            limits,
+            attempt: Some(attempt_terms()),
+        };
+        assert_eq!(rule.validate(), Ok(()));
+        // A misspelt key is refused rather than lost.
+        let typo = r#"{"daily_loss":0.05,"max_drawdown":0.1,"drawdown":"static",
+            "profit_target":0.08,"max_days_without_trade":30}"#;
+        assert!(serde_json::from_str::<FirmLimits>(typo).is_err());
+    }
+
+    #[test]
     fn attempt_terms_read_with_their_defaults() {
         let saved = r#"{"account_size":100000,"evaluation_fee":500,"profit_split":0.8,
             "days_to_first_payout":14,"payout_interval_days":14,"min_payout":100,
@@ -3440,7 +3483,7 @@ mod tests {
     #[test]
     fn each_new_field_out_of_range_is_refused_by_name() {
         type Tweak = fn(&mut FirmLimits, &mut AttemptTerms);
-        let cases: [(&str, Tweak); 31] = [
+        let cases: [(&str, Tweak); 32] = [
             ("firm.day_rollover.offset_minutes", |f, _| {
                 f.day_rollover = Some(DayRollover::Utc {
                     offset_minutes: 24 * 60,
@@ -3501,6 +3544,9 @@ mod tests {
             ("firm.trailing_floor_lock", |f, _| {
                 f.drawdown = DrawdownMode::Static;
                 f.trailing_floor_lock = Some(0.0);
+            }),
+            ("firm.max_days_without_trading", |f, _| {
+                f.max_days_without_trading = Some(0)
             }),
             ("attempt.account_size", |_, t| t.account_size = 0.0),
             ("attempt.evaluation_fee", |_, t| t.evaluation_fee = -1.0),

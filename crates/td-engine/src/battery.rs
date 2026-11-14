@@ -817,6 +817,7 @@ pub fn run_battery_with_references(
                 mean_block: stats::default_block_len(daily.len()),
                 seed: derive_seed(seed, SEED_PROP_FIRM),
                 sizes_from_starting_cash: per_cash.is_some(),
+                max_days_without_trading: firm.max_days_without_trading.map(|n| n as usize),
             };
             // The loss limits are checked on each day's lowest equity when the curve has its
             // ranges, and at each daily close when it does not.
@@ -2677,6 +2678,7 @@ mod tests {
                 day_target_share: None,
                 trading_day: None,
                 trailing_floor_lock: None,
+                max_days_without_trading: None,
                 day_rollover,
             },
             limits: crate::PropFirmLimits {
@@ -3298,6 +3300,7 @@ mod tests {
             day_target_share: None,
             trading_day: None,
             trailing_floor_lock: None,
+            max_days_without_trading: None,
             day_rollover: None,
         };
         let rule = VerdictRule::PropFirm {
@@ -3367,6 +3370,7 @@ mod tests {
                 mean_block: stats::default_block_len(daily.len()),
                 seed: derive_seed(seed, SEED_PROP_FIRM),
                 sizes_from_starting_cash: false,
+                max_days_without_trading: None,
             };
             let lows = daily_lows(
                 &series,
@@ -3501,6 +3505,7 @@ mod tests {
                 mean_block: stats::default_block_len(daily.len()),
                 seed: derive_seed(seed, SEED_PROP_FIRM),
                 sizes_from_starting_cash: false,
+                max_days_without_trading: None,
             };
             stats::prop_firm_odds(&daily, Some(&lows), &traded, &spec, None).unwrap()
         };
@@ -3783,6 +3788,7 @@ mod tests {
                 mean_block: stats::default_block_len(daily.len()),
                 seed: derive_seed(7, SEED_PROP_FIRM),
                 sizes_from_starting_cash: true,
+                max_days_without_trading: None,
             };
             let odds =
                 stats::prop_firm_odds(&daily, Some(&lows), &traded, &spec, Some(&terms)).unwrap();
