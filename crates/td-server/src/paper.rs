@@ -365,6 +365,8 @@ pub struct PaperSession {
     log_len: u64,
     status: Status,
     funding: Vec<Funding>,
+    /// The funding fed with warm-up bars, in order: shown to the strategy, never charged.
+    warm_up_funding: Vec<Funding>,
     /// Open time of the first bar fed live, after warm-up.
     live_from: Option<Millis>,
     dropped: Vec<Millis>,
@@ -440,6 +442,7 @@ impl PaperSession {
             log_len: 0,
             status: Status::Stopped,
             funding: Vec::new(),
+            warm_up_funding: Vec::new(),
             live_from: None,
             dropped: Vec::new(),
             warnings: Vec::new(),
@@ -508,6 +511,7 @@ impl PaperSession {
             log_len: complete as u64,
             status: Status::Stopped,
             funding: Vec::new(),
+            warm_up_funding: Vec::new(),
             live_from: None,
             dropped: Vec::new(),
             warnings,
@@ -787,6 +791,7 @@ impl PaperSession {
         let funding: Vec<(Millis, f64)> = fed.funding.iter().map(|f| (f.time, f.rate)).collect();
         if fed.warm_up {
             self.session.warm_up(fed.bar, &funding)?;
+            self.warm_up_funding.extend(&fed.funding);
         } else {
             self.session.on_bar(fed.bar, &funding)?;
             self.live_from.get_or_insert(fed.bar.open_time);
@@ -947,6 +952,11 @@ impl PaperSession {
     /// Every funding rate charged, in order. Funding fed with a warm-up bar is not charged.
     pub fn funding(&self) -> &[Funding] {
         &self.funding
+    }
+
+    /// The funding fed with warm-up bars, in order. The strategy saw it; none of it was charged.
+    pub fn warm_up_funding(&self) -> &[Funding] {
+        &self.warm_up_funding
     }
 
     /// Open time of the first bar fed after warm-up.

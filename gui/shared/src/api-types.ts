@@ -3017,7 +3017,9 @@ dropped: Array<number>,
  * The funding rates the session was charged. The backtest is given each at the venue's
  * funding time (`due`), as a backtest from stored data would be, so a rate the session was
  * charged on a later bar, because it was not yet published when its own bar closed, lands
- * on another bar there; one due before the first live bar is not charged there at all.
+ * on another bar there; one due before the first live bar is not charged there at all. The
+ * rates fed with warm-up bars, which the strategy saw but was not charged, are not counted
+ * here; the backtest is given them too, so a strategy that reads funding sees them there.
  */
 funding_events: number, 
 /**

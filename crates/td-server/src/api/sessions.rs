@@ -194,7 +194,9 @@ pub struct ComparedBars {
     /// The funding rates the session was charged. The backtest is given each at the venue's
     /// funding time (`due`), as a backtest from stored data would be, so a rate the session was
     /// charged on a later bar, because it was not yet published when its own bar closed, lands
-    /// on another bar there; one due before the first live bar is not charged there at all.
+    /// on another bar there; one due before the first live bar is not charged there at all. The
+    /// rates fed with warm-up bars, which the strategy saw but was not charged, are not counted
+    /// here; the backtest is given them too, so a strategy that reads funding sees them there.
     pub funding_events: usize,
     /// How many of those rates the session charged on a later bar than the one they were due in.
     /// Each moves funding, and the equity after it, to another bar in the backtest, so it shows as
@@ -202,6 +204,17 @@ pub struct ComparedBars {
     /// order and fill quantity differences: none of these is then a difference in how orders were
     /// filled.
     pub late_funding: usize,
+}
+
+/// The funding a backtest beside `paper` is given, each rate at its due time: the rates fed with
+/// warm-up bars, which the session's strategy saw uncharged, then the rates charged.
+fn backtest_funding(paper: &PaperSession) -> Vec<(Millis, f64)> {
+    paper
+        .warm_up_funding()
+        .iter()
+        .chain(paper.funding())
+        .map(|f| (f.due, f.rate))
+        .collect()
 }
 
 fn summary(paper: &PaperSession) -> SessionSummary {
@@ -572,6 +585,7 @@ impl Sessions {
             bars,
             live_from,
             funding,
+            due,
             orders,
             fills,
             equity,
@@ -600,6 +614,7 @@ impl Sessions {
                 s.bars().to_vec(),
                 live_from,
                 paper.funding().to_vec(),
+                backtest_funding(&paper),
                 s.orders().to_vec(),
                 s.fills().to_vec(),
                 s.equity().to_vec(),
@@ -628,7 +643,6 @@ impl Sessions {
             // Paper sessions are on a quote-currency account (see `paper::build_session`).
             account_currency: AccountCurrency::Quote,
         };
-        let due: Vec<(Millis, f64)> = funding.iter().map(|f| (f.due, f.rate)).collect();
         let result = td_engine::run(&backtest, &bars, &[], &due).map_err(|e| {
             ApiError::internal(format!("the backtest beside the session failed: {e}"))
         })?;
@@ -1110,7 +1124,8 @@ pub(crate) mod tests {
     }
 
     /// Writes a perpetual sma_cross session `id` fed 5 warm-up bars and 60 live ones, with a
-    /// funding rate every 8 bars, `late` bars after its due time.
+    /// funding rate every 8 bars, `late` bars after its due time, and one rate on time with the
+    /// warm-up bar at 2 minutes, which the strategy sees and is not charged.
     fn fed_session(dir: &Path, id: &str, late: i64) {
         let config = PaperConfig {
             params: Params::new()
@@ -1126,6 +1141,12 @@ pub(crate) mod tests {
                     time: i * 60_000,
                     rate: 0.001,
                     due: (i - late) * 60_000,
+                }]
+            } else if i == 2 {
+                vec![Funding {
+                    time: i * 60_000,
+                    rate: 0.002,
+                    due: i * 60_000,
                 }]
             } else {
                 Vec::new()
@@ -1159,6 +1180,49 @@ pub(crate) mod tests {
         assert_eq!(backtest.warmup_from, Some(0));
         assert_eq!((backtest.from, backtest.to), (5 * 60_000, 65 * 60_000));
         assert_eq!(compared.manual_orders, 0);
+    }
+
+    /// The backtest beside a session is given the rates fed with its warm-up bars as well as those
+    /// charged, so a strategy that reads funding sees there every rate it saw in the session, and
+    /// funding, charged on neither side during warm-up, shows no difference.
+    #[test]
+    fn the_backtest_beside_a_session_sees_the_funding_its_strategy_saw() {
+        /// Keeps what [`Context::funding`] gives it on the last bar it is called on.
+        struct LastSeen(Arc<Mutex<Vec<(Millis, f64)>>>);
+        impl td_engine::Strategy for LastSeen {
+            fn on_bar(&mut self, ctx: &mut td_engine::Context, _bar: &Candle) {
+                *lock(&self.0) = ctx.funding().to_vec();
+            }
+        }
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        fed_session(dir.path(), "seen", 0);
+        let compared = loaded(dir.path()).comparison("seen").expect("compares");
+        assert_eq!(
+            compared.comparison.differences,
+            [],
+            "{:#?}",
+            compared.comparison.differences
+        );
+        let paper = PaperSession::open(dir.path(), "seen").expect("opens");
+        assert_eq!(paper.warm_up_funding().len(), 1);
+        // What the session's strategy saw on its last bar: every rate fed, at the time it was fed.
+        let fed: Vec<(Millis, f64)> = paper
+            .warm_up_funding()
+            .iter()
+            .chain(paper.funding())
+            .map(|f| (f.time, f.rate))
+            .collect();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        td_engine::run_strategy(
+            &compared.backtest,
+            Box::new(LastSeen(seen.clone())),
+            paper.session().bars(),
+            &[],
+            &backtest_funding(&paper),
+        )
+        .expect("runs");
+        assert_eq!(*lock(&seen), fed);
     }
 
     #[test]
