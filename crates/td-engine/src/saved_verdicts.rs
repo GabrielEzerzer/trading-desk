@@ -687,3 +687,53 @@ pub fn code_matches(strategy: &str, saved: Option<&str>) -> Option<bool> {
         .zip(crate::code_hash(strategy))
         .map(|(saved, now)| saved == now)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{WindowMode, find_strategy};
+
+    /// A session's link checks the plan by its JSON: a plan saved before plans had a window mode
+    /// still matches the rolling plan, and a plan with anchored windows does not match the same
+    /// plan with rolling ones, either way round, with a verdict or without one.
+    #[test]
+    fn a_link_tells_a_plan_with_anchored_windows_from_the_rolling_one() {
+        let rolling = find_strategy("sma_cross").unwrap();
+        let mut anchored = rolling.clone();
+        anchored.plan.walk_forward.mode = WindowMode::Anchored;
+        let instrument = rolling.plan.instruments[0].clone();
+        let plan = |entry: &StrategyEntry| serde_json::to_value(&entry.plan).unwrap();
+        let rule = serde_json::to_value(rolling.rule).unwrap();
+        // As a session or a verdict saved before plans had a mode holds its plan.
+        let saved_before = plan(&rolling);
+        assert_eq!(
+            saved_before["walk_forward"],
+            serde_json::json!({ "train_days": 180, "test_days": 60 })
+        );
+        let link = |plan: Value, with_verdict: bool| SessionLink {
+            code_hash: None,
+            plan: plan.clone(),
+            rule: rule.clone(),
+            verdict: with_verdict.then(|| LinkedVerdict {
+                run_id: RunId::parse("1762790000123-0a1b2c3d").unwrap(),
+                state: VerdictState::Trade,
+                complete: true,
+                engine_revision: ENGINE_REVISION,
+                code_hash: None,
+                plan,
+                rule: rule.clone(),
+            }),
+        };
+        let matches = |link: &SessionLink, now: &StrategyEntry| {
+            LinkState::of(link, "sma_cross", &instrument, std::slice::from_ref(now)).plan_matches
+        };
+        for with_verdict in [false, true] {
+            let old = link(saved_before.clone(), with_verdict);
+            let new = link(plan(&anchored), with_verdict);
+            assert_eq!(matches(&old, &rolling), Some(true), "{with_verdict}");
+            assert_eq!(matches(&old, &anchored), Some(false), "{with_verdict}");
+            assert_eq!(matches(&new, &anchored), Some(true), "{with_verdict}");
+            assert_eq!(matches(&new, &rolling), Some(false), "{with_verdict}");
+        }
+    }
+}

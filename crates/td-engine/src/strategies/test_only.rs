@@ -17,6 +17,7 @@ use crate::{
     BacktestSettings, Context, Direction, EngineError, EvidenceSettings, Metric, Objective,
     ParamAxis, ParamKind, ParamSpace, ParamSpec, ParamValue, Params, Period, PortfolioBenchmark,
     PortfolioLimits, Strategy, StrategyEntry, SweepPlan, TestPlan, VerdictRule, WalkForwardPlan,
+    WindowMode,
 };
 
 pub(crate) fn entries() -> Vec<StrategyEntry> {
@@ -186,6 +187,7 @@ fn plan() -> TestPlan {
         walk_forward: WalkForwardPlan {
             train_days: 60,
             test_days: 45,
+            mode: WindowMode::Rolling,
         },
         out_of_sample: None,
         evidence: EvidenceSettings::default(),

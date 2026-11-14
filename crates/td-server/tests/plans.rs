@@ -284,6 +284,7 @@ fn entry(permutations: u32) -> StrategyEntry {
         walk_forward: WalkForwardPlan {
             train_days: 32,
             test_days: 30,
+            mode: td_engine::WindowMode::Rolling,
         },
         out_of_sample: None,
         evidence: EvidenceSettings {
@@ -935,6 +936,62 @@ async fn a_failure_partway_keeps_the_instruments_saved_before_it() {
     assert!(!message.contains("  "), "{message}");
 }
 
+/// `entry` with anchored walk-forward windows: every train window starts at the period's first
+/// bar. [`entry`]'s period leaves no bars over before the first test window, so the first train
+/// window is its 32 days.
+fn anchored(mut entry: StrategyEntry) -> StrategyEntry {
+    entry.plan.walk_forward.mode = td_engine::WindowMode::Anchored;
+    entry
+}
+
+/// A plan that asks for anchored windows is run on them through the plan route, saved with its
+/// mode in the run and the verdict record, and its verdict is current only under the anchored
+/// plan: the same plan with rolling windows is another plan.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_plan_with_anchored_windows_runs_on_them_and_its_verdict_is_its_own() {
+    let t = TestServer::seeded(vec![anchored(entry(49))]).await;
+    let mut ws = t.websocket().await;
+    let spot = json!({ "strategy": "sma_cross", "instruments": [id(InstrumentKind::Spot)] });
+    let job = t.start_plan(&spot).await;
+    let done = ws.follow(job).await.pop().unwrap();
+    assert_eq!(done.status, JobStatus::Done, "{:?}", done.error);
+    let run_id = plan_done(&done).instruments[0].run_id.clone();
+
+    let runs_dir = t.runs_dir();
+    let SavedRun::Plan(run) = td_engine::load(&runs_dir, run_id.as_str()).unwrap() else {
+        panic!("a plan run");
+    };
+    assert_eq!(run.plan.walk_forward.mode, td_engine::WindowMode::Anchored);
+    let wf = run
+        .battery
+        .walk_forward
+        .as_ref()
+        .expect("the walk-forward ran");
+    assert_eq!(wf.spec.windows.mode, td_engine::WindowMode::Anchored);
+    assert_eq!(wf.windows.len(), 6);
+    for (k, w) in wf.windows.iter().enumerate() {
+        assert_eq!(w.train_from, t0(), "window {k} trains from the first bar");
+        assert_eq!(w.train_to, t0() + (32 + 30 * k as i64) * DAY, "window {k}");
+        assert_eq!(w.test_from, w.train_to);
+    }
+    let record: Value = serde_json::from_slice(
+        &std::fs::read(runs_dir.join(run_id.as_str()).join("verdict.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(record["plan"]["walk_forward"]["mode"], json!("anchored"));
+
+    let row = |rows: Vec<VerdictSummary>| -> VerdictSummary {
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        rows.into_iter().next().unwrap()
+    };
+    let r = row(t.verdicts("").await);
+    assert!(r.plan_matches && !r.stale, "{r:?}");
+    let rolling = t.restarted(vec![entry(49)]).await;
+    let r = row(rolling.verdicts("").await);
+    assert_eq!(r.run_id, run_id);
+    assert!(!r.plan_matches && r.stale, "{r:?}");
+}
+
 /// Rewrites the `verdict.json` of run `id`.
 fn rewrite_record(runs_dir: &Path, id: &RunId, change: impl FnOnce(&mut Value)) {
     let path = runs_dir.join(id.as_str()).join("verdict.json");
@@ -1015,6 +1072,7 @@ async fn the_verdict_list_flags_a_changed_plan_and_prefers_a_complete_battery() 
         vec![other_rule],
         vec![without_spot],
         vec![spot_slippage],
+        vec![anchored(entry(49))],
         Vec::new(),
     ];
     for entries in stale {

@@ -1004,12 +1004,24 @@ fixed: Params, axes: Array<ParamAxis>, objective: Objective,
 min_trades: number, };
 
 /**
- * Rolling walk-forward windows, in days of bars: a day is 24 hours of bars of the plan's
- * timeframe, so on an FX pair, closed at weekends, a window spans more calendar days. Each test
- * segment starts where the previous one ended, so the stitched out-of-sample curve has no holes.
- * Both lengths must be whole bars of the timeframe.
+ * Walk-forward windows, in days of bars: a day is 24 hours of bars of the plan's timeframe, so on
+ * an FX pair, closed at weekends, a window spans more calendar days. Each test segment starts
+ * where the previous one ended, so the stitched out-of-sample curve has no holes. Both lengths
+ * must be whole bars of the timeframe.
  */
-export type WalkForwardPlan = { train_days: number, test_days: number, };
+export type WalkForwardPlan = { 
+/**
+ * With rolling windows, the length of every train window. With anchored windows, the length
+ * of the first one: every train window starts at the period's first bar and grows by one test
+ * window per window, and the first also takes the bars left over before the first test
+ * window, fewer than a test window.
+ */
+train_days: number, test_days: number, 
+/**
+ * Rolling (the default) or anchored train windows ([`WindowMode`]). Left out of JSON when it
+ * is rolling, so a plan saved before it existed reads as rolling.
+ */
+mode?: WindowMode, };
 
 /**
  * The common evidence layer (#35, R2 to R6). Every field is a number: there is no way to switch a

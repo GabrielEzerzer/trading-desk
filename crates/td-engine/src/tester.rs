@@ -1229,13 +1229,20 @@ fn split_time(traded: &[Candle], split: Split) -> Result<Millis, TesterError> {
 // ---------------------------------------------------------------------------------------------
 
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WindowMode {
     /// Every train window has the same length and moves forward by the step.
+    #[default]
     Rolling,
     /// Every train window starts at the first bar and grows by the step.
     Anchored,
+}
+
+impl WindowMode {
+    pub fn is_rolling(&self) -> bool {
+        *self == WindowMode::Rolling
+    }
 }
 
 /// Walk-forward windows, in bars of the base range.
@@ -1573,9 +1580,6 @@ fn floored_metric_name(metric: Metric) -> Option<&'static str> {
 /// days with no bars, so the rule counts bars. [`refuse_short_train`] then checks each window in
 /// the data.
 fn refuse_short_train_bars(spec: &WalkForwardSpec) -> Result<(), TesterError> {
-    let Some(name) = floored_metric_name(spec.sweep.objective.metric) else {
-        return Ok(());
-    };
     let w = &spec.windows;
     // A train length of zero is refused by the run's window rules, with their own message.
     if w.train_bars == 0 {
@@ -1586,14 +1590,29 @@ fn refuse_short_train_bars(spec: &WalkForwardSpec) -> Result<(), TesterError> {
         WindowMode::Anchored => w.train_bars.saturating_add(w.step_bars.saturating_sub(1)),
     };
     let tf = spec.sweep.base.timeframe;
+    let window = match w.mode {
+        WindowMode::Rolling => format!("a train window of {bars} {tf} bars"),
+        WindowMode::Anchored => format!("the first train window, at most {bars} {tf} bars,"),
+    };
+    refuse_short_first_train(spec, bars, &window)
+}
+
+/// [`refuse_short_train_bars`]'s rule on a first train window of `bars` bars without gaps, named
+/// `window` in the message. A test plan, which knows its period, checks an anchored plan's first
+/// train window at its exact length with it.
+pub(crate) fn refuse_short_first_train(
+    spec: &WalkForwardSpec,
+    bars: usize,
+    window: &str,
+) -> Result<(), TesterError> {
+    let Some(name) = floored_metric_name(spec.sweep.objective.metric) else {
+        return Ok(());
+    };
+    let tf = spec.sweep.base.timeframe;
     let bar = tf.duration_ms();
     // A span too long for milliseconds in an i64 is far past every floor.
     let Some(span) = i64::try_from(bars).ok().and_then(|n| n.checked_mul(bar)) else {
         return Ok(());
-    };
-    let window = match w.mode {
-        WindowMode::Rolling => format!("a train window of {bars} {tf} bars"),
-        WindowMode::Anchored => format!("the first train window, at most {bars} {tf} bars,"),
     };
     match spec.sweep.objective.metric {
         Metric::Sharpe | Metric::Sortino => {

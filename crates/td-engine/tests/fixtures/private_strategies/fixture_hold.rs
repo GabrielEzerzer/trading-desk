@@ -91,6 +91,7 @@ fn plan() -> TestPlan {
         walk_forward: WalkForwardPlan {
             train_days: 365,
             test_days: 120,
+            mode: crate::WindowMode::Rolling,
         },
         out_of_sample: None,
         evidence: EvidenceSettings::default(),
