@@ -15,11 +15,11 @@ use td_core::{
     AccountCurrency, Candle, FeeSchedule, Instrument, InstrumentKind, Millis, Timeframe,
 };
 use td_engine::{
-    AttemptTerms, BatteryResult, BatterySpec, Direction, DrawdownMode, EvidenceSettings,
-    FirmLimits, HighRiskLimits, Layer, MAX_RUNS, Metric, Objective, Outcome, ParamAxis, ParamSpace,
-    ParamValue, Params, Period, PortfolioBenchmark, PortfolioLimits, PropFirmLimits,
-    SlippageOverride, SweepPlan, TestPlan, TesterError, VerdictRule, VerdictState, WalkForwardPlan,
-    risk, run_battery,
+    AttemptTerms, BatteryResult, BatterySpec, DayRollover, Direction, DrawdownMode,
+    EvidenceSettings, FirmLimits, HighRiskLimits, Layer, MAX_RUNS, Metric, Objective, Outcome,
+    ParamAxis, ParamSpace, ParamValue, Params, Period, PortfolioBenchmark, PortfolioLimits,
+    PropFirmLimits, SlippageOverride, SweepPlan, TestPlan, TesterError, VerdictRule, VerdictState,
+    WalkForwardPlan, metrics, risk, run_battery,
 };
 
 const HOUR: Millis = 3_600_000;
@@ -441,16 +441,15 @@ fn the_other_kinds_get_their_inputs_from_the_same_runs() {
     assert_eq!(prop.kind.breach_probability, Some(odds.breach));
     let worst = prop.kind.worst_daily_loss.unwrap();
     assert!(worst >= 0.0);
-    // The worse of the two day rollovers is at least the UTC day's, which the metrics report.
+    // The worse of the two day rollovers is at least the UTC day's, each day's fall read as a
+    // share of that day's starting balance.
+    let wf = prop.walk_forward.as_ref().unwrap();
+    let series = metrics::EquitySeries::new(cash, &wf.equity, plan.timeframe);
+    let utc = risk::daily_pnl(&series, Some(extremes), DayRollover::default());
+    let utc_worst = risk::worst_daily_loss_intraday_own(&utc).unwrap();
     assert!(
-        worst
-            >= prop
-                .walk_forward
-                .unwrap()
-                .metrics
-                .worst_daily_loss_intrabar
-                .unwrap()
-                - 1e-12
+        utc_worst > 0.0 && worst >= utc_worst,
+        "{worst} against {utc_worst}"
     );
     assert!(prop.kind.risk_of_ruin.is_none());
 }
