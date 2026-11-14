@@ -12,7 +12,7 @@ use td_core::{
 
 use crate::metrics::{self, DAY_MS, DAYS_PER_YEAR, EquitySeries, MetricsReport};
 use crate::reference::{Aligned, ReferenceBars, align, row};
-use crate::risk::{self, EquityRange, Intrabar};
+use crate::risk::{self, EquityRange, Exposure, Intrabar};
 use crate::session::{check_quote, funding_ranges, sorted_funding};
 use crate::{
     BarFunding, CLOSE_OUT_TAG, CandleFillModel, EngineError, EquityPoint, Order, Params, Portfolio,
@@ -319,6 +319,23 @@ pub fn run_with_references(
     run_built(config, bars, asks, funding, references, || {
         build_strategy(&config.strategy, &config.params)
     })
+}
+
+/// The open position at each point [`risk::intrabar`] evaluates in the backtest
+/// [`run_with_references`] makes ([`risk::Intrabar::exposures`]), which its result does not keep:
+/// for reading the leverage and notional of an account that holds the run's position on another
+/// balance.
+pub(crate) fn run_exposures(
+    config: &BacktestConfig,
+    bars: &[Candle],
+    asks: &[Candle],
+    funding: &[(Millis, f64)],
+    references: &[ReferenceBars],
+) -> Result<Vec<Exposure>, EngineError> {
+    let sim = simulate(config, bars, asks, funding, references, || {
+        build_strategy(&config.strategy, &config.params)
+    })?;
+    Ok(sim.intrabar.exposures)
 }
 
 /// [`run`] with a strategy built by the caller instead of from the registry, for a strategy that

@@ -20,7 +20,7 @@ use td_core::{Candle, Fill, Millis, Side, Timeframe};
 use crate::metrics::{self, EquitySeries, MetricsReport};
 use crate::permute::permute_with_references;
 use crate::reference::{ReferenceBars, align};
-use crate::risk::{EquityRange, Intrabar};
+use crate::risk::{EquityRange, Exposure, Intrabar};
 use crate::rng::{SplitMix64, derive_seed};
 use crate::runner::{
     compare, config_fingerprint_with_references, hold_over, match_asks, run_metrics, select_bars,
@@ -1479,7 +1479,7 @@ pub fn walk_forward_with_references(
         });
     }
 
-    let segments = test_segments(&results);
+    let segments = test_segments(&results, None);
     let Stitched {
         series,
         equity,
@@ -1823,6 +1823,37 @@ pub(crate) fn fixed_size_own_low_at_zero(
         .reduce(f64::min)
 }
 
+/// The highest notional over equity at `exposures`, each point's equity moved by `moved`, as
+/// [`crate::risk::intrabar`] reads its peak leverage: points where that equity is at or below zero
+/// are skipped. 0 with no such point. With `moved` 0 this is the run's own peak leverage.
+fn placed_peak_leverage(exposures: &[Exposure], moved: f64) -> f64 {
+    exposures
+        .iter()
+        .map(|x| (x.notional, x.equity + moved))
+        .filter(|&(_, e)| e > 0.0)
+        .filter_map(|(n, e)| metrics::finite(n / e))
+        .fold(0.0, f64::max)
+}
+
+/// The largest open notional, in the account currency, of the account `windows`' test runs make
+/// stitched with `sizing`: each counted window's largest notional at the points its run's intrabar
+/// measures evaluate (`held`, one list per window, from [`crate::runner::run_exposures`]), times
+/// the window's factor ([`segment_factors`]). When compounding, a window's position is its own
+/// times the account's level over the starting cash; at a fixed size it is the window's own. 0
+/// when no counted window held a position.
+pub(crate) fn peak_open_notional(
+    starting_cash: f64,
+    windows: &[WindowResult],
+    held: &[Vec<Exposure>],
+    sizing: Sizing,
+) -> f64 {
+    segment_factors(starting_cash, &test_curves(windows), sizing)
+        .into_iter()
+        .zip(held)
+        .flat_map(|(f, h)| h.iter().map(move |x| x.notional * f))
+        .fold(0.0, f64::max)
+}
+
 /// Each window's test equity.
 fn test_curves(windows: &[WindowResult]) -> Vec<&[EquityPoint]> {
     windows
@@ -1837,16 +1868,27 @@ struct Segment<'a> {
     /// The equity's range through each bar, one per point of `equity`, or empty.
     ranges: &'a [EquityRange],
     peak_leverage: Option<f64>,
+    /// The open position at each point the run's intrabar measures evaluate, when known: a
+    /// result does not keep it. The peak leverage at a fixed size reads it.
+    exposures: Option<&'a [Exposure]>,
     fills: &'a [Fill],
     trades: &'a [Trade],
     funding_paid: f64,
 }
 
-/// The windows' test runs as segments of the stitched curve.
-fn test_segments(windows: &[WindowResult]) -> Vec<Segment<'_>> {
+/// The windows' test runs as segments of the stitched curve, with each window's open positions
+/// from `held`, one list per window, when given.
+fn test_segments<'a>(
+    windows: &'a [WindowResult],
+    held: Option<&'a [Vec<Exposure>]>,
+) -> Vec<Segment<'a>> {
     windows
         .iter()
-        .map(|w| run_segment(&w.out_of_sample))
+        .enumerate()
+        .map(|(i, w)| Segment {
+            exposures: held.map(|h| &h[i][..]),
+            ..run_segment(&w.out_of_sample)
+        })
         .collect()
 }
 
@@ -1855,6 +1897,7 @@ fn run_segment(r: &BacktestResult) -> Segment<'_> {
         equity: &r.equity,
         ranges: &r.equity_extremes,
         peak_leverage: r.metrics.peak_leverage,
+        exposures: None,
         fills: &r.fills,
         trades: &r.trades,
         funding_paid: r.metrics.funding_paid,
@@ -1874,13 +1917,16 @@ pub(crate) fn stitched_headline(
 
 /// `wf` with its windows replaced by `windows`, stitched with `sizing`: the curve, its ranges, the
 /// metrics, the trades and the fills. The rest is kept as it is, the benchmark too, which still
-/// compares buy and hold with the curve [`walk_forward`] stitched.
+/// compares buy and hold with the curve [`walk_forward`] stitched. `held` is each window's open
+/// positions, one list per window ([`crate::runner::run_exposures`]), which the peak leverage at
+/// a fixed size reads; without it that figure is `None`.
 pub(crate) fn with_windows(
     wf: &WalkForwardResult,
     windows: Vec<WindowResult>,
     sizing: Sizing,
+    held: Option<&[Vec<Exposure>]>,
 ) -> WalkForwardResult {
-    let st = stitched_report(&wf.spec.sweep.base, &test_segments(&windows), sizing);
+    let st = stitched_report(&wf.spec.sweep.base, &test_segments(&windows, held), sizing);
     WalkForwardResult {
         windows,
         equity: st.equity,
@@ -1924,6 +1970,7 @@ fn stitched_benchmark(
             equity: &h.equity,
             ranges: &h.intrabar.ranges,
             peak_leverage: h.intrabar.peak_leverage,
+            exposures: Some(&h.intrabar.exposures),
             fills: &h.fills,
             trades: &h.trades,
             funding_paid: h.funding_paid,
@@ -1966,13 +2013,12 @@ struct Stitched {
 /// is moved to start where the last segment ended, so a segment adds its own money changes, and a
 /// segment after the account is gone stays flat. Either way the intrabar metrics are those of the
 /// stitched account. They are left out (as in a result without ranges) unless every segment has a
-/// range per bar. The peak leverage, a ratio the compounding scale leaves unchanged, is the
-/// highest of the segments with a factor above 0.
-///
-/// shortcut: at a fixed size the peak leverage is still the highest of the counted segments' own,
-/// which is the stitched account's only while that account stands at the starting cash; it holds
-/// the same position on a balance above or below it. Read it from each bar's notional over the
-/// stitched equity when a verdict line comes to judge it for an account at a fixed size.
+/// range per bar. The peak leverage is the highest over the segments with a factor above 0. When
+/// compounding, each segment's own, a ratio the scale leaves unchanged. At a fixed size, the
+/// stitched account holds the segment's own position on the segment's equity moved by where the
+/// account stood at the segment's start less the starting cash, so it is read at each point the
+/// segment's run evaluated ([`placed_peak_leverage`]), and is `None` unless every such segment
+/// has its open positions ([`Segment::exposures`]).
 fn stitched_report(base: &BacktestConfig, runs: &[Segment], sizing: Sizing) -> Stitched {
     let cash = base.starting_cash;
     let segments: Vec<&[EquityPoint]> = runs.iter().map(|r| r.equity).collect();
@@ -1986,10 +2032,14 @@ fn stitched_report(base: &BacktestConfig, runs: &[Segment], sizing: Sizing) -> S
     let mut funding = 0.0;
     let mut ranges: Vec<EquityRange> = Vec::with_capacity(points);
     let mut peak_leverage: Option<f64> = None;
+    // A counted segment at a fixed size whose open positions are not given.
+    let mut unplaced = false;
     let has_ranges = runs.iter().all(|r| r.ranges.len() == r.equity.len());
     // The stitched equity where the last segment ended.
     let mut level = cash;
     for (r, s) in runs.iter().zip(scales) {
+        // Where the stitched account stood at this segment's start.
+        let start = level;
         let place = |x: f64| match sizing {
             Sizing::Compounding => x * s,
             Sizing::FixedSize if s == 0.0 => level,
@@ -2029,7 +2079,17 @@ fn stitched_report(base: &BacktestConfig, runs: &[Segment], sizing: Sizing) -> S
         if s == 0.0 {
             continue;
         }
-        if let Some(l) = r.peak_leverage {
+        let segment_peak = match (sizing, r.exposures) {
+            (Sizing::Compounding, _) => r.peak_leverage,
+            (Sizing::FixedSize, Some(held)) => r
+                .peak_leverage
+                .map(|_| placed_peak_leverage(held, start - cash)),
+            (Sizing::FixedSize, None) => {
+                unplaced |= r.peak_leverage.is_some();
+                None
+            }
+        };
+        if let Some(l) = segment_peak {
             peak_leverage = Some(peak_leverage.map_or(l, |p| p.max(l)));
         }
         fills.extend(r.fills.iter().map(|f| Fill {
@@ -2054,7 +2114,8 @@ fn stitched_report(base: &BacktestConfig, runs: &[Segment], sizing: Sizing) -> S
     }
     let intrabar = Intrabar {
         ranges,
-        peak_leverage,
+        peak_leverage: peak_leverage.filter(|_| !unplaced),
+        exposures: Vec::new(),
     };
     let series = EquitySeries::new(cash, &equity, base.timeframe);
     let metrics = metrics::report_with(
@@ -2535,6 +2596,7 @@ mod tests {
                 equity,
                 ranges,
                 peak_leverage: None,
+                exposures: None,
                 fills: &[],
                 trades: &[],
                 funding_paid: 0.0,
@@ -2684,7 +2746,7 @@ mod tests {
         ruined.out_of_sample.equity.last_mut().unwrap().equity = 0.0;
         let windows = [ruined, rising_window(20, 40)];
         let first = &windows[0].out_of_sample;
-        let st = stitched_report(&base, &test_segments(&windows), Sizing::Compounding);
+        let st = stitched_report(&base, &test_segments(&windows, None), Sizing::Compounding);
         assert_eq!(st.trades, first.trades);
         assert_eq!(st.fills, first.fills);
         assert_eq!(st.metrics.trades, first.metrics.trades);
@@ -2703,7 +2765,7 @@ mod tests {
         doubled.out_of_sample.equity.last_mut().unwrap().equity = 20_000.0;
         let windows = [doubled, rising_window(20, 40)];
         let (first, second) = (&windows[0].out_of_sample, &windows[1].out_of_sample);
-        let fixed = stitched_report(&base, &test_segments(&windows), Sizing::FixedSize);
+        let fixed = stitched_report(&base, &test_segments(&windows, None), Sizing::FixedSize);
         assert_eq!(fixed.fills, [&first.fills[..], &second.fills[..]].concat());
         assert_eq!(
             fixed.trades,
@@ -2727,13 +2789,104 @@ mod tests {
             .map(|p| 20_000.0 + (p.equity - 10_000.0))
             .collect();
         assert_eq!(tail, added);
-        let compounded = stitched_report(&base, &test_segments(&windows), Sizing::Compounding);
+        let compounded =
+            stitched_report(&base, &test_segments(&windows, None), Sizing::Compounding);
         let n = first.fills.len();
         assert_eq!(compounded.fills[n].qty, second.fills[0].qty * 2.0);
         assert_eq!(
             compounded.trades[first.trades.len()].net_pnl,
             second.trades[0].net_pnl * 2.0
         );
+    }
+
+    /// At a fixed size the peak leverage is the stitched account's: the second window's own
+    /// position on its own equity moved by where the account stood at its start less the starting
+    /// cash. Compounding keeps each window's own. Every figure here is exact in binary.
+    #[test]
+    fn at_a_fixed_size_the_peak_leverage_is_read_on_the_account_where_it_stands() {
+        let range = |low: f64, high: f64| EquityRange { low, high };
+        let at = |notional: f64, equity: f64| Exposure { notional, equity };
+        // From 100, the first window holds 50 of notional at its open on 100 (0.5) and ends at
+        // 50. The second, its own backtest from 100 again, holds 100 on 100 at its open (1) and
+        // 60 on 40 at its low (1.5): its own peak is 1.5.
+        let a = [point(0, 75.0), point(1, 50.0)];
+        let a_ranges = [range(75.0, 100.0), range(50.0, 75.0)];
+        let a_held = [at(50.0, 100.0)];
+        let b = [point(2, 100.0), point(3, 60.0)];
+        let b_ranges = [range(100.0, 100.0), range(40.0, 60.0)];
+        let b_held = [at(100.0, 100.0), at(60.0, 40.0)];
+        assert_eq!(placed_peak_leverage(&b_held, 0.0), 1.5);
+        let base = BacktestConfig {
+            starting_cash: 100.0,
+            ..hourly_config()
+        };
+        let segment = |equity, ranges, peak_leverage, exposures| Segment {
+            equity,
+            ranges,
+            peak_leverage: Some(peak_leverage),
+            exposures: Some(exposures),
+            fills: &[],
+            trades: &[],
+            funding_paid: 0.0,
+        };
+        let runs = [
+            segment(&a[..], &a_ranges[..], 0.5, &a_held[..]),
+            segment(&b[..], &b_ranges[..], 1.5, &b_held[..]),
+        ];
+        let peak = |sizing| stitched_report(&base, &runs, sizing).metrics.peak_leverage;
+        // The account at a fixed size starts the second window at 50, so its equity there is the
+        // window's own less 50: 100 on 50 at the open (2), and its low at -10, which is bankrupt
+        // and skipped. 2 is above the windows' own peak.
+        assert_eq!(peak(Sizing::FixedSize), Some(2.0));
+        assert_eq!(peak(Sizing::Compounding), Some(1.5));
+        // A window the account starts at the starting cash reads its own peak.
+        let first = &runs[..1];
+        assert_eq!(
+            stitched_report(&base, first, Sizing::FixedSize)
+                .metrics
+                .peak_leverage,
+            Some(0.5)
+        );
+        // Without a counted window's open positions the figure at a fixed size is not known;
+        // compounding needs none.
+        let unknown = [
+            segment(&a[..], &a_ranges[..], 0.5, &a_held[..]),
+            Segment {
+                exposures: None,
+                ..segment(&b[..], &b_ranges[..], 1.5, &b_held[..])
+            },
+        ];
+        let peak = |sizing| {
+            stitched_report(&base, &unknown, sizing)
+                .metrics
+                .peak_leverage
+        };
+        assert_eq!(peak(Sizing::FixedSize), None);
+        assert_eq!(peak(Sizing::Compounding), Some(1.5));
+    }
+
+    /// The largest open notional of the account the windows make: at a fixed size each window's
+    /// own; compounding scales the second by the account's level, twice the starting cash.
+    #[test]
+    fn the_peak_open_notional_takes_each_window_at_the_size_the_account_holds() {
+        let mut doubled = rising_window(0, 20);
+        doubled.out_of_sample.equity.last_mut().unwrap().equity = 20_000.0;
+        let at = |notional| Exposure {
+            notional,
+            equity: 10_000.0,
+        };
+        let held = [vec![at(5_000.0), at(12_000.0)], vec![at(8_000.0)]];
+        let windows = [doubled, rising_window(20, 40)];
+        let peak =
+            |windows: &[WindowResult], sizing| peak_open_notional(10_000.0, windows, &held, sizing);
+        assert_eq!(peak(&windows, Sizing::FixedSize), 12_000.0);
+        assert_eq!(peak(&windows, Sizing::Compounding), 16_000.0);
+        // Windows after the account is gone hold nothing.
+        let mut gone = windows.clone();
+        gone[0].out_of_sample.equity.last_mut().unwrap().equity = 0.0;
+        for sizing in [Sizing::FixedSize, Sizing::Compounding] {
+            assert_eq!(peak(&gone, sizing), 12_000.0);
+        }
     }
 
     #[test]
