@@ -552,8 +552,8 @@ pub struct PropFirmOdds {
     /// evaluation, or after the last phase passes, trading on as the funded account from a fresh
     /// balance and a fresh peak, as a firm starts each phase and the funded account again at the
     /// account size. With attempt terms the funded account takes its payouts by them, which
-    /// leave the balance and move no floor; without them it takes none. The `prop_firm` kind rule
-    /// asks for at most 0.10 over 90 days.
+    /// leave the balance and move no floor, unless the terms lock the floor at the first payout;
+    /// without them it takes none. The `prop_firm` kind rule asks for at most 0.10 over 90 days.
     pub breach: f64,
     pub paths: usize,
     /// The days the paths were drawn from, one per daily return. `None` in a result saved before
@@ -598,7 +598,8 @@ impl Evaluation {
 /// out first.
 ///
 /// With `payouts`, the funded account takes its payouts by those terms ([`walk_funded`]): a payout
-/// takes profit out of the balance and moves no floor, so it brings the balance nearer the floor.
+/// takes profit out of the balance and moves no floor (unless the terms lock the floor at the
+/// first payout), so it brings the balance nearer the floor.
 /// Everything else keeps the breach walk's meaning: the size tested, not the terms' sizes, and the
 /// days to the end of the path, not the terms' funded horizon. Without `payouts` the funded account
 /// takes none ([`first_breach`]).
