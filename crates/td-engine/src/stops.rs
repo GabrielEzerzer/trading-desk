@@ -6,8 +6,8 @@
 //! account's equity, open profit and loss included, and the open position's notional, and passes
 //! them to [`StopState::check`]; when a stop fires the caller flattens the position, cancels
 //! resting orders and halts the session. A fired state stays fired: nothing in this module un-fires
-//! it, and a restart restores it from its serialised form. [`StopRules::check_order`] is the
-//! pre-trade side of the notional cap.
+//! it, and a restart restores it from its serialised form with [`StopState::restore`].
+//! [`StopRules::check_order`] is the pre-trade side of the notional cap.
 //!
 //! This module only decides. It does no I/O and keeps no clock: every time is given by the caller.
 
@@ -144,14 +144,19 @@ impl fmt::Display for StopFired {
     }
 }
 
-/// The state the stops keep for one session. It serialises, so a restart restores it, and
-/// restoring it cannot reset a limit: the rules, the starting balance and a fired stop come back
-/// as they were.
+/// The state the stops keep for one session. It serialises, so a restart can restore it.
+///
+/// Loading a saved state checks it against itself, and a state that fails loads as an error with
+/// the reason. The rules must pass [`StopRules::validate`], the starting balance must be a finite
+/// number above zero, the day's starting equity must be finite, the day must end at the first
+/// rollover after the last check, and the `fired` key must be present, as `null` when no stop has
+/// fired. [`StopState::restore`] then checks the state against the session's own record of its
+/// rules and starting balance; what the two together catch, and what they do not, is said there.
 ///
 /// The rules are kept in the state, so a session cannot check against other rules than the ones
 /// it started with.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "SavedStopState")]
 pub struct StopState {
     rules: StopRules,
     starting_balance: f64,
@@ -161,10 +166,61 @@ pub struct StopState {
     fired: Option<StopFired>,
 }
 
+/// A [`StopState`] as it is read back, before it is checked. It has the same fields.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SavedStopState {
+    rules: StopRules,
+    starting_balance: f64,
+    day_start_equity: f64,
+    day_ends: Millis,
+    last_check: Millis,
+    // A field with its own deserialiser is required, so a missing key is an error rather than
+    // `None`.
+    #[serde(deserialize_with = "Option::deserialize")]
+    fired: Option<StopFired>,
+}
+
+impl TryFrom<SavedStopState> for StopState {
+    type Error = StopError;
+
+    /// Refuses a saved state that [`StopState::start`] and [`StopState::check`] could not have
+    /// left. Both keep `day_ends` at the first rollover after `last_check`: `start` sets both, a
+    /// check that rolls the day over sets both, a check before the day's end moves `last_check`
+    /// to a time with no rollover between it and `day_ends`, and a check that is refused or comes
+    /// after a fired stop changes neither.
+    fn try_from(saved: SavedStopState) -> Result<Self, StopError> {
+        saved.rules.validate()?;
+        valid_balance(saved.starting_balance)?;
+        if !saved.day_start_equity.is_finite() {
+            return Err(StopError::DayStartEquityNotFinite {
+                value: saved.day_start_equity,
+            });
+        }
+        let day_ends = day_end_after(saved.rules.rollover, saved.last_check)?;
+        if saved.day_ends != day_ends {
+            return Err(StopError::DayEndsMismatch {
+                saved: saved.day_ends,
+                last_check: saved.last_check,
+                want: day_ends,
+            });
+        }
+        Ok(StopState {
+            rules: saved.rules,
+            starting_balance: saved.starting_balance,
+            day_start_equity: saved.day_start_equity,
+            day_ends: saved.day_ends,
+            last_check: saved.last_check,
+            fired: saved.fired,
+        })
+    }
+}
+
 impl StopState {
     /// Starts the stops of a session at `time`, with its starting balance: the account's equity
     /// when the session starts, which is also the first day's starting equity. Refuses rules that
-    /// fail [`StopRules::validate`] and a starting balance that is not a finite number above zero.
+    /// fail [`StopRules::validate`], a starting balance that is not a finite number above zero,
+    /// and a time too far from 1970 to work out when its trading day ends.
     pub fn start(rules: StopRules, starting_balance: f64, time: Millis) -> Result<Self, StopError> {
         rules.validate()?;
         valid_balance(starting_balance)?;
@@ -172,10 +228,38 @@ impl StopState {
             rules,
             starting_balance,
             day_start_equity: starting_balance,
-            day_ends: rules.rollover.next_after(time),
+            day_ends: day_end_after(rules.rollover, time)?,
             last_check: time,
             fired: None,
         })
+    }
+
+    /// Restores a loaded state against the session's own record of the rules and starting balance
+    /// it started with, which the caller keeps in the session's config, written once at start.
+    /// Refuses a state whose rules or starting balance are not exactly those.
+    ///
+    /// With the checks made when the state was loaded, this catches a saved state that disagrees
+    /// with the session's config or with itself: weaker rules, a different starting balance, a
+    /// deleted fired stop, or a day end that does not follow from the last check. It cannot catch
+    /// an edit that keeps the state consistent with both, such as a fired stop set to `null`, a
+    /// different starting equity for the day, or an earlier last check with the day end moved to
+    /// match; the caller's own record of a halt covers the fired stop. It does not defend against
+    /// someone who rewrites every file of a stopped session consistently.
+    pub fn restore(
+        saved: StopState,
+        rules: &StopRules,
+        starting_balance: f64,
+    ) -> Result<StopState, StopError> {
+        if saved.rules != *rules {
+            return Err(StopError::RulesDiffer);
+        }
+        if saved.starting_balance != starting_balance {
+            return Err(StopError::StartingBalanceDiffers {
+                saved: saved.starting_balance,
+                session: starting_balance,
+            });
+        }
+        Ok(saved)
     }
 
     pub fn rules(&self) -> &StopRules {
@@ -206,10 +290,10 @@ impl StopState {
     /// `None` when no stop fires.
     ///
     /// Once a stop has fired, every later call returns the same record, whatever it is given.
-    /// Until then, a time earlier than the last check, an equity that is not finite, a notional
-    /// that is not a finite number at or above zero, or a restored state whose rules or starting
-    /// balance are invalid, is an error, and the state is left as it was. `None` is only returned
-    /// for input the check could judge.
+    /// Until then, a time earlier than the last check, a time too far from 1970 to work out when
+    /// its trading day ends, an equity that is not finite, or a notional that is not a finite
+    /// number at or above zero, is an error, and the state is left as it was. `None` is only
+    /// returned for input the check could judge.
     ///
     /// When `time` has reached the end of the trading day, the day rolls over first, and the new
     /// day starts from the equity given in this same call. Then the rules are checked, and when
@@ -232,14 +316,17 @@ impl StopState {
         if let Some(fired) = self.fired {
             return Ok(Some(fired));
         }
-        self.rules.validate()?;
-        valid_balance(self.starting_balance)?;
+        // The rules and the starting balance were checked when the state was started or loaded,
+        // and nothing changes them.
         if time < self.last_check {
             return Err(StopError::TimeWentBack {
                 last: self.last_check,
                 got: time,
             });
         }
+        // The next day's end is worked out before any field changes, so a time too far from 1970
+        // is refused with the state as it was.
+        let next_day_ends = day_end_after(self.rules.rollover, time)?;
         if !equity.is_finite() {
             return Err(StopError::EquityNotFinite { value: equity });
         }
@@ -253,7 +340,7 @@ impl StopState {
             // which keeps that gap small. Upgrade when the venue reports the equity at the
             // rollover.
             self.day_start_equity = equity;
-            self.day_ends = self.rules.rollover.next_after(time);
+            self.day_ends = next_day_ends;
         }
 
         let r = &self.rules;
@@ -307,10 +394,48 @@ pub enum StopError {
     #[error("the check at {got} is earlier than the last check at {last}")]
     TimeWentBack { last: Millis, got: Millis },
 
+    #[error("the time {got} is too far from 1970 to work out when its trading day ends")]
+    TimeOutOfRange { got: Millis },
+
     #[error(
         "the order would take the open notional from {open} to {after}, above the cap of {cap}"
     )]
     OrderOverCap { open: f64, after: f64, cap: f64 },
+
+    #[error("the saved starting equity of the day is {value}, which is not a finite number")]
+    DayStartEquityNotFinite { value: f64 },
+
+    #[error(
+        "the saved day ends at {saved}, but the first rollover after the last check at \
+         {last_check} is at {want}"
+    )]
+    DayEndsMismatch {
+        saved: Millis,
+        last_check: Millis,
+        want: Millis,
+    },
+
+    #[error("the saved rules differ from the rules in the session's config")]
+    RulesDiffer,
+
+    #[error(
+        "the saved starting balance of {saved} differs from the starting balance of {session} in \
+         the session's config"
+    )]
+    StartingBalanceDiffers { saved: f64, session: f64 },
+}
+
+/// The first rollover after `time`, or an error when `time` is so close to either end of
+/// [`Millis`] that working it out could overflow. A rollover falls within its own UTC date, so
+/// [`DayRollover::next_after`] reaches back no further than the start of the date that holds
+/// `time`, less than a day before it, and forward no further than the end of the next date, less
+/// than two days after it.
+fn day_end_after(rollover: DayRollover, time: Millis) -> Result<Millis, StopError> {
+    if (Millis::MIN + DAY_MS..=Millis::MAX - 2 * DAY_MS).contains(&time) {
+        Ok(rollover.next_after(time))
+    } else {
+        Err(StopError::TimeOutOfRange { got: time })
+    }
 }
 
 fn valid_notional(value: f64) -> Result<(), StopError> {
@@ -587,11 +712,217 @@ mod tests {
                 Err(StopError::InvalidStartingBalance { .. })
             ));
         }
-        // A restored state with rules that fail validation cannot be checked.
-        let mut v = serde_json::to_value(state(rules())).unwrap();
+        // A saved state with rules that fail validation, or a starting balance that is not above
+        // zero, does not load.
+        let saved = serde_json::to_value(state(rules())).unwrap();
+        let mut v = saved.clone();
         v["rules"]["daily_loss_share"] = serde_json::json!(0.0);
-        let mut tampered: StopState = serde_json::from_value(v).unwrap();
-        assert!(tampered.check(6 * DAY, START, 0.0).is_err());
+        assert!(matches!(
+            load_refusal(v),
+            StopError::ShareOutOfRange {
+                rule: "daily loss limit",
+                ..
+            }
+        ));
+        let mut v = saved;
+        v["starting_balance"] = serde_json::json!(-1.0);
+        assert_eq!(
+            load_refusal(v),
+            StopError::InvalidStartingBalance { value: -1.0 }
+        );
+    }
+
+    /// The refusal a saved state given as JSON loads with. Deserialising a `StopState` from it is
+    /// refused too.
+    fn load_refusal(v: serde_json::Value) -> StopError {
+        assert!(serde_json::from_value::<StopState>(v.clone()).is_err());
+        StopState::try_from(serde_json::from_value::<SavedStopState>(v).unwrap()).unwrap_err()
+    }
+
+    #[test]
+    fn a_saved_state_whose_clock_was_edited_does_not_load() {
+        let saved = serde_json::to_value(state(rules())).unwrap();
+        // A day that never ends and a last check at the start of time.
+        let mut v = saved.clone();
+        v["day_ends"] = serde_json::json!(Millis::MAX);
+        v["last_check"] = serde_json::json!(Millis::MIN);
+        assert_eq!(
+            load_refusal(v),
+            StopError::TimeOutOfRange { got: Millis::MIN }
+        );
+        // Either one alone.
+        let mut v = saved.clone();
+        v["day_ends"] = serde_json::json!(Millis::MAX);
+        assert_eq!(
+            load_refusal(v),
+            StopError::DayEndsMismatch {
+                saved: Millis::MAX,
+                last_check: 5 * DAY + HOUR,
+                want: 6 * DAY
+            }
+        );
+        let mut v = saved.clone();
+        v["last_check"] = serde_json::json!(4 * DAY + HOUR);
+        assert_eq!(
+            load_refusal(v),
+            StopError::DayEndsMismatch {
+                saved: 6 * DAY,
+                last_check: 4 * DAY + HOUR,
+                want: 5 * DAY
+            }
+        );
+        // A day end a day later than the last check's.
+        let mut v = saved.clone();
+        v["day_ends"] = serde_json::json!(7 * DAY);
+        assert!(matches!(load_refusal(v), StopError::DayEndsMismatch { .. }));
+        // A last check too late to work out its day end is refused, not a panic.
+        let mut v = saved;
+        v["last_check"] = serde_json::json!(Millis::MAX);
+        assert_eq!(
+            load_refusal(v),
+            StopError::TimeOutOfRange { got: Millis::MAX }
+        );
+    }
+
+    #[test]
+    fn a_saved_day_start_equity_that_is_not_finite_does_not_load() {
+        // JSON cannot hold one, but another format could.
+        let s = state(rules());
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let saved = SavedStopState {
+                rules: s.rules,
+                starting_balance: s.starting_balance,
+                day_start_equity: value,
+                day_ends: s.day_ends,
+                last_check: s.last_check,
+                fired: None,
+            };
+            assert!(matches!(
+                StopState::try_from(saved),
+                Err(StopError::DayStartEquityNotFinite { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn a_saved_state_without_its_fired_key_does_not_load() {
+        let mut s = state(rules());
+        let unfired = serde_json::to_value(&s).unwrap();
+        // A state that has not fired saves the key as null, and loads.
+        assert_eq!(unfired["fired"], serde_json::Value::Null);
+        assert_eq!(
+            serde_json::from_value::<StopState>(unfired.clone()).unwrap(),
+            s
+        );
+        s.check(5 * DAY + 2 * HOUR, 9_300.0, 0.0).unwrap().unwrap();
+        let fired = serde_json::to_value(&s).unwrap();
+        for mut v in [unfired, fired] {
+            v.as_object_mut().unwrap().remove("fired");
+            let err = serde_json::from_value::<StopState>(v).unwrap_err();
+            assert!(err.to_string().contains("missing field `fired`"), "{err}");
+        }
+    }
+
+    #[test]
+    fn restore_refuses_a_saved_state_that_differs_from_the_session_s_record() {
+        let saved = serde_json::to_value(state(rules())).unwrap();
+        // Rules weaker than the session's but valid load, and restoring refuses them.
+        let mut v = saved.clone();
+        v["rules"]["daily_loss_share"] = serde_json::json!(1.0);
+        v["rules"]["max_loss_share"] = serde_json::json!(1.0);
+        v["rules"]["open_notional_cap"] = serde_json::json!(1e300);
+        let weaker: StopState = serde_json::from_value(v).unwrap();
+        assert_eq!(
+            StopState::restore(weaker, &rules(), START),
+            Err(StopError::RulesDiffer)
+        );
+        // So does a rollover moved by a minute, with the day's end moved to match.
+        let mut v = saved.clone();
+        v["rules"]["rollover"]["offset_minutes"] = serde_json::json!(1);
+        v["day_ends"] = serde_json::json!(6 * DAY + 60_000);
+        let moved: StopState = serde_json::from_value(v).unwrap();
+        assert_eq!(
+            StopState::restore(moved, &rules(), START),
+            Err(StopError::RulesDiffer)
+        );
+        // A tiny starting balance with a day that started far below it loads, and restoring
+        // refuses it.
+        let mut v = saved;
+        v["starting_balance"] = serde_json::json!(1e-300);
+        v["day_start_equity"] = serde_json::json!(-1e308);
+        let lowered: StopState = serde_json::from_value(v).unwrap();
+        assert_eq!(
+            StopState::restore(lowered, &rules(), START),
+            Err(StopError::StartingBalanceDiffers {
+                saved: 1e-300,
+                session: START
+            })
+        );
+    }
+
+    #[test]
+    fn restore_with_the_session_s_record_makes_the_same_decisions() {
+        let mut s = state(rules());
+        assert_eq!(s.check(5 * DAY + 20 * HOUR, 9_700.0, 10_000.0), Ok(None));
+        assert_eq!(s.check(6 * DAY + HOUR, 9_600.0, 10_000.0), Ok(None));
+        let loaded: StopState = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        let mut restored = StopState::restore(loaded, &rules(), START).unwrap();
+        assert_eq!(restored, s);
+        for (t, e, n) in [
+            (6 * DAY + 2 * HOUR, 9_100.0, 10_000.0),
+            (6 * DAY + 3 * HOUR, 8_975.0, 10_000.0),
+            (6 * DAY + 4 * HOUR, 12_000.0, 0.0),
+        ] {
+            assert_eq!(restored.check(t, e, n), s.check(t, e, n));
+        }
+        assert_eq!(restored.fired().unwrap().rule, StopRule::DailyLoss);
+    }
+
+    #[test]
+    fn a_time_too_far_from_1970_is_refused_and_changes_nothing() {
+        // Past the day's end, so a pass would roll the day over.
+        let mut s = state(rules());
+        let before = s.clone();
+        assert_eq!(
+            s.check(Millis::MAX, 9_000.0, 0.0),
+            Err(StopError::TimeOutOfRange { got: Millis::MAX })
+        );
+        assert_eq!(s, before);
+        // At the earliest and latest times accepted, every kind of rollover works out the day's
+        // end without overflow, and the state left loads back.
+        let (first, last) = (Millis::MIN + DAY, Millis::MAX - 2 * DAY);
+        for rollover in [
+            DayRollover::default(),
+            DayRollover::Utc { offset_minutes: -1 },
+            DayRollover::Utc {
+                offset_minutes: i32::MIN,
+            },
+            DayRollover::Utc {
+                offset_minutes: i32::MAX,
+            },
+            DayRollover::NewYork1700,
+        ] {
+            let r = StopRules {
+                rollover,
+                ..rules()
+            };
+            assert_eq!(
+                StopState::start(r, START, first - 1),
+                Err(StopError::TimeOutOfRange { got: first - 1 })
+            );
+            let mut s = StopState::start(r, START, first).unwrap();
+            assert!(s.day_ends() > first);
+            assert_eq!(s.check(last, START, 0.0), Ok(None));
+            assert!(s.day_ends() > last);
+            let json = serde_json::to_string(&s).unwrap();
+            assert_eq!(serde_json::from_str::<StopState>(&json).unwrap(), s);
+            let before = s.clone();
+            assert_eq!(
+                s.check(last + 1, START, 0.0),
+                Err(StopError::TimeOutOfRange { got: last + 1 })
+            );
+            assert_eq!(s, before);
+        }
     }
 
     #[test]
@@ -694,6 +1025,42 @@ mod tests {
             for (dt, equity, notional) in checks {
                 t += dt;
                 prop_assert_eq!(s.check(t, equity, notional), Ok(Some(fired)));
+            }
+        }
+
+        /// Every state a session reaches, fired or not, after checks that pass, fail or land
+        /// exactly on a rollover, loads back unchanged: the checks made on load hold for it.
+        #[test]
+        fn every_state_a_session_reaches_loads_back_unchanged(
+            offset_minutes in -1500..1500i32,
+            new_york in any::<bool>(),
+            start in 1_600_000_000_000..1_800_000_000_000i64,
+            checks in prop::collection::vec(
+                (
+                    prop_oneof![Just(None), (-HOUR..2 * DAY).prop_map(Some)],
+                    9_400.0..10_400.0f64,
+                    prop_oneof![Just(-1.0), 0.0..50_000.0f64],
+                ),
+                1..30,
+            )
+        ) {
+            let rollover = if new_york {
+                DayRollover::NewYork1700
+            } else {
+                DayRollover::Utc { offset_minutes }
+            };
+            let mut s = StopState::start(StopRules { rollover, ..rules() }, START, start).unwrap();
+            let mut t = start;
+            let loads_back = |s: &StopState| {
+                let json = serde_json::to_string(s).unwrap();
+                serde_json::from_str::<StopState>(&json).ok() == Some(s.clone())
+            };
+            prop_assert!(loads_back(&s));
+            for (dt, equity, notional) in checks {
+                // `None` checks exactly at the day's end.
+                t = dt.map_or(s.day_ends(), |dt| t + dt);
+                let _ = s.check(t, equity, notional);
+                prop_assert!(loads_back(&s), "{s:?}");
             }
         }
     }
