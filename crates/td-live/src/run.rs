@@ -252,6 +252,9 @@ where
         if let Some(refused) = s.refusal() {
             return Err(refused);
         }
+        // shortcut: the rules are read once per run, so a change at the venue while the run is
+        // live is met only as the venue's refusal of an order (the broker then faults); read them
+        // on each bar if a venue changes rules without notice.
         if let Err(reason) = check_rules(&s) {
             return halt(&mut s, LiveError::Halted(reason));
         }
@@ -514,8 +517,9 @@ fn check_rules(s: &LiveSession) -> Result<(), String> {
     let symbol = &saved.id.symbol;
     let venue = s.client().instrument_info(symbol).map_err(|e| {
         format!(
-            "the venue's trading rules for {symbol} could not be read, so the session did not go \
-             live and sent nothing: {e}"
+            "the venue's trading rules for {symbol} could not be read, so this run did not start \
+             trading; nothing was sent, and any position and resting orders stay at the venue as \
+             they are: {e}"
         )
     })?;
     let changed: Vec<String> = [
@@ -535,8 +539,9 @@ fn check_rules(s: &LiveSession) -> Result<(), String> {
     }
     Err(format!(
         "the venue changed its trading rules for {symbol} since the session was created ({}), so \
-         orders rounded to the saved rules could be refused or mis-sized; the session did not go \
-         live and sent nothing",
+         orders rounded to the saved rules could be refused or mis-sized; nothing was sent, any \
+         position and resting orders stay at the venue as they are, and this session cannot \
+         trade under the new rules",
         changed.join("; ")
     ))
 }

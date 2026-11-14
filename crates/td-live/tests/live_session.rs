@@ -939,6 +939,11 @@ fn a_resume_halts_before_sending_when_the_venue_changed_the_instruments_quantity
         "{reason}"
     );
     assert!(!reason.contains("tick size"), "{reason}");
+    // The session had traded, so the reason says what is left at the venue.
+    assert!(
+        reason.contains("position and resting orders stay at the venue as they are"),
+        "{reason}"
+    );
     assert_eq!(live.status().state, State::Halted { reason });
     assert_eq!(rig.sends(), sends, "nothing sent, cancelled or resized");
     assert_eq!(rig.mock.request_count(CREATE), 1);
