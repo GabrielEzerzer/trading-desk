@@ -426,20 +426,18 @@ fn ruined(returns: impl Iterator<Item = f64>, ruin_drawdown: f64) -> bool {
 pub enum DrawdownMode {
     /// From the starting balance: breached at `start * (1 - max_drawdown)`.
     Static,
-    /// From the highest daily close so far, the day's own included, by the same amount: breached
-    /// at `peak - max_drawdown * start`, the usual trailing rule, whose amount is set by the
-    /// starting balance. [`PropFirmSpec::trailing_lock`] stops the floor rising at a level.
+    /// From the highest daily close before the day, the start included, by the same amount:
+    /// breached at `peak - max_drawdown * start`, the usual trailing rule, whose amount is set by
+    /// the starting balance. [`PropFirmSpec::trailing_lock`] stops the floor rising at a level.
     ///
-    /// A day's low is checked against the floor raised by that day's own close, as if the day
-    /// reached its close before its low. The order inside a day is unknown, and this is the order
-    /// worse for the strategy, so it cannot overstate a pass against a firm that trails its floor
-    /// on daily closes, and it comes as near as a day's close allows to one that trails it on
-    /// equity at every moment.
+    /// A day's low is checked against the floor the closes before it set, and its close raises
+    /// the floor only for the days after, as a firm that trails its floor on daily closes does.
+    /// A close cannot fall to a floor it raised itself, and is at or above the day's low, so the
+    /// low is the only check.
     ///
-    /// shortcut: a day carries its close and its low but not its high, so against a firm that
-    /// trails its floor on equity inside the day, a day that rose above its close before falling
-    /// back is judged against too low a floor. Carry each day's high as well once a plan's firm
-    /// trails on equity inside the day.
+    /// shortcut: a firm that trails its floor on equity inside the day is not modelled: against
+    /// such a firm a day that rose before it fell is judged against too low a floor, so breaches
+    /// are understated. Carry each day's high once a plan's firm trails inside the day.
     Trailing,
 }
 
@@ -485,8 +483,7 @@ pub struct PropFirmSpec {
 }
 
 impl PropFirmSpec {
-    /// The floor on a day whose highest close so far, its own included, is `peak`, the start
-    /// included.
+    /// The floor on a day whose highest close before it is `peak`, the start included.
     fn floor(&self, peak: f64) -> f64 {
         match self.drawdown {
             DrawdownMode::Static => 1.0 - self.max_drawdown,
@@ -499,8 +496,8 @@ impl PropFirmSpec {
     }
 
     /// Whether a day that started from a close of `prev` and fell to `low` at its lowest breached
-    /// the daily loss limit or fell to `floor`, whatever it closed at. `low` is the day's close
-    /// when the walk has no daily lows.
+    /// the daily loss limit or fell to `floor`, the floor in force when it began, whatever it
+    /// closed at. `low` is the day's close when the walk has no daily lows.
     fn breached(&self, prev: f64, low: f64, floor: f64) -> bool {
         prev - low >= self.daily_loss_limit || low <= floor
     }
@@ -566,20 +563,20 @@ fn walk_path(spec: &PropFirmSpec, days: impl Iterator<Item = (f64, f64)>) -> Opt
     for (day, (r, low)) in (1..=spec.horizon_days).zip(days) {
         let prev = equity;
         equity *= 1.0 + r;
-        peak = peak.max(equity);
         if spec.breached(prev, prev * (1.0 + low), spec.floor(peak)) {
             return Some(day);
         }
+        peak = peak.max(equity);
     }
     None
 }
 
 /// Walks the evaluation along one path: the first phase, then the second if the spec has one,
 /// each from a fresh balance of 1, with each day's return and its low (`lows`, one per return)
-/// multiplied by `size`. A phase passes on
-/// the first day its target is met, its best-day rule holds and it has held `spec.min_days` days
-/// that `traded` (one flag per return) marks. Returns the day (counted from 1 along `returns`) the
-/// last phase passed, or `None` after a breach or once `returns` run out.
+/// multiplied by `size`. A phase passes on the first day its target is met, its best-day rule
+/// holds and it has held `spec.min_days` days that `traded` (one flag per return) marks. Returns
+/// the day (counted from 1 along `returns`) the last phase passed, or `None` after a breach or
+/// once `returns` run out.
 ///
 /// With `spec.day_target_share`, the target is met by the counted profit: the balance less the
 /// profit no day was allowed to count (each winning day's profit above the cap). A day that
@@ -610,10 +607,10 @@ fn walk_evaluation(
         let prev = equity;
         equity *= 1.0 + size * r;
         trading_days += usize::from(t);
-        peak = peak.max(equity);
         if spec.breached(prev, prev * (1.0 + size * low), spec.floor(peak)) {
             return None;
         }
+        peak = peak.max(equity);
         best = best.max(equity - prev);
         if let Some(share) = spec.day_target_share {
             let cap = share * target;
@@ -773,11 +770,11 @@ fn walk_funded(
         trading_days += usize::from(t);
         let prev = out.balance;
         out.balance *= 1.0 + terms.funded_size * r;
-        peak = peak.max(out.balance);
         let floor = fixed.unwrap_or_else(|| spec.floor(peak));
         if spec.breached(prev, prev * (1.0 + terms.funded_size * low), floor) {
             break;
         }
+        peak = peak.max(out.balance);
         let due = match last {
             None => trading_days >= first,
             Some(last) => day - last >= interval,
@@ -1396,6 +1393,11 @@ mod tests {
         assert_eq!((inside.pass, inside.breach), (0.0, 1.0));
         // A dip of 2% stays inside the limit.
         assert_eq!(passes_lows(&daily, &path, &[0.05, -0.02, 0.05]), Some(3));
+        // A day whose low breaches and whose close reaches the target is a breach, not a pass:
+        // day 2 closes at 1.05 * 1.05 = 1.1025 but falls to 1.05 * 0.96 = 1.008 inside the day,
+        // 0.042 under day 1's close.
+        assert_eq!(passes(&daily, &[0.05, 0.05]), Some(2));
+        assert_eq!(passes_lows(&daily, &[0.05, 0.05], &[0.05, -0.04]), None);
         // The low is scaled with the size, as the return is: at half size two days of +10% close
         // at 1.05 and 1.1025, and a 4% dip on day 2 is 2% from 1.05, 0.021 of the start, inside
         // the limit; an 8% dip is 0.042 and breaches.
@@ -1420,25 +1422,49 @@ mod tests {
         assert_eq!(walk_lows(&fixed, &path, &lows), Some(2));
         // 1.05 * 0.86 = 0.903 stays above it.
         assert_eq!(walk_lows(&fixed, &path, &[0.05, -0.14, 0.05]), None);
+    }
 
-        // A trailing floor is raised by the day's own close before its low is checked, the order
-        // worse for the strategy: day 1 closes at 1.06, which puts the floor at 0.96, and its low
-        // of 0.95 breaches it. From the start's peak alone the floor would be 0.9 and hold.
+    /// A day's low is checked against the trailing floor the closes before it set, and its close
+    /// raises the floor only for the days after, in the breach walk, the evaluation and the
+    /// funded account alike.
+    #[test]
+    fn a_days_low_is_checked_against_the_trailing_floor_the_closes_before_it_set() {
+        // Day 1 closes at 1.5, which puts the floor at 1.5 - 0.375 = 1.125 from day 2. Day 1's
+        // own low of 0.75 is under that, but above the 0.625 the start set, and holds. Day 2's
+        // low of 1.5 * 0.75 = 1.125 lands on the floor day 1 set and breaches. All exact in
+        // binary.
         let trailing = PropFirmSpec {
+            target: 1.0,
+            max_drawdown: 0.375,
             drawdown: DrawdownMode::Trailing,
-            ..fixed
+            ..unlimited(10)
         };
-        assert_eq!(walk(&trailing, &[0.06]), None);
-        assert_eq!(walk_lows(&trailing, &[0.06], &[-0.05]), Some(1));
-        assert_eq!(walk_lows(&trailing, &[0.06], &[-0.03]), None);
-        // A lock at the start stops the floor at 1.0 however high the close: a close of 1.2 puts
-        // it at 1.0, not 1.1, so a low of 1.02 holds and one of 0.996 breaches.
+        let path = [0.5, 0.0, 0.5];
+        let holds = [-0.25, 0.0, 0.5];
+        let breaches = [-0.25, -0.25, 0.5];
+        assert_eq!(walk_lows(&trailing, &path, &holds), None);
+        assert_eq!(walk_lows(&trailing, &path, &breaches), Some(2));
+        // 1.5 * 1.5 = 2.25 reaches the 100% target on day 3.
+        assert_eq!(passes_lows(&trailing, &path, &holds), Some(3));
+        assert_eq!(passes_lows(&trailing, &path, &breaches), None);
+        // A funded account first paid on day 3 takes the 2.25 - 1.875 = 0.375 above the floor
+        // day 3's close sets, or ends on day 2 with nothing paid.
+        let third = AttemptTerms {
+            days_to_first_payout: 3,
+            ..terms()
+        };
+        let held = walk_funded(&trailing, &third, &path, &holds, &every_day(&path));
+        assert_eq!((held.payouts, held.gross, held.balance), (1, 0.375, 1.875));
+        let ended = walk_funded(&trailing, &third, &path, &breaches, &every_day(&path));
+        assert_eq!((ended.payouts, ended.gross, ended.balance), (0, 0.0, 1.5));
+        // A lock at the start stops the floor at 1.0 however high the closes: day 2's low of
+        // 1.125 holds, and one of 1.5 * 0.625 = 0.9375 breaches.
         let locked = PropFirmSpec {
             trailing_lock: Some(0.0),
             ..trailing
         };
-        assert_eq!(walk_lows(&locked, &[0.2], &[0.02]), None);
-        assert_eq!(walk_lows(&locked, &[0.2], &[-0.004]), Some(1));
+        assert_eq!(walk_lows(&locked, &path, &breaches), None);
+        assert_eq!(walk_lows(&locked, &path, &[-0.25, -0.375, 0.5]), Some(2));
     }
 
     #[test]
@@ -1465,6 +1491,14 @@ mod tests {
         };
         let halved = walk_funded(&daily, &half, &path, &lows, &every_day(&path));
         assert_eq!(halved.payouts, 3);
+        // A breach day pays nothing even when its close would be paid out: at closes every day
+        // of +25% pays, and with day 2 falling 4% inside the day the account ends at its close of
+        // 1.25, after day 1's payout alone.
+        let gains = [0.25; 4];
+        let paid = funded(&daily, &terms(), &gains);
+        assert_eq!((paid.payouts, paid.gross), (4, 1.0));
+        let ended = walk_funded(&daily, &terms(), &gains, &lows, &every_day(&gains));
+        assert_eq!((ended.payouts, ended.gross, ended.balance), (1, 0.25, 1.25));
     }
 
     #[test]
