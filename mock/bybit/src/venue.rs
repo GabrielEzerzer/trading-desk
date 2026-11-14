@@ -9,6 +9,8 @@
 //! - Market orders fill in full at the price the test set, as takers, at the instrument's taker
 //!   fee. A reduce-only market order is cut to the position's size.
 //! - The minimum notional applies to orders that are not reduce-only.
+//! - A test can cap the next market order's fill ([`crate::MockVenue::cap_next_fill`]); the order
+//!   then rests `PartiallyFilled` until [`crate::MockVenue::fill_rest`] fills the rest.
 
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -107,6 +109,8 @@ pub(crate) struct State {
     pub faults_always: Vec<(String, Fault)>,
     pub log: Vec<Logged>,
     pub next: u64,
+    /// The quantity the next market order fills, when a test caps it.
+    pub cap_next_fill: Option<f64>,
 }
 
 impl State {
@@ -130,6 +134,7 @@ impl State {
             faults_always: Vec::new(),
             log: Vec::new(),
             next: 1,
+            cap_next_fill: None,
         }
     }
 
@@ -254,6 +259,18 @@ impl State {
             time: now,
             seq,
         });
+    }
+
+    /// Fills the rest of the partially filled order with `link_id` at the current price.
+    pub fn fill_rest(&mut self, link_id: &str) {
+        let i = self
+            .orders
+            .iter()
+            .position(|o| o.link_id == link_id && o.status == "PartiallyFilled")
+            .expect("no partially filled order with that link id");
+        let price = self.markets[&self.orders[i].symbol].price;
+        let rest = self.orders[i].qty - self.orders[i].cum_qty;
+        self.fill(i, price, rest);
     }
 
     pub fn add_exec(
@@ -614,7 +631,13 @@ impl State {
         });
         if trigger.is_none() {
             let i = self.orders.len() - 1;
-            self.fill(i, price, fill_qty);
+            match self.cap_next_fill.take() {
+                Some(cap) if cap < fill_qty => {
+                    self.fill(i, price, cap);
+                    self.orders[i].status = "PartiallyFilled";
+                }
+                _ => self.fill(i, price, fill_qty),
+            }
         }
         Ok(json!({ "orderId": order_id, "orderLinkId": link }))
     }

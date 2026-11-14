@@ -197,6 +197,26 @@ impl MockVenue {
         s.faults_always.clear();
     }
 
+    /// Makes the next market order fill only `qty`; it then rests `PartiallyFilled` until
+    /// [`MockVenue::fill_rest`].
+    pub fn cap_next_fill(&self, qty: f64) {
+        self.state.lock().unwrap().cap_next_fill = Some(qty);
+    }
+
+    /// Fills the rest of the partially filled order with `link_id` at the current price.
+    pub fn fill_rest(&self, link_id: &str) {
+        self.state.lock().unwrap().fill_rest(link_id);
+    }
+
+    /// Sets the signed position on `symbol` with no execution, as a change the execution list
+    /// does not show.
+    pub fn set_position(&self, symbol: &str, size: f64, avg_price: f64) {
+        let mut s = self.state.lock().unwrap();
+        let pos = s.positions.entry(symbol.into()).or_default();
+        pos.size = size;
+        pos.avg = if size == 0.0 { 0.0 } else { avg_price };
+    }
+
     /// Adds a funding fee execution on `symbol` at the current time.
     pub fn add_funding(&self, symbol: &str, qty: f64, fee: f64) {
         let mut s = self.state.lock().unwrap();
