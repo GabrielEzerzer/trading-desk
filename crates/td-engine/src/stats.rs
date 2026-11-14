@@ -548,9 +548,11 @@ pub struct PropFirmOdds {
     /// The fraction of paths that pass every phase within the horizon before breaching any
     /// limit. The `prop_firm` kind rule asks for at least 0.60.
     pub pass: f64,
-    /// The fraction of paths that breach a limit within the horizon, trading on after reaching
-    /// the target as a funded account would. The `prop_firm` kind rule asks for at most 0.10
-    /// over 90 days.
+    /// The fraction of paths that breach a limit within the horizon: in a phase of the
+    /// evaluation, or after the last phase passes, trading on as the funded account from a fresh
+    /// balance and a fresh peak, as a firm starts each phase and the funded account again at the
+    /// account size. The funded account takes no payouts here. The `prop_firm` kind rule asks for
+    /// at most 0.10 over 90 days.
     pub breach: f64,
     pub paths: usize,
     /// The days the paths were drawn from, one per daily return. `None` in a result saved before
@@ -564,12 +566,64 @@ pub struct PropFirmOdds {
     pub trading_days: Option<usize>,
 }
 
-/// Walks one path of days, each its return and its low (see [`prop_firm_odds`]), on one balance
-/// from 1, trading on after the target as a funded account would, and returns the day (counted
-/// from 1) it first breached a limit, if it did within the horizon.
-fn walk_path(spec: &PropFirmSpec, days: impl Iterator<Item = (f64, f64)>) -> Option<usize> {
+/// How the evaluation along one path ended ([`walk_evaluation`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Evaluation {
+    /// The last phase passed on this day, counted from 1.
+    Passed(usize),
+    /// A limit was breached on this day, counted from 1, before the last phase passed.
+    Breached(usize),
+    /// The days ran out with neither.
+    Unfinished,
+}
+
+impl Evaluation {
+    /// The day the last phase passed, if it did.
+    fn passed(self) -> Option<usize> {
+        match self {
+            Evaluation::Passed(day) => Some(day),
+            _ => None,
+        }
+    }
+}
+
+/// The day (counted from 1) a path of days, each its return and its low (see [`prop_firm_odds`]),
+/// first breached a limit, for the breach odds. `evaluation` is how [`walk_evaluation`] at the size
+/// tested ended on the same days: a breach inside a phase is that day, and after the last phase
+/// passes the path trades on as the funded account, from a fresh balance of 1 and a fresh peak on
+/// the day after the pass, as a firm starts each phase and the funded account again at the
+/// account size ([`first_breach`]). Each phase restarts the same way inside the evaluation, so no
+/// floor is ever measured from an earlier phase's start. `None` when the days run out first.
+///
+/// shortcut: the funded account here takes no payouts, which the odds carry no terms for. A payout
+/// takes profit out of the balance and moves no floor, so it brings the balance nearer the floor
+/// and breaches are understated for a rule whose funded account pays out early; walk the funded
+/// part with the attempt's payout terms once the breach line should count them.
+fn walk_path(
+    spec: &PropFirmSpec,
+    evaluation: Evaluation,
+    returns: &[f64],
+    lows: &[f64],
+) -> Option<usize> {
+    match evaluation {
+        Evaluation::Breached(day) => Some(day),
+        Evaluation::Unfinished => None,
+        Evaluation::Passed(day) => {
+            let funded = returns[day..]
+                .iter()
+                .copied()
+                .zip(lows[day..].iter().copied());
+            first_breach(spec, funded).map(|d| day + d)
+        }
+    }
+}
+
+/// Walks days, each its return and its low, on one balance from 1 with a peak that starts there,
+/// and returns the day (counted from 1) it first breached a limit, if it did before the days ran
+/// out: one account, never reset.
+fn first_breach(spec: &PropFirmSpec, days: impl Iterator<Item = (f64, f64)>) -> Option<usize> {
     let (mut equity, mut peak) = (1.0f64, 1.0f64);
-    for (day, (r, low)) in (1..=spec.horizon_days).zip(days) {
+    for (day, (r, low)) in (1..).zip(days) {
         let prev = equity;
         equity *= 1.0 + r;
         if spec.breached(prev, prev * (1.0 + low), spec.floor(peak)) {
@@ -584,8 +638,8 @@ fn walk_path(spec: &PropFirmSpec, days: impl Iterator<Item = (f64, f64)>) -> Opt
 /// each from a fresh balance of 1, with each day's return and its low (`lows`, one per return)
 /// multiplied by `size`. A phase passes on the first day its target is met, its best-day rule
 /// holds and it has held `spec.min_days` days that `traded` (one flag per return) marks. Returns
-/// the day (counted from 1 along `returns`) the last phase passed, or `None` after a breach or
-/// once `returns` run out.
+/// the day (counted from 1 along `returns`) the last phase passed, the day of a breach before
+/// that, or that `returns` ran out first.
 ///
 /// With `spec.day_target_share`, the target is met by the counted profit: the balance less the
 /// profit no day was allowed to count (each winning day's profit above the cap). A day that
@@ -598,7 +652,7 @@ fn walk_path(spec: &PropFirmSpec, days: impl Iterator<Item = (f64, f64)>) -> Opt
 /// a losing day before the target is reached ends below it.
 ///
 /// shortcut: the size depends only on the phase, not on the balance or the distance to the
-/// target or the floor (returns compound on the balance, as in [`walk_path`]); add a sizing
+/// target or the floor (returns compound on the balance, as in [`first_breach`]); add a sizing
 /// plan once a plan needs one.
 fn walk_evaluation(
     spec: &PropFirmSpec,
@@ -606,7 +660,7 @@ fn walk_evaluation(
     lows: &[f64],
     traded: &[bool],
     size: f64,
-) -> Option<usize> {
+) -> Evaluation {
     let mut later = spec.second_target;
     let mut target = spec.target;
     let (mut equity, mut peak, mut best, mut trading_days) = (1.0f64, 1.0f64, 0.0f64, 0usize);
@@ -617,7 +671,7 @@ fn walk_evaluation(
         equity *= 1.0 + size * r;
         trading_days += usize::from(t);
         if spec.breached(prev, prev * (1.0 + size * low), spec.floor(peak)) {
-            return None;
+            return Evaluation::Breached(day);
         }
         peak = peak.max(equity);
         best = best.max(equity - prev);
@@ -636,11 +690,11 @@ fn walk_evaluation(
                     target = next;
                     (equity, peak, best, trading_days, uncounted) = (1.0, 1.0, 0.0, 0, 0.0);
                 }
-                None => return Some(day),
+                None => return Evaluation::Passed(day),
             }
         }
     }
-    None
+    Evaluation::Unfinished
 }
 
 /// The odds of passing and of breaching a prop-firm challenge, from `paths` paths of
@@ -681,9 +735,9 @@ pub fn prop_firm_odds(
             path_lows.push(lows[i]);
             flags.push(traded[i]);
         }
-        passed += usize::from(walk_evaluation(spec, &path, &path_lows, &flags, 1.0).is_some());
-        let days = path.iter().copied().zip(path_lows.iter().copied());
-        breached += usize::from(walk_path(spec, days).is_some());
+        let evaluation = walk_evaluation(spec, &path, &path_lows, &flags, 1.0);
+        passed += usize::from(evaluation.passed().is_some());
+        breached += usize::from(walk_path(spec, evaluation, &path, &path_lows).is_some());
     }
     Ok(PropFirmOdds {
         pass: passed as f64 / spec.paths as f64,
@@ -844,7 +898,7 @@ fn walk_attempt(
 ) -> Option<Funded> {
     let h = spec.horizon_days;
     let size = terms.evaluation_size;
-    let day = walk_evaluation(spec, &returns[..h], &lows[..h], &traded[..h], size)?;
+    let day = walk_evaluation(spec, &returns[..h], &lows[..h], &traded[..h], size).passed()?;
     let end = day + terms.funded_horizon_days as usize;
     Some(walk_funded(
         spec,
@@ -1329,12 +1383,12 @@ mod tests {
 
     /// The day `path` breaches on one balance.
     fn walk(spec: &PropFirmSpec, path: &[f64]) -> Option<usize> {
-        walk_path(spec, path.iter().map(|&r| (r, r)))
+        first_breach(spec, path.iter().map(|&r| (r, r)))
     }
 
     /// The day `path` passes the evaluation at the size it was tested at.
     fn passes(spec: &PropFirmSpec, path: &[f64]) -> Option<usize> {
-        walk_evaluation(spec, path, path, &every_day(path), 1.0)
+        walk_evaluation(spec, path, path, &every_day(path), 1.0).passed()
     }
 
     /// A flag per day of `x`, each saying the day traded: every day counts as a trading day.
@@ -1395,14 +1449,93 @@ mod tests {
         assert_eq!(passes(&trailing, &[-0.15, 0.4]), None);
     }
 
+    /// The day `path` breaches for the breach odds: the evaluation, then the funded account from
+    /// a fresh balance after the last phase passes.
+    fn walk_restarting(spec: &PropFirmSpec, path: &[f64]) -> Option<usize> {
+        let evaluation = walk_evaluation(spec, path, path, &every_day(path), 1.0);
+        walk_path(spec, evaluation, path, path)
+    }
+
+    #[test]
+    fn the_breach_walk_starts_the_account_again_when_a_phase_passes() {
+        // A 25% target and a 25% static floor, the daily limit off; all values exact in binary.
+        let spec = PropFirmSpec {
+            target: 0.25,
+            max_drawdown: 0.25,
+            ..unlimited(10)
+        };
+        // Day 1 reaches 1.25 and passes. Day 2 falls 25%: on one balance that is 0.9375, above
+        // the floor of 0.75 measured from the first start; the funded account starts again at 1
+        // and falls to 0.75, onto its own floor, a breach.
+        let path = [0.25, -0.25];
+        assert_eq!(passes(&spec, &path), Some(1));
+        assert_eq!(walk(&spec, &path), None);
+        assert_eq!(walk_restarting(&spec, &path), Some(2));
+        // With a second phase of 12.5%, phase 1 passes on day 1, phase 2 starts at 1 and reaches
+        // 1.125 on day 2, and the funded account starts at 1 on day 3 and falls to 0.75. On one
+        // balance day 3 ends at 1.25 * 1.125 * 0.75 = 1.0546875, no breach.
+        let two = PropFirmSpec {
+            second_target: Some(0.125),
+            ..spec
+        };
+        let path = [0.25, 0.125, -0.25];
+        assert_eq!(passes(&two, &path), Some(2));
+        assert_eq!(walk(&two, &path), None);
+        assert_eq!(walk_restarting(&two, &path), Some(3));
+        // Phase 2 restarts inside the evaluation too: a 25% fall on day 2 is from phase 2's own
+        // start of 1, onto its floor of 0.75, a breach on day 2.
+        assert_eq!(walk_restarting(&two, &[0.25, -0.25]), Some(2));
+        assert_eq!(walk(&two, &[0.25, -0.25]), None);
+        // Without a pass, the walk is the one balance: a breach on the same day, or none.
+        assert_eq!(walk_restarting(&spec, &[0.125, -0.375]), Some(2));
+        assert_eq!(walk(&spec, &[0.125, -0.375]), Some(2));
+        assert_eq!(walk_restarting(&spec, &[0.125, -0.25]), None);
+    }
+
+    #[test]
+    fn a_rule_with_no_phase_passed_inside_the_horizon_breaches_as_one_balance_did() {
+        let daily: Vec<f64> = symmetric().iter().map(|r| 4.0 * r).collect();
+        let lows: Vec<f64> = daily.iter().map(|r| r.min(0.0) - 0.004).collect();
+        let traded = every_day(&daily);
+        // The one-balance walk on the same draws, as the breach odds were measured before.
+        let one_balance = |spec: &PropFirmSpec| {
+            let mut draw = Resampler::new(daily.len(), spec.mean_block, spec.seed);
+            let breached = (0..spec.paths)
+                .filter(|_| {
+                    draw.reset();
+                    let days: Vec<usize> = (0..spec.horizon_days).map(|_| draw.next()).collect();
+                    first_breach(spec, days.iter().map(|&i| (daily[i], lows[i]))).is_some()
+                })
+                .count();
+            breached as f64 / spec.paths as f64
+        };
+        // A target out of reach: no path passes, so no path restarts.
+        let unreachable = PropFirmSpec {
+            target: 100.0,
+            ..challenge(60)
+        };
+        let odds = prop_firm_odds(&daily, Some(&lows), &traded, &unreachable).unwrap();
+        assert_eq!(odds.pass, 0.0);
+        assert!(odds.breach > 0.0, "{}", odds.breach);
+        assert_eq!(odds.breach, one_balance(&unreachable));
+        // With a reachable target, paths that pass restart, and the odds differ.
+        let reachable = PropFirmSpec {
+            target: 0.05,
+            ..unreachable
+        };
+        let odds = prop_firm_odds(&daily, Some(&lows), &traded, &reachable).unwrap();
+        assert!(odds.pass > 0.0, "{}", odds.pass);
+        assert_ne!(odds.breach, one_balance(&reachable));
+    }
+
     /// The day `path` breaches on one balance, with each day's low from `lows`.
     fn walk_lows(spec: &PropFirmSpec, path: &[f64], lows: &[f64]) -> Option<usize> {
-        walk_path(spec, path.iter().copied().zip(lows.iter().copied()))
+        first_breach(spec, path.iter().copied().zip(lows.iter().copied()))
     }
 
     /// The day `path` passes the evaluation, with each day's low from `lows`.
     fn passes_lows(spec: &PropFirmSpec, path: &[f64], lows: &[f64]) -> Option<usize> {
-        walk_evaluation(spec, path, lows, &every_day(path), 1.0)
+        walk_evaluation(spec, path, lows, &every_day(path), 1.0).passed()
     }
 
     #[test]
@@ -1434,7 +1567,8 @@ mod tests {
         // The low is scaled with the size, as the return is: at half size two days of +10% close
         // at 1.05 and 1.1025, and a 4% dip on day 2 is 2% from 1.05, 0.021 of the start, inside
         // the limit; an 8% dip is 0.042 and breaches.
-        let half = |lows: &[f64]| walk_evaluation(&daily, &[0.1; 2], lows, &[true; 2], 0.5);
+        let half =
+            |lows: &[f64]| walk_evaluation(&daily, &[0.1; 2], lows, &[true; 2], 0.5).passed();
         assert_eq!(half(&[0.1, -0.04]), Some(2));
         assert_eq!(half(&[0.1, -0.08]), None);
     }
@@ -1641,9 +1775,12 @@ mod tests {
         assert_eq!(odds, again);
     }
 
-    /// 277 and 27 of 300 paths, the values `main` gave before the new evaluation rules: a spec
-    /// with every new rule off is judged exactly as before.
-    const PINNED_PROP: (f64, f64) = (277.0 / 300.0, 27.0 / 300.0);
+    /// 277 and 29 of 300 paths. The pass count is the value `main` gave before the new
+    /// evaluation rules: a spec with every new rule off is judged exactly as before. The breach
+    /// count was 27 while the breach walk kept one balance after the pass; starting the funded
+    /// account again from a fresh balance (#197) moved two passed paths onto a floor measured
+    /// from their own start.
+    const PINNED_PROP: (f64, f64) = (277.0 / 300.0, 29.0 / 300.0);
 
     #[test]
     fn prop_firm_specs_out_of_range_are_errors() {
@@ -1758,7 +1895,7 @@ mod tests {
             for &day in days {
                 traded[day - 1] = true;
             }
-            walk_evaluation(&spec, &path, &path, &traded, 1.0)
+            walk_evaluation(&spec, &path, &path, &traded, 1.0).passed()
         };
         // Counting every day as a trading day, day 20 is past the minimum and passes.
         assert_eq!(passes(&spec, &path), Some(20));
@@ -1788,7 +1925,10 @@ mod tests {
         };
         let path = [0.125, 0.0, 0.0625, 0.0, 0.0];
         let traded = [true, true, true, false, true];
-        assert_eq!(walk_evaluation(&two, &path, &path, &traded, 1.0), Some(5));
+        assert_eq!(
+            walk_evaluation(&two, &path, &path, &traded, 1.0).passed(),
+            Some(5)
+        );
     }
 
     #[test]
@@ -2061,11 +2201,11 @@ mod tests {
         // (1.02^4 = 1.0824, 1.02^5 = 1.1041).
         let spec = unlimited(20);
         assert_eq!(
-            walk_evaluation(&spec, &[0.01; 20], &[0.01; 20], &[true; 20], 1.0),
+            walk_evaluation(&spec, &[0.01; 20], &[0.01; 20], &[true; 20], 1.0).passed(),
             Some(10)
         );
         assert_eq!(
-            walk_evaluation(&spec, &[0.01; 20], &[0.01; 20], &[true; 20], 2.0),
+            walk_evaluation(&spec, &[0.01; 20], &[0.01; 20], &[true; 20], 2.0).passed(),
             Some(5)
         );
         // And to losses: -3% a day, doubled to -6%, breaches a 5% daily limit on day 1.
@@ -2076,10 +2216,13 @@ mod tests {
         // At size 1, day 1's -3% holds and day 2's +25% closes at 0.97 * 1.25 = 1.2125, a pass.
         let down = [-0.03, 0.25];
         assert_eq!(
-            walk_evaluation(&daily, &down, &down, &[true; 2], 1.0),
+            walk_evaluation(&daily, &down, &down, &[true; 2], 1.0).passed(),
             Some(2)
         );
-        assert_eq!(walk_evaluation(&daily, &down, &down, &[true; 2], 2.0), None);
+        assert_eq!(
+            walk_evaluation(&daily, &down, &down, &[true; 2], 2.0).passed(),
+            None
+        );
     }
 
     fn funded(spec: &PropFirmSpec, terms: &AttemptTerms, path: &[f64]) -> Funded {
