@@ -219,7 +219,7 @@ pub struct AttemptTerms {
     /// Whether each payout returns the balance to the start: it counts the profit above the
     /// start up to `payout_cap`, and any profit above the cap is lost rather than left in the
     /// account. The loss limits stay as they were. It cannot be set with `payout_locks_floor`,
-    /// and a `prop_firm` rule refuses it with a trailing drawdown: either would put the floor
+    /// and a `prop_firm` rule refuses it with a trailing drawdown: either can put the floor
     /// at or above the start a payout returns to. `false` is left out of JSON.
     #[serde(default, skip_serializing_if = "is_false")]
     pub payout_resets_balance: bool,
