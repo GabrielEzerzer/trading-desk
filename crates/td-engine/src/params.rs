@@ -38,7 +38,8 @@ pub struct ParamSpec {
 /// Parameter values by name.
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(transparent)]
+// No `#[serde(transparent)]`: serde already writes a one-field tuple struct as its field in
+// JSON, and ts-rs cannot parse that attribute, so it would print a warning on every build.
 pub struct Params(BTreeMap<String, ParamValue>);
 
 impl Params {

@@ -1026,6 +1026,7 @@ fn attempt_terms_price_an_attempt_and_add_the_value_line() {
         refund_fee_with_first_payout: true,
         profit_split: 0.8,
         days_to_first_payout: 10,
+        calendar_days_to_first_payout: None,
         payout_interval_days: 10,
         min_payout: 50.0,
         payout_cap: None,

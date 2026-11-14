@@ -666,11 +666,18 @@ pub fn run_battery(
             let rollover = firm.day_rollover.unwrap_or_default();
             kind.worst_daily_loss =
                 worst_daily_loss(&series, &wf.equity_extremes, cash, firm.day_rollover);
+            // A trailing floor that stops at a lock stops counting the peak once it reaches the
+            // lock plus the drawdown above the start, as the attempt walks apply it.
+            let peak_cap = match firm.drawdown {
+                DrawdownMode::Static => None,
+                DrawdownMode::Trailing => firm.trailing_floor_lock.map(|l| l + firm.max_drawdown),
+            };
             let (fixed, trailing) = attempt_drawdowns(
                 &series,
                 &wf.equity_extremes,
                 rollover,
                 limits.breach_horizon_days as usize,
+                peak_cap,
             );
             kind.intrabar_drawdown_static = fixed.map(|f| f.own);
             kind.intrabar_drawdown_trailing = trailing.map(|f| f.own);
@@ -733,6 +740,8 @@ pub fn run_battery(
                 pass: p.pass,
                 breach: b.breach,
                 paths: b.paths,
+                days: b.days,
+                trading_days: b.trading_days,
             });
             kind.pass_probability = result.prop_firm_odds.map(|o| o.pass);
             kind.breach_probability = result.prop_firm_odds.map(|o| o.breach);
@@ -1112,10 +1121,11 @@ fn sizing_warning(line: &Criterion, fixed_size: f64) -> Option<String> {
     (line.outcome == Outcome::Pass && !line.comparison.holds(Some(fixed_size), limit)).then(|| {
         format!(
             "The max drawdown line passed on the assumption that position size grows with the \
-             balance: its worst attempt fell by {} of that attempt's starting balance. In money, the \
-             worst attempt's fall was {} of the starting balance, over the line's limit of {}. \
-             If the strategy trades a fixed position size set from the starting balance, that is \
-             what an account started fresh would have lost.",
+             balance: its worst attempt's drawdown, as the line measures it, was {} of that \
+             attempt's starting balance. In money, the worst attempt's drawdown was {} of the \
+             starting balance, over the line's limit of {}. If the strategy trades a fixed \
+             position size set from the starting balance, that is what an account started fresh \
+             would have lost.",
             percent(value),
             percent(fixed_size),
             percent(limit)
@@ -1339,9 +1349,14 @@ fn daily_lows(
 /// `evaluation_size` or `funded_size` is not 1; build flags per size to lift that refusal, once a
 /// plan needs a smallest trade size and another size together.
 ///
-/// shortcut: a walk-forward test window closes its open position at its end, and that fill can
-/// pass the test, so up to one day per window is a trading day the strategy would not have had
-/// if it had held on; skip those fills once a fill says it is a window's close-out.
+/// A close-out fill ([`Fill::close_out`]), which closes what a walk-forward test window still
+/// holds at its end, marks no day, with or without a test: the strategy did not choose it, and
+/// would have held on. It is still replayed, so the next fill sees the position it left.
+///
+/// shortcut: the fills that reopen a position at the start of the next test window still count,
+/// without a test or with one that does not ask for a close, though a strategy that had held on
+/// would not have made them; mark a window's first fills too if a plan's strategy holds across
+/// windows often enough for that to matter.
 fn traded_days(
     ends: &[Millis],
     fills: &[Fill],
@@ -1366,7 +1381,7 @@ fn traded_days(
             (*pos, *avg) = next_position(*pos, *avg, dq, f.price);
             test.passes(close)
         });
-        if !counts {
+        if !counts || f.close_out {
             continue;
         }
         // A close after the last day's end is on no day of the curve.
@@ -1433,6 +1448,15 @@ struct AttemptFall {
 /// Each reading also gives the worst of the same attempts' falls, in money, as a fraction of the
 /// curve's first value, the starting cash ([`AttemptFall::cash`]).
 ///
+/// `peak_cap`, for a trailing floor that stops rising at a lock, is how far above an attempt's
+/// start the peak counts, as a fraction of that start: the firm's `trailing_floor_lock` plus its
+/// `max_drawdown`, the peak at which the floor reaches the lock. The trailing fall is then
+/// measured from the peak or that level, whichever is lower, which is the fall to the floor the
+/// firm applies, as the attempt walks apply the lock from a fresh balance. For the starting-cash
+/// reading the cap is the same fraction of the starting cash above the attempt's start, as a
+/// fresh account at the starting balance trading the same fixed size would see it. `None` lets
+/// the peak count however high it goes.
+///
 /// shortcut: each attempt rescans its bars, O(days x bars per attempt); fold each day to its low,
 /// high and own fall once if this shows in a battery's run time.
 ///
@@ -1449,6 +1473,7 @@ fn attempt_drawdowns(
     ranges: &[crate::EquityRange],
     rollover: DayRollover,
     horizon: usize,
+    peak_cap: Option<f64>,
 ) -> (Option<AttemptFall>, Option<AttemptFall>) {
     let (times, values) = (&series.times, &series.values);
     if ranges.is_empty() || ranges.len() + 1 != values.len() || horizon == 0 {
@@ -1474,10 +1499,20 @@ fn attempt_drawdowns(
                         own,
                         cash: (start - low).max(0.0) / cash,
                     });
-                let trailing = risk::trailing_drawdown(start, bars).map(|d| AttemptFall {
-                    own: d.amount / start,
-                    cash: d.amount / cash,
-                });
+                let trailing = match peak_cap {
+                    None => risk::trailing_drawdown(start, bars).map(|d| AttemptFall {
+                        own: d.amount / start,
+                        cash: d.amount / cash,
+                    }),
+                    Some(cap) => {
+                        let own = capped_fall(start, bars, start * (1.0 + cap)) / start;
+                        let fixed_size = capped_fall(start, bars, start + cash * cap) / cash;
+                        (own.is_finite() && fixed_size.is_finite()).then_some(AttemptFall {
+                            own,
+                            cash: fixed_size,
+                        })
+                    }
+                };
                 (fixed, trailing)
             })
         })
@@ -1491,6 +1526,18 @@ fn attempt_drawdowns(
         })
     };
     (worst(fixed), worst(trailing))
+}
+
+/// The largest fall to a later or same-bar low from the running peak, which starts at `start`
+/// and rises with each bar's high ([`risk::trailing_drawdown`]'s amount), counting the peak only
+/// up to `cap`.
+fn capped_fall(start: f64, bars: &[crate::EquityRange], cap: f64) -> f64 {
+    let (mut peak, mut fall) = (start, 0.0f64);
+    for r in bars {
+        peak = peak.max(r.high);
+        fall = fall.max(peak.min(cap) - r.low);
+    }
+    fall
 }
 
 /// `high_risk`'s risk of ruin from the closed trades of the stitched curve: each trade's net P&L
@@ -2122,6 +2169,7 @@ mod tests {
             qty,
             fee: 0.0,
             liquidity: td_core::Liquidity::Taker,
+            close_out: false,
         }
     }
 
@@ -2291,7 +2339,7 @@ mod tests {
         let utc = DayRollover::default();
         let line = |values: &[f64], drawdown| {
             let (series, ranges) = curve(10 * DAY_MS, DAY_MS, values);
-            let (fixed, trailing) = own(attempt_drawdowns(&series, &ranges, utc, 10));
+            let (fixed, trailing) = own(attempt_drawdowns(&series, &ranges, utc, 10, None));
             let kind = KindInputs {
                 intrabar_drawdown_static: fixed,
                 intrabar_drawdown_trailing: trailing,
@@ -2345,7 +2393,7 @@ mod tests {
         let (series, ranges) = curve(10 * DAY_MS, DAY_MS, &slide[..8]);
         let (fixed, trailing) = whole(&slide[..8]);
         assert_eq!(
-            own(attempt_drawdowns(&series, &ranges, utc, 10)),
+            own(attempt_drawdowns(&series, &ranges, utc, 10, None)),
             (Some(fixed), Some(trailing))
         );
         // Every later day still starts an attempt to the end: 100, then 120, then 105 never falls
@@ -2356,13 +2404,13 @@ mod tests {
         let (fixed, trailing) = whole(&peak);
         assert_eq!(fixed, 0.0);
         assert_eq!(
-            own(attempt_drawdowns(&series, &ranges, utc, 10)),
+            own(attempt_drawdowns(&series, &ranges, utc, 10, None)),
             (Some(0.125), Some(trailing))
         );
         // Without ranges, or with ranges that do not match the curve, there is no figure.
-        assert_eq!(attempt_drawdowns(&series, &[], utc, 10), (None, None));
+        assert_eq!(attempt_drawdowns(&series, &[], utc, 10, None), (None, None));
         assert_eq!(
-            attempt_drawdowns(&series, &ranges[1..], utc, 10),
+            attempt_drawdowns(&series, &ranges[1..], utc, 10, None),
             (None, None)
         );
     }
@@ -2390,7 +2438,7 @@ mod tests {
         // The line and the warning as `run_battery` builds them.
         let judge = |values: &[f64], drawdown| {
             let (series, ranges) = curve(10 * DAY_MS, DAY_MS, values);
-            let falls = attempt_drawdowns(&series, &ranges, DayRollover::default(), 10);
+            let falls = attempt_drawdowns(&series, &ranges, DayRollover::default(), 10, None);
             let (fixed, trailing) = own(falls);
             let kind = KindInputs {
                 intrabar_drawdown_static: fixed,
@@ -2426,11 +2474,11 @@ mod tests {
                 warning.as_deref(),
                 Some(
                     "The max drawdown line passed on the assumption that position size grows \
-                     with the balance: its worst attempt fell by 9.17% of that attempt's \
-                     starting balance. In money, the worst attempt's fall was 11.00% of the starting \
-                     balance, over the line's limit of 10.00%. If the strategy trades a fixed \
-                     position size set from the starting balance, that is what an account \
-                     started fresh would have lost."
+                     with the balance: its worst attempt's drawdown, as the line measures it, \
+                     was 9.17% of that attempt's starting balance. In money, the worst \
+                     attempt's drawdown was 11.00% of the starting balance, over the line's \
+                     limit of 10.00%. If the strategy trades a fixed position size set from the \
+                     starting balance, that is what an account started fresh would have lost."
                 ),
                 "{drawdown:?}"
             );
@@ -2467,7 +2515,83 @@ mod tests {
         assert!(
             warning
                 .unwrap()
-                .contains("fall was 11.00% of the starting balance")
+                .contains("drawdown was 11.00% of the starting balance")
+        );
+    }
+
+    /// With a trailing floor that stops at a lock, the drawdown line measures each attempt's fall
+    /// to the floor the firm applies: the peak counts only up to the lock plus the drawdown above
+    /// the attempt's start. Without the lock it reads as before.
+    #[test]
+    fn the_drawdown_line_measures_a_locked_trailing_floor_where_the_firm_stops_it() {
+        // Daily closes rising by 1 a day from 100 to 144, a fall to 133, then flat, judged on
+        // attempts of 60 days. The firm's 20% trailing drawdown, judged at 10%, has its floor
+        // locked at the start. For an attempt from 100 the floor stops at 100 once the peak
+        // reaches 120, and the fall to 133 never comes near it: each rising day's own dip of 1
+        // is the most it uses, 1%. An attempt's peak counts up to 1.2 times its start, so the
+        // attempt from 120 is the worst: its peak counts to 144 and it falls 11 of its 120,
+        // 9.17%. Unlocked, the attempt from 100 falls 11 from 144, 11% of its start.
+        let mut values: Vec<f64> = (100..=144).map(f64::from).collect();
+        values.extend([133.0; 20]);
+        let (series, ranges) = curve(10 * DAY_MS, DAY_MS, &values);
+        let utc = DayRollover::default();
+        let locked = |lock: Option<f64>| {
+            let mut rule = firm_rule(DrawdownMode::Trailing, 60, None);
+            let VerdictRule::PropFirm { firm, .. } = &mut rule else {
+                unreachable!()
+            };
+            firm.trailing_floor_lock = lock;
+            let cap = lock.map(|l| l + firm.max_drawdown);
+            let falls = attempt_drawdowns(&series, &ranges, utc, 60, cap);
+            let kind = KindInputs {
+                intrabar_drawdown_trailing: falls.1.map(|f| f.own),
+                ..KindInputs::default()
+            };
+            let line = crate::evaluate(&rule, &kind)
+                .into_iter()
+                .find(|l| l.id == "max_drawdown")
+                .unwrap();
+            let warning = sizing_warning(&line, falls.1.unwrap().cash);
+            (line, falls.1.unwrap(), warning)
+        };
+        let near = |a: f64, b: f64| assert!((a - b).abs() < 1e-12, "{a} against {b}");
+
+        let (line, fall, warning) = locked(Some(0.0));
+        near(fall.own, 11.0 / 120.0);
+        assert_eq!(line.outcome, Outcome::Pass);
+        assert_eq!(
+            line.name,
+            "Max drawdown from the peak, with the floor stopping at the starting balance, in any \
+             60-day attempt started on a day of the test"
+        );
+        // A fresh account of 100 trading the same fixed size has its peak count up to 20 above
+        // an attempt's start, so from 124 on it falls the whole 11, 11% of the starting cash: the
+        // warning says so.
+        near(fall.cash, 0.11);
+        let warning = warning.unwrap();
+        assert!(
+            warning.contains("was 9.17% of that attempt's starting balance")
+                && warning.contains("drawdown was 11.00% of the starting balance"),
+            "{warning}"
+        );
+
+        // Without the lock the attempt from 100 falls 11 from its peak of 144 and fails, to the
+        // last bit the whole curve's trailing fall, as before the lock was read.
+        let (line, fall, _) = locked(None);
+        assert_eq!(
+            fall.own,
+            risk::trailing_drawdown(100.0, &ranges).unwrap().amount / 100.0
+        );
+        near(fall.own, 0.11);
+        assert_eq!(line.outcome, Outcome::Fail);
+        assert!(line.name.starts_with("Max drawdown from the peak in any"));
+
+        // A lock above the start lets the floor rise further, and the line names it.
+        let (line, _, _) = locked(Some(0.005));
+        assert_eq!(line.outcome, Outcome::Pass);
+        assert!(
+            line.name
+                .contains("with the floor stopping 0.50% above the starting balance")
         );
     }
 
@@ -2523,6 +2647,35 @@ mod tests {
         assert_eq!(
             flagged_days(&fills, day_test(false, Some(0.2), None)),
             NO_DAYS
+        );
+    }
+
+    #[test]
+    fn a_windows_close_out_is_no_trading_day_but_the_strategys_own_close_that_day_is() {
+        // Bought on day 1 and held across a test window's end, which closes it out on day 3.
+        let close_out = Fill {
+            close_out: true,
+            ..day_fill(3, Side::Sell, 1.0, 1_050.0)
+        };
+        let held = [day_fill(1, Side::Buy, 1.0, 1_000.0), close_out.clone()];
+        assert_eq!(flagged_days(&held, None), [1]);
+        assert_eq!(flagged_days(&held, day_test(true, None, None)), NO_DAYS);
+        assert_eq!(
+            flagged_days(&held, day_test(false, Some(0.05), Some(0.01))),
+            NO_DAYS
+        );
+        // The same day, the strategy also opens and closes a trade of its own: that close counts.
+        let own = [
+            day_fill(1, Side::Buy, 1.0, 1_000.0),
+            close_out,
+            day_fill(3, Side::Buy, 1.0, 1_050.0),
+            day_fill(3, Side::Sell, 1.0, 1_070.0),
+        ];
+        assert_eq!(flagged_days(&own, None), [1, 3]);
+        assert_eq!(flagged_days(&own, day_test(true, None, None)), [3]);
+        assert_eq!(
+            flagged_days(&own, day_test(false, Some(0.05), Some(0.01))),
+            [3]
         );
     }
 
@@ -2643,11 +2796,14 @@ mod tests {
         );
         // On UTC days the firm's days are the daily returns' own, to the last bit.
         assert_eq!(days.iter().map(day_return).collect::<Vec<_>>(), daily);
-        // A four-hour bar lies inside one UTC day, so a fill's day is the day its bar opened.
+        // A four-hour bar lies inside one UTC day, so a fill's day is the day its bar opened. A
+        // window's close-out marks no day.
         let first = series.times[0].div_euclid(DAY_MS);
+        assert!(wf.fills.iter().any(|f| f.close_out));
         let filled: BTreeSet<usize> = wf
             .fills
             .iter()
+            .filter(|f| !f.close_out)
             .map(|f| (f.time.div_euclid(DAY_MS) - first) as usize)
             .collect();
         let flagged: BTreeSet<usize> = (0..daily.len()).filter(|&d| traded[d]).collect();
@@ -2688,6 +2844,9 @@ mod tests {
         let fills = odds(&traded);
         let every_day = odds(&vec![true; daily.len()]);
         assert_eq!(r.prop_firm_odds, Some(fills));
+        // The result says how many of the days counted.
+        assert_eq!(fills.days, Some(daily.len()));
+        assert_eq!(fills.trading_days, Some(flagged.len()));
         assert!(r.kind.limits_inside_day);
         assert!(
             fills.pass < every_day.pass,
@@ -2775,7 +2934,7 @@ mod tests {
                 r.kind.intrabar_drawdown_static,
                 r.kind.intrabar_drawdown_trailing
             ),
-            own(attempt_drawdowns(&series, extremes, ny, 90))
+            own(attempt_drawdowns(&series, extremes, ny, 90, None))
         );
     }
 
@@ -2821,8 +2980,13 @@ mod tests {
             let r = battery(drawdown, 0.2);
             let wf = r.walk_forward.as_ref().unwrap();
             let series = EquitySeries::new(plan.backtest.starting_cash, &wf.equity, plan.timeframe);
-            let (fixed, trailing) =
-                attempt_drawdowns(&series, &wf.equity_extremes, DayRollover::default(), 10);
+            let (fixed, trailing) = attempt_drawdowns(
+                &series,
+                &wf.equity_extremes,
+                DayRollover::default(),
+                10,
+                None,
+            );
             let fall = match drawdown {
                 DrawdownMode::Static => fixed,
                 DrawdownMode::Trailing => trailing,

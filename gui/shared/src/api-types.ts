@@ -120,7 +120,14 @@ export type Fill = { order_id: OrderId, instrument: InstrumentId, side: Side, ti
  * The fee paid, in the account currency: the quote asset, or the base currency on a
  * base-currency account. Negative for a rebate.
  */
-fee: number, liquidity: Liquidity, };
+fee: number, liquidity: Liquidity, 
+/**
+ * True for a fill of the end-of-run close-out, the order a backtest submits to close what is
+ * open when it is told to end flat (each walk-forward test window does): the strategy did
+ * not choose it. False for every other fill, and then left out of JSON, so a fill saved
+ * before the field existed reads as false and every other fill is written as it was.
+ */
+close_out?: boolean, };
 
 /**
  * The currency an account holds and reports money in, against the instrument it trades.
@@ -1167,6 +1174,13 @@ profit_split: number,
  */
 days_to_first_payout: number, 
 /**
+ * A wait in calendar days before the first payout, counted from the funded account's first
+ * trading day (as `days_to_first_payout` counts them): the first payout may be asked for at
+ * the close of the day this many days after that one, traded or not. With both set, both
+ * must be met. `None` sets no such wait, and is left out of JSON.
+ */
+calendar_days_to_first_payout?: number | null, 
+/**
  * The days from one payout to the earliest next one, traded or not.
  */
 payout_interval_days: number, 
@@ -1675,7 +1689,9 @@ intrabar_drawdown_static: number | null,
 /**
  * Max drawdown from the running peak, as a fraction of the starting balance, over the same
  * span as `intrabar_drawdown_static`: for a `prop_firm` rule, each attempt's peak starts at
- * its own starting balance, and the fall is a fraction of that balance.
+ * its own starting balance, and the fall is a fraction of that balance. With the firm's
+ * `trailing_floor_lock`, the peak counts only up to where the floor reaches the lock, so the
+ * fall is to the floor the firm applies.
  */
 intrabar_drawdown_trailing: number | null, 
 /**
@@ -1832,10 +1848,21 @@ pass: number,
  * the target as a funded account would. The `prop_firm` kind rule asks for at most 0.10
  * over 90 days.
  */
-breach: number, paths: number, };
+breach: number, paths: number, 
+/**
+ * The days the paths were drawn from, one per daily return. `None` in a result saved before
+ * it existed.
+ */
+days: number | null, 
+/**
+ * How many of `days` count as trading days: the days the traded flags mark, so a reader can
+ * see how sparse the days are that the firm's minimum and the wait before the first payout
+ * count. `None` in a result saved before it existed.
+ */
+trading_days: number | null, };
 
 /**
- * The value of a prop-firm attempt at the edge the test shows and at a reduced one.
+ * The value of a prop-firm attempt at the edge the test shows, at a reduced one and at none.
  */
 export type PropFirmAttempt = { 
 /**
@@ -1846,7 +1873,15 @@ full: AttemptFigures,
  * From the daily returns with their mean scaled by `reduced_edge_factor` and their shape
  * unchanged. The `prop_firm` kind rule asks for its `value` to be above zero.
  */
-reduced: AttemptFigures, reduced_edge_factor: number, paths: number, };
+reduced: AttemptFigures, 
+/**
+ * From the daily returns with their mean removed (a factor of 0) and their shape unchanged:
+ * what the terms alone are worth, with no edge. A positive value here says the terms pay for
+ * an attempt by themselves, so a positive `reduced` value does not show that the edge does.
+ * Reported only: no line of the verdict judges it. `None` in a result saved before it
+ * existed.
+ */
+zero_edge: AttemptFigures | null, reduced_edge_factor: number, paths: number, };
 
 /**
  * What one attempt is worth, from one series of daily returns.
@@ -2685,7 +2720,14 @@ export type PaperFill = { source: OrderSource, order_id: OrderId, instrument: In
  * The fee paid, in the account currency: the quote asset, or the base currency on a
  * base-currency account. Negative for a rebate.
  */
-fee: number, liquidity: Liquidity, };
+fee: number, liquidity: Liquidity, 
+/**
+ * True for a fill of the end-of-run close-out, the order a backtest submits to close what is
+ * open when it is told to end flat (each walk-forward test window does): the strategy did
+ * not choose it. False for every other fill, and then left out of JSON, so a fill saved
+ * before the field existed reads as false and every other fill is written as it was.
+ */
+close_out?: boolean, };
 
 /**
  * Whose fills make up a trade. A liquidation's fill does not count: it only closes a trade that

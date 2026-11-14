@@ -193,6 +193,12 @@ pub struct AttemptTerms {
     /// may be asked for at the close of the day on which the account has held this many trading
     /// days, as the firm's `trading_day` test counts them (without one, days with a fill).
     pub days_to_first_payout: u32,
+    /// A wait in calendar days before the first payout, counted from the funded account's first
+    /// trading day (as `days_to_first_payout` counts them): the first payout may be asked for at
+    /// the close of the day this many days after that one, traded or not. With both set, both
+    /// must be met. `None` sets no such wait, and is left out of JSON.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calendar_days_to_first_payout: Option<u32>,
     /// The days from one payout to the earliest next one, traded or not.
     pub payout_interval_days: u32,
     /// The smallest payout the firm makes, after the split.
@@ -254,6 +260,10 @@ impl AttemptTerms {
         }
         for (name, days) in [
             ("days_to_first_payout", Some(self.days_to_first_payout)),
+            (
+                "calendar_days_to_first_payout",
+                self.calendar_days_to_first_payout,
+            ),
             ("payout_interval_days", Some(self.payout_interval_days)),
             ("funded_horizon_days", Some(self.funded_horizon_days)),
             ("max_payouts", self.max_payouts),
@@ -1134,7 +1144,9 @@ pub struct KindInputs {
     pub intrabar_drawdown_static: Option<f64>,
     /// Max drawdown from the running peak, as a fraction of the starting balance, over the same
     /// span as `intrabar_drawdown_static`: for a `prop_firm` rule, each attempt's peak starts at
-    /// its own starting balance, and the fall is a fraction of that balance.
+    /// its own starting balance, and the fall is a fraction of that balance. With the firm's
+    /// `trailing_floor_lock`, the peak counts only up to where the floor reaches the lock, so the
+    /// fall is to the floor the firm applies.
     pub intrabar_drawdown_trailing: Option<f64>,
     /// The chance of reaching the firm's profit target before breaching a limit.
     pub pass_probability: Option<f64>,
@@ -1178,9 +1190,27 @@ pub fn evaluate(rule: &VerdictRule, x: &KindInputs) -> Vec<Criterion> {
             attempt,
         } => {
             let share = limits.share_of_firm_limits;
-            let (drawdown, measured) = match firm.drawdown {
-                DrawdownMode::Static => (x.intrabar_drawdown_static, "from the starting balance"),
-                DrawdownMode::Trailing => (x.intrabar_drawdown_trailing, "from the peak"),
+            let (drawdown, measured) = match (firm.drawdown, firm.trailing_floor_lock) {
+                (DrawdownMode::Static, _) => (
+                    x.intrabar_drawdown_static,
+                    "from the starting balance".into(),
+                ),
+                (DrawdownMode::Trailing, None) => {
+                    (x.intrabar_drawdown_trailing, "from the peak".to_string())
+                }
+                // The battery measures the fall to the floor the firm applies, lock included.
+                (DrawdownMode::Trailing, Some(lock)) => (
+                    x.intrabar_drawdown_trailing,
+                    if lock == 0.0 {
+                        "from the peak, with the floor stopping at the starting balance,".into()
+                    } else {
+                        format!(
+                            "from the peak, with the floor stopping {:.2}% above the starting \
+                             balance,",
+                            lock * 100.0
+                        )
+                    },
+                ),
             };
             let daily_loss = match firm.day_rollover {
                 // A rule saved before the field existed keeps its line as it was.
@@ -3040,6 +3070,7 @@ mod tests {
             refund_fee_with_first_payout: false,
             profit_split: 0.8,
             days_to_first_payout: 14,
+            calendar_days_to_first_payout: None,
             payout_interval_days: 14,
             min_payout: 100.0,
             payout_cap: None,
@@ -3061,6 +3092,33 @@ mod tests {
             limits,
             attempt: Some(terms),
         }
+    }
+
+    #[test]
+    fn a_calendar_wait_before_the_first_payout_is_left_out_of_json_when_off() {
+        // Terms without the wait are written without its key, and read back the same.
+        let terms = attempt_terms();
+        let json = serde_json::to_value(terms).unwrap();
+        assert!(
+            json.get("calendar_days_to_first_payout").is_none(),
+            "{json}"
+        );
+        assert_eq!(serde_json::from_value::<AttemptTerms>(json).unwrap(), terms);
+        // Set, it is written and read back, and validates.
+        let wait = AttemptTerms {
+            calendar_days_to_first_payout: Some(10),
+            ..terms
+        };
+        let json = serde_json::to_value(wait).unwrap();
+        assert_eq!(json["calendar_days_to_first_payout"], 10);
+        assert_eq!(serde_json::from_value::<AttemptTerms>(json).unwrap(), wait);
+        assert_eq!(with_attempt(wait).validate(), Ok(()));
+        // A wait of 0 days is refused like the other day counts.
+        let zero = AttemptTerms {
+            calendar_days_to_first_payout: Some(0),
+            ..terms
+        };
+        assert!(with_attempt(zero).validate().is_err());
     }
 
     #[test]

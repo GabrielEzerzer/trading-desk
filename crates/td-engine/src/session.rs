@@ -556,6 +556,7 @@ impl Session {
             qty,
             fee,
             liquidity: Liquidity::Taker,
+            close_out: false,
         });
     }
 
