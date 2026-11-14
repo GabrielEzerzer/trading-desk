@@ -1794,33 +1794,12 @@ pub fn stitch(starting_cash: f64, segments: &[&[EquityPoint]]) -> Vec<EquityPoin
 /// its value against the starting balance reads these, since the stitched fills' value is the
 /// tested value times the stitched curve's level at that window.
 pub(crate) fn tested_fills(starting_cash: f64, windows: &[WindowResult]) -> Vec<Fill> {
-    let counted = segment_scales(starting_cash, &test_curves(windows))
-        .into_iter()
-        .map(|s| s != 0.0);
-    counted_fills(windows, counted)
-}
-
-/// [`tested_fills`] for a strategy that trades a fixed size set from the starting cash: each
-/// window's own fills, with the windows [`stitch_fixed_size`] holds flat left out, those after
-/// that curve reached zero, so the fills span the windows that curve counts.
-pub(crate) fn fixed_size_fills(starting_cash: f64, windows: &[WindowResult]) -> Vec<Fill> {
-    let counted = segment_factors(starting_cash, &test_curves(windows), Sizing::FixedSize)
-        .into_iter()
-        .map(|s| s != 0.0);
-    counted_fills(windows, counted)
-}
-
-/// The closed trades of the windows [`stitch_fixed_size`] counts, counted as a walk-forward's
-/// metrics count the stitched trades ([`MetricsReport::trades`]): each window's own trades that
-/// are not still open. The stitched count leaves out the windows after the stitched curve reached
-/// zero; this one leaves out those after the fixed-size curve did.
-pub(crate) fn fixed_size_trades(starting_cash: f64, windows: &[WindowResult]) -> usize {
-    segment_factors(starting_cash, &test_curves(windows), Sizing::FixedSize)
+    segment_scales(starting_cash, &test_curves(windows))
         .into_iter()
         .zip(windows)
         .filter(|&(s, _)| s != 0.0)
-        .map(|(_, w)| w.out_of_sample.trades.iter().filter(|t| !t.open).count())
-        .sum()
+        .flat_map(|(_, w)| w.out_of_sample.fills.iter().cloned())
+        .collect()
 }
 
 /// Each window's test equity.
@@ -1829,81 +1808,6 @@ fn test_curves(windows: &[WindowResult]) -> Vec<&[EquityPoint]> {
         .iter()
         .map(|w| &w.out_of_sample.equity[..])
         .collect()
-}
-
-/// The fills of the windows `counted` marks, in order.
-fn counted_fills(windows: &[WindowResult], counted: impl IntoIterator<Item = bool>) -> Vec<Fill> {
-    counted
-        .into_iter()
-        .zip(windows)
-        .filter(|&(c, _)| c)
-        .flat_map(|(_, w)| w.out_of_sample.fills.iter().cloned())
-        .collect()
-}
-
-/// The test segments stitched for a strategy that trades a fixed size set from the starting cash:
-/// each window's own equity, and its range through each bar, moved so that it starts where the
-/// previous window ended, so each window adds its own money changes where [`stitch`] compounds
-/// them. Each window is its own backtest from the starting cash, so a change on this curve is
-/// what an account at the starting balance trading that window's fixed size made, where the same
-/// change on the stitched curve is that times the stitched curve's level at the window. This
-/// curve's own level decides whether the account is gone, not the stitched curve's: once it is at
-/// or below zero, every later window stays flat, and the window that took it there counts in
-/// full, as [`stitch`] counts its own. [`fixed_size_fills`] spans the windows this curve counts,
-/// as [`tested_fills`] spans those of [`stitch`]. The ranges are empty unless every window has
-/// one per point, as on the stitched curve.
-pub(crate) fn stitch_fixed_size(
-    starting_cash: f64,
-    windows: &[WindowResult],
-) -> (Vec<EquityPoint>, Vec<EquityRange>) {
-    let segments: Vec<(&[EquityPoint], &[EquityRange])> = windows
-        .iter()
-        .map(|w| {
-            (
-                &w.out_of_sample.equity[..],
-                &w.out_of_sample.equity_extremes[..],
-            )
-        })
-        .collect();
-    add_segments(starting_cash, &segments)
-}
-
-/// [`stitch_fixed_size`] on each window's equity and its ranges.
-fn add_segments(
-    starting_cash: f64,
-    segments: &[(&[EquityPoint], &[EquityRange])],
-) -> (Vec<EquityPoint>, Vec<EquityRange>) {
-    let curves: Vec<&[EquityPoint]> = segments.iter().map(|&(equity, _)| equity).collect();
-    let has_ranges = segments.iter().all(|(e, r)| r.len() == e.len());
-    let (mut equity, mut ranges) = (Vec::new(), Vec::new());
-    let mut level = starting_cash;
-    for (&(points, extremes), s) in
-        segments
-            .iter()
-            .zip(segment_factors(starting_cash, &curves, Sizing::FixedSize))
-    {
-        let moved = |x: f64| {
-            if s != 0.0 {
-                level + (x - starting_cash)
-            } else {
-                level
-            }
-        };
-        equity.extend(points.iter().map(|p| EquityPoint {
-            time: p.time,
-            equity: moved(p.equity),
-        }));
-        if has_ranges {
-            ranges.extend(extremes.iter().map(|x| EquityRange {
-                low: moved(x.low),
-                high: moved(x.high),
-            }));
-        }
-        if let Some(last) = equity.last() {
-            level = last.equity;
-        }
-    }
-    (equity, ranges)
 }
 
 /// One run stitched into a curve: a test run's, or buy and hold's in a test window.
@@ -1947,19 +1851,9 @@ pub(crate) fn stitched_headline(
     Headline::new(&stitched_report(base, &segments, sizing).metrics)
 }
 
-/// The total return of `runs`, one test run per walk-forward window in order, stitched as
-/// [`stitch_fixed_size`] stitches a walk-forward's test runs: that curve's last value over the
-/// starting cash, less one, as a `prop_firm` rule sized from the starting cash reads R1's return.
-pub(crate) fn fixed_size_total_return(
-    base: &BacktestConfig,
-    runs: &[&BacktestResult],
-) -> Option<f64> {
-    stitched_headline(base, runs, Sizing::FixedSize).total_return
-}
-
 /// `wf` with its windows replaced by `windows`, stitched with `sizing`: the curve, its ranges, the
-/// metrics, the trades and the fills. The rest is kept.
-#[cfg(test)]
+/// metrics, the trades and the fills. The rest is kept as it is, the benchmark too, which still
+/// compares buy and hold with the curve [`walk_forward`] stitched.
 pub(crate) fn with_windows(
     wf: &WalkForwardResult,
     windows: Vec<WindowResult>,
