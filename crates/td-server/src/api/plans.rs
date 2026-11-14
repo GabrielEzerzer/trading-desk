@@ -95,6 +95,14 @@ pub struct PlanRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub references: Option<Vec<InstrumentId>>,
+    /// Series every run of each battery names ([`td_engine::BacktestConfig::series`]): the
+    /// strategy reads each one's rows, from `<data_dir>/series/<name>.json`, as they became known.
+    /// Each must have a row known by the close of the plan's first bar. The luck test leaves them
+    /// in place in time. A paper or live session cannot start from a verdict judged with them.
+    /// None when left out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub series: Option<Vec<String>>,
 }
 
 /// What a plan job kept: one entry per instrument whose battery finished or reached the luck test
@@ -213,6 +221,7 @@ pub(super) async fn start(
     })?;
     let ids = chosen_instruments(&entry, request.instruments.as_deref())?;
     let references = request.references.clone().unwrap_or_default();
+    let series = request.series.clone().unwrap_or_default();
 
     // The trading rules of each instrument, from the venue's list as `GET /instruments` gives it
     // (cached per server run).
@@ -239,11 +248,12 @@ pub(super) async fn start(
     // nothing is downloaded.
     let (store, checked) = (state.store.clone(), entry.clone());
     let (to_check, cutoff) = (instruments.clone(), state.data_cutoff.clone());
-    let named = references.clone();
+    let (named, named_series) = (references.clone(), series.clone());
     tokio::task::spawn_blocking(move || {
         to_check.into_iter().try_for_each(|i| {
             let mut config = checked.plan.backtest_config(checked.name, i);
             config.references = named.clone();
+            config.series = named_series.clone();
             check_run_data(&store, &config, cutoff.as_ref())
         })
     })
@@ -255,6 +265,7 @@ pub(super) async fn start(
         strategy: request.strategy,
         instruments: Some(ids),
         references: request.references,
+        series: request.series,
     });
     let cutoff = state.data_cutoff.clone();
     let job = state.jobs.submit(job_request, move |ctx| {
@@ -262,6 +273,7 @@ pub(super) async fn start(
             &entry,
             &instruments,
             &references,
+            &series,
             &store,
             cutoff.as_ref(),
             &runs_dir,
@@ -272,10 +284,12 @@ pub(super) async fn start(
 }
 
 /// The job: loads every instrument's data, then runs and saves one battery after another.
+#[allow(clippy::too_many_arguments)]
 fn execute(
     entry: &StrategyEntry,
     instruments: &[Instrument],
     references: &[InstrumentId],
+    series: &[String],
     store: &Store,
     cutoff: Option<&DataCutoff>,
     runs_dir: &Path,
@@ -288,6 +302,7 @@ fn execute(
     for instrument in instruments {
         let mut config = entry.plan.backtest_config(entry.name, instrument.clone());
         config.references = references.to_vec();
+        config.series = series.to_vec();
         let data = load_run_data(store, &config, cutoff).map_err(changed_since_accepted)?;
         let spec = battery_spec(entry, instrument);
         totals.push(td_engine::battery_runs(&spec, &data.bars).map_err(tester_error)?);
@@ -332,6 +347,7 @@ fn execute(
                 &data.asks,
                 &data.funding,
                 &data.references,
+                &data.series,
                 Some(&progress),
             )
         });
@@ -414,6 +430,7 @@ fn save_plan_run(
             .iter()
             .map(|r| r.instrument.clone())
             .collect(),
+        series: data.series.iter().map(|s| s.name.clone()).collect(),
     };
     let run = PlanRun::with_references(
         &battery_spec(entry, instrument),
@@ -422,6 +439,7 @@ fn save_plan_run(
         &data.asks,
         &data.funding,
         &data.references,
+        &data.series,
     )
     .map_err(|e| ApiError::internal(e.to_string()))?;
     let record_json = serde_json::to_vec_pretty(&record)
@@ -467,7 +485,7 @@ fn latest_verdicts(
 
 /// The link of a paper session that feeds its strategy `references` ([`td_engine::session_link`]):
 /// 400 `invalid_verdict` for a run that is not a saved verdict of this strategy on this instrument,
-/// or one judged with other reference instruments, named or latest.
+/// or one judged with a series or with other reference instruments, named or latest.
 pub(crate) fn session_link(
     runs_dir: &Path,
     entry: &StrategyEntry,
@@ -520,16 +538,17 @@ mod tests {
 
     /// A verdict of `entry` on `instrument` as it is now, saved as run `run_id` under `runs_dir`.
     fn save_verdict(runs_dir: &Path, run_id: &str, entry: &StrategyEntry, on: &InstrumentId) {
-        save_verdict_with(runs_dir, run_id, entry, on, Vec::new());
+        save_verdict_with(runs_dir, run_id, entry, on, Vec::new(), Vec::new());
     }
 
-    /// [`save_verdict`] for a battery whose runs named `references`.
+    /// [`save_verdict`] for a battery whose runs named `references` and `series`.
     fn save_verdict_with(
         runs_dir: &Path,
         run_id: &str,
         entry: &StrategyEntry,
         on: &InstrumentId,
         references: Vec<InstrumentId>,
+        series: Vec<String>,
     ) {
         let record = VerdictRecord {
             strategy: entry.name.into(),
@@ -542,6 +561,7 @@ mod tests {
             complete: true,
             code_hash: td_engine::code_hash(entry.name).map(String::from),
             references,
+            series,
         };
         let dir = runs_dir.join(run_id);
         fs::create_dir_all(&dir).unwrap();
@@ -599,7 +619,14 @@ mod tests {
         };
         let (older, newer) = ("1700000000000-0000000a", "1700000000001-0000000b");
         save_verdict(dir.path(), older, &entry, &on);
-        save_verdict_with(dir.path(), newer, &entry, &on, vec![reference.clone()]);
+        save_verdict_with(
+            dir.path(),
+            newer,
+            &entry,
+            &on,
+            vec![reference.clone()],
+            Vec::new(),
+        );
 
         let named = RunId::parse(newer).unwrap();
         let refused = session_link(dir.path(), &entry, &on, Some(&named), &[]).unwrap_err();
@@ -648,6 +675,61 @@ mod tests {
         assert_eq!(rows[0].references, vec![reference]);
         let row = serde_json::to_value(&rows[0]).unwrap();
         assert!(row.get("references").is_some());
+    }
+
+    /// A paper session feeds its strategy no series, so it is never linked to a verdict judged
+    /// with one, named or latest, whatever references it feeds; the verdict list says which
+    /// series the latest verdict was judged with.
+    #[test]
+    fn a_session_is_never_linked_to_a_verdict_judged_with_a_series() {
+        let dir = tempfile::tempdir().unwrap();
+        let entry = td_engine::find_strategy("sma_cross").unwrap();
+        let on = entry.plan.instruments[0].clone();
+        let (older, newer) = ("1700000000000-0000000a", "1700000000001-0000000b");
+        save_verdict(dir.path(), older, &entry, &on);
+        let series = vec!["made_up".to_string()];
+        save_verdict_with(dir.path(), newer, &entry, &on, Vec::new(), series.clone());
+
+        let why = format!(
+            "run {newer} was judged with the series made_up, and a session cannot feed a series yet"
+        );
+        let named = RunId::parse(newer).unwrap();
+        let refused = session_link(dir.path(), &entry, &on, Some(&named), &[]).unwrap_err();
+        assert_eq!(refused.body.code, "invalid_verdict");
+        assert!(
+            refused.body.message.contains(&why),
+            "{}",
+            refused.body.message
+        );
+        let latest = session_link(dir.path(), &entry, &on, None, &[]).unwrap_err();
+        assert_eq!(latest.body.code, "invalid_verdict");
+        assert!(
+            latest.body.message.contains(&format!(
+                "{why}; it is the strategy's latest verdict on {on}, so name a verdict judged \
+                 without series in `verdict_run_id`"
+            )),
+            "{}",
+            latest.body.message
+        );
+        // A verdict judged without one still links.
+        let plain = RunId::parse(older).unwrap();
+        let link = session_link(dir.path(), &entry, &on, Some(&plain), &[]).unwrap();
+        assert_eq!(link.verdict.unwrap().run_id, plain);
+
+        let rows = latest_verdicts(dir.path(), std::slice::from_ref(&entry), None).unwrap();
+        assert_eq!(rows[0].series, series);
+        let row = serde_json::to_value(&rows[0]).unwrap();
+        assert_eq!(row["series"], serde_json::json!(["made_up"]));
+        // A verdict judged without series lists none, as before series existed.
+        let older_dir = tempfile::tempdir().unwrap();
+        save_verdict(older_dir.path(), older, &entry, &on);
+        let rows = latest_verdicts(older_dir.path(), std::slice::from_ref(&entry), None).unwrap();
+        assert!(
+            serde_json::to_value(&rows[0])
+                .unwrap()
+                .get("series")
+                .is_none()
+        );
     }
 
     #[test]

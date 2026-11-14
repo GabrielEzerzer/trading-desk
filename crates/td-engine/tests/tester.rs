@@ -79,6 +79,7 @@ fn base(instrument: td_core::Instrument, bars: i64) -> BacktestConfig {
         close_at_end: false,
         account_currency: td_core::AccountCurrency::Quote,
         references: Vec::new(),
+        series: Vec::new(),
     }
 }
 

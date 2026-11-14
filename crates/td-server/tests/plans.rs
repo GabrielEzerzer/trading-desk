@@ -1438,3 +1438,59 @@ async fn a_plan_naming_a_reference_instrument_judges_with_it_and_records_it() {
     assert_eq!(rows[0].run_id, kept.run_id);
     assert_eq!(rows[0].references, vec![other]);
 }
+
+/// A plan request naming a series gives every run of the battery its rows from the data folder:
+/// the saved plan run's configuration names it and its data still match, and the verdict list
+/// says which series the verdict was judged with. A series the data folder lacks is a 422, and a
+/// name that is not a plain one a 400, neither starting a job.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_plan_naming_a_series_judges_with_it_and_records_it() {
+    let t = TestServer::seeded(vec![entry(49)]).await;
+    let plan = |series: &str| json!({ "strategy": "sma_cross", "instruments": [id(InstrumentKind::Spot)], "series": [series] });
+    for (series, status, code) in [
+        (
+            "example_series",
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "data_missing",
+        ),
+        (
+            "../example_series",
+            StatusCode::BAD_REQUEST,
+            "invalid_config",
+        ),
+    ] {
+        let (got, answer) = t.post("/runs/plan", &plan(series)).await;
+        assert_eq!(got, status, "{answer}");
+        assert_eq!(answer["error"]["code"], code, "{answer}");
+    }
+    let (_, jobs) = t.get("/jobs").await;
+    assert_eq!(jobs, json!([]), "no job was created");
+
+    // The made-up fixture, put where a user puts a series.
+    let folder = t.store.root().join(td_engine::SERIES_DIR);
+    std::fs::create_dir_all(&folder).unwrap();
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../mock/series/example_series.json");
+    std::fs::copy(fixture, folder.join("example_series.json")).unwrap();
+
+    let mut ws = t.websocket().await;
+    let job = t.start_plan(&plan("example_series")).await;
+    let done = ws.follow(job).await.pop().unwrap();
+    assert_eq!(done.status, JobStatus::Done, "{:?}", done.error);
+    let kept = &plan_done(&done).instruments[0];
+    let (status, body) = t.get(&format!("/runs/{}", kept.run_id)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["check"],
+        json!({ "data_matches": true, "engine_matches": true })
+    );
+    let detail: RunDetail = serde_json::from_value(body).unwrap();
+    let SavedRun::Plan(run) = &detail.run else {
+        panic!("a plan run");
+    };
+    assert_eq!(run.config.series, vec!["example_series".to_string()]);
+    let rows = t.verdicts("").await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].run_id, kept.run_id);
+    assert_eq!(rows[0].series, vec!["example_series".to_string()]);
+}

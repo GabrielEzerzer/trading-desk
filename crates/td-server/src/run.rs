@@ -1170,6 +1170,7 @@ mod tests {
             close_at_end: false,
             account_currency: td_core::AccountCurrency::Quote,
             references: config.references.clone(),
+            series: Vec::new(),
         };
         let tested = Seen::default();
         let references = [td_engine::ReferenceBars {
@@ -1183,6 +1184,7 @@ mod tests {
             &[],
             &[],
             &references,
+            &[],
         )
         .expect("backtest");
         let (seen, tested) = (

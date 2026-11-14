@@ -4,7 +4,7 @@ use td_core::{
 };
 
 use crate::broker::ENTRY_CANCELLED;
-use crate::{AttachedStop, Broker, Order, OrderRejected, OrderStatus, Portfolio};
+use crate::{AttachedStop, Broker, Order, OrderRejected, OrderStatus, Portfolio, SeriesRow};
 
 /// A trading strategy. The same value runs in a backtest and in paper trading.
 ///
@@ -34,6 +34,9 @@ pub struct Context<'a> {
     pub(crate) funding: &'a [(Millis, f64)],
     /// Each reference instrument's bars, one slot per bar in `bars`; see [`Context::reference`].
     pub(crate) references: &'a [(InstrumentId, Vec<Option<Candle>>)],
+    /// Each series' rows known by the current bar's close, and no later ones; see
+    /// [`Context::series`].
+    pub(crate) series: &'a [(String, Vec<SeriesRow>)],
     pub(crate) broker: &'a mut dyn Broker,
     pub(crate) orders: &'a mut Vec<Order>,
     pub(crate) warming_up: bool,
@@ -150,6 +153,23 @@ impl Context<'_> {
             .iter()
             .find(|(id, _)| id == instrument)
             .map(|(_, slots)| slots.as_slice())
+    }
+
+    /// The rows of `name`, one of the series the run names ([`crate::BacktestConfig::series`]),
+    /// known at or before the current bar's close, oldest first: a row joins on the first bar whose
+    /// close is at or after its `known_at`, and a row known later is not here. The last row is the
+    /// latest value known. A run starts only when each series has a row known by the close of its
+    /// first bar, warm-up included, so this is never empty in a run that names `name`. `None` when
+    /// the run does not name it; a strategy that needs a series should then stop with
+    /// [`Context::fail`].
+    ///
+    /// Backtests, sweeps, out-of-sample and walk-forward runs and the battery supply series; a
+    /// paper or live session refuses to start from a run that names one (see the README).
+    pub fn series(&self, name: &str) -> Option<&[SeriesRow]> {
+        self.series
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, rows)| rows.as_slice())
     }
 
     pub fn open_orders(&self) -> &[Order] {

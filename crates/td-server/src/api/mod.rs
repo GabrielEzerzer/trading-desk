@@ -79,7 +79,9 @@
 //!   whether its data and engine still match, the hash of the strategy's source file it was made
 //!   with and whether the file is still the same (`code_hash`, `code_matches`, `null` when
 //!   unknown) and the data cutoff it was made under (`data_cutoff`).
-//! - `POST /runs/plan` `{strategy, instruments?}` (a `PlanRequest`): runs the strategy's test
+//! - `POST /runs/plan` `{strategy, instruments?, references?, series?}` (a `PlanRequest`; a run's
+//!   `series` are read from `<data dir>/series`, 400 `invalid_config` for a name that is not a
+//!   plain one and 422 `data_missing` for a missing or malformed file): runs the strategy's test
 //!   battery on each instrument of its plan, or on the given ones, as one job of kind `plan`, and
 //!   answers `{job_id}` (see [`plans`]). 400 `invalid_config` for an unknown strategy or an
 //!   instrument the venue does not list, `invalid_plan` for a plan or rule that fails its checks,
@@ -114,7 +116,7 @@
 //!     the verdict `verdict_run_id` names, or else the latest verdict for its strategy and
 //!     instrument; 400 `invalid_verdict` if the named verdict is missing, is for another strategy
 //!     or instrument, or the session is manual, or if the verdict, named or latest, was judged
-//!     with other reference instruments than the session feeds.
+//!     with a series or with other reference instruments than the session feeds.
 //!   - `GET /sessions`: every session, oldest first, with its status and equity.
 //!   - `GET /sessions/{id}`: a session's full state: status, position, cash, equity curve, open
 //!     orders, fills and trades so far, and its `link` when it has one, with `stale` set when its
