@@ -1220,7 +1220,9 @@ needs_close?: boolean,
 /**
  * The smallest value of the closed part of the trade, as a share of the starting balance:
  * the closed quantity times the position's average entry price, in the account currency at
- * that price, at the size the strategy was tested at. `None` sets no smallest size.
+ * that price, at the size the strategy was tested at. Since it is judged at that size, a
+ * rule that sets it is refused with an `attempt` whose `evaluation_size` or `funded_size`
+ * is not 1, until the flags are built per size. `None` sets no smallest size.
  */
 min_trade_size?: number | null, 
 /**

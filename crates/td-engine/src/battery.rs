@@ -1241,9 +1241,10 @@ fn daily_returns(series: &EquitySeries) -> Vec<f64> {
 /// each one closes and at what average entry; `cash`, the starting balance, and `account`, the
 /// account currency, turn a closed trade's value into a share of the balance.
 ///
-/// shortcut: the smallest trade size is judged at the size the strategy was tested at, not at the
-/// attempt's `evaluation_size` or `funded_size`, since one set of flags serves both; build flags
-/// per size once a plan trades an attempt at a size that moves trades across the firm's smallest.
+/// shortcut: one set of flags, at the size the strategy was tested at, serves the evaluation and
+/// the funded account, so `VerdictRule::validate` refuses a `min_trade_size` with an attempt whose
+/// `evaluation_size` or `funded_size` is not 1; build flags per size to lift that refusal, once a
+/// plan needs a smallest trade size and another size together.
 ///
 /// shortcut: a walk-forward test window closes its open position at its end, and that fill can
 /// pass the test, so up to one day per window is a trading day the strategy would not have had

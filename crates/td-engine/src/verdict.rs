@@ -134,7 +134,9 @@ pub struct TradingDayTest {
     pub needs_close: bool,
     /// The smallest value of the closed part of the trade, as a share of the starting balance:
     /// the closed quantity times the position's average entry price, in the account currency at
-    /// that price, at the size the strategy was tested at. `None` sets no smallest size.
+    /// that price, at the size the strategy was tested at. Since it is judged at that size, a
+    /// rule that sets it is refused with an `attempt` whose `evaluation_size` or `funded_size`
+    /// is not 1, until the flags are built per size. `None` sets no smallest size.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_trade_size: Option<f64>,
     /// The smallest profit or loss of the closed part, as a share of its own value, before fees:
@@ -444,6 +446,22 @@ impl VerdictRule {
                 }
                 if let Some(terms) = attempt {
                     terms.validate()?;
+                    // The trading-day flags are built once, at the tested size: see the shortcut
+                    // on `battery::traded_days`.
+                    if firm.trading_day.is_some_and(|t| t.min_trade_size.is_some()) {
+                        for (name, size) in [
+                            ("evaluation_size", terms.evaluation_size),
+                            ("funded_size", terms.funded_size),
+                        ] {
+                            if size != 1.0 {
+                                return Err(PlanError(format!(
+                                    "firm.trading_day.min_trade_size needs attempt.{name} of 1: \
+                                     the smallest trade size is judged at the size the strategy \
+                                     was tested at"
+                                )));
+                            }
+                        }
+                    }
                 }
                 share("limits.share_of_firm_limits", limits.share_of_firm_limits)?;
                 probability("limits.min_pass_probability", limits.min_pass_probability)?;
@@ -3070,6 +3088,57 @@ mod tests {
             };
             assert_eq!(rule.validate(), Ok(()));
         }
+        // A smallest trade size is judged at the size the strategy was tested at, so it is refused
+        // with an attempt traded at another size, naming both fields.
+        let min_size = |min_trade_size| {
+            Some(TradingDayTest {
+                needs_close: false,
+                min_trade_size,
+                min_trade_move: Some(0.001),
+            })
+        };
+        let rule = |trading_day, terms: Option<AttemptTerms>| {
+            let VerdictRule::PropFirm {
+                mut firm, limits, ..
+            } = prop(DrawdownMode::Trailing)
+            else {
+                unreachable!()
+            };
+            firm.trading_day = trading_day;
+            VerdictRule::PropFirm {
+                firm,
+                limits,
+                attempt: terms,
+            }
+        };
+        let sized = |evaluation_size, funded_size| AttemptTerms {
+            evaluation_size,
+            funded_size,
+            ..attempt_terms()
+        };
+        for (name, terms) in [
+            ("attempt.evaluation_size", sized(0.5, 1.0)),
+            ("attempt.funded_size", sized(1.0, 2.0)),
+            ("attempt.evaluation_size", sized(2.0, 0.5)),
+        ] {
+            match rule(min_size(Some(0.01)), Some(terms)).validate() {
+                Err(PlanError(message)) => assert!(
+                    message.contains("firm.trading_day.min_trade_size") && message.contains(name),
+                    "{name}: {message}"
+                ),
+                Ok(()) => panic!("{name} was accepted with a smallest trade size"),
+            }
+        }
+        // Accepted: no attempt, both sizes at exactly 1, or a test with no smallest trade size.
+        assert_eq!(rule(min_size(Some(0.01)), None).validate(), Ok(()));
+        assert_eq!(
+            rule(min_size(Some(0.01)), Some(sized(1.0, 1.0))).validate(),
+            Ok(())
+        );
+        assert_eq!(
+            rule(min_size(None), Some(sized(0.5, 2.0))).validate(),
+            Ok(())
+        );
     }
 
     #[test]
