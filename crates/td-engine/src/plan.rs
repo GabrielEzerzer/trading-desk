@@ -354,6 +354,7 @@ impl TestPlan {
             warmup_from: None,
             close_at_end: false,
             account_currency: self.backtest.account_currency,
+            references: Vec::new(),
         }
     }
 

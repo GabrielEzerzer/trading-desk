@@ -41,8 +41,8 @@ use td_data::{
     Closures, DataError, Gap, LoadedCandles, MonthQuotes, Store, missing_minutes, resample,
 };
 use td_engine::{
-    BacktestConfig, ENGINE_REVISION, EngineError, RunId, RunSummary, SavedRun, StoreError,
-    TesterError, config_fingerprint,
+    BacktestConfig, ENGINE_REVISION, EngineError, ReferenceBars, RunId, RunSummary, SavedRun,
+    StoreError, TesterError, config_fingerprint_with_references,
 };
 use ts_rs::TS;
 
@@ -297,6 +297,9 @@ pub struct RunData {
     /// minutes, so there is one for every bar; empty for any other kind.
     pub asks: Vec<Candle>,
     pub funding: Vec<(Millis, f64)>,
+    /// The bars of each reference instrument the configuration names, over the same range and at
+    /// the same timeframe ([`read_references`]); empty when it names none.
+    pub references: Vec<ReferenceBars>,
     pub report: DataReport,
 }
 
@@ -473,6 +476,53 @@ fn read_data(store: &Store, config: &BacktestConfig) -> Result<StoreData, ApiErr
     })
 }
 
+/// The bars of each reference instrument `config` names ([`BacktestConfig::references`]), over
+/// the configuration's range: the stored 1-minute bids resampled to its timeframe, as its own bars
+/// are. The range ends where the configuration's does, so the data cutoff that applies to it
+/// applies to them. Refuses with 400 `invalid_config` the names the engine refuses, and with 422
+/// `data_missing` a reference instrument whose stored minutes leave a stretch of its limit or more
+/// of open time missing ([`long_gaps`]), or build no bar at all. Shorter gaps stay gaps: the
+/// strategy sees a missing bar as missing.
+///
+/// shortcut: a reference instrument's missing range is refused, never downloaded as a run's own
+/// range is; download it first with `POST /data/download`. Download it in the run job if runs
+/// with references become common.
+fn read_references(store: &Store, config: &BacktestConfig) -> Result<Vec<ReferenceBars>, ApiError> {
+    if config.references.is_empty() {
+        return Ok(Vec::new());
+    }
+    config.check_references().map_err(engine_error)?;
+    let (from, to) = data_range(config)?;
+    let months = Month::range(from, to);
+    let mut references = Vec::with_capacity(config.references.len());
+    for id in &config.references {
+        let mut minutes = Vec::new();
+        for stored in read_months(store, id, &months) {
+            let (bids, _) = stored?;
+            minutes.extend(bids.iter().filter(|c| (from..to).contains(&c.open_time)));
+        }
+        let closures = store.closures(id, from, to)?;
+        let gaps = closures.remove(missing_minutes(id.kind, &minutes, from, to));
+        let bars = resample(id.kind, &minutes, config.timeframe, false).candles;
+        let mut missing = long_gaps(id.kind, &gaps, &closures);
+        if missing.is_empty() && bars.is_empty() {
+            missing.push(Gap { from, to });
+        }
+        if !missing.is_empty() {
+            return Err(data_missing(format!(
+                "the store has no {id} candles {}; a reference instrument is not downloaded with \
+                 the run, so download it first",
+                spans(&missing.iter().collect::<Vec<_>>())
+            )));
+        }
+        references.push(ReferenceBars {
+            instrument: id.clone(),
+            bars,
+        });
+    }
+    Ok(references)
+}
+
 /// Checks that the store holds a configuration's range well enough to run it, by the rules of
 /// [`load_run_data`], without keeping the data: the months' 1-minute candles, and a quoted
 /// market's asks, are read together ([`read_months`]) and gone through a month at a time, and only
@@ -492,7 +542,9 @@ pub fn check_run_data(
 
 /// What [`check_run_data`] finds the store lacks of a configuration's range; `None` when it can
 /// run. A 400 for a bad range, a 422 `after_cutoff` for a range that ends after `cutoff`, checked
-/// before the store is read, and a 422 for a month without its asks.
+/// before the store is read, and a 422 for a month without its asks. The reference instruments
+/// the configuration names are checked too, and one the store lacks is a refusal, not a
+/// shortfall, since a run does not download them ([`read_references`]).
 pub(super) fn run_shortfall(
     store: &Store,
     config: &BacktestConfig,
@@ -543,6 +595,7 @@ pub(super) fn run_shortfall(
     };
     let closures = store.closures(id, from, to)?;
     let gaps = closures.remove(gaps);
+    read_references(store, config)?;
     Ok(shortfall(config, &gaps, &closures, any_bar, &funding))
 }
 
@@ -755,6 +808,7 @@ fn load_or_shortfall(
     if let Some(s) = shortfall(config, &gaps, &closures, any_bar, &funding) {
         return Ok(Err(s));
     }
+    let references = read_references(store, config)?;
     // Every bucket in the range with no bar: td-data's `dropped` lists only the incomplete ones,
     // not those with no minute at all. Bars are sorted and inside the range, which starts and
     // ends on bar boundaries. A bucket wholly in closed hours or recorded closures has no bar to
@@ -794,6 +848,7 @@ fn load_or_shortfall(
         bars: loaded.candles,
         asks,
         funding,
+        references,
         report,
     }))
 }
@@ -893,6 +948,7 @@ fn execute(
         bars,
         asks,
         funding,
+        references,
         report,
     } = data;
     ctx.checkpoint()?;
@@ -904,23 +960,47 @@ fn execute(
         }
         JobRequest::Backtest(config) => {
             ctx.progress(0.0, "running the backtest");
-            let result = td_engine::run(config, &bars, &asks, &funding).map_err(engine_error)?;
+            let result =
+                td_engine::run_with_references(config, &bars, &asks, &funding, &references)
+                    .map_err(engine_error)?;
             SavedRun::Backtest(Box::new(result))
         }
         JobRequest::Sweep(spec) => {
-            let result =
-                own_pool(|| td_engine::sweep(spec, &bars, &asks, &funding, Some(&progress)))?;
+            let result = own_pool(|| {
+                td_engine::sweep_with_references(
+                    spec,
+                    &bars,
+                    &asks,
+                    &funding,
+                    &references,
+                    Some(&progress),
+                )
+            })?;
             SavedRun::Sweep(Box::new(result.map_err(tester_job_error)?))
         }
         JobRequest::Oos(spec) => {
             let result = own_pool(|| {
-                td_engine::out_of_sample(spec, &bars, &asks, &funding, Some(&progress))
+                td_engine::out_of_sample_with_references(
+                    spec,
+                    &bars,
+                    &asks,
+                    &funding,
+                    &references,
+                    Some(&progress),
+                )
             })?;
             SavedRun::Oos(Box::new(result.map_err(tester_job_error)?))
         }
         JobRequest::WalkForward(spec) => {
             let result = own_pool(|| {
-                td_engine::walk_forward(spec, &bars, &asks, &funding, Some(&progress))
+                td_engine::walk_forward_with_references(
+                    spec,
+                    &bars,
+                    &asks,
+                    &funding,
+                    &references,
+                    Some(&progress),
+                )
             })?;
             SavedRun::WalkForward(Box::new(result.map_err(tester_job_error)?))
         }
@@ -1044,7 +1124,17 @@ pub fn check_run(store: &Store, run: &SavedRun) -> RunCheck {
     let base = run.base_config();
     let data_matches = read_data(store, base)
         .ok()
-        .and_then(|d| config_fingerprint(base, &d.loaded.candles, &d.asks, &d.funding).ok())
+        .and_then(|d| {
+            let references = read_references(store, base).ok()?;
+            config_fingerprint_with_references(
+                base,
+                &d.loaded.candles,
+                &d.asks,
+                &d.funding,
+                &references,
+            )
+            .ok()
+        })
         .is_some_and(|fingerprint| fingerprint == run.data_fingerprint());
     RunCheck {
         data_matches,
@@ -1151,6 +1241,7 @@ fn engine_error(e: EngineError) -> ApiError {
              again"
         )),
         EngineError::InvalidConfig(_)
+        | EngineError::InvalidReferences(_)
         | EngineError::UnknownStrategy(_)
         | EngineError::InvalidParam { .. }
         | EngineError::NoBarsInRange { .. }
@@ -1235,6 +1326,7 @@ mod tests {
             close_at_end: false,
             max_leverage: 1.0,
             account_currency: td_core::AccountCurrency::Quote,
+            references: Vec::new(),
         }
     }
 

@@ -2,7 +2,7 @@
 //! shuffled, so any structure in time a strategy could exploit is gone while each bar's own shape
 //! and the overall drift stay.
 
-use td_core::{Candle, CoreError};
+use td_core::{Candle, CoreError, Millis};
 
 use crate::rng::SplitMix64;
 
@@ -61,15 +61,49 @@ pub(crate) fn permute_quotes(
     asks: &[Candle],
     seed: u64,
 ) -> Result<(Vec<Candle>, Vec<Candle>), CoreError> {
+    permute_with_references(bars, asks, &[], seed).map(|(bars, asks, _)| (bars, asks))
+}
+
+/// The shuffled bars, asks and reference slots of [`permute_with_references`].
+type Permuted = (Vec<Candle>, Vec<Candle>, Vec<Vec<Option<Candle>>>);
+
+/// [`permute_quotes`], also shuffling reference instruments' bars with the same permutation:
+/// each of `references` holds one slot per bar, the reference bar that opens with it or `None`.
+/// The bars and asks come back exactly as [`permute_quotes`] gives them for the same seed, and
+/// each reference's slot moves with the bar of its time, so a pair of instruments keeps how it
+/// moved together on each bar, while the order of the moves is shuffled for both at once.
+///
+/// A reference is rebuilt as the bars are: each present bar after the first slot keeps its gap
+/// (its open over the reference's last close before it, or 1 when it has none) and its shape, and
+/// opens at the reference's last rebuilt close times its gap, or at its own open when no rebuilt
+/// slot before it holds a bar. It takes the open time of the slot it lands in. A missing bar stays
+/// missing, in the slot it moves to, and the first slot is unchanged. A reference identical to the
+/// bars rebuilds to the rebuilt bars exactly.
+///
+/// Panics if a reference does not hold one slot per bar: the caller aligns them.
+pub(crate) fn permute_with_references(
+    bars: &[Candle],
+    asks: &[Candle],
+    references: &[Vec<Option<Candle>>],
+    seed: u64,
+) -> Result<Permuted, CoreError> {
     assert!(
         asks.is_empty() || asks.len() == bars.len(),
         "one ask per bar, or none"
     );
-    for b in bars.iter().chain(asks) {
+    assert!(
+        references.iter().all(|r| r.len() == bars.len()),
+        "one reference slot per bar"
+    );
+    for b in bars
+        .iter()
+        .chain(asks)
+        .chain(references.iter().flatten().flatten())
+    {
         b.validate()?;
     }
     if bars.len() < 3 {
-        return Ok((bars.to_vec(), asks.to_vec()));
+        return Ok((bars.to_vec(), asks.to_vec(), references.to_vec()));
     }
     // order[k] is the source bar of rebuilt bar k + 1.
     let mut order: Vec<usize> = (1..bars.len()).collect();
@@ -78,16 +112,6 @@ pub(crate) fn permute_quotes(
         let j = rng.below(i as u64 + 1) as usize;
         order.swap(i, j);
     }
-    // `like` scaled as the source bar `b` is when it is rebuilt to open at `open`.
-    let scaled = |like: &Candle, b: &Candle, open: f64, open_time| Candle {
-        open_time,
-        open: open * (like.open / b.open),
-        high: open * (like.high / b.open),
-        low: open * (like.low / b.open),
-        close: open * (like.close / b.open),
-        volume: like.volume,
-        quote_volume: open * (like.quote_volume / b.open),
-    };
     let mut out = Vec::with_capacity(bars.len());
     let mut out_asks = Vec::with_capacity(asks.len());
     out.push(bars[0]);
@@ -120,7 +144,60 @@ pub(crate) fn permute_quotes(
         prev_close = bar.close;
         out.push(bar);
     }
-    Ok((out, out_asks))
+    let mut out_references = Vec::with_capacity(references.len());
+    for slots in references {
+        out_references.push(rebuild_reference(bars, slots, &order)?);
+    }
+    Ok((out, out_asks, out_references))
+}
+
+/// `like` scaled as the source bar `b` is when it is rebuilt to open at `open`.
+fn scaled(like: &Candle, b: &Candle, open: f64, open_time: Millis) -> Candle {
+    Candle {
+        open_time,
+        open: open * (like.open / b.open),
+        high: open * (like.high / b.open),
+        low: open * (like.low / b.open),
+        close: open * (like.close / b.open),
+        volume: like.volume,
+        quote_volume: open * (like.quote_volume / b.open),
+    }
+}
+
+/// One reference's `slots` rebuilt in the shuffled `order` of [`permute_with_references`].
+fn rebuild_reference(
+    bars: &[Candle],
+    slots: &[Option<Candle>],
+    order: &[usize],
+) -> Result<Vec<Option<Candle>>, CoreError> {
+    // The last close before each slot, from the slots before it that hold a bar.
+    let mut last_close = Vec::with_capacity(slots.len());
+    let mut close = None;
+    for slot in slots {
+        last_close.push(close);
+        if let Some(b) = slot {
+            close = Some(b.close);
+        }
+    }
+    let mut out = Vec::with_capacity(slots.len());
+    out.push(slots[0]);
+    let mut prev_close = slots[0].map(|b| b.close);
+    for (slot, &src) in bars[1..].iter().zip(order) {
+        let Some(b) = &slots[src] else {
+            out.push(None);
+            continue;
+        };
+        let open = match (prev_close, last_close[src]) {
+            (Some(prev), Some(before)) => prev * (b.open / before),
+            (Some(prev), None) => prev,
+            (None, _) => b.open,
+        };
+        let bar = scaled(b, b, open, slot.open_time);
+        bar.validate()?;
+        prev_close = Some(bar.close);
+        out.push(Some(bar));
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -297,5 +374,48 @@ mod tests {
             permute_quotes(&bars, &[], 3).unwrap().1,
             Vec::<Candle>::new()
         );
+    }
+
+    /// One permutation moves a bar and the reference bars of its time together: a reference equal
+    /// to the bars rebuilds to the rebuilt bars exactly, and in a reference with a missing bar
+    /// every slot holds the bar of the same source moment as the rebuilt bar beside it, the gap
+    /// included. Each bar's volume is its own (`path`), so it names the source of a rebuilt bar.
+    #[test]
+    fn references_are_shuffled_with_the_bars_under_one_permutation() {
+        let bars = path();
+        let (want, _) = permute_quotes(&bars, &[], 7).unwrap();
+        let same: Vec<Option<Candle>> = bars.iter().copied().map(Some).collect();
+        let mut gapped: Vec<Option<Candle>> = bars
+            .iter()
+            .map(|b| {
+                Some(Candle {
+                    open: b.open / 2.0,
+                    high: b.high / 2.0,
+                    low: b.low / 2.0,
+                    close: b.close / 2.0,
+                    volume: b.volume + 0.5,
+                    ..*b
+                })
+            })
+            .collect();
+        gapped[20] = None;
+        let (got, _, refs) =
+            permute_with_references(&bars, &[], &[same, gapped.clone()], 7).unwrap();
+        assert_eq!(got, want, "the bars are as permute_quotes gives them");
+        let as_bars: Vec<Candle> = refs[0].iter().map(|r| r.unwrap()).collect();
+        assert_eq!(as_bars, want);
+        assert_eq!(refs[1][0], gapped[0]);
+        for (k, (bar, slot)) in want.iter().zip(&refs[1]).enumerate() {
+            match slot {
+                Some(r) => {
+                    assert_eq!(r.open_time, bar.open_time);
+                    assert_eq!(r.volume, bar.volume + 0.5, "slot {k}");
+                    r.validate().unwrap();
+                }
+                None => assert_eq!(bar.volume, bars[20].volume, "the gap moved to slot {k}"),
+            }
+        }
+        assert_eq!(refs[1].iter().filter(|r| r.is_none()).count(), 1);
+        assert_ne!(refs[1][20], None, "the shuffle moved the gap");
     }
 }

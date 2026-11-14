@@ -841,6 +841,7 @@ fn seen_in_backtest(
         warmup_from: Some(bars[0].open_time),
         close_at_end: false,
         account_currency: td_core::AccountCurrency::Quote,
+        references: Vec::new(),
     };
     let seen = Arc::new(Mutex::new(Vec::new()));
     let strategy = Box::new(SeesFunding(seen.clone()));
