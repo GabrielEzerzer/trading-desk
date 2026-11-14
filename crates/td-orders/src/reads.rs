@@ -1,4 +1,5 @@
-//! Reads: position, open orders, one order by client id, executions, equity.
+//! Reads: position, open orders, one order by client id, executions, equity, and the public
+//! instrument rules and ticker.
 //!
 //! Visibility, from the v5 pages read on 2026-11-14:
 //! - `GET /v5/order/realtime` lists open orders (conditional ones included) and, when asked by
@@ -8,12 +9,16 @@
 //!   orders for 24 hours only, and "may delay" because order creation and cancellation are
 //!   asynchronous.
 //! - `GET /v5/execution/list` returns executions newest first, 100 a page at most, paged by
-//!   `cursor`, over a window of at most 7 days.
+//!   `cursor`, over a window of at most 7 days. The page's title says the venue keeps two years of
+//!   trade history.
 //! - `GET /v5/position/list` with a symbol returns the symbol's positions even when flat;
 //!   `positionIdx` 0 is one-way mode, 1 and 2 the two sides of hedge mode.
 //! - `GET /v5/account/wallet-balance?accountType=UNIFIED` gives per coin `walletBalance`,
 //!   `unrealisedPnl` and `equity` (wallet balance less spot borrowing plus unrealised P&L and
 //!   option value), and the account's `totalEquity` in USD.
+//! - `GET /v5/market/instruments-info` and `GET /v5/market/tickers` are public (unsigned) and
+//!   served on the demo host, which serves "all endpoints" of the market group
+//!   (<https://bybit-exchange.github.io/docs/v5/demo>).
 
 use std::collections::HashSet;
 
@@ -21,8 +26,8 @@ use td_core::{Instrument, Millis};
 
 use crate::orders::{CATEGORY, check_instrument};
 use crate::wire::{
-    self, Equity, Execution, Page, Position, RawExecution, RawOrder, RawPosition, RawWallet,
-    VenueOrder,
+    self, Equity, Execution, InstrumentInfo, Page, Position, RawExecution, RawInstrument, RawOrder,
+    RawPosition, RawTicker, RawWallet, Ticker, VenueOrder,
 };
 use crate::{Client, ClientOrderId, Error};
 
@@ -31,11 +36,16 @@ const REALTIME: &str = "/v5/order/realtime";
 const HISTORY: &str = "/v5/order/history";
 const EXECUTIONS: &str = "/v5/execution/list";
 const WALLET: &str = "/v5/account/wallet-balance";
+const INSTRUMENTS: &str = "/v5/market/instruments-info";
+const TICKERS: &str = "/v5/market/tickers";
 
 /// The coin USDT perpetuals settle in.
 pub const SETTLE_COIN: &str = "USDT";
 /// The longest span one executions request may cover.
 const WINDOW_MS: Millis = 7 * 24 * 60 * 60 * 1000;
+/// The longest span [`Client::executions_since`] reads: the two years of trade history the venue
+/// keeps, plus two days. About 105 windows.
+const MAX_SPAN_MS: Millis = 732 * 24 * 60 * 60 * 1000;
 /// A bound on pages per listing, so a venue that keeps answering with cursors cannot loop forever.
 const MAX_PAGES: usize = 10_000;
 
@@ -152,6 +162,10 @@ impl Client {
     /// id), each once. Spans longer than the venue's 7-day window are read window by window, and
     /// each window to its last page. Trades, funding fees, liquidations and the rest are told
     /// apart by [`Execution::kind`].
+    ///
+    /// A `since` more than two years (732 days) before the venue's time is refused with
+    /// [`Error::Unsupported`] before any request, rather than clamped: the venue keeps no older
+    /// trades, and a silently shortened answer would look complete.
     pub fn executions_since(
         &self,
         instrument: &Instrument,
@@ -159,11 +173,16 @@ impl Client {
     ) -> Result<Vec<Execution>, Error> {
         check_instrument(instrument)?;
         let now = self.server_now();
+        if now.saturating_sub(since) > MAX_SPAN_MS {
+            return Err(Error::Unsupported {
+                what: "executions from more than two years back, which the venue does not keep",
+            });
+        }
         let mut out = Vec::new();
         let mut seen = HashSet::new();
         let mut start = since;
         loop {
-            let end = start + WINDOW_MS;
+            let end = start.saturating_add(WINDOW_MS);
             let query = vec![
                 ("category", CATEGORY.to_string()),
                 ("symbol", instrument.id.symbol.clone()),
@@ -181,7 +200,7 @@ impl Client {
             if end >= now {
                 break;
             }
-            start = end + 1;
+            start = end.saturating_add(1);
         }
         out.sort_by(|a, b| a.time.cmp(&b.time).then_with(|| a.exec_id.cmp(&b.exec_id)));
         Ok(out)
@@ -202,22 +221,60 @@ impl Client {
             reason: "no account in the answer".into(),
         })?;
         let total = wire::num(WALLET, "totalEquity", &account.total_equity)?;
-        let (wallet_balance, unrealised_pnl) =
+        let (wallet_balance, unrealised_pnl, equity) =
             match account.coin.into_iter().find(|c| c.coin == SETTLE_COIN) {
                 Some(c) => (
                     wire::num(WALLET, "walletBalance", &c.wallet_balance)?,
                     wire::num_or_zero(WALLET, "unrealisedPnl", &c.unrealised_pnl)?,
+                    wire::num(WALLET, "equity", &c.equity)?,
                 ),
                 // The venue lists only coins the account holds.
-                None => (0.0, 0.0),
+                None => (0.0, 0.0, 0.0),
             };
         Ok(Equity {
             coin: SETTLE_COIN.into(),
             wallet_balance,
             unrealised_pnl,
-            equity: wallet_balance + unrealised_pnl,
+            equity,
             account_total_equity_usd: total,
         })
+    }
+
+    /// The trading rules of the linear contract `symbol` (tick size, quantity step, minimum
+    /// quantity and notional), from the venue's public instruments info. Unsigned.
+    pub fn instrument_info(&self, symbol: &str) -> Result<InstrumentInfo, Error> {
+        let query = vec![
+            ("category", CATEGORY.to_string()),
+            ("symbol", symbol.into()),
+        ];
+        let page: Page<RawInstrument> =
+            wire::from_value(INSTRUMENTS, self.get_public(INSTRUMENTS, query)?)?;
+        let info = one(INSTRUMENTS, page.list)?.into_info(INSTRUMENTS)?;
+        if info.symbol != symbol {
+            return Err(Error::BadResponse {
+                endpoint: INSTRUMENTS,
+                reason: "the answer is for another symbol".into(),
+            });
+        }
+        Ok(info)
+    }
+
+    /// The last traded price and mark price of the linear contract `symbol`, from the venue's
+    /// public tickers. Unsigned.
+    pub fn ticker(&self, symbol: &str) -> Result<Ticker, Error> {
+        let query = vec![
+            ("category", CATEGORY.to_string()),
+            ("symbol", symbol.into()),
+        ];
+        let page: Page<RawTicker> = wire::from_value(TICKERS, self.get_public(TICKERS, query)?)?;
+        let ticker = one(TICKERS, page.list)?.into_ticker(TICKERS)?;
+        if ticker.symbol != symbol {
+            return Err(Error::BadResponse {
+                endpoint: TICKERS,
+                reason: "the answer is for another symbol".into(),
+            });
+        }
+        Ok(ticker)
     }
 
     /// Reads every page of a cursor-paged list.
@@ -252,5 +309,17 @@ impl Client {
             endpoint: path,
             reason: "more pages than the route reads".into(),
         })
+    }
+}
+
+/// The one entry a list asked for by symbol must hold.
+fn one<T>(endpoint: &'static str, list: Vec<T>) -> Result<T, Error> {
+    let mut list = list.into_iter();
+    match (list.next(), list.next()) {
+        (Some(only), None) => Ok(only),
+        _ => Err(Error::BadResponse {
+            endpoint,
+            reason: "the answer does not list exactly one entry".into(),
+        }),
     }
 }

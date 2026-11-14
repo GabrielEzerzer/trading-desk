@@ -3,8 +3,12 @@
 //! Field names and meanings come from the v5 pages for real-time orders
 //! (<https://bybit-exchange.github.io/docs/v5/order/open-order>), order history
 //! (`.../order/order-list`), executions (`.../order/execution`), positions (`.../position`), wallet
-//! balance (`.../account/wallet-balance`) and the enums (`.../enum`), read on 2026-11-14. The mock
-//! venue's fixtures under `mock/bybit/fixtures/` hold the shapes, and the tests below parse them.
+//! balance (`.../account/wallet-balance`), instruments info (`.../market/instrument`), tickers
+//! (`.../market/tickers`) and the enums (`.../enum`), read on 2026-11-14. The mock venue's fixtures
+//! under `mock/bybit/fixtures/` hold the shapes, and the tests below parse them.
+//!
+//! Quantities, sizes, executed quantities and prices are refused when negative, which the venue
+//! never sends for them; P&L, fees, funding and balances keep their sign.
 
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -178,8 +182,8 @@ impl RawOrder {
         Ok(VenueOrder {
             side: side(endpoint, &self.side)?,
             status: OrderStatus::parse(&self.order_status),
-            qty: num(endpoint, "qty", &self.qty)?,
-            filled_qty: num_or_zero(endpoint, "cumExecQty", &self.cum_exec_qty)?,
+            qty: unsigned(endpoint, "qty", num(endpoint, "qty", &self.qty)?)?,
+            filled_qty: unsigned_or_zero(endpoint, "cumExecQty", &self.cum_exec_qty)?,
             avg_price: positive_or_none(endpoint, "avgPrice", &self.avg_price)?,
             trigger_price: positive_or_none(endpoint, "triggerPrice", &self.trigger_price)?,
             reduce_only: self.reduce_only,
@@ -276,8 +280,8 @@ impl RawExecution {
                 "" => None,
                 s => Some(side(endpoint, s)?),
             },
-            price: num_or_zero(endpoint, "execPrice", &self.exec_price)?,
-            qty: num_or_zero(endpoint, "execQty", &self.exec_qty)?,
+            price: unsigned_or_zero(endpoint, "execPrice", &self.exec_price)?,
+            qty: unsigned_or_zero(endpoint, "execQty", &self.exec_qty)?,
             fee: num_or_zero(endpoint, "execFee", &self.exec_fee)?,
             liquidity: if self.is_maker {
                 Liquidity::Maker
@@ -324,7 +328,7 @@ pub(crate) struct RawPosition {
 
 impl RawPosition {
     pub(crate) fn into_position(self, endpoint: &'static str) -> Result<Position, Error> {
-        let size = num(endpoint, "size", &self.size)?;
+        let size = unsigned(endpoint, "size", num(endpoint, "size", &self.size)?)?;
         let sign = match self.side.as_str() {
             "Buy" => 1.0,
             "Sell" => -1.0,
@@ -338,9 +342,9 @@ impl RawPosition {
         };
         Ok(Position {
             size: sign * size,
-            avg_price: num_or_zero(endpoint, "avgPrice", &self.avg_price)?,
+            avg_price: unsigned_or_zero(endpoint, "avgPrice", &self.avg_price)?,
             unrealised_pnl: num_or_zero(endpoint, "unrealisedPnl", &self.unrealised_pnl)?,
-            mark_price: num_or_zero(endpoint, "markPrice", &self.mark_price)?,
+            mark_price: unsigned_or_zero(endpoint, "markPrice", &self.mark_price)?,
             symbol: self.symbol,
         })
     }
@@ -355,8 +359,8 @@ pub struct Equity {
     pub wallet_balance: f64,
     /// The coin's `unrealisedPnl` on open positions.
     pub unrealised_pnl: f64,
-    /// `wallet_balance + unrealised_pnl`. The venue's own coin `equity` also subtracts spot
-    /// borrowing and adds option value, which a perpetuals-only demo account does not have.
+    /// The coin's `equity` as the venue reports it: the wallet balance less spot borrowing, plus
+    /// unrealised P&L and option value.
     pub equity: f64,
     /// The venue's `totalEquity`: the whole account's equity in USD across every coin.
     pub account_total_equity_usd: f64,
@@ -377,6 +381,97 @@ pub(crate) struct RawCoin {
     pub wallet_balance: String,
     #[serde(default)]
     pub unrealised_pnl: String,
+    pub equity: String,
+}
+
+/// A linear contract's trading rules, from the venue's public instruments info.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InstrumentInfo {
+    pub symbol: String,
+    /// `LinearPerpetual` for a perpetual.
+    pub contract_type: String,
+    /// `Trading` while the contract trades.
+    pub status: String,
+    pub base_coin: String,
+    pub quote_coin: String,
+    pub settle_coin: String,
+    pub tick_size: f64,
+    pub qty_step: f64,
+    pub min_order_qty: f64,
+    /// The smallest order value in the settle coin; zero when the venue gives none.
+    pub min_notional: f64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RawInstrument {
+    symbol: String,
+    contract_type: String,
+    status: String,
+    base_coin: String,
+    quote_coin: String,
+    settle_coin: String,
+    price_filter: RawPriceFilter,
+    lot_size_filter: RawLotSizeFilter,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawPriceFilter {
+    tick_size: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawLotSizeFilter {
+    qty_step: String,
+    min_order_qty: String,
+    #[serde(default)]
+    min_notional_value: String,
+}
+
+impl RawInstrument {
+    pub(crate) fn into_info(self, endpoint: &'static str) -> Result<InstrumentInfo, Error> {
+        let lot = self.lot_size_filter;
+        Ok(InstrumentInfo {
+            tick_size: positive(endpoint, "tickSize", &self.price_filter.tick_size)?,
+            qty_step: positive(endpoint, "qtyStep", &lot.qty_step)?,
+            min_order_qty: positive(endpoint, "minOrderQty", &lot.min_order_qty)?,
+            min_notional: unsigned_or_zero(endpoint, "minNotionalValue", &lot.min_notional_value)?,
+            symbol: self.symbol,
+            contract_type: self.contract_type,
+            status: self.status,
+            base_coin: self.base_coin,
+            quote_coin: self.quote_coin,
+            settle_coin: self.settle_coin,
+        })
+    }
+}
+
+/// A contract's last traded price and mark price, from the venue's public tickers.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Ticker {
+    pub symbol: String,
+    pub last_price: f64,
+    pub mark_price: f64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RawTicker {
+    pub symbol: String,
+    last_price: String,
+    mark_price: String,
+}
+
+impl RawTicker {
+    pub(crate) fn into_ticker(self, endpoint: &'static str) -> Result<Ticker, Error> {
+        Ok(Ticker {
+            last_price: positive(endpoint, "lastPrice", &self.last_price)?,
+            mark_price: positive(endpoint, "markPrice", &self.mark_price)?,
+            symbol: self.symbol,
+        })
+    }
 }
 
 /// The server time answer.
@@ -424,8 +519,35 @@ pub(crate) fn num_or_zero(endpoint: &'static str, field: &str, s: &str) -> Resul
 
 /// `None` for an empty or zero value, which the venue sends for a field that does not apply.
 fn positive_or_none(endpoint: &'static str, field: &str, s: &str) -> Result<Option<f64>, Error> {
-    let x = num_or_zero(endpoint, field, s)?;
+    let x = unsigned_or_zero(endpoint, field, s)?;
     Ok((x != 0.0).then_some(x))
+}
+
+/// A quantity, size or price, which is never negative.
+fn unsigned(endpoint: &'static str, field: &str, x: f64) -> Result<f64, Error> {
+    if x < 0.0 {
+        return Err(Error::BadResponse {
+            endpoint,
+            reason: format!("{field} is negative"),
+        });
+    }
+    Ok(x)
+}
+
+fn unsigned_or_zero(endpoint: &'static str, field: &str, s: &str) -> Result<f64, Error> {
+    unsigned(endpoint, field, num_or_zero(endpoint, field, s)?)
+}
+
+/// A step, minimum or price that must be above zero.
+fn positive(endpoint: &'static str, field: &str, s: &str) -> Result<f64, Error> {
+    let x = num(endpoint, field, s)?;
+    if x <= 0.0 {
+        return Err(Error::BadResponse {
+            endpoint,
+            reason: format!("{field} is not above zero"),
+        });
+    }
+    Ok(x)
 }
 
 fn millis(endpoint: &'static str, field: &str, s: &str) -> Result<Millis, Error> {
@@ -556,6 +678,41 @@ mod tests {
 
         let wallets: Page<RawWallet> = from_value("t", fixture("wallet-balance.json")).unwrap();
         assert_eq!(wallets.list[0].coin[0].coin, "USDT");
+        assert_eq!(wallets.list[0].coin[0].equity, "50000.00742");
+
+        let infos: Page<RawInstrument> = from_value("t", fixture("instruments-info.json")).unwrap();
+        let info = infos
+            .list
+            .into_iter()
+            .next()
+            .unwrap()
+            .into_info("t")
+            .unwrap();
+        assert_eq!(
+            (
+                info.tick_size,
+                info.qty_step,
+                info.min_order_qty,
+                info.min_notional
+            ),
+            (0.1, 0.001, 0.001, 5.0)
+        );
+        assert_eq!(
+            (info.contract_type.as_str(), info.status.as_str()),
+            ("LinearPerpetual", "Trading")
+        );
+        assert_eq!(info.settle_coin, "USDT");
+
+        let tickers: Page<RawTicker> = from_value("t", fixture("market-tickers.json")).unwrap();
+        let ticker = tickers
+            .list
+            .into_iter()
+            .next()
+            .unwrap()
+            .into_ticker("t")
+            .unwrap();
+        assert_eq!(ticker.symbol, "BTCUSDT");
+        assert!(ticker.last_price > 0.0 && ticker.mark_price > 0.0);
 
         let time: ServerTime = from_value("t", fixture("market-time.json")).unwrap();
         assert_eq!(time.time_nano, "1688639403423213947");
@@ -586,6 +743,50 @@ mod tests {
         ] {
             assert!(!OrderStatus::parse(closed).is_open(), "{closed}");
         }
+    }
+
+    #[test]
+    fn negative_quantities_and_prices_are_refused_and_signed_amounts_kept() {
+        let order = |field: &str, value: &str| {
+            let mut v = fixture("order-history.json")["list"][0].clone();
+            v[field] = serde_json::json!(value);
+            serde_json::from_value::<RawOrder>(v)
+                .unwrap()
+                .into_order("t")
+        };
+        assert!(order("qty", "0.002").is_ok());
+        for field in ["qty", "cumExecQty", "avgPrice", "triggerPrice"] {
+            assert!(order(field, "-1").is_err(), "{field}");
+        }
+        let exec = |field: &str, value: &str| {
+            let mut v = fixture("execution-list.json")["list"][0].clone();
+            v[field] = serde_json::json!(value);
+            serde_json::from_value::<RawExecution>(v)
+                .unwrap()
+                .into_execution("t")
+        };
+        for field in ["execQty", "execPrice"] {
+            assert!(exec(field, "-1").is_err(), "{field}");
+        }
+        assert_eq!(exec("execFee", "-0.5").unwrap().fee, -0.5);
+        let position = |field: &str, value: &str| {
+            let mut v = fixture("position-list.json")["list"][0].clone();
+            v[field] = serde_json::json!(value);
+            serde_json::from_value::<RawPosition>(v)
+                .unwrap()
+                .into_position("t")
+        };
+        for field in ["size", "avgPrice", "markPrice"] {
+            assert!(position(field, "-1").is_err(), "{field}");
+        }
+        assert_eq!(
+            position("unrealisedPnl", "-3").unwrap().unrealised_pnl,
+            -3.0
+        );
+        let mut info = fixture("instruments-info.json")["list"][0].clone();
+        info["priceFilter"]["tickSize"] = serde_json::json!("0");
+        let info: RawInstrument = serde_json::from_value(info).unwrap();
+        assert!(info.into_info("t").is_err());
     }
 
     #[test]
