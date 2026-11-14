@@ -80,6 +80,8 @@ pub struct Session {
     fills: Vec<Fill>,
     equity: Vec<EquityPoint>,
     bar_funding: Vec<BarFunding>,
+    /// Every funding event fed with a live bar, oldest first: what [`Context::funding`] returns.
+    funding: Vec<(Millis, f64)>,
     trade_stops: Vec<TradeStops>,
     /// The reason the strategy stopped the run on the bar being fed ([`Context::fail`]).
     failure: Option<String>,
@@ -159,6 +161,7 @@ impl Session {
             fills: Vec::new(),
             equity: Vec::new(),
             bar_funding: Vec::new(),
+            funding: Vec::new(),
             trade_stops: Vec::new(),
             failure: None,
         })
@@ -318,6 +321,11 @@ impl Session {
             }
         }
         self.bar_funding.push(charged);
+        // Events from one bar come after every earlier bar's (see `check_bar`), but may come in
+        // any order among themselves.
+        let from = self.funding.len();
+        self.funding.extend_from_slice(funding);
+        self.funding[from..].sort_by_key(|&(time, _)| time);
         // A short closes with a buy, at the ask.
         let mark = if self.portfolio.position() < 0.0 {
             ask_bar.close
@@ -464,6 +472,7 @@ impl Session {
             slippage_bps: self.slippage_bps,
             max_leverage: self.max_leverage,
             portfolio: &self.portfolio,
+            funding: &self.funding,
             broker: &mut *self.broker,
             orders: &mut self.orders,
             warming_up: false,
@@ -628,6 +637,7 @@ impl Session {
             slippage_bps: self.slippage_bps,
             max_leverage: self.max_leverage,
             portfolio: &self.portfolio,
+            funding: &self.funding,
             broker: &mut *self.broker,
             orders: &mut self.orders,
             warming_up,

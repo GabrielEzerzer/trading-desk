@@ -945,6 +945,166 @@ mod tests {
         );
     }
 
+    fn flat_bar(i: i64) -> Candle {
+        Candle {
+            open_time: i * HOUR,
+            open: 100.0,
+            high: 101.0,
+            low: 99.0,
+            close: 100.0,
+            volume: 1.0,
+            quote_volume: 100.0,
+        }
+    }
+
+    fn test_instrument(kind: InstrumentKind) -> Instrument {
+        Instrument {
+            id: td_core::InstrumentId {
+                venue: td_core::Venue::Binance,
+                symbol: "TESTUSDT".into(),
+                kind,
+            },
+            base: "TEST".into(),
+            quote: "USDT".into(),
+            tick_size: 0.01,
+            lot_size: 0.001,
+            min_qty: 0.001,
+            min_notional: 1.0,
+            fees: FeeSchedule {
+                maker: 0.001,
+                taker: 0.002,
+                per_unit: 0.0,
+            },
+        }
+    }
+
+    /// What `SeesFunding` saw on each bar of a backtest.
+    type Seen = Vec<(Millis, bool, Vec<(Millis, f64)>)>;
+
+    /// A backtest of `SeesFunding` on hourly bars: warm-up bars from 0h, traded bars from 3h to
+    /// 10h, with no bar at 6h.
+    fn funding_run(
+        kind: InstrumentKind,
+        funding: &[(Millis, f64)],
+    ) -> (Vec<Candle>, BacktestResult, Seen) {
+        use crate::strategies::test_only::{FundingSeen, SeesFunding};
+        let bars: Vec<Candle> = (0..10).filter(|&i| i != 6).map(flat_bar).collect();
+        let config = BacktestConfig {
+            strategy: "sees_funding".into(),
+            params: Params::new(),
+            instrument: test_instrument(kind),
+            timeframe: Timeframe::H1,
+            from: 3 * HOUR,
+            to: 10 * HOUR,
+            starting_cash: 10_000.0,
+            slippage_bps: 2.0,
+            fee_override: None,
+            max_leverage: 1.0,
+            warmup_from: Some(0),
+            close_at_end: false,
+            account_currency: AccountCurrency::Quote,
+        };
+        let seen = FundingSeen::default();
+        let strategy = Box::new(SeesFunding(seen.clone()));
+        let result = run_strategy(&config, strategy, &bars, &[], funding).unwrap();
+        let seen = seen.lock().unwrap().clone();
+        (bars, result, seen)
+    }
+
+    #[test]
+    fn a_strategy_sees_the_funding_charged_up_to_the_bar_it_is_called_on() {
+        const MINUTE: Millis = 60_000;
+        // Out of order, as a run may be given them.
+        let funding = [
+            // The last bar's close: never charged.
+            (10 * HOUR, 0.0007),
+            // Inside the 4h bar.
+            (4 * HOUR + 30 * MINUTE, 0.0003),
+            // On a warm-up bar: never charged.
+            (HOUR, 0.0001),
+            // The 4h bar's close, which is the 5h bar's open.
+            (5 * HOUR, -0.0004),
+            // The first traded bar's open.
+            (3 * HOUR, 0.0002),
+            // In the gap where the 6h bar is missing: charged at the 7h bar's open.
+            (6 * HOUR + 30 * MINUTE, 0.0005),
+            // Inside the last bar.
+            (10 * HOUR - MINUTE, -0.0006),
+        ];
+        let (bars, result, seen) = funding_run(InstrumentKind::Perpetual, &funding);
+        let mut sorted = funding.to_vec();
+        sorted.sort_by_key(|&(time, _)| time);
+
+        let times: Vec<Millis> = seen.iter().map(|&(time, ..)| time).collect();
+        let bar_times: Vec<Millis> = bars.iter().map(|b| b.open_time).collect();
+        assert_eq!(times, bar_times);
+        assert_eq!(seen.iter().filter(|(_, warm, _)| *warm).count(), 3);
+        for (open_time, warming_up, series) in &seen {
+            let expected: Vec<(Millis, f64)> = if *warming_up {
+                // Warm-up bars are charged nothing, so they see nothing.
+                Vec::new()
+            } else {
+                // Charged from the first traded bar's open, up to but not including the close.
+                let close = open_time + HOUR;
+                sorted
+                    .iter()
+                    .copied()
+                    .filter(|&(time, _)| (3 * HOUR..close).contains(&time))
+                    .collect()
+            };
+            assert_eq!(series, &expected, "on the bar at {open_time}");
+        }
+
+        // The bound, one settlement either side: the one due at the 4h bar's close is seen from
+        // the 5h bar on, not on the 4h bar, while the one inside the 4h bar is seen on it.
+        let on = |hour: Millis| &seen.iter().find(|s| s.0 == hour * HOUR).unwrap().2;
+        assert_eq!(on(4).last(), Some(&(4 * HOUR + 30 * MINUTE, 0.0003)));
+        assert_eq!(on(5).last(), Some(&(5 * HOUR, -0.0004)));
+
+        // On the last bar the strategy has seen exactly the funding the result says it charged.
+        let last = &seen.last().unwrap().2;
+        assert_eq!(last.len(), 5);
+        assert_eq!(data_fingerprint(&bars, &[], last), result.data_fingerprint);
+    }
+
+    #[test]
+    fn a_strategy_on_a_market_without_funding_sees_none() {
+        let (_, _, seen) = funding_run(InstrumentKind::Spot, &[]);
+        assert_eq!(seen.len(), 9);
+        assert!(seen.iter().all(|(_, _, series)| series.is_empty()));
+    }
+
+    #[test]
+    fn a_session_shows_its_strategy_only_the_funding_fed_with_live_bars_in_time_order() {
+        use crate::strategies::test_only::{FundingSeen, SeesFunding};
+        let config = SessionConfig {
+            starting_cash: 10_000.0,
+            slippage_bps: 0.0,
+            fees: None,
+            max_leverage: 1.0,
+            account_currency: AccountCurrency::Quote,
+        };
+        let seen = FundingSeen::default();
+        let strategy = Box::new(SeesFunding(seen.clone()));
+        let instrument = test_instrument(InstrumentKind::Perpetual);
+        let mut session = Session::new(strategy, instrument, Timeframe::H1, config).unwrap();
+        // A paper session feeds funding with warm-up bars too; it is not charged, so not seen.
+        session.warm_up(flat_bar(0), &[(HOUR / 2, 0.0001)]).unwrap();
+        let first = [(HOUR + 20, 0.0003), (HOUR + 10, 0.0002)];
+        session.on_bar(flat_bar(1), &first).unwrap();
+        session.on_bar(flat_bar(2), &[(2 * HOUR, 0.0004)]).unwrap();
+        let seen: Vec<Vec<(Millis, f64)>> =
+            seen.lock().unwrap().iter().map(|s| s.2.clone()).collect();
+        assert_eq!(
+            seen,
+            vec![
+                vec![],
+                vec![(HOUR + 10, 0.0002), (HOUR + 20, 0.0003)],
+                vec![(HOUR + 10, 0.0002), (HOUR + 20, 0.0003), (2 * HOUR, 0.0004)],
+            ]
+        );
+    }
+
     #[test]
     fn alpha_is_annualised_by_the_returns_observed_per_year_across_weekend_gaps() {
         // Two FX weeks of hourly bars, Monday 00:00 to Friday 24:00, with the 48-hour weekend

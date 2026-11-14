@@ -1,11 +1,14 @@
-//! Strategies only the crate's own tests can build, each broken on purpose so a test can show
-//! that a check catches it. [`crate::find_strategy`] finds them in the crate's tests; they are not
-//! listed and do not exist outside them.
+//! Strategies only the crate's own tests can build. The registered ones are broken on purpose so
+//! a test can show that a check catches it: [`crate::find_strategy`] finds them in the crate's
+//! tests; they are not listed and do not exist outside them. [`SeesFunding`] is not registered: a
+//! test builds it and runs it with [`crate::run_strategy`].
 
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use td_core::{
-    AccountCurrency, Candle, InstrumentId, InstrumentKind, OrderType, Side, Timeframe, Venue,
+    AccountCurrency, Candle, InstrumentId, InstrumentKind, Millis, OrderType, Side, Timeframe,
+    Venue,
 };
 
 use crate::strategies::{affordable_qty, order};
@@ -179,5 +182,20 @@ fn plan() -> TestPlan {
         },
         out_of_sample: None,
         evidence: EvidenceSettings::default(),
+    }
+}
+
+/// What [`SeesFunding`] saw on each bar it was called on, in order: the bar's open time, whether
+/// it was a warm-up bar, and [`Context::funding`].
+pub(crate) type FundingSeen = Arc<Mutex<Vec<(Millis, bool, Vec<(Millis, f64)>)>>>;
+
+/// Never trades. Records what [`Context::funding`] gives it on each bar, so a test can compare it
+/// with the funding the run was given.
+pub(crate) struct SeesFunding(pub FundingSeen);
+
+impl Strategy for SeesFunding {
+    fn on_bar(&mut self, ctx: &mut Context, bar: &Candle) {
+        let seen = (bar.open_time, ctx.is_warming_up(), ctx.funding().to_vec());
+        self.0.lock().unwrap().push(seen);
     }
 }

@@ -30,6 +30,8 @@ pub struct Context<'a> {
     pub(crate) slippage_bps: f64,
     pub(crate) max_leverage: f64,
     pub(crate) portfolio: &'a Portfolio,
+    /// The funding events fed with the live bars so far, oldest first; see [`Context::funding`].
+    pub(crate) funding: &'a [(Millis, f64)],
     pub(crate) broker: &'a mut dyn Broker,
     pub(crate) orders: &'a mut Vec<Order>,
     pub(crate) warming_up: bool,
@@ -103,6 +105,27 @@ impl Context<'_> {
         self.portfolio
             .account()
             .from_quote(quote_amount, self.bar().close)
+    }
+
+    /// The funding rates settled on this instrument so far, as `(time, rate)`, oldest first: every
+    /// event the session has applied to the position, which is the series the cost model charges
+    /// (a rate charged on a flat position is still here). In a backtest the time is the
+    /// settlement time; a paper session gives a rate published after its own bar closed with a
+    /// later bar, at a time inside that bar.
+    ///
+    /// The series ends at the last settlement strictly before the current bar's close, the
+    /// current bar's `open_time` plus the timeframe: a bar takes the events in its own window and
+    /// in the gap before it, and a settlement due exactly at the close is the next bar's open, so
+    /// it is charged, and visible, on the next bar. It is empty for a kind without funding (spot,
+    /// FX), on every warm-up bar, where nothing is charged, and until the first settlement of the
+    /// first live bar, which takes no funding from before its open (see [`crate::Session::on_bar`]).
+    ///
+    /// shortcut: a strategy sees no funding from before its first live bar, so a rule that looks
+    /// back over funding has its own warm-up from there. Feed the warm-up bars' funding to the
+    /// session as visible but not charged, and add it to the result's data fingerprint, when a
+    /// strategy needs that history from its first live bar.
+    pub fn funding(&self) -> &[(Millis, f64)] {
+        self.funding
     }
 
     pub fn open_orders(&self) -> &[Order] {
