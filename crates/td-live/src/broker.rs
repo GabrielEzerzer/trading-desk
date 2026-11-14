@@ -1718,7 +1718,7 @@ impl Core {
                     FaultKind::MissingOrder,
                     format!(
                         "stop {cid} is {status} at the venue with {reported} of {sent} filled and \
-                         a position of {} still open",
+                         a position of {} still open with no stop covering it",
                         self.book.tally
                     ),
                 )));
