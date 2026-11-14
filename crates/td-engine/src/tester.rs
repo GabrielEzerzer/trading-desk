@@ -1644,6 +1644,24 @@ pub fn stitch(starting_cash: f64, segments: &[&[EquityPoint]]) -> Vec<EquityPoin
         .collect()
 }
 
+/// Every test segment's fills in time order at the size the strategy was tested at: each
+/// window's own fills, without the scale [`WalkForwardResult::fills`] carries, and with the same
+/// segments left out, those after the stitched equity reached zero. A rule that judges a fill by
+/// its value against the starting balance reads these, since the stitched fills' value is the
+/// tested value times the stitched curve's level at that window.
+pub(crate) fn tested_fills(starting_cash: f64, windows: &[WindowResult]) -> Vec<Fill> {
+    let segments: Vec<&[EquityPoint]> = windows
+        .iter()
+        .map(|w| &w.out_of_sample.equity[..])
+        .collect();
+    segment_scales(starting_cash, &segments)
+        .into_iter()
+        .zip(windows)
+        .filter(|&(s, _)| s != 0.0)
+        .flat_map(|(_, w)| w.out_of_sample.fills.iter().cloned())
+        .collect()
+}
+
 /// One run stitched into a curve: a test run's, or buy and hold's in a test window.
 struct Segment<'a> {
     equity: &'a [EquityPoint],
