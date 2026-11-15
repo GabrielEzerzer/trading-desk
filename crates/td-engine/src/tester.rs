@@ -2251,7 +2251,9 @@ fn stitched_report(base: &BacktestConfig, runs: &[Segment], sizing: Sizing) -> S
     let cash = base.starting_cash;
     let segments: Vec<&[EquityPoint]> = runs.iter().map(|r| r.equity).collect();
     let scales = segment_factors(cash, &segments, sizing);
-    let lot = base.instrument.lot_size;
+    let traded: Vec<_> = std::iter::once(&base.instrument)
+        .chain(&base.also_traded)
+        .collect();
     let points = segments.iter().map(|s| s.len()).sum();
     let mut equity: Vec<EquityPoint> = Vec::with_capacity(points);
     let mut positions = Vec::with_capacity(points);
@@ -2284,25 +2286,36 @@ fn stitched_report(base: &BacktestConfig, runs: &[Segment], sizing: Sizing) -> S
         if let Some(last) = equity.last() {
             level = last.equity;
         }
-        // The position after each bar's fills, rebuilt from the fills (a fill's time is the open
-        // time of the bar it filled on) and snapped to the lot size against rounding error.
-        let mut position = 0.0;
+        // The position in each instrument after each bar's fills, rebuilt from the fills (a fill's
+        // time is the open time of the bar it filled on) and snapped to its lot size against
+        // rounding error.
+        let mut position = vec![0.0; traded.len()];
         let mut next = 0;
         for p in r.equity {
             while next < r.fills.len() && r.fills[next].time <= p.time {
                 let f = &r.fills[next];
-                position += match f.side {
+                let k = traded.iter().position(|i| i.id == f.instrument);
+                position[k.unwrap_or(0)] += match f.side {
                     Side::Buy => f.qty,
                     Side::Sell => -f.qty,
                 };
                 next += 1;
             }
-            let snapped = if lot > 0.0 {
-                (position / lot).round() * lot
-            } else {
-                position
+            let snapped = |k: usize| {
+                let lot = traded[k].lot_size;
+                if lot > 0.0 {
+                    (position[k] / lot).round() * lot
+                } else {
+                    position[k]
+                }
             };
-            positions.push(snapped * s);
+            positions.push(if base.also_traded.is_empty() {
+                snapped(0) * s
+            } else if s != 0.0 && (0..traded.len()).any(|k| snapped(k) != 0.0) {
+                1.0
+            } else {
+                0.0
+            });
         }
         if s == 0.0 {
             continue;
@@ -2841,6 +2854,58 @@ mod tests {
             .collect();
         let st = stitched_report(&base, &runs, Sizing::FixedSize);
         (st.equity, st.ranges)
+    }
+
+    #[test]
+    fn a_stitched_bar_is_in_the_market_when_any_traded_instrument_is_held_at_its_own_lot_size() {
+        let first = hourly_config().instrument;
+        let other = td_core::Instrument {
+            id: td_core::InstrumentId {
+                symbol: "OTHERUSDT".into(),
+                ..first.id.clone()
+            },
+            base: "OTHER".into(),
+            lot_size: 0.0001,
+            min_qty: 0.0001,
+            ..first.clone()
+        };
+        let base = BacktestConfig {
+            also_traded: vec![other.clone()],
+            ..hourly_config()
+        };
+        let fill = |instrument: &td_core::Instrument, side: Side, time: Millis, qty: f64| Fill {
+            order_id: td_core::OrderId(1),
+            instrument: instrument.id.clone(),
+            side,
+            time,
+            price: 100.0,
+            qty,
+            fee: 0.0,
+            liquidity: td_core::Liquidity::Taker,
+            close_out: false,
+        };
+        let fills = [
+            fill(&first, Side::Buy, 1, 1.0),
+            fill(&other, Side::Sell, 1, 1.0),
+            fill(&first, Side::Sell, 3, 1.0),
+            fill(&other, Side::Buy, 3, 1.0),
+            fill(&other, Side::Buy, 4, 0.0002),
+            fill(&other, Side::Sell, 5, 0.0002),
+        ];
+        let equity: Vec<EquityPoint> = (0..6).map(|t| point(t, 10_000.0)).collect();
+        let runs = [Segment {
+            equity: &equity,
+            ranges: &[],
+            peak_leverage: None,
+            exposures: None,
+            fills: &fills,
+            trades: &[],
+            funding_paid: 0.0,
+        }];
+        for sizing in [Sizing::Compounding, Sizing::FixedSize] {
+            let metrics = stitched_report(&base, &runs, sizing).metrics;
+            assert_eq!(metrics.exposure, Some(0.5));
+        }
     }
 
     #[test]
