@@ -844,6 +844,8 @@ fn seen_in_backtest(
         account_currency: td_core::AccountCurrency::Quote,
         references: Vec::new(),
         series: Vec::new(),
+        also_traded: Vec::new(),
+        start_when_all_listed: false,
     };
     let seen = Arc::new(Mutex::new(Vec::new()));
     let strategy = Box::new(SeesFunding(seen.clone()));

@@ -65,6 +65,13 @@ pub enum EngineError {
     #[error("series: {0}")]
     InvalidSeries(String),
 
+    /// The other traded instruments a run names ([`crate::BacktestConfig::also_traded`]) or the
+    /// bars and funding given for them: a kind, venue, quote currency or account a run with
+    /// several traded instruments does not take, one named twice or also a reference, or data
+    /// that does not match the names.
+    #[error("traded instruments: {0}")]
+    InvalidTraded(String),
+
     /// A series' data: its file missing, a link or malformed, rows out of order or not finite, or
     /// no row known by the close of the run's first bar.
     #[error("{0}")]

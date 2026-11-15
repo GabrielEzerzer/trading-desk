@@ -3,7 +3,7 @@
 use std::ops::Range;
 
 use serde::{Deserialize, Serialize};
-use td_core::{AccountCurrency, Candle, Fill, Liquidity, Millis, Side};
+use td_core::{AccountCurrency, Candle, Fill, InstrumentId, Liquidity, Millis, Side};
 
 use crate::metrics::finite;
 use crate::portfolio::next_position;
@@ -107,6 +107,11 @@ pub struct Trade {
     /// different prices it is not, since each exit's P&L is converted at its own price.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub net_pips: Option<f64>,
+    /// The instrument the trade was in, in a run with several traded instruments
+    /// ([`crate::BacktestConfig::also_traded`]), whose trades are built per instrument. `None`, and
+    /// left out of saved JSON, in a run with one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instrument: Option<InstrumentId>,
 }
 
 /// The funding a session charged on one bar, split by the position it was charged on.
@@ -262,6 +267,7 @@ impl Building {
             force_closed: false,
             pips,
             net_pips,
+            instrument: None,
         }
     }
 }

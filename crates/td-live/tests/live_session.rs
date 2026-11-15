@@ -1780,6 +1780,8 @@ fn seen_in_backtest(
         references: Vec::new(),
         series: Vec::new(),
         account_currency: AccountCurrency::Quote,
+        also_traded: Vec::new(),
+        start_when_all_listed: false,
     };
     let seen = Arc::new(Mutex::new(Vec::new()));
     let strategy = Box::new(SeesFunding(seen.clone()));
@@ -3498,6 +3500,8 @@ fn seen_reference_in_backtest(
         references: cfg.references.clone(),
         series: Vec::new(),
         account_currency: AccountCurrency::Quote,
+        also_traded: Vec::new(),
+        start_when_all_listed: false,
     };
     let references = [ReferenceBars {
         instrument: other(),

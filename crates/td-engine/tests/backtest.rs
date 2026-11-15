@@ -83,6 +83,8 @@ fn config() -> BacktestConfig {
         account_currency: td_core::AccountCurrency::Quote,
         references: Vec::new(),
         series: Vec::new(),
+        also_traded: Vec::new(),
+        start_when_all_listed: false,
     }
 }
 
