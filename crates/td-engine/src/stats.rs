@@ -3549,7 +3549,8 @@ mod tests {
         assert_eq!(off, Evaluation::Passed(1));
         // The funded account at a size of 1 goes into day 2 at 1.0 and holds 1.0 x 1.1 that day,
         // over 1.05, so it ends before the payout day 2's profit would make. At a funded size of a
-        // half it holds 0.5 x 1.0 x 1.1 = 0.55 and is paid out.
+        // half it holds 0.5 x 1.0 x 1.1 = 0.55, under 0.56, and is paid out; its balance after the
+        // day, 1.05, would read 0.5775 and end it.
         let (path, flags, held) = ([0.0, 0.1], [true; 2], [0.5, 1.1]);
         let funded = |spec: &PropFirmSpec, size, notional| {
             walk_funded(spec, &terms(), size, &path, &path, &flags, notional)
@@ -3558,7 +3559,7 @@ mod tests {
         assert_eq!((ended.breached, ended.payouts), (Some(2), 0));
         let off = funded(&unlimited(2), 1.0, None);
         assert_eq!((off.breached, off.payouts), (None, 1));
-        let half = funded(&notional_limit(1.05, 2), 0.5, Some(&held[..]));
+        let half = funded(&notional_limit(0.56, 2), 0.5, Some(&held[..]));
         assert_eq!((half.breached, half.payouts), (None, 1));
         // The breach odds' funded account starts the day after the pass on day 1 from a fresh
         // balance, so day 3 is its second day. It goes into it at 1.1, or at 1.0 once day 2's
@@ -3576,6 +3577,20 @@ mod tests {
                 Some(&held),
             );
             assert_eq!(breach, Some(3), "{terms:?}");
+            // With a 20% gain on day 3 and a limit of 1.25 the account carries on: it holds 1.21
+            // or 1.1 on its balance going into the day, where its balance after the day would
+            // read 1.452 or 1.32.
+            let gain = [0.6, 0.1, 0.2];
+            let carries_on = walk_path(
+                &notional_limit(1.25, 3),
+                terms,
+                Evaluation::Passed(1),
+                &gain,
+                &gain,
+                &flags,
+                Some(&held),
+            );
+            assert_eq!(carries_on, None, "{terms:?}");
         }
         // The odds: a single day over the limit breaches every path; without the limit none
         // breaches.
