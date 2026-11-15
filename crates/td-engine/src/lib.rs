@@ -54,7 +54,7 @@ mod private_strategies_build;
 pub use battery::{
     BatteryResult, BatteryRuns, BatterySpec, Breakdown, CostStress, IntegrityReport,
     PlateauDirection, PlateauReport, RegimeResult, SideResult, StartOffset, battery_runs,
-    run_battery, run_battery_with_references,
+    run_battery, run_battery_with_references, run_battery_with_traded,
 };
 pub use broker::{AttachedStop, Broker, BrokerEvent, Order, OrderStatus, SimBroker};
 pub use compare::{
@@ -83,8 +83,8 @@ pub use risk::{DayRollover, EquityRange};
 pub use runner::{
     AlsoTradedBars, BacktestConfig, BacktestResult, Benchmark, ENGINE_REVISION, Rerun,
     config_fingerprint, config_fingerprint_with_references, config_fingerprint_with_traded,
-    data_fingerprint, default_slippage_bps, rerun, run, run_strategy, run_strategy_with_references,
-    run_strategy_with_traded, run_with_references, run_with_traded,
+    data_fingerprint, default_slippage_bps, rerun, rerun_with_traded, run, run_strategy,
+    run_strategy_with_references, run_strategy_with_traded, run_with_references, run_with_traded,
 };
 pub use saved_verdicts::{
     LinkState, LinkedVerdict, RECORD_FILE, RUNS_DIR, SessionLink, VERDICT_FILE, VerdictError,
@@ -103,9 +103,10 @@ pub use tester::{
     Direction, Headline, MAX_RUNS, Metric, Objective, OosResult, OosSpec, ParamAxis, ParamSpace,
     PermutationResult, PermutationSpec, Progress, Split, SweepMode, SweepResult, SweepRow,
     SweepSpec, TesterError, WalkForwardResult, WalkForwardSpec, Window, WindowMode, WindowResult,
-    WindowSpec, out_of_sample, out_of_sample_with_references, permutation_test,
-    permutation_test_with_references, stitch, sweep, sweep_with_references, walk_forward,
-    walk_forward_with_references,
+    WindowSpec, out_of_sample, out_of_sample_with_references, out_of_sample_with_traded,
+    permutation_test, permutation_test_with_references, permutation_test_with_traded, stitch,
+    sweep, sweep_with_references, sweep_with_traded, walk_forward, walk_forward_with_references,
+    walk_forward_with_traded,
 };
 pub use trades::{
     BarFunding, Trade, TradeSide, TradeStops, attach_stops, build_trades, build_trades_with_fills,

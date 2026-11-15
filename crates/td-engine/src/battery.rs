@@ -87,12 +87,12 @@ use crate::verdict::{
     IntegrityInputs, OosIntegrityInputs, TradingDayTest, evaluate_integrity, evaluate_oos_integrity,
 };
 use crate::{
-    BacktestConfig, BacktestResult, Criterion, Direction, DrawdownMode, EngineError, EquityPoint,
-    EvidenceInputs, Headline, KindInputs, MAX_RUNS, Objective, Order, Outcome, Params,
-    PermutationResult, PermutationSpec, PortfolioBenchmark, Progress, Series, SweepResult,
-    SweepSpec, TestPlan, TesterError, Trade, TradeSide, Verdict, VerdictRule, WalkForwardResult,
-    WalkForwardSpec, combine, evaluate, evaluate_evidence, permutation_test_with_references,
-    run_with_references, sweep_with_references, walk_forward_with_references,
+    AlsoTradedBars, BacktestConfig, BacktestResult, Criterion, Direction, DrawdownMode,
+    EngineError, EquityPoint, EvidenceInputs, Headline, KindInputs, MAX_RUNS, Objective, Order,
+    Outcome, Params, PermutationResult, PermutationSpec, PortfolioBenchmark, Progress, Series,
+    SweepResult, SweepSpec, TestPlan, TesterError, Trade, TradeSide, Verdict, VerdictRule,
+    WalkForwardResult, WalkForwardSpec, combine, evaluate, evaluate_evidence,
+    permutation_test_with_traded, run_with_traded, sweep_with_traded, walk_forward_with_traded,
 };
 
 /// The seed streams of the battery's seeded steps, derived from its seed.
@@ -355,6 +355,7 @@ pub struct BatterySpec<'a> {
     pub rule: &'a VerdictRule,
     /// One of the plan's instruments.
     pub instrument: &'a Instrument,
+    pub also_traded: &'a [Instrument],
     /// Seeds the luck test and the bootstraps.
     pub seed: u64,
 }
@@ -398,11 +399,26 @@ pub fn run_battery_with_references(
     series: &[Series],
     progress: Option<Progress>,
 ) -> Result<BatteryResult, TesterError> {
+    run_battery_with_traded(spec, bars, asks, funding, references, series, &[], progress)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn run_battery_with_traded(
+    spec: &BatterySpec,
+    bars: &[Candle],
+    asks: &[Candle],
+    funding: &[(Millis, f64)],
+    references: &[ReferenceBars],
+    series: &[Series],
+    also_traded: &[AlsoTradedBars],
+    progress: Option<Progress>,
+) -> Result<BatteryResult, TesterError> {
     let BatterySpec {
         strategy,
         plan,
         rule,
         instrument,
+        also_traded: traded_beside,
         seed,
     } = *spec;
     let instrument = instrument.clone();
@@ -412,6 +428,16 @@ pub fn run_battery_with_references(
             instrument.id
         )));
     }
+    if let Some(inst) = traded_beside
+        .iter()
+        .find(|i| plan.backtest.slippage_bps(&i.id).is_some())
+    {
+        return Err(TesterError::InvalidSpec(format!(
+            "the plan's slippage for {0} cannot be used for an instrument traded beside the first: \
+             {0} trades at its default slippage",
+            inst.id
+        )));
+    }
     rule.validate()
         .map_err(|e| TesterError::InvalidSpec(e.to_string()))?;
     let names: Vec<_> = references.iter().map(|r| r.instrument.clone()).collect();
@@ -419,12 +445,15 @@ pub fn run_battery_with_references(
     let mut base = plan.backtest_config(strategy, instrument.clone());
     base.references.clone_from(&names);
     base.series.clone_from(&series_names);
+    base.also_traded = traded_beside.to_vec();
     let mut sweep_spec = plan.sweep_spec(strategy, instrument.clone());
     sweep_spec.base.references.clone_from(&names);
     sweep_spec.base.series.clone_from(&series_names);
+    sweep_spec.base.also_traded = traded_beside.to_vec();
     let mut wf_spec = plan.walk_forward_spec(strategy, instrument.clone());
     wf_spec.sweep.base.references = names;
     wf_spec.sweep.base.series = series_names;
+    wf_spec.sweep.base.also_traded = traded_beside.to_vec();
     wf_spec.check()?;
     let ev = &plan.evidence;
     check_start_offsets(wf_spec.windows.test_bars, ev.start_offsets)
@@ -451,7 +480,7 @@ pub fn run_battery_with_references(
     // 1. Integrity: I1 to I3.
     let (open_buckets, dropped_buckets) = bucket_counts(&base, &traded);
     let split = (traded.len() >= 2).then(|| traded[traded.len() / 2].open_time);
-    let data = (bars, asks, funding, references, series);
+    let data = (bars, asks, funding, references, series, also_traded);
     let base_checks = repeat_and_prefix(&base, data, split, &mut meter)?;
     let mut integrity_inputs = IntegrityInputs {
         dropped_share: (open_buckets > 0).then(|| dropped_buckets as f64 / open_buckets as f64),
@@ -496,13 +525,14 @@ pub fn run_battery_with_references(
     }
 
     // 2. The sweep over the full period.
-    let swept = sweep_with_references(
+    let swept = sweep_with_traded(
         &sweep_spec,
         bars,
         asks,
         funding,
         references,
         series,
+        also_traded,
         Some(&meter.step()),
     )?;
     meter.base += per_sweep;
@@ -515,13 +545,14 @@ pub fn run_battery_with_references(
         };
         (None, Some(error))
     } else {
-        match walk_forward_with_references(
+        match walk_forward_with_traded(
             &wf_spec,
             bars,
             asks,
             funding,
             references,
             series,
+            also_traded,
             Some(&meter.step()),
         ) {
             Ok(wf) => (Some(wf), None),
@@ -604,7 +635,15 @@ pub fn run_battery_with_references(
                 .iter()
                 .map(|w| {
                     let config = &w.out_of_sample.config;
-                    runner::run_exposures(config, bars, asks, funding, references, series)
+                    runner::run_exposures(
+                        config,
+                        bars,
+                        asks,
+                        funding,
+                        references,
+                        series,
+                        also_traded,
+                    )
                 })
                 .collect::<Result<Vec<_>, _>>()?,
         ),
@@ -627,7 +666,15 @@ pub fn run_battery_with_references(
                         ..w.out_of_sample.config.clone()
                     };
                     // A set the strategy refuses is left out, as a sweep leaves its row unranked.
-                    match run_with_references(&config, bars, asks, funding, references, series) {
+                    match run_with_traded(
+                        &config,
+                        bars,
+                        asks,
+                        funding,
+                        references,
+                        series,
+                        also_traded,
+                    ) {
                         Ok(r) => window.push((steps, r)),
                         Err(EngineError::InvalidParam { .. }) => {}
                         Err(e) => return Err(e.into()),
@@ -710,7 +757,7 @@ pub fn run_battery_with_references(
             &BootstrapSpec::trades(derive_seed(seed, SEED_TRADE_BOOTSTRAP)),
         )
         .ok();
-        let breakdown = breakdown(wf, bars, asks, &instrument, cash);
+        let breakdown = breakdown(wf, bars, asks, &instrument, also_traded, cash);
 
         oos_integrity = OosIntegrityInputs {
             sharpe: m.sharpe,
@@ -927,19 +974,22 @@ pub fn run_battery_with_references(
         later_lines_cannot_change(&criteria, &evaluate_evidence(ev, &evidence), &kind_lines);
     if let (Some(wf), false) = (&wf, decided) {
         // 5. R4: the chosen parameters on each test window at higher costs.
-        let fees = base.fee_override.unwrap_or(instrument.fees);
-        let stressed_fees = stressed(fees, ev.cost_stress);
         let stressed_asks = widened(bars, asks, ev.cost_stress);
         let mut window_returns = Vec::with_capacity(wf.windows.len());
         let mut ends = Vec::with_capacity(wf.windows.len());
         for w in &wf.windows {
-            let config = BacktestConfig {
-                fee_override: Some(stressed_fees),
-                slippage_bps: w.out_of_sample.config.slippage_bps * ev.cost_stress,
-                ..w.out_of_sample.config.clone()
-            };
-            let r =
-                run_with_references(&config, bars, &stressed_asks, funding, references, series)?;
+            let r = run_stressed(
+                &w.out_of_sample.config,
+                ev.cost_stress,
+                (
+                    bars,
+                    &stressed_asks,
+                    funding,
+                    references,
+                    series,
+                    also_traded,
+                ),
+            )?;
             meter.tick()?;
             let end = r.equity.last().map(|p| p.equity);
             window_returns.push(end.map_or(1.0, |e| e / cash) - 1.0);
@@ -969,13 +1019,14 @@ pub fn run_battery_with_references(
                 // it, so that bar exists.
                 let mut spec: WalkForwardSpec = wf_spec.clone();
                 spec.sweep.base.to = traded[traded.len() - shift].open_time;
-                match walk_forward_with_references(
+                match walk_forward_with_traded(
                     &spec,
                     bars,
                     asks,
                     funding,
                     references,
                     series,
+                    also_traded,
                     Some(&meter.step()),
                 ) {
                     Ok(r) => offset.oos_return = as_judged(&r, sizing, None).metrics.total_return,
@@ -1004,13 +1055,14 @@ pub fn run_battery_with_references(
             permutations,
             seed: derive_seed(seed, SEED_LUCK),
         };
-        match permutation_test_with_references(
+        match permutation_test_with_traded(
             &spec,
             bars,
             asks,
             funding,
             references,
             series,
+            also_traded,
             Some(&meter.step()),
         ) {
             Ok(p) => {
@@ -1313,6 +1365,37 @@ fn sizing_warning(line: &Criterion, fixed_size: f64) -> Option<String> {
     ))
 }
 
+fn run_stressed(
+    config: &BacktestConfig,
+    multiplier: f64,
+    (bars, asks, funding, references, series, also_traded): BatteryData,
+) -> Result<BacktestResult, EngineError> {
+    let fees = config.fee_override.unwrap_or(config.instrument.fees);
+    let config = BacktestConfig {
+        fee_override: Some(stressed(fees, multiplier)),
+        slippage_bps: config.slippage_bps * multiplier,
+        also_traded: config
+            .also_traded
+            .iter()
+            .map(|inst| Instrument {
+                fees: stressed(inst.fees, multiplier),
+                ..inst.clone()
+            })
+            .collect(),
+        ..config.clone()
+    };
+    runner::run_with_traded_slippage(
+        &config,
+        bars,
+        asks,
+        funding,
+        references,
+        series,
+        also_traded,
+        multiplier,
+    )
+}
+
 /// R4's fees: every fee of `fees`, the per-unit commission too, times `multiplier`.
 fn stressed(fees: FeeSchedule, multiplier: f64) -> FeeSchedule {
     FeeSchedule {
@@ -1348,30 +1431,32 @@ fn stressed_total_return(cash: f64, ends: &[Option<f64>], fixed_size: bool) -> f
     level.max(0.0) - 1.0
 }
 
-/// The data a battery's runs are given: bars, asks, funding, reference bars and series.
+/// The data a battery's runs are given: bars, asks, funding, reference bars, series and the bars
+/// and funding of the instruments traded beside the first.
 type BatteryData<'a> = (
     &'a [Candle],
     &'a [Candle],
     &'a [(Millis, f64)],
     &'a [ReferenceBars],
     &'a [Series],
+    &'a [AlsoTradedBars],
 );
 
 /// I2 and I3 on one backtest, in three counted runs: the backtest twice, then once on the bars
 /// before `split` alone. Returns I2's and I3's differences; I3's is `None` without a split.
 fn repeat_and_prefix(
     config: &BacktestConfig,
-    (bars, asks, funding, references, series): BatteryData,
+    (bars, asks, funding, references, series, also_traded): BatteryData,
     split: Option<Millis>,
     meter: &mut Meter,
 ) -> Result<(usize, Option<usize>), TesterError> {
-    let first = run_with_references(config, bars, asks, funding, references, series)?;
+    let first = run_with_traded(config, bars, asks, funding, references, series, also_traded)?;
     meter.tick()?;
-    let again = run_with_references(config, bars, asks, funding, references, series)?;
+    let again = run_with_traded(config, bars, asks, funding, references, series, also_traded)?;
     meter.tick()?;
     let prefix = match split {
         Some(at) => {
-            let half = run_with_references(
+            let half = run_with_traded(
                 &BacktestConfig {
                     to: at,
                     ..config.clone()
@@ -1381,6 +1466,7 @@ fn repeat_and_prefix(
                 funding,
                 references,
                 series,
+                also_traded,
             )?;
             Some(prefix_differences(&first.orders, &half.orders, at))
         }
@@ -2098,6 +2184,7 @@ fn breakdown(
     bars: &[Candle],
     asks: &[Candle],
     instrument: &Instrument,
+    also_traded: &[AlsoTradedBars],
     cash: f64,
 ) -> Breakdown {
     let mut long = SideResult::default();
@@ -2140,7 +2227,22 @@ fn breakdown(
         .map(|t| t.net_pnl)
         .reduce(f64::max);
     let end = wf.equity.last().map_or(cash, |p| p.equity);
-    let (limit_fills, touch_only_fills) = limit_fills(&wf.fills, bars, asks, instrument);
+    let own = |id: &InstrumentId| -> Vec<Fill> {
+        wf.fills
+            .iter()
+            .filter(|f| f.instrument == *id)
+            .cloned()
+            .collect()
+    };
+    let (mut limit_count, mut touch_count) =
+        limit_fills(&own(&instrument.id), bars, asks, instrument);
+    for inst in &wf.spec.sweep.base.also_traded {
+        if let Some(given) = also_traded.iter().find(|g| g.instrument == inst.id) {
+            let (limits, touches) = limit_fills(&own(&inst.id), &given.bars, &[], inst);
+            limit_count += limits;
+            touch_count += touches;
+        }
+    }
     Breakdown {
         long,
         short,
@@ -2149,8 +2251,8 @@ fn breakdown(
         falling,
         best_trade_pnl,
         return_without_best_trade: best_trade_pnl.map(|b| (end - b) / cash - 1.0),
-        limit_fills: Some(limit_fills),
-        touch_only_fills: Some(touch_only_fills),
+        limit_fills: Some(limit_count),
+        touch_only_fills: Some(touch_count),
     }
 }
 
@@ -2362,6 +2464,7 @@ mod tests {
             plan: &plan,
             rule: &entry.rule,
             instrument: &instrument,
+            also_traded: &[],
             seed: 7,
         };
         let r = run_battery(&spec, &bids, &asks, &[], None).unwrap();
@@ -2435,6 +2538,7 @@ mod tests {
             plan: &plan,
             rule: &entry.rule,
             instrument: &instrument,
+            also_traded: &[],
             seed: 7,
         };
         let calls = std::sync::Mutex::new(Vec::new());
@@ -2810,6 +2914,7 @@ mod tests {
             plan,
             rule: &rule,
             instrument: &test_instrument(),
+            also_traded: &[],
             seed,
         };
         run_battery(&spec, bars, &[], &[], None).unwrap()
@@ -3399,6 +3504,7 @@ mod tests {
                 plan: &plan,
                 rule: &rule,
                 instrument: &test_instrument(),
+                also_traded: &[],
                 seed: 7,
             };
             run_battery(&spec, &bars, &[], &[], None).unwrap()
@@ -3865,6 +3971,7 @@ mod tests {
             plan: &plan,
             rule: &rule,
             instrument: &test_instrument(),
+            also_traded: &[],
             seed: 7,
         };
         let sized = run_battery(&spec, &bars, &[], &[], None).unwrap();
@@ -4018,6 +4125,7 @@ mod tests {
             plan: &plan,
             rule: &rule,
             instrument: &test_instrument(),
+            also_traded: &[],
             seed,
         };
         let r = run_battery(&spec, &bars, &[], &[], None).unwrap();
@@ -4173,6 +4281,7 @@ mod tests {
             plan: &plan,
             rule: &rule,
             instrument: &test_instrument(),
+            also_traded: &[],
             seed,
         };
         let r = run_battery(&spec, &bars, &[], &[], None).unwrap();
@@ -4259,6 +4368,7 @@ mod tests {
                 plan: &plan,
                 rule: &rule,
                 instrument: &test_instrument(),
+                also_traded: &[],
                 seed: 7,
             };
             (run_battery(&spec, &bars, &[], &[], None).unwrap(), rule)
@@ -4343,6 +4453,7 @@ mod tests {
                 plan: &plan,
                 rule: &rule,
                 instrument: &test_instrument(),
+                also_traded: &[],
                 seed: 7,
             };
             run_battery(&spec, &bars, &[], &[], None).unwrap()
@@ -4398,6 +4509,7 @@ mod tests {
                 plan: &plan,
                 rule: &rule,
                 instrument: &test_instrument(),
+                also_traded: &[],
                 seed: 7,
             };
             run_battery(&spec, &bars, &[], &[], None)
@@ -4422,7 +4534,8 @@ mod tests {
         for w in &wf.windows {
             assert!(fixed > 0.0);
             let r = &w.out_of_sample;
-            let held = crate::runner::run_exposures(&r.config, &bars, &[], &[], &[], &[]).unwrap();
+            let held =
+                crate::runner::run_exposures(&r.config, &bars, &[], &[], &[], &[], &[]).unwrap();
             largest = held.iter().map(|x| x.notional).fold(largest, f64::max);
             leverage = held
                 .iter()
@@ -4533,6 +4646,7 @@ mod tests {
                 plan: &plan,
                 rule: &rule,
                 instrument: &test_instrument(),
+                also_traded: &[],
                 seed: 7,
             };
             run_battery(&spec, &bars, &[], &[], None).unwrap()
@@ -4750,6 +4864,7 @@ mod tests {
                 plan: &plan,
                 rule: &rule,
                 instrument: &test_instrument(),
+                also_traded: &[],
                 seed: 7,
             };
             run_battery(&spec, &bars, &[], &[], None).unwrap()
@@ -4784,7 +4899,8 @@ mod tests {
         for (o, f) in on.start_offsets.iter().zip(&off.start_offsets) {
             let mut spec = plan.walk_forward_spec("sma_cross", test_instrument());
             spec.sweep.base.to = traded[traded.len() - o.shift_bars].open_time;
-            let Ok(r) = walk_forward_with_references(&spec, &bars, &[], &[], &[], &[], None) else {
+            let Ok(r) = crate::walk_forward_with_references(&spec, &bars, &[], &[], &[], &[], None)
+            else {
                 assert!(o.error.is_some() && f.error.is_some(), "{o:?}");
                 continue;
             };
@@ -4934,7 +5050,8 @@ mod tests {
     fn sma_walk_forward() -> crate::WalkForwardResult {
         let (plan, bars) = sma_plan(sma_axes());
         let spec = plan.walk_forward_spec("sma_cross", test_instrument());
-        let wf = walk_forward_with_references(&spec, &bars, &[], &[], &[], &[], None).unwrap();
+        let wf =
+            crate::walk_forward_with_references(&spec, &bars, &[], &[], &[], &[], None).unwrap();
         assert_eq!(wf.spec.sweep.base.starting_cash, 10_000.0);
         wf
     }
@@ -5299,6 +5416,7 @@ mod tests {
                 plan: &plan,
                 rule: &rule,
                 instrument: &test_instrument(),
+                also_traded: &[],
                 seed: 7,
             };
             run_battery(&spec, &bars, &[], &[], None).unwrap()
@@ -5552,5 +5670,114 @@ mod tests {
         verdict.as_object_mut().unwrap().remove("warnings");
         let verdict: Verdict = serde_json::from_value(verdict).unwrap();
         assert!(verdict.warnings.is_empty());
+    }
+
+    mod several {
+        use super::*;
+        use crate::SlippageOverride;
+        use crate::metrics::DAY_MS;
+        use crate::strategies::test_only::{
+            TRADES_BOTH, pair_config, pair_data, pair_first, pair_second,
+        };
+
+        const BARS: i64 = 120;
+        const COST_STRESS: f64 = 2.0;
+
+        fn second_fills(r: &BacktestResult) -> Vec<&Fill> {
+            let id = pair_second().id;
+            r.fills.iter().filter(|f| f.instrument == id).collect()
+        }
+
+        #[test]
+        fn a_plan_that_sets_slippage_for_an_instrument_traded_beside_the_first_is_refused() {
+            const DAYS: i64 = 160;
+            const BARS_A_DAY: i64 = 6;
+            let entry = crate::find_strategy(TRADES_BOTH).unwrap();
+            let (first, second) = (pair_first(), pair_second());
+            let mut plan = entry.plan.clone();
+            plan.instruments.push(second.id.clone());
+            plan.period.to = DAYS * DAY_MS;
+            plan.evidence.luck.permutations = 4;
+            plan.evidence.start_offsets = 0;
+            let (bars, also) = pair_data(DAYS * BARS_A_DAY);
+            let traded_beside = [second.clone()];
+            let battery = |plan: &TestPlan| {
+                let spec = BatterySpec {
+                    strategy: TRADES_BOTH,
+                    plan,
+                    rule: &entry.rule,
+                    instrument: &first,
+                    also_traded: &traded_beside,
+                    seed: 3,
+                };
+                run_battery_with_traded(&spec, &bars, &[], &[], &[], &[], &also, None)
+            };
+            assert!(battery(&plan).is_ok());
+            plan.backtest.slippage = vec![SlippageOverride::new(second.id.clone(), 10.0)];
+            let refused = battery(&plan).unwrap_err().to_string();
+            assert!(
+                refused.contains(&format!(
+                    "the plan's slippage for {0} cannot be used for an instrument traded beside \
+                     the first: {0} trades at its default slippage",
+                    second.id
+                )),
+                "{refused}"
+            );
+        }
+
+        #[test]
+        fn the_cost_stress_raises_the_second_instruments_fees_and_slippage() {
+            let (bars, also) = pair_data(BARS);
+            let mut config = pair_config(TRADES_BOTH, BARS);
+            config.params = Params::new().with("qty", crate::ParamValue::Float(1.0));
+            let plain = run_with_traded(&config, &bars, &[], &[], &[], &[], &also).unwrap();
+            let stressed =
+                run_stressed(&config, COST_STRESS, (&bars, &[], &[], &[], &[], &also)).unwrap();
+            let (plain, stressed) = (second_fills(&plain), second_fills(&stressed));
+            assert!(!plain.is_empty());
+            assert_eq!(plain.len(), stressed.len());
+            for (p, s) in plain.iter().zip(&stressed) {
+                assert_eq!((p.time, p.side, p.qty), (s.time, s.side, s.qty));
+                let fee_rate_ratio = (s.fee / s.price) / (p.fee / p.price);
+                assert!(
+                    (fee_rate_ratio - COST_STRESS).abs() < 1e-9,
+                    "fee rate stressed by {fee_rate_ratio} at {}",
+                    p.time
+                );
+                let worse = match p.side {
+                    Side::Buy => s.price > p.price,
+                    Side::Sell => s.price < p.price,
+                };
+                assert!(
+                    worse,
+                    "{:?} at {} filled at {} unstressed and {} stressed",
+                    p.side, p.time, p.price, s.price
+                );
+            }
+        }
+
+        fn fill_of(instrument: &Instrument, day: i64, side: Side, qty: f64, price: f64) -> Fill {
+            Fill {
+                instrument: instrument.id.clone(),
+                ..day_fill(day, side, qty, price)
+            }
+        }
+
+        #[test]
+        fn a_day_whose_only_passing_fill_is_the_second_instruments_counts_for_the_firm() {
+            let (first, second) = (test_instrument(), pair_second());
+            const DAY_OF_SECOND_CLOSE: usize = 3;
+            let fills = [
+                fill_of(&first, 1, Side::Sell, 2.0, 100.0),
+                fill_of(&second, 1, Side::Buy, 1.0, 200.0),
+                fill_of(&first, DAY_OF_SECOND_CLOSE as i64, Side::Sell, 1.0, 100.0),
+                fill_of(&second, DAY_OF_SECOND_CLOSE as i64, Side::Sell, 1.0, 220.0),
+            ];
+            assert_eq!(
+                flagged_days(&fills, day_test(true, Some(0.015), None)),
+                [DAY_OF_SECOND_CLOSE],
+                "the second instrument's long closes on day {DAY_OF_SECOND_CLOSE}; the first only adds to its short"
+            );
+        }
     }
 }

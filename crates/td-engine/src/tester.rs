@@ -23,11 +23,12 @@ use crate::reference::{ReferenceBars, align};
 use crate::risk::{EquityRange, Exposure, Intrabar};
 use crate::rng::{SplitMix64, derive_seed};
 use crate::runner::{
-    compare, config_fingerprint_with_references, hold_over, match_asks, run_metrics, select_bars,
+    compare, config_fingerprint_with_traded, hold_over, match_asks, run_metrics, select_bars,
+    start_config,
 };
 use crate::{
-    BacktestConfig, BacktestResult, Benchmark, EngineError, EquityPoint, ParamKind, ParamSpec,
-    ParamValue, Params, Series, Trade, find_strategy, run_with_references,
+    AlsoTradedBars, BacktestConfig, BacktestResult, Benchmark, EngineError, EquityPoint, ParamKind,
+    ParamSpec, ParamValue, Params, Series, Trade, find_strategy, run_with_traded,
 };
 
 /// The most backtests one sweep may run: the grid size, or the sample count in random mode. A
@@ -647,36 +648,60 @@ pub fn sweep_with_references(
     series: &[Series],
     progress: Option<Progress>,
 ) -> Result<SweepResult, TesterError> {
-    let plan = Plan::new(spec)?;
-    sweep_planned(
-        spec, &plan, bars, asks, funding, references, series, progress,
-    )
+    sweep_with_traded(spec, bars, asks, funding, references, series, &[], progress)
 }
 
 #[allow(clippy::too_many_arguments)]
-fn sweep_planned(
+pub fn sweep_with_traded(
     spec: &SweepSpec,
-    plan: &Plan,
     bars: &[Candle],
     asks: &[Candle],
     funding: &[(Millis, f64)],
     references: &[ReferenceBars],
     series: &[Series],
+    also_traded: &[AlsoTradedBars],
     progress: Option<Progress>,
 ) -> Result<SweepResult, TesterError> {
-    let data_fingerprint =
-        config_fingerprint_with_references(&spec.base, bars, asks, funding, references, series)?;
-    let rows = ranked_rows(
-        spec, plan, bars, asks, funding, references, series, progress,
+    let plan = Plan::new(spec)?;
+    let data = (bars, asks, funding, references, series, also_traded);
+    sweep_planned(spec, &plan, data, progress)
+}
+
+type TesterData<'a> = (
+    &'a [Candle],
+    &'a [Candle],
+    &'a [(Millis, f64)],
+    &'a [ReferenceBars],
+    &'a [Series],
+    &'a [AlsoTradedBars],
+);
+
+fn sweep_planned(
+    spec: &SweepSpec,
+    plan: &Plan,
+    data: TesterData,
+    progress: Option<Progress>,
+) -> Result<SweepResult, TesterError> {
+    let (bars, asks, funding, references, series, also_traded) = data;
+    let data_fingerprint = config_fingerprint_with_traded(
+        &spec.base,
+        bars,
+        asks,
+        funding,
+        references,
+        series,
+        also_traded,
     )?;
+    let rows = ranked_rows(spec, plan, data, progress)?;
     let best = match rows.first() {
-        Some(top) if top.qualified => Some(run_with_references(
+        Some(top) if top.qualified => Some(run_with_traded(
             &with_params(&spec.base, &top.params),
             bars,
             asks,
             funding,
             references,
             series,
+            also_traded,
         )?),
         _ => None,
     };
@@ -690,15 +715,10 @@ fn sweep_planned(
 }
 
 /// Runs every parameter set of the plan and ranks the rows, best first.
-#[allow(clippy::too_many_arguments)]
 fn ranked_rows(
     spec: &SweepSpec,
     plan: &Plan,
-    bars: &[Candle],
-    asks: &[Candle],
-    funding: &[(Millis, f64)],
-    references: &[ReferenceBars],
-    series: &[Series],
+    data: TesterData,
     progress: Option<Progress>,
 ) -> Result<Vec<SweepRow>, TesterError> {
     let total = plan.indices.len();
@@ -712,7 +732,7 @@ fn ranked_rows(
             if stopped.load(Ordering::Relaxed) {
                 return None;
             }
-            let row = run_row(spec, plan, index, bars, asks, funding, references, series);
+            let row = run_row(spec, plan, index, data);
             let n = done.fetch_add(1, Ordering::Relaxed) + 1;
             if let Some(report) = progress
                 && report(n, total).is_break()
@@ -760,20 +780,23 @@ fn with_params(base: &BacktestConfig, params: &Params) -> BacktestConfig {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn run_row(
     spec: &SweepSpec,
     plan: &Plan,
     index: u64,
-    bars: &[Candle],
-    asks: &[Candle],
-    funding: &[(Millis, f64)],
-    references: &[ReferenceBars],
-    series: &[Series],
+    (bars, asks, funding, references, series, also_traded): TesterData,
 ) -> Result<SweepRow, EngineError> {
     let params = plan.params(&spec.base.params, index).resolve(&plan.specs)?;
     let config = with_params(&spec.base, &params);
-    match run_metrics(&config, bars, asks, funding, references, series) {
+    match run_metrics(
+        &config,
+        bars,
+        asks,
+        funding,
+        references,
+        series,
+        also_traded,
+    ) {
         Ok(metrics) => {
             let h = Headline::new(&metrics);
             let qualified = h.trades >= spec.min_trades && h.value(spec.objective.metric).is_some();
@@ -906,6 +929,20 @@ pub fn permutation_test_with_references(
     series: &[Series],
     progress: Option<Progress>,
 ) -> Result<PermutationResult, TesterError> {
+    permutation_test_with_traded(spec, bars, asks, funding, references, series, &[], progress)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn permutation_test_with_traded(
+    spec: &PermutationSpec,
+    bars: &[Candle],
+    asks: &[Candle],
+    funding: &[(Millis, f64)],
+    references: &[ReferenceBars],
+    series: &[Series],
+    also_traded: &[AlsoTradedBars],
+    progress: Option<Progress>,
+) -> Result<PermutationResult, TesterError> {
     let copies = spec.permutations;
     if copies == 0 {
         return Err(TesterError::InvalidSpec(
@@ -923,29 +960,22 @@ pub fn permutation_test_with_references(
     }
     let base = &spec.sweep.base;
     let data_fingerprint =
-        config_fingerprint_with_references(base, bars, asks, funding, references, series)?;
+        config_fingerprint_with_traded(base, bars, asks, funding, references, series, also_traded)?;
     let total = per_sweep * (copies + 1);
     let objective = spec.sweep.objective;
     let best_of = |sweep_no: usize,
                    bars: &[Candle],
                    asks: &[Candle],
-                   references: &[ReferenceBars]|
+                   references: &[ReferenceBars],
+                   also_traded: &[AlsoTradedBars]|
      -> Result<Option<f64>, TesterError> {
         let offset = sweep_no * per_sweep;
         let sweep_progress = |done: usize, _: usize| match progress {
             Some(report) => report(offset + done, total),
             None => ControlFlow::Continue(()),
         };
-        let rows = ranked_rows(
-            &spec.sweep,
-            &plan,
-            bars,
-            asks,
-            funding,
-            references,
-            series,
-            Some(&sweep_progress),
-        )?;
+        let data = (bars, asks, funding, references, series, also_traded);
+        let rows = ranked_rows(&spec.sweep, &plan, data, Some(&sweep_progress))?;
         Ok(rows
             .first()
             .filter(|top| top.qualified)
@@ -954,12 +984,14 @@ pub fn permutation_test_with_references(
 
     // The real sweep ran, so every traded bar has its ask on a market with quotes, and there
     // are none on the others.
-    let real_best = best_of(0, bars, asks, references)?.ok_or(TesterError::NoQualifyingRun {
-        min_trades: spec.sweep.min_trades,
-        window: None,
-    })?;
+    let real_best =
+        best_of(0, bars, asks, references, also_traded)?.ok_or(TesterError::NoQualifyingRun {
+            min_trades: spec.sweep.min_trades,
+            window: None,
+        })?;
+    let from = start_config(base, bars, also_traded)?.from;
     let traded: Vec<usize> = (0..bars.len())
-        .filter(|&i| (base.from..base.to).contains(&bars[i].open_time))
+        .filter(|&i| (from..base.to).contains(&bars[i].open_time))
         .collect();
     let originals: Vec<Candle> = traded.iter().map(|&i| bars[i]).collect();
     // The index in `asks` of each traded bar's ask.
@@ -985,9 +1017,11 @@ pub fn permutation_test_with_references(
     let original_asks: Vec<Candle> = traded_asks.iter().map(|&j| asks[j]).collect();
     // Each reference's bar at each traded bar's time, or `None`, in the base's order.
     let original_references = align(base, &originals, references)?;
+    let original_traded = traded_slots(base, &originals, also_traded);
     let slots: Vec<Vec<Option<Candle>>> = original_references
         .iter()
         .map(|(_, slots)| slots.clone())
+        .chain(original_traded.iter().map(|(_, slots)| slots.clone()))
         .collect();
     let traded_times: HashSet<Millis> = originals.iter().map(|b| b.open_time).collect();
     let mut copy = bars.to_vec();
@@ -995,9 +1029,10 @@ pub fn permutation_test_with_references(
     let mut permuted_best = Vec::with_capacity(copies);
     for k in 0..copies {
         let seed = derive_seed(spec.seed, k as u64);
-        let (shuffled, shuffled_asks, shuffled_references) =
+        let (shuffled, shuffled_asks, mut shuffled_references) =
             permute_with_references(&originals, &original_asks, &slots, seed)
                 .map_err(EngineError::from)?;
+        let shuffled_traded = shuffled_references.split_off(original_references.len());
         for (&i, bar) in traded.iter().zip(shuffled) {
             copy[i] = bar;
         }
@@ -1022,7 +1057,14 @@ pub fn permutation_test_with_references(
                 }
             })
             .collect();
-        permuted_best.push(best_of(k + 1, &copy, &copy_asks, &copy_references)?);
+        let copy_traded = traded_copy(&original_traded, shuffled_traded, from..base.to);
+        permuted_best.push(best_of(
+            k + 1,
+            &copy,
+            &copy_asks,
+            &copy_references,
+            &copy_traded,
+        )?);
     }
 
     let (qualified_copies, at_least_as_good, p_value) =
@@ -1037,6 +1079,49 @@ pub fn permutation_test_with_references(
         at_least_as_good,
         p_value,
     })
+}
+
+fn traded_slots<'a>(
+    base: &BacktestConfig,
+    originals: &[Candle],
+    also_traded: &'a [AlsoTradedBars],
+) -> Vec<(&'a AlsoTradedBars, Vec<Option<Candle>>)> {
+    base.also_traded
+        .iter()
+        .filter_map(|inst| also_traded.iter().find(|g| g.instrument == inst.id))
+        .map(|given| {
+            let at: HashMap<Millis, Candle> =
+                given.bars.iter().map(|b| (b.open_time, *b)).collect();
+            let slots = originals
+                .iter()
+                .map(|b| at.get(&b.open_time).copied())
+                .collect();
+            (given, slots)
+        })
+        .collect()
+}
+
+fn traded_copy(
+    originals: &[(&AlsoTradedBars, Vec<Option<Candle>>)],
+    shuffled: Vec<Vec<Option<Candle>>>,
+    range: Range<Millis>,
+) -> Vec<AlsoTradedBars> {
+    originals
+        .iter()
+        .zip(shuffled)
+        .map(|((given, _), slots)| {
+            let kept = given
+                .bars
+                .iter()
+                .filter(|b| !range.contains(&b.open_time))
+                .copied();
+            AlsoTradedBars {
+                instrument: given.instrument.clone(),
+                bars: kept.chain(slots.into_iter().flatten()).collect(),
+                funding: given.funding.clone(),
+            }
+        })
+        .collect()
 }
 
 /// The qualifying copies, those of them at least as good as the real best, and the p-value; see
@@ -1144,6 +1229,21 @@ pub fn out_of_sample_with_references(
     series: &[Series],
     progress: Option<Progress>,
 ) -> Result<OosResult, TesterError> {
+    out_of_sample_with_traded(spec, bars, asks, funding, references, series, &[], progress)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn out_of_sample_with_traded(
+    spec: &OosSpec,
+    bars: &[Candle],
+    asks: &[Candle],
+    funding: &[(Millis, f64)],
+    references: &[ReferenceBars],
+    series: &[Series],
+    also_traded: &[AlsoTradedBars],
+    progress: Option<Progress>,
+) -> Result<OosResult, TesterError> {
+    let data = (bars, asks, funding, references, series, also_traded);
     let base = &spec.sweep.base;
     refuse_base_warmup(&spec.sweep)?;
     let plan = Plan::new(&spec.sweep)?;
@@ -1161,9 +1261,7 @@ pub fn out_of_sample_with_references(
     is_spec.base.to = split_at;
     // Close out like the out-of-sample run, so both sides count a position held at the end alike.
     is_spec.base.close_at_end = true;
-    let in_sample = sweep_planned(
-        &is_spec, &plan, bars, asks, funding, references, series, progress,
-    )?;
+    let in_sample = sweep_planned(&is_spec, &plan, data, progress)?;
     let best = in_sample
         .best
         .as_ref()
@@ -1177,7 +1275,15 @@ pub fn out_of_sample_with_references(
         close_at_end: true,
         ..with_params(base, &best.config.params)
     };
-    let out_of_sample = run_with_references(&oos_config, bars, asks, funding, references, series)?;
+    let out_of_sample = run_with_traded(
+        &oos_config,
+        bars,
+        asks,
+        funding,
+        references,
+        series,
+        also_traded,
+    )?;
 
     let degradation = degradation(
         spec.sweep.objective.metric,
@@ -1187,8 +1293,14 @@ pub fn out_of_sample_with_references(
     Ok(OosResult {
         spec: spec.clone(),
         engine_version: env!("CARGO_PKG_VERSION").to_string(),
-        data_fingerprint: config_fingerprint_with_references(
-            base, bars, asks, funding, references, series,
+        data_fingerprint: config_fingerprint_with_traded(
+            base,
+            bars,
+            asks,
+            funding,
+            references,
+            series,
+            also_traded,
         )?,
         split_at,
         in_sample,
@@ -1456,6 +1568,30 @@ pub fn walk_forward_with_references(
     given_series: &[Series],
     progress: Option<Progress>,
 ) -> Result<WalkForwardResult, TesterError> {
+    walk_forward_with_traded(
+        spec,
+        bars,
+        asks,
+        funding,
+        references,
+        given_series,
+        &[],
+        progress,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn walk_forward_with_traded(
+    spec: &WalkForwardSpec,
+    bars: &[Candle],
+    asks: &[Candle],
+    funding: &[(Millis, f64)],
+    references: &[ReferenceBars],
+    given_series: &[Series],
+    also_traded: &[AlsoTradedBars],
+    progress: Option<Progress>,
+) -> Result<WalkForwardResult, TesterError> {
+    let data = (bars, asks, funding, references, given_series, also_traded);
     let base = &spec.sweep.base;
     refuse_base_warmup(&spec.sweep)?;
     let plan = Plan::new(&spec.sweep)?;
@@ -1496,16 +1632,7 @@ pub fn walk_forward_with_references(
             Some(report) => report(offset + done, total),
             None => ControlFlow::Continue(()),
         };
-        let swept = sweep_planned(
-            &train,
-            &plan,
-            bars,
-            asks,
-            funding,
-            references,
-            given_series,
-            Some(&window_progress),
-        )?;
+        let swept = sweep_planned(&train, &plan, data, Some(&window_progress))?;
         let best = swept.best.ok_or(TesterError::NoQualifyingRun {
             min_trades: spec.sweep.min_trades,
             window: Some(k),
@@ -1524,13 +1651,14 @@ pub fn walk_forward_with_references(
             test_to,
             params: best.config.params,
             in_sample: Headline::new(&best.metrics),
-            out_of_sample: run_with_references(
+            out_of_sample: run_with_traded(
                 &test_config,
                 bars,
                 asks,
                 funding,
                 references,
                 given_series,
+                also_traded,
             )?,
         });
     }
@@ -1554,13 +1682,14 @@ pub fn walk_forward_with_references(
     Ok(WalkForwardResult {
         spec: spec.clone(),
         engine_version: env!("CARGO_PKG_VERSION").to_string(),
-        data_fingerprint: config_fingerprint_with_references(
+        data_fingerprint: config_fingerprint_with_traded(
             base,
             bars,
             asks,
             funding,
             references,
             given_series,
+            also_traded,
         )?,
         windows: results,
         equity,
@@ -2122,7 +2251,9 @@ fn stitched_report(base: &BacktestConfig, runs: &[Segment], sizing: Sizing) -> S
     let cash = base.starting_cash;
     let segments: Vec<&[EquityPoint]> = runs.iter().map(|r| r.equity).collect();
     let scales = segment_factors(cash, &segments, sizing);
-    let lot = base.instrument.lot_size;
+    let traded: Vec<_> = std::iter::once(&base.instrument)
+        .chain(&base.also_traded)
+        .collect();
     let points = segments.iter().map(|s| s.len()).sum();
     let mut equity: Vec<EquityPoint> = Vec::with_capacity(points);
     let mut positions = Vec::with_capacity(points);
@@ -2155,25 +2286,36 @@ fn stitched_report(base: &BacktestConfig, runs: &[Segment], sizing: Sizing) -> S
         if let Some(last) = equity.last() {
             level = last.equity;
         }
-        // The position after each bar's fills, rebuilt from the fills (a fill's time is the open
-        // time of the bar it filled on) and snapped to the lot size against rounding error.
-        let mut position = 0.0;
+        // The position in each instrument after each bar's fills, rebuilt from the fills (a fill's
+        // time is the open time of the bar it filled on) and snapped to its lot size against
+        // rounding error.
+        let mut position = vec![0.0; traded.len()];
         let mut next = 0;
         for p in r.equity {
             while next < r.fills.len() && r.fills[next].time <= p.time {
                 let f = &r.fills[next];
-                position += match f.side {
+                let k = traded.iter().position(|i| i.id == f.instrument);
+                position[k.unwrap_or(0)] += match f.side {
                     Side::Buy => f.qty,
                     Side::Sell => -f.qty,
                 };
                 next += 1;
             }
-            let snapped = if lot > 0.0 {
-                (position / lot).round() * lot
-            } else {
-                position
+            let snapped = |k: usize| {
+                let lot = traded[k].lot_size;
+                if lot > 0.0 {
+                    (position[k] / lot).round() * lot
+                } else {
+                    position[k]
+                }
             };
-            positions.push(snapped * s);
+            positions.push(if base.also_traded.is_empty() {
+                snapped(0) * s
+            } else if s != 0.0 && (0..traded.len()).any(|k| snapped(k) != 0.0) {
+                1.0
+            } else {
+                0.0
+            });
         }
         if s == 0.0 {
             continue;
@@ -2715,6 +2857,58 @@ mod tests {
     }
 
     #[test]
+    fn a_stitched_bar_is_in_the_market_when_any_traded_instrument_is_held_at_its_own_lot_size() {
+        let first = hourly_config().instrument;
+        let other = td_core::Instrument {
+            id: td_core::InstrumentId {
+                symbol: "OTHERUSDT".into(),
+                ..first.id.clone()
+            },
+            base: "OTHER".into(),
+            lot_size: 0.0001,
+            min_qty: 0.0001,
+            ..first.clone()
+        };
+        let base = BacktestConfig {
+            also_traded: vec![other.clone()],
+            ..hourly_config()
+        };
+        let fill = |instrument: &td_core::Instrument, side: Side, time: Millis, qty: f64| Fill {
+            order_id: td_core::OrderId(1),
+            instrument: instrument.id.clone(),
+            side,
+            time,
+            price: 100.0,
+            qty,
+            fee: 0.0,
+            liquidity: td_core::Liquidity::Taker,
+            close_out: false,
+        };
+        let fills = [
+            fill(&first, Side::Buy, 1, 1.0),
+            fill(&other, Side::Sell, 1, 1.0),
+            fill(&first, Side::Sell, 3, 1.0),
+            fill(&other, Side::Buy, 3, 1.0),
+            fill(&other, Side::Buy, 4, 0.0002),
+            fill(&other, Side::Sell, 5, 0.0002),
+        ];
+        let equity: Vec<EquityPoint> = (0..6).map(|t| point(t, 10_000.0)).collect();
+        let runs = [Segment {
+            equity: &equity,
+            ranges: &[],
+            peak_leverage: None,
+            exposures: None,
+            fills: &fills,
+            trades: &[],
+            funding_paid: 0.0,
+        }];
+        for sizing in [Sizing::Compounding, Sizing::FixedSize] {
+            let metrics = stitched_report(&base, &runs, sizing).metrics;
+            assert_eq!(metrics.exposure, Some(0.5));
+        }
+    }
+
+    #[test]
     fn stitching_for_a_fixed_size_adds_each_window_from_where_the_last_ended() {
         let range = |low: f64, high: f64| EquityRange { low, high };
         // Each window is its own backtest from 100. The first gains 20; the second dips to 90
@@ -3094,5 +3288,220 @@ mod tests {
             sample_indices(1_000_000, 50, 1),
             sample_indices(1_000_000, 50, 2)
         );
+    }
+
+    mod several {
+        use super::*;
+        use crate::strategies::test_only::{
+            FIRST_SHAPE_TO_SECOND, PAIR_GAP_BAR, PAIR_STEP, PAIRS_SEEN, RECORDS_PAIRS, TRADES_BOTH,
+            pair_bars, pair_config, pair_data, pair_second,
+        };
+
+        const BARS: i64 = 120;
+        const PARAM_SETS: usize = 2;
+
+        fn pair_sweep(strategy: &str) -> SweepSpec {
+            SweepSpec {
+                base: pair_config(strategy, BARS),
+                axes: vec![ParamAxis {
+                    name: "qty".into(),
+                    space: ParamSpace::Values {
+                        values: vec![ParamValue::Float(1.0), ParamValue::Float(2.0)],
+                    },
+                }],
+                mode: SweepMode::Grid,
+                objective: Objective {
+                    metric: Metric::TotalReturn,
+                    direction: Direction::Maximize,
+                },
+                min_trades: 0,
+            }
+        }
+
+        fn second_fills(r: &BacktestResult) -> usize {
+            let id = pair_second().id;
+            r.fills.iter().filter(|f| f.instrument == id).count()
+        }
+
+        fn with_second_scaled(also: &[AlsoTradedBars], by: f64) -> Vec<AlsoTradedBars> {
+            let scale = |b: &Candle| Candle {
+                open: b.open * by,
+                high: b.high * by,
+                low: b.low * by,
+                close: b.close * by,
+                ..*b
+            };
+            also.iter()
+                .map(|g| AlsoTradedBars {
+                    bars: g.bars.iter().map(scale).collect(),
+                    ..g.clone()
+                })
+                .collect()
+        }
+
+        #[test]
+        fn a_walk_forward_with_two_instruments_tests_each_window_as_one_run_over_it() {
+            let (bars, also) = pair_data(BARS);
+            let spec = WalkForwardSpec {
+                sweep: pair_sweep(TRADES_BOTH),
+                windows: WindowSpec {
+                    train_bars: 24,
+                    test_bars: 12,
+                    step_bars: 12,
+                    mode: WindowMode::Rolling,
+                },
+            };
+            let wf =
+                walk_forward_with_traded(&spec, &bars, &[], &[], &[], &[], &also, None).unwrap();
+            assert!(wf.windows.len() >= 3, "{} windows", wf.windows.len());
+            for w in &wf.windows {
+                let alone =
+                    run_with_traded(&w.out_of_sample.config, &bars, &[], &[], &[], &[], &also)
+                        .unwrap();
+                assert_eq!(
+                    w.out_of_sample.fills, alone.fills,
+                    "window from {}",
+                    w.test_from
+                );
+                assert!(
+                    second_fills(&alone) > 0,
+                    "window from {} trades the second instrument",
+                    w.test_from
+                );
+            }
+            let base = &spec.sweep.base;
+            let fingerprint =
+                config_fingerprint_with_traded(base, &bars, &[], &[], &[], &[], &also).unwrap();
+            assert_eq!(wf.data_fingerprint, fingerprint);
+            assert!(walk_forward(&spec, &bars, &[], &[], None).is_err());
+        }
+
+        #[test]
+        fn a_sweep_and_an_out_of_sample_run_trade_the_second_instruments_bars() {
+            let (bars, also) = pair_data(BARS);
+            let moved = with_second_scaled(&also, 1.5);
+            let spec = pair_sweep(TRADES_BOTH);
+            let swept = |also: &[AlsoTradedBars]| {
+                let r = sweep_with_traded(&spec, &bars, &[], &[], &[], &[], also, None).unwrap();
+                r.best.expect("a qualifying run")
+            };
+            let (best, best_moved) = (swept(&also), swept(&moved));
+            assert!(second_fills(&best) > 0);
+            assert_ne!(best.metrics.total_return, best_moved.metrics.total_return);
+
+            let oos = OosSpec {
+                sweep: spec.clone(),
+                split: Split::Fraction(0.5),
+            };
+            let split = |also: &[AlsoTradedBars]| {
+                out_of_sample_with_traded(&oos, &bars, &[], &[], &[], &[], also, None)
+                    .unwrap()
+                    .out_of_sample
+            };
+            let (out, out_moved) = (split(&also), split(&moved));
+            assert!(second_fills(&out) > 0);
+            assert_ne!(out.metrics.total_return, out_moved.metrics.total_return);
+            assert!(sweep(&spec, &bars, &[], &[], None).is_err());
+            assert!(out_of_sample(&oos, &bars, &[], &[], None).is_err());
+        }
+
+        #[test]
+        fn the_luck_test_moves_both_instruments_bars_of_one_time_together() {
+            let (bars, also) = pair_data(BARS);
+            let spec = PermutationSpec {
+                sweep: pair_sweep(RECORDS_PAIRS),
+                permutations: 5,
+                seed: 3,
+            };
+            PAIRS_SEEN.lock().unwrap().clear();
+            let result =
+                permutation_test_with_traded(&spec, &bars, &[], &[], &[], &[], &also, None)
+                    .unwrap();
+            let seen = std::mem::take(&mut *PAIRS_SEEN.lock().unwrap());
+            let runs = PARAM_SETS * (spec.permutations + 1);
+            assert!(
+                seen.len() >= runs * (BARS as usize - 2),
+                "{} pairs",
+                seen.len()
+            );
+            for (first, second) in seen {
+                assert!(
+                    (second - FIRST_SHAPE_TO_SECOND * first).abs() < 1e-9,
+                    "a pair that never stood together: {first} and {second}"
+                );
+            }
+            assert!(
+                result.permuted_best.windows(2).any(|w| w[0] != w[1]),
+                "the copies are shuffled"
+            );
+        }
+
+        #[test]
+        fn with_start_when_all_listed_the_luck_tests_copies_trade_the_real_runs_range() {
+            const LISTED_BAR: i64 = 40;
+            let flat = |k: i64, price: f64| Candle {
+                open_time: k * PAIR_STEP,
+                open: price,
+                high: price * 1.001,
+                low: price * 0.999,
+                close: price,
+                volume: 1.0,
+                quote_volume: price,
+            };
+            let (shaped_before_listing, _) = pair_bars(LISTED_BAR, 1_000.0);
+            let mut bars = shaped_before_listing;
+            bars.extend((LISTED_BAR..BARS).map(|k| flat(k, 1_000.0)));
+            let also = vec![AlsoTradedBars {
+                instrument: pair_second().id,
+                bars: (LISTED_BAR..BARS).map(|k| flat(k, 500.0)).collect(),
+                funding: Vec::new(),
+            }];
+            let mut sweep = pair_sweep(TRADES_BOTH);
+            sweep.base.start_when_all_listed = true;
+            let spec = PermutationSpec {
+                sweep,
+                permutations: 5,
+                seed: 3,
+            };
+            let result =
+                permutation_test_with_traded(&spec, &bars, &[], &[], &[], &[], &also, None)
+                    .unwrap();
+            assert!(
+                result
+                    .permuted_best
+                    .iter()
+                    .all(|best| *best == Some(result.real_best)),
+                "the real run's {} against the copies' {:?}",
+                result.real_best,
+                result.permuted_best
+            );
+        }
+
+        #[test]
+        fn a_shuffled_copy_has_no_second_instrument_bar_where_the_first_has_none() {
+            let (bars, also) = pair_data(BARS);
+            let base = pair_config(TRADES_BOTH, BARS);
+            let shuffled_from = 5 * PAIR_STEP;
+            let originals: Vec<Candle> = bars
+                .iter()
+                .filter(|b| b.open_time >= shuffled_from)
+                .copied()
+                .collect();
+            let slots = traded_slots(&base, &originals, &also);
+            let shuffled = slots.iter().map(|(_, s)| s.clone()).collect();
+            let copy = traded_copy(&slots, shuffled, shuffled_from..base.to);
+            let times: Vec<Millis> = copy[0].bars.iter().map(|b| b.open_time).collect();
+            let gap = PAIR_GAP_BAR * PAIR_STEP;
+            assert!(
+                !times.contains(&gap),
+                "the second instrument's bar in the gap"
+            );
+            assert!(
+                times.contains(&0),
+                "a bar before the shuffled range is kept"
+            );
+            assert_eq!(times.len(), BARS as usize - 1);
+            assert_eq!(copy[0].funding, also[0].funding);
+        }
     }
 }

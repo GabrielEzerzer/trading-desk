@@ -9,7 +9,7 @@ use td_core::{
 
 use crate::broker::ENTRY_CANCELLED;
 use crate::risk::{EquityRange, Exposure};
-use crate::runner::{default_slippage_bps, match_asks};
+use crate::runner::match_asks;
 use crate::{
     BarFunding, Broker, BrokerEvent, CandleFillModel, Context, EngineError, Order, OrderStatus,
     Portfolio, Series, SeriesRow, SimBroker, Strategy, TradeStops,
@@ -162,6 +162,7 @@ pub(crate) struct LegData {
     /// Its funding events from the first bar fed to the last traded bar's close, by time.
     pub(crate) funding: Vec<(Millis, f64)>,
     pub(crate) listed_from: Option<Millis>,
+    pub(crate) slippage_bps: f64,
 }
 
 impl Leg {
@@ -405,7 +406,7 @@ impl Session {
 
     /// Gives the session the instruments a run trades beside the first, in its order, with their
     /// bars and funding already checked (see [`crate::run_with_traded`]). Each trades on the
-    /// simulated broker with its own fees and its default slippage, in the one account. Called
+    /// simulated broker with its own fees and slippage, in the one account. Called
     /// once, before the first bar; refuses a call after a bar was fed or instruments were named.
     /// With `keep_exposures` the session keeps every reading of the account with a position open
     /// ([`Session::exposures`]).
@@ -424,7 +425,7 @@ impl Session {
             .into_iter()
             .map(|leg| {
                 let model = CandleFillModel {
-                    slippage_bps: default_slippage_bps(&leg.instrument),
+                    slippage_bps: leg.slippage_bps,
                 };
                 let fees = leg.instrument.fees;
                 Leg {

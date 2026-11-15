@@ -819,6 +819,7 @@ mod tests {
                 plan: &plan,
                 rule,
                 instrument: &instrument,
+                also_traded: &[],
                 seed: 5,
             };
             crate::run_battery_with_references(&spec, &bars, &[], &[], &[], given, None)
@@ -842,6 +843,7 @@ mod tests {
             plan: &plan,
             rule: &entry.rule,
             instrument: &instrument,
+            also_traded: &[],
             seed: 5,
         };
         let record =

@@ -2433,6 +2433,7 @@ impl Rig {
             code_hash: td_engine::code_hash(LINKED).map(String::from),
             references,
             series,
+            also_traded: Vec::new(),
         };
         let dir = self.data().join(td_engine::RUNS_DIR).join(run_id);
         fs::create_dir_all(&dir).expect("run folder");

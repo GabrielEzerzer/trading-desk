@@ -400,6 +400,7 @@ fn battery_spec<'a>(entry: &'a StrategyEntry, instrument: &'a Instrument) -> Bat
         plan: &entry.plan,
         rule: &entry.rule,
         instrument,
+        also_traded: &[],
         seed: plan_seed(entry.name, &instrument.id),
     }
 }
@@ -431,6 +432,7 @@ fn save_plan_run(
             .map(|r| r.instrument.clone())
             .collect(),
         series: data.series.iter().map(|s| s.name.clone()).collect(),
+        also_traded: Vec::new(),
     };
     let run = PlanRun::with_references(
         &battery_spec(entry, instrument),
@@ -562,6 +564,7 @@ mod tests {
             code_hash: td_engine::code_hash(entry.name).map(String::from),
             references,
             series,
+            also_traded: Vec::new(),
         };
         let dir = runs_dir.join(run_id);
         fs::create_dir_all(&dir).unwrap();

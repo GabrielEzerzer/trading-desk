@@ -439,12 +439,37 @@ pub fn run_with_traded(
         references,
         series,
         also_traded,
+        1.0,
+        || build_strategy(&config.strategy, &config.params),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_with_traded_slippage(
+    config: &BacktestConfig,
+    bars: &[Candle],
+    asks: &[Candle],
+    funding: &[(Millis, f64)],
+    references: &[ReferenceBars],
+    series: &[Series],
+    also_traded: &[AlsoTradedBars],
+    slippage_scale: f64,
+) -> Result<BacktestResult, EngineError> {
+    run_built_with(
+        config,
+        bars,
+        asks,
+        funding,
+        references,
+        series,
+        also_traded,
+        slippage_scale,
         || build_strategy(&config.strategy, &config.params),
     )
 }
 
 /// The open position at each point [`risk::intrabar`] evaluates in the backtest
-/// [`run_with_references`] makes ([`risk::Intrabar::exposures`]), which its result does not keep:
+/// [`run_with_traded`] makes ([`risk::Intrabar::exposures`]), which its result does not keep:
 /// for reading the leverage and notional of an account that holds the run's position on another
 /// balance.
 pub(crate) fn run_exposures(
@@ -454,6 +479,7 @@ pub(crate) fn run_exposures(
     funding: &[(Millis, f64)],
     references: &[ReferenceBars],
     series: &[Series],
+    also_traded: &[AlsoTradedBars],
 ) -> Result<Vec<Exposure>, EngineError> {
     let sim = simulate(
         config,
@@ -462,8 +488,9 @@ pub(crate) fn run_exposures(
         funding,
         references,
         series,
-        &[],
+        also_traded,
         true,
+        1.0,
         || build_strategy(&config.strategy, &config.params),
     )?;
     Ok(sim.intrabar.exposures)
@@ -520,6 +547,7 @@ pub fn run_strategy_with_traded(
         references,
         series,
         also_traded,
+        1.0,
         || Ok(strategy),
     )
 }
@@ -533,6 +561,7 @@ pub(crate) fn run_metrics(
     funding: &[(Millis, f64)],
     references: &[ReferenceBars],
     series: &[Series],
+    also_traded: &[AlsoTradedBars],
 ) -> Result<MetricsReport, EngineError> {
     let sim = simulate(
         config,
@@ -541,8 +570,9 @@ pub(crate) fn run_metrics(
         funding,
         references,
         series,
-        &[],
+        also_traded,
         false,
+        1.0,
         || build_strategy(&config.strategy, &config.params),
     )?;
     Ok(sim.report)
@@ -559,7 +589,17 @@ pub(crate) fn run_built(
     series: &[Series],
     build: impl FnOnce() -> Result<Box<dyn Strategy>, EngineError>,
 ) -> Result<BacktestResult, EngineError> {
-    run_built_with(config, bars, asks, funding, references, series, &[], build)
+    run_built_with(
+        config,
+        bars,
+        asks,
+        funding,
+        references,
+        series,
+        &[],
+        1.0,
+        build,
+    )
 }
 
 /// [`run_built`] with the bars and funding of the instruments traded beside the first.
@@ -572,6 +612,7 @@ fn run_built_with(
     references: &[ReferenceBars],
     series: &[Series],
     also_traded: &[AlsoTradedBars],
+    slippage_scale: f64,
     build: impl FnOnce() -> Result<Box<dyn Strategy>, EngineError>,
 ) -> Result<BacktestResult, EngineError> {
     let Simulated {
@@ -600,6 +641,7 @@ fn run_built_with(
         series,
         also_traded,
         false,
+        slippage_scale,
         build,
     )?;
     let benchmark = benchmark(
@@ -685,13 +727,17 @@ fn simulate<'a>(
     series: &'a [Series],
     also_traded: &[AlsoTradedBars],
     keep_exposures: bool,
+    slippage_scale: f64,
     build: impl FnOnce() -> Result<Box<dyn Strategy>, EngineError>,
 ) -> Result<Simulated<'a>, EngineError> {
     let started = start_config(config, bars, also_traded)?;
     let config: &BacktestConfig = &started;
     let (warmup, traded) = select_bars(config, bars)?;
     let references = align_used(config, &warmup, &traded, references)?;
-    let legs = align_traded(config, &warmup, &traded, also_traded)?;
+    let mut legs = align_traded(config, &warmup, &traded, also_traded)?;
+    for leg in &mut legs {
+        leg.slippage_bps *= slippage_scale;
+    }
     let named = named_series(config, &warmup, &traded, series)?;
     let warmup_asks = match_asks(config.instrument.id.kind, bars, asks, &warmup)?;
     let traded_asks = match_asks(config.instrument.id.kind, bars, asks, &traded)?;
@@ -812,7 +858,7 @@ fn simulate<'a>(
 /// every instrument given in `also_traded` has had a bar, with the bars from `warmup_from` (or
 /// `from`) up to there as warm-up bars. `config` itself when that is not set. Refuses a range in
 /// which no bar time is left.
-fn start_config<'c>(
+pub(crate) fn start_config<'c>(
     config: &'c BacktestConfig,
     bars: &[Candle],
     also_traded: &[AlsoTradedBars],
@@ -912,6 +958,7 @@ fn align_traded(
         }
         funding.retain(|&(time, _)| (start..hi + tf.duration_ms()).contains(&time));
         legs.push(LegData {
+            slippage_bps: default_slippage_bps(inst),
             instrument: inst.clone(),
             bars,
             funding,
@@ -1260,7 +1307,17 @@ pub fn rerun(
     asks: &[Candle],
     funding: &[(Millis, f64)],
 ) -> Result<Rerun, EngineError> {
-    let result = run(&saved.config, bars, asks, funding)?;
+    rerun_with_traded(saved, bars, asks, funding, &[])
+}
+
+pub fn rerun_with_traded(
+    saved: &BacktestResult,
+    bars: &[Candle],
+    asks: &[Candle],
+    funding: &[(Millis, f64)],
+    also_traded: &[AlsoTradedBars],
+) -> Result<Rerun, EngineError> {
+    let result = run_with_traded(&saved.config, bars, asks, funding, &[], &[], also_traded)?;
     let fingerprint_matches = result.data_fingerprint == saved.data_fingerprint;
     let engine_matches = result.engine_revision == saved.engine_revision;
     Ok(Rerun {
@@ -1639,6 +1696,23 @@ mod tests {
     const HOUR: Millis = 3_600_000;
 
     #[test]
+    fn a_run_with_two_instruments_reruns_on_the_same_data_with_the_same_fingerprint() {
+        use crate::strategies::test_only::{TRADES_BOTH, pair_config, pair_data};
+        const BARS: i64 = 120;
+        let (bars, also) = pair_data(BARS);
+        let mut config = pair_config(TRADES_BOTH, BARS);
+        config.params = Params::new().with("qty", crate::ParamValue::Float(1.0));
+        let saved = run_with_traded(&config, &bars, &[], &[], &[], &[], &also).unwrap();
+        let again = rerun_with_traded(&saved, &bars, &[], &[], &also).unwrap();
+        assert!(again.fingerprint_matches && again.engine_matches);
+        assert_eq!(again.result, saved);
+        let mut moved = also.clone();
+        moved[0].bars[10].volume += 1.0;
+        let changed = rerun_with_traded(&saved, &bars, &[], &[], &moved).unwrap();
+        assert!(!changed.fingerprint_matches);
+    }
+
+    #[test]
     fn run_metrics_reports_what_run_reports() {
         let bars: Vec<Candle> = (0..300)
             .map(|i| {
@@ -1697,7 +1771,7 @@ mod tests {
         let full = run(&config, &bars, &[], &funding).unwrap();
         assert!(full.metrics.trades > 2, "{:?}", full.metrics);
         assert_eq!(
-            run_metrics(&config, &bars, &[], &funding, &[], &[]).unwrap(),
+            run_metrics(&config, &bars, &[], &funding, &[], &[], &[]).unwrap(),
             full.metrics
         );
 
@@ -1709,7 +1783,7 @@ mod tests {
             "{refused:?}"
         );
         assert_eq!(
-            run_metrics(&config, &bars, &[], &funding, &[], &[])
+            run_metrics(&config, &bars, &[], &funding, &[], &[], &[])
                 .unwrap_err()
                 .to_string(),
             refused.to_string()
