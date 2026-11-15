@@ -661,6 +661,8 @@ impl Sessions {
             references: config.references.clone(),
             // A paper session cannot start from a verdict judged with a series.
             series: Vec::new(),
+            also_traded: Vec::new(),
+            start_when_all_listed: false,
         };
         let result = td_engine::run_with_references(&backtest, &bars, &[], &due, &references, &[]);
         let result = result.map_err(|e| {

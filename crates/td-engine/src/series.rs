@@ -196,6 +196,10 @@ fn check_rows(name: &str, rows: &[SeriesRow]) -> Result<(), EngineError> {
 ///
 /// The end of the range is not checked: a series can be irregular, so a value missing later on
 /// cannot be told from one that was never published.
+///
+/// In a run with several traded instruments ([`BacktestConfig::also_traded`]) `first_close` is
+/// instead the close of the last traded bar: a series may start inside the range there, and the
+/// strategy reads it as empty until its first row is known.
 pub(crate) fn named<'a>(
     config: &BacktestConfig,
     first_close: Millis,
@@ -223,6 +227,12 @@ pub(crate) fn named<'a>(
         };
         check_rows(name, &s.rows)?;
         if s.rows.first().is_none_or(|r| r.known_at > first_close) {
+            if !config.also_traded.is_empty() {
+                return Err(EngineError::SeriesData(format!(
+                    "series {name} has no row known at or before {first_close}, the close of the \
+                     last traded bar, so the strategy could never read it"
+                )));
+            }
             return Err(EngineError::SeriesData(format!(
                 "series {name} has no row known at or before {first_close}, the close of the \
                  first bar the strategy sees, so it does not cover the start of the range"

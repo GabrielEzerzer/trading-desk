@@ -1242,6 +1242,7 @@ mod tests {
             force_closed,
             net_pips: None,
             pips: None,
+            instrument: None,
         }
     }
 

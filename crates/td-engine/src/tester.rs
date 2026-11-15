@@ -2324,6 +2324,8 @@ mod tests {
                     account_currency: td_core::AccountCurrency::Quote,
                     references: Vec::new(),
                     series: Vec::new(),
+                    also_traded: Vec::new(),
+                    start_when_all_listed: false,
                 },
                 axes: vec![ParamAxis {
                     name: "hour".into(),
@@ -2405,6 +2407,8 @@ mod tests {
                     account_currency: td_core::AccountCurrency::Quote,
                     references: Vec::new(),
                     series: Vec::new(),
+                    also_traded: Vec::new(),
+                    start_when_all_listed: false,
                 },
                 axes: vec![ParamAxis {
                     name: "slow".into(),
@@ -2679,6 +2683,8 @@ mod tests {
             account_currency: td_core::AccountCurrency::Quote,
             references: Vec::new(),
             series: Vec::new(),
+            also_traded: Vec::new(),
+            start_when_all_listed: false,
         }
     }
 

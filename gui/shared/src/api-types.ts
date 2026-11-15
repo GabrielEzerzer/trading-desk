@@ -242,7 +242,27 @@ references?: Array<InstrumentId>,
  * read are part of the data fingerprint. Left out of the saved result when there are none,
  * the default.
  */
-series?: Array<string>, };
+series?: Array<string>, 
+/**
+ * The instruments traded beside `instrument`, which stays the first: in a run that names
+ * any, the strategy is called on the first instrument's bar times and can order any of
+ * them, and they share one account (see the README, "Several traded instruments"). Their
+ * bars and funding are given to the run with [`run_with_traded`] and are part of the data
+ * fingerprint. Every traded instrument must then be a perpetual on `instrument`'s venue in
+ * its quote currency, on a quote account ([`BacktestConfig::check_traded`]). Each is charged
+ * its own fees and its default slippage ([`default_slippage_bps`]); `fee_override` and
+ * `slippage_bps` are the first instrument's. Left out of the saved result when there are
+ * none, the default.
+ */
+also_traded?: Array<Instrument>, 
+/**
+ * When set, the run starts trading at the first of `instrument`'s bar times, at or after
+ * `from`, by which every traded instrument has had a bar, counting the bars given to the run
+ * before its range. The first instrument's bars from `warmup_from` (or `from`) up to then are
+ * warm-up bars: the strategy sees them but cannot trade. Left out of the saved result when it
+ * is not set, the default.
+ */
+start_when_all_listed?: boolean, };
 
 export type BacktestResult = { config: BacktestConfig, 
 /**
@@ -470,7 +490,13 @@ pips?: number | null,
  * one price, `pips - net_pips` is the commission in pips; on a base account with exits at
  * different prices it is not, since each exit's P&L is converted at its own price.
  */
-net_pips?: number | null, };
+net_pips?: number | null, 
+/**
+ * The instrument the trade was in, in a run with several traded instruments
+ * ([`crate::BacktestConfig::also_traded`]), whose trades are built per instrument. `None`, and
+ * left out of saved JSON, in a run with one.
+ */
+instrument?: InstrumentId | null, };
 
 export type TradeSide = "long" | "short";
 
@@ -3067,7 +3093,13 @@ pips?: number | null,
  * one price, `pips - net_pips` is the commission in pips; on a base account with exits at
  * different prices it is not, since each exit's P&L is converted at its own price.
  */
-net_pips?: number | null, };
+net_pips?: number | null, 
+/**
+ * The instrument the trade was in, in a run with several traded instruments
+ * ([`crate::BacktestConfig::also_traded`]), whose trades are built per instrument. `None`, and
+ * left out of saved JSON, in a run with one.
+ */
+instrument?: InstrumentId | null, };
 
 /**
  * `POST /sessions/{id}/orders`: an order placed by hand. It goes through the same rounding,

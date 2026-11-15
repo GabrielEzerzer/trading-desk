@@ -8,7 +8,8 @@ use td_core::{
 };
 
 use crate::broker::ENTRY_CANCELLED;
-use crate::runner::match_asks;
+use crate::risk::{EquityRange, Exposure};
+use crate::runner::{default_slippage_bps, match_asks};
 use crate::{
     BarFunding, Broker, BrokerEvent, CandleFillModel, Context, EngineError, Order, OrderStatus,
     Portfolio, Series, SeriesRow, SimBroker, Strategy, TradeStops,
@@ -96,6 +97,106 @@ pub struct Session {
     trade_stops: Vec<TradeStops>,
     /// The reason the strategy stopped the run on the bar being fed ([`Context::fail`]).
     failure: Option<String>,
+    /// The instruments traded beside the first, in a run with several; empty otherwise, and then
+    /// nothing below is used. See [`Session::name_also_traded`].
+    legs: Vec<Leg>,
+    /// The stops of the last trade each traded instrument opened since the last bar time the
+    /// strategy was called on, first instrument first, until the strategy has handled that bar.
+    opened: Vec<Option<TradeStops>>,
+    /// The account's lowest and highest equity so far in the bar time being fed.
+    step: Option<EquityRange>,
+    /// The account's equity range in each live bar, read as [`Session::trade_time`] describes.
+    ranges: Vec<EquityRange>,
+    /// The account's gross notional and equity at each point read with a position open, when
+    /// `keep_exposures` asks for them.
+    exposures: Vec<Exposure>,
+    keep_exposures: bool,
+    /// The highest gross notional over equity at any point read with a position open and equity
+    /// above zero; 0 before any.
+    peak_leverage: f64,
+    /// The open time of the first instrument's bar being fed. Every reading taken while it is fed
+    /// joins that bar's equity point and range, those at other instruments' bars before it
+    /// included, so each [`Exposure`] is stamped with it, as with one instrument.
+    stamp: Millis,
+}
+
+/// One instrument traded beside the first in a run with several
+/// ([`crate::BacktestConfig::also_traded`]). Its book holds its position, its fees and its
+/// funding; the account's balance is in the first instrument's book, so whatever moves this
+/// book's balance is moved there at once. It pays the instrument's own fees: the run's fee
+/// override is the first instrument's.
+pub(crate) struct Leg {
+    pub(crate) instrument: Instrument,
+    pub(crate) broker: Box<dyn Broker>,
+    pub(crate) portfolio: Portfolio,
+    /// Its bars not yet fed, oldest first.
+    upcoming: VecDeque<Candle>,
+    /// Its bar at each of the first instrument's bar times fed, warm-up included, or `None`: what
+    /// [`Context::bars_of`] shows.
+    pub(crate) slots: Vec<Option<Candle>>,
+    /// The close of the latest of its bars fed, at one of the first instrument's bar times or not.
+    pub(crate) last_close: Option<f64>,
+    /// Every bar it traded on, in time order, and the funding charged on each: what its trades
+    /// are built from.
+    pub(crate) traded: Vec<Candle>,
+    pub(crate) bar_funding: Vec<BarFunding>,
+    /// Its funding events from the first bar fed on, by time. The first `shown` are those settled
+    /// before the close of the first instrument's last bar fed ([`Context::funding_of`]); the
+    /// first `passed` have been charged on one of its bars, or passed over before the run traded.
+    pub(crate) funding: Vec<(Millis, f64)>,
+    pub(crate) shown: usize,
+    passed: usize,
+    pub(crate) trade_stops: Vec<TradeStops>,
+    /// The open time of its first bar given to the run, before its range included.
+    pub(crate) listed_from: Option<Millis>,
+}
+
+/// What a run gives a session for each instrument traded beside the first
+/// ([`Session::name_also_traded`]).
+#[derive(Debug, Clone)]
+pub(crate) struct LegData {
+    pub(crate) instrument: Instrument,
+    /// Its bars the run uses, in time order: those at the first instrument's bar times, warm-up
+    /// included, and those inside the traded range at times the first instrument has no bar.
+    pub(crate) bars: Vec<Candle>,
+    /// Its funding events from the first bar fed to the last traded bar's close, by time.
+    pub(crate) funding: Vec<(Millis, f64)>,
+    pub(crate) listed_from: Option<Millis>,
+}
+
+impl Leg {
+    /// Takes its bar opening at `time` if that is the next one, after passing over any before it.
+    fn take_bar(&mut self, time: Millis, step: Millis) -> Option<Candle> {
+        while self.upcoming.front().is_some_and(|b| b.open_time < time) {
+            let bar = self.upcoming.pop_front().expect("checked");
+            self.pass(&bar, step);
+        }
+        let bar = self
+            .upcoming
+            .front()
+            .filter(|b| b.open_time == time)
+            .copied();
+        bar.inspect(|_| {
+            self.upcoming.pop_front();
+        })
+    }
+
+    /// Marks a bar fed before the run trades: its funding is passed over, uncharged, as the first
+    /// instrument's is on a warm-up bar.
+    fn pass(&mut self, bar: &Candle, step: Millis) {
+        self.bar_events(bar, step);
+        self.last_close = Some(bar.close);
+    }
+
+    /// Its funding events due in `bar`, or in the gap since its bar before, not yet charged.
+    fn bar_events(&mut self, bar: &Candle, step: Millis) -> Vec<(Millis, f64)> {
+        let end = bar.open_time + step;
+        let from = self.passed;
+        while self.passed < self.funding.len() && self.funding[self.passed].0 < end {
+            self.passed += 1;
+        }
+        self.funding[from..self.passed].to_vec()
+    }
 }
 
 impl Session {
@@ -180,6 +281,14 @@ impl Session {
             pending_series: Vec::new(),
             trade_stops: Vec::new(),
             failure: None,
+            legs: Vec::new(),
+            opened: Vec::new(),
+            step: None,
+            ranges: Vec::new(),
+            exposures: Vec::new(),
+            keep_exposures: false,
+            peak_leverage: 0.0,
+            stamp: 0,
         }
     }
 
@@ -294,6 +403,52 @@ impl Session {
         Ok(())
     }
 
+    /// Gives the session the instruments a run trades beside the first, in its order, with their
+    /// bars and funding already checked (see [`crate::run_with_traded`]). Each trades on the
+    /// simulated broker with its own fees and its default slippage, in the one account. Called
+    /// once, before the first bar; refuses a call after a bar was fed or instruments were named.
+    /// With `keep_exposures` the session keeps every reading of the account with a position open
+    /// ([`Session::exposures`]).
+    pub(crate) fn name_also_traded(
+        &mut self,
+        legs: Vec<LegData>,
+        keep_exposures: bool,
+    ) -> Result<(), EngineError> {
+        if !self.bars.is_empty() || !self.legs.is_empty() {
+            return Err(EngineError::InvalidTraded(
+                "traded instruments are named once, before the first bar".into(),
+            ));
+        }
+        let account = self.portfolio.account();
+        self.legs = legs
+            .into_iter()
+            .map(|leg| {
+                let model = CandleFillModel {
+                    slippage_bps: default_slippage_bps(&leg.instrument),
+                };
+                let fees = leg.instrument.fees;
+                Leg {
+                    broker: Box::new(SimBroker::new(leg.instrument.clone(), fees, model)),
+                    portfolio: Portfolio::new_in(leg.instrument.id.kind, 0.0, account),
+                    upcoming: leg.bars.into(),
+                    slots: Vec::new(),
+                    last_close: None,
+                    traded: Vec::new(),
+                    bar_funding: Vec::new(),
+                    funding: leg.funding,
+                    shown: 0,
+                    passed: 0,
+                    trade_stops: Vec::new(),
+                    listed_from: leg.listed_from,
+                    instrument: leg.instrument,
+                }
+            })
+            .collect();
+        self.opened = vec![None; self.legs.len() + 1];
+        self.keep_exposures = keep_exposures;
+        Ok(())
+    }
+
     /// Feeds a bar as [`Session::warm_up`] does when `warming_up`, and as
     /// [`Session::on_bar_with_ask`] does otherwise, with `references`: one slot per reference
     /// instrument [`Session::name_references`] named, in its order, holding that instrument's bar
@@ -307,6 +462,9 @@ impl Session {
         references: &[Option<Candle>],
         warming_up: bool,
     ) -> Result<(), EngineError> {
+        if !self.legs.is_empty() {
+            return self.feed_several(bar, ask, funding, references, warming_up);
+        }
         if warming_up {
             // Every live bar records an equity point.
             if !self.equity.is_empty() {
@@ -351,49 +509,13 @@ impl Session {
             .broker
             .on_bar(&bar, &ask_bar, &self.portfolio, &breached)
         {
-            match event {
-                BrokerEvent::Filled(fill) => {
-                    let before = self.portfolio.position();
-                    self.portfolio
-                        .apply_fill(fill.side, fill.qty, fill.price, fill.fee);
-                    let after = self.portfolio.position();
-                    resting.retain(|&(id, ..)| id != fill.order_id);
-                    // A fill that opens a position, from flat or by flipping it, starts a new
-                    // trade, which keeps its own stops apart from those of the trade before it.
-                    // `signum` of 0.0 is 1.0, so flat is checked on its own.
-                    if after != 0.0 && (before == 0.0 || after.signum() != before.signum()) {
-                        self.trade_stops.extend(opened.take());
-                        let mut stops = TradeStops {
-                            entry_time: fill.time,
-                            ..TradeStops::default()
-                        };
-                        for &(_, side, trigger) in &resting {
-                            stops.add(side, trigger);
-                        }
-                        opened = Some(stops);
-                    }
-                    let order = self.order_mut(fill.order_id);
-                    order.status = OrderStatus::Filled;
-                    if let Some(stops) = opened.as_mut() {
-                        add_stop(stops, order);
-                    }
-                    self.fills.push(fill);
-                }
-                BrokerEvent::Cancelled { id, reason } => {
-                    resting.retain(|&(resting_id, ..)| resting_id != id);
-                    self.order_mut(id).status = OrderStatus::Cancelled(reason);
-                }
-                BrokerEvent::Placed(order) => {
-                    if let Some(stops) = opened.as_mut() {
-                        add_stop(stops, &order);
-                    }
-                    if let Some((side, trigger)) = stop_of(&order) {
-                        resting.push((order.id, side, trigger));
-                    }
-                    let id = order.id;
-                    *self.order_mut(id) = order;
-                }
-            }
+            let book = Book {
+                portfolio: &mut self.portfolio,
+                orders: &mut self.orders,
+                fills: &mut self.fills,
+                trade_stops: &mut self.trade_stops,
+            };
+            book.record(event, &mut resting, &mut opened);
         }
         self.liquidate(&bar, funding);
         self.portfolio.write_off_shortfall();
@@ -433,6 +555,551 @@ impl Session {
             self.trade_stops.push(stops);
         }
         self.strategy_failure()
+    }
+
+    /// [`Session::feed`] in a run with several traded instruments ([`Session::name_also_traded`]):
+    /// the bar is the first instrument's, and the other instruments' bars come from what the run
+    /// gave. Each of their bars at a time before this bar, at which the first instrument has no
+    /// bar, is traded first, in time order, once the run trades (before then it is passed over):
+    /// funding, fills, liquidation and marks, without calling the strategy, whose `on_fill` sees
+    /// those fills on this bar, and whose equity range here includes them. Then this bar time is
+    /// traded for every instrument with a bar at it, the equity point recorded and the strategy
+    /// called, as [`Session::trade_time`] describes.
+    fn feed_several(
+        &mut self,
+        bar: Candle,
+        ask: Option<Candle>,
+        funding: &[(Millis, f64)],
+        references: &[Option<Candle>],
+        warming_up: bool,
+    ) -> Result<(), EngineError> {
+        if warming_up && !self.equity.is_empty() {
+            return Err(EngineError::WarmUpAfterLive);
+        }
+        self.check_bar(&bar, funding)?;
+        if !warming_up {
+            self.check_ask(&bar, ask)?;
+        }
+        self.check_references(&bar, references)?;
+        let step = self.timeframe.duration_ms();
+        let first_new_fill = self.fills.len();
+        self.stamp = bar.open_time;
+        let trading = !warming_up && !self.equity.is_empty();
+        while let Some(time) = self
+            .legs
+            .iter()
+            .filter_map(|leg| leg.upcoming.front())
+            .map(|b| b.open_time)
+            .filter(|&t| t < bar.open_time)
+            .min()
+        {
+            let mut bars = vec![None];
+            for leg in &mut self.legs {
+                let taken = leg.take_bar(time, step);
+                match taken {
+                    Some(b) if !trading => leg.pass(&b, step),
+                    _ => bars.push(taken),
+                }
+            }
+            if trading {
+                self.trade_time(time, &bars, &[]);
+            }
+        }
+        let now: Vec<Option<Candle>> = self
+            .legs
+            .iter_mut()
+            .map(|leg| leg.take_bar(bar.open_time, step))
+            .collect();
+        let close = bar.open_time + step;
+        if warming_up {
+            for (leg, slot) in self.legs.iter_mut().zip(&now) {
+                if let Some(b) = slot {
+                    leg.pass(b, step);
+                }
+                leg.slots.push(*slot);
+            }
+            self.record_funding(funding);
+            self.record_references(references);
+            self.reveal_series(&bar);
+            self.show_leg_funding(close);
+            self.bars.push(bar);
+            self.call_strategy(&bar, self.fills.len(), true);
+            return self.strategy_failure();
+        }
+        let bars: Vec<Option<Candle>> = std::iter::once(Some(bar)).chain(now.clone()).collect();
+        let charged = self.trade_time(bar.open_time, &bars, funding);
+        self.bar_funding.push(charged);
+        for (leg, slot) in self.legs.iter_mut().zip(&now) {
+            leg.slots.push(*slot);
+        }
+        self.record_funding(funding);
+        self.record_references(references);
+        self.reveal_series(&bar);
+        self.show_leg_funding(close);
+        self.equity.push(EquityPoint {
+            time: bar.open_time,
+            equity: self.account_equity(),
+        });
+        let range = self
+            .step
+            .take()
+            .expect("a bar time reads the account at its opens");
+        self.ranges.push(EquityRange {
+            low: range.low.max(0.0),
+            high: range.high,
+        });
+        self.bars.push(bar);
+        self.ask = ask;
+        self.call_strategy(&bar, first_new_fill, false);
+        // Each instrument's last trade opened since the last bar the strategy saw also takes the
+        // stops open once it has handled this one, as with one instrument.
+        for k in 0..self.opened.len() {
+            if let Some(mut stops) = self.opened[k].take() {
+                for order in self.broker_at(k).open_orders() {
+                    add_stop(&mut stops, order);
+                }
+                if k == 0 {
+                    self.trade_stops.push(stops);
+                } else {
+                    self.legs[k - 1].trade_stops.push(stops);
+                }
+            }
+        }
+        self.strategy_failure()
+    }
+
+    /// Trades one bar time of a run with several traded instruments. `bars` holds each traded
+    /// instrument's bar opening at `time`, first instrument first, or `None`, and
+    /// `first_funding` the funding fed with the first instrument's bar. Returns the funding
+    /// charged on the first instrument.
+    ///
+    /// The bar time is traded in three parts, so that what is known to come first does. First,
+    /// for every instrument with a bar, the funding due at its open, or in the gap since its bar
+    /// before, is charged on its position at its open. Then each instrument's open orders are
+    /// checked against its bar on its broker, the first instrument's first and then the others in
+    /// the order the run names them. Last, for every instrument with a bar, the funding due later
+    /// in its bar is charged on its position at its close, after every instrument's fills, as a
+    /// run with one instrument charges it after its own, and it is marked at its close. An
+    /// instrument without a bar keeps its position, its orders and its last mark, and its funding
+    /// waits for its next bar.
+    ///
+    /// The account's equity inside the bar time, which gives its range, its peak leverage and its
+    /// liquidation, is read as [`Session::inside_points`] describes. With one instrument holding or
+    /// trading, it is that instrument's bar read as a run with one instrument reads it, and a
+    /// liquidation is found and priced the same way, against the account's whole equity. With
+    /// more than one, the account is read at every instrument's open, before and after each fill,
+    /// and at every instrument's close. When equity there is at or below maintenance
+    /// ([`MAINTENANCE_MARGIN_RATE`] of the gross notional at those prices), every open order is
+    /// cancelled, the fills left in the bar time do not happen and their orders are cancelled
+    /// with the rest, and every position is closed at those prices ([`Session::liquidate_all`]).
+    /// A flat account left with a negative balance is floored at zero, as with one instrument.
+    fn trade_time(
+        &mut self,
+        time: Millis,
+        bars: &[Option<Candle>],
+        first_funding: &[(Millis, f64)],
+    ) -> BarFunding {
+        let n = bars.len();
+        let step = self.timeframe.duration_ms();
+        let funding: Vec<Vec<(Millis, f64)>> = (0..n)
+            .map(|k| match (k, bars[k]) {
+                (_, None) => Vec::new(),
+                (0, Some(_)) => first_funding.to_vec(),
+                (_, Some(bar)) => self.legs[k - 1].bar_events(&bar, step),
+            })
+            .collect();
+        let mut charged = vec![BarFunding::default(); n];
+        for k in 0..n {
+            let Some(bar) = bars[k] else { continue };
+            for &(t, rate) in &funding[k] {
+                if t <= bar.open_time {
+                    charged[k].at_open += self.charge(k, rate, bar.open);
+                }
+            }
+        }
+        let mut prices: Vec<f64> = (0..n)
+            .map(|k| bars[k].map_or(self.book_at(k).mark_price(), |b| b.open))
+            .collect();
+        // The one instrument holding a position or trading in this bar time, if only one is.
+        let moving: Vec<usize> = (0..n)
+            .filter(|&k| {
+                self.book_at(k).position() != 0.0
+                    || bars[k].is_some_and(|b| self.broker_at(k).may_open(&b, &b))
+            })
+            .collect();
+        let alone = match moving.as_slice() {
+            [k] => Some(*k),
+            _ => None,
+        };
+        self.see(&prices);
+        let mut liquidated = alone.is_none() && self.breach(&prices, time);
+        for k in 0..n {
+            let Some(bar) = bars[k] else { continue };
+            if liquidated {
+                break;
+            }
+            let mut resting: Vec<(OrderId, Side, f64)> = self
+                .broker_at(k)
+                .open_orders()
+                .iter()
+                .filter_map(|o| stop_of(o).map(|(side, trigger)| (o.id, side, trigger)))
+                .collect();
+            let mut events = self
+                .run_broker(k, &bar, &funding[k], alone == Some(k))
+                .into_iter();
+            while let Some(event) = events.next() {
+                let filled = matches!(event, BrokerEvent::Filled(_));
+                if let BrokerEvent::Filled(fill) = &event {
+                    prices[k] = fill.price;
+                    self.see(&prices);
+                    if alone.is_none() && self.breach(&prices, time) {
+                        liquidated = true;
+                        self.drop_events(k, std::iter::once(event).chain(events.by_ref()));
+                        break;
+                    }
+                    // As with one instrument, a maker fill that reduces the position is read
+                    // after the position meets the bar's adverse extreme.
+                    let pos = self.book_at(k).position();
+                    let reducing = pos != 0.0 && pos.signum() != fill.side.sign();
+                    if alone == Some(k) && reducing && fill.liquidity == Liquidity::Maker {
+                        let mut at = prices.clone();
+                        at[k] = if pos > 0.0 { bar.low } else { bar.high };
+                        self.see(&at);
+                    }
+                }
+                self.record(k, event, &mut resting);
+                if filled && alone.is_none() {
+                    // After the fill, with its fee paid.
+                    self.see(&prices);
+                    if self.breach(&prices, time) {
+                        liquidated = true;
+                        self.drop_events(k, events.by_ref());
+                        break;
+                    }
+                }
+            }
+            if alone == Some(k) && !liquidated {
+                let extra = if k == 0 { 0.0 } else { self.portfolio.cash() };
+                let trigger = account_trigger(
+                    self.instrument_at(k),
+                    self.book_at(k),
+                    &bar,
+                    &funding[k],
+                    extra,
+                );
+                if let Some(trigger) = trigger {
+                    // At the trigger, or at the open if the bar opened past it.
+                    prices[k] = if self.book_at(k).position() > 0.0 {
+                        bar.open.min(trigger)
+                    } else {
+                        bar.open.max(trigger)
+                    };
+                    self.see(&prices);
+                    self.liquidate_all(&prices, time);
+                    liquidated = true;
+                }
+            }
+        }
+        for at in inside_points(alone, bars, &prices) {
+            self.see(&at);
+            if alone.is_none() && !liquidated && self.breach(&at, time) {
+                liquidated = true;
+            }
+        }
+        self.write_off();
+        for k in 0..n {
+            let Some(bar) = bars[k] else { continue };
+            for &(t, rate) in &funding[k] {
+                if t > bar.open_time {
+                    charged[k].in_bar += self.charge(k, rate, bar.close);
+                }
+            }
+            prices[k] = bar.close;
+            self.book_at_mut(k).mark(bar.close);
+        }
+        self.see(&prices);
+        if alone.is_none() && !liquidated && self.breach(&prices, time) {
+            self.write_off();
+        }
+        for k in 1..n {
+            if let Some(bar) = bars[k] {
+                let leg = &mut self.legs[k - 1];
+                leg.traded.push(bar);
+                leg.bar_funding.push(charged[k]);
+                leg.last_close = Some(bar.close);
+            }
+        }
+        charged[0]
+    }
+
+    /// Runs traded instrument `k`'s broker on `bar`. With `alone`, the broker finds a liquidation
+    /// on the way through the bar as with one instrument, against the account's whole balance;
+    /// otherwise the session reads the account itself ([`Session::trade_time`]).
+    fn run_broker(
+        &mut self,
+        k: usize,
+        bar: &Candle,
+        funding: &[(Millis, f64)],
+        alone: bool,
+    ) -> Vec<BrokerEvent> {
+        let extra = if k == 0 { 0.0 } else { self.portfolio.cash() };
+        let (instrument, broker, book) = if k == 0 {
+            (&self.instrument, &mut *self.broker, &self.portfolio)
+        } else {
+            let leg = &mut self.legs[k - 1];
+            (&leg.instrument, &mut *leg.broker, &leg.portfolio)
+        };
+        let breached = |book: &Portfolio| {
+            alone
+                .then(|| account_trigger(instrument, book, bar, funding, extra))
+                .flatten()
+        };
+        broker.on_bar(bar, bar, book, &breached)
+    }
+
+    /// Records one broker event of traded instrument `k`, as with one instrument.
+    fn record(&mut self, k: usize, event: BrokerEvent, resting: &mut Vec<(OrderId, Side, f64)>) {
+        let (portfolio, trade_stops) = if k == 0 {
+            (&mut self.portfolio, &mut self.trade_stops)
+        } else {
+            let leg = &mut self.legs[k - 1];
+            (&mut leg.portfolio, &mut leg.trade_stops)
+        };
+        let book = Book {
+            portfolio,
+            orders: &mut self.orders,
+            fills: &mut self.fills,
+            trade_stops,
+        };
+        book.record(event, resting, &mut self.opened[k]);
+        self.sweep(k);
+    }
+
+    /// The broker events of traded instrument `k` left after a liquidation: none of them happen.
+    /// Fills and stops placed are cancelled with the liquidation, and an entry's attached stop
+    /// with its entry.
+    fn drop_events(&mut self, k: usize, events: impl Iterator<Item = BrokerEvent>) {
+        for event in events {
+            match event {
+                BrokerEvent::Filled(fill) => {
+                    let order = self.order_mut(fill.order_id);
+                    order.status = OrderStatus::Cancelled(LIQUIDATED.into());
+                    if let Some(stop) = order.attached_stop
+                        && self.order_mut(stop.id).status == OrderStatus::Attached
+                    {
+                        self.order_mut(stop.id).status =
+                            OrderStatus::Cancelled(ENTRY_CANCELLED.into());
+                    }
+                }
+                BrokerEvent::Placed(order) => {
+                    let id = order.id;
+                    *self.order_mut(id) = Order {
+                        status: OrderStatus::Cancelled(LIQUIDATED.into()),
+                        ..order
+                    };
+                    self.broker_at_mut(k).cancel(id);
+                }
+                BrokerEvent::Cancelled { id, reason } => {
+                    self.order_mut(id).status = OrderStatus::Cancelled(reason);
+                }
+            }
+        }
+    }
+
+    /// Reads the account's equity with each traded instrument at `prices`, for the bar time's
+    /// range, and its gross notional there when a position is open, for the peak leverage and,
+    /// when kept, the exposures.
+    fn see(&mut self, prices: &[f64]) {
+        let equity = self.account_at(prices);
+        let range = self.step.get_or_insert(EquityRange {
+            low: f64::INFINITY,
+            high: f64::NEG_INFINITY,
+        });
+        range.low = range.low.min(equity);
+        range.high = range.high.max(equity);
+        if (0..prices.len()).any(|k| self.book_at(k).position() != 0.0) {
+            let notional = self.gross_notional(prices);
+            if equity > 0.0
+                && let Some(lev) = crate::metrics::finite(notional / equity)
+            {
+                self.peak_leverage = self.peak_leverage.max(lev);
+            }
+            if self.keep_exposures {
+                self.exposures.push(Exposure {
+                    notional,
+                    equity,
+                    time: self.stamp,
+                });
+            }
+        }
+    }
+
+    /// Liquidates the account if its equity with each traded instrument at `prices` is at or below
+    /// maintenance; returns whether it did.
+    fn breach(&mut self, prices: &[f64], time: Millis) -> bool {
+        let maintenance = MAINTENANCE_MARGIN_RATE * self.gross_notional(prices);
+        if maintenance > 0.0 && self.account_at(prices) <= maintenance {
+            self.liquidate_all(prices, time);
+            return true;
+        }
+        false
+    }
+
+    /// Liquidates every position of a run with several traded instruments at `prices`, in the bar
+    /// time at `time`: every open order is cancelled, and each position is closed at its price
+    /// with no slippage, recorded as a filled reduce-only order tagged [`LIQUIDATION_TAG`]. As
+    /// with one instrument, each fill's fee is the taker fee plus a liquidation fee, here the
+    /// equity left after every taker fee shared by notional, so the account ends at exactly zero.
+    fn liquidate_all(&mut self, prices: &[f64], time: Millis) {
+        self.cancel_open_orders(LIQUIDATED);
+        let held: Vec<usize> = (0..prices.len())
+            .filter(|&k| self.book_at(k).position() != 0.0)
+            .collect();
+        let taker = |s: &Session, k: usize| {
+            let fees = s.fees_at(k);
+            fees.fee(prices[k], s.book_at(k).position().abs(), fees.taker)
+        };
+        let takers: f64 = held.iter().map(|&k| taker(self, k)).sum();
+        let left = self.account_at(prices) - takers;
+        let notional = self.gross_notional(prices);
+        for k in held {
+            let q = self.book_at(k).position();
+            let price = prices[k];
+            let (side, qty) = (if q > 0.0 { Side::Sell } else { Side::Buy }, q.abs());
+            let fee = taker(self, k) + left.max(0.0) * (qty * price / notional);
+            let id = OrderId(self.orders.len() as u64 + 1);
+            let instrument = self.instrument_at(k).id.clone();
+            self.orders.push(Order {
+                id,
+                request: OrderRequest {
+                    instrument: instrument.clone(),
+                    side,
+                    qty,
+                    order_type: OrderType::Market,
+                    tif: TimeInForce::Ioc,
+                    reduce_only: true,
+                    client_tag: Some(LIQUIDATION_TAG.into()),
+                },
+                submitted_at: time,
+                decision_close: price,
+                attached_stop: None,
+                status: OrderStatus::Filled,
+            });
+            self.book_at_mut(k).apply_fill(side, qty, price, fee);
+            self.sweep(k);
+            self.fills.push(Fill {
+                order_id: id,
+                instrument,
+                side,
+                time,
+                price,
+                qty,
+                fee,
+                liquidity: Liquidity::Taker,
+                close_out: false,
+            });
+        }
+        if left >= 0.0 {
+            self.portfolio.clear_cash();
+        }
+    }
+
+    /// Floors the account's balance at zero once every traded instrument is flat.
+    fn write_off(&mut self) {
+        if self.legs.iter().all(|leg| leg.portfolio.position() == 0.0) {
+            self.portfolio.write_off_shortfall();
+        }
+    }
+
+    /// Charges one funding payment on traded instrument `k`; returns the amount paid.
+    fn charge(&mut self, k: usize, rate: f64, price: f64) -> f64 {
+        let paid = self.book_at_mut(k).charge_funding(rate, price);
+        self.sweep(k);
+        paid
+    }
+
+    /// Moves what changed another instrument's balance to the account's, in the first
+    /// instrument's book.
+    fn sweep(&mut self, k: usize) {
+        if k > 0 {
+            let moved = self.legs[k - 1].portfolio.take_cash();
+            self.portfolio.add_cash(moved);
+        }
+    }
+
+    /// Shows the strategy each other instrument's funding settled before `close`.
+    fn show_leg_funding(&mut self, close: Millis) {
+        for leg in &mut self.legs {
+            leg.shown = leg.funding.partition_point(|&(t, _)| t < close);
+        }
+    }
+
+    /// The account's equity with each traded instrument at `prices`.
+    fn account_at(&self, prices: &[f64]) -> f64 {
+        (0..prices.len())
+            .map(|k| self.book_at(k).equity_at(prices[k]))
+            .sum()
+    }
+
+    /// The account's gross notional with each traded instrument at `prices`.
+    fn gross_notional(&self, prices: &[f64]) -> f64 {
+        (0..prices.len())
+            .map(|k| self.book_at(k).position().abs() * prices[k])
+            .sum()
+    }
+
+    /// The account's equity at each traded instrument's mark.
+    fn account_equity(&self) -> f64 {
+        let others: f64 = self.legs.iter().map(|leg| leg.portfolio.equity()).sum();
+        self.portfolio.equity() + others
+    }
+
+    fn book_at(&self, k: usize) -> &Portfolio {
+        if k == 0 {
+            &self.portfolio
+        } else {
+            &self.legs[k - 1].portfolio
+        }
+    }
+
+    fn book_at_mut(&mut self, k: usize) -> &mut Portfolio {
+        if k == 0 {
+            &mut self.portfolio
+        } else {
+            &mut self.legs[k - 1].portfolio
+        }
+    }
+
+    fn broker_at(&self, k: usize) -> &dyn Broker {
+        if k == 0 {
+            &*self.broker
+        } else {
+            &*self.legs[k - 1].broker
+        }
+    }
+
+    fn broker_at_mut(&mut self, k: usize) -> &mut dyn Broker {
+        if k == 0 {
+            &mut *self.broker
+        } else {
+            &mut *self.legs[k - 1].broker
+        }
+    }
+
+    fn instrument_at(&self, k: usize) -> &Instrument {
+        if k == 0 {
+            &self.instrument
+        } else {
+            &self.legs[k - 1].instrument
+        }
+    }
+
+    fn fees_at(&self, k: usize) -> FeeSchedule {
+        if k == 0 {
+            self.fees
+        } else {
+            self.legs[k - 1].instrument.fees
+        }
     }
 
     /// Feeds a closed bar that only adds to the strategy's history, before the first live bar.
@@ -525,30 +1192,41 @@ impl Session {
     /// shortcut: a position too small for the instrument's minimums (a spot dust holding below
     /// the minimum notional) has its close-out rejected and stays open; size the close from the
     /// venue's dust rules if that matters.
+    ///
+    /// In a run with several traded instruments every position is closed out this way, the first
+    /// instrument's first, each on its own instrument's next bar. One without a bar at this close
+    /// is still sent, valued at its last close, and fills on its next bar.
     pub(crate) fn close_out(&mut self) {
         if self.equity.is_empty() {
             return;
         }
         self.cancel_open_orders(CLOSED_OUT);
-        let position = self.portfolio.position();
-        if position == 0.0 {
-            return;
+        for k in 0..=self.legs.len() {
+            let position = self.book_at(k).position();
+            if position == 0.0 {
+                continue;
+            }
+            let request = OrderRequest {
+                instrument: self.instrument_at(k).id.clone(),
+                side: if position > 0.0 {
+                    Side::Sell
+                } else {
+                    Side::Buy
+                },
+                qty: position.abs(),
+                order_type: OrderType::Market,
+                tif: TimeInForce::Gtc,
+                reduce_only: true,
+                client_tag: Some(CLOSE_OUT_TAG.into()),
+            };
+            // A rejected close-out is recorded with its reason, and the position stays open.
+            //
+            // shortcut: in a run with several traded instruments, the close-out of one with no
+            // bar after this one in the range stays open, and so does its position and trade;
+            // fill it at the instrument's last close on the final bar if a strategy needs every
+            // position closed.
+            let _ = self.context().submit_close_out(request);
         }
-        let request = OrderRequest {
-            instrument: self.instrument.id.clone(),
-            side: if position > 0.0 {
-                Side::Sell
-            } else {
-                Side::Buy
-            },
-            qty: position.abs(),
-            order_type: OrderType::Market,
-            tif: TimeInForce::Gtc,
-            reduce_only: true,
-            client_tag: Some(CLOSE_OUT_TAG.into()),
-        };
-        // A rejected close-out is recorded with its reason, and the position stays open.
-        let _ = self.context().submit(request);
     }
 
     /// Submits an order from outside the strategy, such as a person's manual order, between bars,
@@ -612,19 +1290,22 @@ impl Session {
             orders: &mut self.orders,
             warming_up: false,
             failure: &mut self.failure,
+            others: &mut self.legs,
         }
     }
 
     /// Cancels every open order, and the attached stops of entries that have not filled, with
     /// `reason`.
     fn cancel_open_orders(&mut self, reason: &str) {
-        for order in self.broker.open_orders().to_vec() {
-            self.broker.cancel(order.id);
-            self.order_mut(order.id).status = OrderStatus::Cancelled(reason.into());
-            if let Some(stop) = order.attached_stop
-                && self.order_mut(stop.id).status == OrderStatus::Attached
-            {
-                self.order_mut(stop.id).status = OrderStatus::Cancelled(ENTRY_CANCELLED.into());
+        for k in 0..=self.legs.len() {
+            for order in self.broker_at(k).open_orders().to_vec() {
+                self.broker_at_mut(k).cancel(order.id);
+                self.order_mut(order.id).status = OrderStatus::Cancelled(reason.into());
+                if let Some(stop) = order.attached_stop
+                    && self.order_mut(stop.id).status == OrderStatus::Attached
+                {
+                    self.order_mut(stop.id).status = OrderStatus::Cancelled(ENTRY_CANCELLED.into());
+                }
             }
         }
     }
@@ -780,6 +1461,7 @@ impl Session {
             orders: &mut self.orders,
             warming_up,
             failure: &mut self.failure,
+            others: &mut self.legs,
         };
         if ctx.bars.len() == 1 {
             self.strategy.on_start(&mut ctx);
@@ -791,8 +1473,7 @@ impl Session {
     }
 
     fn order_mut(&mut self, id: OrderId) -> &mut Order {
-        // Ids are assigned in submission order starting at 1.
-        &mut self.orders[id.0 as usize - 1]
+        order_in(&mut self.orders, id)
     }
 
     pub fn instrument(&self) -> &Instrument {
@@ -845,9 +1526,148 @@ impl Session {
         self.broker.open_orders()
     }
 
+    /// The first traded instrument's book, which holds the account's balance; in a run with
+    /// several traded instruments the others' positions are in [`Session::legs`].
     pub fn portfolio(&self) -> &Portfolio {
         &self.portfolio
     }
+
+    /// The instruments traded beside the first, in a run with several.
+    pub(crate) fn legs(&self) -> &[Leg] {
+        &self.legs
+    }
+
+    /// The account's equity range in each live bar of a run with several traded instruments, one
+    /// per equity point; empty in a run with one, whose ranges [`crate::risk::intrabar`] reads.
+    pub(crate) fn ranges(&self) -> &[EquityRange] {
+        &self.ranges
+    }
+
+    /// The account's gross notional and equity at each point [`Session::trade_time`] read with a
+    /// position open, in a run with several traded instruments that keeps them; empty otherwise.
+    pub(crate) fn exposures(&self) -> &[Exposure] {
+        &self.exposures
+    }
+
+    /// The highest gross notional over equity at any point [`Session::trade_time`] read with a
+    /// position open, in a run with several traded instruments; 0 when it never held one.
+    pub(crate) fn peak_leverage(&self) -> f64 {
+        self.peak_leverage
+    }
+}
+
+/// The points inside a bar time, after its fills and before the funding due later in it, at
+/// which a run with several traded instruments reads the account's equity, beside every
+/// instrument's open, each fill and every instrument's close: this is the rule for the account's
+/// low inside a bar, in one place.
+///
+/// With one instrument holding a position or trading in the bar time (`alone`), its bar is read
+/// as a run with one instrument reads it: at its low and its high with the position after the
+/// fills (and, in [`Session::trade_time`], at the adverse extreme before a maker fill that
+/// reduces the position). With more than one there is no point here: the bars do not say when
+/// each instrument reached its low or its high, so the account is read only where every price is
+/// known. To read every position at its own worst price at once instead, a harsher rule, return
+/// one point here with each instrument that has a bar and holds a position at its low if long
+/// and its high if short, and the rest at `prices`.
+fn inside_points(alone: Option<usize>, bars: &[Option<Candle>], prices: &[f64]) -> Vec<Vec<f64>> {
+    let Some(bar) = alone.and_then(|k| bars[k].map(|bar| (k, bar))) else {
+        return Vec::new();
+    };
+    let (k, bar) = bar;
+    [bar.low, bar.high]
+        .into_iter()
+        .map(|price| {
+            let mut at = prices.to_vec();
+            at[k] = price;
+            at
+        })
+        .collect()
+}
+
+/// [`liquidation_trigger`] for a traded instrument's book in an account whose balance holds
+/// `extra` more than the book: the first instrument's balance, for another instrument's book.
+fn account_trigger(
+    inst: &Instrument,
+    book: &Portfolio,
+    bar: &Candle,
+    funding: &[(Millis, f64)],
+    extra: f64,
+) -> Option<f64> {
+    if extra == 0.0 {
+        return liquidation_trigger(inst, book, bar, funding);
+    }
+    let mut book = book.clone();
+    book.add_cash(extra);
+    liquidation_trigger(inst, &book, bar, funding)
+}
+
+/// What one broker event changes: a traded instrument's book, the session's orders and fills,
+/// and that instrument's trade stops.
+struct Book<'a> {
+    portfolio: &'a mut Portfolio,
+    orders: &'a mut [Order],
+    fills: &'a mut Vec<Fill>,
+    trade_stops: &'a mut Vec<TradeStops>,
+}
+
+impl Book<'_> {
+    /// Records one broker event. `resting` is the instrument's stops resting as the bar's fills
+    /// go, and `opened` the stops of the last trade it opened (see [`Session::trade_stops`]).
+    fn record(
+        self,
+        event: BrokerEvent,
+        resting: &mut Vec<(OrderId, Side, f64)>,
+        opened: &mut Option<TradeStops>,
+    ) {
+        match event {
+            BrokerEvent::Filled(fill) => {
+                let before = self.portfolio.position();
+                self.portfolio
+                    .apply_fill(fill.side, fill.qty, fill.price, fill.fee);
+                let after = self.portfolio.position();
+                resting.retain(|&(id, ..)| id != fill.order_id);
+                // A fill that opens a position, from flat or by flipping it, starts a new
+                // trade, which keeps its own stops apart from those of the trade before it.
+                // `signum` of 0.0 is 1.0, so flat is checked on its own.
+                if after != 0.0 && (before == 0.0 || after.signum() != before.signum()) {
+                    self.trade_stops.extend(opened.take());
+                    let mut stops = TradeStops {
+                        entry_time: fill.time,
+                        ..TradeStops::default()
+                    };
+                    for &(_, side, trigger) in resting.iter() {
+                        stops.add(side, trigger);
+                    }
+                    *opened = Some(stops);
+                }
+                let order = order_in(self.orders, fill.order_id);
+                order.status = OrderStatus::Filled;
+                if let Some(stops) = opened.as_mut() {
+                    add_stop(stops, order);
+                }
+                self.fills.push(fill);
+            }
+            BrokerEvent::Cancelled { id, reason } => {
+                resting.retain(|&(resting_id, ..)| resting_id != id);
+                order_in(self.orders, id).status = OrderStatus::Cancelled(reason);
+            }
+            BrokerEvent::Placed(order) => {
+                if let Some(stops) = opened.as_mut() {
+                    add_stop(stops, &order);
+                }
+                if let Some((side, trigger)) = stop_of(&order) {
+                    resting.push((order.id, side, trigger));
+                }
+                let id = order.id;
+                *order_in(self.orders, id) = order;
+            }
+        }
+    }
+}
+
+/// The order with `id` among `orders`, which hold every order in submission order from id 1.
+fn order_in(orders: &mut [Order], id: OrderId) -> &mut Order {
+    &mut orders[id.0 as usize - 1]
 }
 
 /// Checks a session's config against its instrument, as [`Session::new`] describes, and returns
