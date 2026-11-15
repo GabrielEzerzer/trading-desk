@@ -2057,6 +2057,8 @@ mod tests {
             account_currency: td_core::AccountCurrency::Quote,
             references: Vec::new(),
             series: Vec::new(),
+            also_traded: Vec::new(),
+            start_when_all_listed: false,
         }
     }
 
@@ -2481,6 +2483,7 @@ mod tests {
             force_closed: false,
             net_pips: None,
             pips: None,
+            instrument: None,
         }
     }
 

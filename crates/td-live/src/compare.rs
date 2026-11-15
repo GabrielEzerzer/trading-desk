@@ -410,6 +410,8 @@ pub(crate) fn compare(
         account_currency: AccountCurrency::Quote,
         references: config.references.clone(),
         series: Vec::new(),
+        also_traded: Vec::new(),
+        start_when_all_listed: false,
     };
     let result = catch_unwind(AssertUnwindSafe(|| {
         let strategy = build(&config.strategy, &config.params)?;

@@ -123,9 +123,81 @@ pub struct BacktestConfig {
     /// the default.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub series: Vec<String>,
+    /// The instruments traded beside `instrument`, which stays the first: in a run that names
+    /// any, the strategy is called on the first instrument's bar times and can order any of
+    /// them, and they share one account (see the README, "Several traded instruments"). Their
+    /// bars and funding are given to the run with [`run_with_traded`] and are part of the data
+    /// fingerprint. Every traded instrument must then be a perpetual on `instrument`'s venue in
+    /// its quote currency, on a quote account ([`BacktestConfig::check_traded`]). Each is charged
+    /// its own fees and its default slippage ([`default_slippage_bps`]); `fee_override` and
+    /// `slippage_bps` are the first instrument's. Left out of the saved result when there are
+    /// none, the default.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub also_traded: Vec<Instrument>,
+    /// When set, the run starts at the first of `instrument`'s bar times, at or after `from`, by
+    /// which every traded instrument has had a bar, counting the bars given to the run before
+    /// its range: the first instrument's bars before then are not traded (they are warm-up bars
+    /// when `warmup_from` covers them). Left out of the saved result when it is not set, the
+    /// default.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub start_when_all_listed: bool,
 }
 
 impl BacktestConfig {
+    /// Refuses, in a run that names other traded instruments ([`BacktestConfig::also_traded`]),
+    /// a traded instrument that is not a perpetual, one on another venue or in another quote
+    /// currency than `instrument`, a base-currency account, an instrument named twice and one
+    /// that is also a reference. A run that names none passes.
+    ///
+    /// shortcut: perpetuals only, where one instrument's fills reach another only through the
+    /// account's equity. Spot would need the cash a buy spends shared between the instruments,
+    /// and FX the conversion of each instrument's quote currency into the account's; build those
+    /// into the account before allowing other kinds here.
+    pub fn check_traded(&self) -> Result<(), EngineError> {
+        if self.also_traded.is_empty() {
+            return Ok(());
+        }
+        let refuse = |why: String| Err(EngineError::InvalidTraded(why));
+        let first = &self.instrument;
+        if self.account_currency != AccountCurrency::Quote {
+            return refuse(
+                "a run with several traded instruments needs an account in their quote currency"
+                    .into(),
+            );
+        }
+        let traded: Vec<&Instrument> = std::iter::once(first).chain(&self.also_traded).collect();
+        for (i, inst) in traded.iter().enumerate() {
+            let id = &inst.id;
+            if id.kind != InstrumentKind::Perpetual {
+                return refuse(format!(
+                    "{id} is not a perpetual; a run with several traded instruments trades \
+                     perpetuals only"
+                ));
+            }
+            if id.venue != first.id.venue {
+                return refuse(format!(
+                    "{id} is on another venue than {}; every traded instrument must be on the \
+                     same venue",
+                    first.id
+                ));
+            }
+            if inst.quote != first.quote {
+                return refuse(format!(
+                    "{id} is quoted in {}, not in {}; every traded instrument must be in the \
+                     same quote currency",
+                    inst.quote, first.quote
+                ));
+            }
+            if traded[..i].iter().any(|t| t.id == *id) {
+                return refuse(format!("{id} is named twice among the traded instruments"));
+            }
+            if self.references.contains(id) {
+                return refuse(format!("{id} is traded, so it cannot also be a reference"));
+            }
+        }
+        Ok(())
+    }
+
     /// Refuses reference instruments on another venue than `instrument`'s, `instrument` itself as
     /// a reference, and one named twice.
     pub fn check_references(&self) -> Result<(), EngineError> {
@@ -168,6 +240,10 @@ impl<'de> Deserialize<'de> for BacktestConfig {
             references: Vec<InstrumentId>,
             #[serde(default)]
             series: Vec<String>,
+            #[serde(default)]
+            also_traded: Vec<Instrument>,
+            #[serde(default)]
+            start_when_all_listed: bool,
         }
         let g = Given::deserialize(deserializer)?;
         Ok(BacktestConfig {
@@ -188,6 +264,8 @@ impl<'de> Deserialize<'de> for BacktestConfig {
             account_currency: g.account_currency,
             references: g.references,
             series: g.series,
+            also_traded: g.also_traded,
+            start_when_all_listed: g.start_when_all_listed,
         })
     }
 }
@@ -1205,6 +1283,8 @@ mod tests {
             account_currency: AccountCurrency::Quote,
             references: Vec::new(),
             series: Vec::new(),
+            also_traded: Vec::new(),
+            start_when_all_listed: false,
         };
         let full = run(&config, &bars, &[], &funding).unwrap();
         assert!(full.metrics.trades > 2, "{:?}", full.metrics);
@@ -1291,6 +1371,8 @@ mod tests {
             account_currency: AccountCurrency::Quote,
             references: Vec::new(),
             series: Vec::new(),
+            also_traded: Vec::new(),
+            start_when_all_listed: false,
         };
         let seen = FundingSeen::default();
         let strategy = Box::new(SeesFunding(seen.clone()));
@@ -1449,6 +1531,8 @@ mod tests {
                     account_currency: AccountCurrency::Quote,
                     references: Vec::new(),
                     series: Vec::new(),
+                    also_traded: Vec::new(),
+                    start_when_all_listed: false,
                 },
                 axes: Vec::new(),
                 mode: SweepMode::Grid,

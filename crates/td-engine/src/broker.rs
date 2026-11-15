@@ -113,6 +113,15 @@ pub trait Broker: Send {
         breached: &dyn Fn(&Portfolio) -> Option<f64>,
     ) -> Vec<BrokerEvent>;
     fn open_orders(&self) -> &[Order];
+    /// Whether an open order that is not reduce-only would fill on this bar, before
+    /// [`Broker::on_bar`] processes it: a session with several traded instruments reads the
+    /// account's low inside a bar time by how many instruments hold a position or trade in it
+    /// (see the README, "Several traded instruments"). A reduce-only order is left out, since it
+    /// can only trade where a position is held, or opened by one that is not. The default says
+    /// yes, which reads the bar time at the points of several instruments.
+    fn may_open(&self, _bar: &Candle, _ask: &Candle) -> bool {
+        true
+    }
 }
 
 /// A broker that fills orders with a [`FillModel`] and charges fees from a [`FeeSchedule`].
@@ -706,5 +715,26 @@ impl<M: FillModel> Broker for SimBroker<M> {
 
     fn open_orders(&self) -> &[Order] {
         &self.open
+    }
+
+    fn may_open(&self, bar: &Candle, ask: &Candle) -> bool {
+        self.open.iter().any(|order| {
+            let own = match order.request.side {
+                Side::Buy => ask,
+                Side::Sell => bar,
+            };
+            !order.request.reduce_only
+                && order.submitted_at < bar.open_time
+                && matches!(
+                    self.model.check(
+                        order,
+                        order.submitted_at >= self.last_bar,
+                        self.triggered.contains(&order.id),
+                        own,
+                        &self.instrument,
+                    ),
+                    FillCheck::Fill { .. }
+                )
+        })
     }
 }

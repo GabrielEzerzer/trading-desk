@@ -1171,6 +1171,8 @@ mod tests {
             account_currency: td_core::AccountCurrency::Quote,
             references: config.references.clone(),
             series: Vec::new(),
+            also_traded: Vec::new(),
+            start_when_all_listed: false,
         };
         let tested = Seen::default();
         let references = [td_engine::ReferenceBars {

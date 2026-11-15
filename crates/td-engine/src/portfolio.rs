@@ -187,6 +187,32 @@ impl Portfolio {
     pub(crate) fn mark(&mut self, price: f64) {
         self.mark_price = price;
     }
+
+    /// Equity with the position valued at `price` instead of the mark.
+    pub(crate) fn equity_at(&self, price: f64) -> f64 {
+        if !self.kind.rules().margin {
+            return self.cash + self.position * price;
+        }
+        if self.position == 0.0 {
+            return self.cash;
+        }
+        self.cash
+            + self
+                .account
+                .from_quote(self.position * (price - self.avg_entry), price)
+    }
+
+    /// Takes the whole balance out, leaving zero: in a run with several traded instruments each
+    /// other instrument's book hands what its fills, fees and funding moved to the account's
+    /// balance, which the first instrument's book holds.
+    pub(crate) fn take_cash(&mut self) -> f64 {
+        std::mem::take(&mut self.cash)
+    }
+
+    /// Adds `amount` to the balance; see [`Portfolio::take_cash`].
+    pub(crate) fn add_cash(&mut self, amount: f64) {
+        self.cash += amount;
+    }
 }
 
 /// The position and average entry after a fill of signed quantity `dq` at `price`, from a
