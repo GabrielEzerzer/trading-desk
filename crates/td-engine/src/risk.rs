@@ -45,12 +45,14 @@ pub struct Intrabar {
 }
 
 /// An open position at one point [`intrabar`] evaluates: its notional in the account currency at
-/// that point's price, and the equity there. `notional / equity` is that point's leverage, and an
-/// account holding the same position on a balance moved by `d` has `notional / (equity + d)`.
+/// that point's price, the equity there, and the open time of the bar it is in, as the equity
+/// curve stamps the bar's point. `notional / equity` is that point's leverage, and an account
+/// holding the same position on a balance moved by `d` has `notional / (equity + d)`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Exposure {
     pub notional: f64,
     pub equity: f64,
+    pub time: Millis,
 }
 
 /// The equity each bar reached inside its range, and the peak leverage, from a run's bars, their
@@ -156,6 +158,7 @@ pub(crate) fn intrabar_with(
                 exposures.push(Exposure {
                     notional,
                     equity: e,
+                    time: point.time,
                 });
             }
             if e > 0.0

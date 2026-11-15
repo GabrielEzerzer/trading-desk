@@ -1929,6 +1929,30 @@ pub(crate) fn peak_open_notional(
         .fold(0.0, f64::max)
 }
 
+/// The windows' open positions (`held`, one list per window, from
+/// [`crate::runner::run_exposures`]) as the compounding stitched curve holds them: each point's
+/// notional and equity times its window's scale ([`segment_scales`], the curve's level at the
+/// window's start over the starting cash), from the windows that curve still counts. A position
+/// that grows with the balance is the window's own scaled by that level.
+pub(crate) fn compounded_exposures(
+    starting_cash: f64,
+    windows: &[WindowResult],
+    held: &[Vec<Exposure>],
+) -> Vec<Exposure> {
+    segment_scales(starting_cash, &test_curves(windows))
+        .into_iter()
+        .zip(held)
+        .filter(|&(s, _)| s != 0.0)
+        .flat_map(|(s, h)| {
+            h.iter().map(move |x| Exposure {
+                notional: x.notional * s,
+                equity: x.equity * s,
+                time: x.time,
+            })
+        })
+        .collect()
+}
+
 /// Each window's test equity.
 fn test_curves(windows: &[WindowResult]) -> Vec<&[EquityPoint]> {
     windows
@@ -2883,7 +2907,11 @@ mod tests {
     #[test]
     fn at_a_fixed_size_the_peak_leverage_is_read_on_the_account_where_it_stands() {
         let range = |low: f64, high: f64| EquityRange { low, high };
-        let at = |notional: f64, equity: f64| Exposure { notional, equity };
+        let at = |notional: f64, equity: f64| Exposure {
+            notional,
+            equity,
+            time: 0,
+        };
         // From 100, the first window holds 50 of notional at its open on 100 (0.5) and ends at
         // 50. The second, its own backtest from 100 again, holds 100 on 100 at its open (1) and
         // 60 on 40 at its low (1.5): its own peak is 1.5.
@@ -2959,6 +2987,7 @@ mod tests {
         let at = |notional| Exposure {
             notional,
             equity: 10_000.0,
+            time: 0,
         };
         let held = [
             vec![at(5_000.0), at(6_000.0)],
@@ -2970,6 +2999,42 @@ mod tests {
         // With the account still above zero after the second window, the third is read.
         let kept = [ending(15_000.0), ending(4_000.0), ending(12_000.0)];
         assert_eq!(peak_open_notional(10_000.0, &kept, &held), 9_000.0);
+    }
+
+    /// At a compounding size the stitched curve holds each window's position at the window's
+    /// scale: from 10,000, the first window ends at 11,000, so the second starts at a level of 1.1
+    /// and its notionals come out times 1.1. It ends at 0, so the curve is gone and the third
+    /// window, at a scale of 0, is dropped.
+    #[test]
+    fn compounded_exposures_scale_each_window_by_the_curves_level_and_drop_a_gone_one() {
+        let template = rising_window(0, 20);
+        let ending = |end: f64| {
+            let mut w = template.clone();
+            w.out_of_sample.equity.last_mut().unwrap().equity = end;
+            w
+        };
+        let at = |notional: f64, time| Exposure {
+            notional,
+            equity: 10_000.0,
+            time,
+        };
+        let windows = [ending(11_000.0), ending(0.0), ending(12_000.0)];
+        let held = [
+            vec![at(5_000.0, 1)],
+            vec![at(7_000.0, 2), at(3_000.0, 3)],
+            vec![at(9_000.0, 4)],
+        ];
+        // 11,000 / 10,000 is the double nearest 1.1, so each product below is the one the
+        // function makes.
+        let level = |notional: f64, time| Exposure {
+            notional: notional * 1.1,
+            equity: 10_000.0 * 1.1,
+            time,
+        };
+        assert_eq!(
+            compounded_exposures(10_000.0, &windows, &held),
+            [at(5_000.0, 1), level(7_000.0, 2), level(3_000.0, 3)]
+        );
     }
 
     #[test]
