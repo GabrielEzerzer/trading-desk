@@ -1907,6 +1907,30 @@ pub(crate) fn peak_open_notional(
         .fold(0.0, f64::max)
 }
 
+/// The windows' open positions (`held`, one list per window, from
+/// [`crate::runner::run_exposures`]) as the compounding stitched curve holds them: each point's
+/// notional and equity times its window's scale ([`segment_scales`], the curve's level at the
+/// window's start over the starting cash), from the windows that curve still counts. A position
+/// that grows with the balance is the window's own scaled by that level.
+pub(crate) fn compounded_exposures(
+    starting_cash: f64,
+    windows: &[WindowResult],
+    held: &[Vec<Exposure>],
+) -> Vec<Exposure> {
+    segment_scales(starting_cash, &test_curves(windows))
+        .into_iter()
+        .zip(held)
+        .filter(|&(s, _)| s != 0.0)
+        .flat_map(|(s, h)| {
+            h.iter().map(move |x| Exposure {
+                notional: x.notional * s,
+                equity: x.equity * s,
+                time: x.time,
+            })
+        })
+        .collect()
+}
+
 /// Each window's test equity.
 fn test_curves(windows: &[WindowResult]) -> Vec<&[EquityPoint]> {
     windows
@@ -2861,7 +2885,11 @@ mod tests {
     #[test]
     fn at_a_fixed_size_the_peak_leverage_is_read_on_the_account_where_it_stands() {
         let range = |low: f64, high: f64| EquityRange { low, high };
-        let at = |notional: f64, equity: f64| Exposure { notional, equity };
+        let at = |notional: f64, equity: f64| Exposure {
+            notional,
+            equity,
+            time: 0,
+        };
         // From 100, the first window holds 50 of notional at its open on 100 (0.5) and ends at
         // 50. The second, its own backtest from 100 again, holds 100 on 100 at its open (1) and
         // 60 on 40 at its low (1.5): its own peak is 1.5.
@@ -2937,6 +2965,7 @@ mod tests {
         let at = |notional| Exposure {
             notional,
             equity: 10_000.0,
+            time: 0,
         };
         let held = [
             vec![at(5_000.0), at(6_000.0)],

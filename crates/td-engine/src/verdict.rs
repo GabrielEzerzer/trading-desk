@@ -351,14 +351,23 @@ pub struct PropFirmLimits {
     #[serde(default, skip_serializing_if = "is_false")]
     pub sizes_from_starting_cash: bool,
     /// The most open notional the firm allows, as a multiple of the account size, the starting
-    /// cash. It needs `sizes_from_starting_cash`: at that fixed size the position does not depend
-    /// on the account's balance, so the figure is the largest open notional of any walk-forward
-    /// test window the battery's account counts, in that window's own run, over the starting
     /// cash. It is read at the points the run's intrabar measures evaluate, as the peak leverage
-    /// is, so at bar resolution. With `attempt` terms it is taken at the larger of their
-    /// `evaluation_size` and `funded_size`, so a phase traded at either size that breaches the
-    /// limit fails the line. A rule that sets it at a compounding size is refused, since the open
-    /// notional there depends on each attempt's balance, which this figure does not follow.
+    /// is, so at bar resolution.
+    ///
+    /// With `sizes_from_starting_cash` the position does not depend on the account's balance, so
+    /// the limit is its own line: the largest open notional of any walk-forward test window the
+    /// battery's account counts, in that window's own run, over the starting cash. With `attempt`
+    /// terms it is taken at the larger of their `evaluation_size` and `funded_size`, so a phase
+    /// traded at either size that breaches the limit fails the line.
+    ///
+    /// At a compounding size the position grows and shrinks with each attempt's balance, so the
+    /// attempt walks check it, as they check the loss limits and `max_days_without_trading`: each
+    /// day's largest open notional of the walk-forward curve over the curve's equity at the
+    /// day's start, times the attempt's balance going into the day over the account size, times
+    /// the phase's size, on every day of the evaluation and of the funded account. A day above
+    /// the limit ends the account as a breach, so the pass and breach chances and the attempt's
+    /// value carry it, and there is no line of its own.
+    ///
     /// `None`, the default, sets no limit and is left out of JSON.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_open_notional_multiple: Option<f64>,
@@ -576,16 +585,6 @@ impl VerdictRule {
                 }
                 if let Some(multiple) = limits.max_open_notional_multiple {
                     positive("limits.max_open_notional_multiple", multiple)?;
-                    if !limits.sizes_from_starting_cash {
-                        return Err(PlanError(
-                            "limits.max_open_notional_multiple needs \
-                             limits.sizes_from_starting_cash: at a compounding size the open \
-                             notional depends on each attempt's balance, which this limit does not \
-                             follow, so the limit is judged only for a plan sized from the \
-                             starting cash"
-                                .to_string(),
-                        ));
-                    }
                 }
             }
             VerdictRule::Portfolio { limits, .. } => {
@@ -1263,8 +1262,9 @@ pub struct KindInputs {
     /// The largest open notional inside any bar of a test window the fixed-size account counts, in
     /// that window's own run, over the starting cash, at the larger of the evaluation and funded
     /// sizes when the rule has `attempt` terms. Read for a `prop_firm` rule with
-    /// `max_open_notional_multiple`, which needs `sizes_from_starting_cash`, and `None` otherwise
-    /// (see that field). Left out when `None`.
+    /// `max_open_notional_multiple` and `sizes_from_starting_cash`, and `None` otherwise: at a
+    /// compounding size the attempt walks check the limit instead (see that field). Left out when
+    /// `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub peak_open_notional: Option<f64>,
 }
@@ -1379,7 +1379,11 @@ pub fn evaluate(rule: &VerdictRule, x: &KindInputs) -> Vec<Criterion> {
                     Unit::Percent,
                 ),
             ];
-            if let Some(multiple) = limits.max_open_notional_multiple {
+            // At a compounding size the attempt walks check the limit, so it has no line.
+            if let (Some(multiple), true) = (
+                limits.max_open_notional_multiple,
+                limits.sizes_from_starting_cash,
+            ) {
                 let at = if attempt.is_some() {
                     ", at the larger of the evaluation and funded sizes"
                 } else {
@@ -3439,31 +3443,37 @@ mod tests {
         }
     }
 
-    /// A limit on open notional is refused at a compounding size, where the open notional depends
-    /// on each attempt's balance, and the message names both fields.
+    /// A limit on open notional at a compounding size is accepted and has no line of its own: the
+    /// attempt walks check it, so the pass and breach lines carry it, and the kind's lines are
+    /// those of a rule without the limit.
     #[test]
-    fn a_limit_on_open_notional_needs_a_plan_sized_from_the_starting_cash() {
+    fn a_limit_on_open_notional_at_a_compounding_size_is_judged_in_the_attempt_walks() {
         let VerdictRule::PropFirm { firm, limits, .. } = prop(DrawdownMode::Static) else {
             unreachable!()
         };
-        let rule = |sizes_from_starting_cash| VerdictRule::PropFirm {
+        let rule = |max_open_notional_multiple| VerdictRule::PropFirm {
             firm,
             limits: PropFirmLimits {
-                sizes_from_starting_cash,
-                max_open_notional_multiple: Some(2.5),
+                sizes_from_starting_cash: false,
+                max_open_notional_multiple,
                 ..limits
             },
             attempt: None,
         };
-        assert_eq!(rule(true).validate(), Ok(()));
-        let Err(PlanError(message)) = rule(false).validate() else {
-            panic!("a limit on open notional at a compounding size was accepted")
+        let capped = rule(Some(2.5));
+        assert_eq!(capped.validate(), Ok(()));
+        let x = KindInputs {
+            peak_open_notional: Some(9.0),
+            ..good_prop()
         };
-        for field in [
-            "limits.max_open_notional_multiple",
-            "limits.sizes_from_starting_cash",
-        ] {
-            assert!(message.contains(field), "{message}");
+        assert!(
+            evaluate(&capped, &x)
+                .iter()
+                .all(|l| l.id != "open_notional")
+        );
+        assert_eq!(evaluate(&capped, &x), evaluate(&rule(None), &x));
+        for bad in [0.0, -1.0, f64::NAN] {
+            assert!(rule(Some(bad)).validate().is_err(), "{bad}");
         }
     }
 

@@ -591,11 +591,15 @@ pub fn run_battery_with_references(
         true => Sizing::FixedSize,
         false => Sizing::Compounding,
     };
+    let notional_limit = matches!(
+        rule,
+        VerdictRule::PropFirm { limits, .. } if limits.max_open_notional_multiple.is_some()
+    );
     // Each window's open positions inside its bars, which its result does not keep, from its test
     // run made again: the peak leverage and the open-notional line, both at a fixed size, read
-    // them.
+    // them, and at a compounding size the open-notional limit the attempt walks check.
     let held = match &wf {
-        Some(wf) if sizes_from_cash => Some(
+        Some(wf) if sizes_from_cash || notional_limit => Some(
             wf.windows
                 .iter()
                 .map(|w| {
@@ -769,9 +773,12 @@ pub fn run_battery_with_references(
             // changes, added from window to window, and its lines on the starting-cash reading;
             // otherwise on the stitched curve, and its lines on each fall's own start.
             let per_cash = sizes_from_cash.then_some(cash);
-            // The limit needs `sizes_from_starting_cash` (`VerdictRule::validate`), so `held` is
-            // read whenever it is set.
-            if let (Some(_), Some(held)) = (limits.max_open_notional_multiple, &held) {
+            // At a fixed size the open-notional limit is its own line, read on each counted
+            // window's own notional; at a compounding size the attempt walks check it, below.
+            // `held` is read whenever it is set.
+            if let (Some(_), Some(held), true) =
+                (limits.max_open_notional_multiple, &held, sizes_from_cash)
+            {
                 // The evaluation and the funded account each trade their terms' size, a multiple
                 // of the size tested; the larger is the one that can breach the limit.
                 let size = attempt.map_or(1.0, |t| t.evaluation_size.max(t.funded_size));
@@ -853,7 +860,21 @@ pub fn run_battery_with_references(
                 seed: derive_seed(seed, SEED_PROP_FIRM),
                 sizes_from_starting_cash: per_cash.is_some(),
                 max_days_without_trading: firm.max_days_without_trading.map(|n| n as usize),
+                max_open_notional: limits
+                    .max_open_notional_multiple
+                    .filter(|_| per_cash.is_none()),
             };
+            // At a compounding size, each day's open notional over the curve's equity at its
+            // start, which the walks check against the limit at each attempt's own balance.
+            let notional = match (spec.max_open_notional, &held) {
+                (Some(_), Some(held)) => Some(daily_notional(
+                    &days,
+                    &tester::compounded_exposures(cash, &wf.windows, held),
+                    step,
+                )),
+                _ => None,
+            };
+            let notional = notional.as_deref();
             // The loss limits are checked on each day's lowest equity when the curve has its
             // ranges, and at each daily close when it does not.
             let lows = daily_lows(series, ranges, daily.len(), rollover, per_cash);
@@ -862,7 +883,9 @@ pub fn run_battery_with_references(
             // The firm rule sets no time limit of its own (see `FirmLimits`), so the pass odds
             // run to the rule's `pass_horizon_days`. With the two horizons equal, both odds come
             // from the same paths.
-            let breach = stats::prop_firm_odds(&daily, lows, &traded, &spec, attempt.as_ref()).ok();
+            let breach =
+                stats::prop_firm_odds(&daily, lows, &traded, notional, &spec, attempt.as_ref())
+                    .ok();
             let pass = if limits.pass_horizon_days == limits.breach_horizon_days {
                 breach
             } else {
@@ -870,7 +893,7 @@ pub fn run_battery_with_references(
                     horizon_days: limits.pass_horizon_days as usize,
                     ..spec
                 };
-                stats::prop_firm_odds(&daily, lows, &traded, &spec, None).ok()
+                stats::prop_firm_odds(&daily, lows, &traded, notional, &spec, None).ok()
             };
             result.prop_firm_odds = pass.zip(breach).map(|(p, b)| PropFirmOdds {
                 pass: p.pass,
@@ -878,6 +901,7 @@ pub fn run_battery_with_references(
                 paths: b.paths,
                 days: b.days,
                 trading_days: b.trading_days,
+                peak_day_notional: b.peak_day_notional,
             });
             kind.pass_probability = result.prop_firm_odds.map(|o| o.pass);
             kind.breach_probability = result.prop_firm_odds.map(|o| o.breach);
@@ -888,7 +912,7 @@ pub fn run_battery_with_references(
                     ..spec
                 };
                 result.prop_firm_attempt =
-                    stats::prop_firm_attempt(&daily, lows, &traded, &spec, terms).ok();
+                    stats::prop_firm_attempt(&daily, lows, &traded, notional, &spec, terms).ok();
                 kind.attempt_value = result.prop_firm_attempt.map(|a| a.reduced.value);
             }
         }
@@ -1589,6 +1613,38 @@ fn daily_lows(
             })
             .collect()
     })
+}
+
+/// Each day's open-notional figure for the attempt walks at a compounding size
+/// ([`stats::PropFirmSpec::max_open_notional`]), one for each of `days`, the stitched curve's days
+/// at the firm's rollover that the walks' returns are read on: the largest notional in `held`, the
+/// curve's open positions ([`tester::compounded_exposures`]), at the points of the bars that close
+/// in the day, over the curve's equity at the day's start. A bar's points go on the day its close
+/// falls on, a close exactly at a day's end ending that day, as its low does ([`daily_lows`]) and
+/// as [`traded_days`] places its fills. A day without a position, or one that starts with no
+/// equity left, has a figure of 0. Each figure is read from its own day alone.
+///
+/// The figure is taken over the equity at the day's start, not over each point's own equity:
+/// the walks apply a day's return and low to an attempt's balance going into the day, so an
+/// attempt holds the curve's position times that balance over the curve's equity at the day's
+/// start, and its notional at a point is that point's notional times the same factor. The
+/// figure times the balance (and the phase's size) is then exact; a figure over each point's own
+/// equity would be exact only for a position resized at every point.
+fn daily_notional(days: &[risk::DailyPnl], held: &[Exposure], step: Millis) -> Vec<f64> {
+    let mut peak = vec![0.0f64; days.len()];
+    for x in held {
+        let close = x.time + step;
+        if let Some(p) = peak.get_mut(days.partition_point(|d| d.end < close)) {
+            *p = p.max(x.notional);
+        }
+    }
+    peak.iter()
+        .zip(days)
+        .map(|(&n, d)| match d.start_equity > 0.0 {
+            true => n / d.start_equity,
+            false => 0.0,
+        })
+        .collect()
 }
 
 /// Whether the strategy traded on each of the days that end at `ends` ([`risk::DailyPnl::end`],
@@ -2627,6 +2683,43 @@ mod tests {
         }
     }
 
+    /// Each day's figure is its largest notional over its starting equity, on the days of the
+    /// daily returns: a bar closing at midnight belongs to the day it ends.
+    #[test]
+    fn daily_notional_is_each_days_largest_notional_over_its_starting_equity() {
+        const HALF: Millis = DAY_MS / 2;
+        let day = |end, start_equity| risk::DailyPnl {
+            end,
+            start_equity,
+            end_equity: start_equity,
+            low_equity: start_equity,
+        };
+        // Days ending at day 2's, day 3's and day 4's midnight, starting at 100, 110 and 0.
+        let days = [
+            day(2 * DAY_MS, 100.0),
+            day(3 * DAY_MS, 110.0),
+            day(4 * DAY_MS, 0.0),
+        ];
+        let at = |time, notional| Exposure {
+            notional,
+            equity: 1.0,
+            time,
+        };
+        // Twelve-hour bars stamped with their open. The bar that opens at day 1's noon closes
+        // exactly at day 2's midnight, so its 80 is on day 1 with the 50 before it: 80 over 100.
+        // The 66 of the bar that opens at day 2's midnight is on day 2: 66 over 110. Day 3 starts
+        // with no equity, so its figure is 0, and a bar that closes after the last day is on none.
+        let held = [
+            at(DAY_MS, 50.0),
+            at(DAY_MS + HALF, 80.0),
+            at(2 * DAY_MS, 66.0),
+            at(3 * DAY_MS, 9.0),
+            at(4 * DAY_MS, 1e9),
+        ];
+        assert_eq!(daily_notional(&days, &held, HALF), [0.8, 0.6, 0.0]);
+        assert_eq!(daily_notional(&days, &[], HALF), [0.0; 3]);
+    }
+
     /// Each day's low is its lowest bar low against the day before's close, on the days of the
     /// daily returns: a bar closing at midnight belongs to the day it ends.
     #[test]
@@ -3419,6 +3512,7 @@ mod tests {
                 seed: derive_seed(seed, SEED_PROP_FIRM),
                 sizes_from_starting_cash: false,
                 max_days_without_trading: None,
+                max_open_notional: None,
             };
             let lows = daily_lows(
                 &series,
@@ -3428,7 +3522,7 @@ mod tests {
                 None,
             )
             .unwrap();
-            stats::prop_firm_odds(&daily, Some(&lows), traded, &spec, terms).unwrap()
+            stats::prop_firm_odds(&daily, Some(&lows), traded, None, &spec, terms).unwrap()
         };
         let odds = |traded: &[bool]| odds_with(traded, None);
         let fills = odds(&traded);
@@ -3554,8 +3648,9 @@ mod tests {
                 seed: derive_seed(seed, SEED_PROP_FIRM),
                 sizes_from_starting_cash: false,
                 max_days_without_trading: None,
+                max_open_notional: None,
             };
-            stats::prop_firm_odds(&daily, Some(&lows), &traded, &spec, None).unwrap()
+            stats::prop_firm_odds(&daily, Some(&lows), &traded, None, &spec, None).unwrap()
         };
         assert_eq!(r.prop_firm_odds, Some(odds(ny)));
         // The four-hour bars close at 00:00 UTC, after 17:00 New York, so the days differ.
@@ -3642,11 +3737,72 @@ mod tests {
         }
     }
 
-    /// A limit on open notional, which needs a plan sized from the starting cash, is judged on the
-    /// largest open notional of the windows the fixed-size account counts, each window's own over
-    /// the starting cash. A limit below the figure fails the line, one above passes it, and a rule
-    /// without the limit has the lines it had. With `attempt` terms the figure is taken at the
-    /// larger of the evaluation and funded sizes. At a compounding size the battery refuses it.
+    /// At a compounding size a limit on open notional is accepted, has no line of its own and
+    /// moves only the attempt walks: a limit no day can reach gives the odds and the lines of a
+    /// rule without it, with the days' largest figure beside them, and one under that figure
+    /// breaches at least as often and passes at most as often.
+    #[test]
+    fn a_limit_on_open_notional_at_a_compounding_size_is_checked_in_the_attempt_walks() {
+        let (plan, bars) = sma_plan(sma_axes());
+        let VerdictRule::PropFirm { firm, limits, .. } = firm_rule(DrawdownMode::Static, 10, None)
+        else {
+            unreachable!()
+        };
+        let battery = |cap: Option<f64>| {
+            let rule = VerdictRule::PropFirm {
+                firm,
+                limits: crate::PropFirmLimits {
+                    max_open_notional_multiple: cap,
+                    ..limits
+                },
+                attempt: None,
+            };
+            let spec = BatterySpec {
+                strategy: "sma_cross",
+                plan: &plan,
+                rule: &rule,
+                instrument: &test_instrument(),
+                seed: 7,
+            };
+            run_battery(&spec, &bars, &[], &[], None).unwrap()
+        };
+        let off = battery(None);
+        let off_odds = off.prop_firm_odds.unwrap();
+        assert_eq!(off_odds.peak_day_notional, None);
+        let unreachable = battery(Some(1e9));
+        let odds = unreachable.prop_firm_odds.unwrap();
+        let peak = odds.peak_day_notional.unwrap();
+        assert!(peak > 0.0, "{peak}");
+        assert_eq!(
+            PropFirmOdds {
+                peak_day_notional: None,
+                ..odds
+            },
+            off_odds
+        );
+        assert_eq!(unreachable.verdict.criteria, off.verdict.criteria);
+        assert_eq!(unreachable.kind.peak_open_notional, None);
+        assert!(
+            unreachable
+                .verdict
+                .criteria
+                .iter()
+                .all(|l| l.id != "open_notional")
+        );
+        let tight = battery(Some(peak / 2.0)).prop_firm_odds.unwrap();
+        assert!(
+            tight.breach >= off_odds.breach && tight.pass <= off_odds.pass,
+            "{tight:?}"
+        );
+        assert!(tight.breach > 0.0, "{tight:?}");
+    }
+
+    /// A limit on open notional on a plan sized from the starting cash is judged on the largest
+    /// open notional of the windows the fixed-size account counts, each window's own over the
+    /// starting cash. A limit below the figure fails the line, one above passes it, and a rule
+    /// without the limit has the lines it had. The attempt walks do not read the limit at a fixed
+    /// size, so the odds are those without it and carry no figure of their own. With `attempt`
+    /// terms the figure is taken at the larger of the evaluation and funded sizes.
     #[test]
     fn a_limit_on_open_notional_is_judged_on_the_fixed_size_account() {
         let (plan, bars) = sma_plan(sma_axes());
@@ -3681,13 +3837,6 @@ mod tests {
                 .find(|l| l.id == "open_notional")
                 .cloned()
         };
-        let Err(TesterError::InvalidSpec(refused)) = battery(false, Some(1.0), None) else {
-            panic!("a limit on open notional at a compounding size was accepted")
-        };
-        assert!(
-            refused.contains("limits.sizes_from_starting_cash"),
-            "{refused}"
-        );
         let off = battery(true, None, None).unwrap();
         assert!(line(&off).is_none());
         assert_eq!(off.kind.peak_open_notional, None);
@@ -3718,6 +3867,10 @@ mod tests {
             let capped = battery(true, Some(cap), None).unwrap();
             let l = line(&capped).unwrap();
             assert_eq!((l.value, l.outcome), (Some(figure), outcome));
+            assert_eq!(capped.prop_firm_odds, off.prop_firm_odds);
+            assert_eq!(capped.prop_firm_odds.unwrap().peak_day_notional, None);
+            let json = serde_json::to_value(capped.prop_firm_odds).unwrap();
+            assert!(json.get("peak_day_notional").is_none(), "{json}");
             let rest: Vec<_> = capped
                 .verdict
                 .criteria
@@ -3953,9 +4106,11 @@ mod tests {
                 seed: derive_seed(7, SEED_PROP_FIRM),
                 sizes_from_starting_cash: true,
                 max_days_without_trading: None,
+                max_open_notional: None,
             };
             let odds =
-                stats::prop_firm_odds(&daily, Some(&lows), &traded, &spec, Some(&terms)).unwrap();
+                stats::prop_firm_odds(&daily, Some(&lows), &traded, None, &spec, Some(&terms))
+                    .unwrap();
             assert_eq!(
                 on.kind.breach_probability,
                 Some(odds.breach),
@@ -3967,7 +4122,7 @@ mod tests {
                 ..spec
             };
             let attempt =
-                stats::prop_firm_attempt(&daily, Some(&lows), &traded, &attempt_spec, &terms)
+                stats::prop_firm_attempt(&daily, Some(&lows), &traded, None, &attempt_spec, &terms)
                     .unwrap();
             assert!(attempt.full.payouts_per_funded.is_some(), "{attempt:?}");
             assert_eq!(on.prop_firm_attempt, Some(attempt), "{drawdown:?}");
