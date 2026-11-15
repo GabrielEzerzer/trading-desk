@@ -3481,7 +3481,7 @@ mod tests {
             // reach.
             let far = crate::FirmLimits {
                 daily_loss: 1.0,
-                ..firm.clone()
+                ..*firm
             };
             let limits = crate::PropFirmLimits {
                 breach_horizon_days: 60,
