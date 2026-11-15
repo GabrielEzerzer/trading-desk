@@ -116,9 +116,12 @@ pub struct FirmLimits {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trailing_floor_lock: Option<f64>,
     /// Where the firm's day ends, for its daily loss limit and its trading days. When set, the
-    /// worst-daily-loss line measures these days only, and the attempt walks read each day's
-    /// return, its low and its trading-day flag on them. `None` measures the line on the worse of
-    /// days ending at midnight UTC and at 17:00 New York, and walks days ending at midnight UTC.
+    /// worst-daily-loss line measures these days only, the attempts on the test's curve start on
+    /// them and read their daily losses on them, and the attempt walks read each day's return,
+    /// its low and its trading-day flag on them. `None` measures the line on the worse of days
+    /// ending at midnight UTC and at 17:00 New York, starts the attempts on the test's curve on
+    /// UTC days with each reading the daily losses of both kinds of day whose lowest point falls
+    /// inside it, and walks days ending at midnight UTC.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub day_rollover: Option<DayRollover>,
     /// The number of days in a row without a trading day (as `min_trading_days` counts them) that
@@ -389,8 +392,13 @@ pub enum DrawdownMode {
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PropFirmLimits {
-    /// The worst daily loss and the max drawdown, measured inside bars, must stay within this
-    /// share of the firm's limits.
+    /// The share of the firm's limits at which an attempt on the test's own curve counts as
+    /// breached: one of the attempts of `breach_horizon_days` started on each day of the test
+    /// breaches when its drawdown, measured inside bars, goes past this share of the firm's max
+    /// drawdown, or one of its days loses more than this share of the firm's daily loss. It is
+    /// the margin held against the firm's limits on a curve that use will not repeat exactly; 1
+    /// counts attempts as breached at the firm's real limits. The worst daily loss and the max
+    /// drawdown lines are judged against the same share, and warn when over it.
     pub share_of_firm_limits: f64,
     /// The chance of reaching the profit target within `pass_horizon_days`, before breaching a
     /// limit, must be at least this.
@@ -401,26 +409,28 @@ pub struct PropFirmLimits {
     /// as 90, the horizon it was judged on.
     #[serde(default = "default_pass_horizon_days")]
     pub pass_horizon_days: u32,
-    /// The chance of breaching a limit within `breach_horizon_days` must be at most this.
+    /// The chance of breaching a limit within `breach_horizon_days` must be at most this, and so
+    /// must the share of the attempts on the test's own curve that breach at
+    /// `share_of_firm_limits` of the firm's limits. At 0 no attempt on the test's curve may
+    /// breach.
     pub max_breach_probability: f64,
-    /// Days a simulated attempt runs for the breach odds, and the length of each attempt the
-    /// max-drawdown line reads on the test's curve.
+    /// Days a simulated attempt runs for the breach odds, and the length of each attempt started
+    /// on a day of the test that the breach-share and max-drawdown lines read on the test's curve.
     pub breach_horizon_days: u32,
-    /// Whether the strategy trades a fixed quantity or notional set from the starting cash, so
-    /// its falls in money stay the same size as the balance grows. When set, the max-drawdown and
-    /// worst-daily-loss lines judge each fall in money as a share of the starting cash, and the
-    /// simulated attempts add each day's profit and loss as a share of the starting cash instead
-    /// of compounding a return on the balance. Every figure the battery reads then comes from one
-    /// account that adds each walk-forward test window's own money changes at the size it was
-    /// tested at, whose own balance decides when it is gone, and the runs at higher costs, at
-    /// each start offset and of each plateau neighbour are put together the same way. The
+    /// Whether the strategy trades a fixed quantity or notional set from the starting cash, so its
+    /// falls in money stay the same size as the balance grows. When set, the breach-share,
+    /// max-drawdown and worst-daily-loss lines judge each fall in money as a share of the starting
+    /// cash, and the simulated attempts add each day's profit and loss as a share of the starting
+    /// cash instead of compounding a return on the balance. Every figure the battery reads then
+    /// comes from one account that adds each walk-forward test window's own money changes at the
+    /// size it was tested at, whose own balance decides when it is gone, and the runs at higher
+    /// costs, at each start offset and of each plateau neighbour are put together the same way. The
     /// exceptions read each window's own run (I1 to I3, the share of profitable windows, the day
     /// and window counts and the breakdown's rising and falling returns) or the full-period sweep
     /// (the luck test), and the other kinds' benchmark figures. The lowest-equity line also fails
-    /// when a window that account counts reached zero or below in its own run.
-    /// `false`, the default, reads every fall and every day as a share of the balance it starts
-    /// from, which is exact for a strategy whose size grows with its balance. `false` is left out
-    /// of JSON.
+    /// when a window that account counts reached zero or below in its own run. `false`, the
+    /// default, reads every fall and every day as a share of the balance it starts from, which is
+    /// exact for a strategy whose size grows with its balance. `false` is left out of JSON.
     #[serde(default, skip_serializing_if = "is_false")]
     pub sizes_from_starting_cash: bool,
     /// The most open notional the firm allows, as a multiple of the account size, the starting
@@ -1367,6 +1377,17 @@ pub struct KindInputs {
     /// `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub peak_open_notional: Option<f64>,
+    /// For a `prop_firm` rule, the share of the attempts of its `breach_horizon_days` started on
+    /// each of the firm's days of the curve that breach at its `share_of_firm_limits` of the
+    /// firm's limits: whose drawdown, static or trailing as the firm measures it, is above that
+    /// share of the firm's max drawdown, or one of whose days loses more than that share of the
+    /// firm's daily loss. Each fall is read as `intrabar_drawdown_static`, or
+    /// `intrabar_drawdown_trailing`, and `worst_daily_loss` read theirs, so with
+    /// `sizes_from_starting_cash` as a share of the starting cash. `None` for the other kinds,
+    /// when the falls could not be measured, and in a result saved before it existed, which
+    /// leaves it out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test_breach_share: Option<f64>,
 }
 
 const MINUTES_PER_DAY: i32 = 24 * 60;
@@ -1435,6 +1456,13 @@ pub fn evaluate(rule: &VerdictRule, x: &KindInputs) -> Vec<Criterion> {
                     day_end(rollover)
                 ),
             };
+            // The share line decides: the worst day and the worst attempt only warn when over
+            // the share of the firm's limits at which an attempt counts as breached.
+            let decided_by_share = "Over the limit, this line warns and does not fail the \
+                                    verdict: the line for the share of attempts that breach \
+                                    decides.";
+            let percent = format!("{:.2}", share * 100.0);
+            let percent = percent.trim_end_matches('0').trim_end_matches('.');
             let mut lines = vec![
                 line(
                     "worst_daily_loss",
@@ -1443,7 +1471,9 @@ pub fn evaluate(rule: &VerdictRule, x: &KindInputs) -> Vec<Criterion> {
                     AtMost,
                     share * firm.daily_loss,
                     Unit::Percent,
-                ),
+                )
+                .warning_on_fail()
+                .with_warning_note(decided_by_share),
                 line(
                     "max_drawdown",
                     &format!(
@@ -1454,6 +1484,21 @@ pub fn evaluate(rule: &VerdictRule, x: &KindInputs) -> Vec<Criterion> {
                     drawdown,
                     AtMost,
                     share * firm.max_drawdown,
+                    Unit::Percent,
+                )
+                .warning_on_fail()
+                .with_warning_note(decided_by_share),
+                line(
+                    "test_breach_share",
+                    &format!(
+                        "Share of the {}-day attempts, one started on each day of the test, that \
+                         fell past {percent}% of the firm's max drawdown or lost more than \
+                         {percent}% of its daily loss limit in a day{of_cash}",
+                        limits.breach_horizon_days
+                    ),
+                    x.test_breach_share,
+                    AtMost,
+                    limits.max_breach_probability,
                     Unit::Percent,
                 ),
                 line(
@@ -2405,6 +2450,7 @@ mod tests {
             worst_daily_loss: Some(0.01),
             intrabar_drawdown_static: Some(0.03),
             intrabar_drawdown_trailing: Some(0.20),
+            test_breach_share: Some(0.0),
             pass_probability: Some(0.7),
             breach_probability: Some(0.05),
             limits_inside_day: true,
@@ -2468,6 +2514,7 @@ mod tests {
             [
                 "worst_daily_loss",
                 "max_drawdown",
+                "test_breach_share",
                 "pass_probability",
                 "breach_probability"
             ]
@@ -2481,7 +2528,18 @@ mod tests {
             "Max drawdown from the starting balance in any 90-day attempt started on a day of the \
              test"
         );
-        assert_eq!(lines[3].name, "Chance of breaching a limit within 90 days");
+        // The share of attempts that breach is held to the same limit as the simulated breach
+        // odds, and its name says where an attempt counts as breached.
+        assert_eq!(
+            (lines[2].value, lines[2].limit, lines[2].unit),
+            (Some(0.0), Some(0.1), Unit::Percent)
+        );
+        assert_eq!(
+            lines[2].name,
+            "Share of the 90-day attempts, one started on each day of the test, that fell past 50% \
+             of the firm's max drawdown or lost more than 50% of its daily loss limit in a day"
+        );
+        assert_eq!(lines[4].name, "Chance of breaching a limit within 90 days");
         // A rule that does not say where its firm's day ends names none.
         assert_eq!(
             lines[0].name,
@@ -2493,10 +2551,11 @@ mod tests {
     fn prop_firm_fails_on_each_criterion() {
         type Tweak = fn(&mut KindInputs);
         let rule = prop(DrawdownMode::Static);
-        let cases: [(&str, Tweak); 6] = [
-            ("worst_daily_loss", |x| x.worst_daily_loss = Some(0.026)),
+        let cases: [(&str, Tweak); 7] = [
             ("worst_daily_loss", |x| x.worst_daily_loss = None),
-            ("max_drawdown", |x| x.intrabar_drawdown_static = Some(0.051)),
+            ("max_drawdown", |x| x.intrabar_drawdown_static = None),
+            ("test_breach_share", |x| x.test_breach_share = Some(0.11)),
+            ("test_breach_share", |x| x.test_breach_share = None),
             ("pass_probability", |x| x.pass_probability = Some(0.59)),
             ("breach_probability", |x| x.breach_probability = Some(0.11)),
             ("breach_probability", |x| {
@@ -2512,6 +2571,39 @@ mod tests {
                 "{id}"
             );
         }
+    }
+
+    /// Over its limit, the worst daily loss or the worst attempt's drawdown warns, with a note
+    /// that the share line decides, and does not fail the verdict; within it, it passes with no
+    /// note, as before.
+    #[test]
+    fn prop_firm_worst_day_and_attempt_warn_over_their_limits() {
+        type Tweak = fn(&mut KindInputs);
+        let rule = prop(DrawdownMode::Static);
+        let cases: [(&str, Tweak); 2] = [
+            ("worst_daily_loss", |x| x.worst_daily_loss = Some(0.026)),
+            ("max_drawdown", |x| x.intrabar_drawdown_static = Some(0.051)),
+        ];
+        for (id, tweak) in cases {
+            let mut x = good_prop();
+            tweak(&mut x);
+            let lines = evaluate(&rule, &x);
+            assert_eq!(not_passing(&lines), [(id, Outcome::Warn)], "{id}");
+            let line = lines.iter().find(|l| l.id == id).unwrap();
+            assert_eq!(
+                line.note.as_deref(),
+                Some(
+                    "Over the limit, this line warns and does not fail the verdict: the line for \
+                     the share of attempts that breach decides."
+                ),
+                "{id}"
+            );
+        }
+        assert!(
+            evaluate(&rule, &good_prop())
+                .iter()
+                .all(|l| l.note.is_none())
+        );
     }
 
     /// The daily loss line names the day it measured when the rule states one, and the drawdown
@@ -2608,6 +2700,7 @@ mod tests {
         let edge = KindInputs {
             worst_daily_loss: Some(0.025),
             intrabar_drawdown_static: Some(0.05),
+            test_breach_share: Some(0.1),
             pass_probability: Some(0.6),
             breach_probability: Some(0.1),
             ..KindInputs::default()
@@ -2621,7 +2714,7 @@ mod tests {
     #[test]
     fn prop_firm_reads_the_drawdown_the_firm_measures() {
         let lines = evaluate(&prop(DrawdownMode::Trailing), &good_prop());
-        assert_eq!(not_passing(&lines), [("max_drawdown", Outcome::Fail)]);
+        assert_eq!(not_passing(&lines), [("max_drawdown", Outcome::Warn)]);
         assert_eq!(lines[1].value, Some(0.20));
         assert_eq!(
             lines[1].name,
@@ -3597,7 +3690,7 @@ mod tests {
         assert!(line(&off, Some(9.0)).is_none());
         assert_eq!(
             evaluate(&off, &good_prop()),
-            evaluate(&capped, &good_prop())[..4]
+            evaluate(&capped, &good_prop())[..5]
         );
         let json = serde_json::to_value(off).unwrap();
         assert!(
@@ -3703,21 +3796,27 @@ mod tests {
         // verdict record, so a verdict saved before the new fields stays current.
         let original: serde_json::Value = serde_json::from_str(saved).unwrap();
         assert_eq!(serde_json::to_value(rule).unwrap(), original);
+        // Judged with the lines a rule of today has: the share of the test's attempts that breach
+        // decides, held to the rule's `max_breach_probability`.
         let lines = evaluate(&rule, &good_prop());
         assert_eq!(
             ids(&lines),
             [
                 "worst_daily_loss",
                 "max_drawdown",
+                "test_breach_share",
                 "pass_probability",
                 "breach_probability"
             ]
         );
-        // Half the firm's 5% and 10%, and the rule's 0.6 and 0.1, as on main.
+        // Half the firm's 5% and 10%, and the rule's 0.1, 0.6 and 0.1.
         let limits: Vec<Option<f64>> = lines.iter().map(|c| c.limit).collect();
-        assert_eq!(limits, [Some(0.025), Some(0.05), Some(0.6), Some(0.1)]);
-        // good_prop's trailing drawdown is 0.20, over the 0.05 limit; the rest pass.
-        assert_eq!(not_passing(&lines), [("max_drawdown", Outcome::Fail)]);
+        assert_eq!(
+            limits,
+            [Some(0.025), Some(0.05), Some(0.1), Some(0.6), Some(0.1)]
+        );
+        // good_prop's trailing drawdown is 0.20, over the 0.05 limit, which warns; the rest pass.
+        assert_eq!(not_passing(&lines), [("max_drawdown", Outcome::Warn)]);
         // A second target cannot stand without the first: a firm without `profit_target` does
         // not read.
         let no_first = r#"{"daily_loss":0.05,"max_drawdown":0.1,"drawdown":"static",
@@ -4037,8 +4136,8 @@ mod tests {
                     ..good_prop()
                 },
             );
-            assert_eq!(lines.len(), 5);
-            lines[4].clone()
+            assert_eq!(lines.len(), 6);
+            lines[5].clone()
         };
         let pass = line(Some(0.01));
         assert_eq!(pass.id, "attempt_value");

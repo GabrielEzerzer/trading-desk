@@ -1193,9 +1193,12 @@ trading_day?: TradingDayTest | null,
 trailing_floor_lock?: number | null, 
 /**
  * Where the firm's day ends, for its daily loss limit and its trading days. When set, the
- * worst-daily-loss line measures these days only, and the attempt walks read each day's
- * return, its low and its trading-day flag on them. `None` measures the line on the worse of
- * days ending at midnight UTC and at 17:00 New York, and walks days ending at midnight UTC.
+ * worst-daily-loss line measures these days only, the attempts on the test's curve start on
+ * them and read their daily losses on them, and the attempt walks read each day's return,
+ * its low and its trading-day flag on them. `None` measures the line on the worse of days
+ * ending at midnight UTC and at 17:00 New York, starts the attempts on the test's curve on
+ * UTC days with each reading the daily losses of both kinds of day whose lowest point falls
+ * inside it, and walks days ending at midnight UTC.
  */
 day_rollover?: DayRollover | null, 
 /**
@@ -1337,8 +1340,13 @@ export type DrawdownMode = "static" | "trailing";
 
 export type PropFirmLimits = { 
 /**
- * The worst daily loss and the max drawdown, measured inside bars, must stay within this
- * share of the firm's limits.
+ * The share of the firm's limits at which an attempt on the test's own curve counts as
+ * breached: one of the attempts of `breach_horizon_days` started on each day of the test
+ * breaches when its drawdown, measured inside bars, goes past this share of the firm's max
+ * drawdown, or one of its days loses more than this share of the firm's daily loss. It is
+ * the margin held against the firm's limits on a curve that use will not repeat exactly; 1
+ * counts attempts as breached at the firm's real limits. The worst daily loss and the max
+ * drawdown lines are judged against the same share, and warn when over it.
  */
 share_of_firm_limits: number, 
 /**
@@ -1354,30 +1362,32 @@ min_pass_probability: number,
  */
 pass_horizon_days: number, 
 /**
- * The chance of breaching a limit within `breach_horizon_days` must be at most this.
+ * The chance of breaching a limit within `breach_horizon_days` must be at most this, and so
+ * must the share of the attempts on the test's own curve that breach at
+ * `share_of_firm_limits` of the firm's limits. At 0 no attempt on the test's curve may
+ * breach.
  */
 max_breach_probability: number, 
 /**
- * Days a simulated attempt runs for the breach odds, and the length of each attempt the
- * max-drawdown line reads on the test's curve.
+ * Days a simulated attempt runs for the breach odds, and the length of each attempt started
+ * on a day of the test that the breach-share and max-drawdown lines read on the test's curve.
  */
 breach_horizon_days: number, 
 /**
- * Whether the strategy trades a fixed quantity or notional set from the starting cash, so
- * its falls in money stay the same size as the balance grows. When set, the max-drawdown and
- * worst-daily-loss lines judge each fall in money as a share of the starting cash, and the
- * simulated attempts add each day's profit and loss as a share of the starting cash instead
- * of compounding a return on the balance. Every figure the battery reads then comes from one
- * account that adds each walk-forward test window's own money changes at the size it was
- * tested at, whose own balance decides when it is gone, and the runs at higher costs, at
- * each start offset and of each plateau neighbour are put together the same way. The
+ * Whether the strategy trades a fixed quantity or notional set from the starting cash, so its
+ * falls in money stay the same size as the balance grows. When set, the breach-share,
+ * max-drawdown and worst-daily-loss lines judge each fall in money as a share of the starting
+ * cash, and the simulated attempts add each day's profit and loss as a share of the starting
+ * cash instead of compounding a return on the balance. Every figure the battery reads then
+ * comes from one account that adds each walk-forward test window's own money changes at the
+ * size it was tested at, whose own balance decides when it is gone, and the runs at higher
+ * costs, at each start offset and of each plateau neighbour are put together the same way. The
  * exceptions read each window's own run (I1 to I3, the share of profitable windows, the day
  * and window counts and the breakdown's rising and falling returns) or the full-period sweep
  * (the luck test), and the other kinds' benchmark figures. The lowest-equity line also fails
- * when a window that account counts reached zero or below in its own run.
- * `false`, the default, reads every fall and every day as a share of the balance it starts
- * from, which is exact for a strategy whose size grows with its balance. `false` is left out
- * of JSON.
+ * when a window that account counts reached zero or below in its own run. `false`, the
+ * default, reads every fall and every day as a share of the balance it starts from, which is
+ * exact for a strategy whose size grows with its balance. `false` is left out of JSON.
  */
 sizes_from_starting_cash?: boolean, 
 /**
@@ -1859,7 +1869,19 @@ limits_inside_day?: boolean,
  * compounding size the attempt walks check the limit instead (see that field). Left out when
  * `None`.
  */
-peak_open_notional?: number | null, };
+peak_open_notional?: number | null, 
+/**
+ * For a `prop_firm` rule, the share of the attempts of its `breach_horizon_days` started on
+ * each of the firm's days of the curve that breach at its `share_of_firm_limits` of the
+ * firm's limits: whose drawdown, static or trailing as the firm measures it, is above that
+ * share of the firm's max drawdown, or one of whose days loses more than that share of the
+ * firm's daily loss. Each fall is read as `intrabar_drawdown_static`, or
+ * `intrabar_drawdown_trailing`, and `worst_daily_loss` read theirs, so with
+ * `sizes_from_starting_cash` as a share of the starting cash. `None` for the other kinds,
+ * when the falls could not be measured, and in a result saved before it existed, which
+ * leaves it out.
+ */
+test_breach_share?: number | null, };
 
 /**
  * The integrity checks read on the stitched walk-forward out-of-sample curve (I4 and I5),

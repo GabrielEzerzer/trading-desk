@@ -649,12 +649,10 @@ pub fn run_battery_with_references(
     let mut evidence = EvidenceInputs::default();
     let mut kind = KindInputs::default();
     let mut oos_integrity = OosIntegrityInputs::default();
-    // For a `prop_firm` rule, the worst attempt's fall as a share of the starting cash, on the
-    // reading (static or trailing) its drawdown line judges, and the worst day's, for
-    // `sizing_warning`. A rule sized from the starting cash judges its lines on these figures, so
-    // the warning never fires for it.
-    let mut fixed_size_drawdown = None;
-    let mut fixed_size_daily_loss = None;
+    // For a `prop_firm` rule, the share of the test's attempts that breach with each fall read as
+    // a share of the starting cash, for `sizing_warning`. A rule sized from the starting cash
+    // judges its share line on this figure, so the warning never fires for it.
+    let mut fixed_size_share = None;
     if let Some(p) = &plateau {
         evidence.plateau_median_ratio = p.median_ratio;
         evidence.plateau_positive_share = p.positive_share;
@@ -759,6 +757,7 @@ pub fn run_battery_with_references(
             attempt_value: None,
             limits_inside_day: false,
             peak_open_notional: None,
+            test_breach_share: None,
         };
         if let VerdictRule::PropFirm {
             firm,
@@ -787,29 +786,23 @@ pub fn run_battery_with_references(
             }
             let (series, ranges) = (&series, &wf.equity_extremes[..]);
             let judged = |f: Fall| if per_cash.is_some() { f.cash } else { f.own };
-            let daily_loss = worst_daily_loss(series, ranges, cash, firm.day_rollover);
-            kind.worst_daily_loss = daily_loss.map(judged);
-            fixed_size_daily_loss = daily_loss.map(|f| f.cash);
+            kind.worst_daily_loss =
+                worst_daily_loss(series, ranges, cash, firm.day_rollover).map(judged);
             // A trailing floor that stops at a lock stops counting the peak once it reaches the
             // lock plus the drawdown above the start, as the attempt walks apply it.
-            let peak_cap = match firm.drawdown {
-                DrawdownMode::Static => None,
-                DrawdownMode::Trailing => firm.trailing_floor_lock.map(|l| l + firm.max_drawdown),
-            };
             let (fixed, trailing) = attempt_drawdowns(
                 series,
                 ranges,
                 rollover,
                 limits.breach_horizon_days as usize,
-                peak_cap,
+                peak_cap(firm),
             );
             kind.intrabar_drawdown_static = fixed.map(judged);
             kind.intrabar_drawdown_trailing = trailing.map(judged);
-            fixed_size_drawdown = match firm.drawdown {
-                DrawdownMode::Static => fixed,
-                DrawdownMode::Trailing => trailing,
-            }
-            .map(|f| f.cash);
+            // The same attempts, judged on the share of them that breach.
+            let share = breach_share(series, ranges, cash, firm, limits);
+            kind.test_breach_share = share.map(judged);
+            fixed_size_share = share.map(|f| f.cash);
             let days = risk::daily_pnl(series, None, rollover);
             let daily: Vec<f64> = days
                 .iter()
@@ -922,16 +915,13 @@ pub fn run_battery_with_references(
         plan.backtest.max_leverage,
     ));
     let kind_lines = evaluate(rule, &kind);
-    let sizing_warnings: Vec<String> = [
-        ("worst_daily_loss", fixed_size_daily_loss),
-        ("max_drawdown", fixed_size_drawdown),
-    ]
-    .into_iter()
-    .filter_map(|(id, fixed_size)| {
-        let line = kind_lines.iter().find(|l| l.id == id)?;
-        sizing_warning(line, fixed_size?)
-    })
-    .collect();
+    let sizing_warnings: Vec<String> = fixed_size_share
+        .and_then(|fixed_size| {
+            let line = kind_lines.iter().find(|l| l.id == "test_breach_share")?;
+            sizing_warning(line, fixed_size)
+        })
+        .into_iter()
+        .collect();
 
     // 5 to 7 run only when their lines could still change the verdict.
     let decided =
@@ -1292,13 +1282,14 @@ fn carry_warning(carry: Carry, trades: &[Trade], timeframe: Timeframe) -> Option
     })
 }
 
-/// The warning for a `prop_firm` line, `line`, that passes on a fall as a share of the balance it
-/// started from, when `fixed_size`, the same worst fall as a share of the starting cash, would
-/// fail it. The line then passes only because it assumes the position size grows with the
-/// balance, which the engine cannot check. For the drawdown line the fall is the worst attempt's
-/// ([`attempt_drawdowns`]); for the worst-daily-loss line, the worst day's ([`worst_daily_loss`]).
-/// A rule whose `sizes_from_starting_cash` is set judges its lines on that reading and gets no
-/// such warning.
+/// The warning for a `prop_firm` rule's breach-share line, `line`, that passes on the attempts'
+/// falls read as shares of the balance each attempt, and each day, started from, when
+/// `fixed_size`, the share of the same attempts that breach with each fall read as a share of the
+/// starting cash, would fail it. The line then passes only because it assumes the position size
+/// grows with the balance, which the engine cannot check. The attempts and their falls are
+/// [`breach_share`]'s. A rule whose `sizes_from_starting_cash` is set judges the line on that
+/// reading and gets no such warning. The max-drawdown and worst-daily-loss lines get none of their
+/// own: they only warn when over their limits, and the share line decides.
 ///
 /// shortcut: the starting-cash figure the warning quotes is read on the stitched curve, whose
 /// money changes carry the curve's level at each window, not on the fixed-size account that a
@@ -1310,25 +1301,13 @@ fn sizing_warning(line: &Criterion, fixed_size: f64) -> Option<String> {
     if line.outcome != Outcome::Pass || line.comparison.holds(Some(fixed_size), limit) {
         return None;
     }
-    if line.id == "worst_daily_loss" {
-        return Some(format!(
-            "The worst daily loss line passed on the assumption that position size grows with \
-             the balance: its worst day, as the line measures it, lost {} of that day's starting \
-             balance. In money, the worst day lost {} of the starting balance, over the line's \
-             limit of {}. If the strategy trades a fixed position size set from the starting \
-             balance, that is what an account at the starting balance would have lost in a day.",
-            percent(value),
-            percent(fixed_size),
-            percent(limit)
-        ));
-    }
     Some(format!(
-        "The max drawdown line passed on the assumption that position size grows with the \
-             balance: its worst attempt's drawdown, as the line measures it, was {} of that \
-             attempt's starting balance. In money, the worst attempt's drawdown was {} of the \
-             starting balance, over the line's limit of {}. If the strategy trades a fixed \
-             position size set from the starting balance, that is what an account started fresh \
-             would have lost.",
+        "The line for the share of attempts that breach passed on the assumption that position \
+         size grows with the balance: as the line measures each fall, against the balance its \
+         attempt or its day started from, {} of the attempts breached. In money, as a share of \
+         the starting balance, {} of them did, over the line's limit of {}. If the strategy \
+         trades a fixed position size set from the starting balance, that is the share of \
+         attempts started fresh at the starting balance that would have breached.",
         percent(value),
         percent(fixed_size),
         percent(limit)
@@ -1721,7 +1700,8 @@ fn traded_days(
 ///
 /// Judging each day's fall against its own starting balance assumes the position size grows with
 /// the balance, as for the drawdown line ([`attempt_drawdowns`]), and the verdict warns when the
-/// starting-cash reading would fail a line that passes (`sizing_warning`). A rule whose
+/// starting-cash reading would fail the breach-share line ([`breach_share`]) where it passes
+/// (`sizing_warning`). The line itself only warns when over its limit. A rule whose
 /// `sizes_from_starting_cash` is set judges the starting-cash reading instead, read on the
 /// fixed-size account ([`as_judged`]).
 fn worst_daily_loss(
@@ -1755,7 +1735,8 @@ fn worst_daily_loss(
 }
 
 /// A worst fall read two ways: the worst of [`attempt_drawdowns`]' attempts on one reading,
-/// static or trailing, or the worst day of [`worst_daily_loss`].
+/// static or trailing, or the worst day of [`worst_daily_loss`]; or, from [`breach_share`], the
+/// share of those attempts that breach with their falls read each way.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Fall {
     /// As a fraction of each attempt's, or each day's, own starting equity: what the line judges.
@@ -1785,6 +1766,9 @@ struct Fall {
 /// Each reading also gives the worst of the same attempts' falls, in money, as a fraction of the
 /// curve's first value, the starting cash ([`Fall::cash`]).
 ///
+/// The worst attempt is what the max-drawdown line shows; [`breach_share`] counts how many of the
+/// same attempts breach, which is what the verdict is judged on.
+///
 /// `peak_cap`, for a trailing floor that stops rising at a lock, is how far above an attempt's
 /// start the peak counts, as a fraction of that start: the firm's `trailing_floor_lock` plus its
 /// `max_drawdown`, the peak at which the floor reaches the lock. The trailing fall is then
@@ -1802,8 +1786,9 @@ struct Fall {
 /// sized as a fixed quantity or notional from the starting cash, an attempt that starts after
 /// gains reads lower than a fresh account at the starting balance would lose (11 of 120 is 9.2%,
 /// where the same fall of 11 on a fresh account of 100 is 11%), so the verdict warns when the
-/// starting-cash reading would fail a line that passes (`sizing_warning`); one that starts after
-/// losses reads higher, which only makes the line stricter. A rule whose
+/// starting-cash reading would fail the breach-share line ([`breach_share`]) where it passes
+/// (`sizing_warning`); one that starts after losses reads higher, which only makes the reading
+/// stricter. The drawdown line itself only warns when over its limit. A rule whose
 /// `sizes_from_starting_cash` is set judges the starting-cash reading instead, on the
 /// fixed-size account ([`as_judged`]).
 ///
@@ -1818,22 +1803,63 @@ fn attempt_drawdowns(
     horizon: usize,
     peak_cap: Option<f64>,
 ) -> (Option<Fall>, Option<Fall>) {
-    let (times, values) = (&series.times, &series.values);
-    if ranges.is_empty() || ranges.len() + 1 != values.len() || horizon == 0 {
+    let Some(attempts) = attempts(series, ranges, rollover, horizon, peak_cap) else {
         return (None, None);
+    };
+    // Each share's worst, which need not be the same attempt's.
+    let worst = |falls: Vec<Option<Fall>>| {
+        let falls = falls.into_iter().collect::<Option<Vec<Fall>>>()?;
+        Some(Fall {
+            own: falls.iter().map(|f| f.own).reduce(f64::max)?,
+            cash: falls.iter().map(|f| f.cash).reduce(f64::max)?,
+        })
+    };
+    (
+        worst(attempts.iter().map(|a| a.fixed).collect()),
+        worst(attempts.iter().map(|a| a.trailing).collect()),
+    )
+}
+
+/// One attempt of [`attempt_drawdowns`]: its static and trailing falls, and the bars it holds.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Attempt {
+    fixed: Option<Fall>,
+    trailing: Option<Fall>,
+    /// The attempt's bars, `ranges[first_bar..end_bar]` of the curve's equity ranges.
+    first_bar: usize,
+    end_bar: usize,
+}
+
+/// The index in `series` of each day's last value, its end equity, for `days` of `series`: the
+/// bars that close in day `d` are `ranges[ends[d - 1]..ends[d]]`, from 0 for the first day.
+fn day_ends(series: &EquitySeries, days: &[risk::DailyPnl]) -> Vec<usize> {
+    days.iter()
+        .map(|d| series.times.partition_point(|&t| t <= d.end) - 1)
+        .collect()
+}
+
+/// The attempts [`attempt_drawdowns`] reads, one for each day of `series` (days ending at
+/// `rollover`) that starts one, in day order. `None` without equity ranges, with ranges that do
+/// not match the curve, or with a horizon of 0.
+fn attempts(
+    series: &EquitySeries,
+    ranges: &[crate::EquityRange],
+    rollover: DayRollover,
+    horizon: usize,
+    peak_cap: Option<f64>,
+) -> Option<Vec<Attempt>> {
+    let values = &series.values;
+    if ranges.is_empty() || ranges.len() + 1 != values.len() || horizon == 0 {
+        return None;
     }
     let cash = values[0];
-    // The index in `series` of each day's last value, its end equity: the bars that close in day
-    // `d` are `ranges[ends[d - 1]..ends[d]]`, from 0 for the first day.
-    let ends: Vec<usize> = risk::daily_pnl(series, None, rollover)
-        .iter()
-        .map(|d| times.partition_point(|&t| t <= d.end) - 1)
-        .collect();
-    let (fixed, trailing): (Vec<_>, Vec<_>) = (0..ends.len())
+    let ends = day_ends(series, &risk::daily_pnl(series, None, rollover));
+    let attempts = (0..ends.len())
         .filter_map(|day| {
             let first = if day == 0 { 0 } else { ends[day - 1] };
             let start = values[first];
-            let bars = &ranges[first..ends[(day + horizon).min(ends.len()) - 1]];
+            let end_bar = ends[(day + horizon).min(ends.len()) - 1];
+            let bars = &ranges[first..end_bar];
             (start > 0.0 && !bars.is_empty()).then(|| {
                 let low = bars.iter().map(|r| r.low).reduce(f64::min);
                 let fixed = risk::static_drawdown(start, low)
@@ -1856,19 +1882,140 @@ fn attempt_drawdowns(
                         })
                     }
                 };
-                (fixed, trailing)
+                Attempt {
+                    fixed,
+                    trailing,
+                    first_bar: first,
+                    end_bar,
+                }
             })
         })
-        .unzip();
-    // Each share's worst, which need not be the same attempt's.
-    let worst = |falls: Vec<Option<Fall>>| {
-        let falls = falls.into_iter().collect::<Option<Vec<Fall>>>()?;
-        Some(Fall {
-            own: falls.iter().map(|f| f.own).reduce(f64::max)?,
-            cash: falls.iter().map(|f| f.cash).reduce(f64::max)?,
+        .collect();
+    Some(attempts)
+}
+
+/// The share of [`attempt_drawdowns`]' attempts, `limits.breach_horizon_days` long and one
+/// started on each of the firm's days of the test, that breach at `limits.share_of_firm_limits`
+/// of the firm's limits: read on each attempt's and each day's own starting balance
+/// ([`Fall::own`]), and on the starting cash ([`Fall::cash`]). An attempt breaches when its
+/// drawdown, static or trailing as the firm measures it and with its `trailing_floor_lock`, is
+/// above that share of the firm's `max_drawdown`, or one of its days loses more than that share
+/// of the firm's `daily_loss`. Each day's loss is read as the worst-daily-loss line reads it
+/// ([`worst_daily_loss`]): inside bars, from the day's start to its lowest equity, as a share of
+/// the day's own starting balance (a day that starts with nothing left loses nothing on that
+/// reading) or of `cash`.
+///
+/// A day counts in the attempts that hold the bar where its lowest equity was reached, so a
+/// day's loss counts in the attempts that were running when the loss was at its deepest. On the
+/// firm's own days these are exactly the attempts that span the day. A rule that names no
+/// `day_rollover` has its worst-daily-loss line take the worse of the days ending at midnight UTC
+/// and at 17:00 New York, and its attempts start on UTC days; each attempt then reads both kinds
+/// of day, and a New York day, which straddles two UTC days, counts in the attempts that hold its
+/// lowest bar. Every day the line reads with a loss is then a day of an attempt, and every day of
+/// an attempt is one the line reads, so with a limit of 0 on the share, which no attempt may
+/// cross, the share line passes exactly when the max-drawdown and the worst-daily-loss lines would
+/// both pass. `None` when the attempts or a day's fall cannot be measured, or no day starts an
+/// attempt.
+///
+/// shortcut: a day whose lowest bar no counted attempt holds, which needs every day that could
+/// start such an attempt to begin with no equity left, adds to no attempt, though the
+/// worst-daily-loss line may read it; such a test already fails the lowest-equity line. Count
+/// those days if a rule ever judges a test whose equity reaches zero.
+fn breach_share(
+    series: &EquitySeries,
+    ranges: &[crate::EquityRange],
+    cash: f64,
+    firm: &crate::FirmLimits,
+    limits: &crate::PropFirmLimits,
+) -> Option<Fall> {
+    let attempts = attempts(
+        series,
+        ranges,
+        firm.day_rollover.unwrap_or_default(),
+        limits.breach_horizon_days as usize,
+        peak_cap(firm),
+    )?;
+    // The same limits the worst-daily-loss and max-drawdown lines hold their values to.
+    let share = limits.share_of_firm_limits;
+    let (daily_limit, drawdown_limit) = (share * firm.daily_loss, share * firm.max_drawdown);
+    // Each day of each reading that has a bar: the bar of its lowest equity, and its loss on
+    // each reading, in bar order.
+    let both = [DayRollover::default(), DayRollover::NewYork1700];
+    let readings: Vec<Vec<(usize, Fall)>> = firm
+        .day_rollover
+        .as_ref()
+        .map_or(&both[..], std::slice::from_ref)
+        .iter()
+        .map(|&rollover| {
+            let days = risk::daily_pnl(series, Some(ranges), rollover);
+            let ends = day_ends(series, &days);
+            days.iter()
+                .zip(&ends)
+                .enumerate()
+                .filter_map(|(k, (d, &end))| {
+                    let first = if k == 0 { 0 } else { ends[k - 1] };
+                    // A bar's low, or the close it ends at, as `risk::daily_pnl` reads the day's
+                    // low; the first of equal lows.
+                    let low = |b: usize| ranges[b].low.min(series.values[b + 1]);
+                    let bar = (first..end).reduce(|a, b| if low(b) < low(a) { b } else { a })?;
+                    let lost = d.start_equity - d.low_equity;
+                    let own = if d.start_equity > 0.0 {
+                        lost / d.start_equity
+                    } else {
+                        0.0
+                    };
+                    Some((
+                        bar,
+                        Fall {
+                            own,
+                            cash: lost / cash,
+                        },
+                    ))
+                })
+                .collect()
         })
-    };
-    (worst(fixed), worst(trailing))
+        .collect();
+    // Whether `value` is over `limit` as the lines' `AtMost` reads it, so a value that is not a
+    // number is over.
+    let over = |value: f64, limit: f64| !crate::Comparison::AtMost.holds(Some(value), limit);
+    let (mut own, mut at_cash) = (0usize, 0usize);
+    for a in &attempts {
+        let drawdown = match firm.drawdown {
+            DrawdownMode::Static => a.fixed,
+            DrawdownMode::Trailing => a.trailing,
+        }?;
+        // The attempt's worst day on each reading.
+        let (mut day_own, mut day_cash) = (0.0f64, 0.0f64);
+        for days in &readings {
+            let from = days.partition_point(|&(bar, _)| bar < a.first_bar);
+            let to = days.partition_point(|&(bar, _)| bar < a.end_bar);
+            for (_, day) in &days[from..to] {
+                day_own = day_own.max(day.own);
+                day_cash = day_cash.max(day.cash);
+            }
+        }
+        if !(day_own.is_finite() && day_cash.is_finite()) {
+            return None;
+        }
+        own += usize::from(over(drawdown.own, drawdown_limit) || over(day_own, daily_limit));
+        at_cash += usize::from(over(drawdown.cash, drawdown_limit) || over(day_cash, daily_limit));
+    }
+    let n = attempts.len() as f64;
+    (!attempts.is_empty()).then(|| Fall {
+        own: own as f64 / n,
+        cash: at_cash as f64 / n,
+    })
+}
+
+/// How far above an attempt's start a trailing peak counts, as a fraction of that start, for a
+/// trailing floor that stops rising at the firm's `trailing_floor_lock`: the lock plus the
+/// drawdown, the peak at which the floor reaches the lock, as the attempt walks apply it. `None`
+/// for a static drawdown or a floor that trails for ever.
+fn peak_cap(firm: &crate::FirmLimits) -> Option<f64> {
+    match firm.drawdown {
+        DrawdownMode::Static => None,
+        DrawdownMode::Trailing => firm.trailing_floor_lock.map(|l| l + firm.max_drawdown),
+    }
 }
 
 /// The largest fall to a later or same-bar low from the running peak, which starts at `start`
@@ -2870,15 +3017,15 @@ mod tests {
         // starts at, 4 of 100 on the New York day that starts at
         // 22:00.
         let late = falling(22);
-        assert_eq!(line(&late, None), (Some(0.04), Outcome::Fail));
+        assert_eq!(line(&late, None), (Some(0.04), Outcome::Warn));
         assert_eq!(line(&late, utc), (Some(2.0 / 98.0), Outcome::Pass));
-        assert_eq!(line(&late, ny), (Some(0.04), Outcome::Fail));
+        assert_eq!(line(&late, ny), (Some(0.04), Outcome::Warn));
         // From 20:00 to 24:00 UTC: 4 of 100 on the UTC day; on the New York days around 22:00,
         // 2 of 100 and 2 of the 98 the second starts at.
         let early = falling(20);
-        assert_eq!(line(&early, None), (Some(0.04), Outcome::Fail));
+        assert_eq!(line(&early, None), (Some(0.04), Outcome::Warn));
         assert_eq!(line(&early, ny), (Some(2.0 / 98.0), Outcome::Pass));
-        assert_eq!(line(&early, utc), (Some(0.04), Outcome::Fail));
+        assert_eq!(line(&early, utc), (Some(0.04), Outcome::Warn));
     }
 
     /// The drawdown line reads the worst attempt of the breach horizon's length started on a day
@@ -2929,7 +3076,7 @@ mod tests {
         // an attempt started at the top loses 1 - 0.975^5, 11.9%.
         let drop = path(&[(30, 0.01), (5, -0.025), (30, 0.01)]);
         assert_eq!(whole(&drop).0, 0.0);
-        assert_eq!(line(&drop, DrawdownMode::Static).1, Outcome::Fail);
+        assert_eq!(line(&drop, DrawdownMode::Static).1, Outcome::Warn);
         near(line(&drop, DrawdownMode::Static), 1.0 - 0.975f64.powi(5));
 
         // Trailing: a rise and then the same slide is 24% of the first balance under the top,
@@ -2942,7 +3089,7 @@ mod tests {
         // its peak. Static, no attempt loses more than 11 of the 120 it starts at the top with.
         let mut spike = vec![100.0, 105.0, 110.0, 115.0, 120.0, 116.0, 112.0, 109.0];
         spike.extend([109.0; 20]);
-        assert_eq!(line(&spike, DrawdownMode::Trailing).1, Outcome::Fail);
+        assert_eq!(line(&spike, DrawdownMode::Trailing).1, Outcome::Warn);
         near(line(&spike, DrawdownMode::Trailing), 0.11);
         assert_eq!(line(&spike, DrawdownMode::Static).1, Outcome::Pass);
         near(line(&spike, DrawdownMode::Static), 11.0 / 120.0);
@@ -2979,101 +3126,330 @@ mod tests {
         (fixed.map(|f| f.own), trailing.map(|f| f.own))
     }
 
-    /// The drawdown line passes on each attempt's fall as a share of its own start, as before.
-    /// When the same attempts' worst fall as a share of the starting cash would fail it, the
-    /// verdict warns, with both figures; when both pass, or the line fails anyway, it does not.
+    /// The firm and limits of a prop-firm rule.
+    fn firm_and_limits(rule: &VerdictRule) -> (crate::FirmLimits, crate::PropFirmLimits) {
+        let VerdictRule::PropFirm { firm, limits, .. } = rule else {
+            unreachable!()
+        };
+        (*firm, *limits)
+    }
+
+    /// `rule` with its `max_breach_probability` set to `limit`.
+    fn breach_limit(rule: &VerdictRule, limit: f64) -> VerdictRule {
+        let (firm, limits) = firm_and_limits(rule);
+        VerdictRule::PropFirm {
+            firm,
+            limits: crate::PropFirmLimits {
+                max_breach_probability: limit,
+                ..limits
+            },
+            attempt: None,
+        }
+    }
+
+    /// The kind inputs `run_battery` reads for a prop-firm `rule` on daily closes `values` from
+    /// 100, at a compounding size, with odds that pass; and the breach share on both readings.
+    fn prop_kind(rule: &VerdictRule, values: &[f64]) -> (KindInputs, Fall) {
+        let (firm, limits) = firm_and_limits(rule);
+        let (series, ranges) = curve(10 * DAY_MS, DAY_MS, values);
+        let rollover = firm.day_rollover.unwrap_or_default();
+        let horizon = limits.breach_horizon_days as usize;
+        let (fixed, trailing) = attempt_drawdowns(&series, &ranges, rollover, horizon, None);
+        let share = breach_share(&series, &ranges, 100.0, &firm, &limits).unwrap();
+        let kind = KindInputs {
+            worst_daily_loss: worst_daily_loss(&series, &ranges, 100.0, firm.day_rollover)
+                .map(|f| f.own),
+            intrabar_drawdown_static: fixed.map(|f| f.own),
+            intrabar_drawdown_trailing: trailing.map(|f| f.own),
+            test_breach_share: Some(share.own),
+            pass_probability: Some(0.7),
+            breach_probability: Some(0.05),
+            limits_inside_day: true,
+            ..KindInputs::default()
+        };
+        (kind, share)
+    }
+
+    /// The line `id` of `lines`.
+    fn line_of<'a>(lines: &'a [Criterion], id: &str) -> &'a Criterion {
+        lines.iter().find(|l| l.id == id).unwrap()
+    }
+
+    /// Daily closes from 100: a day that loses 4%, three days flat back at 100, then a slide of
+    /// 2.25 a day for six days, each day losing at most 2.25 of 88.75, 2.54%, and flat at 86.5 to
+    /// 21 closes, so 20 days. The firm's 6% daily loss and 20% drawdown are judged at half, 3% and
+    /// 10%, on attempts of 5 days.
+    fn two_kinds_of_breach() -> Vec<f64> {
+        let mut values = vec![100.0, 96.0, 100.0, 100.0, 100.0];
+        for k in 1..=6 {
+            values.push(100.0 - 2.25 * f64::from(k));
+        }
+        values.resize(21, 86.5);
+        values
+    }
+
+    /// Worked by hand on [`two_kinds_of_breach`]: of its 20 attempts, the one started on the first
+    /// day crosses only on its 4% day (its drawdown is 4%), and the ones started at 100 on day 4
+    /// and at 97.75 on day 5 cross only on their drawdowns of 11.25 of 100 and of 97.75; the one
+    /// started at 100 on day 3 falls to 91, 9%, and the one started at 95.5 on day 6 falls 9 of
+    /// 95.5, 9.4%, and neither crosses. The share is 3 of 20: a limit just under it fails the
+    /// line, and one at it passes.
     #[test]
-    fn the_drawdown_line_warns_when_a_fixed_size_would_fail_it() {
-        // Daily closes rising by 1 a day from 100 to 120, ten days at 120, then a fall to
-        // `bottom` that stays. The firm's 20% drawdown is judged at 10% over attempts of 10 days.
-        let rise_then_fall = |bottom: f64| -> Vec<f64> {
+    fn the_share_line_counts_the_attempts_that_cross_either_limit() {
+        let rule = firm_rule(DrawdownMode::Static, 5, None);
+        let (kind, share) = prop_kind(&rule, &two_kinds_of_breach());
+        assert_eq!(share.own, 3.0 / 20.0);
+        let judge = |limit: f64| {
+            let lines = crate::evaluate(&breach_limit(&rule, limit), &kind);
+            line_of(&lines, "test_breach_share").outcome
+        };
+        assert_eq!(judge(0.149), Outcome::Fail);
+        assert_eq!(judge(0.15), Outcome::Pass);
+
+        // The same curve's worst day and worst attempt are over their limits, so those lines
+        // warn, and the verdict passes on the share.
+        let lines = crate::evaluate(&breach_limit(&rule, 0.15), &kind);
+        let not_passing: Vec<_> = lines
+            .iter()
+            .filter(|l| l.outcome != Outcome::Pass)
+            .map(|l| (l.id.as_str(), l.outcome))
+            .collect();
+        assert_eq!(
+            not_passing,
+            [
+                ("worst_daily_loss", Outcome::Warn),
+                ("max_drawdown", Outcome::Warn)
+            ]
+        );
+        assert!((kind.worst_daily_loss.unwrap() - 0.04).abs() < 1e-12);
+        let worst = kind.intrabar_drawdown_static.unwrap();
+        assert!((worst - 11.25 / 97.75).abs() < 1e-12, "{worst}");
+    }
+
+    /// An attempt that crosses both limits counts once: a single day that loses 12% is over the
+    /// 3% daily limit and the 10% drawdown limit, and on attempts of one day it is one attempt of
+    /// three.
+    #[test]
+    fn an_attempt_that_crosses_both_limits_counts_once() {
+        let rule = firm_rule(DrawdownMode::Static, 1, None);
+        let (kind, share) = prop_kind(&rule, &[100.0, 88.0, 88.0, 88.0]);
+        assert_eq!(share.own, 1.0 / 3.0);
+        assert!(kind.worst_daily_loss.unwrap() > 0.03);
+        assert!(kind.intrabar_drawdown_static.unwrap() > 0.10);
+    }
+
+    /// With no `day_rollover`, a New York day counts in the attempts that hold the bar of its
+    /// lowest equity, not the attempt holding the bar it ends on. Hourly closes over three UTC
+    /// days from 3 January 2024: 100, then 104 from 01:00, 100 at 23:00 and 104 again from
+    /// midnight, then 100.5 at 07:00 on the second day and 104 after. The New York day that starts
+    /// at 22:00 UTC on the first day loses 4 of 104, 3.8%, at 23:00 on the first UTC day, which
+    /// itself loses nothing; the second UTC day loses 3.5 of 104, 3.4%. On attempts of one day,
+    /// the first holds the New York day's low and the second its own loss, so two of the three
+    /// cross the 3% limit. Counted by the bar it ends on, the New York day would fall in the
+    /// second attempt, and only one of the three would cross.
+    #[test]
+    fn a_new_york_day_counts_in_the_attempts_that_hold_its_lowest_bar() {
+        const HOUR: Millis = 3_600_000;
+        let values: Vec<f64> = (0..72usize)
+            .map(|h| match h {
+                0 | 23 => 100.0,
+                31 => 100.5,
+                _ => 104.0,
+            })
+            .collect();
+        let (series, ranges) = curve(19_725 * DAY_MS, HOUR, &values);
+        let rule = firm_rule(DrawdownMode::Static, 1, None);
+        let (firm, limits) = firm_and_limits(&rule);
+        let share = breach_share(&series, &ranges, 100.0, &firm, &limits).unwrap();
+        assert_eq!((share.own, share.cash), (2.0 / 3.0, 2.0 / 3.0));
+    }
+
+    /// With `max_breach_probability` at 0 the share line passes exactly when the worst-daily-loss
+    /// and max-drawdown lines both pass, which is when a verdict passed them before the share
+    /// decided: on each reading, static and trailing, with the firm's day set to UTC or New York
+    /// or left out, on curves that pass both lines, fail only one and fail both.
+    #[test]
+    fn at_a_breach_limit_of_zero_the_share_line_passes_exactly_when_both_old_lines_pass() {
+        const HOUR: Millis = 3_600_000;
+        // Daily closes from 100, and hourly closes over two days from 3 January 2024 that fall 1
+        // an hour for four hours from 22:00 UTC: 4 of 100 on the New York day, 2 of 100 and 2 of
+        // 98 on the UTC days.
+        let daily = |values: &[f64]| curve(10 * DAY_MS, DAY_MS, values);
+        let hourly: Vec<f64> = (0..=48usize)
+            .map(|h| 100.0 - h.saturating_sub(22).min(4) as f64)
+            .collect();
+        let mut rise = vec![100.0, 101.0, 103.0, 102.5, 104.0];
+        rise.resize(15, 104.0);
+        let curves = [
+            daily(&rise),
+            daily(&[100.0, 96.0, 100.0, 100.0, 100.0, 100.0]),
+            daily(&[100.0, 98.0, 96.0, 94.0, 92.0, 90.0, 88.0, 88.0]),
+            daily(&two_kinds_of_breach()),
+            daily(&[100.0, 88.0, 88.0, 88.0]),
+            curve(19_725 * DAY_MS, HOUR, &hourly),
+        ];
+        let rollovers = [
+            None,
+            Some(DayRollover::default()),
+            Some(DayRollover::NewYork1700),
+        ];
+        let at = |f: Fall, cash: bool| if cash { f.cash } else { f.own };
+        // Each old line's outcome on main, and the share line's at a limit of 0.
+        let (mut seen_daily, mut seen_drawdown) = ([false; 2], [false; 2]);
+        for (series, ranges) in &curves {
+            for rollover in rollovers {
+                for drawdown in [DrawdownMode::Static, DrawdownMode::Trailing] {
+                    for horizon in [1, 5] {
+                        let rule = breach_limit(&firm_rule(drawdown, horizon, rollover), 0.0);
+                        let (firm, limits) = firm_and_limits(&rule);
+                        let share = breach_share(series, ranges, 100.0, &firm, &limits).unwrap();
+                        let day = worst_daily_loss(series, ranges, 100.0, rollover).unwrap();
+                        let falls = attempt_drawdowns(
+                            series,
+                            ranges,
+                            rollover.unwrap_or_default(),
+                            horizon as usize,
+                            None,
+                        );
+                        let fall = match drawdown {
+                            DrawdownMode::Static => falls.0,
+                            DrawdownMode::Trailing => falls.1,
+                        }
+                        .unwrap();
+                        for cash in [false, true] {
+                            let kind = KindInputs {
+                                worst_daily_loss: Some(at(day, cash)),
+                                intrabar_drawdown_static: Some(at(fall, cash)),
+                                intrabar_drawdown_trailing: Some(at(fall, cash)),
+                                test_breach_share: Some(at(share, cash)),
+                                ..KindInputs::default()
+                            };
+                            let lines = crate::evaluate(&rule, &kind);
+                            let held = |id| {
+                                let l = line_of(&lines, id);
+                                l.comparison.holds(l.value, l.limit.unwrap())
+                            };
+                            let (d, m) = (held("worst_daily_loss"), held("max_drawdown"));
+                            seen_daily[usize::from(d)] = true;
+                            seen_drawdown[usize::from(m)] = true;
+                            assert_eq!(
+                                line_of(&lines, "test_breach_share").outcome == Outcome::Pass,
+                                d && m,
+                                "{rollover:?} {drawdown:?} {horizon} {cash} {:?}",
+                                series.values
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!((seen_daily, seen_drawdown), ([true; 2], [true; 2]));
+    }
+
+    /// At the default limits (half the firm's limits, a breach limit of 10%) a test whose one
+    /// crossing attempt is one of more than ten passes, where before the share decided it failed
+    /// on the worst-daily-loss line: that line now warns, with its note. A limit of 0 still
+    /// fails it.
+    #[test]
+    fn at_the_default_limits_one_crossing_attempt_in_more_than_ten_passes() {
+        // A day that loses 4% on the first day, then flat: 11 days, and only the attempt started
+        // on the first day holds it.
+        let mut values = vec![100.0, 96.0];
+        values.resize(12, 96.0);
+        let rule = firm_rule(DrawdownMode::Static, 10, None);
+        let (_, limits) = firm_and_limits(&rule);
+        assert_eq!(
+            (limits.share_of_firm_limits, limits.max_breach_probability),
+            (0.5, 0.1)
+        );
+        let (kind, share) = prop_kind(&rule, &values);
+        assert_eq!(share.own, 1.0 / 11.0);
+        let lines = crate::evaluate(&rule, &kind);
+        let not_passing: Vec<_> = lines
+            .iter()
+            .filter(|l| l.outcome != Outcome::Pass)
+            .map(|l| (l.id.as_str(), l.outcome))
+            .collect();
+        assert_eq!(not_passing, [("worst_daily_loss", Outcome::Warn)]);
+        assert!(
+            line_of(&lines, "worst_daily_loss")
+                .note
+                .as_deref()
+                .is_some_and(|n| n.contains("the share of attempts that breach decides"))
+        );
+        let strict = crate::evaluate(&breach_limit(&rule, 0.0), &kind);
+        assert_eq!(line_of(&strict, "test_breach_share").outcome, Outcome::Fail);
+    }
+
+    /// The share line passes on each attempt's falls as shares of its own start and each day's.
+    /// When the share of the same attempts that breach with each fall read as a share of the
+    /// starting cash would fail it, the verdict warns, with both figures; when both pass, or the
+    /// line fails anyway, it does not.
+    #[test]
+    fn the_share_line_warns_when_a_fixed_size_would_fail_it() {
+        // Daily closes rising by 1 a day from 100 to 120, ten days at 120, then a slide of 2 a day
+        // to 110.5 and a last day to `bottom`, which stays to `closes` closes. The firm's 20%
+        // drawdown and 6% daily loss are judged at 10% and 3% over attempts of 10 days.
+        let slide = |bottom: f64, closes: usize| -> Vec<f64> {
             let mut values: Vec<f64> = (100..=120).map(f64::from).collect();
             values.extend([120.0; 10]);
-            values.extend([bottom; 20]);
+            values.extend([118.0, 116.0, 114.0, 112.0, 110.5, bottom]);
+            values.resize(closes, bottom);
             values
         };
         // The line and the warning as `run_battery` builds them.
         let judge = |values: &[f64], drawdown| {
-            let (series, ranges) = curve(10 * DAY_MS, DAY_MS, values);
-            let falls = attempt_drawdowns(&series, &ranges, DayRollover::default(), 10, None);
-            let (fixed, trailing) = own(falls);
-            let kind = KindInputs {
-                intrabar_drawdown_static: fixed,
-                intrabar_drawdown_trailing: trailing,
-                ..KindInputs::default()
-            };
             let rule = firm_rule(drawdown, 10, None);
-            let line = crate::evaluate(&rule, &kind)
-                .into_iter()
-                .find(|l| l.id == "max_drawdown")
-                .unwrap();
-            let fixed_size = match drawdown {
-                DrawdownMode::Static => falls.0,
-                DrawdownMode::Trailing => falls.1,
-            }
-            .unwrap()
-            .cash;
-            let warning = sizing_warning(&line, fixed_size);
-            (line.value.unwrap(), line.outcome, fixed_size, warning)
+            let (kind, share) = prop_kind(&rule, values);
+            let lines = crate::evaluate(&rule, &kind);
+            let line = line_of(&lines, "test_breach_share").clone();
+            let warning = sizing_warning(&line, share.cash);
+            (share, line.outcome, warning)
         };
-        let near = |a: f64, b: f64| assert!((a - b).abs() < 1e-12, "{a} against {b}");
-
         for drawdown in [DrawdownMode::Static, DrawdownMode::Trailing] {
-            // A fall of 11 from 120: the attempts that start at the top lose 11 of their 120,
-            // 9.17%, under the limit, and that is the worst of their falls from their own peak
-            // too (each rising day reads 1 from the peak, at most 1%). A fresh account of 100
-            // trading the same fixed size loses 11, 11%, over it.
-            let (own, outcome, fixed_size, warning) = judge(&rise_then_fall(109.0), drawdown);
-            near(own, 11.0 / 120.0);
-            near(fixed_size, 0.11);
+            // The five attempts started at 120 on days 26 to 30 reach 109: 11 of their 120 is
+            // 9.17%, under the limit, but a fresh account of 100 trading the same fixed size
+            // loses 11, 11%, over it. No day loses 3% on either reading. Of 40 attempts, none
+            // breaches on their own starts and 12.5% on the starting cash.
+            let (share, outcome, warning) = judge(&slide(109.0, 41), drawdown);
+            assert_eq!((share.own, share.cash), (0.0, 5.0 / 40.0), "{drawdown:?}");
             assert_eq!(outcome, Outcome::Pass, "{drawdown:?}");
             assert_eq!(
                 warning.as_deref(),
                 Some(
-                    "The max drawdown line passed on the assumption that position size grows \
-                     with the balance: its worst attempt's drawdown, as the line measures it, \
-                     was 9.17% of that attempt's starting balance. In money, the worst \
-                     attempt's drawdown was 11.00% of the starting balance, over the line's \
-                     limit of 10.00%. If the strategy trades a fixed position size set from the \
-                     starting balance, that is what an account started fresh would have lost."
+                    "The line for the share of attempts that breach passed on the assumption \
+                     that position size grows with the balance: as the line measures each fall, \
+                     against the balance its attempt or its day started from, 0.00% of the \
+                     attempts breached. In money, as a share of the starting balance, 12.50% of \
+                     them did, over the line's limit of 10.00%. If the strategy trades a fixed \
+                     position size set from the starting balance, that is the share of attempts \
+                     started fresh at the starting balance that would have breached."
                 ),
                 "{drawdown:?}"
             );
 
-            // A fall of 8: 6.67% of 120 and 8% of 100, both under the limit, so no warning; nor
-            // at a fall of 10, which is 10% of 100, on the limit, which the line allows.
-            for bottom in [112.0, 110.0] {
-                let (_, outcome, _, warning) = judge(&rise_then_fall(bottom), drawdown);
-                assert_eq!((outcome, warning), (Outcome::Pass, None), "{drawdown:?}");
-            }
+            // Of 50 attempts the same five are 10%, on the limit, which the line allows: no
+            // warning.
+            let (share, outcome, warning) = judge(&slide(109.0, 51), drawdown);
+            assert_eq!(share.cash, 0.1, "{drawdown:?}");
+            assert_eq!((outcome, warning), (Outcome::Pass, None), "{drawdown:?}");
 
-            // A fall of 15: 12.5% of 120 fails the line as it did, and needs no warning.
-            let (own, outcome, fixed_size, warning) = judge(&rise_then_fall(105.0), drawdown);
-            near(own, 0.125);
-            near(fixed_size, 0.15);
+            // A last day to 104 loses 5.9%, so every attempt that holds it breaches on its own
+            // start: the line fails as it would, and needs no warning.
+            let (share, outcome, warning) = judge(&slide(104.0, 41), drawdown);
+            assert!(share.own > 0.1, "{drawdown:?}: {share:?}");
             assert_eq!((outcome, warning), (Outcome::Fail, None), "{drawdown:?}");
         }
 
-        // A rise to 120 and a fall to 109 inside one attempt that starts at 100: the trailing
-        // line fails on 11 of that attempt's 100, which is also the starting cash, so the
-        // starting-cash reading adds nothing and there is no warning. Static, no attempt loses
-        // more than 11 of the 120 it starts at the top with, which a fixed size would see as 11%:
-        // the line passes and warns.
-        let mut spike = vec![100.0, 105.0, 110.0, 115.0, 120.0, 116.0, 112.0, 109.0];
-        spike.extend([109.0; 20]);
-        let (own, outcome, fixed_size, warning) = judge(&spike, DrawdownMode::Trailing);
-        near(own, 0.11);
-        near(fixed_size, 0.11);
-        assert_eq!((outcome, warning), (Outcome::Fail, None));
-        let (own, outcome, fixed_size, warning) = judge(&spike, DrawdownMode::Static);
-        near(own, 11.0 / 120.0);
-        near(fixed_size, 0.11);
+        // After gains, a day that loses 2.5% of 150 loses 3.75 of the starting 100: it breaches
+        // the 3% daily limit only on the starting cash, and the warning says so.
+        let mut gains = vec![100.0, 150.0, 146.25];
+        gains.resize(6, 146.25);
+        let (share, outcome, warning) = judge(&gains, DrawdownMode::Static);
         assert_eq!(outcome, Outcome::Pass);
-        assert!(
-            warning
-                .unwrap()
-                .contains("drawdown was 11.00% of the starting balance")
-        );
+        assert_eq!(share.own, 0.0);
+        assert!(share.cash > 0.1, "{share:?}");
+        assert!(warning.is_some());
     }
 
     /// With a trailing floor that stops at a lock, the drawdown line measures each attempt's fall
@@ -3099,6 +3475,19 @@ mod tests {
             };
             firm.trailing_floor_lock = lock;
             let cap = lock.map(|l| l + firm.max_drawdown);
+            // The cap the battery and the breach share apply.
+            assert_eq!(peak_cap(firm), cap);
+            // The share of the attempts over the drawdown limit, with the daily limit out of
+            // reach.
+            let far = crate::FirmLimits {
+                daily_loss: 1.0,
+                ..*firm
+            };
+            let limits = crate::PropFirmLimits {
+                breach_horizon_days: 60,
+                ..crate::PropFirmLimits::default()
+            };
+            let share = breach_share(&series, &ranges, 100.0, &far, &limits).unwrap();
             let falls = attempt_drawdowns(&series, &ranges, utc, 60, cap);
             let kind = KindInputs {
                 intrabar_drawdown_trailing: falls.1.map(|f| f.own),
@@ -3108,39 +3497,37 @@ mod tests {
                 .into_iter()
                 .find(|l| l.id == "max_drawdown")
                 .unwrap();
-            let warning = sizing_warning(&line, falls.1.unwrap().cash);
-            (line, falls.1.unwrap(), warning)
+            (line, falls.1.unwrap(), share)
         };
         let near = |a: f64, b: f64| assert!((a - b).abs() < 1e-12, "{a} against {b}");
 
-        let (line, fall, warning) = locked(Some(0.0));
+        let (line, fall, share) = locked(Some(0.0));
         near(fall.own, 11.0 / 120.0);
         assert_eq!(line.outcome, Outcome::Pass);
+        // No attempt falls more than 10% to the locked floor, so none breaches.
+        assert_eq!(share.own, 0.0);
         assert_eq!(
             line.name,
             "Max drawdown from the peak, with the floor stopping at the starting balance, in any \
              60-day attempt started on a day of the test"
         );
         // A fresh account of 100 trading the same fixed size has its peak count up to 20 above
-        // an attempt's start, so from 124 on it falls the whole 11, 11% of the starting cash: the
-        // warning says so.
+        // an attempt's start, so from 124 on it falls the whole 11, 11% of the starting cash.
         near(fall.cash, 0.11);
-        let warning = warning.unwrap();
-        assert!(
-            warning.contains("was 9.17% of that attempt's starting balance")
-                && warning.contains("drawdown was 11.00% of the starting balance"),
-            "{warning}"
-        );
 
-        // Without the lock the attempt from 100 falls 11 from its peak of 144 and fails, to the
-        // last bit the whole curve's trailing fall, as before the lock was read.
-        let (line, fall, _) = locked(None);
+        // Without the lock the attempt from 100 falls 11 from its peak of 144, over the limit,
+        // which warns, to the last bit the whole curve's trailing fall, as before the lock was
+        // read.
+        let (line, fall, share) = locked(None);
         assert_eq!(
             fall.own,
             risk::trailing_drawdown(100.0, &ranges).unwrap().amount / 100.0
         );
         near(fall.own, 0.11);
-        assert_eq!(line.outcome, Outcome::Fail);
+        assert_eq!(line.outcome, Outcome::Warn);
+        // Unlocked, an attempt falls the whole 11 from 144, more than 10% of a start below 110:
+        // the ten attempts started from 100 to 109 breach, of 64.
+        near(share.own, 10.0 / 64.0);
         assert!(line.name.starts_with("Max drawdown from the peak in any"));
 
         // A lock above the start lets the floor rise further, and the line names it.
@@ -3672,23 +4059,27 @@ mod tests {
         );
     }
 
-    /// The battery puts the drawdown line's sizing warning on the verdict, from the reading the
-    /// rule judges: with the line's limit between the worst attempt's fall as a share of its own
-    /// start and as a share of the starting cash, the line passes and the verdict warns; with the
-    /// limit above both, it does not.
+    /// The battery puts the share line's sizing warning on the verdict, from the reading the rule
+    /// judges. Each case sets one of the firm's limits between the worst fall read on its own
+    /// start and on the starting cash, and the other out of reach: no attempt breaches on its own
+    /// start, some do on the starting cash, so at a breach limit of 0 the line passes and the
+    /// verdict warns, and at a limit of the starting-cash share it does not. The drawdown cases
+    /// are static and trailing; the daily-loss case is the third.
     #[test]
-    fn the_battery_warns_when_the_drawdown_line_passes_only_on_its_sizing() {
+    fn the_battery_warns_when_the_share_line_passes_only_on_its_sizing() {
         let (plan, bars) = sma_plan(sma_axes());
-        let battery = |drawdown, max_drawdown| {
-            let VerdictRule::PropFirm { firm, limits, .. } = firm_rule(drawdown, 10, None) else {
-                unreachable!()
-            };
+        let battery = |drawdown, max_drawdown, daily_loss, max_breach_probability| {
+            let (firm, limits) = firm_and_limits(&firm_rule(drawdown, 10, None));
             let rule = VerdictRule::PropFirm {
                 firm: crate::FirmLimits {
                     max_drawdown,
+                    daily_loss,
                     ..firm
                 },
-                limits,
+                limits: crate::PropFirmLimits {
+                    max_breach_probability,
+                    ..limits
+                },
                 attempt: None,
             };
             let spec = BatterySpec {
@@ -3698,45 +4089,60 @@ mod tests {
                 instrument: &test_instrument(),
                 seed: 7,
             };
-            run_battery(&spec, &bars, &[], &[], None).unwrap()
+            (run_battery(&spec, &bars, &[], &[], None).unwrap(), rule)
         };
-        let drawdown_line = |r: &BatteryResult| {
+        let share_line = |r: &BatteryResult| {
             r.verdict
                 .criteria
                 .iter()
-                .find(|l| l.layer == crate::Layer::Kind && l.id == "max_drawdown")
+                .find(|l| l.layer == crate::Layer::Kind && l.id == "test_breach_share")
                 .unwrap()
                 .clone()
         };
-        // The line is judged at this share of the firm's limit.
+        let (first, _) = battery(DrawdownMode::Static, 0.2, 0.06, 0.1);
+        let wf = first.walk_forward.as_ref().unwrap();
+        let cash = plan.backtest.starting_cash;
+        let series = EquitySeries::new(cash, &wf.equity, plan.timeframe);
+        let ranges = &wf.equity_extremes[..];
+        let (fixed, trailing) =
+            attempt_drawdowns(&series, ranges, DayRollover::default(), 10, None);
+        let day = worst_daily_loss(&series, ranges, cash, None).unwrap();
+        // The lines are judged at this share of the firm's limits.
         let share = crate::PropFirmLimits::default().share_of_firm_limits;
-        for drawdown in [DrawdownMode::Static, DrawdownMode::Trailing] {
-            let r = battery(drawdown, 0.2);
-            let wf = r.walk_forward.as_ref().unwrap();
-            let series = EquitySeries::new(plan.backtest.starting_cash, &wf.equity, plan.timeframe);
-            let (fixed, trailing) = attempt_drawdowns(
-                &series,
-                &wf.equity_extremes,
-                DayRollover::default(),
-                10,
-                None,
+        let between = |f: Fall| {
+            // The curve grows well above its start, so its falls read smaller on their own start.
+            assert!(f.own < f.cash, "{f:?}");
+            (f.own + f.cash) / 2.0 / share
+        };
+        let out_of_reach = 0.9;
+        let cases = [
+            (DrawdownMode::Static, between(fixed.unwrap()), out_of_reach),
+            (
+                DrawdownMode::Trailing,
+                between(trailing.unwrap()),
+                out_of_reach,
+            ),
+            (DrawdownMode::Static, out_of_reach, between(day)),
+        ];
+        for (drawdown, max_drawdown, daily_loss) in cases {
+            let case = format!("{drawdown:?} {max_drawdown} {daily_loss}");
+            let (strict, rule) = battery(drawdown, max_drawdown, daily_loss, 0.0);
+            let (firm, limits) = firm_and_limits(&rule);
+            let expected = breach_share(&series, ranges, cash, &firm, &limits).unwrap();
+            assert_eq!(expected.own, 0.0, "{case}");
+            assert!(expected.cash > 0.0, "{case}");
+            let line = share_line(&strict);
+            assert_eq!(
+                (line.value, line.outcome),
+                (Some(0.0), Outcome::Pass),
+                "{case}"
             );
-            let fall = match drawdown {
-                DrawdownMode::Static => fixed,
-                DrawdownMode::Trailing => trailing,
-            }
-            .unwrap();
-            assert!(fall.own < fall.cash, "{drawdown:?}: {fall:?}");
+            let warning = sizing_warning(&line, expected.cash).unwrap();
+            assert_eq!(share_warnings(&strict), [warning], "{case}");
 
-            let between = battery(drawdown, (fall.own + fall.cash) / 2.0 / share);
-            let line = drawdown_line(&between);
-            assert_eq!((line.value, line.outcome), (Some(fall.own), Outcome::Pass));
-            let warning = sizing_warning(&line, fall.cash).unwrap();
-            assert_eq!(drawdown_warnings(&between), [warning], "{drawdown:?}");
-
-            let above = battery(drawdown, fall.cash * 1.01 / share);
-            assert_eq!(drawdown_line(&above).outcome, Outcome::Pass);
-            assert!(drawdown_warnings(&above).is_empty(), "{drawdown:?}");
+            let (loose, _) = battery(drawdown, max_drawdown, daily_loss, expected.cash);
+            assert_eq!(share_line(&loose).outcome, Outcome::Pass, "{case}");
+            assert!(share_warnings(&loose).is_empty(), "{case}");
         }
     }
 
@@ -3903,10 +4309,10 @@ mod tests {
     }
 
     /// With `sizes_from_starting_cash`, the battery reads the test windows' own money changes,
-    /// added from window to window: the drawdown and daily-loss lines judge each fall as a share
-    /// of the starting cash, the odds walk each day's money change over the starting cash, and no
-    /// line warns about sizing. A limit between the stitched curve's two readings, which warns
-    /// without the field (as above), is judged on the starting-cash reading instead. With attempt
+    /// added from window to window: the breach-share, drawdown and daily-loss lines judge each
+    /// fall as a share of the starting cash, the odds walk each day's money change over the
+    /// starting cash, and nothing warns about sizing. A drawdown limit between the stitched
+    /// curve's two readings is judged on the starting-cash reading instead. With attempt
     /// terms, the attempt is priced on the same added days.
     #[test]
     fn a_rule_sized_from_the_starting_cash_judges_its_lines_and_odds_on_the_starting_cash() {
@@ -3991,11 +4397,29 @@ mod tests {
             let fall = pick(falls);
             let day = worst_daily_loss(&series, ranges, cash, None).unwrap();
 
-            // A limit between the stitched curve's two readings passes and warns without the
-            // field. With it, the line judges the windows' own fall over the starting cash, which
-            // is not the stitched curve's figure, and nothing warns.
+            // The firm and limits the battery judged with, at a drawdown limit of `max_drawdown`.
+            let judged_with = |max_drawdown: f64| {
+                let (firm, limits) = firm_and_limits(&firm_rule(drawdown, 10, None));
+                (
+                    crate::FirmLimits {
+                        max_drawdown,
+                        ..firm
+                    },
+                    limits,
+                )
+            };
+            // Without the field the share line reads the stitched curve's attempts on their own
+            // starts.
+            let (firm, limits) = judged_with(0.2);
+            let stitched_share =
+                breach_share(&stitched, &wf.equity_extremes, cash, &firm, &limits).unwrap();
+            assert_eq!(off.kind.test_breach_share, Some(stitched_share.own));
+
+            // A limit between the stitched curve's two readings of the worst attempt. With the
+            // field, every line judges the windows' own falls over the starting cash, which are
+            // not the stitched curve's figures, the share line counts the attempts that breach on
+            // them, and nothing warns.
             let limit = (stitched_fall.own + stitched_fall.cash) / 2.0 / share;
-            assert_eq!(drawdown_warnings(&battery(drawdown, limit, false)).len(), 1);
             let on = battery(drawdown, limit, true);
             assert_ne!(fall.cash, stitched_fall.cash, "{drawdown:?}");
             assert_eq!(line(&on, "max_drawdown").value, Some(fall.cash));
@@ -4008,8 +4432,12 @@ mod tests {
             );
             assert_eq!(line(&on, "worst_daily_loss").value, Some(day.cash));
             assert_eq!(on.kind.worst_daily_loss, Some(day.cash));
-            assert!(drawdown_warnings(&on).is_empty(), "{drawdown:?}");
-            assert!(daily_loss_warnings(&on).is_empty(), "{drawdown:?}");
+            let (firm, limits) = judged_with(limit);
+            let fixed_share = breach_share(&series, ranges, cash, &firm, &limits).unwrap();
+            assert_ne!(fixed_share.cash, fixed_share.own, "{drawdown:?}");
+            assert_eq!(on.kind.test_breach_share, Some(fixed_share.cash));
+            assert_eq!(line(&on, "test_breach_share").value, Some(fixed_share.cash));
+            assert!(share_warnings(&on).is_empty(), "{drawdown:?}");
 
             // The out-of-sample return the evidence layer judges is the windows' own money,
             // added, over the starting cash; without the field, the stitched curve's, as before.
@@ -4747,12 +5175,8 @@ mod tests {
         warnings.filter(|w| w.starts_with(text)).cloned().collect()
     }
 
-    fn drawdown_warnings(r: &BatteryResult) -> Vec<String> {
-        warnings_starting(r, "The max drawdown line")
-    }
-
-    fn daily_loss_warnings(r: &BatteryResult) -> Vec<String> {
-        warnings_starting(r, "The worst daily loss line")
+    fn share_warnings(r: &BatteryResult) -> Vec<String> {
+        warnings_starting(r, "The line for the share of attempts that breach")
     }
 
     /// A rule like [`firm_rule`] whose firm allows a daily loss of `daily_loss`.
@@ -4771,9 +5195,10 @@ mod tests {
 
     /// The worst-daily-loss line reads each day's fall as a share of that day's starting balance,
     /// on a curve that compounds: a day that loses 4% of a balance standing at 0.6 of the starting
-    /// cash is 4%, and fails a line of 2.5% (a firm's 5% judged at half), though it is 2.4% of the
-    /// starting cash. After gains the other way: 2% of a balance at 1.5 times the starting cash
-    /// passes, though it is 3% of the starting cash, and the warning carries both figures.
+    /// cash is 4%, over a line of 2.5% (a firm's 5% judged at half), which warns, though it is
+    /// 2.4% of the starting cash. After gains the other way: 2% of a balance at 1.5 times the
+    /// starting cash passes, though it is 3% of the starting cash. The share line's warning, which
+    /// carries the starting-cash reading, is tested above.
     #[test]
     fn the_daily_loss_line_reads_each_day_on_its_own_starting_balance() {
         let judge = |values: &[f64]| {
@@ -4787,78 +5212,20 @@ mod tests {
                 .into_iter()
                 .find(|l| l.id == "worst_daily_loss")
                 .unwrap();
-            let warning = sizing_warning(&line, fall.cash);
-            (fall, line, warning)
+            (fall, line)
         };
         let near = |a: f64, b: f64| assert!((a - b).abs() < 1e-12, "{a} against {b}");
 
-        let (fall, line, warning) = judge(&[60.0, 57.6]);
+        let (fall, line) = judge(&[60.0, 57.6]);
         near(fall.own, 0.04);
         near(fall.cash, 0.024);
         assert_eq!(line.limit, Some(0.025));
-        assert_eq!((line.value, line.outcome), (Some(fall.own), Outcome::Fail));
-        assert_eq!(warning, None);
+        assert_eq!((line.value, line.outcome), (Some(fall.own), Outcome::Warn));
 
-        let (fall, line, warning) = judge(&[150.0, 147.0]);
+        let (fall, line) = judge(&[150.0, 147.0]);
         near(fall.own, 0.02);
         near(fall.cash, 0.03);
         assert_eq!(line.outcome, Outcome::Pass);
-        let warning = warning.unwrap();
-        assert!(
-            warning.contains("lost 2.00% of that day's starting balance"),
-            "{warning}"
-        );
-        assert!(
-            warning.contains("lost 3.00% of the starting balance"),
-            "{warning}"
-        );
-        assert!(warning.contains("limit of 2.50%"), "{warning}");
-    }
-
-    /// The battery puts the worst-daily-loss line's sizing warning on the verdict, from the reading
-    /// the line judges: with the line's limit between the worst day's fall as a share of its own
-    /// start and as a share of the starting cash, the line passes and the verdict warns; with the
-    /// limit above both, it does not.
-    #[test]
-    fn the_battery_warns_when_the_daily_loss_line_passes_only_on_its_sizing() {
-        let (plan, bars) = sma_plan(sma_axes());
-        let battery = |daily_loss| {
-            let rule = daily_loss_rule(daily_loss, None);
-            let spec = BatterySpec {
-                strategy: "sma_cross",
-                plan: &plan,
-                rule: &rule,
-                instrument: &test_instrument(),
-                seed: 7,
-            };
-            run_battery(&spec, &bars, &[], &[], None).unwrap()
-        };
-        let daily_line = |r: &BatteryResult| {
-            r.verdict
-                .criteria
-                .iter()
-                .find(|l| l.layer == crate::Layer::Kind && l.id == "worst_daily_loss")
-                .unwrap()
-                .clone()
-        };
-        let share = crate::PropFirmLimits::default().share_of_firm_limits;
-        let r = battery(0.06);
-        let wf = r.walk_forward.as_ref().unwrap();
-        let cash = plan.backtest.starting_cash;
-        let series = EquitySeries::new(cash, &wf.equity, plan.timeframe);
-        let fall = worst_daily_loss(&series, &wf.equity_extremes, cash, None).unwrap();
-        // The curve grows well above its start, so its days read smaller on their own start.
-        assert!(fall.own < fall.cash, "{fall:?}");
-
-        let between = battery((fall.own + fall.cash) / 2.0 / share);
-        let line = daily_line(&between);
-        assert_eq!((line.value, line.outcome), (Some(fall.own), Outcome::Pass));
-        let warning = sizing_warning(&line, fall.cash).unwrap();
-        assert_eq!(daily_loss_warnings(&between), [warning]);
-
-        let above = battery(fall.cash * 1.01 / share);
-        assert_eq!(daily_line(&above).outcome, Outcome::Pass);
-        assert!(daily_loss_warnings(&above).is_empty());
     }
 
     /// A decimal parameter swept over whole numbers: the chosen sets hold `equity_fraction` as the
