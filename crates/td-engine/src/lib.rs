@@ -81,9 +81,10 @@ pub use results::{
 };
 pub use risk::{DayRollover, EquityRange};
 pub use runner::{
-    BacktestConfig, BacktestResult, Benchmark, ENGINE_REVISION, Rerun, config_fingerprint,
-    config_fingerprint_with_references, data_fingerprint, default_slippage_bps, rerun, run,
-    run_strategy, run_strategy_with_references, run_with_references,
+    AlsoTradedBars, BacktestConfig, BacktestResult, Benchmark, ENGINE_REVISION, Rerun,
+    config_fingerprint, config_fingerprint_with_references, config_fingerprint_with_traded,
+    data_fingerprint, default_slippage_bps, rerun, run, run_strategy, run_strategy_with_references,
+    run_strategy_with_traded, run_with_references, run_with_traded,
 };
 pub use saved_verdicts::{
     LinkState, LinkedVerdict, RECORD_FILE, RUNS_DIR, SessionLink, VERDICT_FILE, VerdictError,

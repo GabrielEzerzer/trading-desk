@@ -256,11 +256,11 @@ series?: Array<string>,
  */
 also_traded?: Array<Instrument>, 
 /**
- * When set, the run starts at the first of `instrument`'s bar times, at or after `from`, by
- * which every traded instrument has had a bar, counting the bars given to the run before
- * its range: the first instrument's bars before then are not traded (they are warm-up bars
- * when `warmup_from` covers them). Left out of the saved result when it is not set, the
- * default.
+ * When set, the run starts trading at the first of `instrument`'s bar times, at or after
+ * `from`, by which every traded instrument has had a bar, counting the bars given to the run
+ * before its range. The first instrument's bars from `warmup_from` (or `from`) up to then are
+ * warm-up bars: the strategy sees them but cannot trade. Left out of the saved result when it
+ * is not set, the default.
  */
 start_when_all_listed?: boolean, };
 

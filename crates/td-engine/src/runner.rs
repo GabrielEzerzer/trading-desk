@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
@@ -14,7 +15,7 @@ use crate::metrics::{self, DAY_MS, DAYS_PER_YEAR, EquitySeries, MetricsReport};
 use crate::reference::{Aligned, ReferenceBars, align, row};
 use crate::risk::{self, EquityRange, Exposure, Intrabar};
 use crate::series::{Series, SeriesRow, known_by};
-use crate::session::{check_quote, funding_ranges, sorted_funding};
+use crate::session::{LegData, check_quote, funding_ranges, sorted_funding};
 use crate::{
     BarFunding, CLOSE_OUT_TAG, CandleFillModel, EngineError, EquityPoint, Order, Params, Portfolio,
     Session, SessionConfig, Strategy, Trade, attach_stops, build_strategy, build_trades,
@@ -134,11 +135,11 @@ pub struct BacktestConfig {
     /// none, the default.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub also_traded: Vec<Instrument>,
-    /// When set, the run starts at the first of `instrument`'s bar times, at or after `from`, by
-    /// which every traded instrument has had a bar, counting the bars given to the run before
-    /// its range: the first instrument's bars before then are not traded (they are warm-up bars
-    /// when `warmup_from` covers them). Left out of the saved result when it is not set, the
-    /// default.
+    /// When set, the run starts trading at the first of `instrument`'s bar times, at or after
+    /// `from`, by which every traded instrument has had a bar, counting the bars given to the run
+    /// before its range. The first instrument's bars from `warmup_from` (or `from`) up to then are
+    /// warm-up bars: the strategy sees them but cannot trade. Left out of the saved result when it
+    /// is not set, the default.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub start_when_all_listed: bool,
 }
@@ -403,6 +404,45 @@ pub fn run_with_references(
     })
 }
 
+/// The bars and funding events of one instrument a run trades beside the first
+/// ([`BacktestConfig::also_traded`]), as [`run_with_traded`] takes them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlsoTradedBars {
+    pub instrument: InstrumentId,
+    /// Its bars at the run's timeframe, in any order. Those before the range count for
+    /// [`crate::Context::has_had_bar`] and [`BacktestConfig::start_when_all_listed`].
+    pub bars: Vec<Candle>,
+    /// Its funding events, `(time, rate)`, in any order.
+    pub funding: Vec<(Millis, f64)>,
+}
+
+/// [`run_with_references`] for a configuration that also names instruments traded beside the
+/// first ([`BacktestConfig::also_traded`]), with each one's bars and funding. The strategy is
+/// called on the first instrument's bar times, and every traded instrument shares one account
+/// (see the README, "Several traded instruments"). The data fingerprint also covers each other
+/// instrument's bars the run used and the funding it could see. [`run_with_references`] is this
+/// with none given, so it refuses a configuration that names any.
+pub fn run_with_traded(
+    config: &BacktestConfig,
+    bars: &[Candle],
+    asks: &[Candle],
+    funding: &[(Millis, f64)],
+    references: &[ReferenceBars],
+    series: &[Series],
+    also_traded: &[AlsoTradedBars],
+) -> Result<BacktestResult, EngineError> {
+    run_built_with(
+        config,
+        bars,
+        asks,
+        funding,
+        references,
+        series,
+        also_traded,
+        || build_strategy(&config.strategy, &config.params),
+    )
+}
+
 /// The open position at each point [`risk::intrabar`] evaluates in the backtest
 /// [`run_with_references`] makes ([`risk::Intrabar::exposures`]), which its result does not keep:
 /// for reading the leverage and notional of an account that holds the run's position on another
@@ -422,6 +462,7 @@ pub(crate) fn run_exposures(
         funding,
         references,
         series,
+        &[],
         true,
         || build_strategy(&config.strategy, &config.params),
     )?;
@@ -458,6 +499,31 @@ pub fn run_strategy_with_references(
     })
 }
 
+/// [`run_strategy_with_references`] with the bars and funding of the instruments `config` trades
+/// beside the first, as [`run_with_traded`] takes them.
+#[allow(clippy::too_many_arguments)]
+pub fn run_strategy_with_traded(
+    config: &BacktestConfig,
+    strategy: Box<dyn Strategy>,
+    bars: &[Candle],
+    asks: &[Candle],
+    funding: &[(Millis, f64)],
+    references: &[ReferenceBars],
+    series: &[Series],
+    also_traded: &[AlsoTradedBars],
+) -> Result<BacktestResult, EngineError> {
+    run_built_with(
+        config,
+        bars,
+        asks,
+        funding,
+        references,
+        series,
+        also_traded,
+        || Ok(strategy),
+    )
+}
+
 /// The metrics [`run`] would report, without the parts of its result a sweep row does not keep:
 /// the buy-and-hold benchmark, the data fingerprint and the copies of the equity and orders.
 pub(crate) fn run_metrics(
@@ -475,6 +541,7 @@ pub(crate) fn run_metrics(
         funding,
         references,
         series,
+        &[],
         false,
         || build_strategy(&config.strategy, &config.params),
     )?;
@@ -492,6 +559,21 @@ pub(crate) fn run_built(
     series: &[Series],
     build: impl FnOnce() -> Result<Box<dyn Strategy>, EngineError>,
 ) -> Result<BacktestResult, EngineError> {
+    run_built_with(config, bars, asks, funding, references, series, &[], build)
+}
+
+/// [`run_built`] with the bars and funding of the instruments traded beside the first.
+#[allow(clippy::too_many_arguments)]
+fn run_built_with(
+    config: &BacktestConfig,
+    bars: &[Candle],
+    asks: &[Candle],
+    funding: &[(Millis, f64)],
+    references: &[ReferenceBars],
+    series: &[Series],
+    also_traded: &[AlsoTradedBars],
+    build: impl FnOnce() -> Result<Box<dyn Strategy>, EngineError>,
+) -> Result<BacktestResult, EngineError> {
     let Simulated {
         warmup,
         bars,
@@ -502,6 +584,7 @@ pub(crate) fn run_built(
         seen,
         references,
         named,
+        legs,
         session,
         fills,
         trades,
@@ -509,7 +592,15 @@ pub(crate) fn run_built(
         intrabar,
         report,
     } = simulate(
-        config, bars, asks, funding, references, series, false, build,
+        config,
+        bars,
+        asks,
+        funding,
+        references,
+        series,
+        also_traded,
+        false,
+        build,
     )?;
     let benchmark = benchmark(
         config,
@@ -534,7 +625,14 @@ pub(crate) fn run_built(
         config: config.clone(),
         engine_version: env!("CARGO_PKG_VERSION").to_string(),
         engine_revision: ENGINE_REVISION,
-        data_fingerprint: fingerprint(&used_bars, &used_asks, &funding[seen], &references, &known),
+        data_fingerprint: fingerprint(
+            &used_bars,
+            &used_asks,
+            &funding[seen],
+            &references,
+            &known,
+            &legs,
+        ),
         equity: session.equity().to_vec(),
         orders: session.orders().to_vec(),
         fills,
@@ -564,6 +662,8 @@ struct Simulated<'a> {
     references: Aligned,
     /// The series the configuration names, in its order, as given.
     named: Vec<&'a Series>,
+    /// The instruments traded beside the first, with the bars and funding the run used.
+    legs: Vec<LegData>,
     session: Session,
     fills: Vec<Fill>,
     trades: Vec<Trade>,
@@ -583,11 +683,15 @@ fn simulate<'a>(
     funding: &[(Millis, f64)],
     references: &[ReferenceBars],
     series: &'a [Series],
+    also_traded: &[AlsoTradedBars],
     keep_exposures: bool,
     build: impl FnOnce() -> Result<Box<dyn Strategy>, EngineError>,
 ) -> Result<Simulated<'a>, EngineError> {
+    let started = start_config(config, bars, also_traded)?;
+    let config: &BacktestConfig = &started;
     let (warmup, traded) = select_bars(config, bars)?;
     let references = align_used(config, &warmup, &traded, references)?;
+    let legs = align_traded(config, &warmup, &traded, also_traded)?;
     let named = named_series(config, &warmup, &traded, series)?;
     let warmup_asks = match_asks(config.instrument.id.kind, bars, asks, &warmup)?;
     let traded_asks = match_asks(config.instrument.id.kind, bars, asks, &traded)?;
@@ -609,6 +713,9 @@ fn simulate<'a>(
     let mut session = Session::new(strategy, config.instrument.clone(), tf, session_config)?;
     session.name_references(references.iter().map(|(id, _)| id.clone()).collect())?;
     session.name_series(named.iter().map(|s| (*s).clone()).collect())?;
+    if !legs.is_empty() {
+        session.name_also_traded(legs.clone())?;
+    }
     for (j, (bar, range)) in warmup.iter().zip(warmup_ranges).enumerate() {
         session.feed(*bar, None, &funding[range], &row(&references, j), true)?;
     }
@@ -619,7 +726,14 @@ fn simulate<'a>(
         let events = &funding[range.clone()];
         let slots = row(&references, warmup.len() + i);
         session.feed(*bar, *ask, events, &slots, false)?;
-        positions.push(session.portfolio().position());
+        if legs.is_empty() {
+            positions.push(session.portfolio().position());
+        } else {
+            // A bar counts as in the market when any traded instrument is held.
+            let held = session.portfolio().position() != 0.0
+                || session.legs().iter().any(|l| l.portfolio.position() != 0.0);
+            positions.push(if held { 1.0 } else { 0.0 });
+        }
         if close_out_at == Some(i) {
             session.close_out();
         }
@@ -628,35 +742,49 @@ fn simulate<'a>(
     let mut fills = session.fills().to_vec();
     mark_close_outs(&mut fills, session.orders());
     let account = config.account_currency;
-    let pip = config.instrument.pip_size();
-    let mut trades = build_trades(
-        &fills,
-        &bars,
-        &traded_asks,
-        session.bar_funding(),
-        account,
-        pip,
-    );
-    attach_stops(&mut trades, session.trade_stops(), account);
+    let (mut trades, intrabar, funding_paid) = if legs.is_empty() {
+        let pip = config.instrument.pip_size();
+        let mut trades = build_trades(
+            &fills,
+            &bars,
+            &traded_asks,
+            session.bar_funding(),
+            account,
+            pip,
+        );
+        attach_stops(&mut trades, session.trade_stops(), account);
+        let intrabar = risk::intrabar_with(
+            config.starting_cash,
+            &bars,
+            &traded_asks,
+            session.equity(),
+            &fills,
+            session.bar_funding(),
+            account,
+            keep_exposures,
+        );
+        (trades, intrabar, session.portfolio().funding_paid())
+    } else {
+        let others: f64 = session
+            .legs()
+            .iter()
+            .map(|l| l.portfolio.funding_paid())
+            .sum();
+        (
+            several_trades(config, &session, &bars, &fills),
+            several_intrabar(&session, keep_exposures),
+            session.portfolio().funding_paid() + others,
+        )
+    };
     mark_forced_closes(&mut trades, &fills);
     let series = EquitySeries::new(config.starting_cash, session.equity(), tf);
-    let intrabar = risk::intrabar_with(
-        config.starting_cash,
-        &bars,
-        &traded_asks,
-        session.equity(),
-        &fills,
-        session.bar_funding(),
-        account,
-        keep_exposures,
-    );
     let report = metrics::report_with(
         &series,
         Some(&intrabar),
         &positions,
         &trades,
         &fills,
-        session.portfolio().funding_paid(),
+        funding_paid,
         account,
     );
     Ok(Simulated {
@@ -669,6 +797,7 @@ fn simulate<'a>(
         seen,
         references,
         named,
+        legs,
         session,
         fills,
         trades,
@@ -678,14 +807,231 @@ fn simulate<'a>(
     })
 }
 
+/// `config` with its range starting where [`BacktestConfig::start_when_all_listed`] starts it: at
+/// the first of its bar times, at or after `from`, by which the first instrument (`bars`) and
+/// every instrument given in `also_traded` has had a bar, with the bars from `warmup_from` (or
+/// `from`) up to there as warm-up bars. `config` itself when that is not set. Refuses a range in
+/// which no bar time is left.
+fn start_config<'c>(
+    config: &'c BacktestConfig,
+    bars: &[Candle],
+    also_traded: &[AlsoTradedBars],
+) -> Result<Cow<'c, BacktestConfig>, EngineError> {
+    if !config.start_when_all_listed {
+        return Ok(Cow::Borrowed(config));
+    }
+    let first_bar = |bars: &[Candle]| bars.iter().map(|b| b.open_time).min();
+    let mut listed = first_bar(bars);
+    for given in also_traded {
+        listed = match (listed, first_bar(&given.bars)) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            _ => None,
+        };
+    }
+    let no_bars = EngineError::NoBarsInRange {
+        from: config.from,
+        to: config.to,
+    };
+    let from = config.from.max(listed.ok_or(no_bars.clone())?);
+    if from >= config.to {
+        return Err(no_bars);
+    }
+    let mut started = config.clone();
+    started.warmup_from = Some(config.warmup_from.unwrap_or(config.from));
+    started.from = from;
+    Ok(Cow::Owned(started))
+}
+
+/// The bars and funding given for `config`'s other traded instruments, checked and cut to what
+/// the run uses, in the order `config` names the instruments; empty when it names none. Refuses
+/// what [`BacktestConfig::check_traded`] refuses, a named instrument without bars, bars given for
+/// one the run does not trade or given twice, two bars of one instrument with the same open time,
+/// a bar off the timeframe's boundaries, an invalid bar the run uses and a funding rate that is
+/// not finite.
+///
+/// The bars used are those at the first instrument's bar times, warm-up included, and those
+/// strictly between its first and last traded bars at times it has no bar. The funding is the
+/// events from the first bar's open to the last traded bar's close, as for the first instrument.
+fn align_traded(
+    config: &BacktestConfig,
+    warmup: &[Candle],
+    traded: &[Candle],
+    given: &[AlsoTradedBars],
+) -> Result<Vec<LegData>, EngineError> {
+    config.check_traded()?;
+    let refuse = |why: String| Err(EngineError::InvalidTraded(why));
+    for (i, g) in given.iter().enumerate() {
+        if !config
+            .also_traded
+            .iter()
+            .any(|inst| inst.id == g.instrument)
+        {
+            return refuse(format!(
+                "bars were given for {}, which the run does not trade",
+                g.instrument
+            ));
+        }
+        if given[..i].iter().any(|o| o.instrument == g.instrument) {
+            return refuse(format!("bars were given twice for {}", g.instrument));
+        }
+    }
+    let tf = config.timeframe;
+    let first_times: HashSet<Millis> = warmup.iter().chain(traded).map(|b| b.open_time).collect();
+    let start = warmup.first().or(traded.first()).map_or(0, |b| b.open_time);
+    let lo = traded.first().map_or(0, |b| b.open_time);
+    let hi = traded.last().map_or(0, |b| b.open_time);
+    let mut legs = Vec::with_capacity(config.also_traded.len());
+    for inst in &config.also_traded {
+        let id = &inst.id;
+        let Some(g) = given.iter().find(|g| g.instrument == *id) else {
+            return refuse(format!("no bars were given for {id}"));
+        };
+        let mut bars = g.bars.clone();
+        bars.sort_by_key(|b| b.open_time);
+        for (j, bar) in bars.iter().enumerate() {
+            if tf.floor(bar.open_time) != bar.open_time {
+                return refuse(format!(
+                    "the bar of {id} at {} is not on a {tf} boundary",
+                    bar.open_time
+                ));
+            }
+            if j > 0 && bars[j - 1].open_time == bar.open_time {
+                return refuse(format!("two bars of {id} open at {}", bar.open_time));
+            }
+        }
+        let listed_from = bars.first().map(|b| b.open_time);
+        bars.retain(|b| {
+            first_times.contains(&b.open_time) || (lo < b.open_time && b.open_time < hi)
+        });
+        for bar in &bars {
+            bar.validate()?;
+        }
+        let mut funding = sorted_funding(&g.funding);
+        if let Some(&(time, rate)) = funding.iter().find(|(_, rate)| !rate.is_finite()) {
+            return Err(EngineError::InvalidFundingRate { time, rate });
+        }
+        funding.retain(|&(time, _)| (start..hi + tf.duration_ms()).contains(&time));
+        legs.push(LegData {
+            instrument: inst.clone(),
+            bars,
+            funding,
+            listed_from,
+        });
+    }
+    Ok(legs)
+}
+
+/// The trades of a run with several traded instruments: each instrument's, built from its own
+/// fills, bars and funding and given its stops, then all of them by entry time.
+fn several_trades(
+    config: &BacktestConfig,
+    session: &Session,
+    bars: &[Candle],
+    fills: &[Fill],
+) -> Vec<Trade> {
+    let account = config.account_currency;
+    let first = (
+        &config.instrument.id,
+        bars,
+        session.bar_funding(),
+        session.trade_stops(),
+    );
+    let others = session.legs().iter().map(|l| {
+        (
+            &l.instrument.id,
+            l.traded.as_slice(),
+            l.bar_funding.as_slice(),
+            l.trade_stops.as_slice(),
+        )
+    });
+    let mut trades = Vec::new();
+    for (id, bars, funding, stops) in std::iter::once(first).chain(others) {
+        let own: Vec<Fill> = fills
+            .iter()
+            .filter(|f| f.instrument == *id)
+            .cloned()
+            .collect();
+        let (bars, funding) = with_fill_bars(bars, funding, &own);
+        let mut built = build_trades(&own, &bars, &[], &funding, account, None);
+        attach_stops(&mut built, stops, account);
+        for trade in &mut built {
+            trade.instrument = Some(id.clone());
+        }
+        trades.extend(built);
+    }
+    trades.sort_by_key(|t| t.entry_time);
+    trades
+}
+
+/// `bars` and their `funding`, with a flat bar at the fill's price, and no funding, at the time of
+/// each of `fills` an instrument has no bar at: a liquidation closes a position whose instrument
+/// has no bar then, at its last close.
+///
+/// shortcut: the added bar counts in the trade's `bars_held`; record the liquidation on the
+/// instrument's next bar instead if that count matters.
+fn with_fill_bars(
+    bars: &[Candle],
+    funding: &[BarFunding],
+    fills: &[Fill],
+) -> (Vec<Candle>, Vec<BarFunding>) {
+    let times: HashSet<Millis> = bars.iter().map(|b| b.open_time).collect();
+    let mut added: Vec<(Candle, BarFunding)> =
+        bars.iter().copied().zip(funding.iter().copied()).collect();
+    for fill in fills.iter().filter(|f| !times.contains(&f.time)) {
+        if added.iter().any(|(b, _)| b.open_time == fill.time) {
+            continue;
+        }
+        let bar = Candle {
+            open_time: fill.time,
+            open: fill.price,
+            high: fill.price,
+            low: fill.price,
+            close: fill.price,
+            volume: 0.0,
+            quote_volume: 0.0,
+        };
+        added.push((bar, BarFunding::default()));
+    }
+    added.sort_by_key(|(b, _)| b.open_time);
+    added.into_iter().unzip()
+}
+
+/// The equity ranges and peak leverage of a run with several traded instruments, from the
+/// session's own reading of the account ([`Session::ranges`]), with its exposures when
+/// `keep_exposures` is set.
+fn several_intrabar(session: &Session, keep_exposures: bool) -> Intrabar {
+    let mut peak = (!session.ranges().is_empty()).then_some(0.0);
+    for x in session.exposures() {
+        if x.equity > 0.0
+            && let Some(lev) = metrics::finite(x.notional / x.equity)
+        {
+            peak = Some(peak.map_or(lev, |p: f64| p.max(lev)));
+        }
+    }
+    Intrabar {
+        ranges: session.ranges().to_vec(),
+        peak_leverage: peak,
+        exposures: if keep_exposures {
+            session.exposures().to_vec()
+        } else {
+            Vec::new()
+        },
+    }
+}
+
 /// The series `given` for `config`, in the order it names them, checked by [`crate::series::named`]
-/// against the close of the first bar the strategy sees, warm-up included.
+/// against the close of the first bar the strategy sees, warm-up included, or, in a run with
+/// several traded instruments, of the last traded bar.
 fn named_series<'a>(
     config: &BacktestConfig,
     warmup: &[Candle],
     traded: &[Candle],
     given: &'a [Series],
 ) -> Result<Vec<&'a Series>, EngineError> {
+    if !config.also_traded.is_empty() {
+        let last = traded.last().map_or(0, |b| b.open_time);
+        return crate::series::named(config, last + config.timeframe.duration_ms(), given);
+    }
     let first = warmup.first().or(traded.first()).map_or(0, |b| b.open_time);
     crate::series::named(config, first + config.timeframe.duration_ms(), given)
 }
@@ -752,14 +1098,17 @@ fn mark_close_outs(fills: &mut [Fill], orders: &[Order]) {
 }
 
 /// Marks the trade each close-out fill closed as force-closed: the last closed trade that exits
-/// on the fill's bar.
+/// on the fill's bar, in the fill's instrument when trades carry one.
 fn mark_forced_closes(trades: &mut [Trade], fills: &[Fill]) {
     for fill in fills {
         if fill.close_out
-            && let Some(t) = trades
-                .iter_mut()
-                .rev()
-                .find(|t| !t.open && t.exit_time == fill.time)
+            && let Some(t) = trades.iter_mut().rev().find(|t| {
+                !t.open
+                    && t.exit_time == fill.time
+                    && t.instrument
+                        .as_ref()
+                        .is_none_or(|id| *id == fill.instrument)
+            })
         {
             t.force_closed = true;
         }
@@ -873,8 +1222,26 @@ pub fn config_fingerprint_with_references(
     references: &[ReferenceBars],
     series: &[Series],
 ) -> Result<String, EngineError> {
+    config_fingerprint_with_traded(config, bars, asks, funding, references, series, &[])
+}
+
+/// [`config_fingerprint_with_references`] for a configuration that also names instruments traded
+/// beside the first, with their bars and funding as [`run_with_traded`] takes them: the
+/// fingerprint that run would record.
+pub fn config_fingerprint_with_traded(
+    config: &BacktestConfig,
+    bars: &[Candle],
+    asks: &[Candle],
+    funding: &[(Millis, f64)],
+    references: &[ReferenceBars],
+    series: &[Series],
+    also_traded: &[AlsoTradedBars],
+) -> Result<String, EngineError> {
+    let started = start_config(config, bars, also_traded)?;
+    let config: &BacktestConfig = &started;
     let (warmup, traded) = select_bars(config, bars)?;
     let references = align_used(config, &warmup, &traded, references)?;
+    let legs = align_traded(config, &warmup, &traded, also_traded)?;
     let named = named_series(config, &warmup, &traded, series)?;
     let last_close = traded.last().map_or(0, |b| b.open_time) + config.timeframe.duration_ms();
     let known = known_series(&named, last_close);
@@ -893,6 +1260,7 @@ pub fn config_fingerprint_with_references(
         &funding[seen],
         &references,
         &known,
+        &legs,
     ))
 }
 
@@ -1142,7 +1510,7 @@ fn annualised_alpha_beta(times: &[Millis], returns: &(Vec<f64>, Vec<f64>)) -> Op
 /// count and each ask in the same form as a bar follow. Without asks nothing is added, so a
 /// fingerprint from before asks existed is unchanged.
 pub fn data_fingerprint(bars: &[Candle], asks: &[Candle], funding: &[(Millis, f64)]) -> String {
-    fingerprint(bars, asks, funding, &[], &[])
+    fingerprint(bars, asks, funding, &[], &[], &[])
 }
 
 /// [`data_fingerprint`], followed, when a run names reference instruments, by each one's id as
@@ -1151,14 +1519,19 @@ pub fn data_fingerprint(bars: &[Candle], asks: &[Candle], funding: &[(Millis, f6
 /// Then, when a run names series, the bytes `series`, their count, and per series its name in the
 /// form of an id, its row count and per row its `known_at`, the bits of its value, and a 0 byte
 /// for no period or a 1 byte and the period: the rows the run could read, those known by its last
-/// bar's close. Without references or series nothing is added, so a fingerprint is what it was
-/// before they existed.
+/// bar's close. Then, when a run trades other instruments beside the first, the bytes `traded`,
+/// their count, and per instrument its id in the form above, one slot per bar in `bars` in the
+/// form of a reference's slots, its other bars the run used (those at times the first instrument
+/// has no bar) in the form of `bars`, and its funding events the strategy could see in the form
+/// of `funding`. Without references, series or other traded instruments nothing is added, so a
+/// fingerprint is what it was before they existed.
 fn fingerprint(
     bars: &[Candle],
     asks: &[Candle],
     funding: &[(Millis, f64)],
     references: &[(InstrumentId, Vec<Option<Candle>>)],
     series: &[(&str, &[SeriesRow])],
+    traded: &[LegData],
 ) -> String {
     let mut h = Sha256::new();
     let candle = |h: &mut Sha256, b: &Candle| {
@@ -1214,6 +1587,40 @@ fn fingerprint(
                     h.update(p.to_le_bytes());
                 }
                 None => h.update([0u8]),
+            }
+        }
+    }
+    if !traded.is_empty() {
+        h.update(b"traded");
+        h.update((traded.len() as u64).to_le_bytes());
+        let times: HashSet<Millis> = bars.iter().map(|b| b.open_time).collect();
+        for leg in traded {
+            let id = leg.instrument.id.to_string();
+            h.update((id.len() as u64).to_le_bytes());
+            h.update(id.as_bytes());
+            let by_time: HashMap<Millis, &Candle> =
+                leg.bars.iter().map(|b| (b.open_time, b)).collect();
+            h.update((bars.len() as u64).to_le_bytes());
+            for bar in bars {
+                match by_time.get(&bar.open_time) {
+                    Some(b) => {
+                        h.update([1u8]);
+                        candle(&mut h, b);
+                    }
+                    None => h.update([0u8]),
+                }
+            }
+            let others: Vec<Candle> = leg
+                .bars
+                .iter()
+                .filter(|b| !times.contains(&b.open_time))
+                .copied()
+                .collect();
+            candles(&mut h, &others);
+            h.update((leg.funding.len() as u64).to_le_bytes());
+            for &(time, rate) in &leg.funding {
+                h.update(time.to_le_bytes());
+                h.update(rate.to_bits().to_le_bytes());
             }
         }
     }
