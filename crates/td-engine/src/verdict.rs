@@ -1127,6 +1127,8 @@ const SAMPLE_LINES: [(Layer, &str); 4] = [
 // The integrity layer
 // ---------------------------------------------------------------------------------------------
 
+const IDLE_LEFT_OUT: &str = ", leaving out the limit on days without a trading day";
+
 /// I1: the largest share of the period's open buckets the data may lack (#35).
 pub const MAX_DROPPED_SHARE: f64 = 0.01;
 
@@ -1465,6 +1467,11 @@ pub fn evaluate(rule: &VerdictRule, x: &KindInputs) -> Vec<Criterion> {
                                     decides.";
             let percent = format!("{:.2}", share * 100.0);
             let percent = percent.trim_end_matches('0').trim_end_matches('.');
+            let idle_left_out = if firm.max_days_without_trading.is_some() {
+                IDLE_LEFT_OUT
+            } else {
+                ""
+            };
             let mut lines = vec![
                 line(
                     "worst_daily_loss",
@@ -1511,7 +1518,7 @@ pub fn evaluate(rule: &VerdictRule, x: &KindInputs) -> Vec<Criterion> {
                 line(
                     "pass_probability",
                     &format!(
-                        "Chance of passing the challenge within {} days",
+                        "Chance of passing the challenge within {} days{idle_left_out}",
                         limits.pass_horizon_days
                     ),
                     x.pass_probability,
@@ -1522,7 +1529,7 @@ pub fn evaluate(rule: &VerdictRule, x: &KindInputs) -> Vec<Criterion> {
                 line(
                     "breach_probability",
                     &format!(
-                        "Chance of breaching a limit within {} days",
+                        "Chance of breaching a limit within {} days{idle_left_out}",
                         limits.breach_horizon_days
                     ),
                     x.breach_probability,
@@ -1557,7 +1564,8 @@ pub fn evaluate(rule: &VerdictRule, x: &KindInputs) -> Vec<Criterion> {
                 lines.push(line(
                     "attempt_value",
                     &format!(
-                        "Value of one attempt with a positive mean daily return scaled by {}",
+                        "Value of one attempt with a positive mean daily return scaled by \
+                         {}{idle_left_out}",
                         terms.reduced_edge_factor
                     ),
                     x.attempt_value,
@@ -2467,6 +2475,28 @@ mod tests {
 
     /// Odds simulated with the limits at daily closes say so on their lines, and only there; odds
     /// that read each day's low need no note.
+    #[test]
+    fn the_simulated_lines_say_they_leave_out_the_days_without_trading_limit_when_it_is_set() {
+        let simulated = ["pass_probability", "breach_probability", "attempt_value"];
+        let names = |most: Option<u32>| -> Vec<String> {
+            let mut rule = with_attempt(attempt_terms());
+            let VerdictRule::PropFirm { firm, .. } = &mut rule else {
+                unreachable!()
+            };
+            firm.max_days_without_trading = most;
+            evaluate(&rule, &good_prop())
+                .into_iter()
+                .filter(|l| simulated.contains(&l.id.as_str()))
+                .map(|l| l.name)
+                .collect()
+        };
+        let off = names(None);
+        assert_eq!(off.len(), simulated.len());
+        assert!(off.iter().all(|name| !name.contains("trading day")));
+        let on: Vec<String> = off.iter().map(|n| format!("{n}{IDLE_LEFT_OUT}")).collect();
+        assert_eq!(names(Some(30)), on);
+    }
+
     #[test]
     fn prop_firm_odds_checked_at_closes_say_so() {
         let rule = with_attempt(attempt_terms());
