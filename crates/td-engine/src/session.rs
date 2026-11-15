@@ -107,8 +107,13 @@ pub struct Session {
     step: Option<EquityRange>,
     /// The account's equity range in each live bar, read as [`Session::trade_time`] describes.
     ranges: Vec<EquityRange>,
-    /// The account's gross notional and equity at each point read with a position open.
+    /// The account's gross notional and equity at each point read with a position open, when
+    /// `keep_exposures` asks for them.
     exposures: Vec<Exposure>,
+    keep_exposures: bool,
+    /// The highest gross notional over equity at any point read with a position open and equity
+    /// above zero; 0 before any.
+    peak_leverage: f64,
     /// The open time of the first instrument's bar being fed. Every reading taken while it is fed
     /// joins that bar's equity point and range, those at other instruments' bars before it
     /// included, so each [`Exposure`] is stamped with it, as with one instrument.
@@ -118,11 +123,10 @@ pub struct Session {
 /// One instrument traded beside the first in a run with several
 /// ([`crate::BacktestConfig::also_traded`]). Its book holds its position, its fees and its
 /// funding; the account's balance is in the first instrument's book, so whatever moves this
-/// book's balance is moved there at once.
+/// book's balance is moved there at once. It pays the instrument's own fees: the run's fee
+/// override is the first instrument's.
 pub(crate) struct Leg {
     pub(crate) instrument: Instrument,
-    /// The instrument's own fees: the run's fee override is the first instrument's.
-    pub(crate) fees: FeeSchedule,
     pub(crate) broker: Box<dyn Broker>,
     pub(crate) portfolio: Portfolio,
     /// Its bars not yet fed, oldest first.
@@ -282,6 +286,8 @@ impl Session {
             step: None,
             ranges: Vec::new(),
             exposures: Vec::new(),
+            keep_exposures: false,
+            peak_leverage: 0.0,
             stamp: 0,
         }
     }
@@ -401,7 +407,13 @@ impl Session {
     /// bars and funding already checked (see [`crate::run_with_traded`]). Each trades on the
     /// simulated broker with its own fees and its default slippage, in the one account. Called
     /// once, before the first bar; refuses a call after a bar was fed or instruments were named.
-    pub(crate) fn name_also_traded(&mut self, legs: Vec<LegData>) -> Result<(), EngineError> {
+    /// With `keep_exposures` the session keeps every reading of the account with a position open
+    /// ([`Session::exposures`]).
+    pub(crate) fn name_also_traded(
+        &mut self,
+        legs: Vec<LegData>,
+        keep_exposures: bool,
+    ) -> Result<(), EngineError> {
         if !self.bars.is_empty() || !self.legs.is_empty() {
             return Err(EngineError::InvalidTraded(
                 "traded instruments are named once, before the first bar".into(),
@@ -418,7 +430,6 @@ impl Session {
                 Leg {
                     broker: Box::new(SimBroker::new(leg.instrument.clone(), fees, model)),
                     portfolio: Portfolio::new_in(leg.instrument.id.kind, 0.0, account),
-                    fees,
                     upcoming: leg.bars.into(),
                     slots: Vec::new(),
                     last_close: None,
@@ -434,6 +445,7 @@ impl Session {
             })
             .collect();
         self.opened = vec![None; self.legs.len() + 1];
+        self.keep_exposures = keep_exposures;
         Ok(())
     }
 
@@ -888,7 +900,8 @@ impl Session {
     }
 
     /// Reads the account's equity with each traded instrument at `prices`, for the bar time's
-    /// range, and its gross notional there when a position is open.
+    /// range, and its gross notional there when a position is open, for the peak leverage and,
+    /// when kept, the exposures.
     fn see(&mut self, prices: &[f64]) {
         let equity = self.account_at(prices);
         let range = self.step.get_or_insert(EquityRange {
@@ -898,11 +911,19 @@ impl Session {
         range.low = range.low.min(equity);
         range.high = range.high.max(equity);
         if (0..prices.len()).any(|k| self.book_at(k).position() != 0.0) {
-            self.exposures.push(Exposure {
-                notional: self.gross_notional(prices),
-                equity,
-                time: self.stamp,
-            });
+            let notional = self.gross_notional(prices);
+            if equity > 0.0
+                && let Some(lev) = crate::metrics::finite(notional / equity)
+            {
+                self.peak_leverage = self.peak_leverage.max(lev);
+            }
+            if self.keep_exposures {
+                self.exposures.push(Exposure {
+                    notional,
+                    equity,
+                    time: self.stamp,
+                });
+            }
         }
     }
 
@@ -1070,7 +1091,7 @@ impl Session {
         if k == 0 {
             self.fees
         } else {
-            self.legs[k - 1].fees
+            self.legs[k - 1].instrument.fees
         }
     }
 
@@ -1192,6 +1213,11 @@ impl Session {
                 client_tag: Some(CLOSE_OUT_TAG.into()),
             };
             // A rejected close-out is recorded with its reason, and the position stays open.
+            //
+            // shortcut: in a run with several traded instruments, the close-out of one with no
+            // bar after this one in the range stays open, and so does its position and trade;
+            // fill it at the instrument's last close on the final bar if a strategy needs every
+            // position closed.
             let _ = self.context().submit_close_out(request);
         }
     }
@@ -1511,9 +1537,15 @@ impl Session {
     }
 
     /// The account's gross notional and equity at each point [`Session::trade_time`] read with a
-    /// position open, in a run with several traded instruments.
+    /// position open, in a run with several traded instruments that keeps them; empty otherwise.
     pub(crate) fn exposures(&self) -> &[Exposure] {
         &self.exposures
+    }
+
+    /// The highest gross notional over equity at any point [`Session::trade_time`] read with a
+    /// position open, in a run with several traded instruments; 0 when it never held one.
+    pub(crate) fn peak_leverage(&self) -> f64 {
+        self.peak_leverage
     }
 }
 
