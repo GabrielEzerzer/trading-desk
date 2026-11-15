@@ -658,7 +658,7 @@ pub struct PropFirmOdds {
     pub pass: f64,
     /// The fraction of paths that breach a limit within the horizon (an account that goes
     /// `max_days_without_trading` days without a trading day, or holds more open notional than
-    /// `max_open_notional` allows, counts as breached): in a phase of
+    /// the rule's `max_open_notional_multiple` allows, counts as breached): in a phase of
     /// the evaluation, or after the last phase passes, trading on as the funded account from a fresh
     /// balance and a fresh peak, as a firm starts each phase and the funded account again at the
     /// account size. With attempt terms the funded account takes its payouts by them, which
@@ -675,13 +675,6 @@ pub struct PropFirmOdds {
     /// the limit on days without a trading day count. `None` in a result saved before it existed.
     #[serde(default)]
     pub trading_days: Option<usize>,
-    /// With an open-notional limit, the largest of the days' open-notional figures the paths were
-    /// drawn from: the run's largest open notional in one day over its equity at that day's start.
-    /// A walk at a balance of `b` and a size of `s` holds `b * s` times a day's figure, so this
-    /// shows how near the limit the days the attempts were built from came. `None` without the
-    /// limit, and left out then.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub peak_day_notional: Option<f64>,
 }
 
 /// How the evaluation along one path ended ([`walk_evaluation`]).
@@ -933,7 +926,6 @@ pub fn prop_firm_odds(
         paths: spec.paths,
         days: Some(traded.len()),
         trading_days: Some(traded.iter().filter(|&&t| t).count()),
-        peak_day_notional: notional.map(|n| n.iter().copied().fold(0.0, f64::max)),
     })
 }
 
@@ -3511,19 +3503,22 @@ mod tests {
 
     /// An account of 10,000. Day 1 the run holds 5,000 of notional on its 10,000 at the day's
     /// start (a figure of 0.5) and gains 10%, so the attempt goes into day 2 at 11,000, a balance
-    /// of 1.1. Day 2 the run holds 10,000 on its 10,000 at the day's start (a figure of 1.0): the
-    /// attempt holds that position scaled by its own balance over the run's, 11,000 over 10,000,
-    /// so 11,000 of notional, 1.1 times the account size. A limit of 1.05 ends it on day 2, though
-    /// the run's own figure that day, 1.0, is under it; a limit of 1.15 lets it carry on.
+    /// of 1.1. Day 2 the run holds 10,000 on its 10,000 at the day's start (a figure of 1.0) and
+    /// gains 10% again: the attempt holds that position scaled by its balance going into the day
+    /// over the run's equity at the day's start, 11,000 over 10,000, so 11,000 of notional, 1.1
+    /// times the account size. A limit of 1.05 ends it on day 2, though the run's own figure that
+    /// day, 1.0, is under it. A limit of 1.15 lets it carry on: read on the balance after day 2,
+    /// 12,100, the same figure would hold 1.21 and breach it.
     #[test]
     fn an_attempt_whose_balance_has_grown_holds_the_notional_of_the_grown_account() {
-        let (path, flags, held) = ([0.10, 0.0], [true; 2], [0.5, 1.0]);
+        let (path, flags, held) = ([0.10, 0.10], [true; 2], [0.5, 1.0]);
         let walk = |spec: &PropFirmSpec, size| {
             walk_evaluation(spec, &path, &path, &flags, Some(&held), size)
         };
         assert_eq!(walk(&notional_limit(1.05, 2), 1.0), Evaluation::Breached(2));
         assert_eq!(walk(&notional_limit(1.15, 2), 1.0), Evaluation::Unfinished);
-        // An attempt that starts on day 2 at 10,000 holds the run's own 10,000: 1.0, under 1.05.
+        // An attempt that starts on day 2 at 10,000 holds the run's own 10,000: 1.0, under 1.05,
+        // where its balance after the day, 11,000, would read 1.1.
         let day_two = walk_evaluation(
             &notional_limit(1.05, 1),
             &path[1..],
@@ -3533,8 +3528,9 @@ mod tests {
             1.0,
         );
         assert_eq!(day_two, Evaluation::Unfinished);
-        // At twice the size, day 1 holds 2 x 1.0 x 0.5 = 1.0, under 1.05, and gains 20%, so day 2
-        // holds 2 x 1.2 x 1.0 = 2.4: above 2.3, under 2.5.
+        // At twice the size, day 1 holds 2 x 1.0 x 0.5 = 1.0 and gains 20%, so day 2 holds
+        // 2 x 1.2 x 1.0 = 2.4: above 2.3, under 2.5 (the balance after day 2, 1.44, would read
+        // 2.88 and breach 2.5).
         assert_eq!(walk(&notional_limit(2.3, 2), 2.0), Evaluation::Breached(2));
         assert_eq!(walk(&notional_limit(2.5, 2), 2.0), Evaluation::Unfinished);
     }
@@ -3581,8 +3577,8 @@ mod tests {
             );
             assert_eq!(breach, Some(3), "{terms:?}");
         }
-        // The odds: a single day over the limit breaches every path, and the figure the days
-        // came from is reported; without the limit none breaches and no figure is.
+        // The odds: a single day over the limit breaches every path; without the limit none
+        // breaches.
         let odds = prop_firm_odds(
             &[0.0],
             None,
@@ -3593,11 +3589,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!((odds.pass, odds.breach), (0.0, 1.0));
-        assert_eq!(odds.peak_day_notional, Some(2.0));
         let odds = prop_firm_odds(&[0.0], None, &[true], None, &unlimited(5), None).unwrap();
-        assert_eq!((odds.breach, odds.peak_day_notional), (0.0, None));
-        let json = serde_json::to_value(odds).unwrap();
-        assert!(json.get("peak_day_notional").is_none(), "{json}");
+        assert_eq!(odds.breach, 0.0);
         // An attempt checks it at the terms' sizes: at an evaluation size of a half the day holds
         // 1.0, under 1.5, and at a size of 1 it holds 2.0, over it, so no attempt passes.
         let spec = PropFirmSpec {

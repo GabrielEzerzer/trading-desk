@@ -901,7 +901,6 @@ pub fn run_battery_with_references(
                 paths: b.paths,
                 days: b.days,
                 trading_days: b.trading_days,
-                peak_day_notional: b.peak_day_notional,
             });
             kind.pass_probability = result.prop_firm_odds.map(|o| o.pass);
             kind.breach_probability = result.prop_firm_odds.map(|o| o.breach);
@@ -2688,17 +2687,18 @@ mod tests {
     #[test]
     fn daily_notional_is_each_days_largest_notional_over_its_starting_equity() {
         const HALF: Millis = DAY_MS / 2;
-        let day = |end, start_equity| risk::DailyPnl {
+        let day = |end, start_equity, end_equity| risk::DailyPnl {
             end,
             start_equity,
-            end_equity: start_equity,
+            end_equity,
             low_equity: start_equity,
         };
-        // Days ending at day 2's, day 3's and day 4's midnight, starting at 100, 110 and 0.
+        // Days ending at day 2's, day 3's and day 4's midnight, starting at 100, 110 and 0 and
+        // ending at 110, 0 and 0: each figure is over the day's start, not its end.
         let days = [
-            day(2 * DAY_MS, 100.0),
-            day(3 * DAY_MS, 110.0),
-            day(4 * DAY_MS, 0.0),
+            day(2 * DAY_MS, 100.0, 110.0),
+            day(3 * DAY_MS, 110.0, 0.0),
+            day(4 * DAY_MS, 0.0, 0.0),
         ];
         let at = |time, notional| Exposure {
             notional,
@@ -3739,8 +3739,8 @@ mod tests {
 
     /// At a compounding size a limit on open notional is accepted, has no line of its own and
     /// moves only the attempt walks: a limit no day can reach gives the odds and the lines of a
-    /// rule without it, with the days' largest figure beside them, and one under that figure
-    /// breaches at least as often and passes at most as often.
+    /// rule without it, and one at half the run's peak leverage breaches more often and passes at
+    /// most as often.
     #[test]
     fn a_limit_on_open_notional_at_a_compounding_size_is_checked_in_the_attempt_walks() {
         let (plan, bars) = sma_plan(sma_axes());
@@ -3768,18 +3768,8 @@ mod tests {
         };
         let off = battery(None);
         let off_odds = off.prop_firm_odds.unwrap();
-        assert_eq!(off_odds.peak_day_notional, None);
         let unreachable = battery(Some(1e9));
-        let odds = unreachable.prop_firm_odds.unwrap();
-        let peak = odds.peak_day_notional.unwrap();
-        assert!(peak > 0.0, "{peak}");
-        assert_eq!(
-            PropFirmOdds {
-                peak_day_notional: None,
-                ..odds
-            },
-            off_odds
-        );
+        assert_eq!(unreachable.prop_firm_odds, Some(off_odds));
         assert_eq!(unreachable.verdict.criteria, off.verdict.criteria);
         assert_eq!(unreachable.kind.peak_open_notional, None);
         assert!(
@@ -3789,19 +3779,20 @@ mod tests {
                 .iter()
                 .all(|l| l.id != "open_notional")
         );
+        let peak = off.oos_integrity.peak_leverage.unwrap();
+        assert!(peak > 0.0, "{peak}");
         let tight = battery(Some(peak / 2.0)).prop_firm_odds.unwrap();
         assert!(
-            tight.breach >= off_odds.breach && tight.pass <= off_odds.pass,
-            "{tight:?}"
+            tight.breach > off_odds.breach && tight.pass <= off_odds.pass,
+            "{tight:?} against {off_odds:?}"
         );
-        assert!(tight.breach > 0.0, "{tight:?}");
     }
 
     /// A limit on open notional on a plan sized from the starting cash is judged on the largest
     /// open notional of the windows the fixed-size account counts, each window's own over the
     /// starting cash. A limit below the figure fails the line, one above passes it, and a rule
     /// without the limit has the lines it had. The attempt walks do not read the limit at a fixed
-    /// size, so the odds are those without it and carry no figure of their own. With `attempt`
+    /// size, so the odds are those without it. With `attempt`
     /// terms the figure is taken at the larger of the evaluation and funded sizes.
     #[test]
     fn a_limit_on_open_notional_is_judged_on_the_fixed_size_account() {
@@ -3868,9 +3859,6 @@ mod tests {
             let l = line(&capped).unwrap();
             assert_eq!((l.value, l.outcome), (Some(figure), outcome));
             assert_eq!(capped.prop_firm_odds, off.prop_firm_odds);
-            assert_eq!(capped.prop_firm_odds.unwrap().peak_day_notional, None);
-            let json = serde_json::to_value(capped.prop_firm_odds).unwrap();
-            assert!(json.get("peak_day_notional").is_none(), "{json}");
             let rest: Vec<_> = capped
                 .verdict
                 .criteria

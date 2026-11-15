@@ -2979,6 +2979,42 @@ mod tests {
         assert_eq!(peak_open_notional(10_000.0, &kept, &held), 9_000.0);
     }
 
+    /// At a compounding size the stitched curve holds each window's position at the window's
+    /// scale: from 10,000, the first window ends at 11,000, so the second starts at a level of 1.1
+    /// and its notionals come out times 1.1. It ends at 0, so the curve is gone and the third
+    /// window, at a scale of 0, is dropped.
+    #[test]
+    fn compounded_exposures_scale_each_window_by_the_curves_level_and_drop_a_gone_one() {
+        let template = rising_window(0, 20);
+        let ending = |end: f64| {
+            let mut w = template.clone();
+            w.out_of_sample.equity.last_mut().unwrap().equity = end;
+            w
+        };
+        let at = |notional: f64, time| Exposure {
+            notional,
+            equity: 10_000.0,
+            time,
+        };
+        let windows = [ending(11_000.0), ending(0.0), ending(12_000.0)];
+        let held = [
+            vec![at(5_000.0, 1)],
+            vec![at(7_000.0, 2), at(3_000.0, 3)],
+            vec![at(9_000.0, 4)],
+        ];
+        // 11,000 / 10,000 is the double nearest 1.1, so each product below is the one the
+        // function makes.
+        let level = |notional: f64, time| Exposure {
+            notional: notional * 1.1,
+            equity: 10_000.0 * 1.1,
+            time,
+        };
+        assert_eq!(
+            compounded_exposures(10_000.0, &windows, &held),
+            [at(5_000.0, 1), level(7_000.0, 2), level(3_000.0, 3)]
+        );
+    }
+
     #[test]
     fn window_lengths_that_overflow_are_errors() {
         let ok = WindowSpec {

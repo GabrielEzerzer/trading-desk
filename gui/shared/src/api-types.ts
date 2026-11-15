@@ -1974,7 +1974,7 @@ pass: number,
 /**
  * The fraction of paths that breach a limit within the horizon (an account that goes
  * `max_days_without_trading` days without a trading day, or holds more open notional than
- * `max_open_notional` allows, counts as breached): in a phase of
+ * the rule's `max_open_notional_multiple` allows, counts as breached): in a phase of
  * the evaluation, or after the last phase passes, trading on as the funded account from a fresh
  * balance and a fresh peak, as a firm starts each phase and the funded account again at the
  * account size. With attempt terms the funded account takes its payouts by them, which
@@ -1992,15 +1992,7 @@ days: number | null,
  * see how sparse the days are that the firm's minimum, the wait before the first payout and
  * the limit on days without a trading day count. `None` in a result saved before it existed.
  */
-trading_days: number | null, 
-/**
- * With an open-notional limit, the largest of the days' open-notional figures the paths were
- * drawn from: the run's largest open notional in one day over its equity at that day's start.
- * A walk at a balance of `b` and a size of `s` holds `b * s` times a day's figure, so this
- * shows how near the limit the days the attempts were built from came. `None` without the
- * limit, and left out then.
- */
-peak_day_notional?: number | null, };
+trading_days: number | null, };
 
 /**
  * The value of a prop-firm attempt at the edge the test shows, at a reduced one and at none.
