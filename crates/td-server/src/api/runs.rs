@@ -536,7 +536,15 @@ fn read_also_traded(
             }
         }
         let funding = store.load_funding(id, range.0, range.1)?;
-        if let Some(s) = shortfall(id, checked, &gaps, &closures, !bars.is_empty(), &funding) {
+        let checked_funding = &funding[funding.partition_point(|&(t, _)| t < checked.0)..];
+        if let Some(s) = shortfall(
+            id,
+            checked,
+            &gaps,
+            &closures,
+            !bars.is_empty(),
+            checked_funding,
+        ) {
             let at_start = s.candles.first().is_some_and(|g| g.from == range.0);
             if let Some((what, end)) = held.filter(|_| at_start) {
                 let hole = format!(

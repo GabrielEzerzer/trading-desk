@@ -2700,9 +2700,16 @@ async fn a_late_first_bar_a_day_or_more_after_a_stored_funding_rate_is_refused_a
     let t = TestServer::seeded(LATE_DAYS).await;
     seed_late_second(&t.store, 0..0, true);
     let id = second_perpetual().id;
-    t.store
-        .write_funding(&id, &[(listed() - DAY + MINUTE, 0.0001)])
-        .unwrap();
+    std::fs::remove_file(t.store.funding_path(&id).unwrap()).unwrap();
+    let rates: Vec<(Millis, f64)> = std::iter::once(listed() - DAY + MINUTE)
+        .chain(
+            (0..LATE_DAYS * 3)
+                .map(|i| t0() + i * 8 * HOUR)
+                .filter(|&t| t > listed()),
+        )
+        .map(|t| (t, 0.0001))
+        .collect();
+    t.store.write_funding(&id, &rates).unwrap();
     assert!(load_run_data(&t.store, &late_config(), None).is_ok());
     t.store
         .write_funding(&id, &[(listed() - DAY, 0.0001)])
