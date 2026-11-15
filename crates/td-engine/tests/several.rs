@@ -932,13 +932,13 @@ fn a_reduce_only_order_is_accepted_over_the_gross_cap() {
     let b_bars = vec![flat(0, 50.0), flat(1, 50.0), flat(2, 45.0), flat(3, 45.0)];
     let (strategy, log) = scripted(|ctx, notes| match index(ctx) {
         0 => {
-            ctx.submit(market(&a(), Side::Buy, 10.0)).unwrap();
-            ctx.submit(market(&b(), Side::Buy, 18.0)).unwrap();
+            ctx.submit(market(&a(), Side::Buy, 1.0)).unwrap();
+            ctx.submit(market(&b(), Side::Buy, 37.0)).unwrap();
         }
         2 => {
             let more = ctx.submit(market(&b(), Side::Buy, 0.1));
             notes.push(format!("{:?}", more.map_err(|r| r.reason)));
-            let mut reduce = market(&a(), Side::Sell, 15.0);
+            let mut reduce = market(&a(), Side::Sell, 2.0);
             reduce.reduce_only = true;
             notes.push(format!("{:?}", ctx.submit(reduce).map(|_| "accepted")));
         }
@@ -948,18 +948,19 @@ fn a_reduce_only_order_is_accepted_over_the_gross_cap() {
     config.starting_cash = 1_000.0;
     let others = [traded(&b(), b_bars, Vec::new())];
     let result = run(&config, strategy, &a_bars, &[], &others).unwrap();
-    // Long 10 A at 100.05 and 18 B at 50.03. At bar 2's close the account holds
-    // 1 000 - 10 * 10.05 - 18 * 5.03 = 808.96 and a gross notional of 900 + 810 = 1 710, over
-    // the 2x cap of 1 617.92: an order that adds is refused, and one that only reduces is not.
-    // The reduce-only sell asks for 15 against the long of 10: counted as an order that could
-    // open 5 short it would be over the cap too, and as reduce-only it is accepted and closes 10.
+    // Long 1 A at 100.05 and 37 B at 50.03. At bar 2's close the account holds
+    // 1 000 - 1 * 10.05 - 37 * 5.03 = 803.84 and a gross notional of 90 + 1 665 = 1 755, over
+    // the 2x cap of 1 607.68, as B's 1 665 alone is: an order that adds is refused. The
+    // reduce-only sell asks for 2 against the long of 1 A. Held to the cap it would be refused
+    // too, since the other instrument alone is over it; as reduce-only it is accepted and
+    // closes 1.
     let notes = &log.lock().unwrap().notes;
     assert!(notes[0].contains("over the leverage cap"), "{}", notes[0]);
     assert_eq!(notes[1], r#"Ok("accepted")"#);
     let reduced = result.fills.last().unwrap();
     assert_eq!(
         (reduced.instrument.clone(), reduced.side, reduced.qty),
-        (a().id, Side::Sell, 10.0)
+        (a().id, Side::Sell, 1.0)
     );
 }
 
