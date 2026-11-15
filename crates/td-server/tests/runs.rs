@@ -2112,3 +2112,281 @@ async fn a_run_naming_a_series_still_matches_when_a_malformed_row_follows_its_en
         "a row known at the last bar's close is in the fingerprint"
     );
 }
+
+fn second_perpetual() -> Instrument {
+    Instrument {
+        id: InstrumentId {
+            venue: Venue::Binance,
+            symbol: "BBBUSDT".into(),
+            kind: InstrumentKind::Perpetual,
+        },
+        base: "BBB".into(),
+        ..instrument(InstrumentKind::Perpetual)
+    }
+}
+
+fn seed_second(store: &Store, days: i64, hole: std::ops::Range<Millis>) -> Vec<Candle> {
+    let stored: Vec<Candle> = minutes(days, hole)
+        .into_iter()
+        .map(|c| Candle {
+            open: c.open * 0.05,
+            high: c.high * 0.05,
+            low: c.low * 0.05,
+            close: c.close * 0.05,
+            quote_volume: c.quote_volume * 0.05,
+            ..c
+        })
+        .collect();
+    let id = second_perpetual().id;
+    store.write_candles(&id, &stored).unwrap();
+    let rates: Vec<(Millis, f64)> = (0..days * 3)
+        .map(|i| (t0() + i * 8 * HOUR, 0.0002))
+        .collect();
+    store.write_funding(&id, &rates).unwrap();
+    stored
+}
+
+struct TradesEach;
+
+impl td_engine::Strategy for TradesEach {
+    fn on_bar(&mut self, ctx: &mut td_engine::Context, _bar: &Candle) {
+        if ctx.is_warming_up() {
+            return;
+        }
+        let ids: Vec<InstrumentId> = ctx.traded().map(|i| i.id.clone()).collect();
+        for id in ids {
+            if ctx.bar_of(&id).is_none() || !ctx.open_orders_of(&id).is_some_and(|o| o.is_empty()) {
+                continue;
+            }
+            let held = ctx.position_of(&id).unwrap_or(0.0);
+            let _ = ctx.submit(td_core::OrderRequest {
+                instrument: id,
+                side: if held == 0.0 { Side::Buy } else { Side::Sell },
+                qty: if held == 0.0 { 2.0 } else { held.abs() },
+                order_type: td_core::OrderType::Market,
+                tif: td_core::TimeInForce::Gtc,
+                reduce_only: held != 0.0,
+                client_tag: None,
+            });
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_backtest_trading_a_second_perpetual_runs_on_its_stored_bars_and_funding() {
+    let t = TestServer::seeded(5).await;
+    let stored = seed_second(&t.store, 5, 0..0);
+    let second = second_perpetual();
+    let config = BacktestConfig {
+        also_traded: vec![second.clone()],
+        ..config(InstrumentKind::Perpetual, 5)
+    };
+    let body = serde_json::to_value(&config).unwrap();
+    let detail = saved_run(&t, "/runs/backtest", &body).await;
+    let SavedRun::Backtest(through_api) = &detail.run else {
+        panic!("a saved backtest");
+    };
+    assert_eq!(through_api.config.also_traded, vec![second.clone()]);
+
+    let data = load_run_data(&t.store, &config, None).unwrap();
+    assert_eq!(data.also_traded.len(), 1);
+    let traded = &data.also_traded[0];
+    assert_eq!(traded.instrument, second.id);
+    let loaded = t
+        .store
+        .load_candles(&second.id, Timeframe::H1, config.from, config.to, false)
+        .unwrap();
+    assert_eq!(traded.bars, loaded.candles);
+    assert_eq!(traded.bars.len(), 5 * 24);
+    let funding = t
+        .store
+        .load_funding(&second.id, config.from, config.to)
+        .unwrap();
+    assert_eq!(traded.funding, funding);
+    let direct = td_engine::run_with_traded(
+        &config,
+        &data.bars,
+        &data.asks,
+        &data.funding,
+        &[],
+        &[],
+        &data.also_traded,
+    )
+    .unwrap();
+    assert_eq!(**through_api, direct);
+    let alone = BacktestConfig {
+        also_traded: Vec::new(),
+        ..config.clone()
+    };
+    let alone = td_engine::run(&alone, &data.bars, &data.asks, &data.funding).unwrap();
+    assert_ne!(direct.data_fingerprint, alone.data_fingerprint);
+    let rerun = td_engine::rerun_with_traded(
+        through_api,
+        &data.bars,
+        &data.asks,
+        &data.funding,
+        &data.also_traded,
+    )
+    .unwrap();
+    assert!(rerun.fingerprint_matches && rerun.engine_matches);
+
+    let both = td_engine::run_strategy_with_traded(
+        &config,
+        Box::new(TradesEach),
+        &data.bars,
+        &data.asks,
+        &data.funding,
+        &[],
+        &[],
+        &data.also_traded,
+    )
+    .unwrap();
+    for id in [&config.instrument.id, &second.id] {
+        assert!(
+            both.fills.iter().any(|f| f.instrument == *id),
+            "{id} has fills"
+        );
+    }
+
+    let run = format!("/runs/{}", detail.id);
+    let (_, reopened) = t.get(&run).await;
+    assert_eq!(
+        reopened["check"],
+        json!({ "data_matches": true, "engine_matches": true })
+    );
+    let mut changed = stored[100];
+    changed.close *= 1.01;
+    changed.high = changed.high.max(changed.close);
+    t.store.write_candles(&second.id, &[changed]).unwrap();
+    let (_, reopened) = t.get(&run).await;
+    assert_eq!(
+        reopened["check"],
+        json!({ "data_matches": false, "engine_matches": true })
+    );
+
+    let absent = InstrumentId {
+        symbol: "CCCUSDT".into(),
+        ..second.id.clone()
+    };
+    let named = |id: &InstrumentId| {
+        let mut body = body.clone();
+        body["also_traded"] = json!([Instrument {
+            id: id.clone(),
+            ..second.clone()
+        }]);
+        body
+    };
+    let (status, answer) = t.post("/runs/backtest", &named(&absent)).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{answer}");
+    assert_eq!(answer["error"]["code"], "data_missing");
+    let message = answer["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("binance:CCCUSDT:perpetual candles")
+            && message.contains("traded beside the first is not downloaded with the run"),
+        "{message}"
+    );
+    t.store.write_candles(&absent, &stored).unwrap();
+    let (status, answer) = t.post("/runs/backtest", &named(&absent)).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{answer}");
+    let message = answer["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("binance:CCCUSDT:perpetual funding rates"),
+        "{message}"
+    );
+    let spot = instrument(InstrumentKind::Spot).id;
+    let (status, answer) = t.post("/runs/backtest", &named(&spot)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{answer}");
+    assert_eq!(answer["error"]["code"], "invalid_config");
+    let (_, jobs) = t.get("/jobs").await;
+    assert_eq!(jobs.as_array().map(Vec::len), Some(1), "{jobs}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_run_trading_one_instrument_saves_no_key_for_other_traded_instruments() {
+    let t = TestServer::seeded(5).await;
+    let body = serde_json::to_value(config(InstrumentKind::Perpetual, 5)).unwrap();
+    assert!(body.get("also_traded").is_none(), "{body}");
+    let detail = saved_run(&t, "/runs/backtest", &body).await;
+    let saved = t.store.root().join("runs").join(detail.id.as_str());
+    for file in ["config.json", "result.json"] {
+        let text = std::fs::read_to_string(saved.join(file)).unwrap();
+        assert!(
+            !text.contains("also_traded") && !text.contains("start_when_all_listed"),
+            "{file}"
+        );
+    }
+    let (_, reopened) = t.get(&format!("/runs/{}", detail.id)).await;
+    assert!(!reopened.to_string().contains("also_traded"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sweeps_out_of_sample_and_walk_forward_runs_trade_a_second_perpetual_from_its_stored_bars()
+{
+    let days = 20;
+    let t = TestServer::seeded(days).await;
+    let listed_late = t0()..t0() + 20 * HOUR;
+    let stored = seed_second(&t.store, days, listed_late.clone());
+    let second = second_perpetual();
+    let mut sweep = sweep_spec(days, (3, 4), (10, 11));
+    sweep["base"]["also_traded"] = json!([second]);
+    sweep["base"]["start_when_all_listed"] = json!(true);
+    let wf = json!({
+        "sweep": sweep,
+        "windows": { "train_bars": 200, "test_bars": 60, "step_bars": 60, "mode": "rolling" },
+    });
+    let oos = json!({ "sweep": sweep, "split": { "fraction": 0.7 } });
+
+    let run = |path: &'static str, body: &Value| {
+        let body = body.clone();
+        let t = &t;
+        async move { saved_run(t, path, &body).await.run }
+    };
+    let late_sweep = run("/runs/sweep", &sweep).await;
+    let late_wf = run("/runs/walk-forward", &wf).await;
+    let SavedRun::Oos(late_oos) = run("/runs/out-of-sample", &oos).await else {
+        panic!("an out-of-sample run");
+    };
+    assert_eq!(late_oos.spec.sweep.base.also_traded, vec![second.clone()]);
+    let SavedRun::Sweep(late) = &late_sweep else {
+        panic!("a sweep");
+    };
+    assert_eq!(late.spec.base.also_traded, vec![second.clone()]);
+    let SavedRun::WalkForward(late_windows) = &late_wf else {
+        panic!("a walk-forward run");
+    };
+    assert_eq!(
+        late_windows.spec.sweep.base.also_traded,
+        vec![second.clone()]
+    );
+
+    let early: Vec<Candle> = minutes(days, 0..0)
+        .into_iter()
+        .filter(|c| listed_late.contains(&c.open_time))
+        .map(|c| Candle {
+            open: c.open * 0.05,
+            high: c.high * 0.05,
+            low: c.low * 0.05,
+            close: c.close * 0.05,
+            quote_volume: c.quote_volume * 0.05,
+            ..c
+        })
+        .collect();
+    assert_eq!(early.len() + stored.len(), (days * 1440) as usize);
+    t.store.write_candles(&second.id, &early).unwrap();
+    let SavedRun::Sweep(listed) = run("/runs/sweep", &sweep).await else {
+        panic!("a sweep");
+    };
+    let SavedRun::WalkForward(listed_windows) = run("/runs/walk-forward", &wf).await else {
+        panic!("a walk-forward run");
+    };
+    let SavedRun::Oos(listed_oos) = run("/runs/out-of-sample", &oos).await else {
+        panic!("an out-of-sample run");
+    };
+    assert_ne!(late_oos.data_fingerprint, listed_oos.data_fingerprint);
+    assert_ne!(late.data_fingerprint, listed.data_fingerprint);
+    assert_ne!(late.rows, listed.rows);
+    assert_ne!(
+        late_windows.data_fingerprint,
+        listed_windows.data_fingerprint
+    );
+}

@@ -2409,7 +2409,7 @@ impl Rig {
     /// Saves a verdict of [`LINKED`] on `on`, as its plan and rule are now, as run `run_id` in the
     /// runs folder, judged with `references`.
     fn save_verdict(&self, run_id: &str, on: &InstrumentId, references: Vec<InstrumentId>) {
-        self.save_verdict_with(run_id, on, references, Vec::new());
+        self.save_verdict_with(run_id, on, references, Vec::new(), Vec::new());
     }
 
     /// [`Rig::save_verdict`] judged with `series` too.
@@ -2419,6 +2419,7 @@ impl Rig {
         on: &InstrumentId,
         references: Vec<InstrumentId>,
         series: Vec<String>,
+        also_traded: Vec<InstrumentId>,
     ) {
         let entry = td_engine::find_strategy(LINKED).expect("registered");
         let record = td_engine::VerdictRecord {
@@ -2433,7 +2434,7 @@ impl Rig {
             code_hash: td_engine::code_hash(LINKED).map(String::from),
             references,
             series,
-            also_traded: Vec::new(),
+            also_traded,
         };
         let dir = self.data().join(td_engine::RUNS_DIR).join(run_id);
         fs::create_dir_all(&dir).expect("run folder");
@@ -2834,7 +2835,8 @@ fn start_refuses_a_verdict_judged_with_a_series() {
     let feed = rig.feed();
     let on = instrument().id;
     rig.save_verdict(OLDER, &on, Vec::new());
-    rig.save_verdict_with(NEWER, &on, Vec::new(), vec!["example_series".into()]);
+    let series = vec!["example_series".into()];
+    rig.save_verdict_with(NEWER, &on, Vec::new(), series, Vec::new());
 
     let requests = rig.mock.requests().len();
     let feeds_none = format!(
@@ -2857,6 +2859,41 @@ fn start_refuses_a_verdict_judged_with_a_series() {
     }
 
     // A verdict judged without one still starts the session.
+    let (code, text) = rig.start_linked(&feed, "plain", &["--verdict", OLDER]);
+    assert_eq!(code, 0, "{text}");
+}
+
+#[test]
+fn start_refuses_a_verdict_judged_trading_other_instruments() {
+    let rig = Rig::new();
+    let feed = rig.feed();
+    let on = instrument().id;
+    let second = InstrumentId {
+        symbol: "BBBUSDT".into(),
+        ..on.clone()
+    };
+    rig.save_verdict(OLDER, &on, Vec::new());
+    rig.save_verdict_with(NEWER, &on, Vec::new(), Vec::new(), vec![second.clone()]);
+
+    let requests = rig.mock.requests().len();
+    let trades_one = format!(
+        "run {NEWER} was judged trading {second} beside {on}, and a session trades one instrument"
+    );
+    for (extra, also) in [
+        (
+            &[][..],
+            format!("name a verdict judged trading {on} alone with --verdict"),
+        ),
+        (&["--verdict", NEWER][..], String::new()),
+    ] {
+        let (code, text) = rig.start_linked(&feed, "refused", extra);
+        assert_eq!(code, 1, "{extra:?}: {text}");
+        assert!(text.contains(&trades_one), "{extra:?}: {text}");
+        assert!(text.contains(&also), "{extra:?}: {text}");
+        assert_eq!(rig.mock.requests().len(), requests, "{extra:?}: {text}");
+        assert!(!rig.data().join("live").exists(), "{extra:?}");
+    }
+
     let (code, text) = rig.start_linked(&feed, "plain", &["--verdict", OLDER]);
     assert_eq!(code, 0, "{text}");
 }

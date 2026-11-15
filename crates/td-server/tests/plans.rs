@@ -70,6 +70,13 @@ fn instrument(kind: InstrumentKind) -> Instrument {
     }
 }
 
+fn second_perpetual() -> Instrument {
+    let mut second = instrument(InstrumentKind::Perpetual);
+    second.id.symbol = "BBBUSDT".into();
+    second.base = "BBB".into();
+    second
+}
+
 /// An FX pair listed beside BTCUSDT, with its trading rules.
 fn fx_instrument(symbol: &str) -> Instrument {
     let mut fx = instrument(InstrumentKind::Fx);
@@ -93,10 +100,10 @@ impl MarketSource for ListOnly {
         if self.nan_perpetual_fees && kind == InstrumentKind::Perpetual {
             listed.fees.taker = f64::NAN;
         }
-        let instruments = if kind == InstrumentKind::Fx {
-            FX_PAIRS.iter().map(|&(s, _)| fx_instrument(s)).collect()
-        } else {
-            vec![listed]
+        let instruments = match kind {
+            InstrumentKind::Fx => FX_PAIRS.iter().map(|&(s, _)| fx_instrument(s)).collect(),
+            InstrumentKind::Perpetual => vec![listed, second_perpetual()],
+            _ => vec![listed],
         };
         Ok(InstrumentList {
             instruments,
@@ -1551,4 +1558,111 @@ async fn a_plan_naming_a_series_judges_with_it_and_records_it() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].run_id, kept.run_id);
     assert_eq!(rows[0].series, vec!["example_series".to_string()]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_plan_trading_a_second_perpetual_judges_with_it_and_records_it() {
+    let t = TestServer::seeded(vec![entry(49)]).await;
+    let second = second_perpetual().id;
+    let stored: Vec<Candle> = tokio::task::spawn_blocking(minutes)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|c| Candle {
+            open: c.open * 0.5,
+            high: c.high * 0.5,
+            low: c.low * 0.5,
+            close: c.close * 0.5,
+            ..c
+        })
+        .collect();
+    t.store.write_candles(&second, &stored).unwrap();
+    let rates: Vec<(Millis, f64)> = (0..DAYS * 3)
+        .map(|i| (t0() + i * 8 * HOUR, 0.00002))
+        .collect();
+    t.store.write_funding(&second, &rates).unwrap();
+    let first = id(InstrumentKind::Perpetual);
+
+    let absent = InstrumentId {
+        symbol: "CCCUSDT".into(),
+        ..second.clone()
+    };
+    let (status, answer) = t
+        .post(
+            "/runs/plan",
+            &json!({ "strategy": "sma_cross", "instruments": [first], "also_traded": [absent] }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{answer}");
+    assert!(
+        answer["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("does not list binance:CCCUSDT:perpetual"),
+        "{answer}"
+    );
+    let (status, answer) = t
+        .post(
+            "/runs/plan",
+            &json!({ "strategy": "sma_cross", "instruments": [first], "also_traded": [first] }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{answer}");
+    assert_eq!(answer["error"]["code"], "invalid_config");
+    let (_, jobs) = t.get("/jobs").await;
+    assert_eq!(jobs, json!([]), "no job was created");
+
+    let mut ws = t.websocket().await;
+    let mut kept = Vec::new();
+    for body in [
+        json!({ "strategy": "sma_cross", "instruments": [first] }),
+        json!({ "strategy": "sma_cross", "instruments": [first], "also_traded": [second] }),
+    ] {
+        let job = t.start_plan(&body).await;
+        let done = ws.follow(job).await.pop().unwrap();
+        assert_eq!(done.status, JobStatus::Done, "{:?}", done.error);
+        let request = serde_json::to_value(&done.request).unwrap();
+        assert_eq!(
+            request.get("also_traded").is_some(),
+            body.get("also_traded").is_some(),
+            "{request}"
+        );
+        kept.push(plan_done(&done).instruments[0].run_id.clone());
+    }
+    let (alone, traded) = (&kept[0], &kept[1]);
+
+    let (status, body) = t.get(&format!("/runs/{traded}")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["check"],
+        json!({ "data_matches": true, "engine_matches": true })
+    );
+    let detail: RunDetail = serde_json::from_value(body).unwrap();
+    let SavedRun::Plan(run) = &detail.run else {
+        panic!("a plan run");
+    };
+    assert_eq!(run.config.also_traded, vec![second_perpetual()]);
+
+    let record = |run: &RunId| -> Value {
+        let path = t
+            .runs_dir()
+            .join(run.as_str())
+            .join(td_engine::VERDICT_FILE);
+        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+    };
+    let (alone_record, traded_record) = (record(alone), record(traded));
+    assert_eq!(traded_record["also_traded"], json!([second]));
+    assert!(alone_record.get("also_traded").is_none(), "{alone_record}");
+    assert_ne!(alone_record, traded_record);
+    let (_, alone_body) = t.get(&format!("/runs/{alone}")).await;
+    assert!(!alone_body["run"].to_string().contains("also_traded"));
+    assert_ne!(
+        alone_body["run"]["result"]["data_fingerprint"],
+        serde_json::to_value(&run.data_fingerprint).unwrap()
+    );
+
+    let rows = t.verdicts("").await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(&rows[0].run_id, traded);
+    assert_eq!(rows[0].also_traded, vec![second]);
 }
