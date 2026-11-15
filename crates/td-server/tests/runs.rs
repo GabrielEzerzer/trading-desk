@@ -2696,10 +2696,21 @@ async fn hole_refusal(t: &TestServer, config: &BacktestConfig) -> String {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_late_first_bar_after_a_stored_funding_rate_is_refused_as_a_hole_in_the_history() {
+async fn a_late_first_bar_a_day_or_more_after_a_stored_funding_rate_is_refused_as_a_hole() {
     let t = TestServer::seeded(LATE_DAYS).await;
     seed_late_second(&t.store, 0..0, true);
     let id = second_perpetual().id;
+    t.store
+        .write_funding(&id, &[(listed() - DAY + MINUTE, 0.0001)])
+        .unwrap();
+    assert!(load_run_data(&t.store, &late_config(), None).is_ok());
+    t.store
+        .write_funding(&id, &[(listed() - DAY, 0.0001)])
+        .unwrap();
+    hole_refusal(&t, &late_config()).await;
+
+    let t = TestServer::seeded(LATE_DAYS).await;
+    seed_late_second(&t.store, 0..0, true);
     t.store
         .write_funding(&id, &[(t0() + 10 * DAY, 0.0002)])
         .unwrap();

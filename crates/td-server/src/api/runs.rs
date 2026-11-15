@@ -589,7 +589,7 @@ fn held_before(
             return Ok(Some("candles"));
         }
     }
-    let funding = store.load_funding(id, Millis::MIN, end)?;
+    let funding = store.load_funding(id, Millis::MIN, end - max_gap(id.kind) + 1)?;
     Ok((!funding.is_empty()).then_some("funding rates"))
 }
 
