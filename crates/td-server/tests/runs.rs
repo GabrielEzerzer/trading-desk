@@ -2179,6 +2179,8 @@ async fn a_backtest_trading_a_second_perpetual_runs_on_its_stored_bars_and_fundi
     let second = second_perpetual();
     let config = BacktestConfig {
         also_traded: vec![second.clone()],
+        from: t0() + DAY,
+        warmup_from: Some(t0()),
         ..config(InstrumentKind::Perpetual, 5)
     };
     let body = serde_json::to_value(&config).unwrap();
@@ -2194,15 +2196,13 @@ async fn a_backtest_trading_a_second_perpetual_runs_on_its_stored_bars_and_fundi
     assert_eq!(traded.instrument, second.id);
     let loaded = t
         .store
-        .load_candles(&second.id, Timeframe::H1, config.from, config.to, false)
+        .load_candles(&second.id, Timeframe::H1, t0(), config.to, false)
         .unwrap();
     assert_eq!(traded.bars, loaded.candles);
     assert_eq!(traded.bars.len(), 5 * 24);
-    let funding = t
-        .store
-        .load_funding(&second.id, config.from, config.to)
-        .unwrap();
+    let funding = t.store.load_funding(&second.id, t0(), config.to).unwrap();
     assert_eq!(traded.funding, funding);
+    assert!(funding.iter().any(|&(time, _)| time < config.from));
     let direct = td_engine::run_with_traded(
         &config,
         &data.bars,
