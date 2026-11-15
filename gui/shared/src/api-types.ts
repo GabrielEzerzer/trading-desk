@@ -1203,11 +1203,13 @@ trailing_floor_lock?: number | null,
 day_rollover?: DayRollover | null, 
 /**
  * The number of days in a row without a trading day (as `min_trading_days` counts them) that
- * ends the account, in each evaluation phase and on the funded account. The days are the
- * walks' calendar days, counted as `calendar_days_to_first_payout` counts them, and each
- * account counts from its own start: the account ends at the close of the day this many
- * days after its start or its last trading day, with no trading day between. The attempt
- * walks treat that end as a breach. `None` sets no such limit.
+ * ends the account. It is judged on the attempts the line for the share of attempts that
+ * breach reads, one started on each of the firm's days of the test, in their real order:
+ * each counts calendar days from its own start, as `calendar_days_to_first_payout` counts
+ * them, and counts as breached at the close of the day this many days after its start or its
+ * last trading day, with no trading day between. The count does not restart when a phase
+ * would pass inside the attempt, and `share_of_firm_limits` does not apply to it. The
+ * simulated attempts do not end an account for it. `None` sets no such limit.
  */
 max_days_without_trading?: number | null, };
 
@@ -1402,7 +1404,7 @@ sizes_from_starting_cash?: boolean,
  * traded at either size that breaches the limit fails the line.
  *
  * At a compounding size the position grows and shrinks with each attempt's balance, so the
- * attempt walks check it, as they check the loss limits and `max_days_without_trading`: each
+ * attempt walks check it, as they check the loss limits: each
  * day's largest open notional of the walk-forward curve over the curve's equity at the
  * day's start, times the attempt's balance going into the day over the account size, times
  * the phase's size, on every day of the evaluation and of the funded account. A day above
@@ -2028,12 +2030,11 @@ export type PropFirmOdds = {
  */
 pass: number, 
 /**
- * The fraction of paths that breach a limit within the horizon (an account that goes
- * `max_days_without_trading` days without a trading day, or holds more open notional than
- * the rule's `max_open_notional_multiple` allows, counts as breached): in a phase of
- * the evaluation, or after the last phase passes, trading on as the funded account from a fresh
- * balance and a fresh peak, as a firm starts each phase and the funded account again at the
- * account size. With attempt terms the funded account takes its payouts by them, which
+ * The fraction of paths that breach a limit within the horizon (an account that holds more
+ * open notional than the rule's `max_open_notional_multiple` allows counts as breached): in
+ * a phase of the evaluation, or after the last phase passes, trading on as the funded account
+ * from a fresh balance and a fresh peak, as a firm starts each phase and the funded account
+ * again at the account size. With attempt terms the funded account takes its payouts by them, which
  * leave the balance and move no floor, unless the terms lock the floor at the first payout;
  * without them it takes none. The `prop_firm` kind rule asks for at most 0.10 over 90 days.
  */
@@ -2045,8 +2046,8 @@ breach: number, paths: number,
 days: number | null, 
 /**
  * How many of `days` count as trading days: the days the traded flags mark, so a reader can
- * see how sparse the days are that the firm's minimum, the wait before the first payout and
- * the limit on days without a trading day count. `None` in a result saved before it existed.
+ * see how sparse the days are that the firm's minimum and the wait before the first payout
+ * count. `None` in a result saved before it existed.
  */
 trading_days: number | null, };
 

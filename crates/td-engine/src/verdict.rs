@@ -125,11 +125,13 @@ pub struct FirmLimits {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub day_rollover: Option<DayRollover>,
     /// The number of days in a row without a trading day (as `min_trading_days` counts them) that
-    /// ends the account, in each evaluation phase and on the funded account. The days are the
-    /// walks' calendar days, counted as `calendar_days_to_first_payout` counts them, and each
-    /// account counts from its own start: the account ends at the close of the day this many
-    /// days after its start or its last trading day, with no trading day between. The attempt
-    /// walks treat that end as a breach. `None` sets no such limit.
+    /// ends the account. It is judged on the attempts the line for the share of attempts that
+    /// breach reads, one started on each of the firm's days of the test, in their real order:
+    /// each counts calendar days from its own start, as `calendar_days_to_first_payout` counts
+    /// them, and counts as breached at the close of the day this many days after its start or its
+    /// last trading day, with no trading day between. The count does not restart when a phase
+    /// would pass inside the attempt, and `share_of_firm_limits` does not apply to it. The
+    /// simulated attempts do not end an account for it. `None` sets no such limit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_days_without_trading: Option<u32>,
 }
@@ -444,7 +446,7 @@ pub struct PropFirmLimits {
     /// traded at either size that breaches the limit fails the line.
     ///
     /// At a compounding size the position grows and shrinks with each attempt's balance, so the
-    /// attempt walks check it, as they check the loss limits and `max_days_without_trading`: each
+    /// attempt walks check it, as they check the loss limits: each
     /// day's largest open notional of the walk-forward curve over the curve's equity at the
     /// day's start, times the attempt's balance going into the day over the account size, times
     /// the phase's size, on every day of the evaluation and of the funded account. A day above
@@ -1125,6 +1127,8 @@ const SAMPLE_LINES: [(Layer, &str); 4] = [
 // The integrity layer
 // ---------------------------------------------------------------------------------------------
 
+const IDLE_LEFT_OUT: &str = ", leaving out the limit on days without a trading day";
+
 /// I1: the largest share of the period's open buckets the data may lack (#35).
 pub const MAX_DROPPED_SHARE: f64 = 0.01;
 
@@ -1463,6 +1467,11 @@ pub fn evaluate(rule: &VerdictRule, x: &KindInputs) -> Vec<Criterion> {
                                     decides.";
             let percent = format!("{:.2}", share * 100.0);
             let percent = percent.trim_end_matches('0').trim_end_matches('.');
+            let idle_left_out = if firm.max_days_without_trading.is_some() {
+                IDLE_LEFT_OUT
+            } else {
+                ""
+            };
             let mut lines = vec![
                 line(
                     "worst_daily_loss",
@@ -1493,8 +1502,13 @@ pub fn evaluate(rule: &VerdictRule, x: &KindInputs) -> Vec<Criterion> {
                     &format!(
                         "Share of the {}-day attempts, one started on each day of the test, that \
                          fell past {percent}% of the firm's max drawdown or lost more than \
-                         {percent}% of its daily loss limit in a day{of_cash}",
-                        limits.breach_horizon_days
+                         {percent}% of its daily loss limit in a day{of_cash}{}",
+                        limits.breach_horizon_days,
+                        firm.max_days_without_trading
+                            .map_or(String::new(), |n| format!(
+                                ", or went {n} {} without a trading day",
+                                if n == 1 { "day" } else { "days" }
+                            ))
                     ),
                     x.test_breach_share,
                     AtMost,
@@ -1504,7 +1518,7 @@ pub fn evaluate(rule: &VerdictRule, x: &KindInputs) -> Vec<Criterion> {
                 line(
                     "pass_probability",
                     &format!(
-                        "Chance of passing the challenge within {} days",
+                        "Chance of passing the challenge within {} days{idle_left_out}",
                         limits.pass_horizon_days
                     ),
                     x.pass_probability,
@@ -1515,7 +1529,7 @@ pub fn evaluate(rule: &VerdictRule, x: &KindInputs) -> Vec<Criterion> {
                 line(
                     "breach_probability",
                     &format!(
-                        "Chance of breaching a limit within {} days",
+                        "Chance of breaching a limit within {} days{idle_left_out}",
                         limits.breach_horizon_days
                     ),
                     x.breach_probability,
@@ -1550,7 +1564,8 @@ pub fn evaluate(rule: &VerdictRule, x: &KindInputs) -> Vec<Criterion> {
                 lines.push(line(
                     "attempt_value",
                     &format!(
-                        "Value of one attempt with a positive mean daily return scaled by {}",
+                        "Value of one attempt with a positive mean daily return scaled by \
+                         {}{idle_left_out}",
                         terms.reduced_edge_factor
                     ),
                     x.attempt_value,
@@ -2456,6 +2471,28 @@ mod tests {
             limits_inside_day: true,
             ..KindInputs::default()
         }
+    }
+
+    #[test]
+    fn the_simulated_lines_say_they_leave_out_the_days_without_trading_limit_when_it_is_set() {
+        let simulated = ["pass_probability", "breach_probability", "attempt_value"];
+        let names = |most: Option<u32>| -> Vec<String> {
+            let mut rule = with_attempt(attempt_terms());
+            let VerdictRule::PropFirm { firm, .. } = &mut rule else {
+                unreachable!()
+            };
+            firm.max_days_without_trading = most;
+            evaluate(&rule, &good_prop())
+                .into_iter()
+                .filter(|l| simulated.contains(&l.id.as_str()))
+                .map(|l| l.name)
+                .collect()
+        };
+        let off = names(None);
+        assert_eq!(off.len(), simulated.len());
+        assert!(off.iter().all(|name| !name.contains("trading day")));
+        let on: Vec<String> = off.iter().map(|n| format!("{n}{IDLE_LEFT_OUT}")).collect();
+        assert_eq!(names(Some(30)), on);
     }
 
     /// Odds simulated with the limits at daily closes say so on their lines, and only there; odds
