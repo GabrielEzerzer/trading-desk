@@ -224,9 +224,9 @@ impl Context<'_> {
     /// not name `instrument`, as in a run that names no references.
     ///
     /// A reference instrument is only read: an order for it is rejected, since orders, fills,
-    /// costs and the account stay on the traded instruments ([`Context::traded`]). Backtests, sweeps, out-of-sample and
-    /// walk-forward runs and the battery supply it; a paper or live session names none (see the
-    /// README).
+    /// costs and the account stay on the traded instruments ([`Context::traded`]). Backtests,
+    /// sweeps, out-of-sample and walk-forward runs and the battery supply it; a paper or live
+    /// session names none (see the README).
     pub fn reference(&self, instrument: &InstrumentId) -> Option<&[Option<Candle>]> {
         self.references
             .iter()
@@ -240,9 +240,9 @@ impl Context<'_> {
     /// latest value known. A run with one traded instrument starts only when each series has a row
     /// known by the close of its first bar, warm-up included, so this is never empty in a run that
     /// names `name`. A run with several traded instruments
-    /// ([`crate::BacktestConfig::also_traded`]) starts when each series has a row known by the close
-    /// of its last traded bar, so this is `Some(&[])` until the first row is known. `None` when the
-    /// run does not name it; a strategy that needs a series should then stop with
+    /// ([`crate::BacktestConfig::also_traded`]) starts when each series has a row known by the
+    /// close of its last traded bar, so this is `Some(&[])` until the first row is known. `None`
+    /// when the run does not name it; a strategy that needs a series should then stop with
     /// [`Context::fail`].
     ///
     /// Backtests, sweeps, out-of-sample and walk-forward runs and the battery supply series; a

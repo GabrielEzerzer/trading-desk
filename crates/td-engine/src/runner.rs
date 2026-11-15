@@ -1512,8 +1512,9 @@ pub fn data_fingerprint(bars: &[Candle], asks: &[Candle], funding: &[(Millis, f6
 /// first bar given (that of the first bar in `bars` when its own is earlier) or a 0 byte when it
 /// has none, one slot per bar in `bars` in the form of a reference's slots, its other bars the
 /// run used (those at times the first instrument has no bar) in the form of `bars`, and its
-/// funding events the strategy could see in the form of `funding`. Without references, series or other traded instruments nothing is added, so a
-/// fingerprint is what it was before they existed.
+/// funding events the strategy could see in the form of `funding`. Without references, series or
+/// other traded instruments nothing is added, so a fingerprint is what it was before they
+/// existed.
 fn fingerprint(
     bars: &[Candle],
     asks: &[Candle],
