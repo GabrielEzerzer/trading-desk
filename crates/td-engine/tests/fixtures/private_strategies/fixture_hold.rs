@@ -85,7 +85,7 @@ fn plan() -> TestPlan {
 
 fn rule() -> VerdictRule {
     VerdictRule::high_risk(HighRiskLimits {
-            min_profit_factor: 1.5,
-            ..HighRiskLimits::default()
-        })
+        min_profit_factor: 1.5,
+        ..HighRiskLimits::default()
+    })
 }
