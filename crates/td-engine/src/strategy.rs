@@ -4,6 +4,7 @@ use td_core::{
 };
 
 use crate::broker::ENTRY_CANCELLED;
+use crate::session::Leg;
 use crate::{AttachedStop, Broker, Order, OrderRejected, OrderStatus, Portfolio, SeriesRow};
 
 /// A trading strategy. The same value runs in a backtest and in paper trading.
@@ -42,6 +43,8 @@ pub struct Context<'a> {
     pub(crate) warming_up: bool,
     /// The reason the strategy gave to [`Context::fail`], if it did.
     pub(crate) failure: &'a mut Option<String>,
+    /// The instruments traded beside the first, in a run with several; empty otherwise.
+    pub(crate) others: &'a mut [Leg],
 }
 
 /// The reason orders submitted on a warm-up bar are rejected with.
@@ -84,21 +87,97 @@ impl Context<'_> {
         self.max_leverage
     }
 
+    /// The first traded instrument's book, which holds the account's balance.
     pub fn portfolio(&self) -> &Portfolio {
         self.portfolio
     }
 
+    /// The position in [`Context::instrument`]; see [`Context::position_of`] for the other
+    /// traded instruments.
     pub fn position(&self) -> f64 {
         self.portfolio.position()
     }
 
+    /// The account's balance.
     pub fn cash(&self) -> f64 {
         self.portfolio.cash()
     }
 
-    /// The account's equity, in the account currency.
+    /// The account's equity, in the account currency: with several traded instruments, the
+    /// balance and every position marked at its instrument's last close.
     pub fn equity(&self) -> f64 {
-        self.portfolio.equity()
+        if self.others.is_empty() {
+            return self.portfolio.equity();
+        }
+        let others: f64 = self.others.iter().map(|leg| leg.portfolio.equity()).sum();
+        self.portfolio.equity() + others
+    }
+
+    /// Every instrument the run trades: [`Context::instrument`] first, then those it trades
+    /// beside it ([`crate::BacktestConfig::also_traded`]), in the order the run names them.
+    pub fn traded(&self) -> impl Iterator<Item = &Instrument> {
+        std::iter::once(self.instrument).chain(self.others.iter().map(|leg| &leg.instrument))
+    }
+
+    /// The rules of `id`, one of the instruments the run trades: its tick, lot, minimums and
+    /// fees. `None` for one it does not trade.
+    pub fn traded_instrument(&self, id: &InstrumentId) -> Option<&Instrument> {
+        self.traded().find(|inst| inst.id == *id)
+    }
+
+    /// The closed bars of `id`, one of the instruments the run trades beside the first, aligned to
+    /// [`Context::bars`] as [`Context::reference`] aligns a reference instrument's: one slot per
+    /// bar there, warm-up bars included, holding its bar that opens at that bar's open time, or
+    /// `None` where it has no bar. Its bars at times the first instrument has none are traded but
+    /// not shown here. `None` for the first instrument, whose bars are [`Context::bars`], and for
+    /// one the run does not trade.
+    pub fn bars_of(&self, id: &InstrumentId) -> Option<&[Option<Candle>]> {
+        self.leg(id).map(|leg| leg.slots.as_slice())
+    }
+
+    /// The current bar of `id`, one of the instruments the run trades: the bar that closed with
+    /// [`Context::bar`]. `None` when it has no bar at this time, or the run does not trade it.
+    pub fn bar_of(&self, id: &InstrumentId) -> Option<&Candle> {
+        if *id == self.instrument.id {
+            return Some(self.bar());
+        }
+        self.leg(id)?.slots.last()?.as_ref()
+    }
+
+    /// The position in `id`, one of the instruments the run trades; `None` for one it does not.
+    pub fn position_of(&self, id: &InstrumentId) -> Option<f64> {
+        let k = self.index(id)?;
+        Some(self.position_at(k))
+    }
+
+    /// The funding rates settled on `id`, one of the instruments the run trades, as
+    /// [`Context::funding`] shows the first instrument's: every event from the first bar fed to
+    /// the last one settled before the current bar's close. A rate due while it has no bar is
+    /// charged at its next bar's open. `None` for one the run does not trade.
+    pub fn funding_of(&self, id: &InstrumentId) -> Option<&[(Millis, f64)]> {
+        if *id == self.instrument.id {
+            return Some(self.funding);
+        }
+        self.leg(id).map(|leg| &leg.funding[..leg.shown])
+    }
+
+    /// Whether `id`, one of the instruments the run trades, has had a bar by the current bar's
+    /// open, counting the bars given to the run before its range: false before an instrument's
+    /// first bar, such as one listed after the run starts. It never tells of a bar still to come.
+    /// False for one the run does not trade.
+    pub fn has_had_bar(&self, id: &InstrumentId) -> bool {
+        if *id == self.instrument.id {
+            return true;
+        }
+        self.leg(id)
+            .and_then(|leg| leg.listed_from)
+            .is_some_and(|t| t <= self.bar().open_time)
+    }
+
+    /// The open orders of `id`, one of the instruments the run trades; `None` for one it does not.
+    pub fn open_orders_of(&self, id: &InstrumentId) -> Option<&[Order]> {
+        let k = self.index(id)?;
+        Some(self.orders_at(k))
     }
 
     /// `quote_amount`, in the instrument's quote currency, in the account currency at the current
@@ -145,7 +224,7 @@ impl Context<'_> {
     /// not name `instrument`, as in a run that names no references.
     ///
     /// A reference instrument is only read: an order for it is rejected, since orders, fills,
-    /// costs and the account stay on [`Context::instrument`]. Backtests, sweeps, out-of-sample and
+    /// costs and the account stay on the traded instruments ([`Context::traded`]). Backtests, sweeps, out-of-sample and
     /// walk-forward runs and the battery supply it; a paper or live session names none (see the
     /// README).
     pub fn reference(&self, instrument: &InstrumentId) -> Option<&[Option<Candle>]> {
@@ -158,9 +237,12 @@ impl Context<'_> {
     /// The rows of `name`, one of the series the run names ([`crate::BacktestConfig::series`]),
     /// known at or before the current bar's close, oldest first: a row joins on the first bar whose
     /// close is at or after its `known_at`, and a row known later is not here. The last row is the
-    /// latest value known. A run starts only when each series has a row known by the close of its
-    /// first bar, warm-up included, so this is never empty in a run that names `name`. `None` when
-    /// the run does not name it; a strategy that needs a series should then stop with
+    /// latest value known. A run with one traded instrument starts only when each series has a row
+    /// known by the close of its first bar, warm-up included, so this is never empty in a run that
+    /// names `name`. A run with several traded instruments
+    /// ([`crate::BacktestConfig::also_traded`]) starts when each series has a row known by the close
+    /// of its last traded bar, so this is `Some(&[])` until the first row is known. `None` when the
+    /// run does not name it; a strategy that needs a series should then stop with
     /// [`Context::fail`].
     ///
     /// Backtests, sweeps, out-of-sample and walk-forward runs and the battery supply series; a
@@ -172,6 +254,8 @@ impl Context<'_> {
             .map(|(_, rows)| rows.as_slice())
     }
 
+    /// The open orders of [`Context::instrument`]; see [`Context::open_orders_of`] for the other
+    /// traded instruments.
     pub fn open_orders(&self) -> &[Order] {
         self.broker.open_orders()
     }
@@ -232,9 +316,30 @@ impl Context<'_> {
     ///
     /// Every order is rejected on a warm-up bar. A rejected order is recorded with its reason and
     /// returned as an error.
+    ///
+    /// In a run with several traded instruments the order goes to the instrument it names, and is
+    /// rounded, validated, priced and filled on that instrument's rules, bars and fees. An order
+    /// for an instrument without a bar at the current bar's time is rejected, since it has no
+    /// price to be checked at; one for an instrument the run does not trade, a reference
+    /// included, is rejected as with one instrument. The leverage cap is on the account's gross
+    /// notional: the position this order could build, as above, plus, for every other traded
+    /// instrument, the largest position its own open orders could build on either side, or its
+    /// position if larger, each valued at its last close.
     pub fn submit(&mut self, request: OrderRequest) -> Result<OrderId, OrderRejected> {
         let decided_on = self.bar().open_time;
-        self.send(request, None, decided_on).map(|(id, _)| id)
+        self.send(request, None, decided_on, false)
+            .map(|(id, _)| id)
+    }
+
+    /// [`Context::submit`] for the end-of-run close-out ([`crate::Session::close_out`]): an order
+    /// for another traded instrument without a bar at the current time is still sent, valued at
+    /// its last close.
+    pub(crate) fn submit_close_out(
+        &mut self,
+        request: OrderRequest,
+    ) -> Result<OrderId, OrderRejected> {
+        let decided_on = self.bar().open_time;
+        self.send(request, None, decided_on, true).map(|(id, _)| id)
     }
 
     /// [`Context::submit`] for an order placed from outside the strategy while the bar that
@@ -246,7 +351,8 @@ impl Context<'_> {
         decided_on: Millis,
     ) -> Result<OrderId, OrderRejected> {
         debug_assert!(decided_on >= self.bar().open_time);
-        self.send(request, None, decided_on).map(|(id, _)| id)
+        self.send(request, None, decided_on, false)
+            .map(|(id, _)| id)
     }
 
     /// Submits an entry with a protective stop attached. When the entry fills, a reduce-only stop
@@ -270,24 +376,37 @@ impl Context<'_> {
         request: OrderRequest,
         stop_trigger: f64,
     ) -> Result<(OrderId, OrderId), OrderRejected> {
-        let trigger = self.instrument.round_price(stop_trigger, Rounding::Nearest);
+        let inst = self.inst_at(self.index(&request.instrument).unwrap_or(0));
+        let trigger = inst.round_price(stop_trigger, Rounding::Nearest);
         let decided_on = self.bar().open_time;
-        let (id, stop) = self.send(request, Some(trigger), decided_on)?;
+        let (id, stop) = self.send(request, Some(trigger), decided_on, false)?;
         Ok((id, stop.expect("an accepted entry has its stop attached")))
     }
 
     /// Records the order and sends it to the broker if it passes the checks, with a protective
     /// stop attached when `stop_trigger` is set, as decided on the bar that opened at
-    /// `submitted_at` (see [`Order::submitted_at`]). Returns the order's id and its stop's.
+    /// `submitted_at` (see [`Order::submitted_at`]). Returns the order's id and its stop's. An
+    /// order for another traded instrument without a bar at the current time is rejected unless
+    /// `without_bar`.
     fn send(
         &mut self,
         request: OrderRequest,
         stop_trigger: Option<f64>,
         submitted_at: Millis,
+        without_bar: bool,
     ) -> Result<(OrderId, Option<OrderId>), OrderRejected> {
         let id = OrderId(self.orders.len() as u64 + 1);
-        let decision_close = self.close_on(request.side);
-        let (request, mut check) = self.prepare(request);
+        // An instrument the run does not trade is checked as the first's, which rejects it.
+        let k = self.index(&request.instrument).unwrap_or(0);
+        let decision_close = self.close_at(k, request.side);
+        let (request, mut check) = self.prepare(k, request);
+        if k > 0 && !without_bar && self.others[k - 1].slots.last().is_none_or(Option::is_none) {
+            check = Err(format!(
+                "{} has no bar at {}, so it has no price to check an order at",
+                request.instrument,
+                self.bar().open_time
+            ));
+        }
         if self.warming_up {
             check = Err(WARM_UP.into());
         }
@@ -296,7 +415,7 @@ impl Context<'_> {
             trigger,
         });
         if let (Ok(()), Some(stop)) = (&check, attached_stop) {
-            check = self.check_stop(&request, stop);
+            check = self.check_stop(k, &request, stop);
         }
         let status = match &check {
             Ok(()) => OrderStatus::Open,
@@ -325,7 +444,11 @@ impl Context<'_> {
                     });
                 }
                 let stop = order.attached_stop.map(|stop| stop.id);
-                self.broker.submit(order);
+                if k == 0 {
+                    self.broker.submit(order);
+                } else {
+                    self.others[k - 1].broker.submit(order);
+                }
                 Ok((id, stop))
             }
             Err(reason) => Err(OrderRejected { id, reason }),
@@ -340,7 +463,9 @@ impl Context<'_> {
 
     /// [`Context::cancel`] with the reason the order records.
     pub(crate) fn cancel_with(&mut self, id: OrderId, reason: &str) -> bool {
-        if !self.broker.cancel(id) {
+        let cancelled =
+            self.broker.cancel(id) || self.others.iter_mut().any(|leg| leg.broker.cancel(id));
+        if !cancelled {
             return false;
         }
         let mut attached = None;
@@ -364,19 +489,74 @@ impl Context<'_> {
         }
     }
 
-    /// Checks a protective stop for `entry`, which has passed its own checks.
-    fn check_stop(&self, entry: &OrderRequest, stop: AttachedStop) -> Result<(), String> {
-        let inst = self.instrument;
+    /// The other traded instrument `id`, if the run trades it beside the first.
+    fn leg(&self, id: &InstrumentId) -> Option<&Leg> {
+        self.others.iter().find(|leg| leg.instrument.id == *id)
+    }
+
+    /// Which traded instrument `id` is: 0 for the first, 1 + its place among the others, or
+    /// `None` for one the run does not trade.
+    fn index(&self, id: &InstrumentId) -> Option<usize> {
+        if *id == self.instrument.id {
+            return Some(0);
+        }
+        self.others
+            .iter()
+            .position(|leg| leg.instrument.id == *id)
+            .map(|i| i + 1)
+    }
+
+    fn inst_at(&self, k: usize) -> &Instrument {
+        if k == 0 {
+            self.instrument
+        } else {
+            &self.others[k - 1].instrument
+        }
+    }
+
+    fn position_at(&self, k: usize) -> f64 {
+        if k == 0 {
+            self.position()
+        } else {
+            self.others[k - 1].portfolio.position()
+        }
+    }
+
+    fn orders_at(&self, k: usize) -> &[Order] {
+        if k == 0 {
+            self.open_orders()
+        } else {
+            self.others[k - 1].broker.open_orders()
+        }
+    }
+
+    /// Traded instrument `k`'s close on `side` at the current bar's time ([`Context::close_on`]
+    /// for the first); without a bar there, another instrument's last close.
+    fn close_at(&self, k: usize, side: Side) -> f64 {
+        if k == 0 {
+            return self.close_on(side);
+        }
+        let leg = &self.others[k - 1];
+        match leg.slots.last() {
+            Some(Some(bar)) => bar.close,
+            _ => leg.last_close.unwrap_or(0.0),
+        }
+    }
+
+    /// Checks a protective stop for `entry`, an order for traded instrument `k` that has passed
+    /// its own checks.
+    fn check_stop(&self, k: usize, entry: &OrderRequest, stop: AttachedStop) -> Result<(), String> {
+        let inst = self.inst_at(k);
         if entry.reduce_only {
             return Err("a reduce-only order cannot have a protective stop attached".into());
         }
         if !inst.id.kind.rules().can_short && entry.side == Side::Sell {
             return Err("spot cannot attach a protective stop to a sell: it has no short".into());
         }
-        let close = self.bar().close;
+        let close = self.close_at(k, Side::Sell);
         inst.validate_order(&stop.request(entry, entry.qty), close)
             .map_err(|e| format!("protective stop: {e}"))?;
-        let price = reference_price(entry.order_type, self.close_on(entry.side));
+        let price = reference_price(entry.order_type, self.close_at(k, entry.side));
         let (wrong_side, side) = match entry.side {
             Side::Buy => (stop.trigger >= price, "below"),
             Side::Sell => (stop.trigger <= price, "above"),
@@ -390,8 +570,10 @@ impl Context<'_> {
         Ok(())
     }
 
-    fn prepare(&self, mut req: OrderRequest) -> (OrderRequest, Result<(), String>) {
-        let inst = self.instrument;
+    /// Rounds and checks an order for traded instrument `k`, as [`Context::submit`] describes.
+    /// Spot is never traded beside another instrument, so its checks are the first's.
+    fn prepare(&self, k: usize, mut req: OrderRequest) -> (OrderRequest, Result<(), String>) {
+        let inst = self.inst_at(k);
         let limit_rounding = match req.side {
             Side::Buy => Rounding::Down,
             Side::Sell => Rounding::Up,
@@ -410,7 +592,7 @@ impl Context<'_> {
                 price: inst.round_price(price, limit_rounding),
             },
         };
-        if let Err(e) = inst.validate_order(&req, self.bar().close) {
+        if let Err(e) = inst.validate_order(&req, self.close_at(k, Side::Sell)) {
             return (req, Err(e.to_string()));
         }
         let rules = inst.id.kind.rules();
@@ -455,68 +637,108 @@ impl Context<'_> {
             }
         }
         if rules.margin && !req.reduce_only {
-            let close = self.bar().close;
-            let position = self.position();
-            // Every order here is on this order's side, and a market order is valued at its side's
-            // close.
-            let last = self.close_on(req.side);
-            let account = self.portfolio.account();
-            // The value of `qty` at `price`, in the account currency.
-            let value = |qty: f64, price: f64| account.from_quote(qty * price, price);
-            // This order and the open orders on its side, and those of them that are not
-            // reduce-only, with their value.
-            let side: Vec<&OrderRequest> = self
-                .open_orders()
-                .iter()
-                .map(|o| &o.request)
-                .filter(|r| r.side == req.side)
-                .chain([&req])
-                .collect();
-            let total: f64 = side.iter().map(|r| r.qty).sum();
-            // The plain orders as (quantity, price), dearest first.
-            let mut plain: Vec<(f64, f64)> = side
-                .iter()
-                .filter(|r| !r.reduce_only)
-                .map(|r| (r.qty, reference_price(r.order_type, last)))
-                .collect();
-            plain.sort_by(|a, b| b.1.total_cmp(&a.1));
-            let plain_qty: f64 = plain.iter().map(|(q, _)| q).sum();
-            let plain_value: f64 = plain.iter().map(|&(q, p)| value(q, p)).sum();
-            let notional = if req.side.sign() * position < 0.0 {
-                // Against the position: the fresh position on the other side if it closes first.
-                // Any of the orders may be the ones that close it, so the fresh quantity is valued
-                // at the dearest of them, which is the largest it can be worth.
-                let fresh = plain_qty.min(total - position.abs());
-                (total > position.abs() * (1.0 + 1e-9)).then(|| {
-                    let mut left = fresh;
-                    let mut worth = 0.0;
-                    for (qty, price) in &plain {
-                        let take = qty.min(left);
-                        worth += value(take, *price);
-                        left -= take;
-                        if left <= 0.0 {
-                            break;
-                        }
-                    }
-                    worth
-                })
+            let notional = self.side_notional(k, req.side, Some(&req));
+            // With several traded instruments the cap is on the gross notional: what the others'
+            // positions and open orders could reach comes on top.
+            let notional = if self.others.is_empty() {
+                notional
             } else {
-                Some((value(position, close) + req.side.sign() * plain_value).abs())
+                notional.map(|n| n + self.others_reach(k))
             };
             if let Some(notional) = notional {
                 let equity = self.equity();
                 let allowed = self.max_leverage * equity;
                 if notional > allowed * (1.0 + 1e-9) {
-                    let reason = format!(
-                        "over the leverage cap of {}x: the position would be worth {notional} with \
-                         the open orders on this side, {allowed} allowed on {equity} of equity",
-                        self.max_leverage
-                    );
+                    let reason = if self.others.is_empty() {
+                        format!(
+                            "over the leverage cap of {}x: the position would be worth {notional} \
+                             with the open orders on this side, {allowed} allowed on {equity} of \
+                             equity",
+                            self.max_leverage
+                        )
+                    } else {
+                        format!(
+                            "over the leverage cap of {}x: the account's gross notional could \
+                             reach {notional} with this order and every traded instrument's \
+                             positions and open orders, {allowed} allowed on {equity} of equity",
+                            self.max_leverage
+                        )
+                    };
                     return (req, Err(reason));
                 }
             }
         }
         (req, Ok(()))
+    }
+
+    /// The largest position traded instrument `k` could build on `side`, valued as
+    /// [`Context::submit`] describes, from its open orders on that side and `new`: with no
+    /// position or on its side, the position plus the orders that are not reduce-only; against
+    /// it, the fresh position on the other side if the orders could flip it, or `None` when they
+    /// can only shrink it.
+    fn side_notional(&self, k: usize, side: Side, new: Option<&OrderRequest>) -> Option<f64> {
+        let close = self.close_at(k, Side::Sell);
+        let position = self.position_at(k);
+        // Every order here is on this side, and a market order is valued at its side's close.
+        let last = self.close_at(k, side);
+        let account = self.portfolio.account();
+        // The value of `qty` at `price`, in the account currency.
+        let value = |qty: f64, price: f64| account.from_quote(qty * price, price);
+        // This order and the open orders on its side, and those of them that are not
+        // reduce-only, with their value.
+        let orders: Vec<&OrderRequest> = self
+            .orders_at(k)
+            .iter()
+            .map(|o| &o.request)
+            .filter(|r| r.side == side)
+            .chain(new)
+            .collect();
+        let total: f64 = orders.iter().map(|r| r.qty).sum();
+        // The plain orders as (quantity, price), dearest first.
+        let mut plain: Vec<(f64, f64)> = orders
+            .iter()
+            .filter(|r| !r.reduce_only)
+            .map(|r| (r.qty, reference_price(r.order_type, last)))
+            .collect();
+        plain.sort_by(|a, b| b.1.total_cmp(&a.1));
+        let plain_qty: f64 = plain.iter().map(|(q, _)| q).sum();
+        let plain_value: f64 = plain.iter().map(|&(q, p)| value(q, p)).sum();
+        if side.sign() * position < 0.0 {
+            // Against the position: the fresh position on the other side if it closes first.
+            // Any of the orders may be the ones that close it, so the fresh quantity is valued
+            // at the dearest of them, which is the largest it can be worth.
+            let fresh = plain_qty.min(total - position.abs());
+            (total > position.abs() * (1.0 + 1e-9)).then(|| {
+                let mut left = fresh;
+                let mut worth = 0.0;
+                for (qty, price) in &plain {
+                    let take = qty.min(left);
+                    worth += value(take, *price);
+                    left -= take;
+                    if left <= 0.0 {
+                        break;
+                    }
+                }
+                worth
+            })
+        } else {
+            Some((value(position, close) + side.sign() * plain_value).abs())
+        }
+    }
+
+    /// What every traded instrument but `k` could reach: for each, the largest of its position
+    /// and the positions its open orders could build on either side ([`Context::side_notional`]).
+    fn others_reach(&self, k: usize) -> f64 {
+        (0..=self.others.len())
+            .filter(|&j| j != k)
+            .map(|j| {
+                let held = self.position_at(j).abs() * self.close_at(j, Side::Sell);
+                [Side::Buy, Side::Sell]
+                    .into_iter()
+                    .filter_map(|side| self.side_notional(j, side, None))
+                    .fold(held, f64::max)
+            })
+            .sum()
     }
 }
 
