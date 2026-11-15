@@ -487,13 +487,6 @@ pub struct PropFirmSpec {
     /// still multiply the day's figure, and every limit, target and payout keeps its meaning in
     /// fractions of the starting balance. `false` compounds.
     pub sizes_from_starting_cash: bool,
-    /// The number of days in a row without a day the traded flags mark that ends the account:
-    /// in each evaluation phase and on the funded account, each counted from its own start.
-    /// The days are the series' days, as the calendar wait before the first payout counts
-    /// them, so a day without bars counts. An account ends at the close of the day this many days
-    /// after its start or its last trading day, with no trading day between, and the walks report
-    /// it as a breach. `None` sets no such limit.
-    pub max_days_without_trading: Option<usize>,
     /// The most open notional an account may hold, as a multiple of the starting balance, for a
     /// compounding size. Each day brings its open-notional figure (see [`prop_firm_odds`]): the
     /// run's largest open notional that day over its equity at the day's start. A walk holds the
@@ -544,25 +537,14 @@ impl PropFirmSpec {
         prev - low >= self.daily_loss_limit || low <= floor
     }
 
-    /// Whether an account has gone too long without a trading day by `day`, whose last trading day
-    /// was `last`: the day before its first day (0 for an account whose first day is 1) while it
-    /// has had none. Never with `max_days_without_trading` off.
-    fn inactive(&self, day: usize, last: usize) -> bool {
-        self.max_days_without_trading
-            .is_some_and(|most| day - last >= most)
-    }
-
-    /// Whether an account broke one of the firm's rules of the account on `day`, which every walk
-    /// ends as a breach, as it ends one at a loss limit: it has gone too long without a trading
-    /// day ([`Self::inactive`], with `last` its last trading day), or it held more open notional
-    /// than `max_open_notional` allows, with `notional` the day's figure, `size` the phase's size
-    /// and `prev` the balance going into the day. This is the one place that decides those rules
-    /// end the account; reporting one on its own line instead would start here.
-    fn broke_rule(&self, day: usize, last: usize, prev: f64, size: f64, notional: f64) -> bool {
-        let over = self
-            .max_open_notional
-            .is_some_and(|most| size * prev * notional > most);
-        self.inactive(day, last) || over
+    /// Whether an account broke one of the firm's rules of the account on a day, which every walk
+    /// ends as a breach, as it ends one at a loss limit: it held more open notional than
+    /// `max_open_notional` allows, with `notional` the day's figure, `size` the phase's size and
+    /// `prev` the balance going into the day. This is the one place that decides those rules end
+    /// the account; reporting one on its own line instead would start here.
+    fn broke_rule(&self, prev: f64, size: f64, notional: f64) -> bool {
+        self.max_open_notional
+            .is_some_and(|most| size * prev * notional > most)
     }
 
     fn check(&self) -> Result<(), StatsError> {
@@ -597,11 +579,6 @@ impl PropFirmSpec {
         if self.horizon_days == 0 {
             return Err(StatsError::InvalidSpec(
                 "the horizon must be at least 1 day",
-            ));
-        }
-        if self.max_days_without_trading == Some(0) {
-            return Err(StatsError::InvalidSpec(
-                "the days allowed without a trading day must be at least 1",
             ));
         }
         if !self.max_open_notional.is_none_or(positive) {
@@ -662,12 +639,11 @@ pub struct PropFirmOdds {
     /// The fraction of paths that pass every phase within the horizon before breaching any
     /// limit. The `prop_firm` kind rule asks for at least 0.60.
     pub pass: f64,
-    /// The fraction of paths that breach a limit within the horizon (an account that goes
-    /// `max_days_without_trading` days without a trading day, or holds more open notional than
-    /// the rule's `max_open_notional_multiple` allows, counts as breached): in a phase of
-    /// the evaluation, or after the last phase passes, trading on as the funded account from a fresh
-    /// balance and a fresh peak, as a firm starts each phase and the funded account again at the
-    /// account size. With attempt terms the funded account takes its payouts by them, which
+    /// The fraction of paths that breach a limit within the horizon (an account that holds more
+    /// open notional than the rule's `max_open_notional_multiple` allows counts as breached): in
+    /// a phase of the evaluation, or after the last phase passes, trading on as the funded account
+    /// from a fresh balance and a fresh peak, as a firm starts each phase and the funded account
+    /// again at the account size. With attempt terms the funded account takes its payouts by them, which
     /// leave the balance and move no floor, unless the terms lock the floor at the first payout;
     /// without them it takes none. The `prop_firm` kind rule asks for at most 0.10 over 90 days.
     pub breach: f64,
@@ -677,8 +653,8 @@ pub struct PropFirmOdds {
     #[serde(default)]
     pub days: Option<usize>,
     /// How many of `days` count as trading days: the days the traded flags mark, so a reader can
-    /// see how sparse the days are that the firm's minimum, the wait before the first payout and
-    /// the limit on days without a trading day count. `None` in a result saved before it existed.
+    /// see how sparse the days are that the firm's minimum and the wait before the first payout
+    /// count. `None` in a result saved before it existed.
     #[serde(default)]
     pub trading_days: Option<usize>,
 }
@@ -743,8 +719,7 @@ fn walk_path(
                 }
                 None => first_breach(
                     spec,
-                    (0..returns.len())
-                        .map(|i| (returns[i], lows[i], traded[i], day_notional(notional, i))),
+                    (0..returns.len()).map(|i| (returns[i], lows[i], day_notional(notional, i))),
                 ),
             }
             .map(|d| day + d)
@@ -752,23 +727,17 @@ fn walk_path(
     }
 }
 
-/// Walks days, each its return, its low (applied as [`PropFirmSpec::step`] says), its traded flag
-/// and its open-notional figure, on one balance from 1 with a peak that starts there, and returns
+/// Walks days, each its return, its low (applied as [`PropFirmSpec::step`] says) and its
+/// open-notional figure, on one balance from 1 with a peak that starts there, and returns
 /// the day (counted from 1) it first breached a limit, if it did before the days ran out: one
 /// account, never reset.
-fn first_breach(
-    spec: &PropFirmSpec,
-    days: impl Iterator<Item = (f64, f64, bool, f64)>,
-) -> Option<usize> {
-    let (mut equity, mut peak, mut last) = (1.0f64, 1.0f64, 0usize);
-    for (day, (r, low, t, n)) in (1..).zip(days) {
+fn first_breach(spec: &PropFirmSpec, days: impl Iterator<Item = (f64, f64, f64)>) -> Option<usize> {
+    let (mut equity, mut peak) = (1.0f64, 1.0f64);
+    for (day, (r, low, n)) in (1..).zip(days) {
         let prev = equity;
         equity = spec.step(prev, r);
-        if t {
-            last = day;
-        }
         if spec.breached(prev, spec.step(prev, low), spec.floor(peak))
-            || spec.broke_rule(day, last, prev, 1.0, n)
+            || spec.broke_rule(prev, 1.0, n)
         {
             return Some(day);
         }
@@ -794,11 +763,6 @@ fn first_breach(
 /// the account at the breach. Without lows no day can do both: a breach needs a losing day, and
 /// a losing day before the target is reached ends below it.
 ///
-/// With `spec.max_days_without_trading`, a phase that reaches that many days after its start or
-/// its last day `traded` marks, with none marked between, ends as a breach on that day, before
-/// the target is checked: a day without a trade can still reach the target on an open position,
-/// and the firm ends the account at that day's close.
-///
 /// With `spec.max_open_notional`, `notional` holds each day's open-notional figure, and a day on
 /// which the phase's balance going into it times `size` times that figure is above the limit ends
 /// the phase as a breach on that day, before the target is checked, as a firm ends the account
@@ -820,17 +784,12 @@ fn walk_evaluation(
     let (mut equity, mut peak, mut best, mut trading_days) = (1.0f64, 1.0f64, 0.0f64, 0usize);
     // The profit above the day cap, which stays in the balance but does not count.
     let mut uncounted = 0.0f64;
-    // The phase's last trading day, or the day before its first while it has had none.
-    let mut last = 0usize;
     for (((day, &r), &low), &t) in (1..).zip(returns).zip(lows).zip(traded) {
         let prev = equity;
         equity = spec.step(prev, size * r);
         trading_days += usize::from(t);
-        if t {
-            last = day;
-        }
         if spec.breached(prev, spec.step(prev, size * low), spec.floor(peak))
-            || spec.broke_rule(day, last, prev, size, day_notional(notional, day - 1))
+            || spec.broke_rule(prev, size, day_notional(notional, day - 1))
         {
             return Evaluation::Breached(day);
         }
@@ -850,7 +809,6 @@ fn walk_evaluation(
                 Some(next) => {
                     target = next;
                     (equity, peak, best, trading_days, uncounted) = (1.0, 1.0, 0.0, 0, 0.0);
-                    last = day;
                 }
                 None => return Evaluation::Passed(day),
             }
@@ -1027,11 +985,9 @@ struct Funded {
 /// the static one under the start and each payout's profit is measured from the start. The day
 /// after a payout starts from the balance it left, which is the start after a reset, for the
 /// daily loss limit as for a day's return. The account ends at a breach or when `returns` run
-/// out. With `spec.max_days_without_trading`, a day that many days after the account's start or
-/// its last day `traded` marks, with none marked between, ends it as a breach at that day's close,
-/// before any payout that day. With `spec.max_open_notional`, a day whose figure in `notional`
-/// times `size` times the balance going into it is above the limit ends it as a breach the same
-/// way.
+/// out. With `spec.max_open_notional`, a day whose figure in `notional` times `size` times the
+/// balance going into it is above the limit ends it as a breach at that day's close, before any
+/// payout that day.
 ///
 /// shortcut: the funded account keeps the evaluation's loss limits; give it its own once a firm
 /// in a plan sets different ones.
@@ -1064,24 +1020,17 @@ fn walk_funded(
     };
     // The floor a payout fixed, with `payout_locks_floor`.
     let (mut peak, mut fixed, mut last) = (1.0f64, None::<f64>, None::<usize>);
-    let (mut trading_days, mut first_traded, mut last_traded) = (0usize, None::<usize>, 0usize);
+    let (mut trading_days, mut first_traded) = (0usize, None::<usize>);
     for (((day, &r), &low), &t) in (1..).zip(returns).zip(lows).zip(traded) {
         trading_days += usize::from(t);
         if t {
             first_traded.get_or_insert(day);
-            last_traded = day;
         }
         let prev = out.balance;
         out.balance = spec.step(prev, size * r);
         let floor = fixed.unwrap_or_else(|| spec.floor(peak));
         if spec.breached(prev, spec.step(prev, size * low), floor)
-            || spec.broke_rule(
-                day,
-                last_traded,
-                prev,
-                size,
-                day_notional(notional, day - 1),
-            )
+            || spec.broke_rule(prev, size, day_notional(notional, day - 1))
         {
             out.breached = Some(day);
             break;
@@ -1617,7 +1566,6 @@ mod tests {
             mean_block: 3,
             seed: 11,
             sizes_from_starting_cash: false,
-            max_days_without_trading: None,
             max_open_notional: None,
         }
     }
@@ -1654,7 +1602,7 @@ mod tests {
 
     /// The day `path` breaches on one balance.
     fn walk(spec: &PropFirmSpec, path: &[f64]) -> Option<usize> {
-        first_breach(spec, path.iter().map(|&r| (r, r, true, 0.0)))
+        first_breach(spec, path.iter().map(|&r| (r, r, 0.0)))
     }
 
     /// The day `path` passes the evaluation at the size it was tested at.
@@ -1852,8 +1800,7 @@ mod tests {
                 .filter(|_| {
                     draw.reset();
                     let days: Vec<usize> = (0..spec.horizon_days).map(|_| draw.next()).collect();
-                    first_breach(spec, days.iter().map(|&i| (daily[i], lows[i], true, 0.0)))
-                        .is_some()
+                    first_breach(spec, days.iter().map(|&i| (daily[i], lows[i], 0.0))).is_some()
                 })
                 .count();
             breached as f64 / spec.paths as f64
@@ -1879,10 +1826,7 @@ mod tests {
 
     /// The day `path` breaches on one balance, with each day's low from `lows`.
     fn walk_lows(spec: &PropFirmSpec, path: &[f64], lows: &[f64]) -> Option<usize> {
-        first_breach(
-            spec,
-            path.iter().zip(lows).map(|(&r, &low)| (r, low, true, 0.0)),
-        )
+        first_breach(spec, path.iter().zip(lows).map(|(&r, &low)| (r, low, 0.0)))
     }
 
     /// The day `path` passes the evaluation, with each day's low from `lows`.
@@ -3395,106 +3339,32 @@ mod tests {
         );
     }
 
-    /// A 10% target, no loss limits, and an account that ends after 3 days without a trading day.
-    fn idle_limit(horizon_days: usize) -> PropFirmSpec {
-        PropFirmSpec {
-            max_days_without_trading: Some(3),
-            ..unlimited(horizon_days)
-        }
-    }
-
     #[test]
-    fn an_evaluation_ends_on_the_day_it_reaches_the_days_without_a_trading_day() {
+    fn the_walks_ignore_the_gaps_between_trading_days() {
         let (t, f) = (true, false);
-        // Flat days, then the target on day 10.
         let mut path = [0.0; 10];
         path[9] = 0.11;
-        let walk = |spec: &PropFirmSpec, traded: &[bool; 10]| {
-            walk_evaluation(spec, &path, &path, traded, None, 1.0)
-        };
-        // The longest gap is 2 days, one under the limit, the first from the start: it passes.
-        let two = [f, f, t, f, f, t, f, f, t, t];
-        assert_eq!(walk(&idle_limit(10), &two), Evaluation::Passed(10));
-        // A gap of 3 days after day 1 ends it on day 4, the third day without a trading day;
-        // without the limit it passes.
-        let three = [t, f, f, f, t, t, t, t, t, t];
-        assert_eq!(walk(&idle_limit(10), &three), Evaluation::Breached(4));
-        assert_eq!(walk(&unlimited(10), &three), Evaluation::Passed(10));
-        // The first gap counts from the start: no trading day in days 1 to 3 ends it on day 3.
-        let late = [f, f, f, t, t, t, t, t, t, t];
-        assert_eq!(walk(&idle_limit(10), &late), Evaluation::Breached(3));
-        // The limit is checked before the target: a day that reaches the target on an open
-        // position on the day the limit is reached ends the account.
-        let path = [0.0, 0.0, 0.0, 0.11];
-        let traded = [t, f, f, f];
-        let walk = |spec: &PropFirmSpec| walk_evaluation(spec, &path, &path, &traded, None, 1.0);
-        assert_eq!(walk(&idle_limit(4)), Evaluation::Breached(4));
-        assert_eq!(walk(&unlimited(4)), Evaluation::Passed(4));
-    }
-
-    #[test]
-    fn a_second_phase_counts_days_without_a_trading_day_from_its_own_start() {
-        let (t, f) = (true, false);
-        let two = PropFirmSpec {
-            second_target: Some(0.10),
-            ..idle_limit(6)
-        };
-        // Phase 1 passes on day 2 on an open position. Phase 2 starts on day 3, so days 3 and 4
-        // are its first 2 days without a trading day, and it passes on day 6. Counted from day 1,
-        // the last trading day, day 4 would be the third.
-        let path = [0.0, 0.11, 0.0, 0.0, 0.0, 0.11];
-        let traded = [t, f, f, f, t, t];
-        assert_eq!(
-            walk_evaluation(&two, &path, &path, &traded, None, 1.0),
-            Evaluation::Passed(6)
-        );
-    }
-
-    #[test]
-    fn a_funded_account_ends_on_the_day_it_reaches_the_days_without_a_trading_day() {
-        let (t, f) = (true, false);
-        let flat = [0.0; 7];
-        let ended = |traded: &[bool]| {
-            walk_funded(&idle_limit(7), &terms(), 1.0, &flat, &flat, traded, None).breached
-        };
-        // A gap of 2 days, one under the limit, carries on; a gap of 3 ends it on its third day,
-        // counted from the account's start when it has not traded yet.
-        assert_eq!(ended(&[t, f, f, t, f, f, t]), None);
-        assert_eq!(ended(&[t, f, f, f, t, t, t]), Some(4));
-        assert_eq!(ended(&[f, f, f, t, t, t, t]), Some(3));
-        // The account ends at that close before the payout the day's profit would have made.
-        let path = [0.0, 0.0, 0.0, 0.1];
-        let traded = [t, f, f, f];
         let walk =
-            |spec: &PropFirmSpec| walk_funded(spec, &terms(), 1.0, &path, &path, &traded, None);
-        let account = walk(&idle_limit(4));
-        assert_eq!((account.breached, account.payouts), (Some(4), 0));
-        let account = walk(&unlimited(4));
-        assert_eq!((account.breached, account.payouts), (None, 1));
-        // The breach odds' funded account ends the same way, with payouts or without, counted
-        // from the day after the pass on day 1.
-        let path = [0.11, 0.0, 0.0, 0.0, 0.0];
-        for terms in [None, Some(&terms())] {
-            let breach = |traded: &[bool]| {
-                walk_path(
-                    &idle_limit(5),
-                    terms,
-                    Evaluation::Passed(1),
-                    &path,
-                    &path,
-                    traded,
-                    None,
-                )
-            };
-            assert_eq!(breach(&[t, t, f, f, f]), Some(5));
-            assert_eq!(breach(&[t, t, f, f, t]), None);
+            |traded: &[bool]| walk_evaluation(&unlimited(10), &path, &path, traded, None, 1.0);
+        for traded in [[t; 10], [f; 10], [t, f, f, f, f, f, f, f, f, t]] {
+            assert_eq!(walk(&traded), Evaluation::Passed(10), "{traded:?}");
         }
-        // A limit of 0 days is refused.
-        let zero = PropFirmSpec {
-            max_days_without_trading: Some(0),
-            ..unlimited(5)
+        let flat = [0.0; 7];
+        let funded = |traded: &[bool]| {
+            walk_funded(&unlimited(7), &terms(), 1.0, &flat, &flat, traded, None).breached
         };
-        assert!(prop_firm_odds(&path, None, &[t; 5], None, &zero, None).is_err());
+        assert_eq!(funded(&[f; 7]), None);
+        assert_eq!(funded(&[t, f, f, f, f, f, f]), None);
+
+        let x: Vec<f64> = symmetric().iter().map(|r| r * 6.0 + 0.003).collect();
+        let odds = |traded: &[bool]| {
+            let o = prop_firm_odds(&x, None, traded, None, &challenge(90), None).unwrap();
+            (o.pass, o.breach)
+        };
+        let every_seventh: Vec<bool> = (0..x.len()).map(|i| i % 7 == 0).collect();
+        assert_eq!(odds(&every_day(&x)), PINNED_PROP);
+        assert_eq!(odds(&every_seventh), PINNED_PROP);
+        assert_eq!(odds(&vec![false; x.len()]), PINNED_PROP);
     }
 
     /// Both loss limits off, a target of 50%, and an open-notional limit of `most` times the

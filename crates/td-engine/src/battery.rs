@@ -836,10 +836,6 @@ pub fn run_battery_with_traded(
             );
             kind.intrabar_drawdown_static = fixed.map(judged);
             kind.intrabar_drawdown_trailing = trailing.map(judged);
-            // The same attempts, judged on the share of them that breach.
-            let share = breach_share(series, ranges, cash, firm, limits);
-            kind.test_breach_share = share.map(judged);
-            fixed_size_share = share.map(|f| f.cash);
             let days = risk::daily_pnl(series, None, rollover);
             let daily: Vec<f64> = days
                 .iter()
@@ -871,6 +867,10 @@ pub fn run_battery_with_traded(
                 cash,
                 base.account_currency,
             );
+            // The same attempts, judged on the share of them that breach.
+            let share = breach_share(series, ranges, cash, firm, limits, &traded);
+            kind.test_breach_share = share.map(judged);
+            fixed_size_share = share.map(|f| f.cash);
             let spec = PropFirmSpec {
                 target: firm.profit_target,
                 second_target: firm.second_target,
@@ -889,7 +889,6 @@ pub fn run_battery_with_traded(
                 mean_block: stats::default_block_len(daily.len()),
                 seed: derive_seed(seed, SEED_PROP_FIRM),
                 sizes_from_starting_cash: per_cash.is_some(),
-                max_days_without_trading: firm.max_days_without_trading.map(|n| n as usize),
                 max_open_notional: limits
                     .max_open_notional_multiple
                     .filter(|_| per_cash.is_none()),
@@ -1901,6 +1900,7 @@ fn attempt_drawdowns(
 struct Attempt {
     fixed: Option<Fall>,
     trailing: Option<Fall>,
+    day: usize,
     /// The attempt's bars, `ranges[first_bar..end_bar]` of the curve's equity ranges.
     first_bar: usize,
     end_bar: usize,
@@ -1961,6 +1961,7 @@ fn attempts(
                 Attempt {
                     fixed,
                     trailing,
+                    day,
                     first_bar: first,
                     end_bar,
                 }
@@ -1976,10 +1977,11 @@ fn attempts(
 /// ([`Fall::own`]), and on the starting cash ([`Fall::cash`]). An attempt breaches when its
 /// drawdown, static or trailing as the firm measures it and with its `trailing_floor_lock`, is
 /// above that share of the firm's `max_drawdown`, or one of its days loses more than that share
-/// of the firm's `daily_loss`. Each day's loss is read as the worst-daily-loss line reads it
-/// ([`worst_daily_loss`]): inside bars, from the day's start to its lowest equity, as a share of
-/// the day's own starting balance (a day that starts with nothing left loses nothing on that
-/// reading) or of `cash`.
+/// of the firm's `daily_loss`, or it goes the firm's `max_days_without_trading` days without a day
+/// `traded` marks, one flag for each day the attempts start on. Each day's loss is read as the
+/// worst-daily-loss line reads it ([`worst_daily_loss`]): inside bars, from the day's start to its
+/// lowest equity, as a share of the day's own starting balance (a day that starts with nothing
+/// left loses nothing on that reading) or of `cash`.
 ///
 /// A day counts in the attempts that hold the bar where its lowest equity was reached, so a
 /// day's loss counts in the attempts that were running when the loss was at its deepest. On the
@@ -1989,9 +1991,9 @@ fn attempts(
 /// of day, and a New York day, which straddles two UTC days, counts in the attempts that hold its
 /// lowest bar. Every day the line reads with a loss is then a day of an attempt, and every day of
 /// an attempt is one the line reads, so with a limit of 0 on the share, which no attempt may
-/// cross, the share line passes exactly when the max-drawdown and the worst-daily-loss lines would
-/// both pass. `None` when the attempts or a day's fall cannot be measured, or no day starts an
-/// attempt.
+/// cross, and no `max_days_without_trading`, the share line passes exactly when the max-drawdown
+/// and the worst-daily-loss lines would both pass. `None` when the attempts or a day's fall
+/// cannot be measured, or no day starts an attempt.
 ///
 /// shortcut: a day whose lowest bar no counted attempt holds, which needs every day that could
 /// start such an attempt to begin with no equity left, adds to no attempt, though the
@@ -2003,12 +2005,14 @@ fn breach_share(
     cash: f64,
     firm: &crate::FirmLimits,
     limits: &crate::PropFirmLimits,
+    traded: &[bool],
 ) -> Option<Fall> {
+    let horizon = limits.breach_horizon_days as usize;
     let attempts = attempts(
         series,
         ranges,
         firm.day_rollover.unwrap_or_default(),
-        limits.breach_horizon_days as usize,
+        horizon,
         peak_cap(firm),
     )?;
     // The same limits the worst-daily-loss and max-drawdown lines hold their values to.
@@ -2073,13 +2077,32 @@ fn breach_share(
         if !(day_own.is_finite() && day_cash.is_finite()) {
             return None;
         }
-        own += usize::from(over(drawdown.own, drawdown_limit) || over(day_own, daily_limit));
-        at_cash += usize::from(over(drawdown.cash, drawdown_limit) || over(day_cash, daily_limit));
+        let idle = match firm.max_days_without_trading {
+            Some(most) => {
+                let days = traded.get(a.day..(a.day + horizon).min(traded.len()))?;
+                went_idle(days, most as usize)
+            }
+            None => false,
+        };
+        own +=
+            usize::from(idle || over(drawdown.own, drawdown_limit) || over(day_own, daily_limit));
+        at_cash +=
+            usize::from(idle || over(drawdown.cash, drawdown_limit) || over(day_cash, daily_limit));
     }
     let n = attempts.len() as f64;
     (!attempts.is_empty()).then(|| Fall {
         own: own as f64 / n,
         cash: at_cash as f64 / n,
+    })
+}
+
+fn went_idle(traded: &[bool], most: usize) -> bool {
+    let mut last = 0;
+    (1..).zip(traded).any(|(day, &t)| {
+        if t {
+            last = day;
+        }
+        day - last >= most
     })
 }
 
@@ -3250,7 +3273,7 @@ mod tests {
         let rollover = firm.day_rollover.unwrap_or_default();
         let horizon = limits.breach_horizon_days as usize;
         let (fixed, trailing) = attempt_drawdowns(&series, &ranges, rollover, horizon, None);
-        let share = breach_share(&series, &ranges, 100.0, &firm, &limits).unwrap();
+        let share = breach_share(&series, &ranges, 100.0, &firm, &limits, &[]).unwrap();
         let kind = KindInputs {
             worst_daily_loss: worst_daily_loss(&series, &ranges, 100.0, firm.day_rollover)
                 .map(|f| f.own),
@@ -3333,6 +3356,156 @@ mod tests {
         assert!(kind.intrabar_drawdown_static.unwrap() > 0.10);
     }
 
+    fn idle_rule(horizon: u32, most: Option<u32>) -> VerdictRule {
+        let (firm, limits) = firm_and_limits(&firm_rule(DrawdownMode::Static, horizon, None));
+        VerdictRule::PropFirm {
+            firm: crate::FirmLimits {
+                max_days_without_trading: most,
+                ..firm
+            },
+            limits,
+            attempt: None,
+        }
+    }
+
+    fn idle_share(rule: &VerdictRule, values: &[f64], traded: &[bool]) -> Fall {
+        let (firm, limits) = firm_and_limits(rule);
+        let (series, ranges) = curve(10 * DAY_MS, DAY_MS, values);
+        breach_share(&series, &ranges, 100.0, &firm, &limits, traded).unwrap()
+    }
+
+    fn share_outcome(rule: &VerdictRule, share: Fall) -> Outcome {
+        let kind = KindInputs {
+            test_breach_share: Some(share.own),
+            ..KindInputs::default()
+        };
+        line_of(&crate::evaluate(rule, &kind), "test_breach_share").outcome
+    }
+
+    fn every(spacing: usize, days: usize) -> Vec<bool> {
+        (0..days).map(|d| d % spacing == spacing - 1).collect()
+    }
+
+    fn rising(days: usize) -> Vec<f64> {
+        (0..=days).map(|d| 100.0 + 0.1 * d as f64).collect()
+    }
+
+    #[test]
+    fn trading_every_fifth_day_under_a_five_day_limit_breaches_no_attempt() {
+        let rule = idle_rule(10, Some(5));
+        let share = idle_share(&rule, &rising(40), &every(5, 40));
+        assert_eq!((share.own, share.cash), (0.0, 0.0));
+        assert_eq!(
+            share_outcome(&breach_limit(&rule, 0.0), share),
+            Outcome::Pass
+        );
+    }
+
+    #[test]
+    fn trading_every_sixth_day_under_a_five_day_limit_breaches_the_31_full_attempts_of_40_and_fails()
+     {
+        let rule = idle_rule(10, Some(5));
+        let share = idle_share(&rule, &rising(40), &every(6, 40));
+        assert_eq!(share.own, 31.0 / 40.0);
+        assert_eq!(share.cash, share.own);
+        assert_eq!(share_outcome(&rule, share), Outcome::Fail);
+        let off = idle_share(&idle_rule(10, None), &rising(40), &every(6, 40));
+        assert_eq!(off.own, 0.0);
+    }
+
+    #[test]
+    fn one_five_day_gap_breaches_the_six_attempts_that_hold_all_of_it_and_not_those_started_inside_it()
+     {
+        let mut traded = vec![true; 30];
+        traded[10..15].fill(false);
+        let share = idle_share(&idle_rule(10, Some(5)), &[100.0; 31], &traded);
+        assert_eq!((share.own, share.cash), (6.0 / 30.0, 6.0 / 30.0));
+    }
+
+    #[test]
+    fn one_gap_past_the_limit_in_a_long_test_passes_and_the_same_gap_every_twenty_days_fails() {
+        let rule = idle_rule(10, Some(5));
+        let values = [100.0; 201];
+        let mut once = vec![true; 200];
+        once[50..55].fill(false);
+        let share = idle_share(&rule, &values, &once);
+        assert_eq!(share.own, 6.0 / 200.0);
+        assert_eq!(share_outcome(&rule, share), Outcome::Pass);
+        let repeated: Vec<bool> = (0..200).map(|d| d % 20 >= 5).collect();
+        let share = idle_share(&rule, &values, &repeated);
+        assert!(share.own > 0.1, "{share:?}");
+        assert_eq!(share_outcome(&rule, share), Outcome::Fail);
+    }
+
+    #[test]
+    fn an_attempt_that_breaches_on_a_loss_and_on_the_days_without_trading_counts_once() {
+        let values = [100.0, 88.0, 88.0, 88.0];
+        let rule = idle_rule(1, Some(1));
+        assert_eq!(
+            idle_share(&rule, &values, &[false, true, true]).own,
+            1.0 / 3.0
+        );
+        assert_eq!(
+            idle_share(&rule, &values, &[true, false, true]).own,
+            2.0 / 3.0
+        );
+        assert_eq!(idle_share(&rule, &values, &[false; 3]).own, 1.0);
+    }
+
+    #[test]
+    fn without_the_limit_the_share_ignores_the_trading_day_flags() {
+        let values = two_kinds_of_breach();
+        let rule = idle_rule(5, None);
+        let unflagged = idle_share(&rule, &values, &[]);
+        assert_eq!(unflagged.own, 3.0 / 20.0);
+        assert_eq!(idle_share(&rule, &values, &[false; 20]), unflagged);
+        assert_eq!(idle_share(&rule, &values, &[true; 20]), unflagged);
+    }
+
+    #[test]
+    fn the_share_line_names_the_days_without_trading_only_when_the_limit_is_set() {
+        let name = |most| {
+            line_of(
+                &crate::evaluate(&idle_rule(10, most), &KindInputs::default()),
+                "test_breach_share",
+            )
+            .name
+            .clone()
+        };
+        let off = name(None);
+        assert!(!off.contains("trading day"), "{off}");
+        assert_eq!(
+            name(Some(30)),
+            format!("{off}, or went 30 days without a trading day")
+        );
+        assert_eq!(
+            name(Some(1)),
+            format!("{off}, or went 1 day without a trading day")
+        );
+    }
+
+    #[test]
+    fn the_simulated_odds_are_the_same_with_the_days_without_trading_limit_on_and_off() {
+        let (plan, bars) = sma_plan(sma_axes());
+        let battery = |most| {
+            let rule = idle_rule(10, most);
+            let spec = BatterySpec {
+                strategy: "sma_cross",
+                plan: &plan,
+                rule: &rule,
+                instrument: &test_instrument(),
+                seed: 7,
+            };
+            run_battery(&spec, &bars, &[], &[], None).unwrap()
+        };
+        let (off, on) = (battery(None), battery(Some(1)));
+        let odds = off.prop_firm_odds.unwrap();
+        assert!(odds.trading_days < odds.days, "{odds:?}");
+        assert_eq!(on.prop_firm_odds, Some(odds));
+        let share = |r: &BatteryResult| r.kind.test_breach_share.unwrap();
+        assert!(share(&on) > share(&off), "{} {}", share(&on), share(&off));
+    }
+
     /// With no `day_rollover`, a New York day counts in the attempts that hold the bar of its
     /// lowest equity, not the attempt holding the bar it ends on. Hourly closes over three UTC
     /// days from 3 January 2024: 100, then 104 from 01:00, 100 at 23:00 and 104 again from
@@ -3355,7 +3528,7 @@ mod tests {
         let (series, ranges) = curve(19_725 * DAY_MS, HOUR, &values);
         let rule = firm_rule(DrawdownMode::Static, 1, None);
         let (firm, limits) = firm_and_limits(&rule);
-        let share = breach_share(&series, &ranges, 100.0, &firm, &limits).unwrap();
+        let share = breach_share(&series, &ranges, 100.0, &firm, &limits, &[]).unwrap();
         assert_eq!((share.own, share.cash), (2.0 / 3.0, 2.0 / 3.0));
     }
 
@@ -3397,7 +3570,8 @@ mod tests {
                     for horizon in [1, 5] {
                         let rule = breach_limit(&firm_rule(drawdown, horizon, rollover), 0.0);
                         let (firm, limits) = firm_and_limits(&rule);
-                        let share = breach_share(series, ranges, 100.0, &firm, &limits).unwrap();
+                        let share =
+                            breach_share(series, ranges, 100.0, &firm, &limits, &[]).unwrap();
                         let day = worst_daily_loss(series, ranges, 100.0, rollover).unwrap();
                         let falls = attempt_drawdowns(
                             series,
@@ -3582,7 +3756,7 @@ mod tests {
                 breach_horizon_days: 60,
                 ..crate::PropFirmLimits::default()
             };
-            let share = breach_share(&series, &ranges, 100.0, &far, &limits).unwrap();
+            let share = breach_share(&series, &ranges, 100.0, &far, &limits, &[]).unwrap();
             let falls = attempt_drawdowns(&series, &ranges, utc, 60, cap);
             let kind = KindInputs {
                 intrabar_drawdown_trailing: falls.1.map(|f| f.own),
@@ -3998,7 +4172,6 @@ mod tests {
                 mean_block: stats::default_block_len(daily.len()),
                 seed: derive_seed(seed, SEED_PROP_FIRM),
                 sizes_from_starting_cash: false,
-                max_days_without_trading: None,
                 max_open_notional: None,
             };
             let lows = daily_lows(
@@ -4135,7 +4308,6 @@ mod tests {
                 mean_block: stats::default_block_len(daily.len()),
                 seed: derive_seed(seed, SEED_PROP_FIRM),
                 sizes_from_starting_cash: false,
-                max_days_without_trading: None,
                 max_open_notional: None,
             };
             stats::prop_firm_odds(&daily, Some(&lows), &traded, None, &spec, None).unwrap()
@@ -4227,7 +4399,7 @@ mod tests {
             let case = format!("{drawdown:?} {max_drawdown} {daily_loss}");
             let (strict, rule) = battery(drawdown, max_drawdown, daily_loss, 0.0);
             let (firm, limits) = firm_and_limits(&rule);
-            let expected = breach_share(&series, ranges, cash, &firm, &limits).unwrap();
+            let expected = breach_share(&series, ranges, cash, &firm, &limits, &[]).unwrap();
             assert_eq!(expected.own, 0.0, "{case}");
             assert!(expected.cash > 0.0, "{case}");
             let line = share_line(&strict);
@@ -4515,7 +4687,7 @@ mod tests {
             // starts.
             let (firm, limits) = judged_with(0.2);
             let stitched_share =
-                breach_share(&stitched, &wf.equity_extremes, cash, &firm, &limits).unwrap();
+                breach_share(&stitched, &wf.equity_extremes, cash, &firm, &limits, &[]).unwrap();
             assert_eq!(off.kind.test_breach_share, Some(stitched_share.own));
 
             // A limit between the stitched curve's two readings of the worst attempt. With the
@@ -4536,7 +4708,7 @@ mod tests {
             assert_eq!(line(&on, "worst_daily_loss").value, Some(day.cash));
             assert_eq!(on.kind.worst_daily_loss, Some(day.cash));
             let (firm, limits) = judged_with(limit);
-            let fixed_share = breach_share(&series, ranges, cash, &firm, &limits).unwrap();
+            let fixed_share = breach_share(&series, ranges, cash, &firm, &limits, &[]).unwrap();
             assert_ne!(fixed_share.cash, fixed_share.own, "{drawdown:?}");
             assert_eq!(on.kind.test_breach_share, Some(fixed_share.cash));
             assert_eq!(line(&on, "test_breach_share").value, Some(fixed_share.cash));
@@ -4627,7 +4799,6 @@ mod tests {
                 mean_block: stats::default_block_len(daily.len()),
                 seed: derive_seed(7, SEED_PROP_FIRM),
                 sizes_from_starting_cash: true,
-                max_days_without_trading: None,
                 max_open_notional: None,
             };
             let odds =
