@@ -3229,7 +3229,7 @@ mod tests {
         use super::*;
         use crate::strategies::test_only::{
             FIRST_SHAPE_TO_SECOND, PAIR_GAP_BAR, PAIR_STEP, PAIRS_SEEN, RECORDS_PAIRS, TRADES_BOTH,
-            pair_config, pair_data, pair_second,
+            pair_bars, pair_config, pair_data, pair_second,
         };
 
         const BARS: i64 = 120;
@@ -3368,6 +3368,47 @@ mod tests {
             assert!(
                 result.permuted_best.windows(2).any(|w| w[0] != w[1]),
                 "the copies are shuffled"
+            );
+        }
+
+        #[test]
+        fn with_start_when_all_listed_the_luck_tests_copies_trade_the_real_runs_range() {
+            const LISTED_BAR: i64 = 40;
+            let flat = |k: i64, price: f64| Candle {
+                open_time: k * PAIR_STEP,
+                open: price,
+                high: price * 1.001,
+                low: price * 0.999,
+                close: price,
+                volume: 1.0,
+                quote_volume: price,
+            };
+            let (shaped_before_listing, _) = pair_bars(LISTED_BAR, 1_000.0);
+            let mut bars = shaped_before_listing;
+            bars.extend((LISTED_BAR..BARS).map(|k| flat(k, 1_000.0)));
+            let also = vec![AlsoTradedBars {
+                instrument: pair_second().id,
+                bars: (LISTED_BAR..BARS).map(|k| flat(k, 500.0)).collect(),
+                funding: Vec::new(),
+            }];
+            let mut sweep = pair_sweep(TRADES_BOTH);
+            sweep.base.start_when_all_listed = true;
+            let spec = PermutationSpec {
+                sweep,
+                permutations: 5,
+                seed: 3,
+            };
+            let result =
+                permutation_test_with_traded(&spec, &bars, &[], &[], &[], &[], &also, None)
+                    .unwrap();
+            assert!(
+                result
+                    .permuted_best
+                    .iter()
+                    .all(|best| *best == Some(result.real_best)),
+                "the real run's {} against the copies' {:?}",
+                result.real_best,
+                result.permuted_best
             );
         }
 

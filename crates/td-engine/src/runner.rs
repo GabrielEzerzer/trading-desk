@@ -1307,7 +1307,7 @@ pub fn rerun(
     asks: &[Candle],
     funding: &[(Millis, f64)],
 ) -> Result<Rerun, EngineError> {
-    rerun_with_traded(saved, bars, asks, funding, &[], &[], &[])
+    rerun_with_traded(saved, bars, asks, funding, &[])
 }
 
 pub fn rerun_with_traded(
@@ -1315,19 +1315,9 @@ pub fn rerun_with_traded(
     bars: &[Candle],
     asks: &[Candle],
     funding: &[(Millis, f64)],
-    references: &[ReferenceBars],
-    series: &[Series],
     also_traded: &[AlsoTradedBars],
 ) -> Result<Rerun, EngineError> {
-    let result = run_with_traded(
-        &saved.config,
-        bars,
-        asks,
-        funding,
-        references,
-        series,
-        also_traded,
-    )?;
+    let result = run_with_traded(&saved.config, bars, asks, funding, &[], &[], also_traded)?;
     let fingerprint_matches = result.data_fingerprint == saved.data_fingerprint;
     let engine_matches = result.engine_revision == saved.engine_revision;
     Ok(Rerun {
@@ -1704,6 +1694,23 @@ mod tests {
     use super::*;
 
     const HOUR: Millis = 3_600_000;
+
+    #[test]
+    fn a_run_with_two_instruments_reruns_on_the_same_data_with_the_same_fingerprint() {
+        use crate::strategies::test_only::{TRADES_BOTH, pair_config, pair_data};
+        const BARS: i64 = 120;
+        let (bars, also) = pair_data(BARS);
+        let mut config = pair_config(TRADES_BOTH, BARS);
+        config.params = Params::new().with("qty", crate::ParamValue::Float(1.0));
+        let saved = run_with_traded(&config, &bars, &[], &[], &[], &[], &also).unwrap();
+        let again = rerun_with_traded(&saved, &bars, &[], &[], &also).unwrap();
+        assert!(again.fingerprint_matches && again.engine_matches);
+        assert_eq!(again.result, saved);
+        let mut moved = also.clone();
+        moved[0].bars[10].volume += 1.0;
+        let changed = rerun_with_traded(&saved, &bars, &[], &[], &moved).unwrap();
+        assert!(!changed.fingerprint_matches);
+    }
 
     #[test]
     fn run_metrics_reports_what_run_reports() {

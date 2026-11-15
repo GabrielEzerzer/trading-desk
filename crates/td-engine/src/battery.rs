@@ -428,6 +428,16 @@ pub fn run_battery_with_traded(
             instrument.id
         )));
     }
+    if let Some(inst) = traded_beside
+        .iter()
+        .find(|i| plan.backtest.slippage_bps(&i.id).is_some())
+    {
+        return Err(TesterError::InvalidSpec(format!(
+            "the plan's slippage for {0} cannot be used for an instrument traded beside the first: \
+             {0} trades at its default slippage",
+            inst.id
+        )));
+    }
     rule.validate()
         .map_err(|e| TesterError::InvalidSpec(e.to_string()))?;
     let names: Vec<_> = references.iter().map(|r| r.instrument.clone()).collect();
@@ -3494,6 +3504,7 @@ mod tests {
                 plan: &plan,
                 rule: &rule,
                 instrument: &test_instrument(),
+                also_traded: &[],
                 seed: 7,
             };
             run_battery(&spec, &bars, &[], &[], None).unwrap()
@@ -5663,7 +5674,11 @@ mod tests {
 
     mod several {
         use super::*;
-        use crate::strategies::test_only::{TRADES_BOTH, pair_config, pair_data, pair_second};
+        use crate::SlippageOverride;
+        use crate::metrics::DAY_MS;
+        use crate::strategies::test_only::{
+            TRADES_BOTH, pair_config, pair_data, pair_first, pair_second,
+        };
 
         const BARS: i64 = 120;
         const COST_STRESS: f64 = 2.0;
@@ -5671,6 +5686,43 @@ mod tests {
         fn second_fills(r: &BacktestResult) -> Vec<&Fill> {
             let id = pair_second().id;
             r.fills.iter().filter(|f| f.instrument == id).collect()
+        }
+
+        #[test]
+        fn a_plan_that_sets_slippage_for_an_instrument_traded_beside_the_first_is_refused() {
+            const DAYS: i64 = 160;
+            const BARS_A_DAY: i64 = 6;
+            let entry = crate::find_strategy(TRADES_BOTH).unwrap();
+            let (first, second) = (pair_first(), pair_second());
+            let mut plan = entry.plan.clone();
+            plan.instruments.push(second.id.clone());
+            plan.period.to = DAYS * DAY_MS;
+            plan.evidence.luck.permutations = 4;
+            plan.evidence.start_offsets = 0;
+            let (bars, also) = pair_data(DAYS * BARS_A_DAY);
+            let traded_beside = [second.clone()];
+            let battery = |plan: &TestPlan| {
+                let spec = BatterySpec {
+                    strategy: TRADES_BOTH,
+                    plan,
+                    rule: &entry.rule,
+                    instrument: &first,
+                    also_traded: &traded_beside,
+                    seed: 3,
+                };
+                run_battery_with_traded(&spec, &bars, &[], &[], &[], &[], &also, None)
+            };
+            assert!(battery(&plan).is_ok());
+            plan.backtest.slippage = vec![SlippageOverride::new(second.id.clone(), 10.0)];
+            let refused = battery(&plan).unwrap_err().to_string();
+            assert!(
+                refused.contains(&format!(
+                    "the plan's slippage for {0} cannot be used for an instrument traded beside \
+                     the first: {0} trades at its default slippage",
+                    second.id
+                )),
+                "{refused}"
+            );
         }
 
         #[test]
