@@ -705,3 +705,352 @@ fn a_run_names_only_the_instruments_it_has_bars_for() {
 fn cents(price: f64) -> f64 {
     (price * 100.0).round() / 100.0
 }
+
+fn c() -> Instrument {
+    perp("CCC")
+}
+
+/// The result of a run whose strategy does nothing.
+fn run_quiet(
+    config: &BacktestConfig,
+    a_bars: &[Candle],
+    others: &[AlsoTradedBars],
+) -> BacktestResult {
+    let (strategy, _) = scripted(|_, _| {});
+    run(config, strategy, a_bars, &[], others).unwrap()
+}
+
+#[test]
+fn the_fingerprint_covers_when_another_instrument_was_listed() {
+    // A has bars 10 to 15 and the run starts at 10. B is listed at 5 in X, at 1 in Z and at 13 in
+    // Y, and has the same bars from 13 on in all three. In X and Z B has had a bar on every bar of
+    // the run; in Y only from 13, so `has_had_bar` differs on bars 10 to 12, and with
+    // `start_when_all_listed` X and Z trade from 10 and Y from 13. The bars before the run are
+    // never used, so only the listing time tells X from Y; Z, a download with longer history,
+    // reads the same as X.
+    let a_bars: Vec<Candle> = (10..16).map(|i| flat(i, 100.0)).collect();
+    let listed = |from: std::ops::Range<i64>| {
+        let bars = from.chain(13..16).map(|i| flat(i, 50.0)).collect();
+        [traded(&b(), bars, Vec::new())]
+    };
+    let (x, y, z) = (listed(5..10), listed(0..0), listed(1..10));
+    for when_all_listed in [false, true] {
+        let mut config = config(16);
+        config.from = 10 * MIN;
+        config.start_when_all_listed = when_all_listed;
+        let fx = run_quiet(&config, &a_bars, &x).data_fingerprint;
+        let fy = run_quiet(&config, &a_bars, &y).data_fingerprint;
+        let fz = run_quiet(&config, &a_bars, &z).data_fingerprint;
+        assert_ne!(
+            fx, fy,
+            "B listed before the run and at 13 (start when all listed: {when_all_listed})"
+        );
+        assert_eq!(
+            fx, fz,
+            "B listed at 5 and at 1 (start when all listed: {when_all_listed})"
+        );
+    }
+}
+
+#[test]
+fn a_hedged_book_is_read_at_the_opens_fills_and_closes_and_not_at_each_worst_price() {
+    let a_bars = vec![
+        flat(0, 100.0),
+        flat(1, 100.0),
+        bar(2, 100.0, 100.0, 89.0, 100.0),
+        flat(3, 100.0),
+    ];
+    let b_bars = vec![
+        flat(0, 50.0),
+        flat(1, 50.0),
+        bar(2, 50.0, 55.6, 50.0, 50.0),
+        flat(3, 50.0),
+    ];
+    let (strategy, _) = scripted(|ctx, _| {
+        if index(ctx) == 0 {
+            ctx.submit(market(&a(), Side::Buy, 45.0)).unwrap();
+            ctx.submit(market(&b(), Side::Sell, 90.0)).unwrap();
+        }
+    });
+    let mut config = config(4);
+    config.starting_cash = 1_000.0;
+    config.max_leverage = 10.0;
+    let others = [traded(&b(), b_bars, Vec::new())];
+    let result = run(&config, strategy, &a_bars, &[], &others).unwrap();
+    // Long 45 A at 100.05 and short 90 B at 49.97. Bar 2 opens and closes at 100 and 50, where
+    // the account holds 1 000 - 45 * 0.05 - 90 * 0.03 = 995.05, and the range is read there.
+    // With each position at its own worst price at once, A at its low of 89 and B at its high of
+    // 55.6, it would hold 1 000 - 45 * 11.05 - 90 * 5.63 = -3.95, under maintenance: the bars do
+    // not say the two happened together, so the account is not liquidated.
+    assert_eq!(result.fills.len(), 2, "{:?}", result.fills);
+    let range = result.equity_extremes[2];
+    close(range.low, 995.05);
+    close(range.high, 995.05);
+    close(final_equity(&result), 995.05);
+}
+
+#[test]
+fn one_instrument_holding_alone_is_read_at_its_low_and_high() {
+    let a_bars: Vec<Candle> = (0..4).map(|i| flat(i, 100.0)).collect();
+    let b_bars = vec![
+        flat(0, 50.0),
+        flat(1, 50.0),
+        bar(2, 50.0, 53.0, 46.0, 51.0),
+        flat(3, 51.0),
+    ];
+    let buy = || {
+        scripted(|ctx, _| {
+            if index(ctx) == 0 {
+                ctx.submit(market(&b(), Side::Buy, 10.0)).unwrap();
+            }
+        })
+        .0
+    };
+    let others = [traded(&b(), b_bars.clone(), Vec::new())];
+    let result = run(&config(4), buy(), &a_bars, &[], &others).unwrap();
+    // Long 10 B at 50.03, and A neither held nor trading: bar 2 is read at B's low of 46 and high
+    // of 53, 10 000 + 10 * (46 - 50.03) and 10 000 + 10 * (53 - 50.03).
+    let range = result.equity_extremes[2];
+    close(range.low, 9_959.7);
+    close(range.high, 10_029.7);
+    // As a run that trades B alone reads it.
+    let mut alone = config(4);
+    alone.instrument = b();
+    alone.also_traded = Vec::new();
+    let single = run_strategy_with_references(&alone, buy(), &b_bars, &[], &[], &[], &[]).unwrap();
+    assert_eq!(single.equity_extremes, result.equity_extremes);
+}
+
+#[test]
+fn a_liquidation_while_the_first_has_no_bar_closes_another_without_one_at_its_mark() {
+    let gap = |price: f64| -> Vec<Candle> {
+        [0, 1, 2, 4, 5]
+            .into_iter()
+            .map(|i| flat(i, price))
+            .collect()
+    };
+    let b_bars = vec![
+        flat(0, 50.0),
+        flat(1, 50.0),
+        flat(2, 50.0),
+        flat(3, 39.0),
+        flat(4, 39.0),
+        flat(5, 39.0),
+    ];
+    let (strategy, _) = scripted(|ctx, _| {
+        if index(ctx) == 0 {
+            ctx.submit(market(&b(), Side::Buy, 90.0)).unwrap();
+            ctx.submit(market(&c(), Side::Buy, 45.0)).unwrap();
+            let limit = OrderType::Limit { price: 10.0 };
+            ctx.submit(order(&a(), Side::Buy, 1.0, limit)).unwrap();
+            ctx.submit(order(&c(), Side::Buy, 1.0, limit)).unwrap();
+        }
+    });
+    let mut config = config(6);
+    config.starting_cash = 1_000.0;
+    config.max_leverage = 10.0;
+    config.also_traded = vec![b(), c()];
+    let others = [
+        traded(&b(), b_bars, Vec::new()),
+        traded(&c(), gap(100.0), Vec::new()),
+    ];
+    let result = run(&config, strategy, &gap(100.0), &[], &others).unwrap();
+    // Long 90 B at 50.03 and 45 C at 100.05. At 3 only B has a bar, opening at 39, and C is at
+    // its last close of 100: the account holds 1 000 - 90 * 11.03 - 45 * 0.05 = 5.05, under
+    // maintenance of 0.5% of 90 * 39 + 45 * 100 = 8 010, which is 40.05. Both are closed there.
+    let liquidations: Vec<(String, Millis, f64, f64)> = result
+        .fills
+        .iter()
+        .skip(2)
+        .map(|f| (f.instrument.symbol.clone(), f.time, f.qty, f.price))
+        .collect();
+    assert_eq!(
+        liquidations,
+        [
+            ("BBBUSDT".to_string(), 3 * MIN, 90.0, 39.0),
+            ("CCCUSDT".to_string(), 3 * MIN, 45.0, 100.0),
+        ]
+    );
+    assert!(
+        result.orders.iter().all(|o| o.status != OrderStatus::Open),
+        "an order is still open: {:?}",
+        result.orders
+    );
+    // Nothing trades after, and the account stays at zero from A's next bar on.
+    let after: Vec<f64> = result.equity.iter().skip(3).map(|p| p.equity).collect();
+    assert_eq!(after, [0.0, 0.0]);
+}
+
+#[test]
+fn another_instrument_holding_alone_is_liquidated_against_the_whole_balance() {
+    let a_bars: Vec<Candle> = (0..4).map(|i| flat(i, 100.0)).collect();
+    let b_bars = vec![
+        flat(0, 50.0),
+        flat(1, 50.0),
+        bar(2, 50.0, 50.0, 44.0, 49.0),
+        flat(3, 49.0),
+    ];
+    let (strategy, _) = scripted(|ctx, _| {
+        if index(ctx) == 0 {
+            ctx.submit(market(&b(), Side::Buy, 180.0)).unwrap();
+            let limit = OrderType::Limit { price: 10.0 };
+            ctx.submit(order(&b(), Side::Buy, 1.0, limit)).unwrap();
+            ctx.submit(order(&a(), Side::Buy, 1.0, limit)).unwrap();
+        }
+    });
+    let mut config = config(4);
+    config.starting_cash = 1_000.0;
+    config.max_leverage = 10.0;
+    let others = [traded(&b(), b_bars, Vec::new())];
+    let result = run(&config, strategy, &a_bars, &[], &others).unwrap();
+    // Long 180 B at 50.03, the 1 000 of cash in the first instrument's book. B alone holds, so
+    // bar 2 is read as a run with one instrument reads it, against the whole balance: the
+    // account is at maintenance where 1 000 + 180 * (p - 50.03) = 0.005 * 180 * p, at
+    // p = 8 005.4 / 179.1 = 44.698, above the low of 44. Without the first book's cash it would
+    // be under maintenance at once, and closed at the open of 50.
+    let liquidation = &result.fills[1];
+    assert_eq!(liquidation.instrument, b().id);
+    assert_eq!(liquidation.time, 2 * MIN);
+    assert!(
+        (liquidation.price - 8_005.4 / 179.1).abs() < 0.01,
+        "{}",
+        liquidation.price
+    );
+    assert_eq!(result.fills.len(), 2);
+    assert!(
+        result.orders.iter().all(|o| o.status != OrderStatus::Open),
+        "an order is still open: {:?}",
+        result.orders
+    );
+    close(result.equity[2].equity, 0.0);
+    close(final_equity(&result), 0.0);
+}
+
+#[test]
+fn a_reduce_only_order_is_accepted_over_the_gross_cap() {
+    let a_bars = vec![flat(0, 100.0), flat(1, 100.0), flat(2, 90.0), flat(3, 90.0)];
+    let b_bars = vec![flat(0, 50.0), flat(1, 50.0), flat(2, 45.0), flat(3, 45.0)];
+    let (strategy, log) = scripted(|ctx, notes| match index(ctx) {
+        0 => {
+            ctx.submit(market(&a(), Side::Buy, 10.0)).unwrap();
+            ctx.submit(market(&b(), Side::Buy, 18.0)).unwrap();
+        }
+        2 => {
+            let more = ctx.submit(market(&b(), Side::Buy, 0.1));
+            notes.push(format!("{:?}", more.map_err(|r| r.reason)));
+            let mut reduce = market(&a(), Side::Sell, 5.0);
+            reduce.reduce_only = true;
+            notes.push(format!("{:?}", ctx.submit(reduce).map(|_| "accepted")));
+        }
+        _ => {}
+    });
+    let mut config = config(4);
+    config.starting_cash = 1_000.0;
+    let others = [traded(&b(), b_bars, Vec::new())];
+    let result = run(&config, strategy, &a_bars, &[], &others).unwrap();
+    // Long 10 A at 100.05 and 18 B at 50.03. At bar 2's close the account holds
+    // 1 000 - 10 * 10.05 - 18 * 5.03 = 808.96 and a gross notional of 900 + 810 = 1 710, over
+    // the 2x cap of 1 617.92: an order that adds is refused, and one that only reduces is not.
+    let notes = &log.lock().unwrap().notes;
+    assert!(notes[0].contains("over the leverage cap"), "{}", notes[0]);
+    assert_eq!(notes[1], r#"Ok("accepted")"#);
+    let reduced = result.fills.last().unwrap();
+    assert_eq!(
+        (reduced.instrument.clone(), reduced.side, reduced.qty),
+        (a().id, Side::Sell, 5.0)
+    );
+}
+
+#[test]
+fn a_configuration_trading_several_instruments_is_refused_unless_they_fit_one_account() {
+    type Change = fn(&mut BacktestConfig);
+    let cases: [(&str, Change); 5] = [
+        ("another venue", |c| {
+            c.also_traded[0].id.venue = Venue::Bybit
+        }),
+        ("same quote currency", |c| {
+            c.also_traded[0].quote = "USDC".into()
+        }),
+        ("account in their quote currency", |c| {
+            c.account_currency = AccountCurrency::Base
+        }),
+        ("named twice", |c| c.also_traded.push(b())),
+        ("cannot also be a reference", |c| c.references.push(b().id)),
+    ];
+    for (why, change) in cases {
+        let mut config = config(4);
+        change(&mut config);
+        match config.check_traded() {
+            Err(EngineError::InvalidTraded(reason)) => {
+                assert!(reason.contains(why), "{why}: {reason}")
+            }
+            other => panic!("{why}: {other:?}"),
+        }
+    }
+    assert!(config(4).check_traded().is_ok());
+}
+
+#[test]
+fn a_strategy_reads_each_traded_instruments_position_orders_and_funding() {
+    let a_bars: Vec<Candle> = (0..4).map(|i| flat(i, 100.0)).collect();
+    let b_bars: Vec<Candle> = (0..4).map(|i| flat(i, 50.0)).collect();
+    // Due exactly at bar 1's close, so first seen on bar 2.
+    let b_funding = vec![(2 * MIN, 0.0001)];
+    let a_funding = [(MIN, 0.0002)];
+    let (strategy, log) = scripted(|ctx, notes| {
+        let (id_a, id_b, id_c) = (a().id, b().id, c().id);
+        if index(ctx) == 0 {
+            ctx.submit(market(&b(), Side::Buy, 2.0)).unwrap();
+            let limit = OrderType::Limit { price: 40.0 };
+            ctx.submit(order(&b(), Side::Buy, 1.0, limit)).unwrap();
+        }
+        let len = |s: Option<&[(Millis, f64)]>| s.map(<[_]>::len);
+        let orders = |s: Option<&[td_engine::Order]>| s.map(<[_]>::len);
+        notes.push(format!(
+            "{} funding {:?} {:?} {:?} position {:?} {:?} {:?} orders {:?} {:?} {:?}",
+            index(ctx),
+            len(ctx.funding_of(&id_a)),
+            len(ctx.funding_of(&id_b)),
+            len(ctx.funding_of(&id_c)),
+            ctx.position_of(&id_a),
+            ctx.position_of(&id_b),
+            ctx.position_of(&id_c),
+            orders(ctx.open_orders_of(&id_a)),
+            orders(ctx.open_orders_of(&id_b)),
+            orders(ctx.open_orders_of(&id_c)),
+        ));
+        assert_eq!(ctx.funding_of(&id_a), Some(ctx.funding()));
+        let symbols: Vec<&str> = ctx.traded().map(|i| i.id.symbol.as_str()).collect();
+        assert_eq!(symbols, ["AAAUSDT", "BBBUSDT"]);
+        assert_eq!(ctx.traded_instrument(&id_b), Some(&b()));
+        assert_eq!(ctx.traded_instrument(&id_c), None);
+    });
+    let others = [traded(&b(), b_bars, b_funding)];
+    run(&config(4), strategy, &a_bars, &a_funding, &others).unwrap();
+    // The market buy fills at bar 1's open and the limit at 40 rests. A's rate due at 1, bar 0's
+    // close, is first seen on bar 1, and B's due at 2 on bar 2.
+    assert_eq!(
+        log.lock().unwrap().notes,
+        [
+            "0 funding Some(0) Some(0) None position Some(0.0) Some(0.0) None orders Some(0) Some(2) None",
+            "1 funding Some(1) Some(0) None position Some(0.0) Some(2.0) None orders Some(0) Some(1) None",
+            "2 funding Some(1) Some(1) None position Some(0.0) Some(2.0) None orders Some(0) Some(1) None",
+            "3 funding Some(1) Some(1) None position Some(0.0) Some(2.0) None orders Some(0) Some(1) None",
+        ]
+    );
+}
+
+#[test]
+fn the_order_of_the_other_instruments_is_part_of_the_fingerprint() {
+    let a_bars: Vec<Candle> = (0..4).map(|i| flat(i, 100.0)).collect();
+    let others = [
+        traded(&b(), (0..4).map(|i| flat(i, 50.0)).collect(), Vec::new()),
+        traded(&c(), (0..4).map(|i| flat(i, 20.0)).collect(), Vec::new()),
+    ];
+    let mut config = config(4);
+    config.also_traded = vec![b(), c()];
+    let b_first = run_quiet(&config, &a_bars, &others).data_fingerprint;
+    config.also_traded = vec![c(), b()];
+    let c_first = run_quiet(&config, &a_bars, &others).data_fingerprint;
+    assert_ne!(b_first, c_first);
+}
