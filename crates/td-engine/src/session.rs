@@ -109,6 +109,10 @@ pub struct Session {
     ranges: Vec<EquityRange>,
     /// The account's gross notional and equity at each point read with a position open.
     exposures: Vec<Exposure>,
+    /// The open time of the first instrument's bar being fed. Every reading taken while it is fed
+    /// joins that bar's equity point and range, those at other instruments' bars before it
+    /// included, so each [`Exposure`] is stamped with it, as with one instrument.
+    stamp: Millis,
 }
 
 /// One instrument traded beside the first in a run with several
@@ -278,6 +282,7 @@ impl Session {
             step: None,
             ranges: Vec::new(),
             exposures: Vec::new(),
+            stamp: 0,
         }
     }
 
@@ -566,6 +571,7 @@ impl Session {
         self.check_references(&bar, references)?;
         let step = self.timeframe.duration_ms();
         let first_new_fill = self.fills.len();
+        self.stamp = bar.open_time;
         let trading = !warming_up && !self.equity.is_empty();
         while let Some(time) = self
             .legs
@@ -895,6 +901,7 @@ impl Session {
             self.exposures.push(Exposure {
                 notional: self.gross_notional(prices),
                 equity,
+                time: self.stamp,
             });
         }
     }
