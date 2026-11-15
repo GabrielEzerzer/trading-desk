@@ -130,6 +130,7 @@ pub(crate) mod fake {
         pub asks: bool,
         /// Each `(from, to)` asked of [`DataSource::minute_history`].
         pub asked: Mutex<Vec<(Millis, Millis)>>,
+        pub fails: bool,
     }
 
     impl DailyFiles {
@@ -139,6 +140,7 @@ pub(crate) mod fake {
                 kind: InstrumentKind::Spot,
                 asks: false,
                 asked: Mutex::new(Vec::new()),
+                fails: false,
             }
         }
 
@@ -209,6 +211,13 @@ pub(crate) mod fake {
             _: Millis,
         ) -> Result<MinuteHistory, DataError> {
             self.asked.lock().expect("lock").push((from, to));
+            if self.fails {
+                return Err(DataError::Status {
+                    url: "https://example.invalid/".into(),
+                    status: 503,
+                    body: String::new(),
+                });
+            }
             let mut history = MinuteHistory::default();
             let mut day = from.div_euclid(DAY) * DAY;
             while day < to {

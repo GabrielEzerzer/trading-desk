@@ -5726,6 +5726,96 @@ mod tests {
         }
 
         #[test]
+        fn every_stage_runs_when_the_second_instrument_is_listed_months_into_the_period() {
+            const DAYS: i64 = 160;
+            const BARS_A_DAY: i64 = 6;
+            let entry = crate::find_strategy(TRADES_BOTH).unwrap();
+            let (first, second) = (pair_first(), pair_second());
+            let mut plan = entry.plan.clone();
+            plan.period.to = DAYS * DAY_MS;
+            plan.evidence.luck.permutations = 4;
+            let (bars, mut also) = pair_data(DAYS * BARS_A_DAY);
+            let listed = 118 * DAY_MS;
+            also[0].bars.retain(|b| b.open_time >= listed);
+            also[0].funding.retain(|&(time, _)| time >= listed);
+            let traded_beside = [second.clone()];
+            let firm = firm_rule(DrawdownMode::Static, 10, None);
+            for rule in [&entry.rule, &firm] {
+                let spec = BatterySpec {
+                    strategy: TRADES_BOTH,
+                    plan: &plan,
+                    rule,
+                    instrument: &first,
+                    also_traded: &traded_beside,
+                    seed: 3,
+                };
+                let result =
+                    run_battery_with_traded(&spec, &bars, &[], &[], &[], &[], &also, None).unwrap();
+                assert_eq!(result.walk_forward_error, None);
+                let windows = &result.walk_forward.as_ref().unwrap().windows;
+                assert!(windows[0].test_to <= listed);
+                for window in windows {
+                    let fills = second_fills(&window.out_of_sample);
+                    assert!(fills.iter().all(|f| f.time >= listed));
+                    if window.test_to <= listed {
+                        assert!(fills.is_empty());
+                    }
+                }
+                assert!(
+                    windows
+                        .iter()
+                        .any(|w| !second_fills(&w.out_of_sample).is_empty())
+                );
+                assert!(result.daily_bootstrap.is_some());
+                if matches!(rule, VerdictRule::PropFirm { .. }) {
+                    assert!(result.prop_firm_odds.is_some());
+                }
+            }
+
+            let first_run = run_battery_with_traded(
+                &BatterySpec {
+                    strategy: TRADES_BOTH,
+                    plan: &plan,
+                    rule: &entry.rule,
+                    instrument: &first,
+                    also_traded: &traded_beside,
+                    seed: 3,
+                },
+                &bars,
+                &[],
+                &[],
+                &[],
+                &[],
+                &also,
+                None,
+            )
+            .unwrap();
+            let wf = first_run.walk_forward.unwrap();
+            for w in &wf.windows {
+                let stressed = run_stressed(
+                    &w.out_of_sample.config,
+                    COST_STRESS,
+                    (&bars, &[], &[], &[], &[], &also),
+                )
+                .unwrap();
+                assert!(second_fills(&stressed).iter().all(|f| f.time >= listed));
+            }
+            let mut shifted = wf.spec.clone();
+            shifted.sweep.base.to = bars[bars.len() - 30].open_time;
+            tester::walk_forward_with_traded(&shifted, &bars, &[], &[], &[], &[], &also, None)
+                .unwrap();
+            let luck = tester::PermutationSpec {
+                sweep: first_run.sweep.unwrap().spec,
+                permutations: 4,
+                seed: 3,
+            };
+            let shuffled =
+                tester::permutation_test_with_traded(&luck, &bars, &[], &[], &[], &[], &also, None)
+                    .unwrap();
+            assert_eq!(shuffled.qualified_copies, 4);
+        }
+
+        #[test]
         fn the_cost_stress_raises_the_second_instruments_fees_and_slippage() {
             let (bars, also) = pair_data(BARS);
             let mut config = pair_config(TRADES_BOTH, BARS);

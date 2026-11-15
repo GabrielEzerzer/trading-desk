@@ -2390,3 +2390,288 @@ async fn sweeps_out_of_sample_and_walk_forward_runs_trade_a_second_perpetual_fro
         listed_windows.data_fingerprint
     );
 }
+
+const LATE_DAYS: i64 = 100;
+
+fn listed() -> Millis {
+    t0() + 62 * DAY
+}
+
+fn scaled(candles: Vec<Candle>) -> Vec<Candle> {
+    candles
+        .into_iter()
+        .map(|c| Candle {
+            open: c.open * 0.05,
+            high: c.high * 0.05,
+            low: c.low * 0.05,
+            close: c.close * 0.05,
+            quote_volume: c.quote_volume * 0.05,
+            ..c
+        })
+        .collect()
+}
+
+fn record_unlisted(store: &Store, id: &InstrumentId, from: Millis, listed: Millis) {
+    for month in Month::range(from, listed) {
+        let lo = from.max(month.start());
+        let empty = td_data::Gap {
+            from: lo,
+            to: listed.min(month.end()),
+        };
+        store
+            .record_closures(id, month, lo, month.end(), &[empty])
+            .unwrap();
+    }
+}
+
+fn seed_late_second(store: &Store, hole: std::ops::Range<Millis>, recorded: bool) {
+    let id = second_perpetual().id;
+    let stored: Vec<Candle> = scaled(minutes(LATE_DAYS, t0()..listed()))
+        .into_iter()
+        .filter(|c| !hole.contains(&c.open_time))
+        .collect();
+    store.write_candles(&id, &stored).unwrap();
+    let rates: Vec<(Millis, f64)> = (0..LATE_DAYS * 3)
+        .map(|i| (t0() + i * 8 * HOUR, 0.0002))
+        .filter(|&(t, _)| t >= listed())
+        .collect();
+    store.write_funding(&id, &rates).unwrap();
+    if recorded {
+        record_unlisted(store, &id, t0(), listed());
+    }
+}
+
+fn late_config() -> BacktestConfig {
+    BacktestConfig {
+        also_traded: vec![second_perpetual()],
+        from: t0() + DAY,
+        warmup_from: Some(t0()),
+        ..config(InstrumentKind::Perpetual, LATE_DAYS)
+    }
+}
+
+struct WatchesSecond(Arc<Mutex<Vec<(Millis, bool, bool)>>>);
+
+impl td_engine::Strategy for WatchesSecond {
+    fn on_bar(&mut self, ctx: &mut td_engine::Context, bar: &Candle) {
+        let id = second_perpetual().id;
+        let seen = (
+            bar.open_time,
+            ctx.has_had_bar(&id),
+            ctx.bar_of(&id).is_some(),
+        );
+        self.0.lock().unwrap().push(seen);
+        TradesEach.on_bar(ctx, bar);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_backtest_trading_a_perpetual_listed_months_into_the_range_runs_from_the_range_start() {
+    let t = TestServer::seeded(LATE_DAYS).await;
+    seed_late_second(&t.store, 0..0, true);
+    let config = late_config();
+    let detail = saved_run(
+        &t,
+        "/runs/backtest",
+        &serde_json::to_value(&config).unwrap(),
+    )
+    .await;
+    let SavedRun::Backtest(through_api) = &detail.run else {
+        panic!("a saved backtest");
+    };
+    let data = load_run_data(&t.store, &config, None).unwrap();
+    assert_eq!(
+        data.also_traded[0].bars.first().map(|b| b.open_time),
+        Some(listed())
+    );
+    let direct = td_engine::run_with_traded(
+        &config,
+        &data.bars,
+        &data.asks,
+        &data.funding,
+        &[],
+        &[],
+        &data.also_traded,
+    )
+    .unwrap();
+    assert_eq!(**through_api, direct);
+    assert_eq!(through_api.equity[0].time, config.from);
+
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let watched = td_engine::run_strategy_with_traded(
+        &config,
+        Box::new(WatchesSecond(seen.clone())),
+        &data.bars,
+        &data.asks,
+        &data.funding,
+        &[],
+        &[],
+        &data.also_traded,
+    )
+    .unwrap();
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.first().map(|s| s.0), Some(t0()));
+    for &(time, had, bar) in seen.iter() {
+        assert_eq!(had, time >= listed(), "at {time}");
+        assert_eq!(bar, time >= listed(), "at {time}");
+    }
+    let second = second_perpetual().id;
+    let fills: Vec<_> = watched
+        .fills
+        .iter()
+        .filter(|f| f.instrument == second)
+        .collect();
+    assert!(!fills.is_empty());
+    assert!(fills.iter().all(|f| f.time >= listed()));
+    assert!(
+        watched
+            .fills
+            .iter()
+            .any(|f| f.instrument == config.instrument.id && f.time < listed())
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn with_start_when_all_listed_a_perpetual_listed_months_in_starts_the_run_at_its_first_bar() {
+    let t = TestServer::seeded(LATE_DAYS).await;
+    seed_late_second(&t.store, 0..0, true);
+    let config = BacktestConfig {
+        start_when_all_listed: true,
+        ..late_config()
+    };
+    let detail = saved_run(
+        &t,
+        "/runs/backtest",
+        &serde_json::to_value(&config).unwrap(),
+    )
+    .await;
+    let SavedRun::Backtest(through_api) = &detail.run else {
+        panic!("a saved backtest");
+    };
+    let data = load_run_data(&t.store, &config, None).unwrap();
+    let direct = td_engine::run_with_traded(
+        &config,
+        &data.bars,
+        &data.asks,
+        &data.funding,
+        &[],
+        &[],
+        &data.also_traded,
+    )
+    .unwrap();
+    assert_eq!(**through_api, direct);
+    assert_eq!(through_api.equity[0].time, listed());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_late_first_bar_with_no_record_of_the_empty_months_or_a_later_day_missing_is_refused() {
+    let t = TestServer::seeded(LATE_DAYS).await;
+    seed_late_second(&t.store, 0..0, false);
+    let config = late_config();
+    let body = serde_json::to_value(&config).unwrap();
+    let (status, answer) = t.post("/runs/backtest", &body).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{answer}");
+    assert_eq!(answer["error"]["code"], "data_missing");
+    let message = answer["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains(
+            "binance:BBBUSDT:perpetual candles from 2024-03-01 00:00 to 2024-05-02 00:00"
+        ) && message.contains("no record that a download asked the venue")
+            && message.contains("download it first from 2024-03-01 00:00 UTC"),
+        "{message}"
+    );
+
+    record_unlisted(&t.store, &second_perpetual().id, t0() + DAY, listed());
+    let (status, answer) = t.post("/runs/backtest", &body).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{answer}");
+    assert!(
+        answer["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("no record that a download asked the venue"),
+        "a record from after the data start does not cover it: {answer}"
+    );
+
+    let refusal = |store: &Store, config: &BacktestConfig| {
+        let e = check_run_data(store, config, None).unwrap_err();
+        assert_eq!(e.body.code, "data_missing", "{}", e.body.message);
+        assert!(
+            load_run_data(store, config, None).is_err(),
+            "{}",
+            e.body.message
+        );
+        e.body.message
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::new(dir.path());
+    let first = instrument(InstrumentKind::Perpetual).id;
+    store
+        .write_candles(&first, &minutes(LATE_DAYS, 0..0))
+        .unwrap();
+    let rates: Vec<(Millis, f64)> = (0..LATE_DAYS * 3)
+        .map(|i| (t0() + i * 8 * HOUR, 0.0001))
+        .collect();
+    store.write_funding(&first, &rates).unwrap();
+    let hole = listed() + 10 * DAY..listed() + 11 * DAY;
+    seed_late_second(&store, hole.clone(), true);
+    let message = refusal(&store, &config);
+    assert!(
+        message.contains(
+            "binance:BBBUSDT:perpetual candles from 2024-05-12 00:00 to 2024-05-13 00:00"
+        ) && !message.contains("no record"),
+        "{message}"
+    );
+
+    let second = second_perpetual();
+    let own = BacktestConfig {
+        instrument: second.clone(),
+        also_traded: Vec::new(),
+        ..late_config()
+    };
+    let message = refusal(&t.store, &own);
+    assert!(
+        message.contains("binance:BBBUSDT:perpetual candles from 2024-03-01 00:00"),
+        "{message}"
+    );
+    let referenced = BacktestConfig {
+        references: vec![second.id.clone()],
+        also_traded: Vec::new(),
+        ..late_config()
+    };
+    let message = refusal(&t.store, &referenced);
+    assert!(
+        message.contains("binance:BBBUSDT:perpetual candles from 2024-03-01 00:00")
+            && message.contains("reference instrument"),
+        "{message}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sweeps_out_of_sample_and_walk_forward_runs_trade_beside_a_perpetual_listed_months_in() {
+    let t = TestServer::seeded(LATE_DAYS).await;
+    seed_late_second(&t.store, 0..0, true);
+    let second = second_perpetual();
+    let mut sweep = sweep_spec(LATE_DAYS, (3, 4), (10, 11));
+    sweep["base"]["also_traded"] = json!([second]);
+    let wf = json!({
+        "sweep": sweep,
+        "windows": { "train_bars": 400, "test_bars": 200, "step_bars": 200, "mode": "rolling" },
+    });
+    let oos = json!({ "sweep": sweep, "split": { "fraction": 0.5 } });
+    let SavedRun::Sweep(swept) = saved_run(&t, "/runs/sweep", &sweep).await.run else {
+        panic!("a sweep");
+    };
+    assert_eq!(swept.spec.base.also_traded, vec![second.clone()]);
+    let SavedRun::Oos(split) = saved_run(&t, "/runs/out-of-sample", &oos).await.run else {
+        panic!("an out-of-sample run");
+    };
+    assert_eq!(split.spec.sweep.base.also_traded, vec![second.clone()]);
+    let SavedRun::WalkForward(windows) = saved_run(&t, "/runs/walk-forward", &wf).await.run else {
+        panic!("a walk-forward run");
+    };
+    assert_eq!(windows.spec.sweep.base.also_traded, vec![second.clone()]);
+    assert!(
+        windows.windows[1].test_to <= listed(),
+        "the first windows lie wholly before the second instrument's first bar"
+    );
+}

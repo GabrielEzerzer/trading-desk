@@ -1666,3 +1666,96 @@ async fn a_plan_trading_a_second_perpetual_judges_with_it_and_records_it() {
     assert_eq!(&rows[0].run_id, traded);
     assert_eq!(rows[0].also_traded, vec![second]);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_plan_trading_a_perpetual_listed_months_into_the_period_runs_its_battery() {
+    let t = TestServer::seeded(vec![entry(49)]).await;
+    let second = second_perpetual().id;
+    let listed = t0() + 70 * DAY;
+    let stored: Vec<Candle> = tokio::task::spawn_blocking(minutes)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|c| c.open_time >= listed)
+        .map(|c| Candle {
+            open: c.open * 0.5,
+            high: c.high * 0.5,
+            low: c.low * 0.5,
+            close: c.close * 0.5,
+            ..c
+        })
+        .collect();
+    t.store.write_candles(&second, &stored).unwrap();
+    let rates: Vec<(Millis, f64)> = (0..DAYS * 3)
+        .map(|i| (t0() + i * 8 * HOUR, 0.00002))
+        .filter(|&(time, _)| time >= listed)
+        .collect();
+    t.store.write_funding(&second, &rates).unwrap();
+    let first = id(InstrumentKind::Perpetual);
+    let plan = json!({ "strategy": "sma_cross", "instruments": [first], "also_traded": [second] });
+    let (status, answer) = t.post("/runs/plan", &plan).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{answer}");
+    assert!(
+        answer["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("no record that a download asked the venue"),
+        "{answer}"
+    );
+
+    for month in Month::range(t0(), listed) {
+        let empty = td_data::Gap {
+            from: month.start(),
+            to: listed.min(month.end()),
+        };
+        t.store
+            .record_closures(&second, month, month.start(), month.end(), &[empty])
+            .unwrap();
+    }
+    let folder = t.store.root().join(td_engine::SERIES_DIR);
+    std::fs::create_dir_all(&folder).unwrap();
+    let rows: Vec<Value> = (0..8)
+        .map(|k| json!({ "known_at": t0() + (20 + k * 25) * DAY, "value": 40.0 + k as f64 }))
+        .collect();
+    std::fs::write(
+        folder.join("late_series.json"),
+        Value::from(rows).to_string(),
+    )
+    .unwrap();
+    let mut with_series = plan.clone();
+    with_series["series"] = json!(["late_series"]);
+
+    let mut ws = t.websocket().await;
+    let mut kept = Vec::new();
+    for body in [&plan, &with_series] {
+        let job = t.start_plan(body).await;
+        let done = ws.follow(job).await.pop().unwrap();
+        assert_eq!(done.status, JobStatus::Done, "{:?}", done.error);
+        kept.push(plan_done(&done).instruments[0].run_id.clone());
+    }
+    for run_id in &kept {
+        let (status, body) = t.get(&format!("/runs/{run_id}")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["check"],
+            json!({ "data_matches": true, "engine_matches": true })
+        );
+        let detail: RunDetail = serde_json::from_value(body).unwrap();
+        let SavedRun::Plan(run) = &detail.run else {
+            panic!("a plan run");
+        };
+        assert_eq!(run.config.also_traded, vec![second_perpetual()]);
+        let windows = &run.battery.walk_forward.as_ref().unwrap().windows;
+        assert!(windows[0].test_to <= listed);
+        let path = t
+            .runs_dir()
+            .join(run_id.as_str())
+            .join(td_engine::VERDICT_FILE);
+        let record: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(record["also_traded"], json!([second]));
+    }
+    let rows = t.verdicts("").await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].series, vec!["late_series".to_string()]);
+    assert_eq!(rows[0].also_traded, vec![second]);
+}

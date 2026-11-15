@@ -200,7 +200,8 @@ pub struct MonthCoverage {
 }
 
 /// One month file of an instrument's candles and its size on disk, with its closure record's
-/// ([`crate::closed`]), which a delete of the month removes with it.
+/// ([`crate::closed`]), which a delete of the month removes with it; or a record alone, for a month
+/// a download found the venue had nothing for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StoredMonth {
     pub month: Month,
@@ -211,14 +212,15 @@ pub struct StoredMonth {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredInstrument {
     pub id: InstrumentId,
-    /// The month files, in order; empty when only a funding file is stored.
+    /// The month files and the records of months the venue had nothing for, in order; empty when
+    /// only a funding file is stored.
     pub months: Vec<StoredMonth>,
     /// The funding file's size; `None` when there is none, which is always so for spot.
     pub funding_bytes: Option<u64>,
 }
 
 impl StoredInstrument {
-    /// The month files and the funding file together.
+    /// The months and the funding file together.
     pub fn bytes(&self) -> u64 {
         self.months.iter().map(|m| m.bytes).sum::<u64>() + self.funding_bytes.unwrap_or(0)
     }
@@ -227,7 +229,8 @@ impl StoredInstrument {
 /// Everything the store holds, from [`Store::stored`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StoredData {
-    /// Each instrument with at least one month file or a funding file, in instrument order.
+    /// Each instrument with at least one month file, month record or funding file, in instrument
+    /// order.
     pub instruments: Vec<StoredInstrument>,
     /// Entries under `candles/` and `funding/` that name no venue, kind, symbol or month the store
     /// writes, and temp files of a month whose month file is absent, relative to the store root.
@@ -812,7 +815,8 @@ impl Store {
         Ok(rates)
     }
 
-    /// Every instrument the store holds, with each month file's size and the funding file's size.
+    /// Every instrument the store holds, with each month file's size, a month record's size where
+    /// the month has no file, and the funding file's size.
     /// Entries that name no venue, kind, symbol or month are reported in
     /// [`StoredData::unrecognised`], not read.
     pub fn stored(&self) -> Result<StoredData, DataError> {
@@ -842,6 +846,7 @@ impl Store {
                             continue;
                         }
                         let mut temps = Vec::new();
+                        let mut records = Vec::new();
                         for name in dir_names(&dir, &mut unrecognised, &self.root)? {
                             match month_of_file(&name) {
                                 Some((month, true)) => {
@@ -858,8 +863,20 @@ impl Store {
                                 Some((month, false)) if name.ends_with(".tmp") => {
                                     temps.push((month, name));
                                 }
-                                Some((_, false)) => {} // a lock sidecar or a closure record
+                                Some((month, false))
+                                    if name.ends_with(crate::closed::RECORD_SUFFIX) =>
+                                {
+                                    records.push((month, name));
+                                }
+                                Some((_, false)) => {} // a lock sidecar
                                 None => unrecognised.push(self.relative(&dir.join(&name))),
+                            }
+                        }
+                        for (month, name) in records {
+                            if !months.iter().any(|m| m.month == month)
+                                && let Some(bytes) = file_bytes(&dir.join(&name))?
+                            {
+                                months.push(StoredMonth { month, bytes });
                             }
                         }
                         // A temp file beside its month file is a write in progress or a leftover

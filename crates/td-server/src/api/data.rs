@@ -318,7 +318,8 @@ pub fn read_coverage(store: &Store, id: InstrumentId) -> Result<CoverageResponse
 }
 
 /// One month file of an instrument's candles and its size on disk, with its closure record's,
-/// which a delete of the month removes with it.
+/// which a delete of the month removes with it; or a record alone, for a month a download found
+/// the venue had nothing for.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 pub struct StoredMonthInfo {
     /// `YYYY-MM`.
@@ -330,11 +331,12 @@ pub struct StoredMonthInfo {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 pub struct StoredInstrumentInfo {
     pub instrument: InstrumentId,
-    /// The month files, oldest first; empty when only a funding file is stored.
+    /// The month files and the records of months the venue had nothing for, oldest first; empty
+    /// when only a funding file is stored.
     pub months: Vec<StoredMonthInfo>,
     /// The funding file's size; `null` when there is none, which is always so for spot.
     pub funding_bytes: Option<u64>,
-    /// The month files and the funding file together.
+    /// The months and the funding file together.
     pub bytes: u64,
 }
 
@@ -343,7 +345,8 @@ pub struct StoredResponse {
     /// The data folder, as an absolute path. It also holds saved runs and paper sessions, which
     /// are not market data.
     pub data_dir: String,
-    /// Every instrument with at least one month file or a funding file, in instrument order.
+    /// Every instrument with at least one month file, month record or funding file, in
+    /// instrument order.
     pub instruments: Vec<StoredInstrumentInfo>,
     /// Paths in the data folder, relative to it, that name no venue, kind, symbol or month the
     /// store writes. They are neither counted nor deleted.

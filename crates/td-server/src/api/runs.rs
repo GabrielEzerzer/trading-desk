@@ -519,9 +519,29 @@ fn read_also_traded(
     let mut also_traded = Vec::with_capacity(config.also_traded.len());
     for instrument in &config.also_traded {
         let id = &instrument.id;
-        let (bars, gaps, closures) = stored_bids(store, config, id)?;
+        let (bars, mut gaps, closures) = stored_bids(store, config, id)?;
+        let mut checked = range;
+        let lead = gaps
+            .first()
+            .copied()
+            .filter(|g| g.from == range.0 && g.to < range.1);
+        if let Some(lead) = lead
+            && store.recorded_empty(id, lead.from, lead.to)?
+        {
+            gaps.remove(0);
+            checked.0 = lead.to;
+        }
         let funding = store.load_funding(id, range.0, range.1)?;
-        if let Some(s) = shortfall(id, range, &gaps, &closures, !bars.is_empty(), &funding) {
+        if let Some(s) = shortfall(id, checked, &gaps, &closures, !bars.is_empty(), &funding) {
+            if s.candles.first().is_some_and(|g| g.from == range.0) {
+                let unlisted = format!(
+                    "the store has no record that a download asked the venue for the start of \
+                     that and found nothing there, as before an instrument is listed; {advice} \
+                     from {} UTC, which settles whether it was listed yet",
+                    format_minute(range.0)
+                );
+                return Err(s.refused(id, &unlisted, advice));
+            }
             return Err(s.refused(id, advice, advice));
         }
         also_traded.push(AlsoTradedBars {
