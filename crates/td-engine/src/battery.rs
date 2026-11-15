@@ -3474,6 +3474,17 @@ mod tests {
             let cap = lock.map(|l| l + firm.max_drawdown);
             // The cap the battery and the breach share apply.
             assert_eq!(peak_cap(firm), cap);
+            // The share of the attempts over the drawdown limit, with the daily limit out of
+            // reach.
+            let far = crate::FirmLimits {
+                daily_loss: 1.0,
+                ..firm.clone()
+            };
+            let limits = crate::PropFirmLimits {
+                breach_horizon_days: 60,
+                ..crate::PropFirmLimits::default()
+            };
+            let share = breach_share(&series, &ranges, 100.0, &far, &limits).unwrap();
             let falls = attempt_drawdowns(&series, &ranges, utc, 60, cap);
             let kind = KindInputs {
                 intrabar_drawdown_trailing: falls.1.map(|f| f.own),
@@ -3483,13 +3494,15 @@ mod tests {
                 .into_iter()
                 .find(|l| l.id == "max_drawdown")
                 .unwrap();
-            (line, falls.1.unwrap())
+            (line, falls.1.unwrap(), share)
         };
         let near = |a: f64, b: f64| assert!((a - b).abs() < 1e-12, "{a} against {b}");
 
-        let (line, fall) = locked(Some(0.0));
+        let (line, fall, share) = locked(Some(0.0));
         near(fall.own, 11.0 / 120.0);
         assert_eq!(line.outcome, Outcome::Pass);
+        // No attempt falls more than 10% to the locked floor, so none breaches.
+        assert_eq!(share.own, 0.0);
         assert_eq!(
             line.name,
             "Max drawdown from the peak, with the floor stopping at the starting balance, in any \
@@ -3502,17 +3515,20 @@ mod tests {
         // Without the lock the attempt from 100 falls 11 from its peak of 144, over the limit,
         // which warns, to the last bit the whole curve's trailing fall, as before the lock was
         // read.
-        let (line, fall) = locked(None);
+        let (line, fall, share) = locked(None);
         assert_eq!(
             fall.own,
             risk::trailing_drawdown(100.0, &ranges).unwrap().amount / 100.0
         );
         near(fall.own, 0.11);
         assert_eq!(line.outcome, Outcome::Warn);
+        // Unlocked, an attempt falls the whole 11 from 144, more than 10% of a start below 110:
+        // the ten attempts started from 100 to 109 breach, of 64.
+        near(share.own, 10.0 / 64.0);
         assert!(line.name.starts_with("Max drawdown from the peak in any"));
 
         // A lock above the start lets the floor rise further, and the line names it.
-        let (line, _) = locked(Some(0.005));
+        let (line, _, _) = locked(Some(0.005));
         assert_eq!(line.outcome, Outcome::Pass);
         assert!(
             line.name
