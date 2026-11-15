@@ -206,6 +206,7 @@ pub struct MonthCoverage {
 pub struct StoredMonth {
     pub month: Month,
     pub bytes: u64,
+    pub record_only: bool,
 }
 
 /// What the store holds for one instrument.
@@ -857,6 +858,7 @@ impl Store {
                                         months.push(StoredMonth {
                                             month,
                                             bytes: bytes + record,
+                                            record_only: false,
                                         });
                                     }
                                 }
@@ -876,7 +878,11 @@ impl Store {
                             if !months.iter().any(|m| m.month == month)
                                 && let Some(bytes) = file_bytes(&dir.join(&name))?
                             {
-                                months.push(StoredMonth { month, bytes });
+                                months.push(StoredMonth {
+                                    month,
+                                    bytes,
+                                    record_only: true,
+                                });
                             }
                         }
                         // A temp file beside its month file is a write in progress or a leftover

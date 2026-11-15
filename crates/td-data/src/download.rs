@@ -7,7 +7,7 @@ use crate::DataError;
 use crate::http::Http;
 use crate::source::{DataSource, MinuteHistory, source};
 use crate::store::{Gap, Store, missing_minutes};
-use crate::time::{MINUTE, Month, now_ms};
+use crate::time::{DAY, MINUTE, Month, now_ms};
 
 /// What a candle download did.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -31,9 +31,12 @@ pub struct DownloadReport {
 ///
 /// A month whose part of the range is already stored with no minute missing, apart from recorded
 /// closures, is skipped. The open time in the range the source returned nothing for is recorded
-/// beside the month ([`Store::record_closures`]), a month it had nothing for at all included, apart
-/// from a span that reaches now. For a kind with closed hours, a month with no record yet is
-/// fetched whole, up to now, so its first record covers all of it.
+/// beside the month ([`Store::record_closures`]), apart from a span at the end of the range that
+/// reaches now or, for a kind that never closes, ends less than a day before now, since its file
+/// may not be published yet. For a kind that never closes, a month the source had nothing for at
+/// all is recorded too. For a kind with closed hours, a month with nothing fetched or stored gets
+/// no record, and a month with no record yet is fetched whole, up to now, so its first record
+/// covers all of it.
 pub fn download_candles(
     http: &Http,
     store: &Store,
@@ -61,7 +64,8 @@ pub(crate) fn download_candles_from(
         let lo = from.max(month.start());
         let hi = to.min(month.end()).min(now);
         // shortcut: a crypto month with an outage in it is never whole, so it is fetched again on
-        // every download that covers it; record crypto outages too if that gets slow.
+        // every download that covers it; its outages are recorded but not read as closures, so
+        // read them here too if that gets slow.
         let stored = store.read_month(id, month)?;
         if !stored.is_empty()
             && store
@@ -104,11 +108,14 @@ pub(crate) fn download_candles_from(
         }
         candles.sort_by_key(|c| c.open_time);
         let mut empty = missing_minutes(id.kind, &candles, lo, hi);
-        // Minutes up to now may only not be published yet.
-        if hi == now && empty.last().is_some_and(|g| g.to == hi) {
+        // Minutes up to now may only not be published yet, and for a kind that never closes so may
+        // the day before now, whose file can come out the day after.
+        let unpublished = if closes { hi == now } else { now - hi < DAY };
+        if unpublished && empty.last().is_some_and(|g| g.to == hi) {
             empty.pop();
         }
-        if !(empty.is_empty() && candles.is_empty() && stored.is_empty()) {
+        let holds = !(candles.is_empty() && stored.is_empty());
+        if holds || (!closes && !empty.is_empty()) {
             store.record_closures(id, month, lo, hi, &empty)?;
         }
         progress(format!("{id} {month}: {} candles", candles.len()));
@@ -389,7 +396,7 @@ mod tests {
     }
 
     #[test]
-    fn an_fx_month_the_source_has_nothing_for_is_recorded_listed_and_deleted() {
+    fn an_fx_month_the_source_has_nothing_for_gets_no_record() {
         let dir = tempfile::tempdir().expect("a temp dir");
         let store = Store::new(dir.path());
         let id = id(InstrumentKind::Fx);
@@ -410,21 +417,7 @@ mod tests {
         )
         .expect("downloads");
         assert_eq!(store.read_month(&id, feb).expect("reads"), []);
-        assert_eq!(
-            store.closure_record(&id, feb).expect("reads"),
-            Some(missing_minutes(id.kind, &[], feb.start(), feb.end()))
-        );
-        assert!(
-            store
-                .recorded_empty(&id, feb.start(), feb.end())
-                .expect("reads")
-        );
-        let stored = store.stored().expect("lists");
-        assert_eq!(stored.instruments.len(), 1);
-        assert_eq!(stored.instruments[0].months[0].month, feb);
-        store.delete_all().expect("deletes");
         assert_eq!(store.closure_record(&id, feb).expect("reads"), None);
-        assert_eq!(store.stored().expect("lists"), StoredData::default());
     }
 
     fn record_files(store: &Store, id: &InstrumentId) -> Vec<String> {
@@ -492,16 +485,16 @@ mod tests {
                 .expect("reads")
         );
 
-        let months = |store: &Store| -> Vec<Month> {
+        let months = |store: &Store| -> Vec<(Month, bool)> {
             let stored = store.stored().expect("lists");
             assert_eq!(stored.unrecognised, Vec::<std::path::PathBuf>::new());
             stored
                 .instruments
                 .iter()
-                .flat_map(|i| i.months.iter().map(|m| m.month))
+                .flat_map(|i| i.months.iter().map(|m| (m.month, m.record_only)))
                 .collect()
         };
-        assert_eq!(months(&store), [jan, feb, mar]);
+        assert_eq!(months(&store), [(jan, true), (feb, true), (mar, false)]);
         let names = record_files(&store, &id);
         assert_eq!(names.len(), 3);
 
@@ -565,6 +558,45 @@ mod tests {
         );
         assert_eq!(store.closure_record(&id, jan).expect("reads"), None);
         assert_eq!(record_files(&store, &id), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_perpetual_day_at_the_end_of_a_download_is_recorded_empty_only_a_day_after_it() {
+        let id = id(InstrumentKind::Perpetual);
+        let http = Http::new().expect("an HTTP client");
+        let today = now_ms().div_euclid(DAY) * DAY;
+        let yesterday = today - DAY;
+
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let store = Store::new(dir.path());
+        let source = DailyFiles::new(vec![yesterday]);
+        download_candles_from(
+            &source,
+            &http,
+            &store,
+            &id,
+            today - 3 * DAY,
+            today,
+            &mut |_| {},
+        )
+        .expect("downloads");
+        assert!(!store.recorded_empty(&id, yesterday, today).expect("reads"));
+
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let store = Store::new(dir.path());
+        let before = yesterday - DAY;
+        let source = DailyFiles::new(vec![before]);
+        download_candles_from(
+            &source,
+            &http,
+            &store,
+            &id,
+            today - 4 * DAY,
+            yesterday,
+            &mut |_| {},
+        )
+        .expect("downloads");
+        assert!(store.recorded_empty(&id, before, yesterday).expect("reads"));
     }
 
     #[test]

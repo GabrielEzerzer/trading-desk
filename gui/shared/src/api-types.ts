@@ -2485,7 +2485,7 @@ export type StoredMonthInfo = {
 /**
  * `YYYY-MM`.
  */
-month: string, bytes: number, };
+month: string, bytes: number, record_only: boolean, };
 
 /**
  * What to delete: the candles of `instrument` for the months `from` to `to`, both included, or,

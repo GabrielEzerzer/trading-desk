@@ -325,6 +325,7 @@ pub struct StoredMonthInfo {
     /// `YYYY-MM`.
     pub month: String,
     pub bytes: u64,
+    pub record_only: bool,
 }
 
 /// What the store holds for one instrument.
@@ -378,6 +379,7 @@ pub(super) async fn stored(
                     .map(|m| StoredMonthInfo {
                         month: m.month.to_string(),
                         bytes: m.bytes,
+                        record_only: m.record_only,
                     })
                     .collect(),
                 funding_bytes: i.funding_bytes,

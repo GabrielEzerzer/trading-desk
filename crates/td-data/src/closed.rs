@@ -7,10 +7,11 @@
 //! the venue returned nothing for: `<YYYY-MM>.parquet.closed.json`, a JSON list of `[from, to]`
 //! pairs in milliseconds, each span holding the open times `from` up to but not including `to`. A
 //! download replaces what the record said about the range it fetched and keeps the rest. A span
-//! that reaches the present is left out, since its minutes may only not be published yet. A month
-//! the venue had nothing for at all, such as one before an instrument was listed, gets a record and
-//! no month file; [`Store::recorded_empty`] reads such records to tell an instrument not listed yet
-//! from one not downloaded.
+//! that reaches the present is left out, since its minutes may only not be published yet; for a
+//! kind that never closes, so is a span at the end of the range that ends less than a day before
+//! the present, since a day's file can come out the day after. For a kind that never closes, a
+//! month the venue had nothing for at all, such as one before an instrument was listed, gets a
+//! record and no month file; for a kind with closed hours it gets neither.
 //!
 //! When the records are read ([`Store::closures`]), spans that meet, at a month's end or across
 //! closed hours, join into one stretch. A stretch holding at most [`SHORT_CLOSURE`] of open time,

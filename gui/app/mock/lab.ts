@@ -80,7 +80,7 @@ function mockStored(): StoredResponse {
     const months = Array.from({ length: count }, (_, k) => {
       const index = 2025 * 12 + 9 - (count - 1 - k)
       const month = `${Math.floor(index / 12)}-${String((index % 12) + 1).padStart(2, '0')}`
-      return { month, bytes: 1_650_000 + ((k * 7919 + i * 104_729) % 380_000) }
+      return { month, bytes: 1_650_000 + ((k * 7919 + i * 104_729) % 380_000), record_only: false }
     })
     const funding_bytes = instrument.kind === 'perpetual' ? 18_000 + count * 2_400 : null
     const bytes = months.reduce((sum, m) => sum + m.bytes, 0) + (funding_bytes ?? 0)

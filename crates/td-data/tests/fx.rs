@@ -692,7 +692,14 @@ fn an_fx_month_is_listed_and_deleted_like_any_other() {
     assert_eq!(stored.instruments.len(), 1);
     let listed = &stored.instruments[0];
     assert_eq!(listed.id, id);
-    assert_eq!(listed.months, [StoredMonth { month: jan, bytes }]);
+    assert_eq!(
+        listed.months,
+        [StoredMonth {
+            month: jan,
+            bytes,
+            record_only: false
+        }]
+    );
     assert_eq!(listed.funding_bytes, None);
 
     let report = store.delete_months(&id, jan, jan).expect("deletes");

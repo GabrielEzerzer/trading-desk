@@ -533,7 +533,8 @@ fn read_also_traded(
         }
         let funding = store.load_funding(id, range.0, range.1)?;
         if let Some(s) = shortfall(id, checked, &gaps, &closures, !bars.is_empty(), &funding) {
-            if s.candles.first().is_some_and(|g| g.from == range.0) {
+            let at_start = s.candles.first().is_some_and(|g| g.from == range.0);
+            if at_start && lead.is_some() {
                 let unlisted = format!(
                     "the store has no record that a download asked the venue for the start of \
                      that and found nothing there, as before an instrument is listed; {advice} \
@@ -541,6 +542,11 @@ fn read_also_traded(
                     format_minute(range.0)
                 );
                 return Err(s.refused(id, &unlisted, advice));
+            }
+            if at_start && bars.is_empty() && store.recorded_empty(id, range.0, range.1)? {
+                let not_trading = "downloads asked the venue for all of that and it had nothing, \
+                                   so the instrument does not trade in that span";
+                return Err(s.refused(id, not_trading, advice));
             }
             return Err(s.refused(id, advice, advice));
         }

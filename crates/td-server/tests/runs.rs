@@ -2647,6 +2647,41 @@ async fn a_late_first_bar_with_no_record_of_the_empty_months_or_a_later_day_miss
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_perpetual_with_no_bar_in_the_range_is_refused_as_not_downloaded_or_as_not_trading() {
+    let t = TestServer::seeded(LATE_DAYS).await;
+    let config = late_config();
+    let body = serde_json::to_value(&config).unwrap();
+    let refused = |answer: &Value| {
+        assert_eq!(answer["error"]["code"], "data_missing", "{answer}");
+        answer["error"]["message"].as_str().unwrap().to_string()
+    };
+    let (status, answer) = t.post("/runs/backtest", &body).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{answer}");
+    let absent = refused(&answer);
+    assert!(
+        absent.contains(
+            "binance:BBBUSDT:perpetual candles from 2024-03-01 00:00 to 2024-06-09 00:00 UTC; \
+             an instrument traded beside the first is not downloaded with the run, so download \
+             it first"
+        ) && !absent.contains("no record"),
+        "{absent}"
+    );
+
+    record_unlisted(&t.store, &second_perpetual().id, t0(), config.to);
+    let (status, answer) = t.post("/runs/backtest", &body).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{answer}");
+    let not_trading = refused(&answer);
+    assert!(
+        not_trading.contains(
+            "binance:BBBUSDT:perpetual candles from 2024-03-01 00:00 to 2024-06-09 00:00 UTC; \
+             downloads asked the venue for all of that and it had nothing, so the instrument \
+             does not trade in that span"
+        ) && !not_trading.contains("download it"),
+        "{not_trading}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn sweeps_out_of_sample_and_walk_forward_runs_trade_beside_a_perpetual_listed_months_in() {
     let t = TestServer::seeded(LATE_DAYS).await;
     seed_late_second(&t.store, 0..0, true);
