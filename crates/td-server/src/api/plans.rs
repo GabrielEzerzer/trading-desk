@@ -103,6 +103,9 @@ pub struct PlanRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub series: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub also_traded: Option<Vec<InstrumentId>>,
 }
 
 /// What a plan job kept: one entry per instrument whose battery finished or reached the luck test
@@ -225,9 +228,59 @@ pub(super) async fn start(
 
     // The trading rules of each instrument, from the venue's list as `GET /instruments` gives it
     // (cached per server run).
+    let instruments = trading_rules(&state, &ids).await?;
+    let also_traded = trading_rules(&state, request.also_traded.as_deref().unwrap_or(&[])).await?;
+
+    // The store must hold each instrument's period, and the period must end by the data cutoff;
+    // nothing is downloaded.
+    let (store, checked) = (state.store.clone(), entry.clone());
+    let (to_check, cutoff) = (instruments.clone(), state.data_cutoff.clone());
+    let (named, named_series) = (references.clone(), series.clone());
+    let named_traded = also_traded.clone();
+    tokio::task::spawn_blocking(move || {
+        to_check.into_iter().try_for_each(|i| {
+            let mut config = checked.plan.backtest_config(checked.name, i);
+            config.references = named.clone();
+            config.series = named_series.clone();
+            config.also_traded = named_traded.clone();
+            check_run_data(&store, &config, cutoff.as_ref())
+        })
+    })
+    .await
+    .map_err(|e| ApiError::internal(format!("the data check stopped: {e}")))??;
+
+    let (store, runs_dir) = (state.store.clone(), state.runs_dir());
+    let job_request = JobRequest::Plan(PlanRequest {
+        strategy: request.strategy,
+        instruments: Some(ids),
+        references: request.references,
+        series: request.series,
+        also_traded: request.also_traded,
+    });
+    let cutoff = state.data_cutoff.clone();
+    let job = state.jobs.submit(job_request, move |ctx| {
+        execute(
+            &entry,
+            &instruments,
+            &references,
+            &series,
+            &also_traded,
+            &store,
+            cutoff.as_ref(),
+            &runs_dir,
+            ctx,
+        )
+    })?;
+    Ok((StatusCode::ACCEPTED, Json(JobCreated { job_id: job.id })))
+}
+
+async fn trading_rules(
+    state: &AppState,
+    ids: &[InstrumentId],
+) -> Result<Vec<Instrument>, ApiError> {
     let mut instruments = Vec::with_capacity(ids.len());
-    for id in &ids {
-        let listed = instrument_list(&state, id.venue, id.kind).await?;
+    for id in ids {
+        let listed = instrument_list(state, id.venue, id.kind).await?;
         let instrument = listed
             .instruments
             .into_iter()
@@ -243,44 +296,7 @@ pub(super) async fn start(
             })?;
         instruments.push(instrument);
     }
-
-    // The store must hold each instrument's period, and the period must end by the data cutoff;
-    // nothing is downloaded.
-    let (store, checked) = (state.store.clone(), entry.clone());
-    let (to_check, cutoff) = (instruments.clone(), state.data_cutoff.clone());
-    let (named, named_series) = (references.clone(), series.clone());
-    tokio::task::spawn_blocking(move || {
-        to_check.into_iter().try_for_each(|i| {
-            let mut config = checked.plan.backtest_config(checked.name, i);
-            config.references = named.clone();
-            config.series = named_series.clone();
-            check_run_data(&store, &config, cutoff.as_ref())
-        })
-    })
-    .await
-    .map_err(|e| ApiError::internal(format!("the data check stopped: {e}")))??;
-
-    let (store, runs_dir) = (state.store.clone(), state.runs_dir());
-    let job_request = JobRequest::Plan(PlanRequest {
-        strategy: request.strategy,
-        instruments: Some(ids),
-        references: request.references,
-        series: request.series,
-    });
-    let cutoff = state.data_cutoff.clone();
-    let job = state.jobs.submit(job_request, move |ctx| {
-        execute(
-            &entry,
-            &instruments,
-            &references,
-            &series,
-            &store,
-            cutoff.as_ref(),
-            &runs_dir,
-            ctx,
-        )
-    })?;
-    Ok((StatusCode::ACCEPTED, Json(JobCreated { job_id: job.id })))
+    Ok(instruments)
 }
 
 /// The job: loads every instrument's data, then runs and saves one battery after another.
@@ -290,6 +306,7 @@ fn execute(
     instruments: &[Instrument],
     references: &[InstrumentId],
     series: &[String],
+    also_traded: &[Instrument],
     store: &Store,
     cutoff: Option<&DataCutoff>,
     runs_dir: &Path,
@@ -303,8 +320,9 @@ fn execute(
         let mut config = entry.plan.backtest_config(entry.name, instrument.clone());
         config.references = references.to_vec();
         config.series = series.to_vec();
+        config.also_traded = also_traded.to_vec();
         let data = load_run_data(store, &config, cutoff).map_err(changed_since_accepted)?;
-        let spec = battery_spec(entry, instrument);
+        let spec = battery_spec(entry, instrument, also_traded);
         totals.push(td_engine::battery_runs(&spec, &data.bars).map_err(tester_error)?);
         loaded.push(data);
         ctx.checkpoint()?;
@@ -319,7 +337,7 @@ fn execute(
     let mut base = 0;
     for (i, ((instrument, data), runs)) in instruments.iter().zip(&loaded).zip(&totals).enumerate()
     {
-        let spec = battery_spec(entry, instrument);
+        let spec = battery_spec(entry, instrument, also_traded);
         let id = &instrument.id;
         let step = (grand / 200).max(1);
         let progress = |count: usize, total: usize| {
@@ -341,13 +359,14 @@ fn execute(
         // The asks are empty for a kind without quotes; for one with quotes every run of the
         // battery trades on them.
         let outcome = own_pool(|| {
-            td_engine::run_battery_with_references(
+            td_engine::run_battery_with_traded(
                 &spec,
                 &data.bars,
                 &data.asks,
                 &data.funding,
                 &data.references,
                 &data.series,
+                &data.also_traded,
                 Some(&progress),
             )
         });
@@ -361,7 +380,7 @@ fn execute(
             }
             Err(e) => return Err(failed(done, e)),
         };
-        match save_plan_run(entry, instrument, battery, data, cutoff, runs_dir) {
+        match save_plan_run(&spec, battery, data, cutoff, runs_dir) {
             Ok(saved) => done.instruments.push(saved),
             Err(e) => return Err(failed(done, e)),
         }
@@ -394,35 +413,38 @@ fn failed(done: PlanDone, e: JobError) -> JobError {
     }
 }
 
-fn battery_spec<'a>(entry: &'a StrategyEntry, instrument: &'a Instrument) -> BatterySpec<'a> {
+fn battery_spec<'a>(
+    entry: &'a StrategyEntry,
+    instrument: &'a Instrument,
+    also_traded: &'a [Instrument],
+) -> BatterySpec<'a> {
     BatterySpec {
         strategy: entry.name,
         plan: &entry.plan,
         rule: &entry.rule,
         instrument,
-        also_traded: &[],
+        also_traded,
         seed: plan_seed(entry.name, &instrument.id),
     }
 }
 
 /// Saves one instrument's battery with its data report and verdict record, in one atomic save.
 fn save_plan_run(
-    entry: &StrategyEntry,
-    instrument: &Instrument,
+    spec: &BatterySpec,
     battery: td_engine::BatteryResult,
     data: &RunData,
     cutoff: Option<&DataCutoff>,
     runs_dir: &Path,
 ) -> Result<PlanInstrumentDone, JobError> {
-    let run_record = RunRecord::new(entry.name, cutoff);
+    let run_record = RunRecord::new(spec.strategy, cutoff);
     let record = VerdictRecord {
-        strategy: entry.name.to_string(),
-        instrument: instrument.id.clone(),
+        strategy: spec.strategy.to_string(),
+        instrument: spec.instrument.id.clone(),
         seed: battery.seed,
         engine_revision: ENGINE_REVISION,
         verdict: battery.verdict.clone(),
-        plan: to_json(&entry.plan)?,
-        rule: to_json(&entry.rule)?,
+        plan: to_json(spec.plan)?,
+        rule: to_json(spec.rule)?,
         // Only a cancel during the luck test leaves a battery incomplete.
         complete: !battery.luck_cancelled,
         code_hash: run_record.code_hash.clone(),
@@ -432,16 +454,17 @@ fn save_plan_run(
             .map(|r| r.instrument.clone())
             .collect(),
         series: data.series.iter().map(|s| s.name.clone()).collect(),
-        also_traded: Vec::new(),
+        also_traded: spec.also_traded.iter().map(|i| i.id.clone()).collect(),
     };
-    let run = PlanRun::with_references(
-        &battery_spec(entry, instrument),
+    let run = PlanRun::with_traded(
+        spec,
         battery,
         &data.bars,
         &data.asks,
         &data.funding,
         &data.references,
         &data.series,
+        &data.also_traded,
     )
     .map_err(|e| ApiError::internal(e.to_string()))?;
     let record_json = serde_json::to_vec_pretty(&record)
@@ -540,7 +563,15 @@ mod tests {
 
     /// A verdict of `entry` on `instrument` as it is now, saved as run `run_id` under `runs_dir`.
     fn save_verdict(runs_dir: &Path, run_id: &str, entry: &StrategyEntry, on: &InstrumentId) {
-        save_verdict_with(runs_dir, run_id, entry, on, Vec::new(), Vec::new());
+        save_verdict_with(
+            runs_dir,
+            run_id,
+            entry,
+            on,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
     }
 
     /// [`save_verdict`] for a battery whose runs named `references` and `series`.
@@ -551,6 +582,7 @@ mod tests {
         on: &InstrumentId,
         references: Vec<InstrumentId>,
         series: Vec<String>,
+        also_traded: Vec<InstrumentId>,
     ) {
         let record = VerdictRecord {
             strategy: entry.name.into(),
@@ -564,7 +596,7 @@ mod tests {
             code_hash: td_engine::code_hash(entry.name).map(String::from),
             references,
             series,
-            also_traded: Vec::new(),
+            also_traded,
         };
         let dir = runs_dir.join(run_id);
         fs::create_dir_all(&dir).unwrap();
@@ -629,6 +661,7 @@ mod tests {
             &on,
             vec![reference.clone()],
             Vec::new(),
+            Vec::new(),
         );
 
         let named = RunId::parse(newer).unwrap();
@@ -691,7 +724,15 @@ mod tests {
         let (older, newer) = ("1700000000000-0000000a", "1700000000001-0000000b");
         save_verdict(dir.path(), older, &entry, &on);
         let series = vec!["made_up".to_string()];
-        save_verdict_with(dir.path(), newer, &entry, &on, Vec::new(), series.clone());
+        save_verdict_with(
+            dir.path(),
+            newer,
+            &entry,
+            &on,
+            Vec::new(),
+            series.clone(),
+            Vec::new(),
+        );
 
         let why = format!(
             "run {newer} was judged with the series made_up, and a session cannot feed a series yet"
@@ -733,6 +774,65 @@ mod tests {
                 .get("series")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn a_session_is_never_linked_to_a_verdict_judged_trading_other_instruments() {
+        let dir = tempfile::tempdir().unwrap();
+        let entry = td_engine::find_strategy("sma_cross").unwrap();
+        let on = entry.plan.instruments[0].clone();
+        let second = InstrumentId {
+            symbol: "BBBUSDT".into(),
+            ..on.clone()
+        };
+        let (older, newer) = ("1700000000000-0000000a", "1700000000001-0000000b");
+        save_verdict(dir.path(), older, &entry, &on);
+        let traded = vec![second.clone()];
+        save_verdict_with(
+            dir.path(),
+            newer,
+            &entry,
+            &on,
+            Vec::new(),
+            Vec::new(),
+            traded,
+        );
+
+        let why = format!(
+            "run {newer} was judged trading {second} beside {on}, and a session trades one \
+             instrument"
+        );
+        let named = RunId::parse(newer).unwrap();
+        let refused = session_link(dir.path(), &entry, &on, Some(&named), &[]).unwrap_err();
+        assert_eq!(refused.body.code, "invalid_verdict");
+        assert!(
+            refused.body.message.contains(&why),
+            "{}",
+            refused.body.message
+        );
+        let latest = session_link(dir.path(), &entry, &on, None, &[]).unwrap_err();
+        assert_eq!(latest.body.code, "invalid_verdict");
+        assert!(
+            latest.body.message.contains(&format!(
+                "{why}; it is the strategy's latest verdict on {on}, so name a verdict judged \
+                 trading {on} alone in `verdict_run_id`"
+            )),
+            "{}",
+            latest.body.message
+        );
+        let fed = std::slice::from_ref(&second);
+        let as_reference = session_link(dir.path(), &entry, &on, Some(&named), fed).unwrap_err();
+        assert!(
+            as_reference.body.message.contains(&why),
+            "{}",
+            as_reference.body.message
+        );
+        let plain = RunId::parse(older).unwrap();
+        let link = session_link(dir.path(), &entry, &on, Some(&plain), &[]).unwrap();
+        assert_eq!(link.verdict.unwrap().run_id, plain);
+
+        let rows = latest_verdicts(dir.path(), std::slice::from_ref(&entry), None).unwrap();
+        assert_eq!(rows[0].also_traded, vec![second]);
     }
 
     #[test]

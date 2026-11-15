@@ -2632,7 +2632,7 @@ references?: Array<InstrumentId>,
  * in place in time. A paper or live session cannot start from a verdict judged with them.
  * None when left out.
  */
-series?: Array<string>, };
+series?: Array<string>, also_traded?: Array<InstrumentId>, };
 
 /**
  * What a plan job kept: one entry per instrument whose battery finished or reached the luck test

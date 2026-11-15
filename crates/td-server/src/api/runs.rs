@@ -41,9 +41,9 @@ use td_data::{
     Closures, DataError, Gap, LoadedCandles, MonthQuotes, Store, missing_minutes, resample,
 };
 use td_engine::{
-    BacktestConfig, ENGINE_REVISION, EngineError, RECORD_FILE, RUNS_DIR, ReferenceBars, RunId,
-    RunSummary, SavedRun, Series, StoreError, TesterError, code_matches,
-    config_fingerprint_with_references,
+    AlsoTradedBars, BacktestConfig, ENGINE_REVISION, EngineError, RECORD_FILE, RUNS_DIR,
+    ReferenceBars, RunId, RunSummary, SavedRun, Series, StoreError, TesterError, code_matches,
+    config_fingerprint_with_traded,
 };
 use ts_rs::TS;
 
@@ -289,6 +289,7 @@ pub struct RunData {
     /// The rows of each series the configuration names, from the data folder, up to the end of
     /// the data cutoff date when there is one ([`read_series`]); empty when it names none.
     pub series: Vec<Series>,
+    pub also_traded: Vec<AlsoTradedBars>,
     pub report: DataReport,
 }
 
@@ -482,17 +483,9 @@ fn read_references(store: &Store, config: &BacktestConfig) -> Result<Vec<Referen
     }
     config.check_references().map_err(engine_error)?;
     let (from, to) = data_range(config)?;
-    let months = Month::range(from, to);
     let mut references = Vec::with_capacity(config.references.len());
     for id in &config.references {
-        let mut minutes = Vec::new();
-        for stored in read_months(store, id, &months) {
-            let (bids, _) = stored?;
-            minutes.extend(bids.iter().filter(|c| (from..to).contains(&c.open_time)));
-        }
-        let closures = store.closures(id, from, to)?;
-        let gaps = closures.remove(missing_minutes(id.kind, &minutes, from, to));
-        let bars = resample(id.kind, &minutes, config.timeframe, false).candles;
+        let (bars, gaps, closures) = stored_bids(store, config, id)?;
         let mut missing = long_gaps(id.kind, &gaps, &closures);
         if missing.is_empty() && bars.is_empty() {
             missing.push(Gap { from, to });
@@ -510,6 +503,51 @@ fn read_references(store: &Store, config: &BacktestConfig) -> Result<Vec<Referen
         });
     }
     Ok(references)
+}
+
+fn read_also_traded(
+    store: &Store,
+    config: &BacktestConfig,
+) -> Result<Vec<AlsoTradedBars>, ApiError> {
+    if config.also_traded.is_empty() {
+        return Ok(Vec::new());
+    }
+    config.check_traded().map_err(engine_error)?;
+    let range = data_range(config)?;
+    let advice = "an instrument traded beside the first is not downloaded with the run, so \
+                  download it first";
+    let mut also_traded = Vec::with_capacity(config.also_traded.len());
+    for instrument in &config.also_traded {
+        let id = &instrument.id;
+        let (bars, gaps, closures) = stored_bids(store, config, id)?;
+        let funding = store.load_funding(id, range.0, range.1)?;
+        if let Some(s) = shortfall(id, range, &gaps, &closures, !bars.is_empty(), &funding) {
+            return Err(s.refused(id, advice, advice));
+        }
+        also_traded.push(AlsoTradedBars {
+            instrument: id.clone(),
+            bars,
+            funding,
+        });
+    }
+    Ok(also_traded)
+}
+
+fn stored_bids(
+    store: &Store,
+    config: &BacktestConfig,
+    id: &InstrumentId,
+) -> Result<(Vec<Candle>, Vec<Gap>, Closures), ApiError> {
+    let (from, to) = data_range(config)?;
+    let mut minutes = Vec::new();
+    for stored in read_months(store, id, &Month::range(from, to)) {
+        let (bids, _) = stored?;
+        minutes.extend(bids.iter().filter(|c| (from..to).contains(&c.open_time)));
+    }
+    let closures = store.closures(id, from, to)?;
+    let gaps = closures.remove(missing_minutes(id.kind, &minutes, from, to));
+    let bars = resample(id.kind, &minutes, config.timeframe, false).candles;
+    Ok((bars, gaps, closures))
 }
 
 /// The rows of each series `config` names ([`BacktestConfig::series`]), from
@@ -550,9 +588,9 @@ pub fn check_run_data(
 
 /// What [`check_run_data`] finds the store lacks of a configuration's range; `None` when it can
 /// run. A 400 for a bad range, a 422 `after_cutoff` for a range that ends after `cutoff`, checked
-/// before the store is read, and a 422 for a month without its asks. The reference instruments
-/// and series the configuration names are checked too, and one the store lacks is a refusal, not
-/// a shortfall, since a run does not download them ([`read_references`], [`read_series`]).
+/// before the store is read, and a 422 for a month without its asks. The reference instruments,
+/// series and other traded instruments the configuration names are checked too, and one the store
+/// lacks is a refusal, not a shortfall, since a run does not download them.
 pub(super) fn run_shortfall(
     store: &Store,
     config: &BacktestConfig,
@@ -605,7 +643,15 @@ pub(super) fn run_shortfall(
     let gaps = closures.remove(gaps);
     read_references(store, config)?;
     read_series(store, config, cutoff)?;
-    Ok(shortfall(config, &gaps, &closures, any_bar, &funding))
+    read_also_traded(store, config)?;
+    Ok(shortfall(
+        id,
+        (from, to),
+        &gaps,
+        &closures,
+        any_bar,
+        &funding,
+    ))
 }
 
 /// The stored 1-minute bids of each of `months`, in order, and for a kind whose rules require
@@ -674,33 +720,36 @@ pub(super) struct Shortfall {
 impl Shortfall {
     /// The 422 `data_missing` refusing the run, naming the missing candles first.
     fn refusal(&self, id: &InstrumentId) -> ApiError {
+        self.refused(id, "download them first", "download the range again")
+    }
+
+    fn refused(&self, id: &InstrumentId, candles_advice: &str, funding_advice: &str) -> ApiError {
         if self.candles.is_empty() {
             data_missing(format!(
-                "the store has no {id} funding rates {}; download the range again",
+                "the store has no {id} funding rates {}; {funding_advice}",
                 spans(&self.funding.iter().collect::<Vec<_>>())
             ))
         } else {
             data_missing(format!(
-                "the store has no {id} candles {}; download them first",
+                "the store has no {id} candles {}; {candles_advice}",
                 spans(&self.candles.iter().collect::<Vec<_>>())
             ))
         }
     }
 }
 
-/// What the store's data lacks to run a configuration whose range is checked, given its missing
+/// What the store's data of `id` lacks over a checked range `(from, to)`, given its missing
 /// minutes as [`missing_minutes`] gives them less the recorded `closures`: a stretch of them
 /// holding its limit or more of open time ([`long_gaps`]), [`max_gap`] or more without funding
 /// rates for a perpetual, or no bar at all. `None` when it can run.
 fn shortfall(
-    config: &BacktestConfig,
+    id: &InstrumentId,
+    (from, to): (Millis, Millis),
     gaps: &[Gap],
     closures: &Closures,
     any_bar: bool,
     funding: &[(Millis, f64)],
 ) -> Option<Shortfall> {
-    let id = &config.instrument.id;
-    let (from, to) = (config.warmup_from.unwrap_or(config.from), config.to);
     let mut candles = long_gaps(id.kind, gaps, closures);
     if candles.is_empty() && !any_bar {
         candles.push(Gap { from, to });
@@ -814,11 +863,13 @@ fn load_or_shortfall(
         funding,
     } = read_data(store, config)?;
     let any_bar = !loaded.candles.is_empty();
-    if let Some(s) = shortfall(config, &gaps, &closures, any_bar, &funding) {
+    let id = &config.instrument.id;
+    if let Some(s) = shortfall(id, (from, to), &gaps, &closures, any_bar, &funding) {
         return Ok(Err(s));
     }
     let references = read_references(store, config)?;
     let series = read_series(store, config, cutoff)?;
+    let also_traded = read_also_traded(store, config)?;
     // Every bucket in the range with no bar: td-data's `dropped` lists only the incomplete ones,
     // not those with no minute at all. Bars are sorted and inside the range, which starts and
     // ends on bar boundaries. A bucket wholly in closed hours or recorded closures has no bar to
@@ -860,6 +911,7 @@ fn load_or_shortfall(
         funding,
         references,
         series,
+        also_traded,
         report,
     }))
 }
@@ -961,6 +1013,7 @@ fn execute(
         funding,
         references,
         series,
+        also_traded,
         report,
     } = data;
     ctx.checkpoint()?;
@@ -972,26 +1025,28 @@ fn execute(
         }
         JobRequest::Backtest(config) => {
             ctx.progress(0.0, "running the backtest");
-            let result = td_engine::run_with_references(
+            let result = td_engine::run_with_traded(
                 config,
                 &bars,
                 &asks,
                 &funding,
                 &references,
                 &series,
+                &also_traded,
             )
             .map_err(engine_error)?;
             SavedRun::Backtest(Box::new(result))
         }
         JobRequest::Sweep(spec) => {
             let result = own_pool(|| {
-                td_engine::sweep_with_references(
+                td_engine::sweep_with_traded(
                     spec,
                     &bars,
                     &asks,
                     &funding,
                     &references,
                     &series,
+                    &also_traded,
                     Some(&progress),
                 )
             })?;
@@ -999,13 +1054,14 @@ fn execute(
         }
         JobRequest::Oos(spec) => {
             let result = own_pool(|| {
-                td_engine::out_of_sample_with_references(
+                td_engine::out_of_sample_with_traded(
                     spec,
                     &bars,
                     &asks,
                     &funding,
                     &references,
                     &series,
+                    &also_traded,
                     Some(&progress),
                 )
             })?;
@@ -1013,13 +1069,14 @@ fn execute(
         }
         JobRequest::WalkForward(spec) => {
             let result = own_pool(|| {
-                td_engine::walk_forward_with_references(
+                td_engine::walk_forward_with_traded(
                     spec,
                     &bars,
                     &asks,
                     &funding,
                     &references,
                     &series,
+                    &also_traded,
                     Some(&progress),
                 )
             })?;
@@ -1147,6 +1204,7 @@ pub fn check_run(store: &Store, run: &SavedRun) -> RunCheck {
         .ok()
         .and_then(|d| {
             let references = read_references(store, base).ok()?;
+            let also_traded = read_also_traded(store, base).ok()?;
             // Only rows known by the close of the run's last bar are in its fingerprint, and that
             // close is at or before `to`, so reading stops at `to`: a later row, malformed or not,
             // is not read, and the cutoff the run was made under does not matter here.
@@ -1156,13 +1214,14 @@ pub fn check_run(store: &Store, run: &SavedRun) -> RunCheck {
                 .map(|name| td_engine::read_series(store.root(), name, Some(base.to)))
                 .collect::<Result<Vec<_>, _>>()
                 .ok()?;
-            config_fingerprint_with_references(
+            config_fingerprint_with_traded(
                 base,
                 &d.loaded.candles,
                 &d.asks,
                 &d.funding,
                 &references,
                 &series,
+                &also_traded,
             )
             .ok()
         })
