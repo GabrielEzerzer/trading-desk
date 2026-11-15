@@ -2473,8 +2473,6 @@ mod tests {
         }
     }
 
-    /// Odds simulated with the limits at daily closes say so on their lines, and only there; odds
-    /// that read each day's low need no note.
     #[test]
     fn the_simulated_lines_say_they_leave_out_the_days_without_trading_limit_when_it_is_set() {
         let simulated = ["pass_probability", "breach_probability", "attempt_value"];
@@ -2497,6 +2495,8 @@ mod tests {
         assert_eq!(names(Some(30)), on);
     }
 
+    /// Odds simulated with the limits at daily closes say so on their lines, and only there; odds
+    /// that read each day's low need no note.
     #[test]
     fn prop_firm_odds_checked_at_closes_say_so() {
         let rule = with_attempt(attempt_terms());
