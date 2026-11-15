@@ -817,6 +817,11 @@ export type WindowMode = "rolling" | "anchored";
  * The leftover bars at the start, fewer than `step`, are never tested. In rolling mode the first
  * train sweep is warmed up on them (as many as the train length); in anchored mode every train
  * window starts at the first bar, so they are part of each one's training data.
+ *
+ * An anchored first train window is checked without data at its longest, `train` bars and up to
+ * `step - 1` left over ([`WalkForwardSpec::check`]), and window by window in the data before a
+ * run. A test plan's validation also checks it at `train_days` alone, the shortest a run of the
+ * battery can leave it ([`crate::TestPlan::validate`]).
  */
 export type WindowSpec = { train_bars: number, test_bars: number, step_bars: number, mode: WindowMode, };
 
@@ -1377,14 +1382,26 @@ breach_horizon_days: number,
 sizes_from_starting_cash?: boolean, 
 /**
  * The most open notional the firm allows, as a multiple of the account size, the starting
- * cash. It needs `sizes_from_starting_cash`: at that fixed size the position does not depend
- * on the account's balance, so the figure is the largest open notional of any walk-forward
- * test window the battery's account counts, in that window's own run, over the starting
  * cash. It is read at the points the run's intrabar measures evaluate, as the peak leverage
- * is, so at bar resolution. With `attempt` terms it is taken at the larger of their
- * `evaluation_size` and `funded_size`, so a phase traded at either size that breaches the
- * limit fails the line. A rule that sets it at a compounding size is refused, since the open
- * notional there depends on each attempt's balance, which this figure does not follow.
+ * is, so at bar resolution.
+ *
+ * With `sizes_from_starting_cash` the position does not depend on the account's balance, so
+ * the limit is its own line: the largest open notional of any walk-forward test window the
+ * battery's account counts, in that window's own run, over the starting cash. With `attempt`
+ * terms it is taken at the larger of their `evaluation_size` and `funded_size`, so a phase
+ * traded at either size that breaches the limit fails the line.
+ *
+ * At a compounding size the position grows and shrinks with each attempt's balance, so the
+ * attempt walks check it, as they check the loss limits and `max_days_without_trading`: each
+ * day's largest open notional of the walk-forward curve over the curve's equity at the
+ * day's start, times the attempt's balance going into the day over the account size, times
+ * the phase's size, on every day of the evaluation and of the funded account. A day above
+ * the limit ends the account as a breach, so the pass and breach chances and the attempt's
+ * value carry it, and there is no line of its own. The size multiplies the figure as it
+ * multiplies each daily return, which is exact at a size of 1. At another size, a position
+ * sized from equity the run has moved by `g` since the day's start holds about
+ * `(size - 1) * g` more than this reads: slightly more after a gain at a size above 1.
+ *
  * `None`, the default, sets no limit and is left out of JSON.
  */
 max_open_notional_multiple?: number | null, };
@@ -1838,8 +1855,9 @@ limits_inside_day?: boolean,
  * The largest open notional inside any bar of a test window the fixed-size account counts, in
  * that window's own run, over the starting cash, at the larger of the evaluation and funded
  * sizes when the rule has `attempt` terms. Read for a `prop_firm` rule with
- * `max_open_notional_multiple`, which needs `sizes_from_starting_cash`, and `None` otherwise
- * (see that field). Left out when `None`.
+ * `max_open_notional_multiple` and `sizes_from_starting_cash`, and `None` otherwise: at a
+ * compounding size the attempt walks check the limit instead (see that field). Left out when
+ * `None`.
  */
 peak_open_notional?: number | null, };
 
@@ -1989,7 +2007,8 @@ export type PropFirmOdds = {
 pass: number, 
 /**
  * The fraction of paths that breach a limit within the horizon (an account that goes
- * `max_days_without_trading` days without a trading day counts as breached): in a phase of
+ * `max_days_without_trading` days without a trading day, or holds more open notional than
+ * the rule's `max_open_notional_multiple` allows, counts as breached): in a phase of
  * the evaluation, or after the last phase passes, trading on as the funded account from a fresh
  * balance and a fresh peak, as a firm starts each phase and the funded account again at the
  * account size. With attempt terms the funded account takes its payouts by them, which

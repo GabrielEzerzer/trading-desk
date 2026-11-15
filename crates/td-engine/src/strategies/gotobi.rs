@@ -20,7 +20,7 @@ use crate::{
     BacktestSettings, Context, Direction, EngineError, EvidenceSettings, HighRiskLimits, Metric,
     MinSample, Objective, ParamAxis, ParamKind, ParamSpace, ParamSpec, ParamValue, Params, Period,
     SlippageOverride, Strategy, StrategyEntry, SweepPlan, TestPlan, VerdictRule, WalkForwardPlan,
-    WindowMode, date,
+    date,
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -283,55 +283,39 @@ fn plan() -> TestPlan {
         symbol: "USDJPY".into(),
         kind: InstrumentKind::Fx,
     };
-    TestPlan {
-        instruments: vec![usdjpy()],
-        timeframe: Timeframe::M5,
-        period: Period {
-            from: date(2016, 1, 1),
-            to: date(2026, 10, 31),
-        },
-        backtest: BacktestSettings {
-            starting_cash: 100_000.0,
-            max_leverage: 30.0,
-            slippage: vec![SlippageOverride {
-                instrument: usdjpy(),
-                bps: 0.0,
-            }],
+    TestPlan::new(
+        vec![usdjpy()],
+        Timeframe::M5,
+        Period::new(date(2016, 1, 1), date(2026, 10, 31)),
+        BacktestSettings {
             account_currency: AccountCurrency::Base,
-            fee_override: None,
+            ..BacktestSettings::new(100_000.0, 30.0, vec![SlippageOverride::new(usdjpy(), 0.0)])
         },
-        sweep: SweepPlan {
-            fixed: Params::new()
+        SweepPlan::new(
+            Params::new()
                 .with("risk_pct", ParamValue::Float(0.5))
                 .with("control", ParamValue::Bool(false)),
-            axes: vec![ParamAxis {
-                name: "stop_pips".into(),
-                space: ParamSpace::Range {
+            vec![ParamAxis::new(
+                "stop_pips",
+                ParamSpace::Range {
                     from: 6.0,
                     to: 24.0,
                     step: 3.0,
                 },
-            }],
-            objective: Objective {
-                metric: Metric::Sharpe,
-                direction: Direction::Maximize,
-            },
-            min_trades: 50,
-        },
-        walk_forward: WalkForwardPlan {
-            train_days: 520,
-            test_days: 130,
-            mode: WindowMode::Rolling,
-        },
-        out_of_sample: None,
-        evidence: EvidenceSettings {
+            )],
+            Objective::new(Metric::Sharpe, Direction::Maximize),
+            50,
+        ),
+        // 520 train days and 130 test days, in rolling windows.
+        WalkForwardPlan::new(520, 130),
+        EvidenceSettings {
             min_sample: MinSample {
                 trades: 200,
                 ..EvidenceSettings::default().min_sample
             },
             ..EvidenceSettings::default()
         },
-    }
+    )
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -371,12 +355,10 @@ fn plan() -> TestPlan {
 /// so this rule's verdict can be inconclusive at best until that test runs on FX. An inconclusive
 /// verdict here says the battery is incomplete, not that the edge is in doubt.
 fn rule() -> VerdictRule {
-    VerdictRule::HighRisk {
-        limits: HighRiskLimits {
-            min_trades: 200,
-            ..HighRiskLimits::default()
-        },
-    }
+    VerdictRule::high_risk(HighRiskLimits {
+        min_trades: 200,
+        ..HighRiskLimits::default()
+    })
 }
 
 #[cfg(test)]

@@ -140,7 +140,7 @@ pub struct FirmLimits {
 /// position closes all of the old one (and opens a new one, which is not a close). Positions and
 /// their average entry prices are tracked per instrument across the fills.
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TradingDayTest {
     /// Only a closing fill can count, on the day the close happens: a day that only opens or
@@ -244,6 +244,79 @@ pub struct AttemptTerms {
     /// and 1: 0.5 asks what an attempt is worth if the edge is half what the test shows.
     #[serde(default = "default_reduced_edge_factor")]
     pub reduced_edge_factor: f64,
+}
+
+impl FirmLimits {
+    /// A one-phase challenge with none of the optional rules.
+    pub fn new(
+        daily_loss: f64,
+        max_drawdown: f64,
+        drawdown: DrawdownMode,
+        profit_target: f64,
+    ) -> Self {
+        FirmLimits {
+            daily_loss,
+            max_drawdown,
+            drawdown,
+            profit_target,
+            second_target: None,
+            min_trading_days: 0,
+            best_day_share: None,
+            day_target_share: None,
+            trading_day: None,
+            trailing_floor_lock: None,
+            day_rollover: None,
+            max_days_without_trading: None,
+        }
+    }
+}
+
+/// The fields of [`AttemptTerms`] that have no default, for [`AttemptTerms::new`]. They are named
+/// here rather than passed in order because two are amounts, one is a share and three are day
+/// counts, which a list of arguments would let a strategy swap without a compiler error.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RequiredAttemptTerms {
+    pub account_size: f64,
+    pub evaluation_fee: f64,
+    pub profit_split: f64,
+    pub days_to_first_payout: u32,
+    pub payout_interval_days: u32,
+    pub funded_horizon_days: u32,
+}
+
+impl AttemptTerms {
+    /// Terms with no pass fee, refund, calendar wait, smallest payout, cap or payout limit, no
+    /// floor lock or balance reset, both accounts traded at the tested size, and the reduced edge
+    /// at half.
+    pub fn new(required: RequiredAttemptTerms) -> Self {
+        let RequiredAttemptTerms {
+            account_size,
+            evaluation_fee,
+            profit_split,
+            days_to_first_payout,
+            payout_interval_days,
+            funded_horizon_days,
+        } = required;
+        AttemptTerms {
+            account_size,
+            evaluation_fee,
+            pass_fee: 0.0,
+            refund_fee_with_first_payout: false,
+            profit_split,
+            days_to_first_payout,
+            calendar_days_to_first_payout: None,
+            payout_interval_days,
+            min_payout: 0.0,
+            payout_cap: None,
+            max_payouts: None,
+            payout_locks_floor: false,
+            payout_resets_balance: false,
+            funded_horizon_days,
+            evaluation_size: one(),
+            funded_size: one(),
+            reduced_edge_factor: default_reduced_edge_factor(),
+        }
+    }
 }
 
 fn is_zero(n: &u32) -> bool {
@@ -351,14 +424,26 @@ pub struct PropFirmLimits {
     #[serde(default, skip_serializing_if = "is_false")]
     pub sizes_from_starting_cash: bool,
     /// The most open notional the firm allows, as a multiple of the account size, the starting
-    /// cash. It needs `sizes_from_starting_cash`: at that fixed size the position does not depend
-    /// on the account's balance, so the figure is the largest open notional of any walk-forward
-    /// test window the battery's account counts, in that window's own run, over the starting
     /// cash. It is read at the points the run's intrabar measures evaluate, as the peak leverage
-    /// is, so at bar resolution. With `attempt` terms it is taken at the larger of their
-    /// `evaluation_size` and `funded_size`, so a phase traded at either size that breaches the
-    /// limit fails the line. A rule that sets it at a compounding size is refused, since the open
-    /// notional there depends on each attempt's balance, which this figure does not follow.
+    /// is, so at bar resolution.
+    ///
+    /// With `sizes_from_starting_cash` the position does not depend on the account's balance, so
+    /// the limit is its own line: the largest open notional of any walk-forward test window the
+    /// battery's account counts, in that window's own run, over the starting cash. With `attempt`
+    /// terms it is taken at the larger of their `evaluation_size` and `funded_size`, so a phase
+    /// traded at either size that breaches the limit fails the line.
+    ///
+    /// At a compounding size the position grows and shrinks with each attempt's balance, so the
+    /// attempt walks check it, as they check the loss limits and `max_days_without_trading`: each
+    /// day's largest open notional of the walk-forward curve over the curve's equity at the
+    /// day's start, times the attempt's balance going into the day over the account size, times
+    /// the phase's size, on every day of the evaluation and of the funded account. A day above
+    /// the limit ends the account as a breach, so the pass and breach chances and the attempt's
+    /// value carry it, and there is no line of its own. The size multiplies the figure as it
+    /// multiplies each daily return, which is exact at a size of 1. At another size, a position
+    /// sized from equity the run has moved by `g` since the day's start holds about
+    /// `(size - 1) * g` more than this reads: slightly more after a gain at a size above 1.
+    ///
     /// `None`, the default, sets no limit and is left out of JSON.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_open_notional_multiple: Option<f64>,
@@ -470,6 +555,30 @@ impl Default for HighRiskLimits {
 }
 
 impl VerdictRule {
+    /// A `prop_firm` rule. A variant of an enum takes no struct update syntax, so a strategy builds
+    /// this one here, and a field added to the variant with a default is filled here.
+    pub fn prop_firm(
+        firm: FirmLimits,
+        limits: PropFirmLimits,
+        attempt: Option<AttemptTerms>,
+    ) -> Self {
+        VerdictRule::PropFirm {
+            firm,
+            limits,
+            attempt,
+        }
+    }
+
+    /// A `portfolio` rule, built here for the reason [`VerdictRule::prop_firm`] gives.
+    pub fn portfolio(benchmark: PortfolioBenchmark, limits: PortfolioLimits) -> Self {
+        VerdictRule::Portfolio { benchmark, limits }
+    }
+
+    /// A `high_risk` rule, built here for the reason [`VerdictRule::prop_firm`] gives.
+    pub fn high_risk(limits: HighRiskLimits) -> Self {
+        VerdictRule::HighRisk { limits }
+    }
+
     pub fn kind(&self) -> RuleKind {
         match self {
             VerdictRule::PropFirm { .. } => RuleKind::PropFirm,
@@ -576,16 +685,6 @@ impl VerdictRule {
                 }
                 if let Some(multiple) = limits.max_open_notional_multiple {
                     positive("limits.max_open_notional_multiple", multiple)?;
-                    if !limits.sizes_from_starting_cash {
-                        return Err(PlanError(
-                            "limits.max_open_notional_multiple needs \
-                             limits.sizes_from_starting_cash: at a compounding size the open \
-                             notional depends on each attempt's balance, which this limit does not \
-                             follow, so the limit is judged only for a plan sized from the \
-                             starting cash"
-                                .to_string(),
-                        ));
-                    }
                 }
             }
             VerdictRule::Portfolio { limits, .. } => {
@@ -1263,8 +1362,9 @@ pub struct KindInputs {
     /// The largest open notional inside any bar of a test window the fixed-size account counts, in
     /// that window's own run, over the starting cash, at the larger of the evaluation and funded
     /// sizes when the rule has `attempt` terms. Read for a `prop_firm` rule with
-    /// `max_open_notional_multiple`, which needs `sizes_from_starting_cash`, and `None` otherwise
-    /// (see that field). Left out when `None`.
+    /// `max_open_notional_multiple` and `sizes_from_starting_cash`, and `None` otherwise: at a
+    /// compounding size the attempt walks check the limit instead (see that field). Left out when
+    /// `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub peak_open_notional: Option<f64>,
 }
@@ -1379,7 +1479,11 @@ pub fn evaluate(rule: &VerdictRule, x: &KindInputs) -> Vec<Criterion> {
                     Unit::Percent,
                 ),
             ];
-            if let Some(multiple) = limits.max_open_notional_multiple {
+            // At a compounding size the attempt walks check the limit, so it has no line.
+            if let (Some(multiple), true) = (
+                limits.max_open_notional_multiple,
+                limits.sizes_from_starting_cash,
+            ) {
                 let at = if attempt.is_some() {
                     ", at the larger of the evaluation and funded sizes"
                 } else {
@@ -1803,6 +1907,78 @@ impl Verdict {
 mod tests {
     use super::*;
     use td_core::{InstrumentKind, Venue};
+
+    /// What serde reads from `json`, a value holding only the fields that have no default. Each
+    /// constructor and `Default` a strategy builds a rule from must equal it, so a field added
+    /// with a serde default gets the same default there.
+    fn read<T: serde::de::DeserializeOwned>(json: serde_json::Value) -> T {
+        serde_json::from_value(json).unwrap()
+    }
+
+    #[test]
+    fn each_rule_constructor_fills_the_defaults_serde_reads() {
+        use serde_json::json;
+        let firm = FirmLimits::new(0.05, 0.10, DrawdownMode::Trailing, 0.08);
+        assert_eq!(
+            read::<FirmLimits>(json!({
+                "daily_loss": 0.05, "max_drawdown": 0.10, "drawdown": "trailing",
+                "profit_target": 0.08,
+            })),
+            firm
+        );
+        assert_eq!(read::<TradingDayTest>(json!({})), TradingDayTest::default());
+        assert_eq!(
+            read::<AttemptTerms>(json!({
+                "account_size": 100_000.0, "evaluation_fee": 500.0, "profit_split": 0.8,
+                "days_to_first_payout": 5, "payout_interval_days": 14, "funded_horizon_days": 180,
+            })),
+            AttemptTerms::new(RequiredAttemptTerms {
+                account_size: 100_000.0,
+                evaluation_fee: 500.0,
+                profit_split: 0.8,
+                days_to_first_payout: 5,
+                payout_interval_days: 14,
+                funded_horizon_days: 180,
+            })
+        );
+        let limits = PropFirmLimits::default();
+        assert_eq!(
+            read::<PropFirmLimits>(json!({
+                "share_of_firm_limits": 0.5, "min_pass_probability": 0.6,
+                "max_breach_probability": 0.1, "breach_horizon_days": 90,
+            })),
+            limits
+        );
+        assert_eq!(
+            read::<VerdictRule>(json!({"kind": "prop_firm", "firm": firm, "limits": limits})),
+            VerdictRule::prop_firm(firm, limits, None)
+        );
+        assert_eq!(
+            read::<PortfolioLimits>(json!({
+                "min_sharpe": 1.0, "max_drawdown": 0.30, "max_drawdown_vs_benchmark": 0.75,
+                "min_alpha": 0.0, "max_p_mean_not_positive": 0.10,
+            })),
+            PortfolioLimits::default()
+        );
+        assert_eq!(
+            read::<HighRiskLimits>(json!({
+                "min_trades": 50, "min_expectancy": 0.0, "min_expectancy_lower_bound": 0.0,
+                "min_profit_factor": 1.3, "max_risk_of_ruin": 0.05, "ruin_drawdown": 0.5,
+                "min_return_without_best_trade": 0.0,
+            })),
+            HighRiskLimits::default()
+        );
+        assert_eq!(
+            read::<VerdictRule>(json!({
+                "kind": "portfolio", "benchmark": "cash", "limits": PortfolioLimits::default(),
+            })),
+            VerdictRule::portfolio(PortfolioBenchmark::Cash, PortfolioLimits::default())
+        );
+        assert_eq!(
+            read::<VerdictRule>(json!({"kind": "high_risk", "limits": HighRiskLimits::default()})),
+            VerdictRule::high_risk(HighRiskLimits::default())
+        );
+    }
 
     /// The ids of the lines that did not pass, with their outcome.
     fn not_passing(lines: &[Criterion]) -> Vec<(&str, Outcome)> {
@@ -3439,31 +3615,37 @@ mod tests {
         }
     }
 
-    /// A limit on open notional is refused at a compounding size, where the open notional depends
-    /// on each attempt's balance, and the message names both fields.
+    /// A limit on open notional at a compounding size is accepted and has no line of its own: the
+    /// attempt walks check it, so the pass and breach lines carry it, and the kind's lines are
+    /// those of a rule without the limit.
     #[test]
-    fn a_limit_on_open_notional_needs_a_plan_sized_from_the_starting_cash() {
+    fn a_limit_on_open_notional_at_a_compounding_size_is_judged_in_the_attempt_walks() {
         let VerdictRule::PropFirm { firm, limits, .. } = prop(DrawdownMode::Static) else {
             unreachable!()
         };
-        let rule = |sizes_from_starting_cash| VerdictRule::PropFirm {
+        let rule = |max_open_notional_multiple| VerdictRule::PropFirm {
             firm,
             limits: PropFirmLimits {
-                sizes_from_starting_cash,
-                max_open_notional_multiple: Some(2.5),
+                sizes_from_starting_cash: false,
+                max_open_notional_multiple,
                 ..limits
             },
             attempt: None,
         };
-        assert_eq!(rule(true).validate(), Ok(()));
-        let Err(PlanError(message)) = rule(false).validate() else {
-            panic!("a limit on open notional at a compounding size was accepted")
+        let capped = rule(Some(2.5));
+        assert_eq!(capped.validate(), Ok(()));
+        let x = KindInputs {
+            peak_open_notional: Some(9.0),
+            ..good_prop()
         };
-        for field in [
-            "limits.max_open_notional_multiple",
-            "limits.sizes_from_starting_cash",
-        ] {
-            assert!(message.contains(field), "{message}");
+        assert!(
+            evaluate(&capped, &x)
+                .iter()
+                .all(|l| l.id != "open_notional")
+        );
+        assert_eq!(evaluate(&capped, &x), evaluate(&rule(None), &x));
+        for bad in [0.0, -1.0, f64::NAN] {
+            assert!(rule(Some(bad)).validate().is_err(), "{bad}");
         }
     }
 

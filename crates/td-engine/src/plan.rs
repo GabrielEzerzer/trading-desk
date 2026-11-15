@@ -12,6 +12,13 @@
 //! off. [`TestPlan::validate`] refuses values looser than #35's: the minimum sample, the p
 //! thresholds, the cost stress, the plateau and the start offsets can only be made stricter, and
 //! the permutation count can go down to [`MIN_PERMUTATIONS`] for a quicker luck test.
+//!
+//! A strategy file builds its plan and rule with constructors, such as [`TestPlan::new`] and
+//! [`WalkForwardPlan::new`], or from a `Default`, and sets an optional field with struct update
+//! syntax: `WalkForwardPlan { mode: WindowMode::Anchored, ..WalkForwardPlan::new(360, 90) }`. A
+//! constructor takes the fields that have no default and fills every other one with the value
+//! serde gives it when JSON leaves it out. A field added with a default goes into the
+//! constructor, so it leaves every strategy file, and with it the strategy's code hash, as it was.
 
 use serde::{Deserialize, Serialize};
 use td_core::{
@@ -124,7 +131,46 @@ pub struct SlippageOverride {
     pub bps: f64,
 }
 
+impl Period {
+    pub fn new(from: Millis, to: Millis) -> Self {
+        Period { from, to }
+    }
+}
+
+impl SlippageOverride {
+    pub fn new(instrument: InstrumentId, bps: f64) -> Self {
+        SlippageOverride { instrument, bps }
+    }
+}
+
+impl SweepPlan {
+    pub fn new(
+        fixed: Params,
+        axes: Vec<ParamAxis>,
+        objective: Objective,
+        min_trades: usize,
+    ) -> Self {
+        SweepPlan {
+            fixed,
+            axes,
+            objective,
+            min_trades,
+        }
+    }
+}
+
 impl BacktestSettings {
+    /// Settings in the quote currency with each instrument's own fees.
+    pub fn new(starting_cash: f64, max_leverage: f64, slippage: Vec<SlippageOverride>) -> Self {
+        BacktestSettings {
+            starting_cash,
+            max_leverage,
+            slippage,
+            account_currency: AccountCurrency::Quote,
+            fee_override: None,
+        }
+    }
+
     /// The slippage the plan sets for `instrument`, or `None` when it leaves it to the backtest
     /// config's default.
     pub fn slippage_bps(&self, instrument: &InstrumentId) -> Option<f64> {
@@ -327,6 +373,15 @@ impl EvidenceSettings {
 }
 
 impl WalkForwardPlan {
+    /// Rolling windows.
+    pub fn new(train_days: u32, test_days: u32) -> Self {
+        WalkForwardPlan {
+            train_days,
+            test_days,
+            mode: WindowMode::Rolling,
+        }
+    }
+
     /// The windows in bars of `timeframe`.
     pub fn window_spec(&self, timeframe: Timeframe) -> WindowSpec {
         let bars = |days: u32| (i64::from(days) * DAY_MS / timeframe.duration_ms()) as usize;
@@ -341,6 +396,28 @@ impl WalkForwardPlan {
 }
 
 impl TestPlan {
+    /// A plan with no out-of-sample split. The arguments are in the order of the fields.
+    pub fn new(
+        instruments: Vec<InstrumentId>,
+        timeframe: Timeframe,
+        period: Period,
+        backtest: BacktestSettings,
+        sweep: SweepPlan,
+        walk_forward: WalkForwardPlan,
+        evidence: EvidenceSettings,
+    ) -> Self {
+        TestPlan {
+            instruments,
+            timeframe,
+            period,
+            backtest,
+            sweep,
+            walk_forward,
+            out_of_sample: None,
+            evidence,
+        }
+    }
+
     /// The backtest of `strategy` on `instrument` over the plan's period, with the sweep's fixed
     /// parameters and the plan's fee override. The slippage is the plan's for `instrument`, or
     /// [`default_slippage_bps`] for it when the plan sets none.
@@ -529,9 +606,9 @@ impl TestPlan {
                 ));
             }
             // The tester checks an anchored first train window at its longest: `train_days` and
-            // the bars left over before the first test window. A start-offset run ends earlier, so
-            // it has fewer bars left over, down to none. `train_days` alone is the shortest the
-            // first train window gets in any run of the battery, so it has to be long enough.
+            // the bars left over before the first test window. A start-offset run, or one missing
+            // bar, can leave as few as no bars over, so `train_days` alone is the shortest the
+            // first train window can be in a run of the battery, and it has to be long enough.
             if ws.mode == WindowMode::Anchored {
                 let shortest = ws.train_bars;
                 let window = format!(
@@ -552,6 +629,95 @@ mod tests {
 
     fn example_plan() -> TestPlan {
         find_strategy("sma_cross").unwrap().plan
+    }
+
+    /// What serde reads from `json`, a value holding only the fields that have no default. Each
+    /// constructor must equal it, so a field added with a serde default gets the same default in
+    /// the constructor.
+    fn read<T: serde::de::DeserializeOwned>(json: serde_json::Value) -> T {
+        serde_json::from_value(json).unwrap()
+    }
+
+    #[test]
+    fn each_plan_constructor_fills_the_defaults_serde_reads() {
+        use serde_json::json;
+        let id = InstrumentId {
+            venue: td_core::Venue::Binance,
+            symbol: "BTCUSDT".into(),
+            kind: td_core::InstrumentKind::Spot,
+        };
+        assert_eq!(
+            read::<Period>(json!({"from": 1, "to": 2})),
+            Period::new(1, 2)
+        );
+        assert_eq!(
+            read::<SlippageOverride>(json!({"instrument": id, "bps": 3.0})),
+            SlippageOverride::new(id.clone(), 3.0)
+        );
+        let slippage = vec![SlippageOverride::new(id.clone(), 3.0)];
+        let backtest = BacktestSettings::new(1_000.0, 2.0, slippage.clone());
+        assert_eq!(
+            read::<BacktestSettings>(json!({
+                "starting_cash": 1_000.0, "max_leverage": 2.0, "slippage": slippage,
+            })),
+            backtest
+        );
+        let fixed = Params::new().with("risk", ParamValue::Float(0.5));
+        let axes = vec![ParamAxis::new(
+            "fast",
+            ParamSpace::Values {
+                values: vec![ParamValue::Int(5)],
+            },
+        )];
+        let objective = Objective::new(crate::Metric::Sharpe, crate::Direction::Maximize);
+        assert_eq!(
+            read::<Objective>(json!({"metric": "sharpe", "direction": "maximize"})),
+            objective
+        );
+        assert_eq!(
+            read::<ParamAxis>(json!({"name": "fast", "space": axes[0].space})),
+            axes[0]
+        );
+        let sweep = SweepPlan::new(fixed.clone(), axes.clone(), objective, 7);
+        assert_eq!(
+            read::<SweepPlan>(json!({
+                "fixed": fixed, "axes": axes, "objective": objective, "min_trades": 7,
+            })),
+            sweep
+        );
+        let walk_forward = WalkForwardPlan::new(360, 90);
+        assert_eq!(
+            read::<WalkForwardPlan>(json!({"train_days": 360, "test_days": 90})),
+            walk_forward
+        );
+        let evidence = EvidenceSettings::default();
+        assert_eq!(
+            read::<TestPlan>(json!({
+                "instruments": [id], "timeframe": Timeframe::H4, "period": Period::new(1, 2),
+                "backtest": backtest, "sweep": sweep, "walk_forward": walk_forward,
+                "evidence": evidence,
+            })),
+            TestPlan::new(
+                vec![id],
+                Timeframe::H4,
+                Period::new(1, 2),
+                backtest,
+                sweep,
+                walk_forward,
+                evidence
+            )
+        );
+        // Every evidence field is required, so this holds all of them at #35's values.
+        assert_eq!(
+            read::<EvidenceSettings>(json!({
+                "min_sample": {"trades": 30, "days": 180, "windows": 4},
+                "luck": {"permutations": 199, "pass_p": 0.05, "inconclusive_p": 0.10},
+                "cost_stress": 2.0,
+                "plateau": {"min_median_ratio": 0.6, "min_positive_share": 0.8},
+                "start_offsets": 8,
+            })),
+            evidence
+        );
     }
 
     #[test]
