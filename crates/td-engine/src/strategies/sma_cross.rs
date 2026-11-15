@@ -6,19 +6,22 @@
 //!    the backtest, the sweep, the walk-forward and the optional out-of-sample split;
 //! 3. its verdict rule: a kind (`PropFirm`, `Portfolio` or `HighRisk`) with its limits.
 //!
+//! Parts 2 and 3 are built with the engine's constructors (`TestPlan::new` and the like) and
+//! `Default`s, and set an optional field with struct update syntax, as `out_of_sample` is set
+//! below. A field the engine adds later with a default then leaves this file, and its code hash,
+//! as they are (README, "Writing a strategy").
+//!
 //! To add a strategy, copy this file and edit it. In `src/strategies/private/` it is found on its
 //! own; here, as an example, it also needs `pub mod` in `mod.rs` and a line in the registry.
 
-use td_core::{
-    AccountCurrency, Candle, InstrumentId, InstrumentKind, OrderType, Side, Timeframe, Venue,
-};
+use td_core::{Candle, InstrumentId, InstrumentKind, OrderType, Side, Timeframe, Venue};
 
 use crate::strategies::{affordable_qty, direction, order};
 use crate::{
     BacktestSettings, Context, Direction, EngineError, EvidenceSettings, Metric, Objective,
     ParamAxis, ParamKind, ParamSpace, ParamSpec, ParamValue, Params, Period, PortfolioBenchmark,
     PortfolioLimits, Split, Strategy, StrategyEntry, SweepPlan, TestPlan, VerdictRule,
-    WalkForwardPlan, WindowMode, date,
+    WalkForwardPlan, date,
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -150,54 +153,41 @@ fn plan() -> TestPlan {
         kind: InstrumentKind::Spot,
     };
     TestPlan {
-        instruments: vec![spot("BTCUSDT"), spot("ETHUSDT")],
-        timeframe: Timeframe::H1,
-        period: Period {
-            from: date(2023, 1, 1),
-            to: date(2025, 1, 1),
-        },
-        backtest: BacktestSettings {
-            starting_cash: 10_000.0,
-            max_leverage: 1.0,
-            // Each instrument takes the backtest config's default slippage; list a
-            // SlippageOverride here to set one.
-            slippage: Vec::new(),
-            account_currency: AccountCurrency::Quote,
-            fee_override: None,
-        },
-        sweep: SweepPlan {
-            fixed: Params::new(),
-            axes: vec![
-                ParamAxis {
-                    name: "fast".into(),
-                    space: ParamSpace::Range {
-                        from: 5.0,
-                        to: 20.0,
-                        step: 5.0,
-                    },
-                },
-                ParamAxis {
-                    name: "slow".into(),
-                    space: ParamSpace::Range {
-                        from: 30.0,
-                        to: 70.0,
-                        step: 10.0,
-                    },
-                },
-            ],
-            objective: Objective {
-                metric: Metric::Sharpe,
-                direction: Direction::Maximize,
-            },
-            min_trades: 10,
-        },
-        walk_forward: WalkForwardPlan {
-            train_days: 180,
-            test_days: 60,
-            mode: WindowMode::Rolling,
-        },
         out_of_sample: Some(Split::Fraction(0.7)),
-        evidence: EvidenceSettings::default(),
+        ..TestPlan::new(
+            vec![spot("BTCUSDT"), spot("ETHUSDT")],
+            Timeframe::H1,
+            Period::new(date(2023, 1, 1), date(2025, 1, 1)),
+            // Starting cash and the leverage cap. Each instrument takes the backtest config's
+            // default slippage; list a SlippageOverride in the vector to set one.
+            BacktestSettings::new(10_000.0, 1.0, Vec::new()),
+            SweepPlan::new(
+                Params::new(),
+                vec![
+                    ParamAxis::new(
+                        "fast",
+                        ParamSpace::Range {
+                            from: 5.0,
+                            to: 20.0,
+                            step: 5.0,
+                        },
+                    ),
+                    ParamAxis::new(
+                        "slow",
+                        ParamSpace::Range {
+                            from: 30.0,
+                            to: 70.0,
+                            step: 10.0,
+                        },
+                    ),
+                ],
+                Objective::new(Metric::Sharpe, Direction::Maximize),
+                10,
+            ),
+            // 180 train days and 60 test days, in rolling windows.
+            WalkForwardPlan::new(180, 60),
+            EvidenceSettings::default(),
+        )
     }
 }
 

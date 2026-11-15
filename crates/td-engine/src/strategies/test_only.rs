@@ -7,17 +7,13 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use td_core::{
-    AccountCurrency, Candle, InstrumentId, InstrumentKind, Millis, OrderType, Side, Timeframe,
-    Venue,
-};
+use td_core::{Candle, InstrumentId, InstrumentKind, Millis, OrderType, Side, Timeframe, Venue};
 
 use crate::strategies::{affordable_qty, order};
 use crate::{
     BacktestSettings, Context, Direction, EngineError, EvidenceSettings, Metric, Objective,
     ParamAxis, ParamKind, ParamSpace, ParamSpec, ParamValue, Params, Period, PortfolioBenchmark,
     PortfolioLimits, Strategy, StrategyEntry, SweepPlan, TestPlan, VerdictRule, WalkForwardPlan,
-    WindowMode,
 };
 
 pub(crate) fn entries() -> Vec<StrategyEntry> {
@@ -152,46 +148,29 @@ impl Strategy for OneHour {
 /// Four-hour bars of a perpetual over 250 days from time 0, `trade` swept over the one value that
 /// trades: four 45-day test windows after a 60-day train window, every one choosing it.
 fn plan() -> TestPlan {
-    TestPlan {
-        instruments: vec![InstrumentId {
+    TestPlan::new(
+        vec![InstrumentId {
             venue: Venue::Binance,
             symbol: "TESTUSDT".into(),
             kind: InstrumentKind::Perpetual,
         }],
-        timeframe: Timeframe::H4,
-        period: Period {
-            from: 0,
-            to: 250 * 24 * 3_600_000,
-        },
-        backtest: BacktestSettings {
-            starting_cash: 10_000.0,
-            max_leverage: 1.0,
-            slippage: Vec::new(),
-            account_currency: AccountCurrency::Quote,
-            fee_override: None,
-        },
-        sweep: SweepPlan {
-            fixed: Params::new(),
-            axes: vec![ParamAxis {
-                name: "trade".into(),
-                space: ParamSpace::Values {
+        Timeframe::H4,
+        Period::new(0, 250 * 24 * 3_600_000),
+        BacktestSettings::new(10_000.0, 1.0, Vec::new()),
+        SweepPlan::new(
+            Params::new(),
+            vec![ParamAxis::new(
+                "trade",
+                ParamSpace::Values {
                     values: vec![ParamValue::Bool(true)],
                 },
-            }],
-            objective: Objective {
-                metric: Metric::TotalReturn,
-                direction: Direction::Maximize,
-            },
-            min_trades: 0,
-        },
-        walk_forward: WalkForwardPlan {
-            train_days: 60,
-            test_days: 45,
-            mode: WindowMode::Rolling,
-        },
-        out_of_sample: None,
-        evidence: EvidenceSettings::default(),
-    }
+            )],
+            Objective::new(Metric::TotalReturn, Direction::Maximize),
+            0,
+        ),
+        WalkForwardPlan::new(60, 45),
+        EvidenceSettings::default(),
+    )
 }
 
 /// Never trades. On its first live bar it sends an order for nothing, which is rejected and kept
@@ -286,14 +265,14 @@ pub struct ExampleSeries {
 
 fn example_series() -> StrategyEntry {
     let mut plan = plan();
-    plan.sweep.axes = vec![ParamAxis {
-        name: "level".into(),
-        space: ParamSpace::Range {
+    plan.sweep.axes = vec![ParamAxis::new(
+        "level",
+        ParamSpace::Range {
             from: 40.0,
             to: 60.0,
             step: 10.0,
         },
-    }];
+    )];
     StrategyEntry {
         name: "example_series",
         description: "Long while the series example_series is above a level.",

@@ -102,6 +102,15 @@ pub struct ParamAxis {
     pub space: ParamSpace,
 }
 
+impl ParamAxis {
+    pub fn new(name: impl Into<String>, space: ParamSpace) -> Self {
+        ParamAxis {
+            name: name.into(),
+            space,
+        }
+    }
+}
+
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -149,6 +158,12 @@ pub enum Direction {
 pub struct Objective {
     pub metric: Metric,
     pub direction: Direction,
+}
+
+impl Objective {
+    pub fn new(metric: Metric, direction: Direction) -> Self {
+        Objective { metric, direction }
+    }
 }
 
 /// A parameter sweep.
@@ -1259,6 +1274,11 @@ impl WindowMode {
 /// The leftover bars at the start, fewer than `step`, are never tested. In rolling mode the first
 /// train sweep is warmed up on them (as many as the train length); in anchored mode every train
 /// window starts at the first bar, so they are part of each one's training data.
+///
+/// An anchored first train window is checked without data at its longest, `train` bars and up to
+/// `step - 1` left over ([`WalkForwardSpec::check`]), and window by window in the data before a
+/// run. A test plan's validation also checks it at `train_days` alone, the shortest a run of the
+/// battery can leave it ([`crate::TestPlan::validate`]).
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WindowSpec {
@@ -1578,7 +1598,9 @@ fn floored_metric_name(metric: Metric) -> Option<&'static str> {
 /// they start on the last bar of a UTC day. A data gap would stretch a window over more days, but
 /// a window that reaches the floor only through a gap would have its metric measured partly on
 /// days with no bars, so the rule counts bars. [`refuse_short_train`] then checks each window in
-/// the data.
+/// the data. For an anchored plan, [`crate::TestPlan::validate`] also checks the first train
+/// window at `train_days` alone, the shortest a start-offset run or a missing bar can leave it,
+/// with [`refuse_short_first_train`].
 fn refuse_short_train_bars(spec: &WalkForwardSpec) -> Result<(), TesterError> {
     let w = &spec.windows;
     // A train length of zero is refused by the run's window rules, with their own message.

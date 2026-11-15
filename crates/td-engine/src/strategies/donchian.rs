@@ -2,8 +2,7 @@
 //! (see `sma_cross.rs`).
 
 use td_core::{
-    AccountCurrency, Candle, InstrumentId, InstrumentKind, OrderId, OrderType, Rounding, Side,
-    Timeframe, Venue,
+    Candle, InstrumentId, InstrumentKind, OrderId, OrderType, Rounding, Side, Timeframe, Venue,
 };
 
 use crate::strategies::{affordable_qty, order};
@@ -11,7 +10,7 @@ use crate::{
     BacktestSettings, Context, Direction, DrawdownMode, EngineError, EvidenceSettings, FirmLimits,
     Metric, Objective, ParamAxis, ParamKind, ParamSpace, ParamSpec, ParamValue, Params, Period,
     PropFirmLimits, Strategy, StrategyEntry, SweepPlan, TestPlan, VerdictRule, WalkForwardPlan,
-    WindowMode, date,
+    date,
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -198,62 +197,46 @@ impl Strategy for DonchianBreakout {
 // ---------------------------------------------------------------------------------------------
 
 fn plan() -> TestPlan {
-    TestPlan {
-        instruments: vec![InstrumentId {
+    TestPlan::new(
+        vec![InstrumentId {
             venue: Venue::Binance,
             symbol: "BTCUSDT".into(),
             kind: InstrumentKind::Perpetual,
         }],
-        timeframe: Timeframe::H4,
-        period: Period {
-            from: date(2022, 1, 1),
-            to: date(2025, 1, 1),
-        },
-        backtest: BacktestSettings {
-            starting_cash: 100_000.0,
-            max_leverage: 1.0,
-            // Each instrument takes the backtest config's default slippage; list a
-            // SlippageOverride here to set one.
-            slippage: Vec::new(),
-            account_currency: AccountCurrency::Quote,
-            fee_override: None,
-        },
-        sweep: SweepPlan {
-            fixed: Params::new()
+        Timeframe::H4,
+        Period::new(date(2022, 1, 1), date(2025, 1, 1)),
+        // Starting cash and the leverage cap. Each instrument takes the backtest config's default
+        // slippage; list a SlippageOverride in the vector to set one.
+        BacktestSettings::new(100_000.0, 1.0, Vec::new()),
+        SweepPlan::new(
+            Params::new()
                 .with("allow_short", ParamValue::Bool(true))
                 .with("risk", ParamValue::Float(0.005)),
-            axes: vec![
-                ParamAxis {
-                    name: "entry".into(),
-                    space: ParamSpace::Range {
+            vec![
+                ParamAxis::new(
+                    "entry",
+                    ParamSpace::Range {
                         from: 10.0,
                         to: 40.0,
                         step: 10.0,
                     },
-                },
-                ParamAxis {
-                    name: "exit".into(),
-                    space: ParamSpace::Range {
+                ),
+                ParamAxis::new(
+                    "exit",
+                    ParamSpace::Range {
                         from: 5.0,
                         to: 20.0,
                         step: 5.0,
                     },
-                },
+                ),
             ],
-            objective: Objective {
-                metric: Metric::Sharpe,
-                direction: Direction::Maximize,
-            },
-            min_trades: 10,
-        },
-        walk_forward: WalkForwardPlan {
-            train_days: 360,
-            test_days: 90,
-            mode: WindowMode::Rolling,
-        },
-        out_of_sample: None,
-        evidence: EvidenceSettings::default(),
-    }
+            Objective::new(Metric::Sharpe, Direction::Maximize),
+            10,
+        ),
+        // 360 train days and 90 test days, in rolling windows.
+        WalkForwardPlan::new(360, 90),
+        EvidenceSettings::default(),
+    )
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -263,22 +246,9 @@ fn plan() -> TestPlan {
 /// A one-step challenge account: 5% daily loss and 10% max drawdown from the starting balance,
 /// passed at 10% profit.
 fn rule() -> VerdictRule {
-    VerdictRule::PropFirm {
-        firm: FirmLimits {
-            daily_loss: 0.05,
-            max_drawdown: 0.10,
-            drawdown: DrawdownMode::Static,
-            profit_target: 0.10,
-            second_target: None,
-            min_trading_days: 0,
-            best_day_share: None,
-            day_target_share: None,
-            trading_day: None,
-            trailing_floor_lock: None,
-            max_days_without_trading: None,
-            day_rollover: None,
-        },
-        limits: PropFirmLimits::default(),
-        attempt: None,
-    }
+    VerdictRule::prop_firm(
+        FirmLimits::new(0.05, 0.10, DrawdownMode::Static, 0.10),
+        PropFirmLimits::default(),
+        None,
+    )
 }

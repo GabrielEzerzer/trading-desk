@@ -140,7 +140,7 @@ pub struct FirmLimits {
 /// position closes all of the old one (and opens a new one, which is not a close). Positions and
 /// their average entry prices are tracked per instrument across the fills.
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TradingDayTest {
     /// Only a closing fill can count, on the day the close happens: a day that only opens or
@@ -244,6 +244,79 @@ pub struct AttemptTerms {
     /// and 1: 0.5 asks what an attempt is worth if the edge is half what the test shows.
     #[serde(default = "default_reduced_edge_factor")]
     pub reduced_edge_factor: f64,
+}
+
+impl FirmLimits {
+    /// A one-phase challenge with none of the optional rules.
+    pub fn new(
+        daily_loss: f64,
+        max_drawdown: f64,
+        drawdown: DrawdownMode,
+        profit_target: f64,
+    ) -> Self {
+        FirmLimits {
+            daily_loss,
+            max_drawdown,
+            drawdown,
+            profit_target,
+            second_target: None,
+            min_trading_days: 0,
+            best_day_share: None,
+            day_target_share: None,
+            trading_day: None,
+            trailing_floor_lock: None,
+            day_rollover: None,
+            max_days_without_trading: None,
+        }
+    }
+}
+
+/// The fields of [`AttemptTerms`] that have no default, for [`AttemptTerms::new`]. They are named
+/// here rather than passed in order because three are amounts and three are day counts, which a
+/// list of arguments would let a strategy swap without a compiler error.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RequiredAttemptTerms {
+    pub account_size: f64,
+    pub evaluation_fee: f64,
+    pub profit_split: f64,
+    pub days_to_first_payout: u32,
+    pub payout_interval_days: u32,
+    pub funded_horizon_days: u32,
+}
+
+impl AttemptTerms {
+    /// Terms with no pass fee, refund, calendar wait, smallest payout, cap or payout limit, no
+    /// floor lock or balance reset, both accounts traded at the tested size, and the reduced edge
+    /// at half.
+    pub fn new(required: RequiredAttemptTerms) -> Self {
+        let RequiredAttemptTerms {
+            account_size,
+            evaluation_fee,
+            profit_split,
+            days_to_first_payout,
+            payout_interval_days,
+            funded_horizon_days,
+        } = required;
+        AttemptTerms {
+            account_size,
+            evaluation_fee,
+            pass_fee: 0.0,
+            refund_fee_with_first_payout: false,
+            profit_split,
+            days_to_first_payout,
+            calendar_days_to_first_payout: None,
+            payout_interval_days,
+            min_payout: 0.0,
+            payout_cap: None,
+            max_payouts: None,
+            payout_locks_floor: false,
+            payout_resets_balance: false,
+            funded_horizon_days,
+            evaluation_size: one(),
+            funded_size: one(),
+            reduced_edge_factor: default_reduced_edge_factor(),
+        }
+    }
 }
 
 fn is_zero(n: &u32) -> bool {
@@ -470,6 +543,20 @@ impl Default for HighRiskLimits {
 }
 
 impl VerdictRule {
+    /// A `prop_firm` rule. A variant of an enum takes no struct update syntax, so a strategy builds
+    /// this one here, and a field added to the variant with a default is filled here.
+    pub fn prop_firm(
+        firm: FirmLimits,
+        limits: PropFirmLimits,
+        attempt: Option<AttemptTerms>,
+    ) -> Self {
+        VerdictRule::PropFirm {
+            firm,
+            limits,
+            attempt,
+        }
+    }
+
     pub fn kind(&self) -> RuleKind {
         match self {
             VerdictRule::PropFirm { .. } => RuleKind::PropFirm,
@@ -1803,6 +1890,68 @@ impl Verdict {
 mod tests {
     use super::*;
     use td_core::{InstrumentKind, Venue};
+
+    /// What serde reads from `json`, a value holding only the fields that have no default. Each
+    /// constructor and `Default` a strategy builds a rule from must equal it, so a field added
+    /// with a serde default gets the same default there.
+    fn read<T: serde::de::DeserializeOwned>(json: serde_json::Value) -> T {
+        serde_json::from_value(json).unwrap()
+    }
+
+    #[test]
+    fn each_rule_constructor_fills_the_defaults_serde_reads() {
+        use serde_json::json;
+        let firm = FirmLimits::new(0.05, 0.10, DrawdownMode::Trailing, 0.08);
+        assert_eq!(
+            read::<FirmLimits>(json!({
+                "daily_loss": 0.05, "max_drawdown": 0.10, "drawdown": "trailing",
+                "profit_target": 0.08,
+            })),
+            firm
+        );
+        assert_eq!(read::<TradingDayTest>(json!({})), TradingDayTest::default());
+        assert_eq!(
+            read::<AttemptTerms>(json!({
+                "account_size": 100_000.0, "evaluation_fee": 500.0, "profit_split": 0.8,
+                "days_to_first_payout": 5, "payout_interval_days": 14, "funded_horizon_days": 180,
+            })),
+            AttemptTerms::new(RequiredAttemptTerms {
+                account_size: 100_000.0,
+                evaluation_fee: 500.0,
+                profit_split: 0.8,
+                days_to_first_payout: 5,
+                payout_interval_days: 14,
+                funded_horizon_days: 180,
+            })
+        );
+        let limits = PropFirmLimits::default();
+        assert_eq!(
+            read::<PropFirmLimits>(json!({
+                "share_of_firm_limits": 0.5, "min_pass_probability": 0.6,
+                "max_breach_probability": 0.1, "breach_horizon_days": 90,
+            })),
+            limits
+        );
+        assert_eq!(
+            read::<VerdictRule>(json!({"kind": "prop_firm", "firm": firm, "limits": limits})),
+            VerdictRule::prop_firm(firm, limits, None)
+        );
+        assert_eq!(
+            read::<PortfolioLimits>(json!({
+                "min_sharpe": 1.0, "max_drawdown": 0.30, "max_drawdown_vs_benchmark": 0.75,
+                "min_alpha": 0.0, "max_p_mean_not_positive": 0.10,
+            })),
+            PortfolioLimits::default()
+        );
+        assert_eq!(
+            read::<HighRiskLimits>(json!({
+                "min_trades": 50, "min_expectancy": 0.0, "min_expectancy_lower_bound": 0.0,
+                "min_profit_factor": 1.3, "max_risk_of_ruin": 0.05, "ruin_drawdown": 0.5,
+                "min_return_without_best_trade": 0.0,
+            })),
+            HighRiskLimits::default()
+        );
+    }
 
     /// The ids of the lines that did not pass, with their outcome.
     fn not_passing(lines: &[Criterion]) -> Vec<(&str, Outcome)> {
