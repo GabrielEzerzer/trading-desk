@@ -2732,7 +2732,7 @@ references?: Array<InstrumentId>,
  * The series the battery's runs named; left out when none. A paper or live session refuses to
  * start from a verdict with series.
  */
-series?: Array<string>, };
+series?: Array<string>, also_traded?: Array<InstrumentId>, };
 
 /**
  * A saved run in full.

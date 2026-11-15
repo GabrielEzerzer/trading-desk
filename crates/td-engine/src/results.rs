@@ -172,15 +172,36 @@ impl PlanRun {
         references: &[crate::ReferenceBars],
         series: &[crate::Series],
     ) -> Result<PlanRun, EngineError> {
+        PlanRun::with_traded(spec, battery, bars, asks, funding, references, series, &[])
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_traded(
+        spec: &crate::BatterySpec,
+        battery: BatteryResult,
+        bars: &[td_core::Candle],
+        asks: &[td_core::Candle],
+        funding: &[(Millis, f64)],
+        references: &[crate::ReferenceBars],
+        series: &[crate::Series],
+        also_traded: &[crate::AlsoTradedBars],
+    ) -> Result<PlanRun, EngineError> {
         let mut config = spec
             .plan
             .backtest_config(spec.strategy, spec.instrument.clone());
         config.references = references.iter().map(|r| r.instrument.clone()).collect();
         config.series = series.iter().map(|s| s.name.clone()).collect();
+        config.also_traded = spec.also_traded.to_vec();
         Ok(PlanRun {
             strategy: spec.strategy.to_string(),
-            data_fingerprint: crate::config_fingerprint_with_references(
-                &config, bars, asks, funding, references, series,
+            data_fingerprint: crate::config_fingerprint_with_traded(
+                &config,
+                bars,
+                asks,
+                funding,
+                references,
+                series,
+                also_traded,
             )?,
             config,
             plan: spec.plan.clone(),
@@ -206,6 +227,8 @@ struct PlanConfig<'a> {
     /// The series the battery's runs named; left out when none.
     #[serde(skip_serializing_if = "<[_]>::is_empty")]
     series: &'a [String],
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    also_traded: &'a [td_core::Instrument],
 }
 
 impl SavedRun {
@@ -333,6 +356,7 @@ pub fn save_with_files(
                 seed: r.battery.seed,
                 references: &r.config.references,
                 series: &r.config.series,
+                also_traded: &r.config.also_traded,
             },
             runs_dir,
         )?,

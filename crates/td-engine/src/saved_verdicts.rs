@@ -85,6 +85,8 @@ pub struct VerdictRecord {
     /// The series the battery's runs named; empty, and left out, when none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub series: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub also_traded: Vec<InstrumentId>,
 }
 
 /// One row of `GET /verdicts`: the latest verdict of a strategy on an instrument, the newest
@@ -139,6 +141,8 @@ pub struct VerdictSummary {
     /// start from a verdict with series.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub series: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub also_traded: Vec<InstrumentId>,
 }
 
 /// A plan run's `config.json`, enough to tell it from the other kinds' without reading the result.
@@ -174,6 +178,8 @@ struct ConfigHead {
     references: Vec<InstrumentId>,
     #[serde(default)]
     series: Vec<String>,
+    #[serde(default)]
+    also_traded: Vec<InstrumentHead>,
 }
 
 #[derive(Deserialize)]
@@ -229,6 +235,7 @@ pub fn read_record(dir: &Path) -> Option<VerdictRecord> {
             .and_then(|r| r.code_hash),
         references: run.config.references,
         series: run.config.series,
+        also_traded: run.config.also_traded.into_iter().map(|i| i.id).collect(),
     })
 }
 
@@ -366,6 +373,7 @@ pub fn latest_verdicts(
             code_versions: 0,
             references: record.references,
             series: record.series,
+            also_traded: record.also_traded,
         };
         // A complete run beats an incomplete one; between two of the same, the newer wins.
         match latest.get_mut(&key) {
@@ -512,7 +520,8 @@ impl LinkState {
 /// `references` are the reference instruments the session feeds its strategy, in any order.
 ///
 /// [`VerdictError::Invalid`] for a run that is not a saved verdict of this strategy on this
-/// instrument, one judged with a series ([`crate::BacktestConfig::series`]), or one judged with
+/// instrument, one judged with a series ([`crate::BacktestConfig::series`]), one judged trading
+/// other instruments beside it ([`crate::BacktestConfig::also_traded`]), or one judged with
 /// other reference instruments than the session feeds: it would be a different test from the one
 /// the verdict judged. The message names the instruments the session is missing, or feeds beyond
 /// the verdict's. That holds for the latest verdict too, so such a session does not start unless
@@ -543,6 +552,14 @@ pub fn session_link(
             )
         })
     };
+    let judged_trading_more = |id: &RunId, also_traded: &[InstrumentId]| {
+        (!also_traded.is_empty()).then(|| {
+            format!(
+                "run {id} was judged trading {} beside {instrument}, and a session trades one instrument",
+                names(also_traded)
+            )
+        })
+    };
     let record = match verdict {
         Some(id) => {
             let checked = RunId::parse(id).map_err(|_| bad(format!("{id:?} is not a run id")))?;
@@ -555,6 +572,9 @@ pub fn session_link(
                 )));
             }
             if let Some(why) = judged_with_series(&checked, &record.series) {
+                return Err(bad(why));
+            }
+            if let Some(why) = judged_trading_more(&checked, &record.also_traded) {
                 return Err(bad(why));
             }
             if let Some(why) = mismatch(&checked, &record.references) {
@@ -585,12 +605,20 @@ pub fn session_link(
                     "{why}; it is the strategy's latest verdict on {instrument}, so name a verdict judged without series {name_one}, or run a test without them first"
                 ))
             };
+            let trading_more_refused = |why: String| {
+                bad(format!(
+                    "{why}; it is the strategy's latest verdict on {instrument}, so name a verdict judged trading {instrument} alone {name_one}, or run a test that trades it alone first"
+                ))
+            };
             match latest {
                 // Judged from the row, so a record that cannot be read again does not let the
                 // session start unlinked.
                 Some(row) => {
                     if let Some(why) = judged_with_series(&row.run_id, &row.series) {
                         return Err(series_refused(why));
+                    }
+                    if let Some(why) = judged_trading_more(&row.run_id, &row.also_traded) {
+                        return Err(trading_more_refused(why));
                     }
                     if let Some(why) = mismatch(&row.run_id, &row.references) {
                         return Err(latest_refused(why));
@@ -600,6 +628,10 @@ pub fn session_link(
                         Some(record) => {
                             if let Some(why) = judged_with_series(&row.run_id, &record.series) {
                                 return Err(series_refused(why));
+                            }
+                            if let Some(why) = judged_trading_more(&row.run_id, &record.also_traded)
+                            {
+                                return Err(trading_more_refused(why));
                             }
                             if let Some(why) = mismatch(&row.run_id, &record.references) {
                                 return Err(latest_refused(why));
@@ -734,6 +766,105 @@ mod tests {
             assert_eq!(matches(&old, &anchored), Some(false), "{with_verdict}");
             assert_eq!(matches(&new, &anchored), Some(true), "{with_verdict}");
             assert_eq!(matches(&new, &rolling), Some(false), "{with_verdict}");
+        }
+    }
+
+    mod several {
+        use super::*;
+        use crate::metrics::DAY_MS;
+        use crate::results::{PlanRun, SavedRun, save};
+        use crate::strategies::test_only::{TRADES_BOTH, pair_data, pair_first, pair_second};
+        use crate::{BatterySpec, run_battery, run_battery_with_traded};
+
+        const DAYS: i64 = 160;
+        const BARS_A_DAY: i64 = 6;
+        const NAME_ONE: &str = "with --verdict";
+
+        fn config_json(runs_dir: &Path, id: &RunId) -> String {
+            fs::read_to_string(runs_dir.join(id.as_str()).join("config.json")).unwrap()
+        }
+
+        #[test]
+        fn a_verdict_judged_trading_a_second_instrument_records_it_and_is_not_the_one_alone() {
+            let entry = find_strategy(TRADES_BOTH).unwrap();
+            let mut plan = entry.plan.clone();
+            plan.period.to = DAYS * DAY_MS;
+            plan.evidence.luck.permutations = 4;
+            plan.evidence.start_offsets = 0;
+            let (bars, also) = pair_data(DAYS * BARS_A_DAY);
+            let (first, second) = (pair_first(), pair_second());
+            let traded_beside = [second.clone()];
+            let several_spec = BatterySpec {
+                strategy: TRADES_BOTH,
+                plan: &plan,
+                rule: &entry.rule,
+                instrument: &first,
+                also_traded: &traded_beside,
+                seed: 3,
+            };
+            let alone_spec = BatterySpec {
+                also_traded: &[],
+                ..several_spec
+            };
+            let several =
+                run_battery_with_traded(&several_spec, &bars, &[], &[], &[], &[], &also, None)
+                    .unwrap();
+            assert!(
+                several.walk_forward.is_some(),
+                "{:?}",
+                several.walk_forward_error
+            );
+            let alone = run_battery(&alone_spec, &bars, &[], &[], None).unwrap();
+            let several =
+                PlanRun::with_traded(&several_spec, several, &bars, &[], &[], &[], &[], &also)
+                    .unwrap();
+            let alone = PlanRun::new(&alone_spec, alone, &bars, &[], &[]).unwrap();
+            assert_eq!(several.config.also_traded, traded_beside);
+            assert_ne!(several.data_fingerprint, alone.data_fingerprint);
+
+            let runs = tempfile::tempdir().unwrap();
+            let several_id = save(&SavedRun::Plan(Box::new(several.clone())), runs.path()).unwrap();
+            let alone_id = save(&SavedRun::Plan(Box::new(alone)), runs.path()).unwrap();
+            assert!(config_json(runs.path(), &several_id).contains("\"also_traded\""));
+            assert!(!config_json(runs.path(), &alone_id).contains("also_traded"));
+
+            let several_record = read_record(&runs.path().join(several_id.as_str())).unwrap();
+            assert_eq!(several_record.also_traded, vec![second.id.clone()]);
+            let alone_record = read_record(&runs.path().join(alone_id.as_str())).unwrap();
+            assert!(alone_record.also_traded.is_empty());
+            let alone_json = serde_json::to_value(&alone_record).unwrap();
+            assert!(alone_json.get("also_traded").is_none(), "{alone_json}");
+
+            let mut saved_before = serde_json::to_value(&several_record).unwrap();
+            saved_before.as_object_mut().unwrap().remove("also_traded");
+            let saved_before: VerdictRecord = serde_json::from_value(saved_before).unwrap();
+            assert!(saved_before.also_traded.is_empty());
+
+            let link = |runs_dir: &Path, id: Option<&RunId>| {
+                session_link(
+                    runs_dir,
+                    &entry,
+                    &first.id,
+                    id.map(RunId::as_str),
+                    &[],
+                    NAME_ONE,
+                )
+            };
+            let refused = link(runs.path(), Some(&several_id))
+                .unwrap_err()
+                .to_string();
+            assert!(refused.contains(&second.id.to_string()), "{refused}");
+            let linked = link(runs.path(), Some(&alone_id)).unwrap();
+            assert_eq!(linked.verdict.unwrap().run_id, alone_id);
+
+            let only_several = tempfile::tempdir().unwrap();
+            save(&SavedRun::Plan(Box::new(several)), only_several.path()).unwrap();
+            let rows =
+                latest_verdicts(only_several.path(), std::slice::from_ref(&entry), None).unwrap();
+            assert_eq!(rows[0].also_traded, vec![second.id.clone()]);
+            let refused = link(only_several.path(), None).unwrap_err().to_string();
+            assert!(refused.contains("latest verdict"), "{refused}");
+            assert!(refused.contains(&second.id.to_string()), "{refused}");
         }
     }
 }

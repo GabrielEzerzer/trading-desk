@@ -214,6 +214,7 @@ fn battery(
         plan,
         rule,
         instrument: &instrument,
+        also_traded: &[],
         seed,
     };
     run_battery(&spec, bars, &[], &[], progress)
@@ -855,6 +856,7 @@ fn fx_run(
         plan,
         rule: &cash_rule(),
         instrument: &instrument,
+        also_traded: &[],
         seed: 7,
     };
     run_battery(&spec, bars, asks, &[], progress).unwrap()

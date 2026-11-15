@@ -7,13 +7,17 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use td_core::{Candle, InstrumentId, InstrumentKind, Millis, OrderType, Side, Timeframe, Venue};
+use td_core::{
+    Candle, FeeSchedule, Instrument, InstrumentId, InstrumentKind, Millis, OrderRequest, OrderType,
+    Side, TimeInForce, Timeframe, Venue,
+};
 
 use crate::strategies::{affordable_qty, order};
 use crate::{
-    BacktestSettings, Context, Direction, EngineError, EvidenceSettings, Metric, Objective,
-    ParamAxis, ParamKind, ParamSpace, ParamSpec, ParamValue, Params, Period, PortfolioBenchmark,
-    PortfolioLimits, Strategy, StrategyEntry, SweepPlan, TestPlan, VerdictRule, WalkForwardPlan,
+    AlsoTradedBars, BacktestConfig, BacktestSettings, Context, Direction, EngineError,
+    EvidenceSettings, Metric, Objective, ParamAxis, ParamKind, ParamSpace, ParamSpec, ParamValue,
+    Params, Period, PortfolioBenchmark, PortfolioLimits, Strategy, StrategyEntry, SweepPlan,
+    TestPlan, VerdictRule, WalkForwardPlan,
 };
 
 pub(crate) fn entries() -> Vec<StrategyEntry> {
@@ -23,6 +27,8 @@ pub(crate) fn entries() -> Vec<StrategyEntry> {
         tells_funding(),
         rests_limits(),
         example_series(),
+        trades_both(TRADES_BOTH, |p| TradesBoth::build(p, false)),
+        trades_both(RECORDS_PAIRS, |p| TradesBoth::build(p, true)),
     ]
 }
 
@@ -331,5 +337,195 @@ impl Strategy for SeesFunding {
         if !ctx.is_warming_up() && ctx.position() == 0.0 && ctx.open_orders().is_empty() {
             let _ = ctx.submit(order(ctx, Side::Buy, 1.0, OrderType::Market, false));
         }
+    }
+}
+
+pub(crate) const TRADES_BOTH: &str = "test_trades_both";
+pub(crate) const RECORDS_PAIRS: &str = "test_records_pairs";
+pub(crate) const PAIR_STEP: Millis = 4 * HOUR;
+pub(crate) const FIRST_SHAPE_TO_SECOND: f64 = 2.0;
+
+pub(crate) static PAIRS_SEEN: Mutex<Vec<(f64, f64)>> = Mutex::new(Vec::new());
+
+pub(crate) fn perpetual(symbol: &str, taker: f64) -> Instrument {
+    Instrument {
+        id: InstrumentId {
+            venue: Venue::Binance,
+            symbol: format!("{symbol}USDT"),
+            kind: InstrumentKind::Perpetual,
+        },
+        base: symbol.into(),
+        quote: "USDT".into(),
+        tick_size: 0.01,
+        lot_size: 0.001,
+        min_qty: 0.001,
+        min_notional: 1.0,
+        fees: FeeSchedule {
+            maker: taker / 2.0,
+            taker,
+            per_unit: 0.0,
+        },
+    }
+}
+
+fn shape(k: i64) -> f64 {
+    ((k * 7) % 23 - 11) as f64 / 1_000.0
+}
+
+fn shaped_bar(k: i64, open: f64, change: f64) -> Candle {
+    let close = open * (1.0 + change);
+    Candle {
+        open_time: k * PAIR_STEP,
+        open,
+        high: open.max(close) * 1.001,
+        low: open.min(close) * 0.999,
+        close,
+        volume: 1.0,
+        quote_volume: open,
+    }
+}
+
+pub(crate) fn pair_bars(n: i64, start: f64) -> (Vec<Candle>, Vec<Candle>) {
+    let (mut first, mut second) = (Vec::new(), Vec::new());
+    let (mut a, mut b) = (start, start / 2.0);
+    for k in 0..n {
+        let change = shape(k);
+        let bar_a = shaped_bar(k, a, change);
+        let bar_b = shaped_bar(k, b, FIRST_SHAPE_TO_SECOND * change);
+        (a, b) = (bar_a.close, bar_b.close);
+        first.push(bar_a);
+        second.push(bar_b);
+    }
+    (first, second)
+}
+
+type Build = fn(&Params) -> Result<Box<dyn Strategy>, EngineError>;
+
+fn trades_both(name: &'static str, build: Build) -> StrategyEntry {
+    let mut plan = plan();
+    plan.sweep.axes = vec![ParamAxis::new(
+        "qty",
+        ParamSpace::Values {
+            values: vec![ParamValue::Float(1.0), ParamValue::Float(2.0)],
+        },
+    )];
+    StrategyEntry {
+        name,
+        description: "Buys and sells every traded instrument on alternate bars.",
+        params: vec![ParamSpec {
+            name: "qty",
+            kind: ParamKind::Float,
+            default: ParamValue::Float(1.0),
+            min: None,
+            max: None,
+            description: "The units of each instrument bought.",
+        }],
+        build,
+        plan,
+        rule: VerdictRule::portfolio(PortfolioBenchmark::Cash, PortfolioLimits::default()),
+    }
+}
+
+pub struct TradesBoth {
+    qty: f64,
+    records: bool,
+}
+
+impl TradesBoth {
+    fn build(p: &Params, records: bool) -> Result<Box<dyn Strategy>, EngineError> {
+        Ok(Box::new(TradesBoth {
+            qty: p.float("qty")?,
+            records,
+        }))
+    }
+
+    fn record(&self, ctx: &Context) {
+        let ids: Vec<InstrumentId> = ctx.traded().map(|i| i.id.clone()).collect();
+        let shapes: Vec<f64> = ids
+            .iter()
+            .filter_map(|id| ctx.bar_of(id))
+            .map(|b| b.close / b.open - 1.0)
+            .collect();
+        if let [first, second] = shapes[..] {
+            PAIRS_SEEN.lock().unwrap().push((first, second));
+        }
+    }
+}
+
+impl Strategy for TradesBoth {
+    fn on_bar(&mut self, ctx: &mut Context, _bar: &Candle) {
+        if self.records {
+            self.record(ctx);
+        }
+        if ctx.is_warming_up() {
+            return;
+        }
+        let ids: Vec<InstrumentId> = ctx.traded().map(|i| i.id.clone()).collect();
+        for id in ids {
+            if ctx.bar_of(&id).is_none() || !ctx.open_orders_of(&id).is_some_and(|o| o.is_empty()) {
+                continue;
+            }
+            let position = ctx.position_of(&id).unwrap_or(0.0);
+            let (side, qty) = match position == 0.0 {
+                true => (Side::Buy, self.qty),
+                false => (Side::Sell, position.abs()),
+            };
+            let _ = ctx.submit(OrderRequest {
+                instrument: id,
+                side,
+                qty,
+                order_type: OrderType::Market,
+                tif: TimeInForce::Gtc,
+                reduce_only: position != 0.0,
+                client_tag: None,
+            });
+        }
+    }
+}
+
+pub(crate) const PAIR_GAP_BAR: i64 = 30;
+pub(crate) const PAIR_FUNDING_RATE: f64 = 0.000_1;
+
+pub(crate) fn pair_first() -> Instrument {
+    perpetual("TEST", 0.000_5)
+}
+
+pub(crate) fn pair_second() -> Instrument {
+    perpetual("BBB", 0.000_5)
+}
+
+pub(crate) fn pair_data(n: i64) -> (Vec<Candle>, Vec<AlsoTradedBars>) {
+    let (mut first, second) = pair_bars(n, 1_000.0);
+    first.retain(|b| b.open_time != PAIR_GAP_BAR * PAIR_STEP);
+    let funding = (0..n)
+        .step_by(2)
+        .map(|k| (k * PAIR_STEP, PAIR_FUNDING_RATE));
+    let also = AlsoTradedBars {
+        instrument: pair_second().id,
+        bars: second,
+        funding: funding.collect(),
+    };
+    (first, vec![also])
+}
+
+pub(crate) fn pair_config(strategy: &str, n: i64) -> BacktestConfig {
+    BacktestConfig {
+        strategy: strategy.into(),
+        params: Params::new(),
+        instrument: pair_first(),
+        timeframe: Timeframe::H4,
+        from: 0,
+        to: n * PAIR_STEP,
+        starting_cash: 10_000.0,
+        slippage_bps: 5.0,
+        fee_override: None,
+        max_leverage: 2.0,
+        warmup_from: None,
+        close_at_end: false,
+        account_currency: td_core::AccountCurrency::Quote,
+        references: Vec::new(),
+        series: Vec::new(),
+        also_traded: vec![pair_second()],
+        start_when_all_listed: false,
     }
 }

@@ -893,6 +893,7 @@ pub(crate) mod tests {
             plan: &plan,
             rule: &entry.rule,
             instrument: &instrument,
+            also_traded: &[],
             seed: 5,
         };
         let battery =
