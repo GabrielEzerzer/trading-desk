@@ -2681,6 +2681,83 @@ async fn a_perpetual_with_no_bar_in_the_range_is_refused_as_not_downloaded_or_as
     );
 }
 
+async fn hole_refusal(t: &TestServer, config: &BacktestConfig) -> String {
+    let body = serde_json::to_value(config).unwrap();
+    let (status, answer) = t.post("/runs/backtest", &body).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{answer}");
+    assert_eq!(answer["error"]["code"], "data_missing", "{answer}");
+    let message = answer["error"]["message"].as_str().unwrap().to_string();
+    let Err(loaded) = load_run_data(&t.store, config, None) else {
+        panic!("loading refuses it too: {message}");
+    };
+    assert_eq!(loaded.body.message, message);
+    assert!(!message.contains("download it"), "{message}");
+    message
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_late_first_bar_after_a_stored_funding_rate_is_refused_as_a_hole_in_the_history() {
+    let t = TestServer::seeded(LATE_DAYS).await;
+    seed_late_second(&t.store, 0..0, true);
+    let id = second_perpetual().id;
+    t.store
+        .write_funding(&id, &[(t0() + 10 * DAY, 0.0002)])
+        .unwrap();
+    let message = hole_refusal(&t, &late_config()).await;
+    assert!(
+        message.contains(
+            "binance:BBBUSDT:perpetual candles from 2024-03-01 00:00 to 2024-05-02 00:00 UTC; \
+             the store holds funding rates of it from before 2024-05-02 00:00 UTC, so it was \
+             trading then, and the venue's history has a hole there that a download cannot fill"
+        ),
+        "{message}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_late_first_bar_after_a_stored_bar_is_refused_as_a_hole_in_the_history() {
+    let id = second_perpetual().id;
+    let t = TestServer::seeded(LATE_DAYS).await;
+    seed_late_second(&t.store, 0..0, true);
+    let february: Vec<Candle> = scaled(minutes(1, 0..0))
+        .into_iter()
+        .map(|c| Candle {
+            open_time: c.open_time - 20 * DAY,
+            ..c
+        })
+        .collect();
+    t.store.write_candles(&id, &february).unwrap();
+    let message = hole_refusal(&t, &late_config()).await;
+    assert!(
+        message.contains(
+            "binance:BBBUSDT:perpetual candles from 2024-03-01 00:00 to 2024-05-02 00:00 UTC; \
+             the store holds candles of it from before 2024-05-02 00:00 UTC, so it was trading \
+             then, and the venue's history has a hole there that a download cannot fill"
+        ),
+        "{message}"
+    );
+
+    let t = TestServer::seeded(LATE_DAYS).await;
+    seed_late_second(&t.store, 0..0, false);
+    t.store
+        .write_candles(&id, &scaled(minutes(1, 0..0)))
+        .unwrap();
+    record_unlisted(&t.store, &id, t0() + 2 * DAY, listed());
+    let config = BacktestConfig {
+        warmup_from: Some(t0() + 2 * DAY),
+        from: t0() + 3 * DAY,
+        ..late_config()
+    };
+    let message = hole_refusal(&t, &config).await;
+    assert!(
+        message.contains(
+            "binance:BBBUSDT:perpetual candles from 2024-03-03 00:00 to 2024-05-02 00:00 UTC; \
+             the store holds candles of it from before 2024-05-02 00:00 UTC"
+        ),
+        "{message}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn sweeps_out_of_sample_and_walk_forward_runs_trade_beside_a_perpetual_listed_months_in() {
     let t = TestServer::seeded(LATE_DAYS).await;
