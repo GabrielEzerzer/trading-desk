@@ -519,9 +519,55 @@ fn read_also_traded(
     let mut also_traded = Vec::with_capacity(config.also_traded.len());
     for instrument in &config.also_traded {
         let id = &instrument.id;
-        let (bars, gaps, closures) = stored_bids(store, config, id)?;
+        let (bars, mut gaps, closures) = stored_bids(store, config, id)?;
+        let mut checked = range;
+        let lead = gaps
+            .first()
+            .copied()
+            .filter(|g| g.from == range.0 && g.to < range.1);
+        let mut held = None;
+        if let Some(lead) = lead
+            && store.recorded_empty(id, lead.from, lead.to)?
+        {
+            held = held_before(store, id, lead.to)?.map(|what| (what, lead.to));
+            if held.is_none() {
+                gaps.remove(0);
+                checked.0 = lead.to;
+            }
+        }
         let funding = store.load_funding(id, range.0, range.1)?;
-        if let Some(s) = shortfall(id, range, &gaps, &closures, !bars.is_empty(), &funding) {
+        let checked_funding = &funding[funding.partition_point(|&(t, _)| t < checked.0)..];
+        if let Some(s) = shortfall(
+            id,
+            checked,
+            &gaps,
+            &closures,
+            !bars.is_empty(),
+            checked_funding,
+        ) {
+            let at_start = s.candles.first().is_some_and(|g| g.from == range.0);
+            if let Some((what, end)) = held.filter(|_| at_start) {
+                let hole = format!(
+                    "the store holds {what} of it from before {} UTC, so it was trading then, \
+                     and the venue's history has a hole there that a download cannot fill",
+                    format_minute(end)
+                );
+                return Err(s.refused(id, &hole, &hole));
+            }
+            if at_start && lead.is_some() {
+                let unlisted = format!(
+                    "the store has no record that a download asked the venue for the start of \
+                     that and found nothing there, as before an instrument is listed; {advice} \
+                     from {} UTC, which settles whether it was listed yet",
+                    format_minute(range.0)
+                );
+                return Err(s.refused(id, &unlisted, advice));
+            }
+            if at_start && bars.is_empty() && store.recorded_empty(id, range.0, range.1)? {
+                let not_trading = "downloads asked the venue for all of that and it had nothing, \
+                                   so the instrument does not trade in that span";
+                return Err(s.refused(id, not_trading, advice));
+            }
             return Err(s.refused(id, advice, advice));
         }
         also_traded.push(AlsoTradedBars {
@@ -531,6 +577,28 @@ fn read_also_traded(
         });
     }
     Ok(also_traded)
+}
+
+fn held_before(
+    store: &Store,
+    id: &InstrumentId,
+    end: Millis,
+) -> Result<Option<&'static str>, ApiError> {
+    for month in store
+        .months(id)?
+        .into_iter()
+        .take_while(|m| m.start() < end)
+    {
+        if store
+            .read_month(id, month)?
+            .first()
+            .is_some_and(|c| c.open_time < end)
+        {
+            return Ok(Some("candles"));
+        }
+    }
+    let funding = store.load_funding(id, Millis::MIN, end - max_gap(id.kind) + 1)?;
+    Ok((!funding.is_empty()).then_some("funding rates"))
 }
 
 fn stored_bids(

@@ -2448,7 +2448,8 @@ export type StoredResponse = {
  */
 data_dir: string, 
 /**
- * Every instrument with at least one month file or a funding file, in instrument order.
+ * Every instrument with at least one month file, month record or funding file, in
+ * instrument order.
  */
 instruments: Array<StoredInstrumentInfo>, 
 /**
@@ -2462,7 +2463,8 @@ unrecognised: Array<string>, };
  */
 export type StoredInstrumentInfo = { instrument: InstrumentId, 
 /**
- * The month files, oldest first; empty when only a funding file is stored.
+ * The month files and the records of months the venue had nothing for, oldest first; empty
+ * when only a funding file is stored.
  */
 months: Array<StoredMonthInfo>, 
 /**
@@ -2470,19 +2472,20 @@ months: Array<StoredMonthInfo>,
  */
 funding_bytes: number | null, 
 /**
- * The month files and the funding file together.
+ * The months and the funding file together.
  */
 bytes: number, };
 
 /**
  * One month file of an instrument's candles and its size on disk, with its closure record's,
- * which a delete of the month removes with it.
+ * which a delete of the month removes with it; or a record alone, for a month a download found
+ * the venue had nothing for.
  */
 export type StoredMonthInfo = { 
 /**
  * `YYYY-MM`.
  */
-month: string, bytes: number, };
+month: string, bytes: number, record_only: boolean, };
 
 /**
  * What to delete: the candles of `instrument` for the months `from` to `to`, both included, or,

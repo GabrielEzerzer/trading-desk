@@ -33,7 +33,7 @@ export function instrumentKey(id: InstrumentId): string {
 
 /** The instruments with candles stored, `first` first when it is one of them, then in the store's order. */
 export function storedDatasets(stored: StoredResponse, first: InstrumentId): InstrumentId[] {
-  const ids = stored.instruments.filter((i) => i.months.length > 0).map((i) => i.instrument)
+  const ids = stored.instruments.filter((i) => i.months.some((m) => !m.record_only)).map((i) => i.instrument)
   const key = instrumentKey(first)
   return [...ids.filter((id) => instrumentKey(id) === key), ...ids.filter((id) => instrumentKey(id) !== key)]
 }

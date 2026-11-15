@@ -3,27 +3,30 @@
 //! minutes of a slow Sunday open. They are recorded when a month is downloaded, and coverage and
 //! the run check read them.
 //!
-//! A download of a kind with closed hours records, beside the month file, the spans of open time in
-//! the range it asked for that the venue returned nothing for: `<YYYY-MM>.parquet.closed.json`, a
-//! JSON list of `[from, to]` pairs in milliseconds, each span holding the open times `from` up to
-//! but not including `to`. A download replaces what the record said about the range it fetched and
-//! keeps the rest. A span that reaches the present is left out, since its minutes may only not be
-//! published yet.
+//! A download records, beside the month file, the spans of open time in the range it asked for that
+//! the venue returned nothing for: `<YYYY-MM>.parquet.closed.json`, a JSON list of `[from, to]`
+//! pairs in milliseconds, each span holding the open times `from` up to but not including `to`. A
+//! download replaces what the record said about the range it fetched and keeps the rest. A span
+//! that reaches the present is left out, since its minutes may only not be published yet; for a
+//! kind that never closes, so is a span at the end of the range that ends less than a day before
+//! the present, since a day's file can come out the day after. For a kind that never closes, a
+//! month the venue had nothing for at all, such as one before an instrument was listed, gets a
+//! record and no month file; for a kind with closed hours it gets neither.
 //!
 //! When the records are read ([`Store::closures`]), spans that meet, at a month's end or across
 //! closed hours, join into one stretch. A stretch holding at most [`SHORT_CLOSURE`] of open time,
 //! such as a late Sunday open, counts as closed. A longer one counts as closed only if it holds at
 //! most [`LONGEST_CLOSURE`] and overlaps the year-end holidays, 24 December 00:00 to 3 January
 //! 00:00 UTC, where OANDA's day-long closures fall. Any other stretch is an outage, not a closure:
-//! it stays missing, so its month is not complete and the run check refuses a long one. Records
-//! are written only for kinds with closed hours, so a crypto outage is always missing.
+//! it stays missing, so its month is not complete and the run check refuses a long one. The records
+//! of a kind that never closes are not read as closures, so a crypto outage is always missing.
 //!
 //! A month downloaded before records were written has none: all its missing open time counts as
 //! missing, as before, and the run check keeps a wider limit for it (`max_gap` in td-server).
 //!
-//! A delete of a month removes its record with its data file, so the stored list and the delete
-//! treat records as the store's own files, and the next download of the month fetches all of it
-//! and writes the record again.
+//! A delete of a month removes its record with its data file, or alone when the month has no data
+//! file, so the stored list and the delete treat records as the store's own files, and the next
+//! download of the month fetches all of it and writes the record again.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -34,7 +37,8 @@ use td_core::{Hours, InstrumentId, InstrumentKind, Millis};
 
 use crate::DataError;
 use crate::store::{
-    Gap, Store, bad_file, file_lock, hold, lock_across_processes, write_bytes_atomic,
+    Gap, Store, bad_file, file_lock, hold, lock_across_processes, missing_minutes,
+    write_bytes_atomic,
 };
 use crate::time::{DAY, MINUTE, Month};
 
@@ -196,6 +200,27 @@ impl Store {
         }
         let json = serde_json::to_vec(&merged).map_err(|e| bad_file(&data, e.to_string()))?;
         write_bytes_atomic(&self.record_path(id, month)?, &json)
+    }
+
+    pub fn recorded_empty(
+        &self,
+        id: &InstrumentId,
+        from: Millis,
+        to: Millis,
+    ) -> Result<bool, DataError> {
+        let mut spans = Vec::new();
+        for month in Month::range(from, to) {
+            match self.closure_record(id, month)? {
+                Some(recorded) => spans.extend(recorded),
+                None => return Ok(false),
+            }
+        }
+        let open = missing_minutes(id.kind, &[], from, to);
+        let recorded = Closures {
+            spans,
+            recorded: BTreeSet::new(),
+        };
+        Ok(recorded.remove(open).is_empty())
     }
 
     /// The closures recorded over `[from, to)`: each stretch of recorded spans, joined where they

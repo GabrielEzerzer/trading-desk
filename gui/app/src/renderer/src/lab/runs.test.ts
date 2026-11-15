@@ -196,7 +196,7 @@ describe('storedDatasets', () => {
   const id = (symbol: string, kind: InstrumentId['kind']): InstrumentId => ({ venue: 'binance', symbol, kind })
   const info = (instrument: InstrumentId, months: number) => ({
     instrument,
-    months: Array.from({ length: months }, (_, i) => ({ month: `2024-0${i + 1}`, bytes: 10 })),
+    months: Array.from({ length: months }, (_, i) => ({ month: `2024-0${i + 1}`, bytes: 10, record_only: false })),
     funding_bytes: instrument.kind === 'perpetual' ? 5 : null,
     bytes: months * 10,
   })
@@ -210,5 +210,18 @@ describe('storedDatasets', () => {
     expect(storedDatasets(stored, id('SOLUSDT', 'spot'))).toEqual([id('SOLUSDT', 'spot'), id('ETHUSDT', 'spot')])
     // An instrument with only a funding file has nothing to run on.
     expect(storedDatasets(stored, id('BTCUSDT', 'perpetual'))).toEqual([id('ETHUSDT', 'spot'), id('SOLUSDT', 'spot')])
+  })
+
+  it('leaves out an instrument whose months are all records of months the venue had nothing for', () => {
+    const months = (...records: boolean[]) =>
+      records.map((record_only, i) => ({ month: `2024-0${i + 1}`, bytes: 10, record_only }))
+    const withRecords: StoredResponse = {
+      ...stored,
+      instruments: [
+        { ...info(id('NEWUSDT', 'perpetual'), 0), months: months(true, true) },
+        { ...info(id('LATEUSDT', 'perpetual'), 0), months: months(true, false) },
+      ],
+    }
+    expect(storedDatasets(withRecords, id('NEWUSDT', 'perpetual'))).toEqual([id('LATEUSDT', 'perpetual')])
   })
 })

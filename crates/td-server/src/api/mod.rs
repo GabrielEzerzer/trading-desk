@@ -21,7 +21,8 @@
 //!   and each month file's bytes. A closure recorded at download time is closed time, neither a
 //!   gap nor counted in `month_minutes`.
 //! - `GET /data/stored`: the data folder's path, every instrument the store holds, with each month
-//!   file's bytes and the funding file's, and any paths in the data folder the store did not write.
+//!   file's bytes, a month record's bytes for a month the venue had nothing for (`record_only`),
+//!   and the funding file's, and any paths in the data folder the store did not write.
 //! - `POST /data/delete` `{instrument, from?, to?}`: deletes the candles of the months `from` to
 //!   `to` (`YYYY-MM`, both included), or with neither the whole instrument including a
 //!   perpetual's funding file, and answers `{files, bytes}` removed. An instrument with a queued
