@@ -1,0 +1,11 @@
+#!/usr/bin/env node
+// Sample module used by the lint tests.
+const url = "http://example.com//x";
+const s = '/* not */' + "// not";
+
+function f() {
+  /* block fails */
+  return url + s; // eslint-disable-line no-undef
+}
+
+module.exports = { f };

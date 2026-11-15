@@ -1,0 +1,337 @@
+id: layers-td-core-pure
+language: Rust
+severity: error
+message: "td-core's library code holds the shared types and the tick and lot rounding, and imports no other workspace crate and no file, network, process or async code. Do the I/O in td-data or in the crate that needs it, and pass the values in."
+files:
+  - "crates/td-core/src/**"
+utils:
+  crate-path-root:
+    any:
+      - inside:
+          kind: use_declaration
+          stopBy: end
+      - inside:
+          any:
+            - kind: scoped_identifier
+            - kind: scoped_type_identifier
+            - kind: scoped_use_list
+            - kind: extern_crate_declaration
+rule:
+  any:
+    - kind: identifier
+      regex: '^(td_engine|td_data|td_orders|td_live|td_server|td_mock_bybit|reqwest|tokio|tokio_tungstenite|axum|hmac)$'
+      matches: crate-path-root
+    - kind: scoped_identifier
+      regex: '^std\s*::\s*(fs|net|process)$'
+    - kind: identifier
+      regex: '^(fs|net|process)$'
+      inside:
+        kind: use_list
+        inside:
+          kind: scoped_use_list
+          has:
+            field: path
+            regex: '^std$'
+---
+id: layers-td-engine-no-venue
+language: Rust
+severity: error
+message: "td-engine runs on the bars and quotes it is given and never fetches data or sends orders. Load data with td-data and send orders with td-orders from td-server or td-live, and pass the results in. Only the cross-check example in crates/td-engine/examples/ downloads through td-data."
+files:
+  - "crates/td-engine/**"
+ignores:
+  - "crates/td-engine/examples/**"
+utils:
+  crate-path-root:
+    any:
+      - inside:
+          kind: use_declaration
+          stopBy: end
+      - inside:
+          any:
+            - kind: scoped_identifier
+            - kind: scoped_type_identifier
+            - kind: scoped_use_list
+            - kind: extern_crate_declaration
+rule:
+  any:
+    - kind: identifier
+      regex: '^(td_data|td_orders|td_live|td_server|td_mock_bybit|reqwest|tokio|tokio_tungstenite|axum|hmac)$'
+      matches: crate-path-root
+    - kind: scoped_identifier
+      regex: '^std\s*::\s*net$'
+---
+id: layers-td-data-adapter
+language: Rust
+severity: error
+message: "td-data is the venue data adapter under the engine and the apps: of the workspace crates it imports td-core only. Put code that combines data with the engine, orders or a session in td-server or td-live."
+files:
+  - "crates/td-data/**"
+utils:
+  crate-path-root:
+    any:
+      - inside:
+          kind: use_declaration
+          stopBy: end
+      - inside:
+          any:
+            - kind: scoped_identifier
+            - kind: scoped_type_identifier
+            - kind: scoped_use_list
+            - kind: extern_crate_declaration
+rule:
+  kind: identifier
+  regex: '^(td_engine|td_orders|td_live|td_server)$'
+  matches: crate-path-root
+---
+id: layers-td-orders-adapter
+language: Rust
+severity: error
+message: "td-orders is the order route under the engine and the apps: of the workspace crates it imports td-core only, and td-mock-bybit in its tests. Put code that combines orders with data, the engine or a session in td-live."
+files:
+  - "crates/td-orders/**"
+utils:
+  crate-path-root:
+    any:
+      - inside:
+          kind: use_declaration
+          stopBy: end
+      - inside:
+          any:
+            - kind: scoped_identifier
+            - kind: scoped_type_identifier
+            - kind: scoped_use_list
+            - kind: extern_crate_declaration
+rule:
+  kind: identifier
+  regex: '^(td_engine|td_data|td_live|td_server)$'
+  matches: crate-path-root
+---
+id: layers-td-server-sends-no-orders
+language: Rust
+severity: error
+message: "td-server never sends venue orders: a live session starts only from the td-live command. Put order and live-session code in td-live, and keep the server to backtests, data and paper sessions."
+files:
+  - "crates/td-server/**"
+utils:
+  crate-path-root:
+    any:
+      - inside:
+          kind: use_declaration
+          stopBy: end
+      - inside:
+          any:
+            - kind: scoped_identifier
+            - kind: scoped_type_identifier
+            - kind: scoped_use_list
+            - kind: extern_crate_declaration
+rule:
+  kind: identifier
+  regex: '^(td_orders|td_live|td_mock_bybit)$'
+  matches: crate-path-root
+---
+id: layers-mock-bybit-independent
+language: Rust
+severity: error
+message: "td-mock-bybit stands in for the venue and, of the workspace crates, imports td-core only, so it never shares code with the client it tests. Copy the venue's documented behaviour into mock/bybit instead of importing it from td-orders, td-live or another crate."
+files:
+  - "mock/bybit/**"
+utils:
+  crate-path-root:
+    any:
+      - inside:
+          kind: use_declaration
+          stopBy: end
+      - inside:
+          any:
+            - kind: scoped_identifier
+            - kind: scoped_type_identifier
+            - kind: scoped_use_list
+            - kind: extern_crate_declaration
+rule:
+  kind: identifier
+  regex: '^(td_engine|td_data|td_orders|td_live|td_server)$'
+  matches: crate-path-root
+---
+id: layers-rust-fixtures-through-mock
+language: Rust
+severity: error
+message: "A file read with include_str! or include_bytes! from outside its own crate comes from a mock/ folder (mock/bybit/fixtures, gui/app/mock). Move the fixture there, or into this crate's tests/fixtures/."
+files:
+  - "crates/**"
+  - "mock/**"
+rule:
+  kind: macro_invocation
+  regex: '^include_(str|bytes)\s*!\s*\(\s*"(\.\./){2,}'
+  not:
+    regex: '/mock/'
+---
+id: layers-gui-shared-stands-alone
+language: TypeScript
+severity: error
+message: "gui/shared is the API types and client that both Electron processes load: it imports nothing from the app, Electron, Node or React. Put process-specific code in gui/app/src/main or gui/app/src/renderer and import @td/shared from there."
+files:
+  - "gui/shared/src/**"
+ignores:
+  - "gui/shared/src/**/*.test.ts"
+rule:
+  kind: string
+  regex: '^[''"](electron|node:.*|react|react-dom(/.*)?|\.\./.*)[''"]$'
+  inside:
+    any:
+      - kind: import_statement
+      - kind: export_statement
+      - kind: arguments
+        inside:
+          kind: call_expression
+          has:
+            field: function
+            regex: '^(import|require)$'
+---
+id: layers-gui-renderer-sandboxed-ts
+language: TypeScript
+severity: error
+message: "The renderer runs in the browser sandbox with no Node or Electron. Reach the engine through @td/shared and the preload bridge, and put Node or Electron code in gui/app/src/main."
+files:
+  - "gui/app/src/renderer/**"
+rule:
+  kind: string
+  regex: '^[''"](electron|node:.*|fs|path|os|child_process|(\.\./)+(main|preload)(/.*)?)[''"]$'
+  inside:
+    any:
+      - kind: import_statement
+      - kind: export_statement
+      - kind: arguments
+        inside:
+          kind: call_expression
+          has:
+            field: function
+            regex: '^(import|require)$'
+---
+id: layers-gui-renderer-sandboxed-tsx
+language: Tsx
+severity: error
+message: "The renderer runs in the browser sandbox with no Node or Electron. Reach the engine through @td/shared and the preload bridge, and put Node or Electron code in gui/app/src/main."
+files:
+  - "gui/app/src/renderer/**"
+rule:
+  kind: string
+  regex: '^[''"](electron|node:.*|fs|path|os|child_process|(\.\./)+(main|preload)(/.*)?)[''"]$'
+  inside:
+    any:
+      - kind: import_statement
+      - kind: export_statement
+      - kind: arguments
+        inside:
+          kind: call_expression
+          has:
+            field: function
+            regex: '^(import|require)$'
+---
+id: layers-gui-main-no-renderer
+language: TypeScript
+severity: error
+message: "The Electron main and preload processes never import renderer code or React. Move what both sides need into @td/shared (gui/shared/src) and import it from there."
+files:
+  - "gui/app/src/main/**"
+  - "gui/app/src/preload/**"
+rule:
+  kind: string
+  regex: '^[''"](react|react-dom(/.*)?|(\.\./)+renderer(/.*)?)[''"]$'
+  inside:
+    any:
+      - kind: import_statement
+      - kind: export_statement
+      - kind: arguments
+        inside:
+          kind: call_expression
+          has:
+            field: function
+            regex: '^(import|require)$'
+---
+id: layers-gui-mock-through-source-ts
+language: TypeScript
+severity: error
+message: "Mock data enters the app only through the source seams, gui/app/src/renderer/src/lab/source.ts and trading/source.ts, and tests. Import the source module instead, or add the mock behind it."
+files:
+  - "gui/app/src/**"
+  - "gui/shared/src/**"
+ignores:
+  - "**/source.ts"
+  - "**/*.test.ts"
+rule:
+  kind: string
+  regex: '^[''"](.*/)?mock(/.*)?[''"]$'
+  inside:
+    any:
+      - kind: import_statement
+      - kind: export_statement
+      - kind: arguments
+        inside:
+          kind: call_expression
+          has:
+            field: function
+            regex: '^(import|require)$'
+---
+id: layers-gui-mock-through-source-tsx
+language: Tsx
+severity: error
+message: "Mock data enters the app only through the source seams, gui/app/src/renderer/src/lab/source.ts and trading/source.ts, and tests. Import the source module instead, or add the mock behind it."
+files:
+  - "gui/app/src/**"
+rule:
+  kind: string
+  regex: '^[''"](.*/)?mock(/.*)?[''"]$'
+  inside:
+    any:
+      - kind: import_statement
+      - kind: export_statement
+      - kind: arguments
+        inside:
+          kind: call_expression
+          has:
+            field: function
+            regex: '^(import|require)$'
+---
+id: layers-gui-app-no-harness-ts
+language: TypeScript
+severity: error
+message: "App and shared code never import the UI gates (gui/e2e), the screenshot tool (gui/app/shots), test helpers (gui/app/test) or scripts (gui/scripts). Move the shared piece into the app or @td/shared and import it from the harness."
+files:
+  - "gui/app/src/**"
+  - "gui/shared/src/**"
+ignores:
+  - "**/*.test.ts"
+rule:
+  kind: string
+  regex: '^[''"](.*/)?(e2e|shots|test|scripts)/.*[''"]$'
+  inside:
+    any:
+      - kind: import_statement
+      - kind: export_statement
+      - kind: arguments
+        inside:
+          kind: call_expression
+          has:
+            field: function
+            regex: '^(import|require)$'
+---
+id: layers-gui-app-no-harness-tsx
+language: Tsx
+severity: error
+message: "App and shared code never import the UI gates (gui/e2e), the screenshot tool (gui/app/shots), test helpers (gui/app/test) or scripts (gui/scripts). Move the shared piece into the app or @td/shared and import it from the harness."
+files:
+  - "gui/app/src/**"
+rule:
+  kind: string
+  regex: '^[''"](.*/)?(e2e|shots|test|scripts)/.*[''"]$'
+  inside:
+    any:
+      - kind: import_statement
+      - kind: export_statement
+      - kind: arguments
+        inside:
+          kind: call_expression
+          has:
+            field: function
+            regex: '^(import|require)$'

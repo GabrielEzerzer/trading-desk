@@ -1,0 +1,8 @@
+id: shebang-python
+language: Python
+rule:
+  kind: comment
+  regex: '^#!'
+  nthChild: 1
+  inside:
+    kind: module

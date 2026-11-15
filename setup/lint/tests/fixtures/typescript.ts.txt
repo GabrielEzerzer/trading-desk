@@ -1,0 +1,22 @@
+// Sample module used by the lint tests.
+// It shows each case the rules must handle.
+const url = "https://example.com/a//b";
+const slashes = '// not a comment /* nor this */';
+const tpl = `# ${url} // still a template`;
+const re = /\/\/ regex/;
+
+/** jsdoc fails */
+export function add(a: number, b: number): number {
+  return a + b; // trailing fails
+}
+
+// eslint-disable-next-line no-console
+console.log(add(1, 2));
+// @ts-ignore
+const x: number = "y";
+// @ts-expect-error
+const y: string = 1;
+/* biome-ignore lint: reason */
+const z = x + y;
+const w = z; /* @ts-nocheck */
+export { url, slashes, tpl, re, w };

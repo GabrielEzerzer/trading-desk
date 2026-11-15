@@ -1,4 +1,4 @@
-# CI for the GUI workspace in gui/. Rules: D:/code/CLAUDE.md, "Test suites".
+# CI for the GUI workspace in gui/.
 # It runs on pushes to branches other than the default and on manual dispatch, so each push starts one run
 # and a branch has results before its PR exists. On a push whose branch differs from main nowhere under gui/
 # or in this file, every step after the comparison is skipped and the run passes in seconds: this workflow
