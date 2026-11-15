@@ -714,7 +714,7 @@ fn simulate<'a>(
     session.name_references(references.iter().map(|(id, _)| id.clone()).collect())?;
     session.name_series(named.iter().map(|s| (*s).clone()).collect())?;
     if !legs.is_empty() {
-        session.name_also_traded(legs.clone())?;
+        session.name_also_traded(legs.clone(), keep_exposures)?;
     }
     for (j, (bar, range)) in warmup.iter().zip(warmup_ranges).enumerate() {
         session.feed(*bar, None, &funding[range], &row(&references, j), true)?;
@@ -772,7 +772,7 @@ fn simulate<'a>(
             .sum();
         (
             several_trades(config, &session, &bars, &fills),
-            several_intrabar(&session, keep_exposures),
+            several_intrabar(&session),
             session.portfolio().funding_paid() + others,
         )
     };
@@ -997,25 +997,13 @@ fn with_fill_bars(
 }
 
 /// The equity ranges and peak leverage of a run with several traded instruments, from the
-/// session's own reading of the account ([`Session::ranges`]), with its exposures when
-/// `keep_exposures` is set.
-fn several_intrabar(session: &Session, keep_exposures: bool) -> Intrabar {
-    let mut peak = (!session.ranges().is_empty()).then_some(0.0);
-    for x in session.exposures() {
-        if x.equity > 0.0
-            && let Some(lev) = metrics::finite(x.notional / x.equity)
-        {
-            peak = Some(peak.map_or(lev, |p: f64| p.max(lev)));
-        }
-    }
+/// session's own reading of the account ([`Session::ranges`]), with its exposures when the run
+/// keeps them.
+fn several_intrabar(session: &Session) -> Intrabar {
     Intrabar {
         ranges: session.ranges().to_vec(),
-        peak_leverage: peak,
-        exposures: if keep_exposures {
-            session.exposures().to_vec()
-        } else {
-            Vec::new()
-        },
+        peak_leverage: (!session.ranges().is_empty()).then_some(session.peak_leverage()),
+        exposures: session.exposures().to_vec(),
     }
 }
 
@@ -1520,10 +1508,11 @@ pub fn data_fingerprint(bars: &[Candle], asks: &[Candle], funding: &[(Millis, f6
 /// form of an id, its row count and per row its `known_at`, the bits of its value, and a 0 byte
 /// for no period or a 1 byte and the period: the rows the run could read, those known by its last
 /// bar's close. Then, when a run trades other instruments beside the first, the bytes `traded`,
-/// their count, and per instrument its id in the form above, one slot per bar in `bars` in the
-/// form of a reference's slots, its other bars the run used (those at times the first instrument
-/// has no bar) in the form of `bars`, and its funding events the strategy could see in the form
-/// of `funding`. Without references, series or other traded instruments nothing is added, so a
+/// their count, and per instrument its id in the form above, a 1 byte and the open time of its
+/// first bar given (that of the first bar in `bars` when its own is earlier) or a 0 byte when it
+/// has none, one slot per bar in `bars` in the form of a reference's slots, its other bars the
+/// run used (those at times the first instrument has no bar) in the form of `bars`, and its
+/// funding events the strategy could see in the form of `funding`. Without references, series or other traded instruments nothing is added, so a
 /// fingerprint is what it was before they existed.
 fn fingerprint(
     bars: &[Candle],
@@ -1594,10 +1583,21 @@ fn fingerprint(
         h.update(b"traded");
         h.update((traded.len() as u64).to_le_bytes());
         let times: HashSet<Millis> = bars.iter().map(|b| b.open_time).collect();
+        let start = bars.first().map_or(0, |b| b.open_time);
         for leg in traded {
             let id = leg.instrument.id.to_string();
             h.update((id.len() as u64).to_le_bytes());
             h.update(id.as_bytes());
+            // When it was listed, which `has_had_bar` and `start_when_all_listed` read. Every
+            // listing at or before the first bar used reads the same on every bar, so it is
+            // hashed as that bar's time, and a download with longer history keeps the fingerprint.
+            match leg.listed_from {
+                Some(t) => {
+                    h.update([1u8]);
+                    h.update(t.max(start).to_le_bytes());
+                }
+                None => h.update([0u8]),
+            }
             let by_time: HashMap<Millis, &Candle> =
                 leg.bars.iter().map(|b| (b.open_time, b)).collect();
             h.update((bars.len() as u64).to_le_bytes());
