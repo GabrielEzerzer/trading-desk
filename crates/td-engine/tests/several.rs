@@ -790,6 +790,33 @@ fn a_hedged_book_is_read_at_the_opens_fills_and_closes_and_not_at_each_worst_pri
 }
 
 #[test]
+fn the_account_is_read_after_each_fill_with_its_fee_paid() {
+    let a_bars = vec![flat(0, 100.0), bar(1, 100.0, 101.0, 100.0, 101.0)];
+    let b_bars = vec![flat(0, 50.0), bar(1, 50.0, 51.0, 50.0, 51.0)];
+    let (strategy, _) = scripted(|ctx, _| {
+        if index(ctx) == 0 {
+            ctx.submit(market(&a(), Side::Buy, 10.0)).unwrap();
+            ctx.submit(market(&b(), Side::Buy, 20.0)).unwrap();
+        }
+    });
+    let mut config = config(2);
+    config.starting_cash = 1_000.0;
+    config.max_leverage = 10.0;
+    config.instrument.fees.per_unit = 0.1;
+    config.also_traded[0].fees.per_unit = 0.1;
+    let others = [traded(&b(), b_bars, Vec::new())];
+    let result = run(&config, strategy, &a_bars, &[], &others).unwrap();
+    // 10 A bought at 100.05 for a fee of 1, then 20 B at 50.03 for a fee of 2. Neither fill moves
+    // the account but for its fee, and both bars close higher, so the least the account holds in
+    // bar 1 is right after the second fill: 1 000 - 1 - 2 = 997. At the closes of 101 and 51 it
+    // holds 997 + 10 * (101 - 100.05) + 20 * (51 - 50.03) = 1 025.9.
+    assert_eq!(result.fills.len(), 2, "{:?}", result.fills);
+    let range = result.equity_extremes[1];
+    close(range.low, 997.0);
+    close(range.high, 1_025.9);
+}
+
+#[test]
 fn one_instrument_holding_alone_is_read_at_its_low_and_high() {
     let a_bars: Vec<Candle> = (0..4).map(|i| flat(i, 100.0)).collect();
     let b_bars = vec![

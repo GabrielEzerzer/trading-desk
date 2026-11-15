@@ -673,12 +673,15 @@ impl Session {
     /// `first_funding` the funding fed with the first instrument's bar. Returns the funding
     /// charged on the first instrument.
     ///
-    /// For every instrument with a bar, in order: the funding due at its open, or in the gap since
-    /// its bar before, is charged on its position at its open; its open orders are checked against
-    /// its bar on its broker, the first instrument's first and then the others in the order the
-    /// run names them; the funding due later in its bar is charged on its position after the
-    /// fills, at its close; and it is marked at its close. An instrument without a bar keeps its
-    /// position, its orders and its last mark, and its funding waits for its next bar.
+    /// The bar time is traded in three parts, so that what is known to come first does. First,
+    /// for every instrument with a bar, the funding due at its open, or in the gap since its bar
+    /// before, is charged on its position at its open. Then each instrument's open orders are
+    /// checked against its bar on its broker, the first instrument's first and then the others in
+    /// the order the run names them. Last, for every instrument with a bar, the funding due later
+    /// in its bar is charged on its position at its close, after every instrument's fills, as a
+    /// run with one instrument charges it after its own, and it is marked at its close. An
+    /// instrument without a bar keeps its position, its orders and its last mark, and its funding
+    /// waits for its next bar.
     ///
     /// The account's equity inside the bar time, which gives its range, its peak leverage and its
     /// liquidation, is read as [`Session::inside_points`] describes. With one instrument holding or
@@ -765,10 +768,14 @@ impl Session {
                     }
                 }
                 self.record(k, event, &mut resting);
-                if filled && alone.is_none() && self.breach(&prices, time) {
-                    liquidated = true;
-                    self.drop_events(k, events.by_ref());
-                    break;
+                if filled && alone.is_none() {
+                    // After the fill, with its fee paid.
+                    self.see(&prices);
+                    if self.breach(&prices, time) {
+                        liquidated = true;
+                        self.drop_events(k, events.by_ref());
+                        break;
+                    }
                 }
             }
             if alone == Some(k) && !liquidated {
