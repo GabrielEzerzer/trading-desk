@@ -355,12 +355,10 @@ fn plan() -> TestPlan {
 /// so this rule's verdict can be inconclusive at best until that test runs on FX. An inconclusive
 /// verdict here says the battery is incomplete, not that the edge is in doubt.
 fn rule() -> VerdictRule {
-    VerdictRule::HighRisk {
-        limits: HighRiskLimits {
-            min_trades: 200,
-            ..HighRiskLimits::default()
-        },
-    }
+    VerdictRule::high_risk(HighRiskLimits {
+        min_trades: 200,
+        ..HighRiskLimits::default()
+    })
 }
 
 #[cfg(test)]

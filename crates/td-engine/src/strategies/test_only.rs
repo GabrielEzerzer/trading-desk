@@ -52,10 +52,7 @@ fn unrepeatable() -> StrategyEntry {
         }],
         build,
         plan: plan(),
-        rule: VerdictRule::Portfolio {
-            benchmark: PortfolioBenchmark::Cash,
-            limits: PortfolioLimits::default(),
-        },
+        rule: VerdictRule::portfolio(PortfolioBenchmark::Cash, PortfolioLimits::default()),
     }
 }
 
@@ -119,10 +116,7 @@ fn one_hour() -> StrategyEntry {
             }))
         },
         plan,
-        rule: VerdictRule::Portfolio {
-            benchmark: PortfolioBenchmark::Cash,
-            limits: PortfolioLimits::default(),
-        },
+        rule: VerdictRule::portfolio(PortfolioBenchmark::Cash, PortfolioLimits::default()),
     }
 }
 
@@ -189,10 +183,7 @@ fn tells_funding() -> StrategyEntry {
         params: Vec::new(),
         build: |_| Ok(Box::new(TellsFunding { told: false })),
         plan,
-        rule: VerdictRule::Portfolio {
-            benchmark: PortfolioBenchmark::Cash,
-            limits: PortfolioLimits::default(),
-        },
+        rule: VerdictRule::portfolio(PortfolioBenchmark::Cash, PortfolioLimits::default()),
     }
 }
 
@@ -223,10 +214,7 @@ fn rests_limits() -> StrategyEntry {
         params: Vec::new(),
         build: |_| Ok(Box::new(RestsLimits)),
         plan,
-        rule: VerdictRule::Portfolio {
-            benchmark: PortfolioBenchmark::Cash,
-            limits: PortfolioLimits::default(),
-        },
+        rule: VerdictRule::portfolio(PortfolioBenchmark::Cash, PortfolioLimits::default()),
     }
 }
 
@@ -290,10 +278,7 @@ fn example_series() -> StrategyEntry {
             }))
         },
         plan,
-        rule: VerdictRule::Portfolio {
-            benchmark: PortfolioBenchmark::Cash,
-            limits: PortfolioLimits::default(),
-        },
+        rule: VerdictRule::portfolio(PortfolioBenchmark::Cash, PortfolioLimits::default()),
     }
 }
 

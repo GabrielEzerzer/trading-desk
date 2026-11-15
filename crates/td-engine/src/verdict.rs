@@ -272,8 +272,8 @@ impl FirmLimits {
 }
 
 /// The fields of [`AttemptTerms`] that have no default, for [`AttemptTerms::new`]. They are named
-/// here rather than passed in order because three are amounts and three are day counts, which a
-/// list of arguments would let a strategy swap without a compiler error.
+/// here rather than passed in order because two are amounts, one is a share and three are day
+/// counts, which a list of arguments would let a strategy swap without a compiler error.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RequiredAttemptTerms {
     pub account_size: f64,
@@ -555,6 +555,16 @@ impl VerdictRule {
             limits,
             attempt,
         }
+    }
+
+    /// A `portfolio` rule, built here for the reason [`VerdictRule::prop_firm`] gives.
+    pub fn portfolio(benchmark: PortfolioBenchmark, limits: PortfolioLimits) -> Self {
+        VerdictRule::Portfolio { benchmark, limits }
+    }
+
+    /// A `high_risk` rule, built here for the reason [`VerdictRule::prop_firm`] gives.
+    pub fn high_risk(limits: HighRiskLimits) -> Self {
+        VerdictRule::HighRisk { limits }
     }
 
     pub fn kind(&self) -> RuleKind {
@@ -1950,6 +1960,16 @@ mod tests {
                 "min_return_without_best_trade": 0.0,
             })),
             HighRiskLimits::default()
+        );
+        assert_eq!(
+            read::<VerdictRule>(json!({
+                "kind": "portfolio", "benchmark": "cash", "limits": PortfolioLimits::default(),
+            })),
+            VerdictRule::portfolio(PortfolioBenchmark::Cash, PortfolioLimits::default())
+        );
+        assert_eq!(
+            read::<VerdictRule>(json!({"kind": "high_risk", "limits": HighRiskLimits::default()})),
+            VerdictRule::high_risk(HighRiskLimits::default())
         );
     }
 

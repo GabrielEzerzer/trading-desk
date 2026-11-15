@@ -196,8 +196,5 @@ fn plan() -> TestPlan {
 // ---------------------------------------------------------------------------------------------
 
 fn rule() -> VerdictRule {
-    VerdictRule::Portfolio {
-        benchmark: PortfolioBenchmark::BuyAndHold,
-        limits: PortfolioLimits::default(),
-    }
+    VerdictRule::portfolio(PortfolioBenchmark::BuyAndHold, PortfolioLimits::default())
 }
