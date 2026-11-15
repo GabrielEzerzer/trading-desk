@@ -2,7 +2,7 @@
 //! into the crate's tests by build.rs the way a file in `src/strategies/private/` is compiled
 //! into the engine.
 
-use td_core::{AccountCurrency, Candle, InstrumentId, InstrumentKind, OrderType, Side, Timeframe, Venue};
+use td_core::{Candle, InstrumentId, InstrumentKind, OrderType, Side, Timeframe, Venue};
 
 use crate::strategies::{affordable_qty, order};
 use crate::{
@@ -54,57 +54,38 @@ impl Strategy for FixtureHold {
 // 2. The test plan
 
 fn plan() -> TestPlan {
-    TestPlan {
-        instruments: vec![InstrumentId {
+    TestPlan::new(
+        vec![InstrumentId {
             venue: Venue::Bybit,
             symbol: "SOLUSDT".into(),
             kind: InstrumentKind::Spot,
         }],
-        timeframe: Timeframe::D1,
-        period: Period {
-            from: date(2021, 1, 1),
-            to: date(2025, 1, 1),
-        },
-        backtest: BacktestSettings {
-            starting_cash: 1_000.0,
-            max_leverage: 1.0,
-            // Each instrument takes the backtest config's default slippage; list a
-            // SlippageOverride here to set one.
-            slippage: Vec::new(),
-            account_currency: AccountCurrency::Quote,
-            fee_override: None,
-        },
-        sweep: SweepPlan {
-            fixed: Params::new(),
-            axes: vec![ParamAxis {
-                name: "wait".into(),
-                space: ParamSpace::Values {
+        Timeframe::D1,
+        Period::new(date(2021, 1, 1), date(2025, 1, 1)),
+        // Starting cash and the leverage cap. Each instrument takes the backtest config's default
+        // slippage; list a SlippageOverride in the vector to set one.
+        BacktestSettings::new(1_000.0, 1.0, Vec::new()),
+        SweepPlan::new(
+            Params::new(),
+            vec![ParamAxis::new(
+                "wait",
+                ParamSpace::Values {
                     values: vec![ParamValue::Int(1), ParamValue::Int(5)],
                 },
-            }],
-            objective: Objective {
-                metric: Metric::TotalReturn,
-                direction: Direction::Maximize,
-            },
-            min_trades: 0,
-        },
-        walk_forward: WalkForwardPlan {
-            train_days: 365,
-            test_days: 120,
-            mode: crate::WindowMode::Rolling,
-        },
-        out_of_sample: None,
-        evidence: EvidenceSettings::default(),
-    }
+            )],
+            Objective::new(Metric::TotalReturn, Direction::Maximize),
+            0,
+        ),
+        WalkForwardPlan::new(365, 120),
+        EvidenceSettings::default(),
+    )
 }
 
 // 3. The verdict rule
 
 fn rule() -> VerdictRule {
-    VerdictRule::HighRisk {
-        limits: HighRiskLimits {
-            min_profit_factor: 1.5,
-            ..HighRiskLimits::default()
-        },
-    }
+    VerdictRule::high_risk(HighRiskLimits {
+        min_profit_factor: 1.5,
+        ..HighRiskLimits::default()
+    })
 }

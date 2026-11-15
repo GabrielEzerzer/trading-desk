@@ -791,6 +791,11 @@ export type WindowMode = "rolling" | "anchored";
  * The leftover bars at the start, fewer than `step`, are never tested. In rolling mode the first
  * train sweep is warmed up on them (as many as the train length); in anchored mode every train
  * window starts at the first bar, so they are part of each one's training data.
+ *
+ * An anchored first train window is checked without data at its longest, `train` bars and up to
+ * `step - 1` left over ([`WalkForwardSpec::check`]), and window by window in the data before a
+ * run. A test plan's validation also checks it at `train_days` alone, the shortest a run of the
+ * battery can leave it ([`crate::TestPlan::validate`]).
  */
 export type WindowSpec = { train_bars: number, test_bars: number, step_bars: number, mode: WindowMode, };
 
