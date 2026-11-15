@@ -439,7 +439,10 @@ pub struct PropFirmLimits {
     /// day's start, times the attempt's balance going into the day over the account size, times
     /// the phase's size, on every day of the evaluation and of the funded account. A day above
     /// the limit ends the account as a breach, so the pass and breach chances and the attempt's
-    /// value carry it, and there is no line of its own.
+    /// value carry it, and there is no line of its own. The size multiplies the figure as it
+    /// multiplies each daily return, which is exact at a size of 1. At another size, a position
+    /// sized from equity the run has moved by `g` since the day's start holds about
+    /// `(size - 1) * g` more than this reads: slightly more after a gain at a size above 1.
     ///
     /// `None`, the default, sets no limit and is left out of JSON.
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -498,9 +498,15 @@ pub struct PropFirmSpec {
     /// compounding size. Each day brings its open-notional figure (see [`prop_firm_odds`]): the
     /// run's largest open notional that day over its equity at the day's start. A walk holds the
     /// run's position scaled by its own balance going into the day over that equity, times the
-    /// phase's size, as each day's return and low apply to the balance, so the figure times the
-    /// size times that balance is the account's largest open notional that day, exactly. Above
+    /// phase's size, as each day's return and low apply to the balance, so at a size of 1 the
+    /// figure times that balance is the account's largest open notional that day, exactly. Above
     /// this limit the account ends on that day as a breach ([`PropFirmSpec::broke_rule`]).
+    ///
+    /// shortcut: at another size the figure is multiplied by the size, as each day's return is,
+    /// which leaves out what the size does to the account's equity inside the day. A position
+    /// sized inside the day from equity the run has moved by `g` since the day's start holds
+    /// `(1 + size * g) / (1 + g)` times this reading: more after a gain at a size above 1, less
+    /// after a loss. Reading it exactly needs each window run at the phase's size.
     /// Refused with `sizes_from_starting_cash`, where the position does not follow the balance.
     /// `None` sets no such limit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
