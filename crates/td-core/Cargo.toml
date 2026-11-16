@@ -16,4 +16,5 @@ ts-rs = { workspace = true, optional = true }
 ts = ["dep:ts-rs"]
 
 [dev-dependencies]
+proptest.workspace = true
 serde_json.workspace = true

@@ -1,0 +1,610 @@
+{
+  "features": [
+    {
+      "name": "Market data command",
+      "description": "The td-data command line tool for the local candle store.",
+      "kind": "cli",
+      "entry": "td-data",
+      "source": "crates/td-data/src/main.rs",
+      "inputs": "A subcommand and its flags; TD_DATA_DIR picks the store.",
+      "outputs": "The subcommand's output; help text without a subcommand.",
+      "test": "crates/td-data/tests/help.rs"
+    },
+    {
+      "name": "List a venue's instruments",
+      "description": "Lists the instruments a venue has open for trading, with their trading rules and fees.",
+      "kind": "cli",
+      "entry": "td-data instruments",
+      "source": "crates/td-data/src/main.rs",
+      "inputs": "--venue (binance, bybit, oanda) and --kind (spot, perpetual, fx).",
+      "outputs": "One tab-separated row per instrument on stdout; left-out symbols and a count on stderr.",
+      "test": "crates/td-data/src/instruments.rs"
+    },
+    {
+      "name": "Download history",
+      "description": "Downloads 1-minute candles, and funding rates for a perpetual, into the store.",
+      "kind": "cli",
+      "entry": "td-data download",
+      "source": "crates/td-data/src/main.rs",
+      "inputs": "--venue, --kind, --symbol, --from and --to as YYYY-MM-DD (UTC); OANDA_API_TOKEN for FX.",
+      "outputs": "Month files in the store and a report of what was written and what is missing.",
+      "test": "crates/td-data/src/download.rs"
+    },
+    {
+      "name": "Show stored coverage",
+      "description": "Shows which months and minutes the store holds for one instrument.",
+      "kind": "cli",
+      "entry": "td-data coverage",
+      "source": "crates/td-data/src/main.rs",
+      "inputs": "--venue, --kind and --symbol.",
+      "outputs": "The stored months and up to 20 runs of missing minutes.",
+      "test": "crates/td-data/tests/store.rs"
+    },
+    {
+      "name": "List stored data",
+      "description": "Lists every instrument the store holds, with the size of each month file and funding file.",
+      "kind": "cli",
+      "entry": "td-data stored",
+      "source": "crates/td-data/src/main.rs",
+      "inputs": "None.",
+      "outputs": "One block per instrument with its months and sizes, and any unrecognised files.",
+      "test": "crates/td-data/tests/store.rs"
+    },
+    {
+      "name": "Delete stored data",
+      "description": "Deletes an instrument's candles for a range of months, or the whole instrument.",
+      "kind": "cli",
+      "entry": "td-data delete",
+      "source": "crates/td-data/src/main.rs",
+      "inputs": "--venue, --kind, --symbol, and optionally --from and --to as YYYY-MM.",
+      "outputs": "What was removed; refused while the instrument is being downloaded.",
+      "test": "crates/td-data/tests/store.rs"
+    },
+    {
+      "name": "Live session command",
+      "description": "The td-live command line tool that runs a strategy on a venue's demo-trading account.",
+      "kind": "cli",
+      "entry": "td-live",
+      "source": "crates/td-live/src/bin/td-live.rs",
+      "inputs": "A subcommand and its flags; demo keys from the environment.",
+      "outputs": "The subcommand's output; help text without a subcommand.",
+      "test": "crates/td-live/tests/help.rs"
+    },
+    {
+      "name": "Start a live session",
+      "description": "Creates a live demo session with its stop rules and runs it until it halts or Ctrl-C.",
+      "kind": "cli",
+      "entry": "td-live start",
+      "source": "crates/td-live/src/cli.rs",
+      "inputs": "--id, --strategy, --params, --symbol, --timeframe, --daily-loss, --max-loss, --notional-cap, optional --reference and --data-dir.",
+      "outputs": "A session folder under <data dir>/live/<id>/ and one line per event.",
+      "test": "crates/td-live/tests/live_session.rs"
+    },
+    {
+      "name": "Resume a live session",
+      "description": "Runs a saved live session again with the stop rules it was created with.",
+      "kind": "cli",
+      "entry": "td-live resume",
+      "source": "crates/td-live/src/cli.rs",
+      "inputs": "--id and optional --data-dir.",
+      "outputs": "The session's log replayed and continued; one line per event.",
+      "test": "crates/td-live/tests/live_session.rs"
+    },
+    {
+      "name": "Show a live session's status",
+      "description": "Prints a session's saved status, stop state and the verdict it was started from, without touching the venue.",
+      "kind": "cli",
+      "entry": "td-live status",
+      "source": "crates/td-live/src/cli.rs",
+      "inputs": "--id and optional --data-dir.",
+      "outputs": "The status lines on stdout.",
+      "test": "crates/td-live/tests/stops.rs"
+    },
+    {
+      "name": "Flatten a live session",
+      "description": "Cancels a session's resting orders, closes its position reduce-only and ends it.",
+      "kind": "cli",
+      "entry": "td-live flatten",
+      "source": "crates/td-live/src/cli.rs",
+      "inputs": "--id and optional --data-dir.",
+      "outputs": "The orders cancelled and the close sent; the session ends.",
+      "test": "crates/td-live/tests/stops.rs"
+    },
+    {
+      "name": "Compare a live session with a backtest",
+      "description": "Sets a session's fills beside a backtest over its own saved bars, without touching the venue.",
+      "kind": "cli",
+      "entry": "td-live compare",
+      "source": "crates/td-live/src/cli.rs",
+      "inputs": "--id and optional --data-dir.",
+      "outputs": "The fills side by side and where they differ.",
+      "test": "crates/td-live/tests/live_session.rs"
+    },
+    {
+      "name": "Engine sidecar",
+      "description": "The localhost API the desktop app starts; it prints a port and token and serves the routes below.",
+      "kind": "cli",
+      "entry": "td-server",
+      "source": "crates/td-server/src/main.rs",
+      "inputs": "--port; TD_TOKEN, TD_DATA_DIR and TD_DATA_CUTOFF from the environment.",
+      "outputs": "One handshake line on stdout with the port and token; logs on stderr.",
+      "test": "crates/td-server/tests/api.rs"
+    },
+    {
+      "name": "Generate the GUI's API types",
+      "description": "Writes the TypeScript API types the GUI builds against from the server's Rust types.",
+      "kind": "cli",
+      "entry": "gen-api-types",
+      "source": "crates/td-server/src/bin/gen-api-types.rs",
+      "inputs": "None.",
+      "outputs": "gui/shared/src/api-types.ts.",
+      "test": ".github/workflows/ci.yml"
+    },
+    {
+      "name": "Benchmark the engine",
+      "description": "Times the engine's real work on synthetic data and prints a results checksum.",
+      "kind": "cli",
+      "entry": "td-bench",
+      "source": "crates/td-server/src/bin/td-bench.rs",
+      "inputs": "--split and --reps; the workloads in harness/evals/perf-workloads.json.",
+      "outputs": "WORKLOAD, PHASES and BENCH lines on stdout.",
+      "test": ".github/workflows/ci.yml"
+    },
+    {
+      "name": "Engine health",
+      "description": "Says whether the engine is up, and the data cutoff in force.",
+      "kind": "http",
+      "entry": "GET /health",
+      "source": "crates/td-server/src/api/mod.rs",
+      "inputs": "The launch token.",
+      "outputs": "JSON status.",
+      "test": "crates/td-server/tests/api.rs"
+    },
+    {
+      "name": "Instrument list",
+      "description": "Lists a venue's instruments of one kind with their trading rules.",
+      "kind": "http",
+      "entry": "GET /instruments",
+      "source": "crates/td-server/src/api/data.rs",
+      "inputs": "venue and kind query parameters.",
+      "outputs": "JSON instruments and the symbols left out.",
+      "test": "crates/td-server/tests/api.rs"
+    },
+    {
+      "name": "Start a download",
+      "description": "Starts a background job that downloads an instrument's history into the store.",
+      "kind": "http",
+      "entry": "POST /data/download",
+      "source": "crates/td-server/src/api/data.rs",
+      "inputs": "JSON instrument and date range.",
+      "outputs": "A job id to follow on /jobs and /ws.",
+      "test": "crates/td-server/tests/api.rs"
+    },
+    {
+      "name": "Stored coverage",
+      "description": "Reports which months and minutes the store holds for an instrument.",
+      "kind": "http",
+      "entry": "GET /data/coverage",
+      "source": "crates/td-server/src/api/data.rs",
+      "inputs": "instrument query parameters.",
+      "outputs": "JSON months and missing spans.",
+      "test": "crates/td-server/tests/api.rs"
+    },
+    {
+      "name": "Stored data list",
+      "description": "Lists every stored instrument with its months and sizes.",
+      "kind": "http",
+      "entry": "GET /data/stored",
+      "source": "crates/td-server/src/api/data.rs",
+      "inputs": "The launch token.",
+      "outputs": "JSON instruments, months and byte sizes.",
+      "test": "crates/td-server/tests/api.rs"
+    },
+    {
+      "name": "Delete one instrument's data",
+      "description": "Deletes an instrument's stored candles and funding.",
+      "kind": "http",
+      "entry": "POST /data/delete",
+      "source": "crates/td-server/src/api/data.rs",
+      "inputs": "JSON instrument and optional month range.",
+      "outputs": "JSON report of what was removed.",
+      "test": "crates/td-server/tests/api.rs"
+    },
+    {
+      "name": "Delete all market data",
+      "description": "Deletes every stored candle and funding file, keeping saved runs and sessions.",
+      "kind": "http",
+      "entry": "POST /data/delete-all",
+      "source": "crates/td-server/src/api/data.rs",
+      "inputs": "The launch token.",
+      "outputs": "JSON report of what was removed.",
+      "test": "crates/td-server/tests/api.rs"
+    },
+    {
+      "name": "Chart candles",
+      "description": "Returns stored and venue candles for the Trading chart.",
+      "kind": "http",
+      "entry": "GET /candles",
+      "source": "crates/td-server/src/api/candles.rs",
+      "inputs": "instrument, timeframe, from and to query parameters.",
+      "outputs": "JSON candles.",
+      "test": "crates/td-server/tests/api_candles.rs"
+    },
+    {
+      "name": "Strategy list",
+      "description": "Lists the registered strategies with their parameters, test plans and code hashes.",
+      "kind": "http",
+      "entry": "GET /strategies",
+      "source": "crates/td-server/src/api/mod.rs",
+      "inputs": "The launch token.",
+      "outputs": "JSON strategies.",
+      "test": "crates/td-server/tests/api.rs"
+    },
+    {
+      "name": "Job list",
+      "description": "Lists the background jobs and their status.",
+      "kind": "http",
+      "entry": "GET /jobs",
+      "source": "crates/td-server/src/api/mod.rs",
+      "inputs": "The launch token.",
+      "outputs": "JSON jobs.",
+      "test": "crates/td-server/tests/api.rs"
+    },
+    {
+      "name": "One job",
+      "description": "Shows one background job's status and progress.",
+      "kind": "http",
+      "entry": "GET /jobs/{id}",
+      "source": "crates/td-server/src/api/mod.rs",
+      "inputs": "The job id.",
+      "outputs": "JSON job.",
+      "test": "crates/td-server/tests/api.rs"
+    },
+    {
+      "name": "Cancel a job",
+      "description": "Asks a running job to stop at its next checkpoint.",
+      "kind": "http",
+      "entry": "POST /jobs/{id}/cancel",
+      "source": "crates/td-server/src/api/mod.rs",
+      "inputs": "The job id.",
+      "outputs": "JSON job after the request.",
+      "test": "crates/td-server/tests/api.rs"
+    },
+    {
+      "name": "Job result",
+      "description": "Returns a finished run job's result.",
+      "kind": "http",
+      "entry": "GET /jobs/{id}/result",
+      "source": "crates/td-server/src/api/runs.rs",
+      "inputs": "The job id.",
+      "outputs": "JSON result of the run.",
+      "test": "crates/td-server/tests/runs.rs"
+    },
+    {
+      "name": "Saved runs",
+      "description": "Lists the saved runs.",
+      "kind": "http",
+      "entry": "GET /runs",
+      "source": "crates/td-server/src/api/runs.rs",
+      "inputs": "The launch token.",
+      "outputs": "JSON run summaries.",
+      "test": "crates/td-server/tests/runs.rs"
+    },
+    {
+      "name": "Run a backtest",
+      "description": "Starts a backtest of a strategy over stored data.",
+      "kind": "http",
+      "entry": "POST /runs/backtest",
+      "source": "crates/td-server/src/api/runs.rs",
+      "inputs": "JSON run configuration.",
+      "outputs": "A job id; the result is saved as a run.",
+      "test": "crates/td-server/tests/runs.rs"
+    },
+    {
+      "name": "Run a sweep",
+      "description": "Starts a parameter sweep of a strategy.",
+      "kind": "http",
+      "entry": "POST /runs/sweep",
+      "source": "crates/td-server/src/api/runs.rs",
+      "inputs": "JSON base configuration and parameter axes.",
+      "outputs": "A job id; the result is saved as a run.",
+      "test": "crates/td-server/tests/runs.rs"
+    },
+    {
+      "name": "Run an out-of-sample test",
+      "description": "Starts an in-sample sweep followed by an out-of-sample run of the best set.",
+      "kind": "http",
+      "entry": "POST /runs/out-of-sample",
+      "source": "crates/td-server/src/api/runs.rs",
+      "inputs": "JSON configuration, axes and split.",
+      "outputs": "A job id; the result is saved as a run.",
+      "test": "crates/td-server/tests/runs.rs"
+    },
+    {
+      "name": "Run a walk-forward test",
+      "description": "Starts a walk-forward test over rolling windows.",
+      "kind": "http",
+      "entry": "POST /runs/walk-forward",
+      "source": "crates/td-server/src/api/runs.rs",
+      "inputs": "JSON configuration, axes and windows.",
+      "outputs": "A job id; the result is saved as a run.",
+      "test": "crates/td-server/tests/runs.rs"
+    },
+    {
+      "name": "Run a test battery",
+      "description": "Runs a strategy's test plan and saves its verdict.",
+      "kind": "http",
+      "entry": "POST /runs/plan",
+      "source": "crates/td-server/src/api/plans.rs",
+      "inputs": "JSON strategy, instrument and optional references, series and other traded instruments.",
+      "outputs": "A job id; a saved verdict.",
+      "test": "crates/td-server/tests/plans.rs"
+    },
+    {
+      "name": "Saved verdicts",
+      "description": "Lists the saved battery verdicts with whether each is stale.",
+      "kind": "http",
+      "entry": "GET /verdicts",
+      "source": "crates/td-server/src/api/plans.rs",
+      "inputs": "The launch token.",
+      "outputs": "JSON verdict rows.",
+      "test": "crates/td-server/tests/plans.rs"
+    },
+    {
+      "name": "One saved run",
+      "description": "Returns a saved run with whether its strategy code and data still match.",
+      "kind": "http",
+      "entry": "GET /runs/{id}",
+      "source": "crates/td-server/src/api/runs.rs",
+      "inputs": "The run id.",
+      "outputs": "JSON run.",
+      "test": "crates/td-server/tests/runs.rs"
+    },
+    {
+      "name": "Paper session list",
+      "description": "Lists the paper sessions.",
+      "kind": "http",
+      "entry": "GET /sessions",
+      "source": "crates/td-server/src/api/sessions.rs",
+      "inputs": "The launch token.",
+      "outputs": "JSON session summaries.",
+      "test": "crates/td-server/tests/api_paper.rs"
+    },
+    {
+      "name": "Start a paper session",
+      "description": "Starts a paper session of a strategy, or of manual orders, on a live feed.",
+      "kind": "http",
+      "entry": "POST /sessions",
+      "source": "crates/td-server/src/api/sessions.rs",
+      "inputs": "JSON strategy, parameters, instrument, timeframe and optional references.",
+      "outputs": "JSON session id and state.",
+      "test": "crates/td-server/tests/api_paper.rs"
+    },
+    {
+      "name": "One paper session",
+      "description": "Returns a paper session's state, orders, fills and equity.",
+      "kind": "http",
+      "entry": "GET /sessions/{id}",
+      "source": "crates/td-server/src/api/sessions.rs",
+      "inputs": "The session id.",
+      "outputs": "JSON session state.",
+      "test": "crates/td-server/tests/api_paper.rs"
+    },
+    {
+      "name": "Stop a paper session",
+      "description": "Stops a running paper session.",
+      "kind": "http",
+      "entry": "POST /sessions/{id}/stop",
+      "source": "crates/td-server/src/api/sessions.rs",
+      "inputs": "The session id.",
+      "outputs": "JSON session state.",
+      "test": "crates/td-server/tests/api_paper.rs"
+    },
+    {
+      "name": "Resume a paper session",
+      "description": "Resumes a stopped paper session from its saved log.",
+      "kind": "http",
+      "entry": "POST /sessions/{id}/resume",
+      "source": "crates/td-server/src/api/sessions.rs",
+      "inputs": "The session id.",
+      "outputs": "JSON session state.",
+      "test": "crates/td-server/tests/api_paper.rs"
+    },
+    {
+      "name": "Compare a paper session with a backtest",
+      "description": "Sets a paper session's fills beside a backtest over its own logged bars.",
+      "kind": "http",
+      "entry": "GET /sessions/{id}/comparison",
+      "source": "crates/td-server/src/api/sessions.rs",
+      "inputs": "The session id.",
+      "outputs": "JSON comparison.",
+      "test": "crates/td-server/tests/api_paper.rs"
+    },
+    {
+      "name": "Place a manual paper order",
+      "description": "Sends a manual order in a paper session.",
+      "kind": "http",
+      "entry": "POST /sessions/{id}/orders",
+      "source": "crates/td-server/src/api/sessions.rs",
+      "inputs": "The session id and a JSON order.",
+      "outputs": "JSON order id, or the reason it was refused.",
+      "test": "crates/td-server/tests/api_paper.rs"
+    },
+    {
+      "name": "Cancel a manual paper order",
+      "description": "Cancels an open manual order in a paper session.",
+      "kind": "http",
+      "entry": "POST /sessions/{id}/orders/{order_id}/cancel",
+      "source": "crates/td-server/src/api/sessions.rs",
+      "inputs": "The session id and order id.",
+      "outputs": "JSON outcome.",
+      "test": "crates/td-server/tests/api_paper.rs"
+    },
+    {
+      "name": "Live updates",
+      "description": "A WebSocket that streams job progress, live candles and paper session events.",
+      "kind": "http",
+      "entry": "GET /ws",
+      "source": "crates/td-server/src/api/ws.rs",
+      "inputs": "The launch token and topic subscriptions.",
+      "outputs": "JSON messages per topic.",
+      "test": "crates/td-server/tests/api.rs"
+    },
+    {
+      "name": "Strategy Lab",
+      "description": "The app section that lists strategies, runs a backtest and shows the result and verdict.",
+      "kind": "gui",
+      "entry": "gui:lab",
+      "source": "gui/app/src/renderer/src/lab/StrategyLab.tsx",
+      "inputs": "A strategy, instrument and range picked in the app.",
+      "outputs": "The run's progress, metrics, equity chart and verdict.",
+      "test": "gui/e2e/flows.spec.ts"
+    },
+    {
+      "name": "Stored data view",
+      "description": "The Lab view that lists stored data and deletes an instrument after asking.",
+      "kind": "gui",
+      "entry": "gui:lab/stored-data",
+      "source": "gui/app/src/renderer/src/lab/StoredData.tsx",
+      "inputs": "The instrument to delete, confirmed.",
+      "outputs": "The stored instruments with their sizes, updated after a delete.",
+      "test": "gui/e2e/flows.spec.ts"
+    },
+    {
+      "name": "Trading",
+      "description": "The app section with the live chart, instrument search, paper sessions and manual orders.",
+      "kind": "gui",
+      "entry": "gui:trading",
+      "source": "gui/app/src/renderer/src/trading/Trading.tsx",
+      "inputs": "An instrument, timeframe, strategy or manual orders picked in the app.",
+      "outputs": "The live chart, the session panel, orders and fills.",
+      "test": "gui/e2e/flows.spec.ts"
+    },
+    {
+      "name": "Build the engine for the app",
+      "description": "Builds the release td-server binary the app starts as its engine.",
+      "kind": "script",
+      "entry": "pnpm engine",
+      "source": "gui/package.json",
+      "inputs": "None.",
+      "outputs": "target/release/td-server.",
+      "test": "none",
+      "issue": 264
+    },
+    {
+      "name": "Run the app in development",
+      "description": "Builds the engine, then starts the app with live reload.",
+      "kind": "script",
+      "entry": "pnpm dev",
+      "source": "gui/package.json",
+      "inputs": "None; the data folder is the app default.",
+      "outputs": "The app window and the engine it starts.",
+      "test": "none",
+      "issue": 264
+    },
+    {
+      "name": "Run the app with secrets",
+      "description": "Starts the app in development with the vault's secrets in its environment.",
+      "kind": "script",
+      "entry": "pnpm dev:hush",
+      "source": "gui/package.json",
+      "inputs": "The secrets the hush vault holds for this project.",
+      "outputs": "The app window and the engine it starts.",
+      "test": "none",
+      "issue": 264
+    },
+    {
+      "name": "Build the app",
+      "description": "Builds the app's main, preload and renderer bundles.",
+      "kind": "script",
+      "entry": "pnpm build",
+      "source": "gui/package.json",
+      "inputs": "The GUI sources.",
+      "outputs": "gui/app/out.",
+      "test": ".github/workflows/gui.yml"
+    },
+    {
+      "name": "Build the installer",
+      "description": "Builds the engine and the app, then the Windows installer.",
+      "kind": "script",
+      "entry": "pnpm dist",
+      "source": "gui/package.json",
+      "inputs": "None.",
+      "outputs": "An NSIS installer under gui/app/dist.",
+      "test": "none",
+      "issue": 264
+    },
+    {
+      "name": "Check the installer",
+      "description": "Installs the built installer into a temporary folder, launches it once on a fresh profile and uninstalls it.",
+      "kind": "script",
+      "entry": "pnpm install-check",
+      "source": "gui/scripts/install-check.mjs",
+      "inputs": "The installer pnpm dist built.",
+      "outputs": "INSTALL-CHECK PASS or INSTALL-CHECK FAIL with the reason.",
+      "test": "gui/scripts/install-verdict.test.mjs"
+    },
+    {
+      "name": "Typecheck the GUI",
+      "description": "Typechecks every GUI package and the UI gates.",
+      "kind": "script",
+      "entry": "pnpm typecheck",
+      "source": "gui/package.json",
+      "inputs": "The GUI sources.",
+      "outputs": "Type errors, if any; exit 1 on an error.",
+      "test": ".github/workflows/gui.yml"
+    },
+    {
+      "name": "Run the GUI unit tests",
+      "description": "Runs the GUI's unit tests.",
+      "kind": "script",
+      "entry": "pnpm test",
+      "source": "gui/vitest.config.ts",
+      "inputs": "The test files vitest.config.ts includes.",
+      "outputs": "Test results; exit 1 on a failure.",
+      "test": ".github/workflows/gui.yml"
+    },
+    {
+      "name": "Write the app screenshots",
+      "description": "Builds the app and writes its screenshots at each window size.",
+      "kind": "script",
+      "entry": "pnpm shots",
+      "source": "gui/app/shots/shots.mjs",
+      "inputs": "None.",
+      "outputs": "PNG screenshots under gui/shots/<size>/ (git-ignored).",
+      "test": "none",
+      "issue": 264
+    },
+    {
+      "name": "Run the UI gates",
+      "description": "Runs the Playwright layout, flow, motion, accessibility and screenshot checks.",
+      "kind": "script",
+      "entry": "pnpm gates",
+      "source": "gui/playwright.config.ts",
+      "inputs": "The built app and the screenshot baselines.",
+      "outputs": "Gate results; exit 1 on a failure.",
+      "test": ".github/workflows/gui.yml"
+    },
+    {
+      "name": "Check the app quits",
+      "description": "Launches the built app with the real engine, opens a section, closes the window and checks every process exits within 5 s.",
+      "kind": "script",
+      "entry": "gui/scripts/quit-check.mjs",
+      "source": "gui/scripts/quit-check.mjs",
+      "inputs": "The section to open: lab (default) or trading.",
+      "outputs": "quit-check: PASS with the time to exit, or FAIL with the processes still running.",
+      "test": "none",
+      "issue": 264
+    },
+    {
+      "name": "Cross-check against NautilusTrader",
+      "description": "Runs the cross-check cases on this engine and on NautilusTrader and compares their fills and equity.",
+      "kind": "script",
+      "entry": "harness/crosscheck/run.py",
+      "source": "harness/crosscheck/run.py",
+      "inputs": "--case to pick cases (all by default); --fetch downloads and exports the data again.",
+      "outputs": "reports/<case>.md per case and a count of the cases that pass; exit 1 if one fails.",
+      "test": "harness/crosscheck/tests/test_run.py"
+    }
+  ]
+}

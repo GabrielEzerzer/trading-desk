@@ -618,7 +618,7 @@ fn reject(instrument: &Instrument, code: i64, message: String) -> Error {
 }
 
 /// The create-order body, after the engine's own checks.
-fn order_body(
+pub(crate) fn order_body(
     instrument: &Instrument,
     order: &OrderRequest,
     id: &ClientOrderId,
