@@ -1,0 +1,42 @@
+id: no-justification-header-rust
+language: Rust
+severity: error
+message: "The file header says what the module is for, not why the code is a patch. A word like shortcut, workaround, stopgap, temporary, for now, deliberately or TODO means the reason belongs elsewhere: fix the cause, put the reason in a test, or put the known limit in a GitHub issue."
+rule:
+  matches: header-rust
+  regex: '(?i)\b(short[\s-]?cuts?|works?[\s-]?arounds?|stop[\s-]?gaps?|hacks?|hacky|for\s+now|temporary|temporarily|deliberately|intentionally|on\s+purpose|todo|fixme|xxx|the\s+owner)\b'
+---
+id: no-justification-header-python
+language: Python
+severity: error
+message: "The file header says what the module is for, not why the code is a patch. A word like shortcut, workaround, stopgap, temporary, for now, deliberately or TODO means the reason belongs elsewhere: fix the cause, put the reason in a test, or put the known limit in a GitHub issue."
+rule:
+  matches: header-python
+  regex: '(?i)\b(short[\s-]?cuts?|works?[\s-]?arounds?|stop[\s-]?gaps?|hacks?|hacky|for\s+now|temporary|temporarily|deliberately|intentionally|on\s+purpose|todo|fixme|xxx|the\s+owner)\b'
+---
+id: no-justification-header-ts
+language: TypeScript
+severity: error
+message: "The file header says what the module is for, not why the code is a patch. A word like shortcut, workaround, stopgap, temporary, for now, deliberately or TODO means the reason belongs elsewhere: fix the cause, put the reason in a test, or put the known limit in a GitHub issue."
+ignores:
+  - "**/next-env.d.ts"
+  - "gui/shared/src/api-types.ts"
+rule:
+  matches: header-ts
+  regex: '(?i)\b(short[\s-]?cuts?|works?[\s-]?arounds?|stop[\s-]?gaps?|hacks?|hacky|for\s+now|temporary|temporarily|deliberately|intentionally|on\s+purpose|todo|fixme|xxx|the\s+owner)\b'
+---
+id: no-justification-header-tsx
+language: Tsx
+severity: error
+message: "The file header says what the module is for, not why the code is a patch. A word like shortcut, workaround, stopgap, temporary, for now, deliberately or TODO means the reason belongs elsewhere: fix the cause, put the reason in a test, or put the known limit in a GitHub issue."
+rule:
+  matches: header-tsx
+  regex: '(?i)\b(short[\s-]?cuts?|works?[\s-]?arounds?|stop[\s-]?gaps?|hacks?|hacky|for\s+now|temporary|temporarily|deliberately|intentionally|on\s+purpose|todo|fixme|xxx|the\s+owner)\b'
+---
+id: no-justification-header-js
+language: JavaScript
+severity: error
+message: "The file header says what the module is for, not why the code is a patch. A word like shortcut, workaround, stopgap, temporary, for now, deliberately or TODO means the reason belongs elsewhere: fix the cause, put the reason in a test, or put the known limit in a GitHub issue."
+rule:
+  matches: header-js
+  regex: '(?i)\b(short[\s-]?cuts?|works?[\s-]?arounds?|stop[\s-]?gaps?|hacks?|hacky|for\s+now|temporary|temporarily|deliberately|intentionally|on\s+purpose|todo|fixme|xxx|the\s+owner)\b'

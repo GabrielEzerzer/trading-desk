@@ -18,3 +18,6 @@ gui/playwright-report/
 
 # Private strategies: the trading-desk-strategies repo, cloned here (crates/td-engine/build.rs)
 crates/td-engine/src/strategies/private/
+
+# Python bytecode the lint-pack tests write
+__pycache__/
