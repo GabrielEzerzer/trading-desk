@@ -36,7 +36,7 @@ use axum::extract::{Path as UrlPath, State};
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 use td_core::{Candle, Hours, InstrumentId, InstrumentKind, Millis};
-use td_data::time::{DAY, Month, format_minute, now_ms};
+use td_data::time::{DAY, MINUTE, Month, format_minute, now_ms};
 use td_data::{
     Closures, DataError, Gap, LoadedCandles, MonthQuotes, Store, missing_minutes, resample,
 };
@@ -174,6 +174,7 @@ pub fn max_gap(kind: InstrumentKind) -> Millis {
     match kind.rules().hours {
         Hours::Always => DAY,
         Hours::FxWeek => 2 * DAY,
+        Hours::UsTradingDays => MINUTE,
     }
 }
 

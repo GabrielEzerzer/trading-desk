@@ -101,16 +101,24 @@ pub(super) fn earliest_from(venue: Venue) -> (Millis, &'static str) {
             "`from` must not be before 2007-01-01 00:00 UTC (1167609600000) for oanda: the FX \
              market hours follow the US daylight-saving rule in force since 2007",
         ),
+        Venue::Alpaca => (
+            ALPACA_EARLIEST_FROM,
+            "`from` must not be before 2016-01-01 00:00 UTC (1451606400000) for alpaca, before \
+             its earliest daily bars",
+        ),
     }
 }
+
+pub const ALPACA_EARLIEST_FROM: Millis = 1_451_606_400_000;
 
 /// What to download: the 1-minute candles of `instrument` with open times in `[from, to)`, and
 /// for a perpetual its funding rates in the same range. Anything after now is skipped.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 pub struct DownloadRequest {
     pub instrument: InstrumentId,
-    /// Not before 2017-01-01 00:00 UTC (1483228800000) for binance and bybit, or before
-    /// 2007-01-01 00:00 UTC (1167609600000) for oanda; earlier is a 400.
+    /// Not before 2017-01-01 00:00 UTC (1483228800000) for binance and bybit, 2007-01-01 00:00 UTC
+    /// (1167609600000) for oanda, or 2016-01-01 00:00 UTC (1451606400000) for alpaca; earlier is a
+    /// 400.
     pub from: Millis,
     pub to: Millis,
 }

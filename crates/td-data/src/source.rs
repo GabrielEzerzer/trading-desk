@@ -9,7 +9,7 @@
 use td_core::{Candle, FeeSchedule, InstrumentId, InstrumentKind, Millis, Timeframe, Venue};
 
 use crate::live::{Greeting, KlineUpdate};
-use crate::{DataError, Http, InstrumentList, binance, bybit, oanda};
+use crate::{DataError, Http, InstrumentList, alpaca, binance, bybit, oanda};
 
 /// The source that serves `venue`.
 pub fn source(venue: Venue) -> &'static dyn DataSource {
@@ -17,6 +17,7 @@ pub fn source(venue: Venue) -> &'static dyn DataSource {
         Venue::Binance => &binance::Binance,
         Venue::Bybit => &bybit::Bybit,
         Venue::Oanda => &oanda::Oanda,
+        Venue::Alpaca => &alpaca::Alpaca,
     }
 }
 
@@ -81,6 +82,10 @@ pub trait DataSource: Send + Sync {
     /// The source's live stream. A source without one keeps the default, which says so.
     fn live(&self) -> Result<&dyn LiveStream, DataError> {
         Err(DataError::NoLiveStream(self.venue()))
+    }
+
+    fn adjustment(&self) -> Option<&'static str> {
+        None
     }
 }
 
@@ -344,7 +349,7 @@ mod tests {
                     let ping = (Duration::from_secs(20), r#"{"op":"ping"}"#.to_string());
                     assert_eq!(greeting.heartbeat, Some(ping));
                 }
-                Venue::Oanda => unreachable!("not among the cases"),
+                Venue::Oanda | Venue::Alpaca => unreachable!("not among the cases"),
             }
         }
     }

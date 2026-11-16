@@ -42,7 +42,7 @@ const PAGE: usize = 5_000;
 const CLOSURE_MINUTES: i64 = 60;
 /// The pauses before each retry of a page after a failed connection, a 429 or a 5xx: five tries
 /// over about 40 seconds.
-const RETRY_DELAYS: [Duration; 4] = [
+pub(crate) const RETRY_DELAYS: [Duration; 4] = [
     Duration::from_secs(2),
     Duration::from_secs(5),
     Duration::from_secs(10),
@@ -149,10 +149,12 @@ fn oanda_name(symbol: &str) -> String {
 fn fx_only(kind: InstrumentKind) -> Result<(), DataError> {
     match kind {
         InstrumentKind::Fx => Ok(()),
-        InstrumentKind::Spot | InstrumentKind::Perpetual => Err(DataError::KindNotListed {
-            venue: Venue::Oanda,
-            kind,
-        }),
+        InstrumentKind::Spot | InstrumentKind::Perpetual | InstrumentKind::Stock => {
+            Err(DataError::KindNotListed {
+                venue: Venue::Oanda,
+                kind,
+            })
+        }
     }
 }
 
@@ -480,7 +482,7 @@ fn answer(url: &str, status: u16, body: Vec<u8>, token: &Token) -> Result<String
 
 /// Calls `get` until it gives anything but a passing failure (a failed connection, a 429 or a
 /// 5xx), sleeping each of `delays` in turn between tries, and returns the last answer.
-fn with_retries<T>(
+pub(crate) fn with_retries<T>(
     delays: &[Duration],
     mut get: impl FnMut() -> Result<T, DataError>,
 ) -> Result<T, DataError> {

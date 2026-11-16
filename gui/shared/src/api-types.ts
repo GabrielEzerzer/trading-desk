@@ -4,9 +4,9 @@
 /**
  * An exchange the desk reads data from and simulates orders against.
  */
-export type Venue = "binance" | "bybit" | "oanda";
+export type Venue = "binance" | "bybit" | "oanda" | "alpaca";
 
-export type InstrumentKind = "spot" | "perpetual" | "fx";
+export type InstrumentKind = "spot" | "perpetual" | "fx" | "stock";
 
 /**
  * Identifies an instrument across venues. The same symbol can exist as spot and as a perpetual on
@@ -2365,8 +2365,9 @@ export type RejectedInstrument = { symbol: string, reason: string, };
  */
 export type DownloadRequest = { instrument: InstrumentId, 
 /**
- * Not before 2017-01-01 00:00 UTC (1483228800000) for binance and bybit, or before
- * 2007-01-01 00:00 UTC (1167609600000) for oanda; earlier is a 400.
+ * Not before 2017-01-01 00:00 UTC (1483228800000) for binance and bybit, 2007-01-01 00:00 UTC
+ * (1167609600000) for oanda, or 2016-01-01 00:00 UTC (1451606400000) for alpaca; earlier is a
+ * 400.
  */
 from: number, to: number, };
 

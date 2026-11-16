@@ -87,7 +87,7 @@ impl DataSource for Bybit {
         match kind {
             InstrumentKind::Spot => Ok(BYBIT_SPOT_FEES),
             InstrumentKind::Perpetual => Ok(BYBIT_LINEAR_FEES),
-            InstrumentKind::Fx => Err(not_listed(kind)),
+            InstrumentKind::Fx | InstrumentKind::Stock => Err(not_listed(kind)),
         }
     }
 
@@ -164,7 +164,7 @@ fn category(kind: InstrumentKind) -> Result<&'static str, DataError> {
     match kind {
         InstrumentKind::Spot => Ok("spot"),
         InstrumentKind::Perpetual => Ok("linear"),
-        InstrumentKind::Fx => Err(not_listed(kind)),
+        InstrumentKind::Fx | InstrumentKind::Stock => Err(not_listed(kind)),
     }
 }
 
@@ -502,7 +502,7 @@ fn add_bybit(list: &mut InstrumentList, kind: InstrumentKind, page: Vec<BybitIns
             && match kind {
                 InstrumentKind::Spot => true,
                 InstrumentKind::Perpetual => s.contract_type.as_deref() == Some("LinearPerpetual"),
-                InstrumentKind::Fx => false,
+                InstrumentKind::Fx | InstrumentKind::Stock => false,
             };
         if listed {
             list.push(&s.symbol, bybit_instrument(&s, kind));
@@ -515,7 +515,7 @@ fn bybit_instrument(s: &BybitInstrument, kind: InstrumentKind) -> Result<Instrum
     let (step, min_value) = match kind {
         InstrumentKind::Spot => (&lot.base_precision, &lot.min_order_amt),
         InstrumentKind::Perpetual => (&lot.qty_step, &lot.min_notional_value),
-        InstrumentKind::Fx => return Err(not_listed(kind).to_string()),
+        InstrumentKind::Fx | InstrumentKind::Stock => return Err(not_listed(kind).to_string()),
     };
     let required = |name: &str, value: &Option<String>| -> Result<f64, String> {
         number(name, value.as_deref().ok_or_else(|| format!("no {name}"))?)

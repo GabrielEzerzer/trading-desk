@@ -54,6 +54,7 @@ describe('engine download', () => {
       binance: Date.UTC(2017, 0, 1),
       bybit: Date.UTC(2017, 0, 1),
       oanda: Date.UTC(2007, 0, 1),
+      alpaca: Date.UTC(2016, 0, 1),
     })
     const fx = await download(usdjpy)
     expect(bridge.downloads[0]).toMatchObject({ instrument: usdjpy, from: Date.UTC(2007, 0, 1) })

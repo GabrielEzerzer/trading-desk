@@ -5,6 +5,7 @@
 //! The engine reads candles as [`LoadedCandles`] (the bars, and the buckets dropped as incomplete
 //! or built with a few minutes missing) and funding as `Vec<(Millis, f64)>` from [`Store`].
 
+pub mod alpaca;
 pub mod binance;
 pub mod bybit;
 mod closed;

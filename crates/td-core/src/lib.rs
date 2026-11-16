@@ -13,14 +13,16 @@ mod instrument;
 mod market;
 mod order;
 mod timeframe;
+mod us_calendar;
 
 pub use candle::Candle;
 pub use civil::{civil_from_days, days_from_civil};
 pub use error::CoreError;
 pub use instrument::{FeeSchedule, Instrument, InstrumentId, InstrumentKind, Rounding, Venue};
-pub use market::{AccountCurrency, Carry, Hours, MarketRules};
+pub use market::{AccountCurrency, Carry, Hours, MarketRules, us_bar_minute};
 pub use order::{Fill, Liquidity, OrderId, OrderRequest, OrderType, Side, TimeInForce};
 pub use timeframe::Timeframe;
+pub use us_calendar::us_session;
 
 /// Milliseconds since the Unix epoch, UTC.
 pub type Millis = i64;

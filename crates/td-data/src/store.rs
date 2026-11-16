@@ -360,6 +360,33 @@ impl Store {
             .join(format!("{}.parquet", id.symbol)))
     }
 
+    fn adjustment_path(&self, id: &InstrumentId) -> Result<PathBuf, DataError> {
+        check_symbol(&id.symbol)?;
+        Ok(self
+            .root
+            .join("adjustments")
+            .join(id.venue.to_string())
+            .join(id.kind.to_string())
+            .join(format!("{}.json", id.symbol)))
+    }
+
+    pub fn adjustment(&self, id: &InstrumentId) -> Result<Option<String>, DataError> {
+        let path = self.adjustment_path(id)?;
+        match fs::read(&path) {
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .map(Some)
+                .map_err(|e| DataError::parse(path.display().to_string(), e)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(DataError::io(path)(e)),
+        }
+    }
+
+    pub fn record_adjustment(&self, id: &InstrumentId, adjustment: &str) -> Result<(), DataError> {
+        let bytes =
+            serde_json::to_vec(adjustment).map_err(|e| DataError::parse("adjustment", e))?;
+        write_bytes_atomic(&self.adjustment_path(id)?, &bytes)
+    }
+
     /// Merges 1-minute candles into the store. Every candle must be valid and start on a minute;
     /// if any is not, nothing is written. A candle replaces a stored one with the same open time.
     /// A kind whose rules require quotes is refused: its candles are written with their asks by

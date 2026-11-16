@@ -61,9 +61,14 @@ export function formatMonth(ms: number): string {
   return `${MONTHS[d.getUTCMonth()]} ${d.getUTCFullYear()}`
 }
 
-const VENUES: Record<InstrumentId['venue'], string> = { binance: 'Binance', bybit: 'Bybit', oanda: 'OANDA' }
+const VENUES: Record<InstrumentId['venue'], string> = {
+  binance: 'Binance',
+  bybit: 'Bybit',
+  oanda: 'OANDA',
+  alpaca: 'Alpaca',
+}
 
-/** "Binance", "Bybit" or "OANDA". */
+/** "Binance", "Bybit", "OANDA" or "Alpaca". */
 export function formatVenue(venue: InstrumentId['venue']): string {
   return VENUES[venue]
 }

@@ -4,7 +4,7 @@ use std::ops::Range;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{InstrumentKind, Millis, days_from_civil};
+use crate::{InstrumentKind, Millis, Timeframe, days_from_civil, us_session};
 
 /// The currency an account holds and reports money in, against the instrument it trades.
 ///
@@ -62,6 +62,7 @@ pub struct MarketRules {
     /// A financing cost the market charges on held positions that the engine does not model yet,
     /// if any. Funding (`funding`) is modelled, so it is never one.
     pub unmodelled_carry: Option<Carry>,
+    pub shortest_timeframe: Timeframe,
 }
 
 /// A financing cost charged on a position held through a point in time.
@@ -88,6 +89,7 @@ pub enum Hours {
     Always,
     /// The FX week: closed from Friday 17:00 to Sunday 17:00 New York time.
     FxWeek,
+    UsTradingDays,
 }
 
 impl InstrumentKind {
@@ -102,6 +104,7 @@ impl InstrumentKind {
                 quotes: false,
                 hours: Hours::Always,
                 unmodelled_carry: None,
+                shortest_timeframe: Timeframe::M1,
             },
             InstrumentKind::Perpetual => MarketRules {
                 margin: true,
@@ -111,6 +114,17 @@ impl InstrumentKind {
                 quotes: false,
                 hours: Hours::Always,
                 unmodelled_carry: None,
+                shortest_timeframe: Timeframe::M1,
+            },
+            InstrumentKind::Stock => MarketRules {
+                margin: false,
+                can_short: false,
+                funding: false,
+                liquidation: false,
+                quotes: false,
+                hours: Hours::UsTradingDays,
+                unmodelled_carry: None,
+                shortest_timeframe: Timeframe::D1,
             },
             // FX margin rules (margin call and stop-out) and the overnight swap are named gaps on
             // #44, so FX has no liquidation yet and its swap is not charged.
@@ -122,6 +136,7 @@ impl InstrumentKind {
                 quotes: true,
                 hours: Hours::FxWeek,
                 unmodelled_carry: Some(Carry::DailyRollover),
+                shortest_timeframe: Timeframe::M1,
             },
         }
     }
@@ -143,14 +158,39 @@ impl InstrumentKind {
                 };
                 !fx_weekend(day + to_sunday).contains(&t)
             }
+            Hours::UsTradingDays => {
+                us_bar_minute(t.div_euclid(DAY)).is_some_and(|m| m.contains(&t))
+            }
         }
     }
 
     /// The closed time in `[from, to)`, as half-open spans clipped to it, in order.
     pub fn closed_spans(self, from: Millis, to: Millis) -> Vec<Range<Millis>> {
         let mut spans = Vec::new();
-        if self.rules().hours == Hours::Always {
-            return spans;
+        match self.rules().hours {
+            Hours::Always => return spans,
+            Hours::FxWeek => {}
+            Hours::UsTradingDays => {
+                let mut start = from;
+                let mut day = from.div_euclid(DAY);
+                while start < to {
+                    let open = us_bar_minute(day)
+                        .map(|m| m.start.max(start)..m.end.min(to))
+                        .filter(|m| m.start < m.end);
+                    if let Some(open) = open {
+                        if start < open.start {
+                            spans.push(start..open.start);
+                        }
+                        start = open.end;
+                    }
+                    day += 1;
+                    if day * DAY >= to && start < to {
+                        spans.push(start..to);
+                        break;
+                    }
+                }
+                return spans;
+            }
         }
         // The weekend that ends on the last Sunday on or before `from` is the earliest that can
         // reach into the range.
@@ -170,15 +210,20 @@ impl InstrumentKind {
     }
 }
 
-const HOUR: Millis = 3_600_000;
+const MINUTE: Millis = 60_000;
+const HOUR: Millis = 60 * MINUTE;
 const DAY: Millis = 24 * HOUR;
 const SUNDAY: i64 = 0;
 const FRIDAY: i64 = 5;
 const SATURDAY: i64 = 6;
 
 /// The day of the week of a day count since 1970-01-01, Sunday as 0. That day was a Thursday.
-fn weekday(day: i64) -> i64 {
+pub(crate) fn weekday(day: i64) -> i64 {
     (day + 4).rem_euclid(7)
+}
+
+pub fn us_bar_minute(day: i64) -> Option<Range<Millis>> {
+    us_session(day).map(|s| s.end - MINUTE..s.end)
 }
 
 /// The FX weekend that ends on `sunday` (a day count since 1970-01-01): from Friday 17:00 to
@@ -198,7 +243,7 @@ fn fx_weekend(sunday: i64) -> Range<Millis> {
 /// before 2007. What keeps runs inside that limit is OANDA's earliest download date, 2007-01-01
 /// (td-server's `OANDA_EARLIEST_FROM`), which the app's downloads and charts keep to; the
 /// `td-data` CLI does not check it. Upgrade to a per-year rule before moving that date earlier.
-fn new_york_offset_hours(day: i64) -> i64 {
+pub(crate) fn new_york_offset_hours(day: i64) -> i64 {
     let (year, _, _) = crate::civil_from_days(day);
     let first_sunday = |month: u32| {
         let first = days_from_civil(year, month, 1);
@@ -212,9 +257,7 @@ fn new_york_offset_hours(day: i64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use InstrumentKind::{Fx, Perpetual, Spot};
-
-    const MINUTE: Millis = 60_000;
+    use InstrumentKind::{Fx, Perpetual, Spot, Stock};
 
     /// `hour:minute` UTC on a date.
     fn utc(year: i64, month: u32, day: u32, hour: i64, minute: i64) -> Millis {
@@ -344,6 +387,51 @@ mod tests {
             assert!(kind.closed_spans(week.start, week.end).is_empty());
             assert!(kind.is_open(saturday));
         }
+    }
+
+    #[test]
+    fn a_stock_is_open_for_the_last_minute_of_each_session() {
+        let rules = Stock.rules();
+        assert!(!rules.margin && !rules.can_short && !rules.funding && !rules.liquidation);
+        assert_eq!(rules.hours, Hours::UsTradingDays);
+        assert_eq!(rules.shortest_timeframe, Timeframe::D1);
+        for kind in [Spot, Perpetual, Fx] {
+            assert_eq!(kind.rules().shortest_timeframe, Timeframe::M1);
+        }
+
+        let friday = utc(2024, 7, 12, 19, 59);
+        let monday = utc(2024, 7, 15, 19, 59);
+        assert!(Stock.is_open(friday));
+        assert!(!Stock.is_open(friday - MINUTE));
+        assert!(!Stock.is_open(friday + MINUTE));
+        let from = utc(2024, 7, 12, 0, 0);
+        let to = utc(2024, 7, 16, 0, 0);
+        assert_eq!(
+            Stock.closed_spans(from, to),
+            vec![from..friday, friday + MINUTE..monday, monday + MINUTE..to]
+        );
+        assert_eq!(Stock.closed_spans(friday, friday + MINUTE), vec![]);
+        assert_eq!(Stock.closed_spans(to, from), vec![]);
+
+        let early = utc(2024, 7, 3, 16, 59);
+        assert!(Stock.is_open(early));
+        assert!(!Stock.is_open(utc(2024, 7, 4, 19, 59)));
+    }
+
+    #[test]
+    fn a_stock_is_open_where_its_closed_spans_leave_open() {
+        let start = utc(2024, 6, 24, 0, 0);
+        let end = start + 14 * DAY;
+        let spans = Stock.closed_spans(start, end);
+        let mut open = 0;
+        let mut t = start;
+        while t < end {
+            let closed = spans.iter().any(|span| span.contains(&t));
+            assert_eq!(Stock.is_open(t), !closed, "at {t}");
+            open += usize::from(!closed);
+            t += MINUTE;
+        }
+        assert_eq!(open, 9, "ten weekdays less 4 July");
     }
 
     #[test]

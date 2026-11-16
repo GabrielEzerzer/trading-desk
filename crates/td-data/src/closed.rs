@@ -238,7 +238,7 @@ impl Store {
         let (Some(&first), Some(&last)) = (months.first(), months.last()) else {
             return Ok(closures);
         };
-        if id.kind.rules().hours == Hours::Always {
+        if id.kind.rules().hours != Hours::FxWeek {
             return Ok(closures);
         }
         let before = Month::containing(first.start() - 1);
