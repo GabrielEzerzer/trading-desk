@@ -64,6 +64,9 @@ mod orders;
 mod reads;
 mod wire;
 
+#[cfg(test)]
+mod properties;
+
 pub use client::{Client, Timing};
 pub use error::{Action, Error};
 pub use guard::{DEMO_HOST, Endpoint};

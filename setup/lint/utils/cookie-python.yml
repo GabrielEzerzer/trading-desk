@@ -1,0 +1,5 @@
+id: cookie-python
+language: Python
+rule:
+  kind: comment
+  regex: '^#[ \t\f]*(?:-\*-[ \t\f]*)?coding[:=][ \t\f]*(?i:utf[-_]?8)[ \t\f]*(?:-\*-[ \t\f]*)?\r?$'

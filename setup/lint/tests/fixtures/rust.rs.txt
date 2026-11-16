@@ -1,0 +1,45 @@
+//! Sample module used by the lint tests.
+//! It shows each case the rules must handle.
+use std::fmt;
+
+/// item doc fails
+pub struct Point<'a> {
+    label: &'a str, // trailing fails
+}
+
+/* block fails */
+fn strings<'a>(input: &'a str) -> Vec<&'a str> {
+    let url = "https://example.com/a//b";
+    let hash = "# not a comment /* nor this */";
+    let raw = r#"he said "// still a string" and /* this */"#;
+    let raw2 = r##"a "# b // c"##;
+    let ch = '/';
+    let lifetime_ok: &'static str = "'a // b";
+    vec![input, url, hash, raw, raw2, lifetime_ok]
+}
+
+#[allow(dead_code)]
+fn allowed() {}
+
+#[expect(unused_variables)]
+fn expected() {}
+
+mod inner {
+    #![allow(unused)]
+}
+
+#[derive(Debug)]
+struct Kept;
+
+fn tail() {
+    let x = 1; /* inline block fails */
+    // line fails
+}
+
+macro_rules! suppressed {
+    () => {
+        #[allow(dead_code)]
+        #[derive(Debug)]
+        struct Inside;
+    };
+}

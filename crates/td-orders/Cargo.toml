@@ -16,6 +16,7 @@ td-core.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+proptest.workspace = true
 td-mock-bybit.workspace = true
 
 [[example]]

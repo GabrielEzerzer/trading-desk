@@ -1,0 +1,12 @@
+/* eslint-disable react/no-danger */
+import React from "react";
+
+export function Card({ href }: { href: string }) {
+  return (
+    <div>
+      {/* jsx comment fails */}
+      <a href="https://example.com//path">// text, not a comment</a>
+      <span title="/* not a comment */">{href}</span>
+    </div>
+  );
+}

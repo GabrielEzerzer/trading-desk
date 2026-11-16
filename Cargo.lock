@@ -2327,6 +2327,7 @@ dependencies = [
 name = "td-core"
 version = "0.1.0"
 dependencies = [
+ "proptest",
  "serde",
  "serde_json",
  "thiserror",
@@ -2342,6 +2343,7 @@ dependencies = [
  "flate2",
  "futures-util",
  "parquet",
+ "proptest",
  "rayon",
  "reqwest",
  "rustls",
@@ -2408,6 +2410,7 @@ name = "td-orders"
 version = "0.1.0"
 dependencies = [
  "hmac",
+ "proptest",
  "reqwest",
  "serde",
  "serde_json",

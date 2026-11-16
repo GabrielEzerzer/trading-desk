@@ -1,0 +1,72 @@
+id: no-inline-suppressions-rust
+language: Rust
+severity: error
+message: "Inline lint suppressions and other tool directives are not allowed, in attributes or in comments. Fix the cause. A real exception goes in the [lints] table in Cargo.toml, or in rustfmt.toml for formatting. A header line that starts with one word and a colon reads as a directive, so rephrase it. The one exception is a // SAFETY: comment directly before unsafe code."
+rule:
+  any:
+    - any:
+        - kind: attribute_item
+        - kind: inner_attribute_item
+      has:
+        kind: attribute
+        any:
+          - regex: '^(?:allow|expect)\s*\('
+          - regex: '^rustfmt\s*::\s*skip\b'
+          - regex: '(?s)^cfg_attr\s*\(.*(?:\b(?:allow|expect)\s*\(|\brustfmt\s*::\s*skip\b)'
+    - kind: token_tree
+      regex: '(?s)^\[\s*(?:(?:allow|expect)\s*\(|rustfmt\s*::\s*skip\b|cfg_attr\s*\(.*(?:\b(?:allow|expect)\s*\(|\brustfmt\s*::\s*skip\b))'
+      any:
+        - follows: { regex: '^#$' }
+        - follows: { regex: '^!$', follows: { regex: '^#$' } }
+    - all:
+        - any:
+            - kind: line_comment
+            - kind: block_comment
+        - any:
+            - regex: '(?m)^\s*(?:#!?|//[/!]?|/\*[*!]?|<!--|-->)?[\s*!#-]*(?:[\w.]+(?:-[\w.]+)*\s*:|@\w|<[A-Za-z]|(?:globals?|exported|eslint|jshint|jslint)\b)'
+              not:
+                matches: safety-rust
+            - regex: '(?:\w-(?:disable|ignore)|\b(?:disable|ignore)-\w|\b[\w-]+:\s*(?:disable|enable|ignore|skip|off|noqa)(?:\b|_)|\bignore\s+(?:file|next|start|stop|else|if|line)\b|coding[:=]|\bpragma\b|(?i:\bnoqa\b)|\bnosec\b|\bNOLINT|@ts-\w|\bnosemgrep\b|\bNOSONAR\b|\bnoinspection\b|\blgtm\[|\bsource(?:Mapping)?URL=)'
+---
+id: no-inline-suppressions-python
+language: Python
+severity: error
+message: "Inline lint suppressions and other tool directives are not allowed in comments, the header included. Fix the cause. A real exception goes in the tool's config, such as ruff per-file-ignores in pyproject.toml, with the file path. The one directive allowed is an encoding line naming utf-8. A header line that starts with one word and a colon reads as a directive, so rephrase it."
+rule:
+  kind: comment
+  regex: '(?m)^\s*(?:#!?|//[/!]?|/\*[*!]?|<!--|-->)?[\s*!#-]*(?:[\w.]+(?:-[\w.]+)*\s*:|@\w|<[A-Za-z]|(?:globals?|exported|eslint|jshint|jslint)\b)|(?:\w-(?:disable|ignore)|\b(?:disable|ignore)-\w|\b[\w-]+:\s*(?:disable|enable|ignore|skip|off|noqa)(?:\b|_)|\bignore\s+(?:file|next|start|stop|else|if|line)\b|coding[:=]|\bpragma\b|(?i:\bnoqa\b)|\bnosec\b|\bNOLINT|@ts-\w|\bnosemgrep\b|\bNOSONAR\b|\bnoinspection\b|\blgtm\[|\bsource(?:Mapping)?URL=)'
+  not:
+    matches: cookie-python
+---
+id: no-inline-suppressions-ts
+language: TypeScript
+severity: error
+message: "Inline lint suppressions and other tool directives are not allowed in comments, the header included. Fix the cause. A real exception goes in the tool's config, such as an ESLint config override, with the file path. Put the types from a /// <reference> line in compilerOptions.types in tsconfig.json. A header line that starts with one word and a colon reads as a directive, so rephrase it."
+ignores:
+  - "**/next-env.d.ts"
+  - "gui/shared/src/api-types.ts"
+rule:
+  any:
+    - kind: comment
+    - kind: html_comment
+  regex: '(?m)^\s*(?:#!?|//[/!]?|/\*[*!]?|<!--|-->)?[\s*!#-]*(?:[\w.]+(?:-[\w.]+)*\s*:|@\w|<[A-Za-z]|(?:globals?|exported|eslint|jshint|jslint)\b)|(?:\w-(?:disable|ignore)|\b(?:disable|ignore)-\w|\b[\w-]+:\s*(?:disable|enable|ignore|skip|off|noqa)(?:\b|_)|\bignore\s+(?:file|next|start|stop|else|if|line)\b|coding[:=]|\bpragma\b|(?i:\bnoqa\b)|\bnosec\b|\bNOLINT|@ts-\w|\bnosemgrep\b|\bNOSONAR\b|\bnoinspection\b|\blgtm\[|\bsource(?:Mapping)?URL=)'
+---
+id: no-inline-suppressions-tsx
+language: Tsx
+severity: error
+message: "Inline lint suppressions and other tool directives are not allowed in comments, the header included. Fix the cause. A real exception goes in the tool's config, such as an ESLint config override, with the file path. Put the types from a /// <reference> line in compilerOptions.types in tsconfig.json. A header line that starts with one word and a colon reads as a directive, so rephrase it."
+rule:
+  any:
+    - kind: comment
+    - kind: html_comment
+  regex: '(?m)^\s*(?:#!?|//[/!]?|/\*[*!]?|<!--|-->)?[\s*!#-]*(?:[\w.]+(?:-[\w.]+)*\s*:|@\w|<[A-Za-z]|(?:globals?|exported|eslint|jshint|jslint)\b)|(?:\w-(?:disable|ignore)|\b(?:disable|ignore)-\w|\b[\w-]+:\s*(?:disable|enable|ignore|skip|off|noqa)(?:\b|_)|\bignore\s+(?:file|next|start|stop|else|if|line)\b|coding[:=]|\bpragma\b|(?i:\bnoqa\b)|\bnosec\b|\bNOLINT|@ts-\w|\bnosemgrep\b|\bNOSONAR\b|\bnoinspection\b|\blgtm\[|\bsource(?:Mapping)?URL=)'
+---
+id: no-inline-suppressions-js
+language: JavaScript
+severity: error
+message: "Inline lint suppressions and other tool directives are not allowed in comments, the header included. Fix the cause. A real exception goes in the tool's config, such as an ESLint config override, with the file path. Put the types from a /// <reference> line in compilerOptions.types in tsconfig.json. A header line that starts with one word and a colon reads as a directive, so rephrase it."
+rule:
+  any:
+    - kind: comment
+    - kind: html_comment
+  regex: '(?m)^\s*(?:#!?|//[/!]?|/\*[*!]?|<!--|-->)?[\s*!#-]*(?:[\w.]+(?:-[\w.]+)*\s*:|@\w|<[A-Za-z]|(?:globals?|exported|eslint|jshint|jslint)\b)|(?:\w-(?:disable|ignore)|\b(?:disable|ignore)-\w|\b[\w-]+:\s*(?:disable|enable|ignore|skip|off|noqa)(?:\b|_)|\bignore\s+(?:file|next|start|stop|else|if|line)\b|coding[:=]|\bpragma\b|(?i:\bnoqa\b)|\bnosec\b|\bNOLINT|@ts-\w|\bnosemgrep\b|\bNOSONAR\b|\bnoinspection\b|\blgtm\[|\bsource(?:Mapping)?URL=)'

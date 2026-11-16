@@ -1,0 +1,18 @@
+id: safety-rust
+language: Rust
+rule:
+  kind: line_comment
+  regex: '^//\s*SAFETY:'
+  precedes:
+    any:
+      - kind: unsafe_block
+      - kind: impl_item
+        regex: '^unsafe\s+impl\b'
+      - kind: expression_statement
+        has:
+          kind: unsafe_block
+          stopBy: end
+      - kind: let_declaration
+        has:
+          kind: unsafe_block
+          stopBy: end

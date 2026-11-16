@@ -1,0 +1,30 @@
+id: prologue-ts
+language: TypeScript
+utils:
+  directive:
+    kind: expression_statement
+    regex: '^(?:"use (?:strict|client|server)"|''use (?:strict|client|server)'')\s*;?$'
+rule:
+  matches: directive
+  any:
+    - inside:
+        kind: program
+    - inside:
+        kind: statement_block
+        inside:
+          any:
+            - kind: function_declaration
+            - kind: function_expression
+            - kind: arrow_function
+            - kind: method_definition
+            - kind: generator_function_declaration
+            - kind: generator_function
+  not:
+    follows:
+      stopBy: end
+      not:
+        any:
+          - kind: comment
+          - kind: hash_bang_line
+          - matches: directive
+          - regex: '^\{$'
