@@ -1,0 +1,425 @@
+#!/usr/bin/env python3
+# Lint ratchet: runs the comment-ban ast-grep rules on every file git lists in the current repo.
+# Fails on any violation .lint-baseline.json does not record, or when that baseline grew against a base ref.
+import argparse
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import traceback
+from collections import Counter
+from pathlib import Path
+
+PACK = Path(__file__).resolve().parent
+CONFIG = PACK / "sgconfig.yml"
+BASELINE = ".lint-baseline.json"
+LANGUAGES = {
+    "python": ({".py", ".pyw", ".py3", ".pyi", ".bzl"}, "module", "comment"),
+    "js": ({".js", ".mjs", ".cjs", ".jsx"}, "program", "comment,html_comment"),
+    "ts": ({".ts", ".mts", ".cts"}, "program", "comment,html_comment"),
+    "tsx": ({".tsx"}, "program", "comment,html_comment"),
+    "rust": ({".rs"}, "source_file", "line_comment,block_comment"),
+}
+INTERPRETERS = [
+    (re.compile(r"python[\d.]*|uv|pipx|hatch|pdm"), "python"),
+    (re.compile(r"node"), "js"),
+    (re.compile(r"deno|bun|ts-node|tsx"), "ts"),
+]
+GLOB_SPECIAL = "*?[]{}\\"
+BATCH_CHARS = 7000
+SCAN_SUMMARY = re.compile(r"Error: (\d+) error\(s\) found in code\.\nHelp: [^\n]*")
+HASH = re.compile(r"[0-9a-f]{16}")
+IGNORE_MARKER = "ast-grep-ignore"
+IGNORE_RULE = "no-ast-grep-ignore"
+IGNORE_MESSAGE = (
+    "ast-grep-ignore hides violations from the scan and is not allowed. Fix the cause. "
+    "A real exception goes in the ignores list of the rule in the lint pack's rules folder, with the file path."
+)
+
+
+class ToolError(Exception):
+    pass
+
+
+class OldBaseline(ToolError):
+    pass
+
+
+def git(*args):
+    binary = shutil.which("git")
+    if binary is None:
+        raise ToolError("git is not on PATH")
+    return subprocess.run([binary, *args], capture_output=True)
+
+
+def git_output(*args):
+    proc = git(*args)
+    if proc.returncode != 0:
+        raise ToolError(f"git {' '.join(args)} failed: {proc.stderr.decode('utf-8', 'replace').strip()}")
+    return proc.stdout.decode("utf-8")
+
+
+def basename(path):
+    return path.rsplit("/", 1)[-1]
+
+
+def suffix_of(path):
+    return os.path.splitext(basename(path))[1].lower()
+
+
+def program_name(word):
+    return basename(word.replace("\\", "/")).lower().removesuffix(".exe")
+
+
+def shebang_language(path):
+    with open(path, "rb") as handle:
+        first = handle.readline(512)
+    if not first.startswith(b"#!"):
+        return None
+    names = [program_name(word) for word in first[2:].decode("utf-8", "replace").split()]
+    return next((lang for name in names for pattern, lang in INTERPRETERS if pattern.fullmatch(name)), None)
+
+
+def language_of(path):
+    suffix = suffix_of(path)
+    if not suffix:
+        return shebang_language(path)
+    return next((lang for lang, (suffixes, _, _) in LANGUAGES.items() if suffix in suffixes), None)
+
+
+def candidates():
+    listed = git_output("ls-files", "-z", "--cached", "--others", "--exclude-standard").split("\0")
+    files = {}
+    for path in sorted(set(filter(None, listed))):
+        if os.path.isfile(path) and not os.path.islink(path):
+            lang = language_of(path)
+            if lang:
+                files[path] = lang
+    return files
+
+
+def non_empty_utf8(files):
+    bad, non_empty = [], set()
+    for path in files:
+        data = Path(path).read_bytes()
+        try:
+            data.decode("utf-8")
+        except UnicodeDecodeError as error:
+            bad.append(f"{path} (byte {error.start})")
+        if data:
+            non_empty.add(path)
+    if bad:
+        raise ToolError("ast-grep skips files that are not valid UTF-8, so these cannot be checked: " + ", ".join(bad))
+    return non_empty
+
+
+def batches(paths):
+    batch, size = [], 0
+    for path in paths:
+        if batch and size + len(path) + 3 > BATCH_CHARS:
+            yield batch
+            batch, size = [], 0
+        batch.append(path)
+        size += len(path) + 3
+    if batch:
+        yield batch
+
+
+def ast_grep(args, paths):
+    binary = shutil.which("ast-grep")
+    if binary is None:
+        raise ToolError("ast-grep is not on PATH; install it with `uv tool install ast-grep-cli==0.51.1` or `pip install ast-grep-cli==0.51.1`")
+    for batch in batches(paths):
+        proc = subprocess.run([binary, *args, "--", *batch], capture_output=True, text=True, encoding="utf-8")
+        yield args, proc
+
+
+def tool_failure(args, proc):
+    output = proc.stderr.strip() or proc.stdout.strip()[:2000]
+    return ToolError(f"ast-grep {' '.join(args)} failed with exit code {proc.returncode}:\n{output}")
+
+
+def json_matches(args, proc):
+    try:
+        matches = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        raise tool_failure(args, proc)
+    if not isinstance(matches, list):
+        raise tool_failure(args, proc)
+    return matches
+
+
+def literal_glob(name):
+    return "".join(f"[{char}]" if char in GLOB_SPECIAL else char for char in name)
+
+
+def write_configs(directory, files):
+    for name in ("rules", "utils"):
+        shutil.copytree(PACK / name, directory / name)
+    base = CONFIG.read_text(encoding="utf-8").rstrip("\n") + "\n"
+    configs = {}
+    for lang, (suffixes, _, _) in LANGUAGES.items():
+        scripts = [path for path, path_lang in files.items() if path_lang == lang and not suffix_of(path)]
+        globs = sorted(f"*{suffix}" for suffix in suffixes) + sorted({literal_glob(basename(path)) for path in scripts})
+        configs[lang] = directory / f"sgconfig-{lang}.yml"
+        configs[lang].write_text(f"{base}languageGlobs:\n  {lang}: {json.dumps(globs)}\n", encoding="utf-8")
+    return configs
+
+
+def scan(config, paths):
+    found = []
+    for args, proc in ast_grep(["scan", "-c", str(config), "--json=compact"], paths):
+        matches = json_matches(args, proc)
+        errors = sum(1 for match in matches if match.get("severity") == "error")
+        summary = SCAN_SUMMARY.fullmatch(proc.stderr.strip())
+        clean = proc.returncode == 0 and not errors and not proc.stderr.strip()
+        flagged = proc.returncode == 1 and bool(errors) and bool(summary) and int(summary.group(1)) == errors
+        if not (clean or flagged):
+            raise tool_failure(args, proc)
+        found += matches
+    return found
+
+
+def run_kinds(config, lang, kinds, paths):
+    found = []
+    for args, proc in ast_grep(["run", "-c", str(config), "--lang", lang, "-k", kinds, "--json=compact"], paths):
+        matches = json_matches(args, proc)
+        if proc.stderr.strip() or proc.returncode != (0 if matches else 1):
+            raise tool_failure(args, proc)
+        found += matches
+    return found
+
+
+def check_parsed(config, lang, root, paths):
+    parsed = set()
+    command = ["run", "-c", str(config), "--lang", lang, "-k", root, "--files-with-matches", "--color=never"]
+    for args, proc in ast_grep(command, paths):
+        listed = [normalise(line) for line in proc.stdout.splitlines() if line.strip()]
+        if proc.stderr.strip() or proc.returncode != (0 if listed else 1):
+            raise tool_failure(args, proc)
+        parsed.update(listed)
+    missing = sorted(set(paths) - parsed)
+    if missing:
+        raise ToolError(f"ast-grep did not parse these {lang} files, so they cannot be checked: " + ", ".join(missing))
+
+
+def normalise(path):
+    return path.strip().replace("\\", "/").removeprefix("./")
+
+
+def identity(text):
+    return hashlib.sha256(" ".join(text.split()).encode("utf-8")).hexdigest()[:16]
+
+
+def finding(match, rule, message):
+    return normalise(match["file"]), match["range"]["start"]["line"] + 1, rule, message, identity(match["text"])
+
+
+def collect_findings(files):
+    non_empty = non_empty_utf8(files)
+    findings = []
+    with tempfile.TemporaryDirectory() as directory:
+        configs = write_configs(Path(directory), files)
+        for lang, (_, root, kinds) in LANGUAGES.items():
+            paths = sorted(path for path, path_lang in files.items() if path_lang == lang)
+            if not paths:
+                continue
+            findings += [finding(m, m["ruleId"], m["message"]) for m in scan(configs[lang], paths)]
+            check_parsed(configs[lang], lang, root, [path for path in paths if path in non_empty])
+            comments = run_kinds(configs[lang], lang, kinds, paths)
+            findings += [finding(m, IGNORE_RULE, IGNORE_MESSAGE) for m in comments if IGNORE_MARKER in m["text"]]
+    return sorted(findings)
+
+
+def entries(findings):
+    found = {}
+    for path, _, rule, _, key in findings:
+        found.setdefault(path, {}).setdefault(rule, []).append(key)
+    return {path: {rule: sorted(keys) for rule, keys in rules.items()} for path, rules in found.items()}
+
+
+def validated(baseline, source):
+    if not isinstance(baseline, dict):
+        raise ToolError(f"{source} must be a JSON object mapping files to rules")
+    for path, rules in baseline.items():
+        if not isinstance(rules, dict):
+            raise ToolError(f"{source}: {path} must map rule ids to lists of violation hashes")
+        for rule, keys in rules.items():
+            if type(keys) is int:
+                raise OldBaseline(
+                    f"{source} holds a count per file and rule, an older format that cannot tell a new violation "
+                    "from an old one. Delete it and run with --init to record each violation"
+                )
+            if not isinstance(keys, list) or not all(isinstance(key, str) and HASH.fullmatch(key) for key in keys):
+                raise ToolError(f"{source}: {path} {rule} must be a list of 16-character violation hashes")
+    return baseline
+
+
+def parsed_baseline(text, source):
+    try:
+        return validated(json.loads(text), source)
+    except json.JSONDecodeError as error:
+        raise ToolError(f"{source} is not valid JSON: {error}")
+
+
+def load_baseline():
+    try:
+        text = Path(BASELINE).read_text(encoding="utf-8")
+    except FileNotFoundError:
+        raise ToolError(f"{BASELINE} not found; run with --init to write the first baseline")
+    return parsed_baseline(text, BASELINE)
+
+
+def load_base_baseline(ref):
+    if ref.startswith("-") or git("rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}").returncode != 0:
+        raise ToolError(f"--base {ref} is not a commit in this repository; fetch it first")
+    spec = f"{ref}:{BASELINE}"
+    if git("cat-file", "-e", spec).returncode != 0:
+        return None
+    return parsed_baseline(git_output("show", spec), spec)
+
+
+def write_baseline(recorded):
+    text = json.dumps(recorded, indent=2, sort_keys=True) + "\n"
+    Path(BASELINE).write_text(text, encoding="utf-8", newline="\n")
+
+
+def added(allowed, recorded):
+    found = {}
+    for path, rules in sorted(recorded.items()):
+        for rule, keys in sorted(rules.items()):
+            extra = Counter(keys) - Counter(allowed.get(path, {}).get(rule, []))
+            if extra:
+                found[path, rule] = extra
+    return found
+
+
+def renames(ref):
+    if ref is None:
+        return {}
+    tokens = git_output("diff", "-M", "--name-status", "-z", "--no-color", "--no-relative", ref, "--").split("\0")
+    pairs, index = {}, 0
+    while index < len(tokens) and tokens[index]:
+        status = tokens[index]
+        if status[0] in "RC":
+            if status[0] == "R":
+                pairs[tokens[index + 1]] = tokens[index + 2]
+            index += 3
+        else:
+            index += 2
+    return pairs
+
+
+def baseline_commit():
+    for args in (["log", "-1", "--format=%H", "--", BASELINE], ["rev-parse", "--verify", "--quiet", "HEAD^{commit}"]):
+        proc = git(*args)
+        sha = proc.stdout.decode("utf-8").strip() if proc.returncode == 0 else ""
+        if sha:
+            return sha
+    return None
+
+
+def carry(allowed, pairs):
+    carried = {path: dict(rules) for path, rules in allowed.items() if path not in pairs}
+    for old, new in pairs.items():
+        for rule, keys in allowed.get(old, {}).items():
+            target = carried.setdefault(new, {})
+            target[rule] = sorted(target.get(rule, []) + keys)
+    return carried
+
+
+def print_located(path, rule, extra, findings):
+    left, picked = Counter(extra), []
+    for found in reversed(findings):
+        if found[0] == path and found[2] == rule and left[found[4]] > 0:
+            left[found[4]] -= 1
+            picked.append(found)
+    for f_path, line, f_rule, message, _ in reversed(picked):
+        print(f"  {f_path}:{line}: {f_rule}: {message}")
+
+
+def report_new(new, findings):
+    for (path, rule), extra in new.items():
+        print(f"{path}: {extra.total()} {rule} violations are not in the baseline")
+        print_located(path, rule, extra, findings)
+
+
+def check_base(ref, baseline, findings):
+    try:
+        base = load_base_baseline(ref)
+    except OldBaseline:
+        print(f"{ref} has a {BASELINE} in the older count format, so there is nothing to compare against")
+        return True
+    if base is None:
+        print(f"{ref} has no {BASELINE}, so there is nothing to compare against")
+        return True
+    pairs = renames(ref)
+    renamed_from = {new: old for old, new in pairs.items()}
+    new = added(carry(base, pairs), baseline)
+    for (path, rule), extra in new.items():
+        print(f"{BASELINE}: {path} adds {extra.total()} {rule} violations that {ref} did not have")
+        if path in renamed_from:
+            print(f"  {path} was renamed from {renamed_from[path]} since {ref}, and only that file's entries carried over")
+        print_located(path, rule, extra, findings)
+    if new:
+        print(f"the baseline grew against {ref}. Fix the violations instead, or merge {ref} if it removed these entries")
+    return not new
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Fail on any lint violation that .lint-baseline.json does not record.")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--init", action="store_true", help="write the first baseline")
+    mode.add_argument("--update", action="store_true", help="remove the baseline entries of fixed violations")
+    mode.add_argument("--base", metavar="REF", help="also fail if the baseline grew against the one at REF")
+    args = parser.parse_args()
+    try:
+        os.chdir(git_output("rev-parse", "--show-toplevel").strip())
+        if args.init and Path(BASELINE).exists():
+            raise ToolError(f"{BASELINE} already exists; use --update to remove fixed violations from it")
+        files = candidates()
+        findings = collect_findings(files)
+        recorded = entries(findings)
+        if args.init:
+            write_baseline(recorded)
+            print(f"wrote {BASELINE} with {len(findings)} violations in {len(recorded)} files")
+            return 0
+        baseline = load_baseline()
+        carried = carry(baseline, renames(baseline_commit()))
+        if args.update:
+            new = added(carried, recorded)
+            if new:
+                report_new(new, findings)
+                print("refusing to update: the baseline can only lose entries")
+                return 1
+            write_baseline(recorded)
+            print(f"updated {BASELINE} to {len(findings)} violations in {len(recorded)} files")
+            return 0
+        new = added(baseline, recorded)
+        base_ok = check_base(args.base, baseline, findings) if args.base else True
+    except ToolError as error:
+        print(f"ratchet: {error}", file=sys.stderr)
+        return 2
+    if new:
+        report_new(new, findings)
+        if not added(carried, recorded):
+            print("these violations moved with files git sees as renamed; run with --update to move their baseline entries")
+    elif added(recorded, baseline):
+        print("some baseline violations are fixed; run with --update to remove their entries")
+    if new or not base_ok:
+        return 1
+    print(f"ratchet passed: {len(findings)} violations, all in the baseline")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        status = main()
+    except Exception:
+        traceback.print_exc()
+        status = 2
+    sys.exit(status)

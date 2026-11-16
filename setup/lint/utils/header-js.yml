@@ -1,0 +1,29 @@
+id: header-js
+language: JavaScript
+rule:
+  kind: comment
+  inside:
+    kind: program
+  not:
+    any:
+      - follows:
+          stopBy: end
+          not:
+            any:
+              - kind: comment
+              - kind: hash_bang_line
+      - follows:
+          kind: comment
+          follows:
+            kind: comment
+            follows:
+              kind: comment
+      - regex: '(\n[^\n]*){3}'
+      - regex: '[^\r\n]{121}'
+      - all:
+          - regex: '\n.'
+          - any:
+              - follows:
+                  kind: comment
+              - precedes:
+                  kind: comment

@@ -1,0 +1,24 @@
+id: header-python
+language: Python
+utils:
+  line:
+    kind: comment
+    not:
+      matches: shebang-python
+rule:
+  matches: line
+  inside:
+    kind: module
+  not:
+    any:
+      - follows:
+          stopBy: end
+          not:
+            kind: comment
+      - follows:
+          matches: line
+          follows:
+            matches: line
+            follows:
+              matches: line
+      - regex: '[^\r\n]{121}'

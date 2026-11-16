@@ -1,0 +1,152 @@
+id: no-comments-rust
+language: Rust
+severity: error
+message: "Comments are not allowed. Name things so the code says what it does. Put the reason for a behaviour in a test. Put a known limit in a GitHub issue. Put a lint exception in the lint config with the file path. Two comments are allowed: a header of up to 3 lines of at most 120 characters at the top of the file saying what the module is for, and the one-line // SAFETY: comment that clippy requires directly before an unsafe block, an unsafe impl or a statement that uses an unsafe block. A bare string statement or a #[doc = \"...\"] attribute counts as a comment."
+rule:
+  any:
+    - kind: line_comment
+      not:
+        any:
+          - matches: header-rust
+          - matches: safety-rust
+    - kind: block_comment
+      not:
+        matches: header-rust
+    - any:
+        - kind: string_literal
+        - kind: raw_string_literal
+      inside:
+        kind: expression_statement
+        stopBy:
+          not:
+            kind: parenthesized_expression
+    - any:
+        - kind: attribute_item
+        - kind: inner_attribute_item
+      has:
+        kind: attribute
+        regex: '(?s)^(?:doc\s*=\s*r?#*"|cfg_attr\s*\(.*\bdoc\s*=\s*r?#*")'
+---
+id: no-comments-python
+language: Python
+severity: error
+message: "Comments are not allowed. Name things so the code says what it does. Put the reason for a behaviour in a test. Put a known limit in a GitHub issue. Put a lint exception in the lint config with the file path. The only comment allowed is a header of up to 3 lines of at most 120 characters at the top of the file saying what the module is for. Docstrings, other bare string statements and strings assigned to _ count as comments."
+rule:
+  any:
+    - kind: comment
+      not:
+        any:
+          - matches: header-python
+          - matches: shebang-python
+    - any:
+        - kind: string
+        - kind: concatenated_string
+      inside:
+        kind: expression_statement
+        stopBy:
+          not:
+            kind: parenthesized_expression
+    - any:
+        - kind: string
+        - kind: concatenated_string
+      inside:
+        kind: assignment
+        has:
+          field: left
+          regex: '^_$'
+        stopBy:
+          not:
+            kind: parenthesized_expression
+---
+id: no-comments-ts
+language: TypeScript
+severity: error
+message: "Comments are not allowed. Name things so the code says what it does. Put the reason for a behaviour in a test. Put a known limit in a GitHub issue. Put a lint exception in the lint config with the file path. The only comment allowed is a header of up to 3 lines of at most 120 characters at the top of the file saying what the module is for. A bare string or template statement, or a void of one, counts as a comment, except a \"use strict\", \"use client\" or \"use server\" directive at the top of a file or function."
+ignores:
+  - "**/next-env.d.ts"
+  - "gui/shared/src/api-types.ts"
+rule:
+  any:
+    - kind: comment
+      not:
+        matches: header-ts
+    - kind: html_comment
+    - any:
+        - kind: string
+        - kind: template_string
+      inside:
+        kind: expression_statement
+        stopBy:
+          not:
+            kind: parenthesized_expression
+        not:
+          matches: prologue-ts
+    - any:
+        - kind: string
+        - kind: template_string
+      inside:
+        kind: unary_expression
+        regex: '^void\b'
+        stopBy:
+          not:
+            kind: parenthesized_expression
+---
+id: no-comments-tsx
+language: Tsx
+severity: error
+message: "Comments are not allowed. Name things so the code says what it does. Put the reason for a behaviour in a test. Put a known limit in a GitHub issue. Put a lint exception in the lint config with the file path. The only comment allowed is a header of up to 3 lines of at most 120 characters at the top of the file saying what the module is for. A bare string or template statement, or a void of one, counts as a comment, except a \"use strict\", \"use client\" or \"use server\" directive at the top of a file or function."
+rule:
+  any:
+    - kind: comment
+      not:
+        matches: header-tsx
+    - kind: html_comment
+    - any:
+        - kind: string
+        - kind: template_string
+      inside:
+        kind: expression_statement
+        stopBy:
+          not:
+            kind: parenthesized_expression
+        not:
+          matches: prologue-tsx
+    - any:
+        - kind: string
+        - kind: template_string
+      inside:
+        kind: unary_expression
+        regex: '^void\b'
+        stopBy:
+          not:
+            kind: parenthesized_expression
+---
+id: no-comments-js
+language: JavaScript
+severity: error
+message: "Comments are not allowed. Name things so the code says what it does. Put the reason for a behaviour in a test. Put a known limit in a GitHub issue. Put a lint exception in the lint config with the file path. The only comment allowed is a header of up to 3 lines of at most 120 characters at the top of the file saying what the module is for. A bare string or template statement, or a void of one, counts as a comment, except a \"use strict\", \"use client\" or \"use server\" directive at the top of a file or function."
+rule:
+  any:
+    - kind: comment
+      not:
+        matches: header-js
+    - kind: html_comment
+    - any:
+        - kind: string
+        - kind: template_string
+      inside:
+        kind: expression_statement
+        stopBy:
+          not:
+            kind: parenthesized_expression
+        not:
+          matches: prologue-js
+    - any:
+        - kind: string
+        - kind: template_string
+      inside:
+        kind: unary_expression
+        regex: '^void\b'
+        stopBy:
+          not:
+            kind: parenthesized_expression

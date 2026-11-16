@@ -1,0 +1,36 @@
+id: header-rust
+language: Rust
+utils:
+  comment:
+    any:
+      - kind: line_comment
+      - kind: block_comment
+rule:
+  matches: comment
+  inside:
+    kind: source_file
+  not:
+    any:
+      - follows:
+          stopBy: end
+          not:
+            any:
+              - matches: comment
+              - kind: shebang
+      - follows:
+          matches: comment
+          follows:
+            matches: comment
+            follows:
+              matches: comment
+      - regex: '(\n[^\n]*){3}'
+      - regex: '[^\r\n]{121}'
+      - all:
+          - regex: '\n.'
+          - any:
+              - follows:
+                  matches: comment
+              - precedes:
+                  matches: comment
+      - has:
+          kind: outer_doc_comment_marker
