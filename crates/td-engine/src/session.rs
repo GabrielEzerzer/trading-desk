@@ -827,11 +827,11 @@ impl Session {
             prices[k] = bar.close;
             self.book_at_mut(k).mark(bar.close);
         }
-        for k in 1..n {
-            if let Some(bar) = bars[k]
+        for (k, bar) in bars.iter().enumerate().skip(1) {
+            if let Some(bar) = bar
                 && self.legs[k - 1].left_at == Some(bar.open_time)
             {
-                self.leave(k, &bar);
+                self.leave(k, bar);
             }
         }
         self.see(&prices);

@@ -724,7 +724,8 @@ fn an_instrument_that_stops_trading_is_closed_at_its_last_close_and_takes_no_mor
             notes.push(e.to_string());
         }
     });
-    let result = run(&config(8), strategy, &a_bars, &[], &[leaving.clone()]).unwrap();
+    let leaving = [leaving];
+    let result = run(&config(8), strategy, &a_bars, &[], &leaving).unwrap();
     let fills: Vec<(Millis, Side, f64, f64)> = result
         .fills
         .iter()
@@ -757,9 +758,10 @@ fn an_instrument_that_stops_trading_is_closed_at_its_last_close_and_takes_no_mor
         &a_bars,
         &[traded(&b(), b_bars.clone(), Vec::new())],
     );
-    let left = run_quiet(&config(8), &a_bars, &[leaving.clone()]);
+    let left = run_quiet(&config(8), &a_bars, &leaving);
     assert_ne!(staying.data_fingerprint, left.data_fingerprint);
 
+    let [leaving] = leaving;
     let early = AlsoTradedBars {
         left_at: Some(3 * MIN),
         ..leaving
