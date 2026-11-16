@@ -62,20 +62,6 @@ pub(crate) fn download_candles_from(
     progress: &mut dyn FnMut(String),
 ) -> Result<DownloadReport, DataError> {
     let now = now_ms();
-    if source.lists_delisted()
-        && !list_cached(source, http, store.root(), id.kind, now)?
-            .instruments
-            .iter()
-            .any(|i| &i.id == id)
-    {
-        return Err(DataError::InvalidInstrument {
-            symbol: id.symbol.clone(),
-            reason: format!(
-                "{} lists no {} by that symbol, active or delisted",
-                id.venue, id.kind
-            ),
-        });
-    }
     if let Some(wanted) = source.adjustment() {
         check_adjustment(source, http, store, id, wanted, now)?;
     }
@@ -146,6 +132,21 @@ pub(crate) fn download_candles_from(
         }
         progress(format!("{id} {month}: {} candles", candles.len()));
         report.months.push((month, candles.len()));
+    }
+    if source.unlisted(id).is_some()
+        && store.months(id)?.is_empty()
+        && !list_cached(source, http, store.root(), id.kind, now)?
+            .instruments
+            .iter()
+            .any(|i| &i.id == id)
+    {
+        return Err(DataError::InvalidInstrument {
+            symbol: id.symbol.clone(),
+            reason: format!(
+                "{} lists no {} by that symbol and serves no bars for it",
+                id.venue, id.kind
+            ),
+        });
     }
     let end = to.min(now - now.rem_euclid(MINUTE));
     if from < end {

@@ -26,7 +26,7 @@ pub use error::DataError;
 pub use http::Http;
 pub use instruments::{
     INSTRUMENT_CACHE_AGE, InstrumentList, cached_instruments, default_fees, fetch_instruments,
-    validate_instrument,
+    unlisted_instrument, validate_instrument,
 };
 pub use resample::{LoadedCandles, resample};
 pub use source::{DataSource, LiveStream, MinuteHistory, source};

@@ -65,8 +65,8 @@ impl DataSource for Alpaca {
         Some(ADJUSTMENT)
     }
 
-    fn lists_delisted(&self) -> bool {
-        true
+    fn unlisted(&self, id: &InstrumentId) -> Option<Instrument> {
+        stock_only(id.kind).ok().map(|()| instrument(&id.symbol))
     }
 
     fn minute_history(
@@ -133,6 +133,9 @@ fn parse_assets(url: &str, body: &str) -> Result<InstrumentList, DataError> {
         if asset.class == "us_equity" && seen.insert(asset.symbol.clone()) {
             list.push(&asset.symbol, Ok(instrument(&asset.symbol)));
         }
+    }
+    if list.instruments.is_empty() {
+        return Err(DataError::parse(url, "it lists no US stock or ETF"));
     }
     Ok(list)
 }
@@ -254,7 +257,7 @@ fn page_url(
          &adjustment={ADJUSTMENT}&feed=sip&sort=asc&asof={}",
         time(start),
         time(end),
-        format_date(now)
+        format_date(new_york_date(now) * DAY)
     );
     if let Some(token) = token {
         url.push_str("&page_token=");
@@ -266,6 +269,12 @@ fn page_url(
         }));
     }
     url
+}
+
+fn new_york_date(now: Millis) -> i64 {
+    let day = now.div_euclid(DAY);
+    let midnight = day * DAY + new_york_offset_hours(day - 1) * 60 * MINUTE;
+    if now < midnight { day - 1 } else { day }
 }
 
 fn get_page(http: &Http, keys: &Keys, url: &str) -> Result<(u16, Vec<u8>), DataError> {
@@ -424,6 +433,7 @@ mod tests {
     use crate::Store;
     use crate::download::download_candles_from;
     use crate::http::stub;
+    use crate::instruments::list_cached;
     use crate::time::{Month, parse_date};
 
     const PAGE_ONE: &str = include_str!("../../../mock/alpaca/aapl-2024-01-page-1.json");
@@ -503,7 +513,7 @@ mod tests {
             asked[0],
             "https://data.alpaca.markets/v2/stocks/AAPL/bars?timeframe=1Day\
              &start=2023-12-31T00:00:00Z&end=2024-02-01T00:00:00Z&limit=10000&adjustment=all\
-             &feed=sip&sort=asc&asof=2026-01-01"
+             &feed=sip&sort=asc&asof=2025-12-31"
         );
         assert!(asked[1].ends_with("&page_token=QUFQTHxEfDIwMjQtMDEtMTJUMDU6MDA6MDBa"));
     }
@@ -628,6 +638,28 @@ mod tests {
         );
         assert_eq!(parse_midnight_new_york("2024-03-11T05:00:00Z"), None);
         assert_eq!(parse_midnight_new_york("2024-11-01T05:00:00Z"), None);
+    }
+
+    #[test]
+    fn a_request_names_the_date_in_new_york_as_its_asof() {
+        let at = |text: &str, hour: i64, minute: i64| date(text) + (hour * 60 + minute) * MINUTE;
+        for (now, want) in [
+            (at("2024-01-02", 4, 59), "2024-01-01"),
+            (at("2024-01-02", 5, 0), "2024-01-02"),
+            (at("2024-07-02", 3, 59), "2024-07-01"),
+            (at("2024-07-02", 4, 0), "2024-07-02"),
+            (at("2024-03-10", 4, 59), "2024-03-09"),
+            (at("2024-03-10", 5, 0), "2024-03-10"),
+            (at("2024-11-03", 3, 59), "2024-11-02"),
+            (at("2024-11-03", 4, 0), "2024-11-03"),
+        ] {
+            let url = page_url(DATA_HOST, "AAPL", 0, DAY, now, None);
+            assert!(
+                url.ends_with(&format!("&asof={want}")),
+                "{}: {url}",
+                format_minute(now)
+            );
+        }
     }
 
     #[test]
@@ -830,8 +862,49 @@ mod tests {
             Err(DataError::KindNotListed { .. })
         ));
         assert_eq!(Alpaca.adjustment(), Some("all"));
-        assert!(Alpaca.lists_delisted());
         assert!(Alpaca.live().is_err());
+    }
+
+    #[test]
+    fn a_stock_missing_from_the_list_trades_on_the_rules_every_alpaca_stock_has() {
+        let lltc = crate::unlisted_instrument(&stock("LLTC")).expect("a description");
+        assert_eq!(lltc, instrument("LLTC"));
+        assert_eq!(
+            (lltc.base.as_str(), lltc.quote.as_str(), lltc.id.kind),
+            ("LLTC", "USD", InstrumentKind::Stock)
+        );
+        assert_eq!(crate::unlisted_instrument(&stock("BRK.B")), None);
+        let spot = InstrumentId {
+            kind: InstrumentKind::Spot,
+            ..stock("LLTC")
+        };
+        assert_eq!(crate::unlisted_instrument(&spot), None);
+        let binance = InstrumentId {
+            venue: Venue::Binance,
+            ..spot
+        };
+        assert_eq!(crate::unlisted_instrument(&binance), None);
+    }
+
+    #[test]
+    fn an_empty_assets_list_is_refused_and_not_kept() {
+        let e = assets(env, &[], |_, _| Ok((200, b"[]".to_vec()))).unwrap_err();
+        assert!(matches!(e, DataError::Parse { .. }), "{e}");
+        assert!(
+            e.to_string().contains(
+                "https://paper-api.alpaca.markets/v2/assets?status=all&asset_class=us_equity"
+            ),
+            "{e}"
+        );
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let source = FakeAlpaca {
+            assets: "[]",
+            ..FakeAlpaca::new([EMPTY, EMPTY])
+        };
+        let http = Http::new().expect("a client");
+        let listed = list_cached(&source, &http, dir.path(), InstrumentKind::Stock, 0);
+        assert!(matches!(listed, Err(DataError::Parse { .. })), "{listed:?}");
+        assert!(!dir.path().join("instruments").exists());
     }
 
     #[test]
@@ -853,12 +926,14 @@ mod tests {
 
     struct FakeAlpaca {
         pages: Mutex<Vec<String>>,
+        assets: &'static str,
     }
 
     impl FakeAlpaca {
         fn new(pages: [&str; 2]) -> Self {
             FakeAlpaca {
                 pages: Mutex::new(pages.map(String::from).to_vec()),
+                assets: ASSETS,
             }
         }
     }
@@ -874,7 +949,7 @@ mod tests {
 
         fn instruments(&self, _: &Http, kind: InstrumentKind) -> Result<InstrumentList, DataError> {
             stock_only(kind)?;
-            parse_assets("assets.json", ASSETS)
+            parse_assets("assets.json", self.assets)
         }
 
         fn default_fees(&self, kind: InstrumentKind) -> Result<FeeSchedule, DataError> {
@@ -885,8 +960,8 @@ mod tests {
             Alpaca.adjustment()
         }
 
-        fn lists_delisted(&self) -> bool {
-            Alpaca.lists_delisted()
+        fn unlisted(&self, id: &InstrumentId) -> Option<Instrument> {
+            Alpaca.unlisted(id)
         }
 
         fn minute_history(
@@ -949,31 +1024,56 @@ mod tests {
     }
 
     #[test]
-    fn a_symbol_alpaca_does_not_list_is_refused_before_any_bars_are_asked_for() {
+    fn a_symbol_missing_from_the_list_downloads_and_is_refused_only_while_no_bar_of_it_is_stored() {
         let dir = tempfile::tempdir().expect("a temp dir");
         let store = Store::new(dir.path());
-        let source = FakeAlpaca::new([PAGE_ONE, PAGE_TWO]);
+        let lltc = stock("LLTC");
+        let empty = EMPTY.replace("AAPL", "LLTC");
+        let source = FakeAlpaca::new([&empty, &empty]);
         let http = Http::new().expect("a client");
-        let unlisted = InstrumentId {
-            symbol: "NOSUCH".into(),
-            ..aapl()
+        let download = |month: &str| {
+            let month = Month::parse(month).expect("a month");
+            download_candles_from(
+                &source,
+                &http,
+                &store,
+                &lltc,
+                month.start(),
+                month.end(),
+                &mut |_| {},
+            )
         };
-        let e = download_candles_from(
-            &source,
-            &http,
-            &store,
-            &unlisted,
-            date("2024-01-01"),
-            date("2024-02-01"),
-            &mut |_| {},
-        )
-        .unwrap_err();
+        let e = download("2023-12").unwrap_err();
         assert_eq!(
             e.to_string(),
-            "instrument NOSUCH: alpaca lists no stock by that symbol, active or delisted"
+            "instrument LLTC: alpaca lists no stock by that symbol and serves no bars for it"
         );
-        assert!(store.months(&unlisted).expect("reads").is_empty());
+        let dec = Month::parse("2023-12").expect("a month");
+        assert!(
+            store
+                .recorded_empty(&lltc, dec.start(), dec.end())
+                .expect("reads"),
+            "the month it had nothing for is still recorded"
+        );
         assert!(dir.path().join("instruments/alpaca-stock.json").is_file());
+
+        *source.pages.lock().expect("lock") = vec![
+            PAGE_ONE.replace("AAPL", "LLTC"),
+            PAGE_TWO.replace("AAPL", "LLTC"),
+        ];
+        download("2024-01").expect("its bars download");
+        let jan = Month::parse("2024-01").expect("a month");
+        assert_eq!(store.read_month(&lltc, jan).expect("reads").len(), 21);
+
+        *source.pages.lock().expect("lock") = vec![empty.clone(), empty];
+        download("2024-03").expect("a month without bars, once one is stored");
+        let mar = Month::parse("2024-03").expect("a month");
+        assert!(
+            store
+                .recorded_empty(&lltc, mar.start(), mar.end())
+                .expect("reads")
+        );
+
         let twtr = InstrumentId {
             symbol: "TWTR".into(),
             ..aapl()
@@ -1137,6 +1237,33 @@ mod tests {
                 .expect("records"),
             "downloads recorded nothing after {gone}'s last bar"
         );
+
+        let january = (date("2016-01-01"), date("2016-02-01"));
+        for symbol in ["LLTC", "SYMC", "YHOO"] {
+            let id = stock(symbol);
+            assert!(!listed.contains(symbol), "{symbol} is in the assets list");
+            download_candles_from(
+                &Alpaca,
+                &http,
+                &store,
+                &id,
+                january.0,
+                january.1,
+                &mut |_| {},
+            )
+            .expect("an unlisted stock with bars downloads");
+            let candles = store
+                .read_month(&id, Month::containing(january.0))
+                .expect("January 2016");
+            eprintln!(
+                "{symbol}: not listed, {} bars in 2016-01 from {} (close {})",
+                candles.len(),
+                format_date(candles[0].open_time),
+                candles[0].close
+            );
+            assert_eq!(format_date(candles[0].open_time), "2016-01-04");
+            assert_eq!(candles.len(), 19, "{symbol}'s trading days in 2016-01");
+        }
 
         let june = (date("2023-06-01"), date("2023-07-01"));
         let fetch = || {

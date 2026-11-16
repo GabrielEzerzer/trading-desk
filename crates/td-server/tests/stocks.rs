@@ -290,7 +290,12 @@ impl TestServer {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::new(dir.path());
         let times = trading_minutes(day("2016-01-01"), day("2018-01-01"));
-        for (symbol, scale, phase) in [("AAPL", 1.0, 0.0), ("MSFT", 2.0, 0.3), ("SPY", 4.0, 0.1)] {
+        for (symbol, scale, phase) in [
+            ("AAPL", 1.0, 0.0),
+            ("MSFT", 2.0, 0.3),
+            ("SPY", 4.0, 0.1),
+            ("YHOO", 3.0, 0.2),
+        ] {
             store
                 .write_candles(&stock(symbol).id, &bars(scale, phase, &times))
                 .unwrap();
@@ -645,12 +650,22 @@ async fn sweeps_and_walk_forward_runs_trade_daily_stock_bars_in_one_account() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_plan_runs_its_battery_on_several_stocks_with_an_etf_as_reference() {
     let t = TestServer::seeded().await;
-    let body = json!({
+    assert!(!LISTED.contains(&"YHOO"));
+    let mut body = json!({
         "strategy": "sma_cross",
         "instruments": [stock("AAPL").id],
         "references": [stock("SPY").id],
-        "also_traded": [stock("MSFT").id],
+        "also_traded": [stock("BRK.B").id],
     });
+    let (status, refused) = t.post("/runs/plan", &body).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("does not list alpaca:BRK.B:stock")),
+        "{refused}"
+    );
+    body["also_traded"] = json!([stock("MSFT").id, stock("YHOO").id]);
     let (state, job) = t.finished("/runs/plan", &body).await;
     assert_eq!(state["status"], "done", "{state}");
     let (_, info) = t.get(&format!("/jobs/{job}")).await;
@@ -666,7 +681,7 @@ async fn a_plan_runs_its_battery_on_several_stocks_with_an_etf_as_reference() {
     let SavedRun::Plan(run) = &detail.run else {
         panic!("a plan run");
     };
-    assert_eq!(run.config.also_traded, vec![stock("MSFT")]);
+    assert_eq!(run.config.also_traded, vec![stock("MSFT"), stock("YHOO")]);
     assert_eq!(run.config.references, vec![stock("SPY").id]);
     let sweep = run.battery.sweep.as_ref().expect("a sweep");
     let traded = sweep

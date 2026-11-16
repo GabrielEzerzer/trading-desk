@@ -1046,7 +1046,10 @@ impl Session {
         };
         let price = model.slip(bar.close, side, &leg.instrument);
         let fees = leg.instrument.fees;
-        let fee = fees.fee(price, qty, fees.taker);
+        let fee = leg
+            .portfolio
+            .account()
+            .from_quote(fees.fee(price, qty, fees.taker), price);
         let instrument = leg.instrument.id.clone();
         let id = OrderId(self.orders.len() as u64 + 1);
         self.orders.push(Order {

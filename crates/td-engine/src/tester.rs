@@ -1018,6 +1018,7 @@ pub fn permutation_test_with_traded(
     // Each reference's bar at each traded bar's time, or `None`, in the base's order.
     let original_references = align(base, &originals, references)?;
     let original_traded = traded_slots(base, &originals, also_traded);
+    let cuts = span_cuts(&originals, &original_traded);
     let slots: Vec<Vec<Option<Candle>>> = original_references
         .iter()
         .map(|(_, slots)| slots.clone())
@@ -1030,7 +1031,7 @@ pub fn permutation_test_with_traded(
     for k in 0..copies {
         let seed = derive_seed(spec.seed, k as u64);
         let (shuffled, shuffled_asks, mut shuffled_references) =
-            permute_with_references(&originals, &original_asks, &slots, seed)
+            permute_with_references(&originals, &original_asks, &slots, &cuts, seed)
                 .map_err(EngineError::from)?;
         let shuffled_traded = shuffled_references.split_off(original_references.len());
         for (&i, bar) in traded.iter().zip(shuffled) {
@@ -1098,6 +1099,22 @@ fn traded_slots<'a>(
                 .collect();
             (given, slots)
         })
+        .collect()
+}
+
+fn span_cuts(
+    originals: &[Candle],
+    traded: &[(&AlsoTradedBars, Vec<Option<Candle>>)],
+) -> Vec<usize> {
+    let at = |t: Millis| originals.partition_point(|b| b.open_time < t);
+    traded
+        .iter()
+        .flat_map(|(given, _)| {
+            let listed = given.bars.iter().map(|b| b.open_time).min().map(at);
+            let left = given.left_at.map(|t| at(t + 1));
+            [listed, left]
+        })
+        .flatten()
         .collect()
 }
 
@@ -3505,6 +3522,71 @@ mod tests {
             );
             assert_eq!(times.len(), BARS as usize - 1);
             assert_eq!(copy[0].funding, also[0].funding);
+        }
+
+        fn copies_of_the_second(also: &[AlsoTradedBars]) -> Vec<AlsoTradedBars> {
+            let (bars, _) = pair_data(BARS);
+            let base = pair_config(TRADES_BOTH, BARS);
+            let slots = traded_slots(&base, &bars, also);
+            let cuts = span_cuts(&bars, &slots);
+            let shuffled: Vec<Vec<Option<Candle>>> = slots.iter().map(|(_, s)| s.clone()).collect();
+            (0..20)
+                .map(|seed| {
+                    let (_, _, moved) =
+                        permute_with_references(&bars, &[], &shuffled, &cuts, seed).unwrap();
+                    traded_copy(&slots, moved, base.from..base.to).remove(0)
+                })
+                .collect()
+        }
+
+        #[test]
+        fn the_luck_tests_copies_trade_a_leaving_instrument_only_until_it_left() {
+            const LEFT_BAR: i64 = 72;
+            let (bars, mut also) = pair_data(BARS);
+            also[0].bars.truncate(LEFT_BAR as usize + 1);
+            let left = LEFT_BAR * PAIR_STEP;
+            also[0].left_at = Some(left);
+            for (seed, copy) in copies_of_the_second(&also).iter().enumerate() {
+                let times: Vec<Millis> = copy.bars.iter().map(|b| b.open_time).collect();
+                assert!(
+                    times.iter().all(|&t| t <= left),
+                    "seed {seed}: a bar after it left, at {:?}",
+                    times.iter().filter(|&&t| t > left).collect::<Vec<_>>()
+                );
+                assert_eq!(copy.left_at, Some(left), "seed {seed}");
+                assert_eq!(times.len(), LEFT_BAR as usize, "seed {seed}");
+            }
+            let spec = PermutationSpec {
+                sweep: pair_sweep(TRADES_BOTH),
+                permutations: 5,
+                seed: 3,
+            };
+            let result =
+                permutation_test_with_traded(&spec, &bars, &[], &[], &[], &[], &also, None)
+                    .unwrap();
+            assert_eq!(result.qualified_copies, 5);
+        }
+
+        #[test]
+        fn the_luck_tests_copies_trade_an_instrument_listed_late_only_from_its_first_bar() {
+            const LISTED_BAR: i64 = 40;
+            let (bars, mut also) = pair_data(BARS);
+            also[0].bars.drain(..LISTED_BAR as usize);
+            let listed = LISTED_BAR * PAIR_STEP;
+            for (seed, copy) in copies_of_the_second(&also).iter().enumerate() {
+                let times: Vec<Millis> = copy.bars.iter().map(|b| b.open_time).collect();
+                assert_eq!(times.iter().min(), Some(&listed), "seed {seed}");
+                assert_eq!(times.len(), (BARS - LISTED_BAR) as usize, "seed {seed}");
+            }
+            let spec = PermutationSpec {
+                sweep: pair_sweep(TRADES_BOTH),
+                permutations: 5,
+                seed: 3,
+            };
+            let result =
+                permutation_test_with_traded(&spec, &bars, &[], &[], &[], &[], &also, None)
+                    .unwrap();
+            assert_eq!(result.qualified_copies, 5);
         }
     }
 }

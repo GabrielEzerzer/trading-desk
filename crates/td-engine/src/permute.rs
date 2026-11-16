@@ -61,7 +61,7 @@ pub(crate) fn permute_quotes(
     asks: &[Candle],
     seed: u64,
 ) -> Result<(Vec<Candle>, Vec<Candle>), CoreError> {
-    permute_with_references(bars, asks, &[], seed).map(|(bars, asks, _)| (bars, asks))
+    permute_with_references(bars, asks, &[], &[], seed).map(|(bars, asks, _)| (bars, asks))
 }
 
 /// The shuffled bars, asks and reference slots of [`permute_with_references`].
@@ -85,6 +85,7 @@ pub(crate) fn permute_with_references(
     bars: &[Candle],
     asks: &[Candle],
     references: &[Vec<Option<Candle>>],
+    cuts: &[usize],
     seed: u64,
 ) -> Result<Permuted, CoreError> {
     assert!(
@@ -108,9 +109,22 @@ pub(crate) fn permute_with_references(
     // order[k] is the source bar of rebuilt bar k + 1.
     let mut order: Vec<usize> = (1..bars.len()).collect();
     let mut rng = SplitMix64(seed);
-    for i in (1..order.len()).rev() {
-        let j = rng.below(i as u64 + 1) as usize;
-        order.swap(i, j);
+    let mut ends: Vec<usize> = cuts
+        .iter()
+        .filter(|&&c| 1 < c && c < bars.len())
+        .map(|&c| c - 1)
+        .chain([order.len()])
+        .collect();
+    ends.sort_unstable();
+    ends.dedup();
+    let mut start = 0;
+    for end in ends {
+        let block = &mut order[start..end];
+        for i in (1..block.len()).rev() {
+            let j = rng.below(i as u64 + 1) as usize;
+            block.swap(i, j);
+        }
+        start = end;
     }
     let mut out = Vec::with_capacity(bars.len());
     let mut out_asks = Vec::with_capacity(asks.len());
@@ -400,7 +414,7 @@ mod tests {
             .collect();
         gapped[20] = None;
         let (got, _, refs) =
-            permute_with_references(&bars, &[], &[same, gapped.clone()], 7).unwrap();
+            permute_with_references(&bars, &[], &[same, gapped.clone()], &[], 7).unwrap();
         assert_eq!(got, want, "the bars are as permute_quotes gives them");
         let as_bars: Vec<Candle> = refs[0].iter().map(|r| r.unwrap()).collect();
         assert_eq!(as_bars, want);
@@ -417,5 +431,31 @@ mod tests {
         }
         assert_eq!(refs[1].iter().filter(|r| r.is_none()).count(), 1);
         assert_ne!(refs[1][20], None, "the shuffle moved the gap");
+    }
+
+    #[test]
+    fn cuts_keep_each_bars_move_inside_its_block_and_none_shuffle_as_before() {
+        let bars = path();
+        let block = |i: usize| usize::from(i >= 20) + usize::from(i >= 45);
+        for seed in 0..10 {
+            let (p, _, _) = permute_with_references(&bars, &[], &[], &[45, 20, 20], seed).unwrap();
+            for (k, b) in p.iter().enumerate() {
+                let src = b.volume as usize - 1;
+                assert_eq!(block(src), block(k), "seed {seed}: bar {k} took bar {src}");
+            }
+            assert!(
+                p.iter()
+                    .enumerate()
+                    .any(|(k, b)| b.volume as usize - 1 != k)
+            );
+            assert!(rel_close(
+                p.last().unwrap().close,
+                bars.last().unwrap().close
+            ));
+            assert_eq!(
+                permute_with_references(&bars, &[], &[], &[0, 1, bars.len()], seed).unwrap(),
+                permute_with_references(&bars, &[], &[], &[], seed).unwrap()
+            );
+        }
     }
 }

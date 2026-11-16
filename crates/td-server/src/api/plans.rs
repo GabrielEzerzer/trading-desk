@@ -285,6 +285,7 @@ async fn trading_rules(
             .instruments
             .into_iter()
             .find(|i| &i.id == id)
+            .or_else(|| td_data::unlisted_instrument(id))
             .ok_or_else(|| {
                 invalid(
                     "invalid_config",

@@ -6,7 +6,9 @@
 //! ([`crate::fetch_instruments`]) and live feeds ([`crate::live`]) are written once against the
 //! trait.
 
-use td_core::{Candle, FeeSchedule, InstrumentId, InstrumentKind, Millis, Timeframe, Venue};
+use td_core::{
+    Candle, FeeSchedule, Instrument, InstrumentId, InstrumentKind, Millis, Timeframe, Venue,
+};
 
 use crate::live::{Greeting, KlineUpdate};
 use crate::{DataError, Http, InstrumentList, alpaca, binance, bybit, oanda};
@@ -88,8 +90,8 @@ pub trait DataSource: Send + Sync {
         None
     }
 
-    fn lists_delisted(&self) -> bool {
-        false
+    fn unlisted(&self, _id: &InstrumentId) -> Option<Instrument> {
+        None
     }
 }
 
