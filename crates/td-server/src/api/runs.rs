@@ -393,6 +393,14 @@ fn data_range(config: &BacktestConfig) -> Result<(Millis, Millis), ApiError> {
         return Err(invalid_config("`to` must be after `from`".into()));
     }
     let timeframe = config.timeframe;
+    let shortest = config.instrument.id.kind.rules().shortest_timeframe;
+    if timeframe.duration_ms() < shortest.duration_ms() {
+        return Err(invalid_config(format!(
+            "{} has one bar per trading day: run it at {} or longer",
+            config.instrument.id,
+            shortest.as_str()
+        )));
+    }
     let edges = [
         ("from", Some(config.from)),
         ("to", Some(config.to)),
@@ -536,7 +544,11 @@ fn read_also_traded(
                 checked.0 = lead.to;
             }
         }
-        let funding = store.load_funding(id, range.0, range.1)?;
+        let funding = if id.kind.rules().funding {
+            store.load_funding(id, range.0, range.1)?
+        } else {
+            Vec::new()
+        };
         let checked_funding = &funding[funding.partition_point(|&(t, _)| t < checked.0)..];
         if let Some(s) = shortfall(
             id,
@@ -597,6 +609,9 @@ fn held_before(
         {
             return Ok(Some("candles"));
         }
+    }
+    if !id.kind.rules().funding {
+        return Ok(None);
     }
     let funding = store.load_funding(id, Millis::MIN, end - max_gap(id.kind) + 1)?;
     Ok((!funding.is_empty()).then_some("funding rates"))

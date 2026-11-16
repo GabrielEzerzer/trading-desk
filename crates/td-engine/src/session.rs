@@ -217,7 +217,7 @@ impl Session {
         timeframe: Timeframe,
         config: SessionConfig,
     ) -> Result<Session, EngineError> {
-        let fees = check_config(&instrument, &config)?;
+        let fees = check_config(&instrument, timeframe, &config)?;
         let model = CandleFillModel {
             slippage_bps: config.slippage_bps,
         };
@@ -243,7 +243,7 @@ impl Session {
         config: SessionConfig,
         broker: Box<dyn Broker>,
     ) -> Result<Session, EngineError> {
-        let fees = check_config(&instrument, &config)?;
+        let fees = check_config(&instrument, timeframe, &config)?;
         Ok(Session::build(
             strategy, instrument, timeframe, config, fees, broker,
         ))
@@ -844,11 +844,20 @@ impl Session {
         alone: bool,
     ) -> Vec<BrokerEvent> {
         let extra = if k == 0 { 0.0 } else { self.portfolio.cash() };
+        let shared;
         let (instrument, broker, book) = if k == 0 {
             (&self.instrument, &mut *self.broker, &self.portfolio)
         } else {
             let leg = &mut self.legs[k - 1];
-            (&leg.instrument, &mut *leg.broker, &leg.portfolio)
+            let book = if leg.instrument.id.kind.rules().margin {
+                &leg.portfolio
+            } else {
+                let mut with_cash = leg.portfolio.clone();
+                with_cash.add_cash(extra);
+                shared = with_cash;
+                &shared
+            };
+            (&leg.instrument, &mut *leg.broker, book)
         };
         let breached = |book: &Portfolio| {
             alone
@@ -938,6 +947,9 @@ impl Session {
     /// Liquidates the account if its equity with each traded instrument at `prices` is at or below
     /// maintenance; returns whether it did.
     fn breach(&mut self, prices: &[f64], time: Millis) -> bool {
+        if !self.instrument.id.kind.rules().liquidation {
+            return false;
+        }
         let maintenance = MAINTENANCE_MARGIN_RATE * self.gross_notional(prices);
         if maintenance > 0.0 && self.account_at(prices) <= maintenance {
             self.liquidate_all(prices, time);
@@ -1675,8 +1687,14 @@ fn order_in(orders: &mut [Order], id: OrderId) -> &mut Order {
 /// the fee schedule it trades on.
 fn check_config(
     instrument: &Instrument,
+    timeframe: Timeframe,
     config: &SessionConfig,
 ) -> Result<FeeSchedule, EngineError> {
+    if timeframe.duration_ms() < instrument.id.kind.rules().shortest_timeframe.duration_ms() {
+        return Err(EngineError::InvalidConfig(
+            "the market's data is one bar per trading day: run it at 1d or longer",
+        ));
+    }
     if !(config.starting_cash.is_finite() && config.starting_cash >= 0.0) {
         return Err(EngineError::InvalidConfig(
             "starting cash must be a finite number, zero or more",

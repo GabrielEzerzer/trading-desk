@@ -994,7 +994,13 @@ fn a_reduce_only_order_is_accepted_over_the_gross_cap() {
 #[test]
 fn a_configuration_trading_several_instruments_is_refused_unless_they_fit_one_account() {
     type Change = fn(&mut BacktestConfig);
-    let cases: [(&str, Change); 5] = [
+    let cases: [(&str, Change); 7] = [
+        ("perpetuals or stocks only", |c| {
+            c.also_traded[0].id.kind = InstrumentKind::Spot
+        }),
+        ("of the same kind", |c| {
+            c.also_traded[0].id.kind = InstrumentKind::Stock
+        }),
         ("another venue", |c| {
             c.also_traded[0].id.venue = Venue::Bybit
         }),

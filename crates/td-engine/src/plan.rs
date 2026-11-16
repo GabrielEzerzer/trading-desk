@@ -584,13 +584,27 @@ impl TestPlan {
         let ws = &wf.windows;
         let min = &self.evidence.min_sample;
         for id in &self.instruments {
-            let closed: Millis = id
-                .kind
-                .closed_spans(from, to)
-                .iter()
-                .map(|s| s.end - s.start)
-                .sum();
-            let bars = ((to - from - closed) / bar) as usize;
+            let shortest = id.kind.rules().shortest_timeframe;
+            if bar < shortest.duration_ms() {
+                return refuse(format!(
+                    "{id} has one bar per trading day: run its plan at {shortest} or longer"
+                ));
+            }
+            let closed_in = |from: Millis, to: Millis| -> Millis {
+                id.kind
+                    .closed_spans(from, to)
+                    .iter()
+                    .map(|s| s.end - s.start)
+                    .sum()
+            };
+            let bars = if shortest == Timeframe::M1 {
+                ((to - from - closed_in(from, to)) / bar) as usize
+            } else {
+                (0..(to - from) / bar)
+                    .map(|i| from + i * bar)
+                    .filter(|&start| closed_in(start, start + bar) < bar)
+                    .count()
+            };
             let windows = if bars < ws.train_bars + ws.test_bars {
                 0
             } else {
@@ -1147,6 +1161,25 @@ mod tests {
         plan.instruments = vec![fx];
         plan.period.to = date(2023, 1, 1) + 600 * DAY_MS;
         assert_eq!(plan.validate("sma_cross"), Ok(()));
+    }
+
+    #[test]
+    fn stock_plans_count_one_bar_per_trading_day_and_refuse_hourly_bars() {
+        let mut plan = example_plan();
+        plan.instruments = vec![InstrumentId {
+            venue: td_core::Venue::Alpaca,
+            symbol: "AAPL".into(),
+            kind: td_core::InstrumentKind::Stock,
+        }];
+        plan.walk_forward = WalkForwardPlan::new(60, 45);
+        plan.period = Period::new(date(2016, 1, 1), date(2017, 7, 1));
+        let err = plan.validate("sma_cross").unwrap_err();
+        assert!(err.0.contains("one bar per trading day"), "{err}");
+        plan.timeframe = Timeframe::D1;
+        assert_eq!(plan.validate("sma_cross"), Ok(()));
+        plan.period.to = date(2016, 11, 1);
+        let err = plan.validate("sma_cross").unwrap_err();
+        assert!(err.0.contains("3 walk-forward windows"), "{err}");
     }
 
     /// The minimum-sample check counts windows as the tester lays them: a period that holds

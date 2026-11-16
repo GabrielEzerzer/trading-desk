@@ -146,14 +146,13 @@ pub struct BacktestConfig {
 
 impl BacktestConfig {
     /// Refuses, in a run that names other traded instruments ([`BacktestConfig::also_traded`]),
-    /// a traded instrument that is not a perpetual, one on another venue or in another quote
-    /// currency than `instrument`, a base-currency account, an instrument named twice and one
-    /// that is also a reference. A run that names none passes.
+    /// a traded instrument that is not a perpetual or a stock, one of another kind, on another
+    /// venue or in another quote currency than `instrument`, a base-currency account, an
+    /// instrument named twice and one that is also a reference. A run that names none passes.
     ///
-    /// shortcut: perpetuals only, where one instrument's fills reach another only through the
-    /// account's equity. Spot would need the cash a buy spends shared between the instruments,
-    /// and FX the conversion of each instrument's quote currency into the account's; build those
-    /// into the account before allowing other kinds here.
+    /// shortcut: perpetuals or stocks only. Crypto spot would share cash as stocks do, but no test
+    /// covers it yet; FX needs the conversion of each instrument's quote currency into the
+    /// account's. Build and test those before allowing them.
     pub fn check_traded(&self) -> Result<(), EngineError> {
         if self.also_traded.is_empty() {
             return Ok(());
@@ -169,10 +168,17 @@ impl BacktestConfig {
         let traded: Vec<&Instrument> = std::iter::once(first).chain(&self.also_traded).collect();
         for (i, inst) in traded.iter().enumerate() {
             let id = &inst.id;
-            if id.kind != InstrumentKind::Perpetual {
+            if !matches!(id.kind, InstrumentKind::Perpetual | InstrumentKind::Stock) {
                 return refuse(format!(
-                    "{id} is not a perpetual; a run with several traded instruments trades \
-                     perpetuals only"
+                    "{id} is not a perpetual or a stock; a run with several traded instruments \
+                     trades perpetuals or stocks only"
+                ));
+            }
+            if id.kind != first.id.kind {
+                return refuse(format!(
+                    "{id} is a {}, not a {} like {}; every traded instrument must be of the same \
+                     kind",
+                    id.kind, first.id.kind, first.id
                 ));
             }
             if id.venue != first.id.venue {
