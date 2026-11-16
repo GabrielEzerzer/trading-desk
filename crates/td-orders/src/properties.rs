@@ -69,22 +69,21 @@ proptest! {
     #![proptest_config(config())]
 
     #[test]
-    fn a_base_url_passes_only_as_the_demo_host_or_a_loopback_port(
+    fn a_base_url_passes_only_as_the_demo_host_or_a_loopback_port_but_0_and_80(
         scheme in prop::sample::select(vec!["http", "https", "HTTP", "Https", "wss", "ftp"]),
         user in prop_oneof![3 => Just(""), 1 => prop::sample::select(vec!["u@", "u:p@", "api-demo.bybit.com@"])],
         host in host(),
-        port in prop_oneof![Just(None), Just(Some(0u16)), Just(Some(443)), any::<u16>().prop_map(Some)],
+        port in prop_oneof![Just(None), Just(Some(0u16)), Just(Some(80)), Just(Some(443)), any::<u16>().prop_map(Some)],
         tail in prop_oneof![3 => prop::sample::select(vec!["", "/"]), 1 => prop::sample::select(vec!["/v5", "?x=1", "#f", "/?", "/#"])],
     ) {
         let scheme_lower = scheme.to_ascii_lowercase();
-        prop_assume!(!(scheme_lower == "http" && port == Some(80)));
         let port_text = port.map_or(String::new(), |p| format!(":{p}"));
         let text = format!("{scheme}://{user}{host}{port_text}{tail}");
         let bare = user.is_empty() && (tail.is_empty() || tail == "/");
         let demo = scheme_lower == "https" && DEMO.contains(&host) && matches!(port, None | Some(443));
         let loopback = scheme_lower == "http"
             && LOOPBACK.contains(&host)
-            && port.is_some_and(|p| p != 0);
+            && port.is_some_and(|p| p != 0 && p != 80);
         match check_base(&text) {
             Ok(url) => {
                 prop_assert!(bare && (demo || loopback), "{} passed", text);
@@ -101,9 +100,10 @@ proptest! {
     }
 
     #[test]
-    fn a_loopback_endpoint_builds_for_every_port_but_zero(port in any::<u16>()) {
-        prop_assume!(port != 80);
-        prop_assert_eq!(Endpoint::Loopback(port).base_url().is_ok(), port != 0);
+    fn a_loopback_endpoint_builds_for_every_port_but_0_and_80(
+        port in prop_oneof![Just(0u16), Just(80), any::<u16>()],
+    ) {
+        prop_assert_eq!(Endpoint::Loopback(port).base_url().is_ok(), port != 0 && port != 80);
     }
 
     #[test]

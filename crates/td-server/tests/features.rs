@@ -1,6 +1,6 @@
-//! features.json at the repo root maps every binary cargo metadata lists, its clap subcommands, the
-//! server's routes, the app's sections, the GUI's package scripts and every standalone script, and
-//! every source and test file it names exists.
+//! features.json at the repo root maps every binary and example cargo metadata lists, its clap
+//! subcommands, the server's routes, the app's sections, the GUI's package scripts and every
+//! standalone script, and every source and test file it names exists.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -9,11 +9,12 @@ use std::process::Command;
 
 use serde_json::Value;
 
-struct Bin {
+struct Target {
     name: String,
     package: String,
     src: PathBuf,
     dir: PathBuf,
+    example: bool,
 }
 
 fn root() -> PathBuf {
@@ -44,7 +45,7 @@ fn field<'a>(feature: &'a Value, key: &str) -> &'a str {
     }
 }
 
-fn binaries() -> Vec<Bin> {
+fn targets() -> Vec<Target> {
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
     let out = Command::new(cargo)
         .args([
@@ -60,23 +61,28 @@ fn binaries() -> Vec<Bin> {
         .expect("cargo metadata runs");
     assert!(out.status.success(), "cargo metadata failed: {out:?}");
     let meta: Value = serde_json::from_slice(&out.stdout).expect("cargo metadata prints JSON");
-    let mut bins = Vec::new();
+    let mut found = Vec::new();
     for package in meta["packages"].as_array().expect("a packages array") {
         let manifest = Path::new(package["manifest_path"].as_str().expect("a manifest path"));
         for target in package["targets"].as_array().expect("a targets array") {
             let kinds = target["kind"].as_array().expect("a target kind");
-            if kinds.iter().any(|k| k == "bin") {
-                bins.push(Bin {
+            let example = kinds.iter().any(|k| k == "example");
+            if example || kinds.iter().any(|k| k == "bin") {
+                found.push(Target {
                     name: target["name"].as_str().expect("a target name").into(),
                     package: package["name"].as_str().expect("a package name").into(),
                     src: target["src_path"].as_str().expect("a source path").into(),
                     dir: manifest.parent().expect("a package folder").into(),
+                    example,
                 });
             }
         }
     }
-    assert!(!bins.is_empty(), "cargo metadata listed no binaries");
-    bins
+    assert!(
+        found.iter().any(|t| !t.example),
+        "cargo metadata listed no binaries"
+    );
+    found
 }
 
 fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -179,7 +185,10 @@ fn files_in(dir: &str, extension: &str) -> Vec<(String, String)> {
 
 fn standalone_scripts() -> Vec<String> {
     let mut found = Vec::new();
-    let node = files_in("gui/scripts", "mjs");
+    let node: Vec<(String, String)> = ["gui/scripts", "gui/app/mock"]
+        .into_iter()
+        .flat_map(|dir| files_in(dir, "mjs"))
+        .collect();
     let run_by_package: String = package_scripts().into_iter().map(|(_, c)| c).collect();
     for (path, _) in &node {
         let file = path.rsplit('/').next().expect("a file name");
@@ -207,13 +216,13 @@ fn standalone_scripts() -> Vec<String> {
 
 fn discovered() -> BTreeSet<String> {
     let mut entries = BTreeSet::new();
-    for bin in binaries() {
-        if bin.name == bin.package {
-            for sub in subcommands(&bin.dir) {
-                entries.insert(format!("{} {sub}", bin.name));
+    for target in targets() {
+        if !target.example && target.name == target.package {
+            for sub in subcommands(&target.dir) {
+                entries.insert(format!("{} {sub}", target.name));
             }
         }
-        entries.insert(bin.name);
+        entries.insert(target.name);
     }
     entries.extend(routes());
     entries.extend(sections().into_iter().map(|s| format!("gui:{s}")));
@@ -233,10 +242,13 @@ fn every_entry_point_is_in_the_map() {
         "td-data download",
         "td-live start",
         "td-bench",
+        "demo-smoke",
+        "crosscheck",
         "POST /sessions",
         "gui:trading",
         "pnpm dev",
         "gui/scripts/quit-check.mjs",
+        "gui/app/mock/generate.mjs",
         "harness/crosscheck/run.py",
     ] {
         assert!(found.contains(expected), "discovery missed {expected}");
@@ -251,14 +263,15 @@ fn every_entry_point_is_in_the_map() {
 
 #[test]
 fn every_subcommand_belongs_to_a_binary_named_after_its_package() {
-    let bins = binaries();
-    for bin in &bins {
-        if !subcommands(&bin.dir).is_empty() {
+    let targets = targets();
+    for target in &targets {
+        if !subcommands(&target.dir).is_empty() {
             assert!(
-                bins.iter()
-                    .any(|b| b.name == bin.package && b.package == bin.package),
+                targets
+                    .iter()
+                    .any(|t| !t.example && t.name == target.package && t.package == target.package),
                 "{} defines subcommands but builds no binary named after it",
-                bin.package
+                target.package
             );
         }
     }
@@ -267,7 +280,7 @@ fn every_subcommand_belongs_to_a_binary_named_after_its_package() {
 #[test]
 fn every_mapped_entry_has_its_code_and_its_test() {
     let found = discovered();
-    let bins = binaries();
+    let targets = targets();
     let sections = sections();
     let mut entries = BTreeSet::new();
     let mut names = BTreeSet::new();
@@ -287,15 +300,31 @@ fn every_mapped_entry_has_its_code_and_its_test() {
             "{entry}: {} does not exist",
             source.display()
         );
-        if let Some(bin) = bins.iter().find(|b| b.name == entry) {
+        if let Some(target) = targets.iter().find(|t| t.name == entry) {
             assert!(
-                same_file(&source, &bin.src),
-                "{entry}: source is not its binary's main file"
+                same_file(&source, &target.src),
+                "{entry}: source is not its target's main file"
             );
         }
         match field(&f, "kind") {
-            "cli" | "http" | "script" => {
+            "cli" => {
+                let binary = entry.split(' ').next().unwrap_or("");
+                assert!(
+                    targets.iter().any(|t| !t.example && t.name == binary),
+                    "{entry} does not start with a binary"
+                );
                 assert!(found.contains(entry), "{entry} is not in the code")
+            }
+            "http" | "script" => {
+                assert!(found.contains(entry), "{entry} is not in the code")
+            }
+            "example" => assert!(
+                targets.iter().any(|t| t.example && t.name == entry),
+                "{entry} is not an example"
+            ),
+            "internal" => {
+                assert!(found.contains(entry), "{entry} is not in the code");
+                field(&f, "reason");
             }
             "gui" => {
                 let section = entry
@@ -316,7 +345,13 @@ fn every_mapped_entry_has_its_code_and_its_test() {
             ),
             workflow if workflow.starts_with(".github/workflows/") => {
                 let text = read(&root().join(workflow));
-                assert!(text.contains(entry), "{workflow} never runs {entry}");
+                let runs = text.match_indices(entry).any(|(i, _)| {
+                    text[i + entry.len()..]
+                        .chars()
+                        .next()
+                        .is_none_or(|c| c.is_whitespace() || c == '"' || c == '\'')
+                });
+                assert!(runs, "{workflow} never runs {entry}");
             }
             test => assert!(
                 root().join(test).is_file(),

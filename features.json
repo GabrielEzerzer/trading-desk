@@ -151,6 +151,27 @@
       "test": ".github/workflows/ci.yml"
     },
     {
+      "name": "Demo order smoke test",
+      "description": "Sends real orders to the venue's demo account to check the order route end to end: a market buy, a reduce-only stop read back, amended and cancelled, a repeated client id and a reduce-only close.",
+      "kind": "example",
+      "entry": "demo-smoke",
+      "source": "crates/td-orders/examples/demo-smoke.rs",
+      "inputs": "--confirm-send-orders and --symbol (a trading USDT perpetual), through cargo run -p td-orders --example demo-smoke; BYBIT_DEMO_API_KEY and BYBIT_DEMO_API_SECRET.",
+      "outputs": "One line per step on stdout, then PASS, or FAIL with what may be left open on the account.",
+      "test": "crates/td-orders/examples/demo-smoke.rs"
+    },
+    {
+      "name": "Cross-check engine side",
+      "description": "This engine's side of the NautilusTrader cross-check: fetches and exports a case's data, runs its backtest, and measures an equity curve.",
+      "kind": "internal",
+      "entry": "crosscheck",
+      "reason": "Started only by harness/crosscheck/run.py, which builds it with cargo.",
+      "source": "crates/td-engine/examples/crosscheck.rs",
+      "inputs": "fetch <case.json> <harness dir>, run <case.json> <harness dir> <real|gapless> <out.json>, or metrics <curve.json> <out.json>.",
+      "outputs": "The case's exported bars, funding and meta.json; the run's fills, orders, trades, equity and metrics as JSON; or a metrics report as JSON.",
+      "test": "crates/td-engine/examples/crosscheck.rs"
+    },
+    {
       "name": "Engine health",
       "description": "Says whether the engine is up, and the data cutoff in force.",
       "kind": "http",
@@ -593,6 +614,28 @@
       "source": "gui/scripts/quit-check.mjs",
       "inputs": "The section to open: lab (default) or trading.",
       "outputs": "quit-check: PASS with the time to exit, or FAIL with the processes still running.",
+      "test": "none",
+      "issue": 264
+    },
+    {
+      "name": "Write the Lab's mock fixtures",
+      "description": "Writes the Lab's mock fixtures and the data of the engine stub the screenshots and UI gates use, from a seeded random walk so every run writes the same files.",
+      "kind": "script",
+      "entry": "gui/app/mock/generate.mjs",
+      "source": "gui/app/mock/generate.mjs",
+      "inputs": "None.",
+      "outputs": "gui/app/mock/lab.json and gui/app/mock/engine.json.",
+      "test": "none",
+      "issue": 264
+    },
+    {
+      "name": "Write Trading's mock fixtures",
+      "description": "Writes Trading's mock fixtures: instruments for both venues and seeded 1h and 1m candle history for BTCUSDT and ETHUSDT.",
+      "kind": "script",
+      "entry": "gui/app/mock/generate-trading.mjs",
+      "source": "gui/app/mock/generate-trading.mjs",
+      "inputs": "None.",
+      "outputs": "gui/app/mock/trading.json.",
       "test": "none",
       "issue": 264
     },
