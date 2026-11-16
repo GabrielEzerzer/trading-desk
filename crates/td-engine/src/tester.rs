@@ -1111,8 +1111,9 @@ fn span_cuts(
         .iter()
         .flat_map(|(given, _)| {
             let listed = given.bars.iter().map(|b| b.open_time).min().map(at);
+            let leave = given.left_at.map(at);
             let left = given.left_at.map(|t| at(t + 1));
-            [listed, left]
+            [listed, listed.map(|i| i + 1), leave, left]
         })
         .flatten()
         .collect()
@@ -3530,13 +3531,45 @@ mod tests {
             let slots = traded_slots(&base, &bars, also);
             let cuts = span_cuts(&bars, &slots);
             let shuffled: Vec<Vec<Option<Candle>>> = slots.iter().map(|(_, s)| s.clone()).collect();
-            (0..20)
+            (0..64)
                 .map(|seed| {
                     let (_, _, moved) =
                         permute_with_references(&bars, &[], &shuffled, &cuts, seed).unwrap();
                     traded_copy(&slots, moved, base.from..base.to).remove(0)
                 })
                 .collect()
+        }
+
+        #[test]
+        fn an_instrument_listed_before_the_range_and_never_leaving_cuts_no_span() {
+            let (bars, also) = pair_data(BARS);
+            let base = pair_config(TRADES_BOTH, BARS);
+            let slots = traded_slots(&base, &bars, &also);
+            let cuts = span_cuts(&bars, &slots);
+            assert!(cuts.iter().all(|&c| c <= 1), "cuts {cuts:?}");
+        }
+
+        #[test]
+        fn a_gap_inside_the_span_never_moves_the_first_bar_or_the_leave() {
+            const LISTED_BAR: i64 = 40;
+            const MISSING_BAR: i64 = 60;
+            const LEFT_BAR: i64 = 72;
+            let (_, mut also) = pair_data(BARS);
+            also[0].bars.truncate(LEFT_BAR as usize + 1);
+            also[0].bars.drain(..LISTED_BAR as usize);
+            also[0]
+                .bars
+                .retain(|b| b.open_time != MISSING_BAR * PAIR_STEP);
+            let (listed, left) = (LISTED_BAR * PAIR_STEP, LEFT_BAR * PAIR_STEP);
+            also[0].left_at = Some(left);
+            for (seed, copy) in copies_of_the_second(&also).iter().enumerate() {
+                assert_eq!(copy.left_at, Some(left), "seed {seed}");
+                assert_eq!(
+                    copy.bars.iter().map(|b| b.open_time).min(),
+                    Some(listed),
+                    "seed {seed}"
+                );
+            }
         }
 
         #[test]
