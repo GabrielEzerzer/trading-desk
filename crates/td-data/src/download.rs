@@ -29,17 +29,6 @@ pub struct DownloadReport {
 /// [`Store::write_candles`]. A month whose source returns candles without asks for such a kind,
 /// or asks for a kind without quotes, is an error, and nothing of it is written. `progress` is
 /// called with a line of text after each month.
-///
-/// A month whose part of the range is already stored with no minute missing, apart from recorded
-/// closures, is skipped. The open time in the range the source returned nothing for is recorded
-/// beside the month ([`Store::record_closures`]), apart from a span at the end of the range that
-/// reaches now or, for any kind but FX, a last span with nothing after it in a range ending less
-/// than a day before now, since its file may not be published yet. For any kind but FX, a month
-/// the source had nothing for at all is recorded too. For FX, a month with nothing fetched or
-/// stored gets no record, and a month with no record yet is fetched whole, up to now, so its first
-/// record covers all of it. A source that gives adjusted prices ([`DataSource::adjustment`]) is
-/// refused when the store holds another adjustment, or when its prices for the latest stored month
-/// no longer match the stored ones.
 pub fn download_candles(
     http: &Http,
     store: &Store,

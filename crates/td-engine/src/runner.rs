@@ -145,14 +145,6 @@ pub struct BacktestConfig {
 }
 
 impl BacktestConfig {
-    /// Refuses, in a run that names other traded instruments ([`BacktestConfig::also_traded`]),
-    /// a traded instrument that is not a perpetual or a stock, one of another kind, on another
-    /// venue or in another quote currency than `instrument`, a base-currency account, an
-    /// instrument named twice and one that is also a reference. A run that names none passes.
-    ///
-    /// shortcut: perpetuals or stocks only. Crypto spot would share cash as stocks do, but no test
-    /// covers it yet; FX needs the conversion of each instrument's quote currency into the
-    /// account's. Build and test those before allowing them.
     pub fn check_traded(&self) -> Result<(), EngineError> {
         if self.also_traded.is_empty() {
             return Ok(());

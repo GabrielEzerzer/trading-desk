@@ -1,6 +1,6 @@
 //! Alpaca as a [`DataSource`]: US stocks and ETFs, active and delisted, from the paper trading API's assets list, and
 //! their split- and dividend-adjusted daily bars from the data API (<https://docs.alpaca.markets/us/reference/>).
-//! Each bar is stored as the candle of its session's last minute ([`td_core::us_bar_minute`]); keys never leave headers.
+//! Each bar is stored as the candle of its session's last minute ([`td_core::us_bar_minute`]); keys stay in headers.
 
 use std::collections::HashSet;
 use std::fmt;

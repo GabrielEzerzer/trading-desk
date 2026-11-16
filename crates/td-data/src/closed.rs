@@ -19,8 +19,7 @@
 //! most [`LONGEST_CLOSURE`] and overlaps the year-end holidays, 24 December 00:00 to 3 January
 //! 00:00 UTC, where OANDA's day-long closures fall. Any other stretch is an outage, not a closure:
 //! it stays missing, so its month is not complete and the run check refuses a long one. The records
-//! of a kind that never closes are not read as closures, so a crypto outage is always missing. On
-//! US trading days every recorded span counts as closed: a day a stock had no bar it did not trade.
+//! of a kind that never closes are not read as closures, so a crypto outage is always missing.
 //!
 //! A month downloaded before records were written has none: all its missing open time counts as
 //! missing, as before, and the run check keeps a wider limit for it (`max_gap` in td-server).

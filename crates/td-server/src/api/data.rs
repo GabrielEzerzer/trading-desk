@@ -116,9 +116,6 @@ pub const ALPACA_EARLIEST_FROM: Millis = 1_451_606_400_000;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 pub struct DownloadRequest {
     pub instrument: InstrumentId,
-    /// Not before 2017-01-01 00:00 UTC (1483228800000) for binance and bybit, 2007-01-01 00:00 UTC
-    /// (1167609600000) for oanda, or 2016-01-01 00:00 UTC (1451606400000) for alpaca; earlier is a
-    /// 400.
     pub from: Millis,
     pub to: Millis,
 }

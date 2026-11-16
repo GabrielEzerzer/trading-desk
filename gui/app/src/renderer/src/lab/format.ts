@@ -68,7 +68,6 @@ const VENUES: Record<InstrumentId['venue'], string> = {
   alpaca: 'Alpaca',
 }
 
-/** "Binance", "Bybit", "OANDA" or "Alpaca". */
 export function formatVenue(venue: InstrumentId['venue']): string {
   return VENUES[venue]
 }
