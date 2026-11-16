@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from test_rules import setUpModule
+from test_rules import AST_GREP_MISSING, GIT_MISSING, setUpModule, tool
 
 PACK = Path(__file__).resolve().parent.parent
 RATCHET = PACK / "ratchet"
@@ -80,7 +80,7 @@ def fake_ast_grep(directory, behaviours):
         wrapper = Path(directory, "ast-grep")
         wrapper.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{script}" "$@"\n', encoding="utf-8")
         wrapper.chmod(0o755)
-    return dict(os.environ, PATH=os.pathsep.join([str(directory), str(Path(shutil.which("git")).parent)]))
+    return dict(os.environ, PATH=os.pathsep.join([str(directory), str(Path(tool("git", GIT_MISSING)).parent)]))
 
 
 class RepoTest(unittest.TestCase):
@@ -230,7 +230,7 @@ class Ratchet(RepoTest):
     def test_missing_ast_grep_is_tool_error(self):
         self.write("a.py", CLEAN)
         self.init()
-        env = dict(os.environ, PATH=str(Path(shutil.which("git")).parent))
+        env = dict(os.environ, PATH=str(Path(tool("git", GIT_MISSING)).parent))
         proc = self.ratchet(env=env)
         self.assertExit(proc, 2)
         self.assertIn("ast-grep is not on PATH", proc.stderr)
@@ -589,7 +589,7 @@ class AstGrepIgnore(unittest.TestCase):
         self.addCleanup(shutil.rmtree, repo)
         Path(repo, "a.py").write_text("y = 2  # ast-grep-ignore\n", encoding="utf-8")
         proc = subprocess.run(
-            [shutil.which("ast-grep"), "scan", "-c", str(CONFIG), "--json=compact", "."],
+            [tool("ast-grep", AST_GREP_MISSING), "scan", "-c", str(CONFIG), "--json=compact", "."],
             cwd=repo, capture_output=True, text=True, encoding="utf-8",
         )
         self.assertEqual(json.loads(proc.stdout), [])

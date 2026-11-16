@@ -1,21 +1,36 @@
 id: layers-td-core-pure
 language: Rust
 severity: error
-message: "td-core's library code holds the shared types and the tick and lot rounding, and imports no other workspace crate and no file, network, process or async code. Do the I/O in td-data or in the crate that needs it, and pass the values in."
+message: "td-core's library code holds the shared types and the tick and lot rounding, and imports no other workspace crate and no file, network or process code. Do the I/O in td-data or in the crate that needs it, and pass the values in."
 files:
   - "crates/td-core/src/**"
 utils:
   crate-path-root:
     any:
       - inside:
-          kind: use_declaration
-          stopBy: end
-      - inside:
+          field: path
           any:
             - kind: scoped_identifier
             - kind: scoped_type_identifier
             - kind: scoped_use_list
+            - kind: use_as_clause
+      - inside:
+          field: name
+          any:
             - kind: extern_crate_declaration
+            - kind: scoped_identifier
+              regex: '^::'
+      - inside:
+          any:
+            - kind: use_declaration
+            - kind: use_list
+            - kind: use_wildcard
+    not:
+      inside:
+        kind: use_list
+        stopBy: end
+        inside:
+          kind: scoped_use_list
 rule:
   any:
     - kind: identifier
@@ -23,8 +38,13 @@ rule:
       matches: crate-path-root
     - kind: scoped_identifier
       regex: '^std\s*::\s*(fs|net|process)$'
-    - kind: identifier
-      regex: '^(fs|net|process)$'
+    - regex: '^(fs|net|process)\b'
+      any:
+        - kind: identifier
+        - kind: scoped_identifier
+        - kind: scoped_use_list
+        - kind: use_as_clause
+        - kind: use_wildcard
       inside:
         kind: use_list
         inside:
@@ -45,14 +65,29 @@ utils:
   crate-path-root:
     any:
       - inside:
-          kind: use_declaration
-          stopBy: end
-      - inside:
+          field: path
           any:
             - kind: scoped_identifier
             - kind: scoped_type_identifier
             - kind: scoped_use_list
+            - kind: use_as_clause
+      - inside:
+          field: name
+          any:
             - kind: extern_crate_declaration
+            - kind: scoped_identifier
+              regex: '^::'
+      - inside:
+          any:
+            - kind: use_declaration
+            - kind: use_list
+            - kind: use_wildcard
+    not:
+      inside:
+        kind: use_list
+        stopBy: end
+        inside:
+          kind: scoped_use_list
 rule:
   any:
     - kind: identifier
@@ -60,6 +95,20 @@ rule:
       matches: crate-path-root
     - kind: scoped_identifier
       regex: '^std\s*::\s*net$'
+    - regex: '^net\b'
+      any:
+        - kind: identifier
+        - kind: scoped_identifier
+        - kind: scoped_use_list
+        - kind: use_as_clause
+        - kind: use_wildcard
+      inside:
+        kind: use_list
+        inside:
+          kind: scoped_use_list
+          has:
+            field: path
+            regex: '^std$'
 ---
 id: layers-td-data-adapter
 language: Rust
@@ -71,14 +120,29 @@ utils:
   crate-path-root:
     any:
       - inside:
-          kind: use_declaration
-          stopBy: end
-      - inside:
+          field: path
           any:
             - kind: scoped_identifier
             - kind: scoped_type_identifier
             - kind: scoped_use_list
+            - kind: use_as_clause
+      - inside:
+          field: name
+          any:
             - kind: extern_crate_declaration
+            - kind: scoped_identifier
+              regex: '^::'
+      - inside:
+          any:
+            - kind: use_declaration
+            - kind: use_list
+            - kind: use_wildcard
+    not:
+      inside:
+        kind: use_list
+        stopBy: end
+        inside:
+          kind: scoped_use_list
 rule:
   kind: identifier
   regex: '^(td_engine|td_orders|td_live|td_server)$'
@@ -94,14 +158,29 @@ utils:
   crate-path-root:
     any:
       - inside:
-          kind: use_declaration
-          stopBy: end
-      - inside:
+          field: path
           any:
             - kind: scoped_identifier
             - kind: scoped_type_identifier
             - kind: scoped_use_list
+            - kind: use_as_clause
+      - inside:
+          field: name
+          any:
             - kind: extern_crate_declaration
+            - kind: scoped_identifier
+              regex: '^::'
+      - inside:
+          any:
+            - kind: use_declaration
+            - kind: use_list
+            - kind: use_wildcard
+    not:
+      inside:
+        kind: use_list
+        stopBy: end
+        inside:
+          kind: scoped_use_list
 rule:
   kind: identifier
   regex: '^(td_engine|td_data|td_live|td_server)$'
@@ -117,14 +196,29 @@ utils:
   crate-path-root:
     any:
       - inside:
-          kind: use_declaration
-          stopBy: end
-      - inside:
+          field: path
           any:
             - kind: scoped_identifier
             - kind: scoped_type_identifier
             - kind: scoped_use_list
+            - kind: use_as_clause
+      - inside:
+          field: name
+          any:
             - kind: extern_crate_declaration
+            - kind: scoped_identifier
+              regex: '^::'
+      - inside:
+          any:
+            - kind: use_declaration
+            - kind: use_list
+            - kind: use_wildcard
+    not:
+      inside:
+        kind: use_list
+        stopBy: end
+        inside:
+          kind: scoped_use_list
 rule:
   kind: identifier
   regex: '^(td_orders|td_live|td_mock_bybit)$'
@@ -140,14 +234,29 @@ utils:
   crate-path-root:
     any:
       - inside:
-          kind: use_declaration
-          stopBy: end
-      - inside:
+          field: path
           any:
             - kind: scoped_identifier
             - kind: scoped_type_identifier
             - kind: scoped_use_list
+            - kind: use_as_clause
+      - inside:
+          field: name
+          any:
             - kind: extern_crate_declaration
+            - kind: scoped_identifier
+              regex: '^::'
+      - inside:
+          any:
+            - kind: use_declaration
+            - kind: use_list
+            - kind: use_wildcard
+    not:
+      inside:
+        kind: use_list
+        stopBy: end
+        inside:
+          kind: scoped_use_list
 rule:
   kind: identifier
   regex: '^(td_engine|td_data|td_orders|td_live|td_server)$'
@@ -176,7 +285,7 @@ ignores:
   - "gui/shared/src/**/*.test.ts"
 rule:
   kind: string
-  regex: '^[''"](electron|node:.*|react|react-dom(/.*)?|\.\./.*)[''"]$'
+  regex: '^[''"](electron(/.*)?|node:.*|(fs|path|os|child_process|http|https|net|crypto|url|worker_threads|stream|events)(/.*)?|react|react-dom(/.*)?|\.\./.*)[''"]$'
   inside:
     any:
       - kind: import_statement
@@ -196,7 +305,7 @@ files:
   - "gui/app/src/renderer/**"
 rule:
   kind: string
-  regex: '^[''"](electron|node:.*|fs|path|os|child_process|(\.\./)+(main|preload)(/.*)?)[''"]$'
+  regex: '^[''"](electron(/.*)?|node:.*|(fs|path|os|child_process|http|https|net|crypto|url|worker_threads|stream|events)(/.*)?|(\.\./)+(main|preload)(/.*)?)[''"]$'
   inside:
     any:
       - kind: import_statement
@@ -216,7 +325,7 @@ files:
   - "gui/app/src/renderer/**"
 rule:
   kind: string
-  regex: '^[''"](electron|node:.*|fs|path|os|child_process|(\.\./)+(main|preload)(/.*)?)[''"]$'
+  regex: '^[''"](electron(/.*)?|node:.*|(fs|path|os|child_process|http|https|net|crypto|url|worker_threads|stream|events)(/.*)?|(\.\./)+(main|preload)(/.*)?)[''"]$'
   inside:
     any:
       - kind: import_statement
@@ -228,8 +337,29 @@ rule:
             field: function
             regex: '^(import|require)$'
 ---
-id: layers-gui-main-no-renderer
+id: layers-gui-main-no-renderer-ts
 language: TypeScript
+severity: error
+message: "The Electron main and preload processes never import renderer code or React. Move what both sides need into @td/shared (gui/shared/src) and import it from there."
+files:
+  - "gui/app/src/main/**"
+  - "gui/app/src/preload/**"
+rule:
+  kind: string
+  regex: '^[''"](react|react-dom(/.*)?|(\.\./)+renderer(/.*)?)[''"]$'
+  inside:
+    any:
+      - kind: import_statement
+      - kind: export_statement
+      - kind: arguments
+        inside:
+          kind: call_expression
+          has:
+            field: function
+            regex: '^(import|require)$'
+---
+id: layers-gui-main-no-renderer-tsx
+language: Tsx
 severity: error
 message: "The Electron main and preload processes never import renderer code or React. Move what both sides need into @td/shared (gui/shared/src) and import it from there."
 files:

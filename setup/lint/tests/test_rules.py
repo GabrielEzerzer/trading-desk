@@ -17,11 +17,18 @@ SUP = "no-inline-suppressions"
 JUST = "no-justification-header"
 AST_GREP_MISSING = ("ast-grep is not on PATH. Install it with `uv tool install ast-grep-cli==0.51.1` "
                     "or `pip install ast-grep-cli==0.51.1`, then rerun the tests.")
+GIT_MISSING = "git is not on PATH. Install Git and add its folder to PATH, then rerun the tests."
+
+
+def tool(name, missing):
+    path = shutil.which(name)
+    if path is None:
+        raise RuntimeError(missing)
+    return path
 
 
 def setUpModule():
-    if shutil.which("ast-grep") is None:
-        raise RuntimeError(AST_GREP_MISSING)
+    tool("ast-grep", AST_GREP_MISSING)
 
 
 def scan_matches(files):
@@ -31,7 +38,7 @@ def scan_matches(files):
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(text, encoding="utf-8", newline="\n")
         proc = subprocess.run(
-            [shutil.which("ast-grep"), "scan", "-c", str(CONFIG), "--json=compact", "."],
+            [tool("ast-grep", AST_GREP_MISSING), "scan", "-c", str(CONFIG), "--json=compact", "."],
             cwd=tmp,
             capture_output=True,
             text=True,
@@ -363,7 +370,7 @@ class Suppressions(unittest.TestCase):
 
 class MissingAstGrep(unittest.TestCase):
     def test_suite_fails_once_with_the_install_command(self):
-        env = dict(os.environ, PATH=str(Path(shutil.which("git")).parent))
+        env = dict(os.environ, PATH=str(Path(tool("git", GIT_MISSING)).parent))
         proc = subprocess.run([sys.executable, "-m", "unittest", "test_rules.Headers"], cwd=Path(__file__).parent,
                               capture_output=True, text=True, encoding="utf-8", env=env)
         self.assertNotEqual(proc.returncode, 0)
