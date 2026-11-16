@@ -27,6 +27,10 @@ pub const LIQUIDATION_TAG: &str = "liquidation";
 /// The `client_tag` of the market order [`Session::close_out`] submits at the end of a run.
 pub const CLOSE_OUT_TAG: &str = "close-out";
 
+pub const LEFT_TAG: &str = "stopped-trading";
+
+const LEFT: &str = "cancelled as the instrument stopped trading";
+
 /// The maintenance margin of a perpetual position, as a fraction of its notional at the current
 /// price: below it the position is liquidated (see [`Session::on_bar`]). 0.5% is close to the
 /// first tier on Binance and Bybit for small positions in the largest perpetuals; smaller coins
@@ -149,6 +153,8 @@ pub(crate) struct Leg {
     pub(crate) trade_stops: Vec<TradeStops>,
     /// The open time of its first bar given to the run, before its range included.
     pub(crate) listed_from: Option<Millis>,
+    pub(crate) left_at: Option<Millis>,
+    slippage_bps: f64,
 }
 
 /// What a run gives a session for each instrument traded beside the first
@@ -162,6 +168,7 @@ pub(crate) struct LegData {
     /// Its funding events from the first bar fed to the last traded bar's close, by time.
     pub(crate) funding: Vec<(Millis, f64)>,
     pub(crate) listed_from: Option<Millis>,
+    pub(crate) left_at: Option<Millis>,
     pub(crate) slippage_bps: f64,
 }
 
@@ -441,6 +448,8 @@ impl Session {
                     passed: 0,
                     trade_stops: Vec::new(),
                     listed_from: leg.listed_from,
+                    left_at: leg.left_at,
+                    slippage_bps: leg.slippage_bps,
                     instrument: leg.instrument,
                 }
             })
@@ -818,6 +827,13 @@ impl Session {
             prices[k] = bar.close;
             self.book_at_mut(k).mark(bar.close);
         }
+        for k in 1..n {
+            if let Some(bar) = bars[k]
+                && self.legs[k - 1].left_at == Some(bar.open_time)
+            {
+                self.leave(k, &bar);
+            }
+        }
         self.see(&prices);
         if alone.is_none() && !liquidated && self.breach(&prices, time) {
             self.write_off();
@@ -1015,6 +1031,53 @@ impl Session {
         if left >= 0.0 {
             self.portfolio.clear_cash();
         }
+    }
+
+    fn leave(&mut self, k: usize, bar: &Candle) {
+        self.cancel_orders_at(k, LEFT);
+        let q = self.book_at(k).position();
+        if q == 0.0 {
+            return;
+        }
+        let leg = &self.legs[k - 1];
+        let (side, qty) = (if q > 0.0 { Side::Sell } else { Side::Buy }, q.abs());
+        let model = CandleFillModel {
+            slippage_bps: leg.slippage_bps,
+        };
+        let price = model.slip(bar.close, side, &leg.instrument);
+        let fees = leg.instrument.fees;
+        let fee = fees.fee(price, qty, fees.taker);
+        let instrument = leg.instrument.id.clone();
+        let id = OrderId(self.orders.len() as u64 + 1);
+        self.orders.push(Order {
+            id,
+            request: OrderRequest {
+                instrument: instrument.clone(),
+                side,
+                qty,
+                order_type: OrderType::Market,
+                tif: TimeInForce::Ioc,
+                reduce_only: true,
+                client_tag: Some(LEFT_TAG.into()),
+            },
+            submitted_at: bar.open_time,
+            decision_close: bar.close,
+            attached_stop: None,
+            status: OrderStatus::Filled,
+        });
+        self.book_at_mut(k).apply_fill(side, qty, price, fee);
+        self.sweep(k);
+        self.fills.push(Fill {
+            order_id: id,
+            instrument,
+            side,
+            time: bar.open_time,
+            price,
+            qty,
+            fee,
+            liquidity: Liquidity::Taker,
+            close_out: false,
+        });
     }
 
     /// Floors the account's balance at zero once every traded instrument is flat.
@@ -1311,14 +1374,18 @@ impl Session {
     /// `reason`.
     fn cancel_open_orders(&mut self, reason: &str) {
         for k in 0..=self.legs.len() {
-            for order in self.broker_at(k).open_orders().to_vec() {
-                self.broker_at_mut(k).cancel(order.id);
-                self.order_mut(order.id).status = OrderStatus::Cancelled(reason.into());
-                if let Some(stop) = order.attached_stop
-                    && self.order_mut(stop.id).status == OrderStatus::Attached
-                {
-                    self.order_mut(stop.id).status = OrderStatus::Cancelled(ENTRY_CANCELLED.into());
-                }
+            self.cancel_orders_at(k, reason);
+        }
+    }
+
+    fn cancel_orders_at(&mut self, k: usize, reason: &str) {
+        for order in self.broker_at(k).open_orders().to_vec() {
+            self.broker_at_mut(k).cancel(order.id);
+            self.order_mut(order.id).status = OrderStatus::Cancelled(reason.into());
+            if let Some(stop) = order.attached_stop
+                && self.order_mut(stop.id).status == OrderStatus::Attached
+            {
+                self.order_mut(stop.id).status = OrderStatus::Cancelled(ENTRY_CANCELLED.into());
             }
         }
     }

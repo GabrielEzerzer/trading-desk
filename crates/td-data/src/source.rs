@@ -87,6 +87,10 @@ pub trait DataSource: Send + Sync {
     fn adjustment(&self) -> Option<&'static str> {
         None
     }
+
+    fn lists_delisted(&self) -> bool {
+        false
+    }
 }
 
 /// A source's live data: a WebSocket stream of 1-minute bars, and the recent bars over REST that

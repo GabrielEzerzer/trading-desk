@@ -1,14 +1,16 @@
-//! Alpaca as a [`DataSource`]: US stocks and ETFs from a fixed table, and their daily bars, adjusted for splits and
-//! dividends, from `GET /v2/stocks/{symbol}/bars` (<https://docs.alpaca.markets/us/reference/stockbarsingle-1>).
+//! Alpaca as a [`DataSource`]: US stocks and ETFs, active and delisted, from the paper trading API's assets list, and
+//! their split- and dividend-adjusted daily bars from the data API (<https://docs.alpaca.markets/us/reference/>).
 //! Each bar is stored as the candle of its session's last minute ([`td_core::us_bar_minute`]); keys never leave headers.
 
+use std::collections::HashSet;
 use std::fmt;
 use std::time::Duration;
 
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde::Deserialize;
 use td_core::{
-    Candle, FeeSchedule, Instrument, InstrumentId, InstrumentKind, Millis, Venue, us_bar_minute,
+    Candle, FeeSchedule, Instrument, InstrumentId, InstrumentKind, Millis, Venue,
+    new_york_offset_hours, us_bar_minute,
 };
 
 use crate::http::Http;
@@ -17,19 +19,15 @@ use crate::source::{DataSource, MinuteHistory};
 use crate::time::{DAY, MINUTE, format_date, format_minute};
 use crate::{DataError, InstrumentList};
 
-const HOST: &str = "https://data.alpaca.markets";
+const DATA_HOST: &str = "https://data.alpaca.markets";
+const TRADING_HOST: &str = "https://paper-api.alpaca.markets";
 const KEY_ID_VAR: &str = "APCA_API_KEY_ID";
 const SECRET_VAR: &str = "APCA_API_SECRET_KEY";
 const PAGE: usize = 10_000;
 const ADJUSTMENT: &str = "all";
 const RECENT: Millis = 15 * MINUTE;
-
-const SYMBOLS: [&str; 44] = [
-    "SPY", "QQQ", "IWM", "DIA", "TLT", "IEF", "GLD", "XLB", "XLC", "XLE", "XLF", "XLI", "XLK",
-    "XLP", "XLRE", "XLU", "XLV", "XLY", "AAPL", "MSFT", "AMZN", "GOOGL", "META", "NVDA", "TSLA",
-    "JPM", "V", "MA", "JNJ", "UNH", "WMT", "PG", "KO", "PEP", "XOM", "CVX", "HD", "COST", "DIS",
-    "INTC", "CSCO", "ORCL", "NFLX", "IBM",
-];
+const LOT: f64 = 1e-9;
+const MIN_NOTIONAL: f64 = 1.0;
 
 const STOCK_FEES: FeeSchedule = FeeSchedule {
     maker: 0.0,
@@ -49,13 +47,13 @@ impl DataSource for Alpaca {
         &[InstrumentKind::Stock]
     }
 
-    fn instruments(&self, _: &Http, kind: InstrumentKind) -> Result<InstrumentList, DataError> {
+    fn instruments(&self, http: &Http, kind: InstrumentKind) -> Result<InstrumentList, DataError> {
         stock_only(kind)?;
-        let mut list = InstrumentList::default();
-        for symbol in SYMBOLS {
-            list.push(symbol, Ok(instrument(symbol)));
-        }
-        Ok(list)
+        assets(
+            |name| std::env::var(name).ok(),
+            &RETRY_DELAYS,
+            |keys, url| get_page(http, keys, url),
+        )
     }
 
     fn default_fees(&self, kind: InstrumentKind) -> Result<FeeSchedule, DataError> {
@@ -65,6 +63,10 @@ impl DataSource for Alpaca {
 
     fn adjustment(&self) -> Option<&'static str> {
         Some(ADJUSTMENT)
+    }
+
+    fn lists_delisted(&self) -> bool {
+        true
     }
 
     fn minute_history(
@@ -97,11 +99,42 @@ fn instrument(symbol: &str) -> Instrument {
         base: symbol.to_string(),
         quote: "USD".into(),
         tick_size: 0.01,
-        lot_size: 1.0,
-        min_qty: 1.0,
-        min_notional: 0.01,
+        lot_size: LOT,
+        min_qty: LOT,
+        min_notional: MIN_NOTIONAL,
         fees: STOCK_FEES,
     }
+}
+
+pub(crate) fn assets(
+    env: impl Fn(&str) -> Option<String>,
+    delays: &[Duration],
+    mut get: impl FnMut(&Keys, &str) -> Result<(u16, Vec<u8>), DataError>,
+) -> Result<InstrumentList, DataError> {
+    let keys = Keys::from_lookup(env)?;
+    let url = format!("{TRADING_HOST}/v2/assets?status=all&asset_class=us_equity");
+    let body = with_retries(delays, || {
+        let (status, body) = get(&keys, &url)?;
+        answer(&url, status, body, &keys)
+    })?;
+    parse_assets(&url, &body)
+}
+
+fn parse_assets(url: &str, body: &str) -> Result<InstrumentList, DataError> {
+    #[derive(Deserialize)]
+    struct Asset {
+        symbol: String,
+        class: String,
+    }
+    let assets: Vec<Asset> = serde_json::from_str(body).map_err(|e| DataError::parse(url, e))?;
+    let mut list = InstrumentList::default();
+    let mut seen = HashSet::new();
+    for asset in assets {
+        if asset.class == "us_equity" && seen.insert(asset.symbol.clone()) {
+            list.push(&asset.symbol, Ok(instrument(&asset.symbol)));
+        }
+    }
+    Ok(list)
 }
 
 fn stock_only(kind: InstrumentKind) -> Result<(), DataError> {
@@ -154,12 +187,6 @@ pub(crate) fn history(
     mut get: impl FnMut(&Keys, &str) -> Result<(u16, Vec<u8>), DataError>,
 ) -> Result<MinuteHistory, DataError> {
     stock_only(id.kind)?;
-    if !SYMBOLS.contains(&id.symbol.as_str()) {
-        return Err(DataError::InvalidInstrument {
-            symbol: id.symbol.clone(),
-            reason: "not one of the stocks and ETFs read from alpaca".into(),
-        });
-    }
     let keys = Keys::from_lookup(env)?;
     let mut history = MinuteHistory::default();
     let end = to.min(now - RECENT);
@@ -167,9 +194,17 @@ pub(crate) fn history(
         return Ok(history);
     }
     let mut token: Option<String> = None;
+    let mut tokens = HashSet::new();
     let mut previous: Option<Millis> = None;
     loop {
-        let url = page_url(HOST, &id.symbol, from - DAY, end, token.as_deref());
+        let url = page_url(
+            DATA_HOST,
+            &id.symbol,
+            from - DAY,
+            end,
+            now,
+            token.as_deref(),
+        );
         let body = with_retries(delays, || {
             let (status, body) = get(&keys, &url)?;
             answer(&url, status, body, &keys)
@@ -191,19 +226,35 @@ pub(crate) fn history(
             }
         }
         match page.next_page_token {
-            Some(next) if !next.is_empty() => token = Some(next),
+            Some(next) if !next.is_empty() => {
+                if !tokens.insert(next.clone()) {
+                    return Err(DataError::parse(
+                        &url,
+                        "it gives a next_page_token an earlier page gave, so its pages never end",
+                    ));
+                }
+                token = Some(next);
+            }
             _ => return Ok(history),
         }
     }
 }
 
-fn page_url(base: &str, symbol: &str, start: Millis, end: Millis, token: Option<&str>) -> String {
+fn page_url(
+    base: &str,
+    symbol: &str,
+    start: Millis,
+    end: Millis,
+    now: Millis,
+    token: Option<&str>,
+) -> String {
     let time = |t: Millis| format_minute(t).replace(' ', "T") + ":00Z";
     let mut url = format!(
         "{base}/v2/stocks/{symbol}/bars?timeframe=1Day&start={}&end={}&limit={PAGE}\
-         &adjustment={ADJUSTMENT}&feed=sip&sort=asc",
+         &adjustment={ADJUSTMENT}&feed=sip&sort=asc&asof={}",
         time(start),
-        time(end)
+        time(end),
+        format_date(now)
     );
     if let Some(token) = token {
         url.push_str("&page_token=");
@@ -273,7 +324,7 @@ struct Page {
 fn parse_page(url: &str, body: &str, symbol: &str) -> Result<Page, DataError> {
     #[derive(Deserialize)]
     struct Raw {
-        #[serde(default)]
+        #[serde(deserialize_with = "Option::deserialize")]
         bars: Option<Vec<RawBar>>,
         symbol: String,
         #[serde(default)]
@@ -360,7 +411,8 @@ fn parse_midnight_new_york(text: &str) -> Option<i64> {
     if td_core::civil_from_days(date) != (i64::from(year), month, day) {
         return None;
     }
-    matches!(time, (4, 0, 0) | (5, 0, 0)).then_some(date)
+    let hour = u32::try_from(new_york_offset_hours(date)).ok()?;
+    (time == (hour, 0, 0)).then_some(date)
 }
 
 #[cfg(test)]
@@ -378,6 +430,7 @@ mod tests {
     const PAGE_TWO: &str = include_str!("../../../mock/alpaca/aapl-2024-01-page-2.json");
     const FORBIDDEN: &str = include_str!("../../../mock/alpaca/forbidden.json");
     const EMPTY: &str = include_str!("../../../mock/alpaca/empty.json");
+    const ASSETS: &str = include_str!("../../../mock/alpaca/assets.json");
 
     fn aapl() -> InstrumentId {
         InstrumentId {
@@ -450,7 +503,7 @@ mod tests {
             asked[0],
             "https://data.alpaca.markets/v2/stocks/AAPL/bars?timeframe=1Day\
              &start=2023-12-31T00:00:00Z&end=2024-02-01T00:00:00Z&limit=10000&adjustment=all\
-             &feed=sip&sort=asc"
+             &feed=sip&sort=asc&asof=2026-01-01"
         );
         assert!(asked[1].ends_with("&page_token=QUFQTHxEfDIwMjQtMDEtMTJUMDU6MDA6MDBa"));
     }
@@ -521,6 +574,8 @@ mod tests {
                 "which the US market calendar has as closed",
             ),
             ("2024-01-16T00:00:00Z", "midnight in New York"),
+            ("2024-01-16T04:00:00Z", "midnight in New York"),
+            ("2024-07-16T05:00:00Z", "midnight in New York"),
             ("2024-01-16", "midnight in New York"),
         ] {
             let body = bar(t);
@@ -548,6 +603,69 @@ mod tests {
         )
         .unwrap_err();
         assert!(e.to_string().contains("bars of MSFT"), "{e}");
+    }
+
+    #[test]
+    fn midnight_in_new_york_is_four_or_five_utc_by_the_date() {
+        let day = |text: &str| Some(date(text) / DAY);
+        assert_eq!(
+            parse_midnight_new_york("2024-01-16T05:00:00Z"),
+            day("2024-01-16")
+        );
+        assert_eq!(
+            parse_midnight_new_york("2024-07-16T04:00:00Z"),
+            day("2024-07-16")
+        );
+        assert_eq!(
+            parse_midnight_new_york("2024-03-11T04:00:00Z"),
+            day("2024-03-11"),
+            "the Monday after summer time starts"
+        );
+        assert_eq!(
+            parse_midnight_new_york("2024-11-04T05:00:00Z"),
+            day("2024-11-04"),
+            "the Monday after summer time ends"
+        );
+        assert_eq!(parse_midnight_new_york("2024-03-11T05:00:00Z"), None);
+        assert_eq!(parse_midnight_new_york("2024-11-01T05:00:00Z"), None);
+    }
+
+    #[test]
+    fn a_page_without_a_bars_key_is_refused() {
+        let body = r#"{"symbol":"AAPL","next_page_token":null}"#;
+        let e = history(
+            &aapl(),
+            date("2024-01-01"),
+            date("2024-02-01"),
+            date("2026-01-01"),
+            env,
+            &[],
+            |_, _| Ok((200, body.as_bytes().to_vec())),
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("missing field `bars`"), "{e}");
+    }
+
+    #[test]
+    fn a_page_token_given_twice_is_refused() {
+        let looping = r#"{"bars":[],"symbol":"AAPL","next_page_token":"QUFQTA"}"#;
+        let mut asked = 0;
+        let e = history(
+            &aapl(),
+            date("2024-01-01"),
+            date("2024-02-01"),
+            date("2026-01-01"),
+            env,
+            &[],
+            |_, _| {
+                asked += 1;
+                assert!(asked <= 3, "it keeps asking");
+                Ok((200, looping.as_bytes().to_vec()))
+            },
+        )
+        .unwrap_err();
+        assert_eq!(asked, 2);
+        assert!(e.to_string().contains("next_page_token"), "{e}");
     }
 
     #[test]
@@ -652,7 +770,14 @@ mod tests {
     fn a_request_carries_the_keys_only_in_its_headers() {
         let (base, server) = stub::serve_once(&[], EMPTY.as_bytes().to_vec());
         let keys = Keys::from_lookup(env).expect("keys");
-        let url = page_url(&base, "AAPL", date("2024-01-01"), date("2024-02-01"), None);
+        let url = page_url(
+            &base,
+            "AAPL",
+            date("2024-01-01"),
+            date("2024-02-01"),
+            date("2026-01-01"),
+            None,
+        );
         let (status, _) = get_page(&Http::new().expect("a client"), &keys, &url).expect("answers");
         assert_eq!(status, 200);
         let request = server.join().expect("the server");
@@ -673,24 +798,57 @@ mod tests {
     }
 
     #[test]
-    fn only_stocks_are_listed_with_whole_shares_and_no_commission() {
-        let http = Http::new().expect("a client");
-        let list = crate::fetch_instruments(&http, Venue::Alpaca, InstrumentKind::Stock)
-            .expect("the table");
-        let spy = list
+    fn every_listed_stock_active_or_delisted_trades_in_fractional_shares_without_commission() {
+        let mut asked = Vec::new();
+        let list = assets(env, &[], |_, url| {
+            asked.push(url.to_string());
+            Ok((200, ASSETS.as_bytes().to_vec()))
+        })
+        .expect("the list");
+        assert_eq!(
+            asked,
+            ["https://paper-api.alpaca.markets/v2/assets?status=all&asset_class=us_equity"]
+        );
+        let symbols: Vec<&str> = list
             .instruments
             .iter()
-            .find(|i| i.id.symbol == "SPY")
-            .expect("SPY");
+            .map(|i| i.id.symbol.as_str())
+            .collect();
+        assert_eq!(symbols, ["AAPL", "MSFT", "SPY", "META", "TWTR"]);
+        assert_eq!(list.rejected.len(), 1);
+        assert_eq!(list.rejected[0].0, "BRK.B");
+        let spy = &list.instruments[2];
         assert_eq!((spy.base.as_str(), spy.quote.as_str()), ("SPY", "USD"));
-        assert_eq!((spy.tick_size, spy.lot_size, spy.min_qty), (0.01, 1.0, 1.0));
+        assert_eq!(
+            (spy.tick_size, spy.lot_size, spy.min_qty, spy.min_notional),
+            (0.01, 1e-9, 1e-9, 1.0)
+        );
         assert_eq!(spy.fees, STOCK_FEES);
+        let http = Http::new().expect("a client");
         assert!(matches!(
             Alpaca.instruments(&http, InstrumentKind::Spot),
             Err(DataError::KindNotListed { .. })
         ));
         assert_eq!(Alpaca.adjustment(), Some("all"));
+        assert!(Alpaca.lists_delisted());
         assert!(Alpaca.live().is_err());
+    }
+
+    #[test]
+    fn the_assets_list_without_keys_or_refused_never_shows_them() {
+        let e = assets(|_| None, &[], |_, _| panic!("no request without keys")).unwrap_err();
+        assert!(matches!(e, DataError::MissingAlpacaKeys), "{e}");
+        let e = assets(env, &[], |_, _| {
+            let body = FORBIDDEN.replace("forbidden", "forbidden for PKTESTKEYID testsecretvalue");
+            Ok((403, body.into_bytes()))
+        })
+        .unwrap_err();
+        let shown = e.to_string();
+        assert!(matches!(e, DataError::AlpacaRefused { .. }), "{shown}");
+        assert!(
+            !shown.contains("PKTESTKEYID") && !shown.contains("testsecretvalue"),
+            "{shown}"
+        );
     }
 
     struct FakeAlpaca {
@@ -714,12 +872,9 @@ mod tests {
             Alpaca.kinds()
         }
 
-        fn instruments(
-            &self,
-            http: &Http,
-            kind: InstrumentKind,
-        ) -> Result<InstrumentList, DataError> {
-            Alpaca.instruments(http, kind)
+        fn instruments(&self, _: &Http, kind: InstrumentKind) -> Result<InstrumentList, DataError> {
+            stock_only(kind)?;
+            parse_assets("assets.json", ASSETS)
         }
 
         fn default_fees(&self, kind: InstrumentKind) -> Result<FeeSchedule, DataError> {
@@ -728,6 +883,10 @@ mod tests {
 
         fn adjustment(&self) -> Option<&'static str> {
             Alpaca.adjustment()
+        }
+
+        fn lists_delisted(&self) -> bool {
+            Alpaca.lists_delisted()
         }
 
         fn minute_history(
@@ -764,15 +923,14 @@ mod tests {
         .expect("downloads");
         let jan = Month::parse("2024-01").expect("a month");
         let dec = Month::parse("2023-12").expect("a month");
-        assert!(
-            report.gaps.iter().all(|g| g.to <= jan.start()),
-            "{:?}",
-            report.gaps
-        );
-        let missing: i64 = report.gaps.iter().map(|g| g.minutes()).sum();
+        assert!(report.gaps.is_empty(), "{:?}", report.gaps);
+        let closures = store
+            .closures(&aapl(), dec.start(), jan.end())
+            .expect("reads");
         assert_eq!(
-            missing, 20,
-            "December's trading days, without Christmas, are missing"
+            closures.closed_in(dec.start(), jan.end()),
+            20 * MINUTE,
+            "December's trading days, without Christmas, had no bar and are closed"
         );
         assert_eq!(store.read_month(&aapl(), jan).expect("reads").len(), 21);
         assert_eq!(
@@ -788,6 +946,50 @@ mod tests {
         let coverage = store.coverage(&aapl()).expect("coverage");
         assert_eq!(coverage.len(), 1);
         assert_eq!((coverage[0].minutes, coverage[0].open_minutes), (21, 21));
+    }
+
+    #[test]
+    fn a_symbol_alpaca_does_not_list_is_refused_before_any_bars_are_asked_for() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let store = Store::new(dir.path());
+        let source = FakeAlpaca::new([PAGE_ONE, PAGE_TWO]);
+        let http = Http::new().expect("a client");
+        let unlisted = InstrumentId {
+            symbol: "NOSUCH".into(),
+            ..aapl()
+        };
+        let e = download_candles_from(
+            &source,
+            &http,
+            &store,
+            &unlisted,
+            date("2024-01-01"),
+            date("2024-02-01"),
+            &mut |_| {},
+        )
+        .unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "instrument NOSUCH: alpaca lists no stock by that symbol, active or delisted"
+        );
+        assert!(store.months(&unlisted).expect("reads").is_empty());
+        assert!(dir.path().join("instruments/alpaca-stock.json").is_file());
+        let twtr = InstrumentId {
+            symbol: "TWTR".into(),
+            ..aapl()
+        };
+        let empty = EMPTY.replace("AAPL", "TWTR");
+        *source.pages.lock().expect("lock") = vec![empty.clone(), empty];
+        download_candles_from(
+            &source,
+            &http,
+            &store,
+            &twtr,
+            date("2024-01-01"),
+            date("2024-02-01"),
+            &mut |_| {},
+        )
+        .expect("a delisted stock downloads");
     }
 
     #[test]
@@ -836,5 +1038,157 @@ mod tests {
         )
         .unwrap_err();
         assert!(e.to_string().contains("raw"), "{e}");
+    }
+
+    fn live_env(name: &str) -> Option<String> {
+        std::env::var(name).ok()
+    }
+
+    fn stock(symbol: &str) -> InstrumentId {
+        InstrumentId {
+            venue: Venue::Alpaca,
+            symbol: symbol.into(),
+            kind: InstrumentKind::Stock,
+        }
+    }
+
+    #[test]
+    #[ignore = "downloads from Alpaca with the keys in APCA_API_KEY_ID and APCA_API_SECRET_KEY"]
+    fn live_alpaca_lists_delisted_stocks_and_serves_their_adjusted_daily_bars() {
+        let http = Http::new().expect("a client");
+        let keys = Keys::from_lookup(live_env).expect("the keys are set");
+        let get = |url: &str| {
+            let (status, body) = get_page(&http, &keys, url).expect("an answer");
+            answer(url, status, body, &keys).expect("a 2xx answer")
+        };
+
+        let list = assets(live_env, &RETRY_DELAYS, |k, url| get_page(&http, k, url))
+            .expect("the assets list");
+        let listed: HashSet<&str> = list
+            .instruments
+            .iter()
+            .map(|i| i.id.symbol.as_str())
+            .collect();
+        eprintln!(
+            "assets with status=all: {} listed, {} left out",
+            listed.len(),
+            list.rejected.len()
+        );
+        let url = format!("{TRADING_HOST}/v2/assets?status=inactive&asset_class=us_equity");
+        let raw: Vec<serde_json::Value> = serde_json::from_str(&get(&url)).expect("JSON");
+        let inactive: HashSet<&str> = raw
+            .iter()
+            .filter(|a| a["status"] == "inactive")
+            .filter_map(|a| a["symbol"].as_str())
+            .collect();
+        eprintln!("assets with status=inactive: {}", inactive.len());
+        let delistings = [
+            ("TWTR", "2022-10-27"),
+            ("XLNX", "2022-02-11"),
+            ("CELG", "2019-11-20"),
+        ];
+        for (symbol, _) in delistings {
+            eprintln!(
+                "{symbol}: listed {}, inactive {}",
+                listed.contains(symbol),
+                inactive.contains(symbol)
+            );
+        }
+        assert!(listed.contains("AAPL") && listed.contains("META"));
+        let &(gone, last_day) = delistings
+            .iter()
+            .find(|(s, _)| inactive.contains(s) && listed.contains(s))
+            .expect("a delisted stock in the inactive assets");
+
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let store = Store::new(dir.path());
+        let (from, to) = (date("2016-01-01"), date("2024-01-01"));
+        let mut firsts = Vec::new();
+        for symbol in ["AAPL", "META", gone] {
+            let id = stock(symbol);
+            let report = download_candles_from(&Alpaca, &http, &store, &id, from, to, &mut |_| {})
+                .expect("downloads");
+            let candles: Vec<Candle> = store
+                .months(&id)
+                .expect("months")
+                .into_iter()
+                .flat_map(|m| store.read_month(&id, m).expect("a month"))
+                .collect();
+            let (first, last) = (candles[0], candles[candles.len() - 1]);
+            eprintln!(
+                "{symbol}: {} bars from {} (close {}) to {} (close {}), {} gaps",
+                candles.len(),
+                format_date(first.open_time),
+                first.close,
+                format_date(last.open_time),
+                last.close,
+                report.gaps.len()
+            );
+            firsts.push((symbol, format_date(first.open_time), last));
+        }
+        assert_eq!(firsts[0].1, "2016-01-04");
+        assert_eq!(firsts[1].1, "2016-01-04", "META's bars from when it was FB");
+        let last = firsts[2].2;
+        assert_eq!(format_date(last.open_time), last_day, "{gone}'s last bar");
+        let after = date(last_day) + DAY;
+        assert!(
+            store
+                .recorded_empty(&stock(gone), after, to)
+                .expect("records"),
+            "downloads recorded nothing after {gone}'s last bar"
+        );
+
+        let june = (date("2023-06-01"), date("2023-07-01"));
+        let fetch = || {
+            let get = |k: &Keys, url: &str| get_page(&http, k, url);
+            history(
+                &aapl(),
+                june.0,
+                june.1,
+                crate::time::now_ms(),
+                live_env,
+                &RETRY_DELAYS,
+                get,
+            )
+            .expect("a month")
+            .candles
+        };
+        let bits = |candles: &[Candle]| -> Vec<[u64; 5]> {
+            candles
+                .iter()
+                .map(|c| [c.open, c.high, c.low, c.close, c.volume].map(f64::to_bits))
+                .collect()
+        };
+        let (one, two) = (fetch(), fetch());
+        assert_eq!(bits(&one), bits(&two), "two downloads of June 2023");
+        eprintln!(
+            "two downloads of AAPL 2023-06: {} bars each, the same bits",
+            one.len()
+        );
+        let next = (to, date("2024-02-01"));
+        download_candles_from(&Alpaca, &http, &store, &aapl(), next.0, next.1, &mut |_| {})
+            .expect("a later download, after comparing the latest stored month again");
+        eprintln!("a download of 2024-01 fetched 2023-12 again and found it unchanged");
+
+        let small = |token: Option<&str>| {
+            let (start, end) = (date("2023-01-01"), date("2023-02-01"));
+            page_url(DATA_HOST, "AAPL", start, end, crate::time::now_ms(), token)
+                .replace("limit=10000", "limit=5")
+        };
+        let first_url = small(None);
+        assert!(first_url.contains("feed=sip"), "{first_url}");
+        let page_one = parse_page(&first_url, &get(&first_url), "AAPL").expect("page one");
+        let token = page_one.next_page_token.clone().expect("a next_page_token");
+        let second_url = small(Some(&token));
+        let page_two = parse_page(&second_url, &get(&second_url), "AAPL").expect("page two");
+        eprintln!(
+            "pages of 5 on the sip feed: a token of {} characters; {:?} then {:?}",
+            token.len(),
+            days(&page_one.candles),
+            days(&page_two.candles)
+        );
+        assert_eq!((page_one.candles.len(), page_two.candles.len()), (5, 5));
+        assert!(page_two.candles[0].open_time > page_one.candles[4].open_time);
+        assert_ne!(page_two.next_page_token.as_deref(), Some(token.as_str()));
     }
 }

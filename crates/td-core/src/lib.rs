@@ -19,7 +19,9 @@ pub use candle::Candle;
 pub use civil::{civil_from_days, days_from_civil};
 pub use error::CoreError;
 pub use instrument::{FeeSchedule, Instrument, InstrumentId, InstrumentKind, Rounding, Venue};
-pub use market::{AccountCurrency, Carry, Hours, MarketRules, us_bar_minute};
+pub use market::{
+    AccountCurrency, Carry, Hours, MarketRules, new_york_offset_hours, us_bar_minute,
+};
 pub use order::{Fill, Liquidity, OrderId, OrderRequest, OrderType, Side, TimeInForce};
 pub use timeframe::Timeframe;
 pub use us_calendar::us_session;

@@ -420,6 +420,7 @@ pub struct AlsoTradedBars {
     pub bars: Vec<Candle>,
     /// Its funding events, `(time, rate)`, in any order.
     pub funding: Vec<(Millis, f64)>,
+    pub left_at: Option<Millis>,
 }
 
 /// [`run_with_references`] for a configuration that also names instruments traded beside the
@@ -952,6 +953,13 @@ fn align_traded(
             }
         }
         let listed_from = bars.first().map(|b| b.open_time);
+        if let Some(t) = g.left_at
+            && Some(t) != bars.last().map(|b| b.open_time)
+        {
+            return refuse(format!(
+                "{id} is said to stop trading at {t}, which is not the open of its last bar"
+            ));
+        }
         bars.retain(|b| {
             first_times.contains(&b.open_time) || (lo < b.open_time && b.open_time < hi)
         });
@@ -969,6 +977,7 @@ fn align_traded(
             bars,
             funding,
             listed_from,
+            left_at: g.left_at,
         });
     }
     Ok(legs)
@@ -1661,6 +1670,10 @@ fn fingerprint(
                     h.update(t.max(start).to_le_bytes());
                 }
                 None => h.update([0u8]),
+            }
+            if let Some(t) = leg.left_at {
+                h.update(b"left");
+                h.update(t.to_le_bytes());
             }
             let by_time: HashMap<Millis, &Candle> =
                 leg.bars.iter().map(|b| (b.open_time, b)).collect();

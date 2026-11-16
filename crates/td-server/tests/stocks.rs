@@ -1,26 +1,28 @@
 //! Runs on daily bars of US stocks through the API, on a store seeded with one candle per trading day at the session's
 //! last minute: several stocks in one account, an ETF as reference, the cutoff, the data report and the fingerprint.
 
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 use td_core::{
-    Candle, Instrument, InstrumentId, InstrumentKind, Millis, OrderRequest, OrderType, Side,
-    TimeInForce, Timeframe, Venue, us_bar_minute, us_session,
+    Candle, FeeSchedule, Instrument, InstrumentId, InstrumentKind, Millis, OrderRequest, OrderType,
+    Rounding, Side, TimeInForce, Timeframe, Venue, us_bar_minute, us_session,
 };
-use td_data::time::{DAY, parse_date};
-use td_data::{DataError, DownloadReport, Http, InstrumentList, Store};
+use td_data::time::{DAY, Month, parse_date};
+use td_data::{DataError, DownloadReport, Gap, InstrumentList, Store};
 use td_engine::{
-    BacktestConfig, BacktestSettings, Context, Direction, EvidenceSettings, LuckTest, Metric,
-    Objective, ParamAxis, ParamSpace, ParamValue, Params, Period, PortfolioBenchmark,
-    PortfolioLimits, SavedRun, Strategy, StrategyEntry, SweepPlan, TestPlan, VerdictRule,
-    WalkForwardPlan,
+    BacktestConfig, BacktestSettings, Context, Direction, EvidenceSettings, LEFT_TAG, LuckTest,
+    Metric, Objective, OrderStatus, ParamAxis, ParamSpace, ParamValue, Params, Period,
+    PortfolioBenchmark, PortfolioLimits, SavedRun, Strategy, StrategyEntry, SweepPlan, TestPlan,
+    VerdictRule, WalkForwardPlan,
 };
 use td_server::api::auth::Token;
 use td_server::api::jobs::JobStatus;
-use td_server::api::runs::{DataCutoff, RunDetail, load_run_data};
+use td_server::api::runs::{
+    DataCutoff, DaysWithoutBars, RunData, RunDetail, check_run_data, load_run_data,
+};
 use td_server::api::source::{LiveSource, MarketSource};
 use td_server::api::{ApiConfig, Server};
 use tempfile::TempDir;
@@ -66,29 +68,38 @@ fn bars(scale: f64, phase: f64, times: &[Millis]) -> Vec<Candle> {
         .collect()
 }
 
+const LISTED: [&str; 6] = ["AAPL", "IBM", "MSFT", "SPY", "OLD", "NEW"];
+
 fn stock(symbol: &str) -> Instrument {
-    static LISTED: OnceLock<Vec<Instrument>> = OnceLock::new();
-    let listed = LISTED.get_or_init(|| {
-        std::thread::spawn(|| {
-            td_data::fetch_instruments(&Http::new().unwrap(), Venue::Alpaca, InstrumentKind::Stock)
-                .unwrap()
-                .instruments
-        })
-        .join()
-        .unwrap()
-    });
-    listed
-        .iter()
-        .find(|i| i.id.symbol == symbol)
-        .unwrap()
-        .clone()
+    Instrument {
+        id: InstrumentId {
+            venue: Venue::Alpaca,
+            symbol: symbol.into(),
+            kind: InstrumentKind::Stock,
+        },
+        base: symbol.into(),
+        quote: "USD".into(),
+        tick_size: 0.01,
+        lot_size: 1e-9,
+        min_qty: 1e-9,
+        min_notional: 1.0,
+        fees: FeeSchedule {
+            maker: 0.0,
+            taker: 0.0,
+            per_unit: 0.0,
+        },
+    }
 }
 
 struct Listing;
 
 impl MarketSource for Listing {
     fn instruments(&self, venue: Venue, kind: InstrumentKind) -> Result<InstrumentList, DataError> {
-        td_data::fetch_instruments(&Http::new()?, venue, kind)
+        assert_eq!((venue, kind), (Venue::Alpaca, InstrumentKind::Stock));
+        Ok(InstrumentList {
+            instruments: LISTED.into_iter().map(stock).collect(),
+            rejected: Vec::new(),
+        })
     }
     fn candles(
         &self,
@@ -493,7 +504,7 @@ impl Strategy for BuysBoth {
         self.bar += 1;
         let (aapl, msft) = (stock("AAPL").id, stock("MSFT").id);
         let all_in = |ctx: &Context, id: &InstrumentId| {
-            (ctx.cash() * 0.98 / ctx.bar_of(id).unwrap().close).floor()
+            stock(&id.symbol).round_qty(ctx.cash() * 0.98 / ctx.bar_of(id).unwrap().close)
         };
         let note = |r: Result<_, td_engine::OrderRejected>| {
             if let Err(e) = r {
@@ -569,8 +580,19 @@ async fn the_stocks_of_one_account_buy_from_its_one_balance() {
             cash >= -1e-6,
             "the account went below zero: {cash} after {fill:?}"
         );
-        assert_eq!(fill.qty, fill.qty.floor(), "whole shares: {fill:?}");
+        assert_eq!(stock("AAPL").round_qty(fill.qty), fill.qty, "{fill:?}");
     }
+    assert!(
+        result.fills.iter().all(|f| f.qty != f.qty.floor()),
+        "fractional shares: {:?}",
+        result.fills
+    );
+    assert_eq!(data.bars[9].open_time, day("2016-01-15"), "a Friday");
+    assert_eq!(
+        result.fills[1].time,
+        day("2016-01-19"),
+        "the AAPL sell decided on Friday fills on Tuesday, after the Monday holiday"
+    );
     let decided = data.bars[10].open_time;
     let next = trading_minutes(decided + DAY, decided + 10 * DAY)[0] / DAY * DAY;
     assert_eq!(result.fills[2].time, next, "the next trading day's open");
@@ -664,4 +686,321 @@ async fn a_plan_runs_its_battery_on_several_stocks_with_an_etf_as_reference() {
         JobStatus::Done,
         serde_json::from_value(state["status"].clone()).unwrap()
     );
+}
+
+const YEAR: (&str, &str) = ("2016-01-01", "2017-01-01");
+const LISTED_ON: &str = "2016-03-14";
+const LAST_BAR: &str = "2016-09-15";
+
+fn record_empty(store: &Store, id: &InstrumentId, from: Millis, to: Millis) {
+    for month in Month::range(from, to) {
+        let (lo, hi) = (from.max(month.start()), to.min(month.end()));
+        let empty: Vec<Gap> = (lo / DAY..hi / DAY)
+            .filter_map(us_bar_minute)
+            .map(|m| Gap {
+                from: m.start,
+                to: m.end,
+            })
+            .collect();
+        store.record_closures(id, month, lo, hi, &empty).unwrap();
+    }
+}
+
+fn year_store() -> (TempDir, Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::new(dir.path());
+    let times = trading_minutes(day(YEAR.0), day(YEAR.1));
+    store
+        .write_candles(&stock("AAPL").id, &bars(1.0, 0.0, &times))
+        .unwrap();
+    (dir, store)
+}
+
+fn write_listed_between(store: &Store, symbol: &str, trail_recorded: bool) {
+    let id = stock(symbol).id;
+    let (listed, last) = (day(LISTED_ON), day(LAST_BAR));
+    let times = trading_minutes(listed, last + DAY);
+    store.write_candles(&id, &bars(2.0, 0.3, &times)).unwrap();
+    record_empty(store, &id, day(YEAR.0), listed);
+    if trail_recorded {
+        record_empty(store, &id, last + DAY, day(YEAR.1));
+    }
+}
+
+fn refusal(store: &Store, config: &BacktestConfig) -> String {
+    let checked = check_run_data(store, config, None).unwrap_err();
+    let loaded = load_run_data(store, config, None).err().unwrap();
+    assert_eq!(checked, loaded);
+    assert_eq!(loaded.body.code, "data_missing", "{loaded:?}");
+    loaded.body.message
+}
+
+fn run(
+    config: &BacktestConfig,
+    data: &RunData,
+    strategy: Box<dyn Strategy>,
+) -> td_engine::BacktestResult {
+    td_engine::run_strategy_with_traded(
+        config,
+        strategy,
+        &data.bars,
+        &data.asks,
+        &data.funding,
+        &data.references,
+        &data.series,
+        &data.also_traded,
+    )
+    .unwrap()
+}
+
+struct HoldsOld {
+    bought: bool,
+    refused: Arc<Mutex<Vec<String>>>,
+}
+
+impl Strategy for HoldsOld {
+    fn on_bar(&mut self, ctx: &mut Context, _bar: &Candle) {
+        let old = stock("OLD");
+        if ctx.has_left(&old.id) {
+            if let Err(e) = ctx.submit(market(old.id, Side::Buy, 1.0)) {
+                self.refused.lock().unwrap().push(e.to_string());
+            }
+            return;
+        }
+        let Some(close) = ctx.bar_of(&old.id).map(|b| b.close) else {
+            return;
+        };
+        if !self.bought {
+            self.bought = true;
+            let qty = old.round_qty(ctx.cash() * 0.5 / close);
+            ctx.submit(market(old.id.clone(), Side::Buy, qty)).unwrap();
+            let resting = OrderRequest {
+                order_type: OrderType::Limit { price: 1.0 },
+                ..market(old.id, Side::Buy, 1.0)
+            };
+            ctx.submit(resting).unwrap();
+        }
+    }
+}
+
+#[test]
+fn a_stock_that_lists_late_and_delists_inside_the_run_trades_between_and_leaves_at_its_last_bar() {
+    let (_dir, store) = year_store();
+    write_listed_between(&store, "OLD", true);
+    let config = BacktestConfig {
+        references: Vec::new(),
+        also_traded: vec![stock("OLD")],
+        ..config()
+    };
+    check_run_data(&store, &config, None).unwrap();
+    let data = load_run_data(&store, &config, None).unwrap();
+    let last = day(LAST_BAR);
+    assert_eq!(data.also_traded[0].left_at, Some(last));
+    assert_eq!(data.report.days_without_bars, None);
+
+    let refused = Arc::new(Mutex::new(Vec::new()));
+    let strategy = HoldsOld {
+        bought: false,
+        refused: refused.clone(),
+    };
+    let result = run(&config, &data, Box::new(strategy));
+    let old = stock("OLD");
+    let fills: Vec<_> = result
+        .fills
+        .iter()
+        .filter(|f| f.instrument == old.id)
+        .collect();
+    assert_eq!(fills.len(), 2, "{fills:?}");
+    let (buy, sell) = (fills[0], fills[1]);
+    assert_eq!(
+        (buy.side, buy.time),
+        (Side::Buy, day("2016-03-15")),
+        "bought on the bar after its first"
+    );
+    let last_bar = data.also_traded[0].bars.last().unwrap();
+    assert_eq!(last_bar.open_time, last);
+    let slipped = old.round_price(last_bar.close * (1.0 - 5.0 / 10_000.0), Rounding::Down);
+    assert_eq!(
+        (sell.side, sell.time, sell.qty, sell.price, sell.fee),
+        (Side::Sell, last, buy.qty, slipped, 0.0),
+        "closed at its last bar's close with the run's costs"
+    );
+    let orders: Vec<_> = result
+        .orders
+        .iter()
+        .filter(|o| o.request.instrument == old.id)
+        .collect();
+    assert!(
+        orders
+            .iter()
+            .any(|o| o.request.client_tag.as_deref() == Some(LEFT_TAG)
+                && o.status == OrderStatus::Filled),
+        "{orders:?}"
+    );
+    assert!(
+        orders.iter().any(|o| matches!(
+            &o.status,
+            OrderStatus::Cancelled(why) if why.contains("stopped trading")
+        )),
+        "the resting order is cancelled: {orders:?}"
+    );
+    let refused = refused.lock().unwrap().clone();
+    assert!(
+        !refused.is_empty()
+            && refused
+                .iter()
+                .all(|e| e.contains("stopped trading at its last bar")),
+        "{refused:?}"
+    );
+    assert_eq!(
+        result.equity.last().unwrap().time,
+        data.bars.last().unwrap().open_time,
+        "the run goes on to its end"
+    );
+
+    write_listed_between(&store, "NEW", false);
+    let unrecorded = BacktestConfig {
+        also_traded: vec![stock("NEW")],
+        ..config.clone()
+    };
+    let message = refusal(&store, &unrecorded);
+    assert!(message.contains("download it first"), "{message}");
+}
+
+#[test]
+fn a_run_refuses_a_first_instrument_that_lists_or_delists_inside_its_range() {
+    let (_dir, store) = year_store();
+    write_listed_between(&store, "OLD", true);
+    let config = BacktestConfig {
+        instrument: stock("OLD"),
+        references: Vec::new(),
+        also_traded: Vec::new(),
+        ..config()
+    };
+    let message = refusal(&store, &config);
+    assert!(
+        message.contains("must trade from the start of its range to the end")
+            && message.contains("start the range on 2016-03-14"),
+        "{message}"
+    );
+    let from_listing = BacktestConfig {
+        from: day(LISTED_ON),
+        ..config.clone()
+    };
+    let message = refusal(&store, &from_listing);
+    assert!(
+        message.contains("end the range after its last bar, on 2016-09-15"),
+        "{message}"
+    );
+    let between = BacktestConfig {
+        to: day(LAST_BAR) + DAY,
+        ..from_listing
+    };
+    check_run_data(&store, &between, None).unwrap();
+    assert!(load_run_data(&store, &between, None).is_ok());
+
+    record_empty(&store, &stock("NEW").id, day(YEAR.0), day(YEAR.1));
+    let nothing = BacktestConfig {
+        instrument: stock("AAPL"),
+        references: vec![stock("NEW").id],
+        ..config
+    };
+    let message = refusal(&store, &nothing);
+    assert!(
+        message.contains("had nothing there, so a download cannot fill it"),
+        "{message}"
+    );
+}
+
+struct BuysOn {
+    days: Vec<(InstrumentId, Millis)>,
+}
+
+impl Strategy for BuysOn {
+    fn on_bar(&mut self, ctx: &mut Context, _bar: &Candle) {
+        for (id, on) in self.days.clone() {
+            if let Some(close) = ctx
+                .bar_of(&id)
+                .filter(|b| b.open_time == on)
+                .map(|b| b.close)
+            {
+                let qty = stock(&id.symbol).round_qty(ctx.cash() * 0.3 / close);
+                ctx.submit(market(id, Side::Buy, qty)).unwrap();
+            }
+        }
+    }
+}
+
+#[test]
+fn an_open_day_without_a_bar_holds_a_stocks_orders_to_its_next_bar_once_downloads_found_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::new(dir.path());
+    let times = trading_minutes(day(YEAR.0), day(YEAR.1));
+    let (aapl, msft) = (stock("AAPL").id, stock("MSFT").id);
+    let (aapl_halt, msft_halt) = (day("2016-03-02"), day("2016-05-04"));
+    for (id, halt, scale) in [(&aapl, aapl_halt, 1.0), (&msft, msft_halt, 2.0)] {
+        let kept: Vec<Millis> = times
+            .iter()
+            .copied()
+            .filter(|t| t / DAY != halt / DAY)
+            .collect();
+        store.write_candles(id, &bars(scale, 0.0, &kept)).unwrap();
+        record_empty(&store, id, halt, halt + DAY);
+    }
+    let config = BacktestConfig {
+        references: Vec::new(),
+        ..config()
+    };
+    check_run_data(&store, &config, None).unwrap();
+    let data = load_run_data(&store, &config, None).unwrap();
+    assert_eq!(data.bars.len(), 251, "the trading days of 2016 but one");
+    assert!(data.report.gaps.is_empty() && data.report.dropped.is_empty());
+    assert_eq!(
+        data.report.days_without_bars,
+        Some(vec![
+            DaysWithoutBars {
+                instrument: aapl.clone(),
+                days: 1
+            },
+            DaysWithoutBars {
+                instrument: msft.clone(),
+                days: 1
+            },
+        ])
+    );
+    let strategy = BuysOn {
+        days: vec![
+            (aapl.clone(), aapl_halt - DAY),
+            (msft.clone(), msft_halt - DAY),
+        ],
+    };
+    let result = run(&config, &data, Box::new(strategy));
+    let fills: Vec<(&InstrumentId, Millis)> = result
+        .fills
+        .iter()
+        .map(|f| (&f.instrument, f.time))
+        .collect();
+    assert_eq!(
+        fills,
+        [(&aapl, aapl_halt + DAY), (&msft, msft_halt + DAY)],
+        "each order waits for its own stock's next bar"
+    );
+
+    let ibm = stock("IBM");
+    let mut holed = bars(1.5, 0.6, &times);
+    holed.remove(40);
+    store.write_candles(&ibm.id, &holed).unwrap();
+    let beside = BacktestConfig {
+        also_traded: vec![ibm.clone()],
+        ..config.clone()
+    };
+    let message = refusal(&store, &beside);
+    assert!(message.contains("download it first"), "{message}");
+    let first = BacktestConfig {
+        instrument: ibm,
+        also_traded: Vec::new(),
+        ..config
+    };
+    let message = refusal(&store, &first);
+    assert!(message.contains("download them first"), "{message}");
 }

@@ -148,6 +148,7 @@ fn traded(inst: &Instrument, bars: Vec<Candle>, funding: Vec<(Millis, f64)>) -> 
         instrument: inst.id.clone(),
         bars,
         funding,
+        left_at: None,
     }
 }
 
@@ -699,6 +700,75 @@ fn a_run_names_only_the_instruments_it_has_bars_for() {
     let mut spot = config(4);
     spot.also_traded[0].id.kind = InstrumentKind::Spot;
     assert!(refused(&spot, &[]).contains("not a perpetual"));
+}
+
+#[test]
+fn an_instrument_that_stops_trading_is_closed_at_its_last_close_and_takes_no_more_orders() {
+    let a_bars: Vec<Candle> = (0..8).map(|i| flat(i, 100.0)).collect();
+    let b_bars: Vec<Candle> = (0..5).map(|i| flat(i, 50.0)).collect();
+    let leaving = AlsoTradedBars {
+        left_at: Some(4 * MIN),
+        ..traded(&b(), b_bars.clone(), Vec::new())
+    };
+    let (strategy, log) = scripted(|ctx, notes| {
+        let i = index(ctx);
+        notes.push(format!("{i} left {}", ctx.has_left(&b().id)));
+        if i == 0 {
+            ctx.submit(market(&b(), Side::Buy, 10.0)).unwrap();
+            let resting = OrderType::Limit { price: 10.0 };
+            ctx.submit(order(&b(), Side::Buy, 1.0, resting)).unwrap();
+        }
+        if i >= 4
+            && let Err(e) = ctx.submit(market(&b(), Side::Buy, 1.0))
+        {
+            notes.push(e.to_string());
+        }
+    });
+    let result = run(&config(8), strategy, &a_bars, &[], &[leaving.clone()]).unwrap();
+    let fills: Vec<(Millis, Side, f64, f64)> = result
+        .fills
+        .iter()
+        .map(|f| (f.time, f.side, f.qty, f.price))
+        .collect();
+    assert_eq!(
+        fills,
+        [
+            (MIN, Side::Buy, 10.0, 50.03),
+            (4 * MIN, Side::Sell, 10.0, 49.97)
+        ],
+        "bought at the open of 50 plus 5 bps, sold at the last close of 50 less 5 bps"
+    );
+    let cancelled = result.orders.iter().any(
+        |o| matches!(&o.status, OrderStatus::Cancelled(why) if why.contains("stopped trading")),
+    );
+    assert!(cancelled, "{:?}", result.orders);
+    let notes = log.lock().unwrap().notes.clone();
+    assert!(notes.contains(&"3 left false".to_string()), "{notes:?}");
+    assert!(notes.contains(&"4 left true".to_string()), "{notes:?}");
+    let refused: Vec<&String> = notes
+        .iter()
+        .filter(|n| n.contains("stopped trading"))
+        .collect();
+    assert_eq!(refused.len(), 4, "bars 4 to 7: {notes:?}");
+    assert_eq!(result.equity.len(), 8, "the run goes on");
+
+    let staying = run_quiet(
+        &config(8),
+        &a_bars,
+        &[traded(&b(), b_bars.clone(), Vec::new())],
+    );
+    let left = run_quiet(&config(8), &a_bars, &[leaving.clone()]);
+    assert_ne!(staying.data_fingerprint, left.data_fingerprint);
+
+    let early = AlsoTradedBars {
+        left_at: Some(3 * MIN),
+        ..leaving
+    };
+    let (strategy, _) = scripted(|_, _| {});
+    match run(&config(8), strategy, &a_bars, &[], &[early]).unwrap_err() {
+        EngineError::InvalidTraded(why) => assert!(why.contains("not the open of its last bar")),
+        other => panic!("{other}"),
+    }
 }
 
 /// `price` rounded to the cent, to compare a price the engine worked out.

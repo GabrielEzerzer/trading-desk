@@ -21,7 +21,7 @@ use super::plans::{
     LinkState, LinkedVerdict, PlanDone, PlanInstrumentDone, PlanRequest, SessionLink,
     VerdictSummary,
 };
-use super::runs::{DataReport, RunCheck, RunDetail, RunDone, ToleratedBucket};
+use super::runs::{DataReport, DaysWithoutBars, RunCheck, RunDetail, RunDone, ToleratedBucket};
 use super::sessions::{
     ComparedBars, PositionInfo, SessionComparisonResponse, SessionState, SessionSummary,
     StartSessionRequest,
@@ -208,6 +208,7 @@ pub fn render() -> String {
         RunDetail,
         RunCheck,
         DataReport,
+        DaysWithoutBars,
         ToleratedBucket,
         PaperConfig,
         Funding,

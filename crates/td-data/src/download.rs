@@ -5,6 +5,7 @@ use td_core::{Hours, InstrumentId, InstrumentKind, Millis, Timeframe};
 
 use crate::DataError;
 use crate::http::Http;
+use crate::instruments::list_cached;
 use crate::source::{DataSource, MinuteHistory, source};
 use crate::store::{Gap, Store, missing_minutes};
 use crate::time::{DAY, MINUTE, Month, format_date, now_ms};
@@ -61,6 +62,20 @@ pub(crate) fn download_candles_from(
     progress: &mut dyn FnMut(String),
 ) -> Result<DownloadReport, DataError> {
     let now = now_ms();
+    if source.lists_delisted()
+        && !list_cached(source, http, store.root(), id.kind, now)?
+            .instruments
+            .iter()
+            .any(|i| &i.id == id)
+    {
+        return Err(DataError::InvalidInstrument {
+            symbol: id.symbol.clone(),
+            reason: format!(
+                "{} lists no {} by that symbol, active or delisted",
+                id.venue, id.kind
+            ),
+        });
+    }
     if let Some(wanted) = source.adjustment() {
         check_adjustment(source, http, store, id, wanted, now)?;
     }

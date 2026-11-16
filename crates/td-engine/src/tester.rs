@@ -1115,9 +1115,11 @@ fn traded_copy(
                 .iter()
                 .filter(|b| !range.contains(&b.open_time))
                 .copied();
+            let bars: Vec<Candle> = kept.chain(slots.into_iter().flatten()).collect();
             AlsoTradedBars {
                 instrument: given.instrument.clone(),
-                bars: kept.chain(slots.into_iter().flatten()).collect(),
+                left_at: given.left_at.and(bars.iter().map(|b| b.open_time).max()),
+                bars,
                 funding: given.funding.clone(),
             }
         })
@@ -3455,6 +3457,7 @@ mod tests {
                 instrument: pair_second().id,
                 bars: (LISTED_BAR..BARS).map(|k| flat(k, 500.0)).collect(),
                 funding: Vec::new(),
+                left_at: None,
             }];
             let mut sweep = pair_sweep(TRADES_BOTH);
             sweep.base.start_when_all_listed = true;

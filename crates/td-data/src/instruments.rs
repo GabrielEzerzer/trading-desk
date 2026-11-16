@@ -118,7 +118,7 @@ struct CachedList {
 }
 
 /// [`cached_instruments`] from a given source, at `now`.
-fn list_cached(
+pub(crate) fn list_cached(
     source: &dyn DataSource,
     http: &Http,
     root: &Path,

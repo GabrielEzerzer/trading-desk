@@ -504,6 +504,7 @@ pub(crate) fn pair_data(n: i64) -> (Vec<Candle>, Vec<AlsoTradedBars>) {
         instrument: pair_second().id,
         bars: second,
         funding: funding.collect(),
+        left_at: None,
     };
     (first, vec![also])
 }

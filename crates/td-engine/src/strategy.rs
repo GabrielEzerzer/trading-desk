@@ -174,6 +174,12 @@ impl Context<'_> {
             .is_some_and(|t| t <= self.bar().open_time)
     }
 
+    pub fn has_left(&self, id: &InstrumentId) -> bool {
+        self.leg(id)
+            .and_then(|leg| leg.left_at)
+            .is_some_and(|t| t <= self.bar().open_time)
+    }
+
     /// The open orders of `id`, one of the instruments the run trades; `None` for one it does not.
     pub fn open_orders_of(&self, id: &InstrumentId) -> Option<&[Order]> {
         let k = self.index(id)?;
@@ -405,6 +411,12 @@ impl Context<'_> {
                 "{} has no bar at {}, so it has no price to check an order at",
                 request.instrument,
                 self.bar().open_time
+            ));
+        }
+        if self.has_left(&request.instrument) {
+            check = Err(format!(
+                "{} stopped trading at its last bar, so it takes no more orders",
+                request.instrument
             ));
         }
         if self.warming_up {

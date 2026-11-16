@@ -243,7 +243,7 @@ fn fx_weekend(sunday: i64) -> Range<Millis> {
 /// before 2007. What keeps runs inside that limit is OANDA's earliest download date, 2007-01-01
 /// (td-server's `OANDA_EARLIEST_FROM`), which the app's downloads and charts keep to; the
 /// `td-data` CLI does not check it. Upgrade to a per-year rule before moving that date earlier.
-pub(crate) fn new_york_offset_hours(day: i64) -> i64 {
+pub fn new_york_offset_hours(day: i64) -> i64 {
     let (year, _, _) = crate::civil_from_days(day);
     let first_sunday = |month: u32| {
         let first = days_from_civil(year, month, 1);

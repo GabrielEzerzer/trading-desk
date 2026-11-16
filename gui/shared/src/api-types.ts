@@ -2829,7 +2829,9 @@ tolerated: Array<ToleratedBucket>,
 /**
  * Funding rates given to the run; 0 for spot.
  */
-funding_rates: number, };
+funding_rates: number, days_without_bars?: Array<DaysWithoutBars>, };
+
+export type DaysWithoutBars = { instrument: InstrumentId, days: number, };
 
 /**
  * A bucket built although a few of its minutes are missing, within td-data's tolerance.
