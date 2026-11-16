@@ -1,6 +1,6 @@
 # Trading Desk
 
-A workspace for my own trading: one Electron desktop app with two sections on one Rust engine. Strategy Lab backtests strategies on historical data and runs the strategy tester; Trading shows live charts and paper-trades the same strategy code. The engine runs as a sidecar process that the app talks to over localhost. Markets are crypto spot and perpetuals on Binance and Bybit, and FX history from OANDA. The plan and its decisions are on the map issue, #1.
+A workspace for my own trading: one Electron desktop app with two sections on one Rust engine. Strategy Lab backtests strategies on historical data and runs the strategy tester; Trading shows live charts and paper-trades the same strategy code. The engine runs as a sidecar process that the app talks to over localhost. Markets are crypto spot and perpetuals on Binance and Bybit, FX history from OANDA, and daily history of US stocks and ETFs from Alpaca. The plan and its decisions are on the map issue, #1.
 
 ## Layout
 

@@ -93,8 +93,8 @@ pub use saved_verdicts::{
 };
 pub use series::{SERIES_DIR, Series, SeriesRow, check_name as check_series_name, read_series};
 pub use session::{
-    CLOSE_OUT_TAG, EquityPoint, LIQUIDATION_TAG, MAINTENANCE_MARGIN_RATE, Session, SessionConfig,
-    run_backtest,
+    CLOSE_OUT_TAG, EquityPoint, LEFT_TAG, LIQUIDATION_TAG, MAINTENANCE_MARGIN_RATE, Session,
+    SessionConfig, run_backtest,
 };
 pub use stops::{SavedStopState, StopError, StopFired, StopRule, StopRules, StopState};
 pub use strategies::gotobi_calendar;

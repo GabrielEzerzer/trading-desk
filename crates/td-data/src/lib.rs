@@ -5,6 +5,7 @@
 //! The engine reads candles as [`LoadedCandles`] (the bars, and the buckets dropped as incomplete
 //! or built with a few minutes missing) and funding as `Vec<(Millis, f64)>` from [`Store`].
 
+pub mod alpaca;
 pub mod binance;
 pub mod bybit;
 mod closed;
@@ -25,7 +26,7 @@ pub use error::DataError;
 pub use http::Http;
 pub use instruments::{
     INSTRUMENT_CACHE_AGE, InstrumentList, cached_instruments, default_fees, fetch_instruments,
-    validate_instrument,
+    unlisted_instrument, validate_instrument,
 };
 pub use resample::{LoadedCandles, resample};
 pub use source::{DataSource, LiveStream, MinuteHistory, source};

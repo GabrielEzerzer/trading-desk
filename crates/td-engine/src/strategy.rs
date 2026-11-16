@@ -174,6 +174,12 @@ impl Context<'_> {
             .is_some_and(|t| t <= self.bar().open_time)
     }
 
+    pub fn has_left(&self, id: &InstrumentId) -> bool {
+        self.leg(id)
+            .and_then(|leg| leg.left_at)
+            .is_some_and(|t| t <= self.bar().open_time)
+    }
+
     /// The open orders of `id`, one of the instruments the run trades; `None` for one it does not.
     pub fn open_orders_of(&self, id: &InstrumentId) -> Option<&[Order]> {
         let k = self.index(id)?;
@@ -407,6 +413,12 @@ impl Context<'_> {
                 self.bar().open_time
             ));
         }
+        if self.has_left(&request.instrument) {
+            check = Err(format!(
+                "{} stopped trading at its last bar, so it takes no more orders",
+                request.instrument
+            ));
+        }
         if self.warming_up {
             check = Err(WARM_UP.into());
         }
@@ -522,6 +534,14 @@ impl Context<'_> {
         }
     }
 
+    fn fees_at(&self, k: usize) -> FeeSchedule {
+        if k == 0 {
+            self.fees
+        } else {
+            self.others[k - 1].instrument.fees
+        }
+    }
+
     fn orders_at(&self, k: usize) -> &[Order] {
         if k == 0 {
             self.open_orders()
@@ -571,7 +591,6 @@ impl Context<'_> {
     }
 
     /// Rounds and checks an order for traded instrument `k`, as [`Context::submit`] describes.
-    /// Spot is never traded beside another instrument, so its checks are the first's.
     fn prepare(&self, k: usize, mut req: OrderRequest) -> (OrderRequest, Result<(), String>) {
         let inst = self.inst_at(k);
         let limit_rounding = match req.side {
@@ -599,12 +618,12 @@ impl Context<'_> {
         if !rules.can_short && req.side == Side::Sell {
             // Open sells count against the holding, so several sells cannot add up to a short.
             let pending: f64 = self
-                .open_orders()
+                .orders_at(k)
                 .iter()
                 .filter(|o| o.request.side == Side::Sell)
                 .map(|o| o.request.qty)
                 .sum();
-            let available = self.position() - pending;
+            let available = self.position_at(k) - pending;
             if req.qty > available * (1.0 + 1e-9) {
                 let reason = format!(
                     "spot cannot sell more than it holds: selling {}, {} available",
@@ -615,18 +634,18 @@ impl Context<'_> {
         }
         if !rules.margin && req.side == Side::Buy {
             // Open buys count against the cash too, so several buys cannot add up to more than it.
-            let close = self.bar().close;
-            let cost = |r: &OrderRequest| {
-                r.qty * reference_price(r.order_type, close) * (1.0 + self.fees.taker)
-                    + r.qty * self.fees.per_unit
+            let cost = |j: usize, r: &OrderRequest| {
+                let fees = self.fees_at(j);
+                let close = self.close_at(j, Side::Buy);
+                r.qty * reference_price(r.order_type, close) * (1.0 + fees.taker)
+                    + r.qty * fees.per_unit
             };
-            let pending: f64 = self
-                .open_orders()
-                .iter()
-                .filter(|o| o.request.side == Side::Buy)
-                .map(|o| cost(&o.request))
+            let pending: f64 = (0..=self.others.len())
+                .flat_map(|j| self.orders_at(j).iter().map(move |o| (j, o)))
+                .filter(|(_, o)| o.request.side == Side::Buy)
+                .map(|(j, o)| cost(j, &o.request))
                 .sum();
-            let needed = cost(&req) + pending;
+            let needed = cost(k, &req) + pending;
             let cash = self.cash();
             if needed > cash * (1.0 + 1e-9) {
                 let reason = format!(

@@ -161,6 +161,38 @@ pub enum DataError {
         status: u16,
         message: String,
     },
+
+    #[error(
+        "alpaca's market data needs API keys: set APCA_API_KEY_ID and APCA_API_SECRET_KEY to the \
+         keys of an Alpaca account"
+    )]
+    MissingAlpacaKeys,
+
+    #[error(
+        "{url} was refused ({status}: {message}): the keys in APCA_API_KEY_ID and \
+         APCA_API_SECRET_KEY are not valid, or their plan cannot read this data"
+    )]
+    AlpacaRefused {
+        url: String,
+        status: u16,
+        message: String,
+    },
+
+    #[error(
+        "{instrument} is stored with price adjustment {stored}, but its source gives {wanted}: \
+         delete its stored data and download it again"
+    )]
+    AdjustmentMismatch {
+        instrument: String,
+        stored: String,
+        wanted: String,
+    },
+
+    #[error(
+        "{instrument}'s adjusted prices changed for {date} since they were stored, after a split \
+         or dividend: delete its stored data and download it again so every bar shares one basis"
+    )]
+    AdjustmentChanged { instrument: String, date: String },
 }
 
 impl DataError {

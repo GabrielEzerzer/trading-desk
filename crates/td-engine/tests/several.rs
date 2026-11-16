@@ -148,6 +148,7 @@ fn traded(inst: &Instrument, bars: Vec<Candle>, funding: Vec<(Millis, f64)>) -> 
         instrument: inst.id.clone(),
         bars,
         funding,
+        left_at: None,
     }
 }
 
@@ -701,6 +702,95 @@ fn a_run_names_only_the_instruments_it_has_bars_for() {
     assert!(refused(&spot, &[]).contains("not a perpetual"));
 }
 
+#[test]
+fn an_instrument_that_stops_trading_is_closed_at_its_last_close_and_takes_no_more_orders() {
+    let a_bars: Vec<Candle> = (0..8).map(|i| flat(i, 100.0)).collect();
+    let b_bars: Vec<Candle> = (0..5).map(|i| flat(i, 50.0)).collect();
+    let leaving = AlsoTradedBars {
+        left_at: Some(4 * MIN),
+        ..traded(&b(), b_bars.clone(), Vec::new())
+    };
+    let account = Arc::new(Mutex::new(Vec::new()));
+    let seen = account.clone();
+    let (strategy, log) = scripted(move |ctx, notes| {
+        let i = index(ctx);
+        notes.push(format!("{i} left {}", ctx.has_left(&b().id)));
+        let b_position = ctx.position_of(&b().id);
+        seen.lock()
+            .unwrap()
+            .push((ctx.cash(), ctx.equity(), b_position));
+        if i == 0 {
+            ctx.submit(market(&b(), Side::Buy, 10.0)).unwrap();
+            let resting = OrderType::Limit { price: 10.0 };
+            ctx.submit(order(&b(), Side::Buy, 1.0, resting)).unwrap();
+        }
+        if i >= 4
+            && let Err(e) = ctx.submit(market(&b(), Side::Buy, 1.0))
+        {
+            notes.push(e.to_string());
+        }
+    });
+    let leaving = [leaving];
+    let result = run(&config(8), strategy, &a_bars, &[], &leaving).unwrap();
+    let fills: Vec<(Millis, Side, f64, f64)> = result
+        .fills
+        .iter()
+        .map(|f| (f.time, f.side, f.qty, f.price))
+        .collect();
+    assert_eq!(
+        fills,
+        [
+            (MIN, Side::Buy, 10.0, 50.03),
+            (4 * MIN, Side::Sell, 10.0, 49.97)
+        ],
+        "bought at the open of 50 plus 5 bps, sold at the last close of 50 less 5 bps"
+    );
+    let cancelled = result.orders.iter().any(
+        |o| matches!(&o.status, OrderStatus::Cancelled(why) if why.contains("stopped trading")),
+    );
+    assert!(cancelled, "{:?}", result.orders);
+    let notes = log.lock().unwrap().notes.clone();
+    assert!(notes.contains(&"3 left false".to_string()), "{notes:?}");
+    assert!(notes.contains(&"4 left true".to_string()), "{notes:?}");
+    let refused: Vec<&String> = notes
+        .iter()
+        .filter(|n| n.contains("stopped trading"))
+        .collect();
+    assert_eq!(refused.len(), 4, "bars 4 to 7: {notes:?}");
+    assert_eq!(result.equity.len(), 8, "the run goes on");
+    let account = account.lock().unwrap().clone();
+    let (cash, equity, position) = account[3];
+    close(cash, 10_000.0);
+    close(equity, 9_999.7);
+    assert_eq!(position, Some(10.0));
+    for (i, &(cash, equity, position)) in account.iter().enumerate().skip(4) {
+        close(cash, 9_999.4);
+        close(equity, 9_999.4);
+        assert_eq!(position, Some(0.0), "bar {i}");
+    }
+    close(result.equity[3].equity, 9_999.7);
+    close(final_equity(&result), 9_999.4);
+
+    let staying = run_quiet(
+        &config(8),
+        &a_bars,
+        &[traded(&b(), b_bars.clone(), Vec::new())],
+    );
+    let left = run_quiet(&config(8), &a_bars, &leaving);
+    assert_ne!(staying.data_fingerprint, left.data_fingerprint);
+
+    let [leaving] = leaving;
+    let early = AlsoTradedBars {
+        left_at: Some(3 * MIN),
+        ..leaving
+    };
+    let (strategy, _) = scripted(|_, _| {});
+    match run(&config(8), strategy, &a_bars, &[], &[early]).unwrap_err() {
+        EngineError::InvalidTraded(why) => assert!(why.contains("not the open of its last bar")),
+        other => panic!("{other}"),
+    }
+}
+
 /// `price` rounded to the cent, to compare a price the engine worked out.
 fn cents(price: f64) -> f64 {
     (price * 100.0).round() / 100.0
@@ -994,7 +1084,13 @@ fn a_reduce_only_order_is_accepted_over_the_gross_cap() {
 #[test]
 fn a_configuration_trading_several_instruments_is_refused_unless_they_fit_one_account() {
     type Change = fn(&mut BacktestConfig);
-    let cases: [(&str, Change); 5] = [
+    let cases: [(&str, Change); 7] = [
+        ("perpetuals or stocks only", |c| {
+            c.also_traded[0].id.kind = InstrumentKind::Spot
+        }),
+        ("of the same kind", |c| {
+            c.also_traded[0].id.kind = InstrumentKind::Stock
+        }),
         ("another venue", |c| {
             c.also_traded[0].id.venue = Venue::Bybit
         }),

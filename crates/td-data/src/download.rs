@@ -5,9 +5,10 @@ use td_core::{Hours, InstrumentId, InstrumentKind, Millis, Timeframe};
 
 use crate::DataError;
 use crate::http::Http;
+use crate::instruments::list_cached;
 use crate::source::{DataSource, MinuteHistory, source};
 use crate::store::{Gap, Store, missing_minutes};
-use crate::time::{DAY, MINUTE, Month, now_ms};
+use crate::time::{DAY, MINUTE, Month, format_date, now_ms};
 
 /// What a candle download did.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -28,15 +29,6 @@ pub struct DownloadReport {
 /// [`Store::write_candles`]. A month whose source returns candles without asks for such a kind,
 /// or asks for a kind without quotes, is an error, and nothing of it is written. `progress` is
 /// called with a line of text after each month.
-///
-/// A month whose part of the range is already stored with no minute missing, apart from recorded
-/// closures, is skipped. The open time in the range the source returned nothing for is recorded
-/// beside the month ([`Store::record_closures`]), apart from a span at the end of the range that
-/// reaches now or, for a kind that never closes, ends less than a day before now, since its file
-/// may not be published yet. For a kind that never closes, a month the source had nothing for at
-/// all is recorded too. For a kind with closed hours, a month with nothing fetched or stored gets
-/// no record, and a month with no record yet is fetched whole, up to now, so its first record
-/// covers all of it.
 pub fn download_candles(
     http: &Http,
     store: &Store,
@@ -59,6 +51,9 @@ pub(crate) fn download_candles_from(
     progress: &mut dyn FnMut(String),
 ) -> Result<DownloadReport, DataError> {
     let now = now_ms();
+    if let Some(wanted) = source.adjustment() {
+        check_adjustment(source, http, store, id, wanted, now)?;
+    }
     let mut report = DownloadReport::default();
     for month in Month::range(from, to.min(now)) {
         let lo = from.max(month.start());
@@ -77,10 +72,10 @@ pub(crate) fn download_candles_from(
             report.months.push((month, 0));
             continue;
         }
-        let closes = id.kind.rules().hours != Hours::Always;
+        let fx = id.kind.rules().hours == Hours::FxWeek;
         // A record makes the run check hold the month to a day missing, so it must not cover only
         // the part this download asked for while the month's other closures go unrecorded.
-        let (lo, hi) = if closes && store.closure_record(id, month)?.is_none() {
+        let (lo, hi) = if fx && store.closure_record(id, month)?.is_none() {
             (month.start(), month.end().min(now))
         } else {
             (lo, hi)
@@ -110,16 +105,37 @@ pub(crate) fn download_candles_from(
         let mut empty = missing_minutes(id.kind, &candles, lo, hi);
         // Minutes up to now may only not be published yet, and for a kind that never closes so may
         // the day before now, whose file can come out the day after.
-        let unpublished = if closes { hi == now } else { now - hi < DAY };
-        if unpublished && empty.last().is_some_and(|g| g.to == hi) {
+        let unpublished = empty.last().is_some_and(|g| {
+            if fx {
+                hi == now && g.to == hi
+            } else {
+                now - hi < DAY && candles.last().is_none_or(|c| c.open_time < g.from)
+            }
+        });
+        if unpublished {
             empty.pop();
         }
         let holds = !(candles.is_empty() && stored.is_empty());
-        if holds || (!closes && !empty.is_empty()) {
+        if holds || (!fx && !empty.is_empty()) {
             store.record_closures(id, month, lo, hi, &empty)?;
         }
         progress(format!("{id} {month}: {} candles", candles.len()));
         report.months.push((month, candles.len()));
+    }
+    if source.unlisted(id).is_some()
+        && store.months(id)?.is_empty()
+        && !list_cached(source, http, store.root(), id.kind, now)?
+            .instruments
+            .iter()
+            .any(|i| &i.id == id)
+    {
+        return Err(DataError::InvalidInstrument {
+            symbol: id.symbol.clone(),
+            reason: format!(
+                "{} lists no {} by that symbol and serves no bars for it",
+                id.venue, id.kind
+            ),
+        });
     }
     let end = to.min(now - now.rem_euclid(MINUTE));
     if from < end {
@@ -132,6 +148,44 @@ pub(crate) fn download_candles_from(
         ));
     }
     Ok(report)
+}
+
+fn check_adjustment(
+    source: &dyn DataSource,
+    http: &Http,
+    store: &Store,
+    id: &InstrumentId,
+    wanted: &str,
+    now: Millis,
+) -> Result<(), DataError> {
+    let latest = store.months(id)?.last().copied();
+    let stored = store.adjustment(id)?;
+    if stored.as_deref() != Some(wanted) && (stored.is_some() || latest.is_some()) {
+        return Err(DataError::AdjustmentMismatch {
+            instrument: id.to_string(),
+            stored: stored.unwrap_or_else(|| "unrecorded".into()),
+            wanted: wanted.into(),
+        });
+    }
+    if let Some(month) = latest {
+        let kept = store.read_month(id, month)?;
+        let fresh = source.minute_history(http, id, month.start(), month.end().min(now), now)?;
+        for candle in fresh.candles {
+            let Ok(i) = kept.binary_search_by_key(&candle.open_time, |c| c.open_time) else {
+                continue;
+            };
+            let old = &kept[i];
+            if (old.open, old.high, old.low, old.close)
+                != (candle.open, candle.high, candle.low, candle.close)
+            {
+                return Err(DataError::AdjustmentChanged {
+                    instrument: id.to_string(),
+                    date: format_date(candle.open_time),
+                });
+            }
+        }
+    }
+    store.record_adjustment(id, wanted)
 }
 
 /// Downloads the funding rates of a perpetual in `[from, to)` and merges them into the store.

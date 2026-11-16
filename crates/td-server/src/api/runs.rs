@@ -36,7 +36,7 @@ use axum::extract::{Path as UrlPath, State};
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 use td_core::{Candle, Hours, InstrumentId, InstrumentKind, Millis};
-use td_data::time::{DAY, Month, format_minute, now_ms};
+use td_data::time::{DAY, MINUTE, Month, format_date, format_minute, now_ms};
 use td_data::{
     Closures, DataError, Gap, LoadedCandles, MonthQuotes, Store, missing_minutes, resample,
 };
@@ -174,6 +174,7 @@ pub fn max_gap(kind: InstrumentKind) -> Millis {
     match kind.rules().hours {
         Hours::Always => DAY,
         Hours::FxWeek => 2 * DAY,
+        Hours::UsTradingDays => MINUTE,
     }
 }
 
@@ -181,9 +182,10 @@ pub fn max_gap(kind: InstrumentKind) -> Millis {
 /// it touches has a closure record, else [`max_gap`].
 fn gap_limit(kind: InstrumentKind, closures: &Closures, stretch: &[Gap]) -> Millis {
     let (from, to) = (stretch[0].from, stretch[stretch.len() - 1].to);
-    if Month::range(from, to)
-        .into_iter()
-        .all(|m| closures.recorded(m))
+    if kind.rules().hours == Hours::FxWeek
+        && Month::range(from, to)
+            .into_iter()
+            .all(|m| closures.recorded(m))
     {
         DAY
     } else {
@@ -225,6 +227,15 @@ pub struct DataReport {
     pub tolerated: Vec<ToleratedBucket>,
     /// Funding rates given to the run; 0 for spot.
     pub funding_rates: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub days_without_bars: Option<Vec<DaysWithoutBars>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+pub struct DaysWithoutBars {
+    pub instrument: InstrumentId,
+    pub days: i64,
 }
 
 /// What a finished run job produced: the saved run's id and its row in the run list. The whole
@@ -392,6 +403,14 @@ fn data_range(config: &BacktestConfig) -> Result<(Millis, Millis), ApiError> {
         return Err(invalid_config("`to` must be after `from`".into()));
     }
     let timeframe = config.timeframe;
+    let shortest = config.instrument.id.kind.rules().shortest_timeframe;
+    if timeframe.duration_ms() < shortest.duration_ms() {
+        return Err(invalid_config(format!(
+            "{} has one bar per trading day: run it at {} or longer",
+            config.instrument.id,
+            shortest.as_str()
+        )));
+    }
     let edges = [
         ("from", Some(config.from)),
         ("to", Some(config.to)),
@@ -431,6 +450,7 @@ struct StoreData {
     closures: Closures,
     /// A perpetual's funding rates; empty for spot.
     funding: Vec<(Millis, f64)>,
+    held: Option<(Millis, Millis)>,
 }
 
 /// Reads the 1-minute candles of the configuration's range, and for a kind with quotes their asks,
@@ -448,6 +468,7 @@ fn read_data(store: &Store, config: &BacktestConfig) -> Result<StoreData, ApiErr
     }
     let closures = store.closures(id, from, to)?;
     let gaps = closures.remove(missing_minutes(id.kind, &minutes, from, to));
+    let held = held(&minutes);
     let loaded = resample(id.kind, &minutes, config.timeframe, false);
     // The asks share the bids' rows in the store, so these are the same minutes and resample
     // builds the same buckets from them.
@@ -463,6 +484,7 @@ fn read_data(store: &Store, config: &BacktestConfig) -> Result<StoreData, ApiErr
         gaps,
         closures,
         funding,
+        held,
     })
 }
 
@@ -485,15 +507,19 @@ fn read_references(store: &Store, config: &BacktestConfig) -> Result<Vec<Referen
     let (from, to) = data_range(config)?;
     let mut references = Vec::with_capacity(config.references.len());
     for id in &config.references {
-        let (bars, gaps, closures) = stored_bids(store, config, id)?;
+        let (bars, gaps, closures, _) = stored_bids(store, config, id)?;
         let mut missing = long_gaps(id.kind, &gaps, &closures);
         if missing.is_empty() && bars.is_empty() {
             missing.push(Gap { from, to });
         }
         if !missing.is_empty() {
+            let advice = if found_nothing(store, id, &missing)? {
+                FOUND_NOTHING
+            } else {
+                "a reference instrument is not downloaded with the run, so download it first"
+            };
             return Err(data_missing(format!(
-                "the store has no {id} candles {}; a reference instrument is not downloaded with \
-                 the run, so download it first",
+                "the store has no {id} candles {}; {advice}",
                 spans(&missing.iter().collect::<Vec<_>>())
             )));
         }
@@ -519,7 +545,7 @@ fn read_also_traded(
     let mut also_traded = Vec::with_capacity(config.also_traded.len());
     for instrument in &config.also_traded {
         let id = &instrument.id;
-        let (bars, mut gaps, closures) = stored_bids(store, config, id)?;
+        let (bars, mut gaps, closures, stored) = stored_bids(store, config, id)?;
         let mut checked = range;
         let lead = gaps
             .first()
@@ -535,7 +561,11 @@ fn read_also_traded(
                 checked.0 = lead.to;
             }
         }
-        let funding = store.load_funding(id, range.0, range.1)?;
+        let funding = if id.kind.rules().funding {
+            store.load_funding(id, range.0, range.1)?
+        } else {
+            Vec::new()
+        };
         let checked_funding = &funding[funding.partition_point(|&(t, _)| t < checked.0)..];
         if let Some(s) = shortfall(
             id,
@@ -568,12 +598,24 @@ fn read_also_traded(
                                    so the instrument does not trade in that span";
                 return Err(s.refused(id, not_trading, advice));
             }
-            return Err(s.refused(id, advice, advice));
+            let candles_advice = if found_nothing(store, id, &s.candles)? {
+                FOUND_NOTHING
+            } else {
+                advice
+            };
+            return Err(s.refused(id, candles_advice, advice));
         }
+        let left_at = stored
+            .filter(|&(_, last)| {
+                id.kind.rules().hours == Hours::UsTradingDays
+                    && recorded_empty(id.kind, &closures, last + MINUTE, range.1)
+            })
+            .and(bars.last().map(|b| b.open_time));
         also_traded.push(AlsoTradedBars {
             instrument: id.clone(),
             bars,
             funding,
+            left_at,
         });
     }
     Ok(also_traded)
@@ -597,15 +639,31 @@ fn held_before(
             return Ok(Some("candles"));
         }
     }
+    if !id.kind.rules().funding {
+        return Ok(None);
+    }
     let funding = store.load_funding(id, Millis::MIN, end - max_gap(id.kind) + 1)?;
     Ok((!funding.is_empty()).then_some("funding rates"))
 }
+
+const FOUND_NOTHING: &str = "downloads asked the venue for all of that and it had nothing there, so a download cannot fill it";
+
+fn found_nothing(store: &Store, id: &InstrumentId, spans: &[Gap]) -> Result<bool, ApiError> {
+    for g in spans {
+        if !store.recorded_empty(id, g.from, g.to)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+type StoredBids = (Vec<Candle>, Vec<Gap>, Closures, Option<(Millis, Millis)>);
 
 fn stored_bids(
     store: &Store,
     config: &BacktestConfig,
     id: &InstrumentId,
-) -> Result<(Vec<Candle>, Vec<Gap>, Closures), ApiError> {
+) -> Result<StoredBids, ApiError> {
     let (from, to) = data_range(config)?;
     let mut minutes = Vec::new();
     for stored in read_months(store, id, &Month::range(from, to)) {
@@ -615,7 +673,71 @@ fn stored_bids(
     let closures = store.closures(id, from, to)?;
     let gaps = closures.remove(missing_minutes(id.kind, &minutes, from, to));
     let bars = resample(id.kind, &minutes, config.timeframe, false).candles;
-    Ok((bars, gaps, closures))
+    Ok((bars, gaps, closures, held(&minutes)))
+}
+
+fn held(minutes: &[Candle]) -> Option<(Millis, Millis)> {
+    Some((minutes.first()?.open_time, minutes.last()?.open_time))
+}
+
+fn recorded_empty(kind: InstrumentKind, closures: &Closures, from: Millis, to: Millis) -> bool {
+    let open = missing_minutes(kind, &[], from, to);
+    !open.is_empty() && closures.remove(open).is_empty()
+}
+
+fn trades_whole_range(
+    id: &InstrumentId,
+    (from, to): (Millis, Millis),
+    held: Option<(Millis, Millis)>,
+    closures: &Closures,
+) -> Result<(), ApiError> {
+    if id.kind.rules().hours != Hours::UsTradingDays {
+        return Ok(());
+    }
+    let empty = |lo, hi| recorded_empty(id.kind, closures, lo, hi);
+    let refuse = |lo, hi, fix: String| {
+        Err(data_missing(format!(
+            "the venue has no {id} bars {}: downloads asked for them and it had none; the first \
+             instrument of a run must trade from the start of its range to the end, so {fix}",
+            span(lo, hi)
+        )))
+    };
+    match held {
+        None if empty(from, to) => refuse(from, to, "choose a range it trades in".into()),
+        Some((first, _)) if empty(from, first) => refuse(
+            from,
+            first,
+            format!(
+                "start the range on {} or trade {id} beside another instrument",
+                format_date(first)
+            ),
+        ),
+        Some((_, last)) if empty(last + MINUTE, to) => refuse(
+            last + MINUTE,
+            to,
+            format!(
+                "end the range after its last bar, on {}, or trade {id} beside another instrument",
+                format_date(last)
+            ),
+        ),
+        _ => Ok(()),
+    }
+}
+
+fn days_without_bars(
+    store: &Store,
+    id: &InstrumentId,
+    bars: &[Candle],
+    step: Millis,
+) -> Result<i64, ApiError> {
+    let (Some(first), Some(last)) = (bars.first(), bars.last()) else {
+        return Ok(0);
+    };
+    if id.kind.rules().hours != Hours::UsTradingDays {
+        return Ok(0);
+    }
+    let (from, to) = (first.open_time, last.open_time + step);
+    Ok(store.closures(id, from, to)?.closed_in(from, to) / MINUTE)
 }
 
 /// The rows of each series `config` names ([`BacktestConfig::series`]), from
@@ -671,6 +793,7 @@ pub(super) fn run_shortfall(
     // Each month's missing minutes; a gap that a month's end cuts is joined again by `refusal`.
     let mut gaps = Vec::new();
     let mut any_bar = false;
+    let mut stored_span: Option<(Millis, Millis)> = None;
     // Minutes of a bucket that a month's end cuts, kept for the next month.
     let mut pending: Vec<Candle> = Vec::new();
     let months = Month::range(from, to);
@@ -685,6 +808,9 @@ pub(super) fn run_shortfall(
             .copied()
             .collect();
         gaps.extend(missing_minutes(id.kind, &minutes, start, end));
+        if let Some((first, last)) = held(&minutes) {
+            stored_span = Some((stored_span.map_or(first, |(f, _)| f), last));
+        }
         if any_bar {
             continue;
         }
@@ -709,6 +835,7 @@ pub(super) fn run_shortfall(
     };
     let closures = store.closures(id, from, to)?;
     let gaps = closures.remove(gaps);
+    trades_whole_range(id, (from, to), stored_span, &closures)?;
     read_references(store, config)?;
     read_series(store, config, cutoff)?;
     read_also_traded(store, config)?;
@@ -929,9 +1056,11 @@ fn load_or_shortfall(
         gaps,
         closures,
         funding,
+        held,
     } = read_data(store, config)?;
     let any_bar = !loaded.candles.is_empty();
     let id = &config.instrument.id;
+    trades_whole_range(id, (from, to), held, &closures)?;
     if let Some(s) = shortfall(id, (from, to), &gaps, &closures, any_bar, &funding) {
         return Ok(Err(s));
     }
@@ -954,6 +1083,18 @@ fn load_or_shortfall(
                 .is_empty()
         })
         .collect();
+    let mut halted = Vec::new();
+    let traded = std::iter::once((id, &loaded.candles))
+        .chain(also_traded.iter().map(|leg| (&leg.instrument, &leg.bars)));
+    for (instrument, bars) in traded {
+        let days = days_without_bars(store, instrument, bars, step)?;
+        if days > 0 {
+            halted.push(DaysWithoutBars {
+                instrument: instrument.clone(),
+                days,
+            });
+        }
+    }
     let report = DataReport {
         bars: loaded.candles.len(),
         gaps: gaps.iter().map(GapInfo::from).collect(),
@@ -972,6 +1113,7 @@ fn load_or_shortfall(
             })
             .collect(),
         funding_rates: funding.len(),
+        days_without_bars: (!halted.is_empty()).then_some(halted),
     };
     Ok(Ok(RunData {
         bars: loaded.candles,

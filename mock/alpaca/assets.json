@@ -1,0 +1,9 @@
+[
+{"id":"b0b6dd9d-8b9b-48a9-ba46-b9d54906e415","class":"us_equity","exchange":"NASDAQ","symbol":"AAPL","name":"Apple Inc. Common Stock","status":"active","tradable":true,"marginable":true,"shortable":true,"easy_to_borrow":true,"fractionable":true},
+{"id":"b6d1aa75-5c9c-4353-a305-9e2caa1925ab","class":"us_equity","exchange":"NASDAQ","symbol":"MSFT","name":"Microsoft Corporation Common Stock","status":"active","tradable":true,"marginable":true,"shortable":true,"easy_to_borrow":true,"fractionable":true},
+{"id":"b28f4066-5c6d-479b-a2af-85dc1a8f16fb","class":"us_equity","exchange":"ARCA","symbol":"SPY","name":"SPDR S&P 500 ETF Trust","status":"active","tradable":true,"marginable":true,"shortable":true,"easy_to_borrow":true,"fractionable":true},
+{"id":"fc6a5dcd-4a70-4b8d-b64f-d83a6dae9ba4","class":"us_equity","exchange":"NASDAQ","symbol":"META","name":"Meta Platforms, Inc. Class A Common Stock","status":"active","tradable":true,"marginable":true,"shortable":true,"easy_to_borrow":true,"fractionable":true},
+{"id":"8ccae427-5dd0-45b3-b5fe-7ba5e422c766","class":"us_equity","exchange":"NYSE","symbol":"TWTR","name":"Twitter, Inc. Common Stock","status":"inactive","tradable":false,"marginable":false,"shortable":false,"easy_to_borrow":false,"fractionable":false},
+{"id":"0a5b2c8e-6f0e-4d6a-9d3c-2f4a1b7c9e10","class":"us_equity","exchange":"NYSE","symbol":"TWTR","name":"An earlier listing under the same symbol","status":"inactive","tradable":false,"marginable":false,"shortable":false,"easy_to_borrow":false,"fractionable":false},
+{"id":"3f5c8a1e-2b7d-4e9a-8c6f-1d2e3f4a5b6c","class":"us_equity","exchange":"NYSE","symbol":"BRK.B","name":"Berkshire Hathaway Inc. Class B","status":"active","tradable":true,"marginable":true,"shortable":true,"easy_to_borrow":true,"fractionable":true}
+]

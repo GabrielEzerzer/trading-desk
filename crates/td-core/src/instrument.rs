@@ -13,6 +13,7 @@ pub enum Venue {
     Bybit,
     /// OANDA's v20 REST API on a practice account: FX bid and ask candles, no trading.
     Oanda,
+    Alpaca,
 }
 
 impl fmt::Display for Venue {
@@ -21,6 +22,7 @@ impl fmt::Display for Venue {
             Venue::Binance => "binance",
             Venue::Bybit => "bybit",
             Venue::Oanda => "oanda",
+            Venue::Alpaca => "alpaca",
         })
     }
 }
@@ -34,6 +36,7 @@ pub enum InstrumentKind {
     Perpetual,
     /// A spot currency pair, for example USD/JPY.
     Fx,
+    Stock,
 }
 
 impl fmt::Display for InstrumentKind {
@@ -42,6 +45,7 @@ impl fmt::Display for InstrumentKind {
             InstrumentKind::Spot => "spot",
             InstrumentKind::Perpetual => "perpetual",
             InstrumentKind::Fx => "fx",
+            InstrumentKind::Stock => "stock",
         })
     }
 }

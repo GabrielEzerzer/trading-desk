@@ -129,4 +129,44 @@ mod tests {
         // 1m, 5m, 15m, 30m, 1h, 4h, 1d, 1w.
         assert_eq!(tolerated, [0, 0, 0, 0, 0, 2, 14, 100]);
     }
+
+    #[test]
+    fn stock_bars_make_one_daily_bar_per_trading_day_and_whole_weeks() {
+        let day0 = crate::time::parse_date("2024-01-01").expect("a date") / crate::time::DAY;
+        let minutes: Vec<Candle> = (day0..day0 + 35)
+            .filter_map(td_core::us_bar_minute)
+            .enumerate()
+            .map(|(i, m)| Candle {
+                open_time: m.start,
+                open: 100.0 + i as f64,
+                high: 101.0 + i as f64,
+                low: 99.0 + i as f64,
+                close: 100.5 + i as f64,
+                volume: 10.0,
+                quote_volume: 0.0,
+            })
+            .collect();
+        let daily = resample(InstrumentKind::Stock, &minutes, Timeframe::D1, false);
+        assert_eq!(daily.candles.len(), 23);
+        assert!(daily.dropped.is_empty() && daily.tolerated.is_empty());
+        assert!(
+            daily
+                .candles
+                .iter()
+                .all(|c| c.open_time % crate::time::DAY == 0)
+        );
+        let weekly = resample(InstrumentKind::Stock, &minutes, Timeframe::W1, false);
+        assert!(weekly.dropped.is_empty(), "{:?}", weekly.dropped);
+        assert_eq!(weekly.candles.len(), 5);
+        assert_eq!(weekly.candles.iter().map(|c| c.volume).sum::<f64>(), 230.0);
+
+        let mut holed = minutes.clone();
+        holed.remove(3);
+        let weekly = resample(InstrumentKind::Stock, &holed, Timeframe::W1, false);
+        assert_eq!(
+            weekly.dropped.len(),
+            1,
+            "a week missing a trading day is incomplete"
+        );
+    }
 }

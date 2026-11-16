@@ -14,15 +14,11 @@ import { type LabJob, type LabSource, RunCancelled, readableName } from './sourc
 const STARTING_CASH = 10_000
 const SLIPPAGE_BPS = 2
 
-/**
- * The earliest `from` a download of each venue accepts (`earliest_from` in td-server's data.rs):
- * 2017-01-01 UTC for Binance and Bybit, before either has data, and 2007-01-01 UTC for OANDA, since
- * the desk's FX market hours follow the US daylight-saving rule in force since 2007.
- */
 export const HISTORY_FROM: Record<Venue, number> = {
   binance: 1_483_228_800_000,
   bybit: 1_483_228_800_000,
   oanda: 1_167_609_600_000,
+  alpaca: 1_451_606_400_000,
 }
 
 /** What the Lab says when a download fails because the engine has no OANDA token. */

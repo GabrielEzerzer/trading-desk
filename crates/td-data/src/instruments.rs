@@ -6,7 +6,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use td_core::{FeeSchedule, Instrument, InstrumentKind, Millis, Venue};
+use td_core::{FeeSchedule, Instrument, InstrumentId, InstrumentKind, Millis, Venue};
 
 use crate::http::Http;
 use crate::source::{DataSource, source};
@@ -21,6 +21,12 @@ pub const INSTRUMENT_CACHE_AGE: Millis = DAY;
 /// venue does not list.
 pub fn default_fees(venue: Venue, kind: InstrumentKind) -> Result<FeeSchedule, DataError> {
     source(venue).default_fees(kind)
+}
+
+pub fn unlisted_instrument(id: &InstrumentId) -> Option<Instrument> {
+    source(id.venue)
+        .unlisted(id)
+        .filter(|i| validate_instrument(i).is_ok())
 }
 
 /// The instruments a venue lists, and those it lists that failed validation.
@@ -118,7 +124,7 @@ struct CachedList {
 }
 
 /// [`cached_instruments`] from a given source, at `now`.
-fn list_cached(
+pub(crate) fn list_cached(
     source: &dyn DataSource,
     http: &Http,
     root: &Path,

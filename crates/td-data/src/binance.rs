@@ -87,7 +87,7 @@ impl DataSource for Binance {
             InstrumentKind::Spot => fetch_spot_instruments(http, SPOT_INFO_URL),
             // `/fapi/v1/exchangeInfo` takes no filters; gzip alone shrinks it.
             InstrumentKind::Perpetual => parse_binance_usdm(&http.get_text(USDM_INFO_URL, &[])?),
-            InstrumentKind::Fx => Err(not_listed(kind)),
+            InstrumentKind::Fx | InstrumentKind::Stock => Err(not_listed(kind)),
         }
     }
 
@@ -95,7 +95,7 @@ impl DataSource for Binance {
         match kind {
             InstrumentKind::Spot => Ok(BINANCE_SPOT_FEES),
             InstrumentKind::Perpetual => Ok(BINANCE_USDM_FEES),
-            InstrumentKind::Fx => Err(not_listed(kind)),
+            InstrumentKind::Fx | InstrumentKind::Stock => Err(not_listed(kind)),
         }
     }
 
@@ -155,7 +155,7 @@ impl LiveStream for Binance {
             }
             // Never connected to: a stream for a kind the source does not list refuses to open
             // (see `SharedStream::open_on`).
-            InstrumentKind::Fx => String::new(),
+            InstrumentKind::Fx | InstrumentKind::Stock => String::new(),
         }
     }
 
@@ -225,7 +225,7 @@ fn archive_market(kind: InstrumentKind) -> Result<&'static str, DataError> {
     match kind {
         InstrumentKind::Spot => Ok("spot"),
         InstrumentKind::Perpetual => Ok("futures/um"),
-        InstrumentKind::Fx => Err(not_listed(kind)),
+        InstrumentKind::Fx | InstrumentKind::Stock => Err(not_listed(kind)),
     }
 }
 
@@ -451,7 +451,7 @@ pub fn fetch_klines(
     let url = match id.kind {
         InstrumentKind::Spot => SPOT_KLINES_URL,
         InstrumentKind::Perpetual => USDM_KLINES_URL,
-        InstrumentKind::Fx => return Err(not_listed(id.kind)),
+        InstrumentKind::Fx | InstrumentKind::Stock => return Err(not_listed(id.kind)),
     };
     let to = to.min(timeframe.floor(now_ms()));
     let open_time = |c: &Candle| c.open_time;
@@ -635,7 +635,7 @@ fn parse_binance(body: &str, kind: InstrumentKind) -> Result<InstrumentList, Dat
             && match kind {
                 InstrumentKind::Spot => true,
                 InstrumentKind::Perpetual => s.contract_type.as_deref() == Some("PERPETUAL"),
-                InstrumentKind::Fx => false,
+                InstrumentKind::Fx | InstrumentKind::Stock => false,
             };
         if listed {
             list.push(&s.symbol, binance_instrument(s, kind));
@@ -664,7 +664,7 @@ fn binance_instrument(s: &BinanceSymbol, kind: InstrumentKind) -> Result<Instrum
             "MIN_NOTIONAL.notional",
             filter("MIN_NOTIONAL").map(|f| &f.notional),
         )?,
-        InstrumentKind::Fx => return Err(not_listed(kind).to_string()),
+        InstrumentKind::Fx | InstrumentKind::Stock => return Err(not_listed(kind).to_string()),
     };
     Ok(Instrument {
         id: InstrumentId {

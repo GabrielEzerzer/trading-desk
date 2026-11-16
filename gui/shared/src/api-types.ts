@@ -4,9 +4,9 @@
 /**
  * An exchange the desk reads data from and simulates orders against.
  */
-export type Venue = "binance" | "bybit" | "oanda";
+export type Venue = "binance" | "bybit" | "oanda" | "alpaca";
 
-export type InstrumentKind = "spot" | "perpetual" | "fx";
+export type InstrumentKind = "spot" | "perpetual" | "fx" | "stock";
 
 /**
  * Identifies an instrument across venues. The same symbol can exist as spot and as a perpetual on
@@ -2363,12 +2363,7 @@ export type RejectedInstrument = { symbol: string, reason: string, };
  * What to download: the 1-minute candles of `instrument` with open times in `[from, to)`, and
  * for a perpetual its funding rates in the same range. Anything after now is skipped.
  */
-export type DownloadRequest = { instrument: InstrumentId, 
-/**
- * Not before 2017-01-01 00:00 UTC (1483228800000) for binance and bybit, or before
- * 2007-01-01 00:00 UTC (1167609600000) for oanda; earlier is a 400.
- */
-from: number, to: number, };
+export type DownloadRequest = { instrument: InstrumentId, from: number, to: number, };
 
 /**
  * What a download did.
@@ -2828,7 +2823,9 @@ tolerated: Array<ToleratedBucket>,
 /**
  * Funding rates given to the run; 0 for spot.
  */
-funding_rates: number, };
+funding_rates: number, days_without_bars?: Array<DaysWithoutBars>, };
+
+export type DaysWithoutBars = { instrument: InstrumentId, days: number, };
 
 /**
  * A bucket built although a few of its minutes are missing, within td-data's tolerance.

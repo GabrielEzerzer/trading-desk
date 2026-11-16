@@ -81,7 +81,9 @@ impl From<DataError> for ApiError {
         match e {
             // A stored month without its asks, read for a run or merged into by a download: it
             // cannot be used until it is deleted and downloaded again.
-            DataError::NoAskColumns { .. } => {
+            DataError::NoAskColumns { .. }
+            | DataError::AdjustmentMismatch { .. }
+            | DataError::AdjustmentChanged { .. } => {
                 ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, "data_missing", message)
             }
             // Only writes give these, and the server writes only what a download's source gave.
@@ -100,7 +102,9 @@ impl From<DataError> for ApiError {
             | DataError::NoLiveStream(_)
             | DataError::InvalidInstrument { .. }
             | DataError::MissingOandaToken
-            | DataError::OandaRefused { .. } => ApiError::bad_request(message),
+            | DataError::OandaRefused { .. }
+            | DataError::MissingAlpacaKeys
+            | DataError::AlpacaRefused { .. } => ApiError::bad_request(message),
             DataError::InstrumentBusy(_) => {
                 ApiError::new(StatusCode::CONFLICT, "conflict", message)
             }
@@ -169,6 +173,24 @@ mod tests {
                 502,
                 "venue",
             ),
+            (
+                DataError::AdjustmentChanged {
+                    instrument: "alpaca:AAPL:stock".into(),
+                    date: "2024-01-16".into(),
+                },
+                422,
+                "data_missing",
+            ),
+            (
+                DataError::AdjustmentMismatch {
+                    instrument: "alpaca:AAPL:stock".into(),
+                    stored: "raw".into(),
+                    wanted: "all".into(),
+                },
+                422,
+                "data_missing",
+            ),
+            (DataError::MissingAlpacaKeys, 400, "bad_request"),
         ];
         for (e, status, code) in cases {
             let message = e.to_string();

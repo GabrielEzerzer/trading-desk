@@ -13,14 +13,6 @@
 //! month the venue had nothing for at all, such as one before an instrument was listed, gets a
 //! record and no month file; for a kind with closed hours it gets neither.
 //!
-//! When the records are read ([`Store::closures`]), spans that meet, at a month's end or across
-//! closed hours, join into one stretch. A stretch holding at most [`SHORT_CLOSURE`] of open time,
-//! such as a late Sunday open, counts as closed. A longer one counts as closed only if it holds at
-//! most [`LONGEST_CLOSURE`] and overlaps the year-end holidays, 24 December 00:00 to 3 January
-//! 00:00 UTC, where OANDA's day-long closures fall. Any other stretch is an outage, not a closure:
-//! it stays missing, so its month is not complete and the run check refuses a long one. The records
-//! of a kind that never closes are not read as closures, so a crypto outage is always missing.
-//!
 //! A month downloaded before records were written has none: all its missing open time counts as
 //! missing, as before, and the run check keeps a wider limit for it (`max_gap` in td-server).
 //!
@@ -223,10 +215,6 @@ impl Store {
         Ok(recorded.remove(open).is_empty())
     }
 
-    /// The closures recorded over `[from, to)`: each stretch of recorded spans, joined where they
-    /// meet at a month's end or across closed hours, that counts as closed by the rule in this
-    /// module's doc. The months either side of the range are read too, so a stretch the range cuts
-    /// is judged whole. Nothing for a kind that never closes.
     pub fn closures(
         &self,
         id: &InstrumentId,
@@ -238,8 +226,18 @@ impl Store {
         let (Some(&first), Some(&last)) = (months.first(), months.last()) else {
             return Ok(closures);
         };
-        if id.kind.rules().hours == Hours::Always {
-            return Ok(closures);
+        match id.kind.rules().hours {
+            Hours::Always => return Ok(closures),
+            Hours::UsTradingDays => {
+                for &month in &months {
+                    if let Some(spans) = self.closure_record(id, month)? {
+                        closures.recorded.insert(month);
+                        closures.spans.extend(spans);
+                    }
+                }
+                return Ok(closures);
+            }
+            Hours::FxWeek => {}
         }
         let before = Month::containing(first.start() - 1);
         let mut recorded = Vec::new();

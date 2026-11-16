@@ -93,6 +93,7 @@ enum VenueArg {
     Binance,
     Bybit,
     Oanda,
+    Alpaca,
 }
 
 impl From<VenueArg> for Venue {
@@ -101,6 +102,7 @@ impl From<VenueArg> for Venue {
             VenueArg::Binance => Venue::Binance,
             VenueArg::Bybit => Venue::Bybit,
             VenueArg::Oanda => Venue::Oanda,
+            VenueArg::Alpaca => Venue::Alpaca,
         }
     }
 }
@@ -110,6 +112,7 @@ enum KindArg {
     Spot,
     Perpetual,
     Fx,
+    Stock,
 }
 
 impl From<KindArg> for InstrumentKind {
@@ -118,6 +121,7 @@ impl From<KindArg> for InstrumentKind {
             KindArg::Spot => InstrumentKind::Spot,
             KindArg::Perpetual => InstrumentKind::Perpetual,
             KindArg::Fx => InstrumentKind::Fx,
+            KindArg::Stock => InstrumentKind::Stock,
         }
     }
 }
@@ -347,6 +351,7 @@ mod tests {
             ("spot", InstrumentKind::Spot),
             ("perpetual", InstrumentKind::Perpetual),
             ("fx", InstrumentKind::Fx),
+            ("stock", InstrumentKind::Stock),
         ] {
             let cli = Cli::try_parse_from([
                 "td-data",

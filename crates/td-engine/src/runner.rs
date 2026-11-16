@@ -145,15 +145,6 @@ pub struct BacktestConfig {
 }
 
 impl BacktestConfig {
-    /// Refuses, in a run that names other traded instruments ([`BacktestConfig::also_traded`]),
-    /// a traded instrument that is not a perpetual, one on another venue or in another quote
-    /// currency than `instrument`, a base-currency account, an instrument named twice and one
-    /// that is also a reference. A run that names none passes.
-    ///
-    /// shortcut: perpetuals only, where one instrument's fills reach another only through the
-    /// account's equity. Spot would need the cash a buy spends shared between the instruments,
-    /// and FX the conversion of each instrument's quote currency into the account's; build those
-    /// into the account before allowing other kinds here.
     pub fn check_traded(&self) -> Result<(), EngineError> {
         if self.also_traded.is_empty() {
             return Ok(());
@@ -169,10 +160,17 @@ impl BacktestConfig {
         let traded: Vec<&Instrument> = std::iter::once(first).chain(&self.also_traded).collect();
         for (i, inst) in traded.iter().enumerate() {
             let id = &inst.id;
-            if id.kind != InstrumentKind::Perpetual {
+            if !matches!(id.kind, InstrumentKind::Perpetual | InstrumentKind::Stock) {
                 return refuse(format!(
-                    "{id} is not a perpetual; a run with several traded instruments trades \
-                     perpetuals only"
+                    "{id} is not a perpetual or a stock; a run with several traded instruments \
+                     trades perpetuals or stocks only"
+                ));
+            }
+            if id.kind != first.id.kind {
+                return refuse(format!(
+                    "{id} is a {}, not a {} like {}; every traded instrument must be of the same \
+                     kind",
+                    id.kind, first.id.kind, first.id
                 ));
             }
             if id.venue != first.id.venue {
@@ -414,6 +412,7 @@ pub struct AlsoTradedBars {
     pub bars: Vec<Candle>,
     /// Its funding events, `(time, rate)`, in any order.
     pub funding: Vec<(Millis, f64)>,
+    pub left_at: Option<Millis>,
 }
 
 /// [`run_with_references`] for a configuration that also names instruments traded beside the
@@ -946,6 +945,13 @@ fn align_traded(
             }
         }
         let listed_from = bars.first().map(|b| b.open_time);
+        if let Some(t) = g.left_at
+            && Some(t) != bars.last().map(|b| b.open_time)
+        {
+            return refuse(format!(
+                "{id} is said to stop trading at {t}, which is not the open of its last bar"
+            ));
+        }
         bars.retain(|b| {
             first_times.contains(&b.open_time) || (lo < b.open_time && b.open_time < hi)
         });
@@ -963,6 +969,7 @@ fn align_traded(
             bars,
             funding,
             listed_from,
+            left_at: g.left_at,
         });
     }
     Ok(legs)
@@ -1655,6 +1662,10 @@ fn fingerprint(
                     h.update(t.max(start).to_le_bytes());
                 }
                 None => h.update([0u8]),
+            }
+            if let Some(t) = leg.left_at {
+                h.update(b"left");
+                h.update(t.to_le_bytes());
             }
             let by_time: HashMap<Millis, &Candle> =
                 leg.bars.iter().map(|b| (b.open_time, b)).collect();
