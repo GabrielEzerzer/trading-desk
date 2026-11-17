@@ -84,9 +84,6 @@ pub struct BacktestConfig {
     /// The largest position allowed on a margined kind (perpetual, FX), as its notional over
     /// equity: 1.0 means 1x, the default. On a perpetual at 1x a long is liquidated only near a
     /// price of zero and a short only once the price has about doubled (see [`Session::on_bar`]).
-    /// Orders that would take the position over it are rejected when submitted; orders that
-    /// reduce the position are always allowed (see [`crate::Context::submit`]). A kind without
-    /// margin, such as spot, ignores it. Left out of the saved result when it is the default.
     #[serde(
         default = "default_max_leverage",
         skip_serializing_if = "is_default_max_leverage"

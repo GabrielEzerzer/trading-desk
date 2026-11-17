@@ -48,9 +48,6 @@ pub struct SessionConfig {
     pub slippage_bps: f64,
     /// Replaces the instrument's fee schedule when set.
     pub fees: Option<FeeSchedule>,
-    /// The largest position allowed on a margined kind (perpetual, FX), as its notional over the
-    /// account's equity: 1.0 means 1x. Checked when an order is submitted (see
-    /// [`Context::submit`]). A kind without margin, such as spot, ignores it.
     pub max_leverage: f64,
     /// The currency the account holds and reports every amount in; see [`Session::new`] for the
     /// kinds that allow [`AccountCurrency::Base`].

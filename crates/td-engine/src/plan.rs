@@ -102,7 +102,6 @@ pub struct Period {
 pub struct BacktestSettings {
     /// Starting balance in the account currency (`account_currency`).
     pub starting_cash: f64,
-    /// The perpetual leverage cap, as in [`BacktestConfig::max_leverage`]; 1.0 is 1x.
     pub max_leverage: f64,
     /// Slippage set for some of the plan's instruments. An instrument not listed here uses the
     /// backtest config's default slippage for that instrument (#35: 2 bps on BTC and ETH, 5 bps

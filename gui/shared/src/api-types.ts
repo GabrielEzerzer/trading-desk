@@ -200,9 +200,6 @@ fee_override: FeeSchedule | null,
  * The largest position allowed on a margined kind (perpetual, FX), as its notional over
  * equity: 1.0 means 1x, the default. On a perpetual at 1x a long is liquidated only near a
  * price of zero and a short only once the price has about doubled (see [`Session::on_bar`]).
- * Orders that would take the position over it are rejected when submitted; orders that
- * reduce the position are always allowed (see [`crate::Context::submit`]). A kind without
- * margin, such as spot, ignores it. Left out of the saved result when it is the default.
  */
 max_leverage?: number, 
 /**
@@ -983,11 +980,7 @@ export type BacktestSettings = {
 /**
  * Starting balance in the account currency (`account_currency`).
  */
-starting_cash: number, 
-/**
- * The perpetual leverage cap, as in [`BacktestConfig::max_leverage`]; 1.0 is 1x.
- */
-max_leverage: number, 
+starting_cash: number, max_leverage: number, 
 /**
  * Slippage set for some of the plan's instruments. An instrument not listed here uses the
  * backtest config's default slippage for that instrument (#35: 2 bps on BTC and ETH, 5 bps
@@ -1020,7 +1013,7 @@ instrument: InstrumentId,
  */
 bps: number, };
 
-export type StockShorting = { shortable: Shortable, borrow_rate: number, };
+export type StockShorting = { shortable: Shortable, borrow_rate?: number, };
 
 export type Shortable = "all" | { "only": Array<string> };
 

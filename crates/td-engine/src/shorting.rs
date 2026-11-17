@@ -12,8 +12,12 @@ const BORROW_DAYS_PER_YEAR: f64 = 360.0;
 #[serde(deny_unknown_fields)]
 pub struct StockShorting {
     pub shortable: Shortable,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_zero")]
     pub borrow_rate: f64,
+}
+
+fn is_zero(rate: &f64) -> bool {
+    *rate == 0.0
 }
 
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -103,6 +107,10 @@ mod tests {
     fn json_names_the_list_or_all_and_the_rate_defaults_to_zero() {
         let all: StockShorting = serde_json::from_str(r#"{"shortable":"all"}"#).unwrap();
         assert_eq!(all, StockShorting::new(Shortable::All));
+        assert_eq!(
+            serde_json::to_string(&all).unwrap(),
+            r#"{"shortable":"all"}"#
+        );
         let only: StockShorting =
             serde_json::from_str(r#"{"shortable":{"only":["SPY","QQQ"]},"borrow_rate":0.01}"#)
                 .unwrap();

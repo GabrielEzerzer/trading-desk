@@ -90,8 +90,8 @@ use crate::{
     AlsoTradedBars, BacktestConfig, BacktestResult, Criterion, Direction, DrawdownMode,
     EngineError, EquityPoint, EvidenceInputs, Headline, KindInputs, MAX_RUNS, Objective, Order,
     Outcome, Params, PermutationResult, PermutationSpec, PortfolioBenchmark, Progress, Series,
-    SweepResult, SweepSpec, TestPlan, TesterError, Trade, TradeSide, Verdict, VerdictRule,
-    WalkForwardResult, WalkForwardSpec, combine, evaluate, evaluate_evidence,
+    StockShorting, SweepResult, SweepSpec, TestPlan, TesterError, Trade, TradeSide, Verdict,
+    VerdictRule, WalkForwardResult, WalkForwardSpec, combine, evaluate, evaluate_evidence,
     permutation_test_with_traded, run_with_traded, sweep_with_traded, walk_forward_with_traded,
 };
 
@@ -1370,20 +1370,7 @@ fn run_stressed(
     multiplier: f64,
     (bars, asks, funding, references, series, also_traded): BatteryData,
 ) -> Result<BacktestResult, EngineError> {
-    let fees = config.fee_override.unwrap_or(config.instrument.fees);
-    let config = BacktestConfig {
-        fee_override: Some(stressed(fees, multiplier)),
-        slippage_bps: config.slippage_bps * multiplier,
-        also_traded: config
-            .also_traded
-            .iter()
-            .map(|inst| Instrument {
-                fees: stressed(inst.fees, multiplier),
-                ..inst.clone()
-            })
-            .collect(),
-        ..config.clone()
-    };
+    let config = stressed_config(config, multiplier);
     runner::run_with_traded_slippage(
         &config,
         bars,
@@ -1394,6 +1381,27 @@ fn run_stressed(
         also_traded,
         multiplier,
     )
+}
+
+fn stressed_config(config: &BacktestConfig, multiplier: f64) -> BacktestConfig {
+    let fees = config.fee_override.unwrap_or(config.instrument.fees);
+    BacktestConfig {
+        fee_override: Some(stressed(fees, multiplier)),
+        slippage_bps: config.slippage_bps * multiplier,
+        also_traded: config
+            .also_traded
+            .iter()
+            .map(|inst| Instrument {
+                fees: stressed(inst.fees, multiplier),
+                ..inst.clone()
+            })
+            .collect(),
+        short_stocks: config.short_stocks.clone().map(|s| StockShorting {
+            borrow_rate: s.borrow_rate * multiplier,
+            ..s
+        }),
+        ..config.clone()
+    }
 }
 
 /// R4's fees: every fee of `fees`, the per-unit commission too, times `multiplier`.
@@ -2777,6 +2785,20 @@ mod tests {
                 per_unit: 0.000_07,
             }
         );
+    }
+
+    #[test]
+    fn the_cost_stress_multiplies_the_borrow_fee_of_a_short_stock() {
+        let config = BacktestConfig {
+            short_stocks: Some(StockShorting {
+                borrow_rate: 0.03,
+                ..StockShorting::new(crate::Shortable::All)
+            }),
+            ..test_config()
+        };
+        let stressed = stressed_config(&config, 2.0);
+        assert_eq!(stressed.short_stocks.map(|s| s.borrow_rate), Some(0.06));
+        assert_eq!(stressed_config(&test_config(), 2.0).short_stocks, None);
     }
 
     #[test]
