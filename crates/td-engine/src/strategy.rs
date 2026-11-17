@@ -285,15 +285,6 @@ impl Context<'_> {
         self.warming_up
     }
 
-    /// Rounds the order to the instrument's lot and tick, validates it and sends it to the
-    /// broker. Quantities round down; limit prices round in the order's favour-safe direction
-    /// (buys down, sells up) so an order never trades worse than asked; triggers round to the
-    /// nearest tick. On spot, a sell must fit in the holding less the open sells, and a buy must
-    /// fit in the cash together with the open buys: each buy is valued at its limit price, its
-    /// trigger, or this bar's close for a market order, plus the taker fee and any per-unit
-    /// commission. A spot buy is checked
-    /// again when it fills and cut to the cash then (see [`crate::SimBroker`]).
-    ///
     /// On a margined kind (perpetual, FX), an order that is not reduce-only is rejected if the
     /// position it could build is worth more than [`Context::max_leverage`] times the equity. A
     /// reduce-only order is never checked, as on a venue, so a strategy can always reduce or close,
@@ -590,7 +581,6 @@ impl Context<'_> {
         Ok(())
     }
 
-    /// Rounds and checks an order for traded instrument `k`, as [`Context::submit`] describes.
     fn prepare(&self, k: usize, mut req: OrderRequest) -> (OrderRequest, Result<(), String>) {
         let inst = self.inst_at(k);
         let limit_rounding = match req.side {
@@ -616,17 +606,22 @@ impl Context<'_> {
         }
         let rules = inst.id.kind.rules();
         if !rules.can_short && req.side == Side::Sell {
-            // Open sells count against the holding, so several sells cannot add up to a short.
             let pending: f64 = self
                 .orders_at(k)
                 .iter()
                 .filter(|o| o.request.side == Side::Sell)
+                .filter(|o| !req.reduce_only || !o.request.reduce_only)
                 .map(|o| o.request.qty)
                 .sum();
             let available = self.position_at(k) - pending;
             if req.qty > available * (1.0 + 1e-9) {
+                let open = if req.reduce_only {
+                    "the open sells that are not reduce-only"
+                } else {
+                    "every open sell, reduce-only ones included"
+                };
                 let reason = format!(
-                    "spot cannot sell more than it holds: selling {}, {} available",
+                    "spot cannot sell more than it holds: selling {}, {} available after {open}",
                     req.qty, available
                 );
                 return (req, Err(reason));
