@@ -238,6 +238,11 @@ impl<M: FillModel> SimBroker<M> {
             if qty <= 0.0 {
                 return Err("reduce-only order would not reduce the position".into());
             }
+        } else if !inst.id.kind.rules().can_short && req.side == Side::Sell {
+            qty = inst.round_qty(qty.min(book.position().max(0.0)));
+            if qty <= 0.0 {
+                return Err("spot sell cancelled at fill time: nothing is held".into());
+            }
         }
         let rate = match liquidity {
             Liquidity::Maker => self.fees.maker,

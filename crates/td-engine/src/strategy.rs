@@ -581,7 +581,6 @@ impl Context<'_> {
         Ok(())
     }
 
-    /// Rounds and checks an order for traded instrument `k`, as [`Context::submit`] describes.
     fn prepare(&self, k: usize, mut req: OrderRequest) -> (OrderRequest, Result<(), String>) {
         let inst = self.inst_at(k);
         let limit_rounding = match req.side {
