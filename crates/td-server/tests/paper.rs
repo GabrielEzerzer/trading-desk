@@ -846,6 +846,7 @@ fn seen_in_backtest(
         series: Vec::new(),
         also_traded: Vec::new(),
         start_when_all_listed: false,
+        short_stocks: None,
     };
     let seen = Arc::new(Mutex::new(Vec::new()));
     let strategy = Box::new(SeesFunding(seen.clone()));

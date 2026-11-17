@@ -262,7 +262,7 @@ also_traded?: Array<Instrument>,
  * warm-up bars: the strategy sees them but cannot trade. Left out of the saved result when it
  * is not set, the default.
  */
-start_when_all_listed?: boolean, };
+start_when_all_listed?: boolean, short_stocks?: StockShorting | null, };
 
 export type BacktestResult = { config: BacktestConfig, 
 /**
@@ -1005,7 +1005,7 @@ account_currency?: AccountCurrency,
  * [`BacktestConfig::fee_override`]: a broker's commission per unit of an FX pair, for
  * example. Left out of JSON when it is not set, the default.
  */
-fee_override?: FeeSchedule | null, };
+fee_override?: FeeSchedule | null, short_stocks?: StockShorting | null, };
 
 /**
  * One instrument's slippage, overriding the backtest config's default for it.
@@ -1019,6 +1019,10 @@ instrument: InstrumentId,
  * Slippage on market and stop fills, in basis points of price.
  */
 bps: number, };
+
+export type StockShorting = { shortable: Shortable, borrow_rate: number, };
+
+export type Shortable = "all" | { "only": Array<string> };
 
 /**
  * The parameter grid. It always runs as a full grid, because the plateau test (R5) reads each

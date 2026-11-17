@@ -663,6 +663,7 @@ impl Sessions {
             series: Vec::new(),
             also_traded: Vec::new(),
             start_when_all_listed: false,
+            short_stocks: None,
         };
         let result = td_engine::run_with_references(&backtest, &bars, &[], &due, &references, &[]);
         let result = result.map_err(|e| {

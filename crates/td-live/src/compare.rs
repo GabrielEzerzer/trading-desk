@@ -412,6 +412,7 @@ pub(crate) fn compare(
         series: Vec::new(),
         also_traded: Vec::new(),
         start_when_all_listed: false,
+        short_stocks: None,
     };
     let result = catch_unwind(AssertUnwindSafe(|| {
         let strategy = build(&config.strategy, &config.params)?;

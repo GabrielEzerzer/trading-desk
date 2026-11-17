@@ -528,5 +528,6 @@ pub(crate) fn pair_config(strategy: &str, n: i64) -> BacktestConfig {
         series: Vec::new(),
         also_traded: vec![pair_second()],
         start_when_all_listed: false,
+        short_stocks: None,
     }
 }

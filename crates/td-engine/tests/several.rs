@@ -69,6 +69,7 @@ fn config(n: i64) -> BacktestConfig {
         series: Vec::new(),
         also_traded: vec![b()],
         start_when_all_listed: false,
+        short_stocks: None,
     }
 }
 

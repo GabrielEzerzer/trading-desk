@@ -28,8 +28,8 @@ use td_core::{
 use crate::metrics::DAY_MS;
 use crate::tester::refuse_short_first_train;
 use crate::{
-    BacktestConfig, MAX_RUNS, Objective, OosSpec, ParamAxis, Params, Split, SweepMode, SweepSpec,
-    WalkForwardSpec, WindowMode, WindowSpec, default_slippage_bps,
+    BacktestConfig, MAX_RUNS, Objective, OosSpec, ParamAxis, Params, Split, StockShorting,
+    SweepMode, SweepSpec, WalkForwardSpec, WindowMode, WindowSpec, default_slippage_bps,
 };
 
 /// The fewest permutations the luck test (R3) may run. With 49 the smallest p it can report is
@@ -118,6 +118,8 @@ pub struct BacktestSettings {
     /// example. Left out of JSON when it is not set, the default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fee_override: Option<FeeSchedule>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub short_stocks: Option<StockShorting>,
 }
 
 /// One instrument's slippage, overriding the backtest config's default for it.
@@ -168,6 +170,7 @@ impl BacktestSettings {
             slippage,
             account_currency: AccountCurrency::Quote,
             fee_override: None,
+            short_stocks: None,
         }
     }
 
@@ -444,6 +447,7 @@ impl TestPlan {
             series: Vec::new(),
             also_traded: Vec::new(),
             start_when_all_listed: false,
+            short_stocks: self.backtest.short_stocks.clone(),
         }
     }
 
@@ -521,6 +525,13 @@ impl TestPlan {
             && !(f.maker.is_finite() && f.taker.is_finite() && f.per_unit.is_finite())
         {
             return refuse("the fee override's fees must be numbers");
+        }
+        if let Some(shorting) = &b.short_stocks {
+            for id in &self.instruments {
+                shorting
+                    .check(id.kind)
+                    .map_err(|why| PlanError(why.into()))?;
+            }
         }
         let bar = tf.duration_ms();
         let w = &self.walk_forward;
@@ -1013,7 +1024,7 @@ mod tests {
     #[test]
     fn invalid_plans_are_refused() {
         type Tweak = fn(&mut TestPlan);
-        let cases: [(&str, Tweak); 17] = [
+        let cases: [(&str, Tweak); 18] = [
             ("no instruments", |p| p.instruments.clear()),
             ("an instrument twice", |p| {
                 let first = p.instruments[0].clone();
@@ -1053,6 +1064,12 @@ mod tests {
                     per_unit: f64::NAN,
                 });
             }),
+            (
+                "short sales of stocks on a run that trades no stocks",
+                |p| {
+                    p.backtest.short_stocks = Some(StockShorting::new(crate::Shortable::All));
+                },
+            ),
             ("no test days", |p| p.walk_forward.test_days = 0),
             ("days that are not whole weekly bars", |p| {
                 p.timeframe = Timeframe::W1;

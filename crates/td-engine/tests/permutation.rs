@@ -107,6 +107,7 @@ fn spec(permutations: usize, seed: u64) -> PermutationSpec {
         series: Vec::new(),
         also_traded: Vec::new(),
         start_when_all_listed: false,
+        short_stocks: None,
     };
     PermutationSpec {
         sweep: SweepSpec {

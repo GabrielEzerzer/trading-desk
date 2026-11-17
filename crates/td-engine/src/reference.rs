@@ -285,6 +285,7 @@ pub(crate) mod tests {
             series: Vec::new(),
             also_traded: Vec::new(),
             start_when_all_listed: false,
+            short_stocks: None,
         }
     }
 

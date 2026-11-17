@@ -38,6 +38,7 @@ mod runner;
 mod saved_verdicts;
 mod series;
 mod session;
+mod shorting;
 pub mod stats;
 mod stops;
 mod strategies;
@@ -96,6 +97,7 @@ pub use session::{
     CLOSE_OUT_TAG, EquityPoint, LEFT_TAG, LIQUIDATION_TAG, MAINTENANCE_MARGIN_RATE, Session,
     SessionConfig, run_backtest,
 };
+pub use shorting::{Shortable, StockShorting};
 pub use stops::{SavedStopState, StopError, StopFired, StopRule, StopRules, StopState};
 pub use strategies::gotobi_calendar;
 pub use strategy::{Context, Strategy};

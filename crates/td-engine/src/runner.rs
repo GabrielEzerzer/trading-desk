@@ -18,7 +18,8 @@ use crate::series::{Series, SeriesRow, known_by};
 use crate::session::{LegData, check_quote, funding_ranges, sorted_funding};
 use crate::{
     BarFunding, CLOSE_OUT_TAG, CandleFillModel, EngineError, EquityPoint, Order, Params, Portfolio,
-    Session, SessionConfig, Strategy, Trade, attach_stops, build_strategy, build_trades,
+    Session, SessionConfig, StockShorting, Strategy, Trade, attach_stops, build_strategy,
+    build_trades,
 };
 
 /// The slippage a backtest gets when its configuration leaves `slippage_bps` out, in basis
@@ -142,6 +143,8 @@ pub struct BacktestConfig {
     /// is not set, the default.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub start_when_all_listed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub short_stocks: Option<StockShorting>,
 }
 
 impl BacktestConfig {
@@ -243,6 +246,8 @@ impl<'de> Deserialize<'de> for BacktestConfig {
             also_traded: Vec<Instrument>,
             #[serde(default)]
             start_when_all_listed: bool,
+            #[serde(default)]
+            short_stocks: Option<StockShorting>,
         }
         let g = Given::deserialize(deserializer)?;
         Ok(BacktestConfig {
@@ -265,6 +270,7 @@ impl<'de> Deserialize<'de> for BacktestConfig {
             series: g.series,
             also_traded: g.also_traded,
             start_when_all_listed: g.start_when_all_listed,
+            short_stocks: g.short_stocks,
         })
     }
 }
@@ -756,6 +762,9 @@ fn simulate<'a>(
         account_currency: config.account_currency,
     };
     let mut session = Session::new(strategy, config.instrument.clone(), tf, session_config)?;
+    if let Some(shorting) = &config.short_stocks {
+        session.allow_short_sales(shorting.clone())?;
+    }
     session.name_references(references.iter().map(|(id, _)| id.clone()).collect())?;
     session.name_series(named.iter().map(|s| (*s).clone()).collect())?;
     if !legs.is_empty() {
@@ -1778,6 +1787,7 @@ mod tests {
             series: Vec::new(),
             also_traded: Vec::new(),
             start_when_all_listed: false,
+            short_stocks: None,
         };
         let full = run(&config, &bars, &[], &funding).unwrap();
         assert!(full.metrics.trades > 2, "{:?}", full.metrics);
@@ -1866,6 +1876,7 @@ mod tests {
             series: Vec::new(),
             also_traded: Vec::new(),
             start_when_all_listed: false,
+            short_stocks: None,
         };
         let seen = FundingSeen::default();
         let strategy = Box::new(SeesFunding(seen.clone()));
@@ -2026,6 +2037,7 @@ mod tests {
                     series: Vec::new(),
                     also_traded: Vec::new(),
                     start_when_all_listed: false,
+                    short_stocks: None,
                 },
                 axes: Vec::new(),
                 mode: SweepMode::Grid,

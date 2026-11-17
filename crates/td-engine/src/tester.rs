@@ -2488,6 +2488,7 @@ mod tests {
                     series: Vec::new(),
                     also_traded: Vec::new(),
                     start_when_all_listed: false,
+                    short_stocks: None,
                 },
                 axes: vec![ParamAxis {
                     name: "hour".into(),
@@ -2571,6 +2572,7 @@ mod tests {
                     series: Vec::new(),
                     also_traded: Vec::new(),
                     start_when_all_listed: false,
+                    short_stocks: None,
                 },
                 axes: vec![ParamAxis {
                     name: "slow".into(),
@@ -2847,6 +2849,7 @@ mod tests {
             series: Vec::new(),
             also_traded: Vec::new(),
             start_when_all_listed: false,
+            short_stocks: None,
         }
     }
 

@@ -923,6 +923,7 @@ fn fx_backtest(bars: usize) -> td_engine::BacktestConfig {
         series: Vec::new(),
         also_traded: Vec::new(),
         start_when_all_listed: false,
+        short_stocks: None,
     }
 }
 
