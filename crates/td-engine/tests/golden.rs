@@ -795,6 +795,108 @@ fn spot_cannot_short_or_sell_more_than_it_holds() {
     approx(s.portfolio().position(), 0.4);
 }
 
+const DAY: i64 = 1_440 * MIN;
+const MONDAY_2024_01_08: i64 = 1_704_672_000_000;
+
+fn day_bar(i: i64, low: f64, high: f64) -> Candle {
+    let mut b = bar(0, 100.0, high, low, 100.0);
+    b.open_time = MONDAY_2024_01_08 + i * DAY;
+    b
+}
+
+fn stock_exits(day2: (f64, f64), day3: (f64, f64)) -> (Session, SubmitLog) {
+    let i = instrument(InstrumentKind::Stock);
+    let bars = [
+        day_bar(0, 99.0, 101.0),
+        day_bar(1, 99.0, 101.0),
+        day_bar(2, day2.0, day2.1),
+        day_bar(3, day3.0, day3.1),
+    ];
+    let (script, log) = Script::new(vec![
+        (0, req(&i, Side::Buy, 1.0, OrderType::Market)),
+        (
+            1,
+            reduce_only(req(&i, Side::Sell, 1.0, OrderType::Limit { price: 110.0 })),
+        ),
+        (
+            1,
+            reduce_only(req(&i, Side::Sell, 1.0, OrderType::Stop { trigger: 95.0 })),
+        ),
+    ]);
+    let s = run_backtest(script, i, Timeframe::D1, &bars, &[], &[], config(0.0)).unwrap();
+    (s, log)
+}
+
+#[test]
+fn reduce_only_exits_rest_together_for_a_stocks_whole_holding_and_the_first_closes_it() {
+    let (s, log) = stock_exits((99.0, 111.0), (94.0, 101.0));
+    assert!(log.lock().unwrap().iter().all(|r| r.is_ok()));
+    let f = s.fills();
+    assert_eq!(f.len(), 2);
+    assert_eq!(
+        (f[1].order_id.0, f[1].time),
+        (2, day_bar(2, 0.0, 0.0).open_time)
+    );
+    approx(f[1].price, 110.0);
+    approx(f[1].qty, 1.0);
+    assert_eq!(
+        s.orders()[2].status,
+        OrderStatus::Cancelled("reduce-only order would not reduce the position".into())
+    );
+    assert_eq!(s.portfolio().position(), 0.0);
+    assert!(s.open_orders().is_empty());
+}
+
+#[test]
+fn reduce_only_exits_on_a_stock_touched_in_one_bar_open_no_short() {
+    let (s, log) = stock_exits((94.0, 111.0), (99.0, 101.0));
+    assert!(log.lock().unwrap().iter().all(|r| r.is_ok()));
+    let f = s.fills();
+    assert_eq!(f.len(), 2);
+    assert_eq!(
+        (f[1].order_id.0, f[1].time),
+        (3, day_bar(2, 0.0, 0.0).open_time)
+    );
+    approx(f[1].price, 95.0);
+    approx(f[1].qty, 1.0);
+    assert_eq!(
+        s.orders()[1].status,
+        OrderStatus::Cancelled("reduce-only order would not reduce the position".into())
+    );
+    assert_eq!(s.portfolio().position(), 0.0);
+    assert!(s.open_orders().is_empty());
+}
+
+#[test]
+fn plain_sells_and_reduce_only_sells_on_a_stock_cannot_add_up_to_a_short() {
+    let i = instrument(InstrumentKind::Stock);
+    let bars: Vec<Candle> = (0..3).map(|n| day_bar(n, 99.0, 101.0)).collect();
+    let limit = |side, qty, price| req(&i, side, qty, OrderType::Limit { price });
+    let (script, log) = Script::new(vec![
+        (0, req(&i, Side::Buy, 1.0, OrderType::Market)),
+        (1, limit(Side::Sell, 0.6, 120.0)),
+        (1, reduce_only(limit(Side::Sell, 0.6, 130.0))),
+        (1, reduce_only(limit(Side::Sell, 0.4, 130.0))),
+        (1, reduce_only(limit(Side::Sell, 0.4, 140.0))),
+        (1, limit(Side::Sell, 0.1, 150.0)),
+        (1, reduce_only(limit(Side::Sell, 1.1, 150.0))),
+    ]);
+    let s = run_backtest(script, i, Timeframe::D1, &bars, &[], &[], config(0.0)).unwrap();
+    let log = log.lock().unwrap();
+    assert!(log[0].is_ok() && log[1].is_ok() && log[3].is_ok() && log[4].is_ok());
+    for rejected in [&log[2], &log[5], &log[6]] {
+        let err = rejected.as_ref().unwrap_err();
+        assert!(
+            err.reason
+                .starts_with("spot cannot sell more than it holds"),
+            "{}",
+            err.reason
+        );
+    }
+    assert_eq!(s.open_orders().len(), 3);
+    assert_eq!(s.portfolio().position(), 1.0);
+}
+
 #[test]
 fn spot_buys_must_fit_in_the_cash_with_the_taker_fee_and_open_buys() {
     let i = spot();
