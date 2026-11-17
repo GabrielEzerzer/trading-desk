@@ -5,7 +5,9 @@ use td_core::{
 
 use crate::broker::ENTRY_CANCELLED;
 use crate::session::Leg;
-use crate::{AttachedStop, Broker, Order, OrderRejected, OrderStatus, Portfolio, SeriesRow};
+use crate::{
+    AttachedStop, Broker, Order, OrderRejected, OrderStatus, Portfolio, SeriesRow, StockShorting,
+};
 
 /// A trading strategy. The same value runs in a backtest and in paper trading.
 ///
@@ -45,6 +47,7 @@ pub struct Context<'a> {
     pub(crate) failure: &'a mut Option<String>,
     /// The instruments traded beside the first, in a run with several; empty otherwise.
     pub(crate) others: &'a mut [Leg],
+    pub(crate) short_sales: Option<&'a StockShorting>,
 }
 
 /// The reason orders submitted on a warm-up bar are rejected with.
@@ -509,6 +512,11 @@ impl Context<'_> {
             .map(|i| i + 1)
     }
 
+    fn can_short_at(&self, k: usize) -> bool {
+        let id = &self.inst_at(k).id;
+        id.kind.rules().can_short || self.short_sales.is_some_and(|s| s.allows(id))
+    }
+
     fn inst_at(&self, k: usize) -> &Instrument {
         if k == 0 {
             self.instrument
@@ -561,7 +569,7 @@ impl Context<'_> {
         if entry.reduce_only {
             return Err("a reduce-only order cannot have a protective stop attached".into());
         }
-        if !inst.id.kind.rules().can_short && entry.side == Side::Sell {
+        if !self.can_short_at(k) && entry.side == Side::Sell {
             return Err("spot cannot attach a protective stop to a sell: it has no short".into());
         }
         let close = self.close_at(k, Side::Sell);
@@ -605,7 +613,7 @@ impl Context<'_> {
             return (req, Err(e.to_string()));
         }
         let rules = inst.id.kind.rules();
-        if !rules.can_short && req.side == Side::Sell {
+        if !self.can_short_at(k) && req.side == Side::Sell {
             let pending: f64 = self
                 .orders_at(k)
                 .iter()
@@ -620,8 +628,16 @@ impl Context<'_> {
                 } else {
                     "every open sell, reduce-only ones included"
                 };
+                let cannot = match self.short_sales {
+                    Some(_) => format!(
+                        "{} is not on the run's list of stocks that can be sold short, so it \
+                         cannot sell more than it holds",
+                        inst.id.symbol
+                    ),
+                    None => "spot cannot sell more than it holds".to_string(),
+                };
                 let reason = format!(
-                    "spot cannot sell more than it holds: selling {}, {} available after {open}",
+                    "{cannot}: selling {}, {} available after {open}",
                     req.qty, available
                 );
                 return (req, Err(reason));
@@ -650,7 +666,7 @@ impl Context<'_> {
                 return (req, Err(reason));
             }
         }
-        if rules.margin && !req.reduce_only {
+        if (rules.margin || self.short_sales.is_some()) && !req.reduce_only {
             let notional = self.side_notional(k, req.side, Some(&req));
             // With several traded instruments the cap is on the gross notional: what the others'
             // positions and open orders could reach comes on top.

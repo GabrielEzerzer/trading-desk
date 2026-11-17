@@ -751,6 +751,7 @@ fn run_case(case_path: &Path, dir: &Path, series: &str, out: &Path) -> Res<()> {
         series: Vec::new(),
         also_traded: Vec::new(),
         start_when_all_listed: false,
+        short_stocks: None,
     };
     let result = match harness_strategy(&case.strategy, &case.params)? {
         Some(strategy) => run_strategy(&config, strategy, &bars, &[], &funding)?,

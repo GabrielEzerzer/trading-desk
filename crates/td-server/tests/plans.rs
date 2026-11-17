@@ -278,6 +278,7 @@ fn entry(permutations: u32) -> StrategyEntry {
             slippage: Vec::new(),
             account_currency: td_core::AccountCurrency::Quote,
             fee_override: None,
+            short_stocks: None,
         },
         sweep: SweepPlan {
             fixed: Params::new(),

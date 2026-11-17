@@ -240,6 +240,7 @@ fn stock_plan_entry() -> StrategyEntry {
                 slippage: Vec::new(),
                 account_currency: td_core::AccountCurrency::Quote,
                 fee_override: None,
+                short_stocks: None,
             },
             sweep: SweepPlan {
                 fixed: Params::new(),
@@ -410,6 +411,7 @@ fn config() -> BacktestConfig {
         series: Vec::new(),
         also_traded: vec![stock("MSFT")],
         start_when_all_listed: false,
+        short_stocks: None,
     }
 }
 

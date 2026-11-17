@@ -135,6 +135,7 @@ fn plan(days: i64) -> TestPlan {
             slippage: Vec::new(),
             account_currency: AccountCurrency::Quote,
             fee_override: None,
+            short_stocks: None,
         },
         sweep: SweepPlan {
             fixed: Params::new().with("allow_short", ParamValue::Bool(true)),

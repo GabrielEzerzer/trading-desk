@@ -171,6 +171,16 @@ impl Portfolio {
         payment
     }
 
+    pub(crate) fn charge_borrow(&mut self, fraction: f64) -> f64 {
+        if self.position >= 0.0 || fraction == 0.0 {
+            return 0.0;
+        }
+        let payment = -self.position * self.mark_price * fraction;
+        self.cash -= payment;
+        self.funding_paid += payment;
+        payment
+    }
+
     /// Sets the balance to exactly zero, for a liquidation that keeps the rest of the margin.
     pub(crate) fn clear_cash(&mut self) {
         self.cash = 0.0;

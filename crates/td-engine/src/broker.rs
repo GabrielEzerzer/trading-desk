@@ -122,6 +122,9 @@ pub trait Broker: Send {
     fn may_open(&self, _bar: &Candle, _ask: &Candle) -> bool {
         true
     }
+    fn allow_short_sales(&mut self) -> bool {
+        false
+    }
 }
 
 /// A broker that fills orders with a [`FillModel`] and charges fees from a [`FeeSchedule`].
@@ -200,6 +203,7 @@ pub struct SimBroker<M: FillModel> {
     triggered: Vec<OrderId>,
     /// Open time of the previous bar. An order decided on it is seeing its first bar.
     last_bar: Millis,
+    short_sales: bool,
 }
 
 impl<M: FillModel> SimBroker<M> {
@@ -211,6 +215,7 @@ impl<M: FillModel> SimBroker<M> {
             open: Vec::new(),
             triggered: Vec::new(),
             last_bar: Millis::MIN,
+            short_sales: false,
         }
     }
 
@@ -237,6 +242,17 @@ impl<M: FillModel> SimBroker<M> {
             qty = inst.round_qty(qty.min(reducible.max(0.0)));
             if qty <= 0.0 {
                 return Err("reduce-only order would not reduce the position".into());
+            }
+        } else if self.short_sales && req.side == Side::Sell {
+            let from_holding = qty.min(book.position().max(0.0));
+            let whole_shares = ((qty - from_holding) * (1.0 + 4.0 * f64::EPSILON)).floor();
+            qty = inst.round_qty(from_holding + whole_shares);
+            if qty <= 0.0 {
+                return Err(
+                    "short sale cancelled at fill time: nothing is held, and a short \
+                            sale is in whole shares"
+                        .into(),
+                );
             }
         } else if !inst.id.kind.rules().can_short && req.side == Side::Sell {
             qty = inst.round_qty(qty.min(book.position().max(0.0)));
@@ -720,6 +736,11 @@ impl<M: FillModel> Broker for SimBroker<M> {
 
     fn open_orders(&self) -> &[Order] {
         &self.open
+    }
+
+    fn allow_short_sales(&mut self) -> bool {
+        self.short_sales = true;
+        true
     }
 
     fn may_open(&self, bar: &Candle, ask: &Candle) -> bool {

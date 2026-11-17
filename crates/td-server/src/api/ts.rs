@@ -119,6 +119,8 @@ pub fn render() -> String {
         td_engine::Period,
         td_engine::BacktestSettings,
         td_engine::SlippageOverride,
+        td_engine::StockShorting,
+        td_engine::Shortable,
         td_engine::SweepPlan,
         td_engine::WalkForwardPlan,
         td_engine::EvidenceSettings,

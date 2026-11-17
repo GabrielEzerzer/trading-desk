@@ -12,7 +12,7 @@ use crate::risk::{EquityRange, Exposure};
 use crate::runner::match_asks;
 use crate::{
     BarFunding, Broker, BrokerEvent, CandleFillModel, Context, EngineError, Order, OrderStatus,
-    Portfolio, Series, SeriesRow, SimBroker, Strategy, TradeStops,
+    Portfolio, Series, SeriesRow, SimBroker, StockShorting, Strategy, TradeStops,
 };
 
 /// Why [`Session::close_out`] cancels the open orders.
@@ -48,9 +48,6 @@ pub struct SessionConfig {
     pub slippage_bps: f64,
     /// Replaces the instrument's fee schedule when set.
     pub fees: Option<FeeSchedule>,
-    /// The largest position allowed on a margined kind (perpetual, FX), as its notional over the
-    /// account's equity: 1.0 means 1x. Checked when an order is submitted (see
-    /// [`Context::submit`]). A kind without margin, such as spot, ignores it.
     pub max_leverage: f64,
     /// The currency the account holds and reports every amount in; see [`Session::new`] for the
     /// kinds that allow [`AccountCurrency::Base`].
@@ -122,6 +119,7 @@ pub struct Session {
     /// joins that bar's equity point and range, those at other instruments' bars before it
     /// included, so each [`Exposure`] is stamped with it, as with one instrument.
     stamp: Millis,
+    short_sales: Option<StockShorting>,
 }
 
 /// One instrument traded beside the first in a run with several
@@ -297,7 +295,48 @@ impl Session {
             keep_exposures: false,
             peak_leverage: 0.0,
             stamp: 0,
+            short_sales: None,
         }
+    }
+
+    pub fn allow_short_sales(&mut self, shorting: StockShorting) -> Result<(), EngineError> {
+        if !self.bars.is_empty() || self.short_sales.is_some() {
+            return Err(EngineError::InvalidConfig(
+                "short selling is set once, before the first bar",
+            ));
+        }
+        shorting
+            .check(self.instrument.id.kind)
+            .map_err(EngineError::InvalidConfig)?;
+        for k in 0..=self.legs.len() {
+            if shorting.allows(&self.instrument_at(k).id)
+                && !self.broker_at_mut(k).allow_short_sales()
+            {
+                return Err(EngineError::InvalidConfig(
+                    "this session's broker cannot sell stocks short",
+                ));
+            }
+        }
+        self.short_sales = Some(shorting);
+        Ok(())
+    }
+
+    fn charge_borrow(&mut self, k: usize, open_time: Millis) -> f64 {
+        let Some(shorting) = &self.short_sales else {
+            return 0.0;
+        };
+        let last = if k == 0 {
+            self.bars.last()
+        } else {
+            self.legs[k - 1].traded.last()
+        };
+        let Some(last) = last else {
+            return 0.0;
+        };
+        let fraction = shorting.borrow_fraction(last.open_time, open_time);
+        let paid = self.book_at_mut(k).charge_borrow(fraction);
+        self.sweep(k);
+        paid
     }
 
     /// Feeds the next closed bar, with the funding events (`(time, rate)`) that fall inside it or
@@ -454,6 +493,13 @@ impl Session {
                 }
             })
             .collect();
+        if let Some(shorting) = &self.short_sales {
+            for leg in &mut self.legs {
+                if shorting.allows(&leg.instrument.id) {
+                    leg.broker.allow_short_sales();
+                }
+            }
+        }
         self.opened = vec![None; self.legs.len() + 1];
         self.keep_exposures = keep_exposures;
         Ok(())
@@ -502,6 +548,7 @@ impl Session {
                 charged.at_open += self.portfolio.charge_funding(rate, bar.open);
             }
         }
+        charged.at_open += self.charge_borrow(0, bar.open_time);
         let first_new_fill = self.fills.len();
         let instrument = &self.instrument;
         let breached = |book: &Portfolio| liquidation_trigger(instrument, book, &bar, funding);
@@ -726,6 +773,7 @@ impl Session {
                     charged[k].at_open += self.charge(k, rate, bar.open);
                 }
             }
+            charged[k].at_open += self.charge_borrow(k, bar.open_time);
         }
         let mut prices: Vec<f64> = (0..n)
             .map(|k| bars[k].map_or(self.book_at(k).mark_price(), |b| b.open))
@@ -1370,6 +1418,7 @@ impl Session {
             warming_up: false,
             failure: &mut self.failure,
             others: &mut self.legs,
+            short_sales: self.short_sales.as_ref(),
         }
     }
 
@@ -1545,6 +1594,7 @@ impl Session {
             warming_up,
             failure: &mut self.failure,
             others: &mut self.legs,
+            short_sales: self.short_sales.as_ref(),
         };
         if ctx.bars.len() == 1 {
             self.strategy.on_start(&mut ctx);
