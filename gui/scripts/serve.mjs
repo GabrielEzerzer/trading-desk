@@ -94,7 +94,13 @@ export function createStubServer({ root = join(app, 'out', 'renderer') } = {}) {
       send(200, 'text/javascript', `${stubSource}\ninstallBridgeStub(${JSON.stringify(config)})\n`)
       return
     }
-    const path = decodeURIComponent(url.pathname)
+    let path
+    try {
+      path = decodeURIComponent(url.pathname)
+    } catch {
+      send(400, 'text/plain', 'malformed path')
+      return
+    }
     const file = normalize(join(base, path === '/' ? 'index.html' : path))
     if (!file.startsWith(base + sep)) {
       send(403, 'text/plain', 'outside the renderer build')

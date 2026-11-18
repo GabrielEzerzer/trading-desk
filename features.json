@@ -480,7 +480,7 @@
       "inputs": "A strategy, instrument and range picked in the app.",
       "outputs": "The run's progress, metrics, equity chart and verdict.",
       "test": "none",
-      "issue": 264
+      "issue": 296
     },
     {
       "name": "Stored data view",
@@ -491,7 +491,7 @@
       "inputs": "The instrument to delete, confirmed.",
       "outputs": "The stored instruments with their sizes, updated after a delete.",
       "test": "none",
-      "issue": 264
+      "issue": 296
     },
     {
       "name": "Trading",
@@ -502,7 +502,7 @@
       "inputs": "An instrument, timeframe, strategy or manual orders picked in the app.",
       "outputs": "The live chart, the session panel, orders and fills.",
       "test": "none",
-      "issue": 264
+      "issue": 296
     },
     {
       "name": "Build the engine for the app",

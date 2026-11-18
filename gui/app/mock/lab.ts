@@ -1,5 +1,5 @@
-// The Lab's mock source, used when the app runs with TD_MOCK=1 and by the headless screenshots'
-// mock states. It reads lab.json (made by generate.mjs): two strategies with results, one that never
+// The Lab's mock source, used when the app runs with TD_MOCK=1 and in `pnpm serve`'s mock states.
+// It reads lab.json (made by generate.mjs): two strategies with results, one that never
 // ran and whose run finishes, and one whose run fails. Its stored data is the fixtures' datasets,
 // each with a run of months up to Oct 2025 and made-up file sizes, and deletes change it in memory.
 // The engine states drive the engine source instead, through the bridge stub in app/shots/ and

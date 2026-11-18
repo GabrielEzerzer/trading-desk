@@ -27,7 +27,7 @@ Then, from `gui/`:
 - `pnpm dev` builds the engine optimised (`cargo build --release -p td-server --bin td-server`) and opens the app with hot reload. The first build takes several minutes; later ones rebuild only what changed.
 - `pnpm build` makes the production bundle in `app/out`, and `pnpm test` runs the GUI tests.
 
-The engine's own tests run with `cargo test --workspace` from the repository root. `gui/README.md` has the rest of the GUI commands, including the screenshot and UI checks.
+The engine's own tests run with `cargo test --workspace` from the repository root. `gui/README.md` has the rest of the GUI commands, including `pnpm serve`, which opens the renderer in a browser tab on stand-in data.
 
 ### Installing
 
