@@ -54,7 +54,7 @@ const parseValue = (text) => {
 
 export function stubConfig(params) {
   const name = params.get('preset') ?? 'mock'
-  const preset = PRESETS[name]
+  const preset = Object.hasOwn(PRESETS, name) ? PRESETS[name] : undefined
   if (!preset) throw new Error(`unknown preset "${name}"; the presets are ${Object.keys(PRESETS).join(', ')}`)
   const fields = Object.fromEntries([...params].filter(([key]) => key !== 'preset').map(([key, value]) => [key, parseValue(value)]))
   return { hangStrategies: false, engineData, ...preset, ...fields }

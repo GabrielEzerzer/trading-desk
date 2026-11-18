@@ -57,6 +57,7 @@ describe('pnpm serve', () => {
   it('refuses an unknown preset and paths outside the build', async () => {
     const bad = await fetch(`${origin}/?preset=nope`)
     expect(bad.status).toBe(400)
+    expect((await fetch(`${origin}/?preset=constructor`)).status).toBe(400)
     expect(await bad.text()).toContain('engine-trading')
     expect((await fetch(`${origin}/..%2fpackage.json`)).status).toBe(403)
     expect((await fetch(`${origin}/%E0%A4%A`)).status).toBe(400)

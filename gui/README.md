@@ -34,7 +34,7 @@ The app's `productName`, `Trading Desk`, names its profile folder (`%APPDATA%\Tr
 - `/?engine=starting` and `/?engine=failed`: the engine starting and failed.
 - `/?preset=engine`: the Lab on the fake engine, with saved runs and stored data. Add `&hangStrategies=true` for the strategy list loading, `&noData=true` for nothing stored, `&dataCutoff=2025-03-31&codeChanged=true` for a data cutoff and a changed strategy, `&backtest=data_missing` or `&backtest=too_many_runs` for a refused run, `&download=no_token` for an FX download without a token, and `&deleteFails=true` for a refused delete.
 - `/?preset=engine-trading`, then Ctrl+2: Trading on the fake engine. Add `&history={"*":"hang"}` or `&history={"*":"fail"}` for the candle history loading or failing, and `&hangInstruments=true` or `&failInstruments=true` for the instrument lists.
-- `/?preset=engine-session`, then Ctrl+2: Trading with a running strategy session.
+- `/?preset=engine-session`, then Ctrl+2 and Binance spot BTCUSDT: Trading with a running strategy session.
 
 The rest of a state is reached by using the page: choose a strategy, run it, open a menu. Time runs as it does in the app, so a run or a live chart keeps moving. On the mock, `window.tdMockTrading.reconnect()` and `window.tdMockTrading.dropBucket()` in the browser console show the feed reconnecting and a dropped bucket.
 
