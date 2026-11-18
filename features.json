@@ -479,7 +479,8 @@
       "source": "gui/app/src/renderer/src/lab/StrategyLab.tsx",
       "inputs": "A strategy, instrument and range picked in the app.",
       "outputs": "The run's progress, metrics, equity chart and verdict.",
-      "test": "gui/e2e/flows.spec.ts"
+      "test": "none",
+      "issue": 296
     },
     {
       "name": "Stored data view",
@@ -489,7 +490,8 @@
       "source": "gui/app/src/renderer/src/lab/StoredData.tsx",
       "inputs": "The instrument to delete, confirmed.",
       "outputs": "The stored instruments with their sizes, updated after a delete.",
-      "test": "gui/e2e/flows.spec.ts"
+      "test": "none",
+      "issue": 296
     },
     {
       "name": "Trading",
@@ -499,7 +501,8 @@
       "source": "gui/app/src/renderer/src/trading/Trading.tsx",
       "inputs": "An instrument, timeframe, strategy or manual orders picked in the app.",
       "outputs": "The live chart, the session panel, orders and fills.",
-      "test": "gui/e2e/flows.spec.ts"
+      "test": "none",
+      "issue": 296
     },
     {
       "name": "Build the engine for the app",
@@ -567,7 +570,7 @@
     },
     {
       "name": "Typecheck the GUI",
-      "description": "Typechecks every GUI package and the UI gates.",
+      "description": "Typechecks every GUI package.",
       "kind": "script",
       "entry": "pnpm typecheck",
       "source": "gui/package.json",
@@ -586,25 +589,14 @@
       "test": ".github/workflows/gui.yml"
     },
     {
-      "name": "Write the app screenshots",
-      "description": "Builds the app and writes its screenshots at each window size.",
+      "name": "Serve the renderer on the bridge stub",
+      "description": "Serves the last renderer build on localhost with the bridge stub as window.td, so any state opens in a browser tab.",
       "kind": "script",
-      "entry": "pnpm shots",
-      "source": "gui/app/shots/shots.mjs",
-      "inputs": "None.",
-      "outputs": "PNG screenshots under gui/shots/<size>/ (git-ignored).",
-      "test": "none",
-      "issue": 264
-    },
-    {
-      "name": "Run the UI gates",
-      "description": "Runs the Playwright layout, flow, motion, accessibility and screenshot checks.",
-      "kind": "script",
-      "entry": "pnpm gates",
-      "source": "gui/playwright.config.ts",
-      "inputs": "The built app and the screenshot baselines.",
-      "outputs": "Gate results; exit 1 on a failure.",
-      "test": ".github/workflows/gui.yml"
+      "entry": "pnpm serve",
+      "source": "gui/scripts/serve.mjs",
+      "inputs": "--port (default 4319); the page's query string picks the stub's configuration.",
+      "outputs": "The URL it serves on.",
+      "test": "gui/scripts/serve.test.mjs"
     },
     {
       "name": "Check the app quits",
@@ -619,7 +611,7 @@
     },
     {
       "name": "Write the Lab's mock fixtures",
-      "description": "Writes the Lab's mock fixtures and the data of the engine stub the screenshots and UI gates use, from a seeded random walk so every run writes the same files.",
+      "description": "Writes the Lab's mock fixtures and the data of the engine stub pnpm serve uses, from a seeded random walk so every run writes the same files.",
       "kind": "script",
       "entry": "gui/app/mock/generate.mjs",
       "source": "gui/app/mock/generate.mjs",

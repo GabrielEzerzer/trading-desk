@@ -1,12 +1,9 @@
-// Trading's mock source, used when the app runs with TD_MOCK=1 and by the headless screenshots.
+// Trading's mock source, used when the app runs with TD_MOCK=1 and in `pnpm serve`'s mock states.
 // It reads trading.json (made by generate-trading.mjs): instruments for both venues and candle
 // history for BTCUSDT and ETHUSDT. Other instruments reuse BTCUSDT's path scaled to their own
 // price. Live bars continue the history quickly (one closed bar every `liveMs`, whatever the
 // timeframe, with the bar in progress shown twice before it closes), and paper sessions run on them: manual orders fill at the next bar's open, and a
 // strategy session trades a simple moving-average cross so its markers can be designed.
-//
-// It also exposes `window.tdMockTrading` so the screenshots can show the feed reconnecting and a
-// dropped bucket on demand.
 
 import type {
   Candle,
@@ -121,11 +118,6 @@ function seedOf(text: string): number {
   return h >>> 0
 }
 
-/**
- * When the bar in progress is shown between two closes, as fractions of `liveMs`. Late in the
- * cycle, so the screenshots' quiet moment (0.6 of the cycle, harness.mjs `quiet`) still shows the
- * last closed bar with the price's tint gone.
- */
 const FORMING_AT = [0.75, 0.9] as const
 
 /** One instrument and timeframe's live bars, shared by the chart and every session on it. */
@@ -618,7 +610,6 @@ export interface MockTradingOptions {
 
 declare global {
   interface Window {
-    /** Mock only: lets the screenshots show a reconnecting feed and a dropped bucket. */
     tdMockTrading?: { reconnect(): void; dropBucket(): void }
   }
 }

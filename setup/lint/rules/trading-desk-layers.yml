@@ -426,7 +426,7 @@ rule:
 id: layers-gui-app-no-harness-ts
 language: TypeScript
 severity: error
-message: "App and shared code never import the UI gates (gui/e2e), the screenshot tool (gui/app/shots), test helpers (gui/app/test) or scripts (gui/scripts). Move the shared piece into the app or @td/shared and import it from the harness."
+message: "App and shared code never import the bridge stub (gui/app/shots), test helpers (gui/app/test) or scripts (gui/scripts). Move the shared piece into the app or @td/shared and import it from the harness."
 files:
   - "gui/app/src/**"
   - "gui/shared/src/**"
@@ -434,7 +434,7 @@ ignores:
   - "**/*.test.ts"
 rule:
   kind: string
-  regex: '^[''"](.*/)?(e2e|shots|test|scripts)/.*[''"]$'
+  regex: '^[''"](.*/)?(shots|test|scripts)/.*[''"]$'
   inside:
     any:
       - kind: import_statement
@@ -449,12 +449,12 @@ rule:
 id: layers-gui-app-no-harness-tsx
 language: Tsx
 severity: error
-message: "App and shared code never import the UI gates (gui/e2e), the screenshot tool (gui/app/shots), test helpers (gui/app/test) or scripts (gui/scripts). Move the shared piece into the app or @td/shared and import it from the harness."
+message: "App and shared code never import the bridge stub (gui/app/shots), test helpers (gui/app/test) or scripts (gui/scripts). Move the shared piece into the app or @td/shared and import it from the harness."
 files:
   - "gui/app/src/**"
 rule:
   kind: string
-  regex: '^[''"](.*/)?(e2e|shots|test|scripts)/.*[''"]$'
+  regex: '^[''"](.*/)?(shots|test|scripts)/.*[''"]$'
   inside:
     any:
       - kind: import_statement

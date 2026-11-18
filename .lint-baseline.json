@@ -15244,10 +15244,7 @@
       "08afb6450b4f39d0",
       "0ad76db683fa6fc1",
       "1998c18b92044ab2",
-      "20673156baebd850",
-      "275a59623b9de20c",
       "2a91088ea42e2997",
-      "2df48c59c2802c6d",
       "3307296947b45c2c",
       "3904c0bca4cbe825",
       "3e2bbb27eb6193e9",
@@ -15263,9 +15260,7 @@
       "8a2d1f992acd9939",
       "8b0ca1ae8d3758c9",
       "a0382efc4407d7d2",
-      "a2c2339691fc48fb",
       "ad4c27e360789d3e",
-      "b044563616c77aa2",
       "b18ebf66e194d5b5",
       "bce24e7644732fae",
       "d6d3247b3f3aa50f",
@@ -15349,98 +15344,6 @@
     ],
     "no-inline-suppressions-js": [
       "b6e2f81c507b002c"
-    ]
-  },
-  "gui/app/shots/harness.d.mts": {
-    "no-comments-ts": [
-      "0ce3f0201db679ff",
-      "1947c7b3b20afc67",
-      "23c94b3a4fb00d03",
-      "25415000dae6ce01",
-      "3588a6e0e190bec0",
-      "455dbf1dc2499652",
-      "4c850b5e9556936f",
-      "700f6d6b3c569e5c",
-      "822829c6946a1bda",
-      "8d12a3d24a88bb79",
-      "8fadbd6d4972215f",
-      "a229b35808f371db",
-      "a78d2f1621cf9706",
-      "ba716411d3f57d4f",
-      "bc9d609f5efa45fd",
-      "cbea283b69b15e65",
-      "db7122bcf03f7618",
-      "eb421ac45db28860",
-      "f69c42c449c54553"
-    ]
-  },
-  "gui/app/shots/harness.mjs": {
-    "no-comments-js": [
-      "01dfc3ddcde9ca3f",
-      "02f767e707bed4c6",
-      "072ec5874c22bd1f",
-      "0d895d18d70fd2e0",
-      "0e3907cfed95ba57",
-      "0e82a1a18db2dfed",
-      "124f6efa15cdbc3a",
-      "1c6c6ac11c6b8af4",
-      "2016ea937a579692",
-      "22e241ad9dfe92a3",
-      "2731777828f91cc4",
-      "33937fca9e8328dd",
-      "36cb6c99054fe521",
-      "3bdeb12afd469ee1",
-      "4392a516e775964a",
-      "49fa24988c0fe35b",
-      "4a5548dadefd60ca",
-      "4cd88d288b541bc7",
-      "5709e642b16d9ce3",
-      "5a5320415a7e84a9",
-      "6d72fea4f823d766",
-      "6ecb09d81328e47e",
-      "6f31663a03dfb3f8",
-      "70df4704ea998bc7",
-      "721b9df7676caac0",
-      "73c50f36877f7dfa",
-      "7b1f447d0030e1fc",
-      "7c7de4533043fd91",
-      "7e6bd0bc168be654",
-      "84772406e2ee7ccb",
-      "892764a23a4d28b1",
-      "93a0ff31ed1d6b13",
-      "9d8f221d34b3790d",
-      "9f6683b5e0d6de4d",
-      "a2c2339691fc48fb",
-      "a30b29d48bae081e",
-      "abca712f87cbd60e",
-      "aec7e095aec4c3ad",
-      "afb04121c2dd5f79",
-      "b25e12c3a36a7ead",
-      "b4bbc2c9b02a5f07",
-      "bb4935650a3a6fe1",
-      "bf35b0e3e8744ccd",
-      "cc6a1b4ac130178a",
-      "cde3ac37da784a0f",
-      "ce89574dfff87e95",
-      "cf3e2a745b4e6ad3",
-      "dc81027b2981674e",
-      "de619cce9e99c835",
-      "df7b2c0ca1cf5521",
-      "f004b4cbebff688e",
-      "f5b16da2dfa107b5",
-      "f9b607aedd03e9ad",
-      "fb9861676ca58545"
-    ]
-  },
-  "gui/app/shots/shots.mjs": {
-    "no-comments-js": [
-      "10b84f13665f686c",
-      "493e3bf2753920f4",
-      "8202e3007db9755c",
-      "c142898ec6817219"
-    ],
-    "no-inline-suppressions-js": [
-      "4908d1a1687c5126"
     ]
   },
   "gui/app/src/main/bridge.test.ts": {
@@ -16110,113 +16013,6 @@
       "0526ab9c7170f97b",
       "91ad5d35df8feec7",
       "9f5e5d0d01d83133"
-    ]
-  },
-  "gui/e2e/audit.ts": {
-    "no-comments-ts": [
-      "0fb80987bb28eb14",
-      "13b4085f4345805a",
-      "24a44e9b8b530bab",
-      "30c6dd925f7da736",
-      "39d9f8a724583636",
-      "3bb4701d8875334a",
-      "4c51dff95cd860f9",
-      "689db1b2f3994b70",
-      "7dbe96a308c576de",
-      "87d8329f17a46919",
-      "8998be7a59353f1b",
-      "92deb9fb07454c24",
-      "a2c2339691fc48fb",
-      "a91f18401fad6402",
-      "c5a4eda4d24113e2",
-      "ca4e844ae2821e85",
-      "cad186e100e943df",
-      "cb88640a774a49cc",
-      "cbad343871c6ddd6",
-      "d4688b707391ec07",
-      "f0be7b76350fe115"
-    ],
-    "no-inline-suppressions-ts": [
-      "39d9f8a724583636"
-    ]
-  },
-  "gui/e2e/fixtures.ts": {
-    "no-comments-ts": [
-      "a603aaa12c396aab"
-    ]
-  },
-  "gui/e2e/flows.spec.ts": {
-    "no-comments-ts": [
-      "073e64fd2d1ffa08",
-      "07697447973413d5",
-      "0841a17b920e9486",
-      "0abd655a6a1455b2",
-      "1c05504bacd907c8",
-      "1d1ecad24713ca76",
-      "297ea96338c28dc2",
-      "3c8c31666bc325d7",
-      "3ccd9713b99e2c52",
-      "4392d0faafdc03bd",
-      "48a11768583c03d4",
-      "4912756ba5f63abd",
-      "6094ae5caa87cf9f",
-      "66d513d3d323de12",
-      "7ecdea54fecd20db",
-      "7f03c9931c6d6a64",
-      "8148962cb49b9f03",
-      "82a5cd400e1b1395",
-      "82f92605b14faaff",
-      "83107ce49ff62305",
-      "87b0c41b29aed67d",
-      "888a626bae993717",
-      "8c88fa14dcdb3cc4",
-      "94948cb9a0169e3d",
-      "aa9c739f94f9c421",
-      "ac5e4d60c6cf0c11",
-      "adc8e46c7a0fd1e1",
-      "b7386c415e2cea9c",
-      "c225c6049e33a878",
-      "c4f08fe874fa9222",
-      "c6b252fe91e4aea6",
-      "cf308da989762aca",
-      "cf5be6a55b3715a1",
-      "d6a72a3678606cfc",
-      "d6e400e2aee2ad84",
-      "de13106754179c1a",
-      "de2722c4a04228d5",
-      "ef05744f22e46566",
-      "f19aa80277c52e09",
-      "f37bd2d4e691c5f0",
-      "f8faa20864d9eb93",
-      "fb7c8c9b89853c06"
-    ],
-    "no-inline-suppressions-ts": [
-      "073e64fd2d1ffa08",
-      "d6e400e2aee2ad84"
-    ]
-  },
-  "gui/e2e/layout.spec.ts": {
-    "no-comments-ts": [
-      "6ff56a42ba0204e0"
-    ]
-  },
-  "gui/e2e/motion.spec.ts": {
-    "no-comments-ts": [
-      "447a7c2b428f321e",
-      "5a179853d2d26026",
-      "a22afffa877a0702",
-      "e182a2833f547fa3"
-    ]
-  },
-  "gui/e2e/screenshots.spec.ts": {
-    "no-comments-ts": [
-      "79fc9a0b6a6ffa08"
-    ]
-  },
-  "gui/playwright.config.ts": {
-    "no-comments-ts": [
-      "c0771c27a1028ddf",
-      "f80d429a72b3d2f0"
     ]
   },
   "gui/scripts/install-check.mjs": {
