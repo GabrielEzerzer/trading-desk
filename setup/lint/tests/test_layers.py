@@ -69,11 +69,11 @@ CASES = [
      ["import { lab } from '../../../../mock/lab'\nexport const X = () => <div />\n"],
      ["import { source } from './source'\nexport const X = () => <div />\n"]),
     ("layers-gui-app-no-harness-ts", "gui/app/src/main/x.ts",
-     ["import { serve } from '../../shots/harness.mjs'\n", "import { audit } from '../../../e2e/audit'\n",
+     ["import stub from '../../shots/bridge-stub.js'\n", "import { serve } from '../../../scripts/serve.mjs'\n",
       "import { procs } from '../../../scripts/procs.mjs'\n", "import fake from '../../test/fake-sidecar.mjs'\n"],
      ["import { bridge } from './bridge'\n"]),
     ("layers-gui-app-no-harness-tsx", "gui/app/src/renderer/src/X.tsx",
-     ["import { serve } from '../../../shots/harness.mjs'\nexport const X = () => <div />\n"],
+     ["import stub from '../../../shots/bridge-stub.js'\nexport const X = () => <div />\n"],
      ["import { Chart } from './trading/Chart'\nexport const X = () => <div />\n"]),
 ]
 

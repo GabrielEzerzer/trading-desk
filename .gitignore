@@ -9,13 +9,6 @@ node_modules/
 out/
 dist/
 
-# Headless screenshots from pnpm shots
-gui/shots/
-
-# Playwright UI gate output (baselines in gui/e2e/__screenshots__ are committed)
-gui/e2e/.results/
-gui/playwright-report/
-
 # Private strategies: the trading-desk-strategies repo, cloned here (crates/td-engine/build.rs)
 crates/td-engine/src/strategies/private/
 

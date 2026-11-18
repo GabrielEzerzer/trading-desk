@@ -8,12 +8,6 @@ importers:
 
   .:
     devDependencies:
-      '@axe-core/playwright':
-        specifier: 4.14.0
-        version: 4.14.0(playwright-core@1.65.0)
-      '@playwright/test':
-        specifier: 1.65.0
-        version: 1.65.0
       '@types/node':
         specifier: 24.19.2
         version: 24.19.2
@@ -81,12 +75,6 @@ importers:
   shared: {}
 
 packages:
-
-  '@axe-core/playwright@4.14.0':
-    resolution: {integrity: sha512-SGUhG5PIHd2eMdpgBF2PyQLOhX+qyDR2PT4cmoS4Qk2ak+jX/rrSvst9l0PGv5WTHolKpUMvVmoHpr4cZgf1RQ==}
-    engines: {node: '>=22.12.0'}
-    peerDependencies:
-      playwright-core: '>= 1.0.0'
 
   '@babel/code-frame@7.29.7':
     resolution: {integrity: sha512-Aup7aUOfpbAUg2ROOJN6Iw5f9DMBlzu0mIkm/malLQFN/YQgO48wCj0Kxa3sEHJvPVFg7siR+qRInwXd2qhQKw==}
@@ -276,11 +264,6 @@ packages:
   '@peculiar/webcrypto@1.7.2':
     resolution: {integrity: sha512-ktTSACRJ5WdpfjHjFT2EWJQQPacGv1cPCDfEbdmpAHOxdFiYqPe4lfnXGA3D8Dg9/0kHPYSvyRlgujIOVlTdvQ==}
     engines: {node: '>=14.18.0'}
-
-  '@playwright/test@1.65.0':
-    resolution: {integrity: sha512-iGURLGuKDLakSEl7Pgfv8h7f+XLT+V861Wfhz0zlEl5nyFuKUopdkFBPKqTllTUp06aOwPuH8iuUEb3yp3MpbQ==}
-    engines: {node: '>=20'}
-    hasBin: true
 
   '@radix-ui/primitive@1.2.0':
     resolution: {integrity: sha512-KABY+VMIRPJL+Vyzv/335FEhXXD/xDv8BMb1kl48/aXJZMH0LtHCTx5ga5RnxaEP3nZHtmTLf1P9vanmFX46bw==}
@@ -946,10 +929,6 @@ packages:
 
   aws4@1.13.2:
     resolution: {integrity: sha512-lHe62zvbTB5eEABUVi/AwVh0ZKY9rMMDhmm+eeyuuUQbQ3+J+fONVQOZyj+DdrvD4BY33uYniyRJ4UJIaSKAfw==}
-
-  axe-core@4.14.0:
-    resolution: {integrity: sha512-9WTZxEjsZ7b13TH8JPmbV2z8CHbl80/2hm3XPEG4JgNdQLK81IBRXmSxHfMAOkSqQeRxT/0dwNDz2GOm3zzpcQ==}
-    engines: {node: '>=4'}
 
   balanced-match@1.0.2:
     resolution: {integrity: sha512-3oSeUO0TMV67hN1AmbXsK4yaqU7tjiHlbxRDZOpH0KW9+CeX4bRAaX0Anxt0tx2MrpRpWwQaPwIlISEJhYU5Pw==}
@@ -2191,11 +2170,6 @@ packages:
 
 snapshots:
 
-  '@axe-core/playwright@4.14.0(playwright-core@1.65.0)':
-    dependencies:
-      axe-core: 4.14.0
-      playwright-core: 1.65.0
-
   '@babel/code-frame@7.29.7':
     dependencies:
       '@babel/helper-validator-identifier': 7.29.7
@@ -2477,10 +2451,6 @@ snapshots:
       '@peculiar/utils': 2.0.3
       tslib: 2.9.1
       webcrypto-core: 1.9.2
-
-  '@playwright/test@1.65.0':
-    dependencies:
-      playwright: 1.65.0
 
   '@radix-ui/primitive@1.2.0': {}
 
@@ -3047,8 +3017,6 @@ snapshots:
   at-least-node@1.0.0: {}
 
   aws4@1.13.2: {}
-
-  axe-core@4.14.0: {}
 
   balanced-match@1.0.2: {}
 

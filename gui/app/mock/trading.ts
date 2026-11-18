@@ -121,11 +121,6 @@ function seedOf(text: string): number {
   return h >>> 0
 }
 
-/**
- * When the bar in progress is shown between two closes, as fractions of `liveMs`. Late in the
- * cycle, so the screenshots' quiet moment (0.6 of the cycle, harness.mjs `quiet`) still shows the
- * last closed bar with the price's tint gone.
- */
 const FORMING_AT = [0.75, 0.9] as const
 
 /** One instrument and timeframe's live bars, shared by the chart and every session on it. */

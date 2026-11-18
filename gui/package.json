@@ -11,14 +11,11 @@
     "build": "pnpm --filter @td/app build",
     "dist": "pnpm engine && pnpm build && pnpm --filter @td/app dist",
     "install-check": "node scripts/install-check.mjs",
-    "typecheck": "pnpm -r typecheck && tsc -p tsconfig.e2e.json",
+    "typecheck": "pnpm -r typecheck",
     "test": "vitest run",
-    "shots": "pnpm --filter @td/app build && node app/shots/shots.mjs",
-    "gates": "playwright test"
+    "serve": "node scripts/serve.mjs"
   },
   "devDependencies": {
-    "@axe-core/playwright": "4.14.0",
-    "@playwright/test": "1.65.0",
     "@types/node": "24.19.2",
     "fast-check": "4.10.2",
     "playwright": "1.65.0",

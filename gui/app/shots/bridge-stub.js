@@ -1,5 +1,5 @@
-// Test-only stand-in for the preload's `window.td`, injected by shots.mjs and the UI gates (gui/e2e)
-// before the page loads.
+// Test-only stand-in for the preload's `window.td`, injected by scripts/serve.mjs (`pnpm serve`)
+// before the app's own scripts run.
 // It implements the TdBridge contract (gui/shared/src/bridge.ts) with a scripted engine status, and
 // answers the engine's routes from the fixtures in app/mock/engine.json: the strategy list, saved
 // runs, stored data with its coverage and deletes, instrument rules, and backtest and download jobs
